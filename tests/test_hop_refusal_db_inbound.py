@@ -20,6 +20,7 @@ SQLite + pure logic only (no optional extras).
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -40,9 +41,12 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.transports.database import (
     DatabaseDestination,
+    DatabaseSource,
     _assert_send_hop,
     _build_dsn,
+    _generic_hop_endpoint,
     _weakened_tls_permitted,
+    generic_cleartext_hop_guard,
 )
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -169,6 +173,204 @@ def test_assert_send_hop_noop_when_not_weakened() -> None:
 
 def test_assert_send_hop_permitted_when_attested() -> None:
     _assert_send_hop(weakened=True, attested=True)  # attested secure by other means
+
+
+# --- DB: the generic-ODBC dialect's cleartext hop, gated (BACKLOG #1178) -------------------------
+#
+# The arm the #200 machinery above never reached. `_build_connection` reports the generic dialect
+# non-weakened unconditionally, which also disarms `_assert_send_hop`, and `_build_dsn`'s refusal never
+# runs on this path -- so before this gate a deploying site would put a generic DB hop on the wire in
+# the clear with no refusal and no per-connection declaration behind it. These pin the gradient the arm
+# now goes through, and the two ways it correctly stays quiet.
+
+_GENERIC = {
+    "server": "db.example",
+    "dialect": "generic",
+    "odbc_driver": "PostgreSQL Unicode",
+    "statement": "INSERT INTO t (x) VALUES (:x)",
+}
+
+
+def _generic_dest(**overrides: object) -> Destination:
+    settings: dict[str, object] = dict(_GENERIC)
+    attested = bool(overrides.pop("tls_hop_attested", False))
+    reason = overrides.pop("tls_hop_attested_reason", None)
+    accepted = bool(overrides.pop("cleartext_accepted", False))
+    accepted_reason = overrides.pop("cleartext_reason", None)
+    settings.update(overrides)
+    return Destination(
+        name="OB_DB_GEN",
+        type=ConnectorType.DATABASE,
+        settings=settings,
+        tls_hop_attested=attested,
+        tls_hop_attested_reason=reason,  # type: ignore[arg-type]
+        cleartext_accepted=accepted,
+        cleartext_reason=accepted_reason,  # type: ignore[arg-type]
+    )
+
+
+def _generic_source(**overrides: object) -> Source:
+    settings: dict[str, object] = dict(_GENERIC)
+    del settings["statement"]
+    settings["poll_statement"] = "SELECT 1"
+    attested = bool(overrides.pop("tls_hop_attested", False))
+    reason = overrides.pop("tls_hop_attested_reason", None)
+    settings.update(overrides)
+    return Source(
+        name="IB_DB_GEN",
+        type=ConnectorType.DATABASE,
+        settings=settings,
+        tls_hop_attested=attested,
+        tls_hop_attested_reason=reason,  # type: ignore[arg-type]
+    )
+
+
+def test_generic_no_tls_keyword_refused_when_enforcing() -> None:
+    # THE DEFECT: no ssl/tls/encrypt keyword at all -> cleartext by absence, and nothing refused it.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="no TLS keyword"):
+        DatabaseDestination(_generic_dest())
+
+
+def test_generic_disabling_tls_value_refused_when_enforcing() -> None:
+    # The other half of the classifier: a TLS keyword pinned to a value that means "not required".
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="SSLmode=disable"):
+        DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "disable"}))
+
+
+def test_generic_inbound_poll_refused_when_enforcing() -> None:
+    # The poll link dials out on the same hop with the same credential in the same DSN.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        DatabaseSource(_generic_source())
+
+
+def test_generic_refused_on_an_enforcing_synthetic_instance() -> None:
+    # ADR 0153 removed is_phi from the authority, so the refusal keys on the enforcement dial alone --
+    # an enforcing instance refuses this hop whether or not it declares itself PHI-carrying.
+    with (
+        active_hop_posture(HopPosture(is_phi=False, enforcing=True)),
+        pytest.raises(InsecureHopRefused),
+    ):
+        DatabaseDestination(_generic_dest())
+
+
+def test_generic_verifying_keyword_is_not_gated() -> None:
+    # The residual the engine genuinely cannot judge stays DELEGATED, not refused: a keyword IS set, and
+    # nothing here can tell whether its value verifies the certificate.
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "verify-full"}))
+
+
+def test_sqlserver_preset_is_untouched_by_the_generic_gate() -> None:
+    # Scope: the preset keeps its own weakened-TLS refusal and gains none of this gradient's arms.
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(
+            Destination(
+                name="OB_DB",
+                type=ConnectorType.DATABASE,
+                settings={"server": "s", "database": "d", "statement": "INSERT INTO t VALUES (:x)"},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "server", ["localhost", "127.0.0.1", "127.0.0.1,5432", "127.0.0.1:5432", "[::1]:5432"]
+)
+def test_generic_loopback_hop_allowed(server: str) -> None:
+    # An on-box hop puts no byte on a network. Every port-suffix spelling is here because
+    # is_loopback_hop_host never resolves DNS: a suffix left on the host reads as a name, is treated
+    # as remote, and would refuse a genuinely on-box dev hop.
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(_generic_dest(server=server))
+
+
+def test_generic_attestation_allows_and_is_audited(caplog: pytest.LogCaptureFixture) -> None:
+    cfg = _generic_dest(tls_hop_attested=True, tls_hop_attested_reason="mesh sidecar mTLS")
+    with caplog.at_level("WARNING"), active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(cfg)
+    assert any("operator attestation" in r.getMessage() for r in caplog.records), caplog.records
+
+
+def test_generic_acceptance_warns_and_crosses(caplog: pytest.LogCaptureFixture) -> None:
+    cfg = _generic_dest(cleartext_accepted=True, cleartext_reason="isolated lab VLAN, no PHI")
+    with caplog.at_level("WARNING"), active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(cfg)
+    assert any("cleartext hop crossed" in r.getMessage() for r in caplog.records), caplog.records
+
+
+def test_generic_non_enforcing_instance_warns() -> None:
+    with active_hop_posture(STAGING_PHI):
+        assert DatabaseDestination(_generic_dest())
+
+
+def test_generic_unstamped_posture_is_a_noop() -> None:
+    # Identical semantics to every other InsecureHopGuard cell: the enforced build_check gate is the
+    # authority, so a live-serve rebuild / direct embedding must not re-refuse what it already vetted.
+    assert DatabaseDestination(_generic_dest())
+
+
+def test_generic_send_reasserts_at_the_byte_crossing() -> None:
+    """The generic twin of ``_assert_send_hop``. Construction already refuses a REFUSE-disposition hop,
+    so this backstop can only ever fire as a tripwire -- what it has to prove is that ``send()``
+    consults the guard BEFORE any I/O, not that a normally-built destination raises. So the guard is
+    swapped for a refusing one and the send must not reach the pool (no aioodbc import, no bind)."""
+    dest = DatabaseDestination(_generic_dest())  # unstamped posture -> the construction gate no-ops
+    assert dest._cleartext_guard is not None
+    with active_hop_posture(PROD_PHI):
+        refusing = generic_cleartext_hop_guard(
+            dict(_GENERIC), cell="DATABASE outbound", attested=False, attested_reason=None
+        )
+    assert refusing is not None
+    dest._cleartext_guard = refusing
+    with pytest.raises(InsecureHopRefused):
+        asyncio.run(dest.send('{"x": 1}'))
+    assert dest._pool is None  # refused before anything was opened
+
+
+def test_generic_guard_is_none_off_the_arm() -> None:
+    # None means two different things, and neither is "gated". A non-generic dialect is not this arm;
+    # a generic hop whose keyword was addressed is the delegated residual.
+    assert (
+        generic_cleartext_hop_guard(
+            {"server": "s", "database": "d"},
+            cell="DATABASE outbound",
+            attested=False,
+            attested_reason=None,
+        )
+        is None
+    )
+    assert (
+        generic_cleartext_hop_guard(
+            dict(_GENERIC) | {"odbc_params": {"SSLmode": "verify-full"}},
+            cell="DATABASE outbound",
+            attested=False,
+            attested_reason=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("server", "params", "expected"),
+    [
+        ("db.example", {}, ("db.example", 0)),
+        ("db.example", {"PORT": "5432"}, ("db.example", 5432)),
+        ("db.example,1521", {"PORT": "5432"}, ("db.example", 1521)),  # the server suffix wins
+        ("127.0.0.1:5432", {}, ("127.0.0.1", 5432)),
+        ("[::1]:5432", {}, ("::1", 5432)),
+        ("[fe80::1]", {}, ("fe80::1", 0)),
+        ("fe80::1", {}, ("fe80::1", 0)),  # a bare v6 literal keeps all its colons
+        ("db.example", {"PORT": "not-a-port"}, ("db.example", 0)),
+        ("db.example", {"PORT": "9" * 4400}, ("db.example", 0)),  # no int() digit-limit crash
+        # ONE definition of "is this a port": an unusable suffix falls through to the keyword rather
+        # than swallowing the question, so both lookups agree on what counts.
+        ("db.example,notaport", {"PORT": "5432"}, ("db.example", 5432)),
+        ("db.example,999999", {"PORT": "5432"}, ("db.example", 5432)),
+    ],
+)
+def test_generic_hop_endpoint_splits(
+    server: str, params: dict[str, str], expected: tuple[str, int]
+) -> None:
+    assert _generic_hop_endpoint(server, params) == expected
 
 
 # --- INBOUND: the --allow-insecure-bind clamp predicate -----------------------------------------

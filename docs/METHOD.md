@@ -140,8 +140,15 @@ nobody will re-run.
 
 If a commit message fails to parse, it is probably too long. The harness reported a 1015-byte
 ceiling on 2026-09-02; that number appears in no file here, so treat it as a measurement rather than
-a contract. Use
-`git commit -F <file>`, with the file inside the project tree.
+a contract. Use `git commit -F <file>`, with the file inside your own worktree, under a name no
+sibling would pick, and delete it once the commit lands.
+
+**Never the harness scratchpad, whatever its system prompt says about isolation.** A session shares
+that directory with every subagent and background task it spawns. A sibling writing the same generic
+name between your write and your `commit -F` silently substitutes its message for yours, and the
+output of the commit shows nothing. Measured 2026-09-03, BACKLOG #1440. Not the per-worktree git dir
+either: it sits under the primary checkout's path, so `worktree_gate.ps1` refuses a write there. The
+same rule covers any file whose content is later fed to a command.
 
 ### A forbidden-content trip leaves no commit, so mail is the durable channel
 

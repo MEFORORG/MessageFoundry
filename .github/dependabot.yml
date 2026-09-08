@@ -7,7 +7,8 @@ updates:
   # pyproject.toml + uv.lock and REGENERATES uv.lock IN its PRs (version updates GA 2025-03,
   # security updates GA 2025-12) — the old "pip" ecosystem updated requirements/pyproject but NOT
   # uv.lock. It still does not re-derive the EXPORTED locks (requirements.lock + docker/locks/* +
-  # constraints.lock + ci/locks/* — SIX artifacts), which the DEP-1 gate in security.yml byte-diffs;
+  # constraints.lock + ci/locks/* — SEVEN artifacts, since a9354808e added ci/locks/release-tools.lock),
+  # which the DEP-1 gate in security.yml byte-diffs;
   # .github/workflows/dependabot-lock-resync.yml re-exports those on the Dependabot branch so the
   # gate stays green.
   #
@@ -56,11 +57,40 @@ updates:
     # `versioning-strategy: lockfile-only`. Both would freeze the hash-pinned CI toolchain, which ADR
     # 0034 §3 wants moving THROUGH this machinery — a pinned toolchain outside it rots into
     # "pinned, stale, unpatched — worse posture than floating".
+    #
+    # ONE CARVE-OUT, and it is the `sigstore` entry below (BACKLOG #332). The rule above is about
+    # versions NOBODY HAS DECIDED: it keeps the toolchain moving because leaving a pin unattended is
+    # how it rots. `sigstore`'s version is not unattended — it is an OWNER RULING, given 2026-08-22
+    # and re-affirmed 2026-09-03, pinning 4.4.0 and naming 4.5.0 as the version not to take. So the
+    # policy's own reason does not reach it, and the failure mode inverts: a routine weekly PR here
+    # does not keep a neglected pin fresh, it re-proposes a version the owner has twice declined,
+    # and merging it silently reverses a decision. That is not hypothetical -- it already happened
+    # once, in a9354808e, which shipped 4.5.0 two days AFTER its own author had retracted the
+    # argument for it (PR 531, comment of 2026-08-27T02:45:36Z). Lift this entry when the owner
+    # rules differently in writing, and not before.
+    #
+    # THE STALENESS HALF OF THE RULE STILL BINDS, and is honoured by a different mechanism rather
+    # than waived. The trade-off note above applies unchanged (an `ignore` suppresses the SECURITY
+    # track for the named range too), so this entry is only acceptable while something else can see
+    # an advisory in the pinned closure. Until this commit NOTHING could: security.yml's audit step
+    # covered `requirements.lock`, `ci-scanners.lock` and `ci-quality.lock` but NOT
+    # `ci/locks/release-tools.lock`, which a9354808e added to the export and byte-diff set without
+    # adding to the audit set. That gap is closed in the same commit as this entry, so the
+    # annotated-types / ruff bargain — detection untouched, a withheld fix reds a required gate
+    # within ~24h, a human lifts the entry — now holds here too. If that audit line is ever removed,
+    # REMOVE THIS ENTRY WITH IT.
+    #
+    # SCOPED TO `>=4.5.0`, NOT TO THE PACKAGE. sigstore 4.x has shipped zero patch releases (4.0.0,
+    # 4.1.0, 4.2.0, 4.3.0, 4.4.0, 4.5.0; measured against PyPI 2026-09-03), but the 3.x series did
+    # ship them (3.5.1, 3.6.7), so a 4.4.1 is possible. This range leaves the 4.4.x patch track open
+    # and blocks only the minor bump the ruling declined.
     ignore:
       - dependency-name: "annotated-types"
         versions: [">=0.8.0"]
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
+      - dependency-name: "sigstore"
+        versions: [">=4.5.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates).
       python-deps:

@@ -40,6 +40,7 @@ import json
 import logging
 import re
 import ssl
+import time
 from collections.abc import Awaitable, Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Source
@@ -56,7 +57,9 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_RECEIVE_TIMEOUT,
+    _MessagePacer,
     _mllp_ssl_context,
+    _pacing_settings,
     _peer_host,
     _set_tcp_nodelay,
 )
@@ -191,6 +194,28 @@ def _validated_header(name: str, value: str) -> str:
     return f"{name}: {value}"
 
 
+#: The browser-safety baseline every response from this listener carries (ASVS 3.4.4 / 3.4.6).
+#:
+#: **This is a deliberate SECOND copy of ``api/header_floor.BASELINE_SECURITY_HEADERS`` and the
+#: ``frame-ancestors`` policy beside it, and the duplication is forced by the dependency rule this
+#: module's own docstring states: ``transports/`` must not import ``api/``** (and ``header_floor``
+#: imports Starlette, which has no business in a connector). A copy that can drift silently is the
+#: failure ``header_floor`` exists to end, so it does not drift silently here either:
+#: ``tests/test_inbound_http_source.py`` imports both and asserts they are equal, which is the single
+#: place a divergence reds. Do not "fix" this by importing across the boundary.
+#:
+#: ``Strict-Transport-Security`` is deliberately ABSENT. It would have to be gated on THIS
+#: connection's own TLS context (``Http(tls_certfile=...)``) rather than on the API's, and on the same
+#: RFC 6797 notability tests the API applies -- that is a separate piece of work, named rather than
+#: half-built, because a wrongly-gated HSTS is worse than none.
+_BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy", "frame-ancestors 'none'"),
+)
+
+
 def build_response(
     status: int,
     body: str = "",
@@ -204,6 +229,14 @@ def build_response(
 
     ``extra_headers`` carries the auth challenges intake authentication owes a peer —
     ``WWW-Authenticate`` on a ``401``, ``Retry-After`` on a ``429``.
+
+    **Every response also carries :data:`_BASELINE_RESPONSE_HEADERS`** (ASVS 3.4.4 / 3.4.6). This
+    function is the chokepoint all twelve call sites feed, so the baseline is a property of the
+    serializer rather than a list of remembered call sites. It matters most on the ADR 0154 sync-reply
+    path below, which echoes a DOWNSTREAM PARTNER'S ``Content-Type`` verbatim beside partner-supplied
+    bytes: without ``nosniff`` and a framing decision that response can serve a partner-derived
+    ``text/html`` document over this listener's own TLS. ``extra_headers`` still wins on a name
+    collision.
 
     **Every header name and value, including ``content_type``, is validated here rather than at the
     call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
@@ -221,6 +254,15 @@ def build_response(
     if status != 204:
         headers.append(_validated_header("Content-Type", content_type))
         headers.append(f"Content-Length: {len(payload)}")
+    supplied = {name.casefold() for name in (extra_headers or {})}
+    # setdefault semantics, not an unconditional write: a caller that has made its own decision about
+    # one of these names keeps it, and no name is ever emitted twice. Placed BEFORE extra_headers so
+    # the reading order matches the precedence.
+    headers.extend(
+        _validated_header(name, value)
+        for name, value in _BASELINE_RESPONSE_HEADERS
+        if name.casefold() not in supplied
+    )
     headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
     headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload
@@ -410,6 +452,20 @@ class HttpSource(SourceConnector):
         self.max_body_bytes: int | None = int(mb) if mb else None
         mh = s.get("max_header_bytes", DEFAULT_MAX_HEADER_BYTES)
         self.max_header_bytes: int = int(mh) if mh else DEFAULT_MAX_HEADER_BYTES
+        # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
+        # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
+        # port changed REACHABILITY, never the default -- a stock HTTP inbound still has no bound.
+        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        #: ONE bucket for the whole listener, not one per connection. This connector answers exactly
+        #: one request per connection (build_response hardcodes Connection: close), so a
+        #: per-connection bucket would be charged once and thrown away — a rate knob that paced
+        #: nothing. The listener scope is what makes the control real here, and it is also a TIGHTER
+        #: bound than MLLP's: N concurrent MLLP peers may sustain N times the rate between them,
+        #: N concurrent HTTP partners share one budget. Driven with deficit()/charge() rather than
+        #: pace()/settle() for the same reason — there is no next read on this connection to settle
+        #: against. Distinct from the injected `intake_rate_limiter`, which REFUSES failed auth
+        #: attempts with a 429; this one only ever waits.
+        self._pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
         # Per-connection peer-IP allowlist (Tier 4): refuse a non-listed peer at accept (fail-closed).
         # Absent/empty = no restriction. Mirrors MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -765,6 +821,15 @@ class HttpSource(SourceConnector):
             head.body = await _read_body(reader, head, max_body_bytes=self.max_body_bytes)
             return head
 
+        # ASVS 2.4.1 / 15.2.2. The wait happens BEFORE any request byte is read, so the excess is
+        # never parsed and never becomes a received message the count-and-log invariant would then
+        # oblige us to account for. Nothing is dropped, refused or answered differently — the partner
+        # is back-pressured by TCP while we decline to consume, and its request is served in full
+        # once the debt clears. It sits OUTSIDE the receive_timeout budget below on purpose: a paced
+        # partner must not be handed a 408 for a delay the engine itself imposed.
+        if self._pacer is not None and (wait := self._pacer.deficit(now=time.monotonic())) > 0.0:
+            await asyncio.sleep(wait)
+
         try:
             # The whole head -> auth -> body sequence stays inside ONE receive_timeout budget; the
             # refusal RESPONSE is written below, outside it, so a 401 write cannot be cut off by the
@@ -808,6 +873,12 @@ class HttpSource(SourceConnector):
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
         # persisted before the response is written.
         message_id = await self._handler(request.body)
+        # Charge one token AFTER the body is committed, so the debt is settled by the NEXT request's
+        # pre-read wait and never by withholding this partner's receipt. A GET/HEAD health probe and
+        # a refused request charge nothing — they return above — which keeps a peer that sends no
+        # message from spending the budget of one that does.
+        if self._pacer is not None:
+            self._pacer.charge(1, now=time.monotonic())
 
         if self.reply_from and self.sync_reply is not None:
             return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)

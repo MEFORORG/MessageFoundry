@@ -38,11 +38,27 @@ The tests in the second half of this module are modelled on
 ``test_gate_installed_parity.py::test_the_installed_gate_matches_the_committed_source`` and use the same
 comparison basis; ``-Status`` now reports the same parity from the PowerShell side.
 
-LOCAL-MACHINE TESTS. CI has no user settings, so these skip there, and that is honest: an unresolvable
-shim is a developer-box condition, not a repository one. **What CI therefore does not guard is exactly
-this property.** Following ``test_gate_installed_parity.py`` verbatim, every test PRINTS what it scanned
-BEFORE it can skip -- the repo's pytest config carries no ``-rs``, so a skip would otherwise render as a
-bare dot with its reason invisible.
+THIRD MECHANISM, SAME FILE, added for BACKLOG #1376: the OTHER governed roots. Everything above roots
+its git-hook half at THIS repository, so it answers the question for one checkout and says nothing about
+any other. The worktree gate's machine allowlist
+(``~/.claude/hooks/worktree-gate.repos.txt``) names more than one primary checkout, and a second
+checkout that also ships ``scripts/coord/install-git-hooks.ps1`` installs its own payloads into its own
+common git dir, where the same silent-staleness applies and no instrument was watching at all. Measured
+2026-09-03 on the reference box: the allowlist named two roots, and the second one carried an installed
+``claim_check.py`` that nothing in either checkout compared against anything.
+
+**THE COMPARISON IS PER-ROOT AND SELF-REFERENTIAL, DELIBERATELY.** Each root's installed payload is
+judged against THAT ROOT's own committed ``scripts/hooks/`` source, using THAT ROOT's own installer to
+say which payloads it manages. No copy is ever compared across roots. Which checkout's copy of a shared
+script is authoritative when two of them disagree is an open owner ruling (BACKLOG #1376), and a test
+that compared one root's installed file against another root's source would decide it silently. This one
+cannot: it only asserts that whatever a root committed is what that root runs.
+
+LOCAL-MACHINE TESTS. CI has no user settings and no allowlist, so these skip there, and that is honest:
+an unresolvable shim is a developer-box condition, not a repository one. **What CI therefore does not
+guard is exactly this property.** Following ``test_gate_installed_parity.py`` verbatim, every test PRINTS
+what it scanned BEFORE it can skip -- the repo's pytest config carries no ``-rs``, so a skip would
+otherwise render as a bare dot with its reason invisible.
 """
 
 from __future__ import annotations
@@ -202,6 +218,7 @@ def test_report_any_foreign_hook_entry_that_resolves_nothing_here() -> None:
 HOOK_INSTALLER = ROOT / "scripts" / "coord" / "install-git-hooks.ps1"
 HOOK_SOURCE_DIR = ROOT / "scripts" / "hooks"
 
+
 # Parsed out of the installer for the same reason MARKERS is: a test carrying its own list of payloads
 # cannot notice one being ADDED to the installer, and an unaudited payload is exactly the state this
 # section exists to end.
@@ -211,10 +228,29 @@ HOOK_SOURCE_DIR = ROOT / "scripts" / "hooks"
 # would otherwise satisfy it. That is the same defect this session fixed in
 # test_gate_installed_parity.py's handled_tools, where a comment written in rule syntax was being
 # credited as the rule; a raw text scan does not know what is code.
-_PAYLOAD_DECL = re.search(
-    r"(?m)^\s*\$payloads\s*=\s*@\(([^)]*)\)", HOOK_INSTALLER.read_text(encoding="utf-8")
-)
-PAYLOADS: list[str] = re.findall(r'"([^"]+)"', _PAYLOAD_DECL.group(1)) if _PAYLOAD_DECL else []
+def payloads_declared_by(root: Path) -> list[str]:
+    """The payload names ``root``'s OWN ``install-git-hooks.ps1`` says it manages, or [] if it has none.
+
+    Parameterised by root so a second governed checkout is audited against its own installer rather than
+    this one's. Two checkouts may legitimately manage different payload sets, and reading this list off
+    the wrong installer would report a phantom missing payload in one direction and skip a real one in
+    the other.
+
+    Recognises ONE declaration shape and deliberately guesses at no other. An installer written
+    differently returns [], which ``audit_governed_root`` reports as UNAUDITABLE rather than as clean --
+    the honest answer. Widening this to infer payloads from, say, a ``Copy-Item`` scan would produce a
+    confident payload list for a file nobody has read, and a wrong list reports parity over the wrong
+    files, which is worse than reporting nothing.
+    """
+    try:
+        src = (root / "scripts" / "coord" / "install-git-hooks.ps1").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    decl = re.search(r"(?m)^\s*\$payloads\s*=\s*@\(([^)]*)\)", src)
+    return re.findall(r'"([^"]+)"', decl.group(1)) if decl else []
+
+
+PAYLOADS: list[str] = payloads_declared_by(ROOT)
 
 
 def content_hash(data: bytes) -> str:
@@ -237,49 +273,53 @@ def content_hash(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
-def _git(*args: str) -> str:
-    """stdout of a git command run at ROOT, or "" if git failed or is unusable.
+def _git_at(root: Path, *args: str) -> str:
+    """stdout of a git command run at ``root``, or "" if git failed or is unusable.
 
     Never raises: "git could not tell us where the hooks are" is a skip reason these tests must be able
     to PRINT, not an error that kills the module before it says what it scanned.
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(ROOT), *args], capture_output=True, text=True, timeout=30
+            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30
         )
     except (OSError, subprocess.SubprocessError):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
-def installed_hooks_dir() -> Path | None:
-    """Where git looks for hooks, resolved exactly as ``install-git-hooks.ps1`` resolves it.
+def hooks_dir_for(root: Path) -> Path | None:
+    """Where git looks for ``root``'s hooks, resolved exactly as ``install-git-hooks.ps1`` resolves it.
 
-    ``core.hooksPath`` wins when set (it is set on this box), otherwise ``<git-common-dir>/hooks``.
-    Deriving it any other way would compare a directory git never consults and report parity for a copy
-    that is not the one running -- and the obvious shortcut is worse than wrong, it is empty: in a linked
-    worktree ``ROOT/.git`` is a FILE pointing at the common dir, so ``ROOT/.git/hooks`` never exists and
-    every payload would read as "not installed".
+    ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. Deriving it any other way
+    would compare a directory git never consults and report parity for a copy that is not the one
+    running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
+    ``root/.git`` is a FILE pointing at the common dir, so ``root/.git/hooks`` never exists and every
+    payload would read as "not installed".
     """
-    configured = _git("config", "--get", "core.hooksPath")
+    configured = _git_at(root, "config", "--get", "core.hooksPath")
     if configured:
         p = Path(configured)
-        return p if p.is_absolute() else ROOT / configured
-    common = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        return p if p.is_absolute() else root / configured
+    common = _git_at(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(common) / "hooks" if common else None
 
 
-def payload_source_is_committed(name: str) -> bool:
+def installed_hooks_dir() -> Path | None:
+    """``hooks_dir_for`` bound to this checkout."""
+    return hooks_dir_for(ROOT)
+
+
+def source_is_committed_in(root: Path, name: str) -> bool:
     """Same posture as the gate parity test: assert only against a COMMITTED source.
 
     Mid-edit the installed copy is *supposed* to differ, and a check that goes red on every keystroke is
     one that gets deselected and then deleted.
     """
-    rel = (HOOK_SOURCE_DIR / name).relative_to(ROOT).as_posix()
     try:
         out = subprocess.run(
-            ["git", "status", "--porcelain", "--", rel],
-            cwd=ROOT,
+            ["git", "status", "--porcelain", "--", f"scripts/hooks/{name}"],
+            cwd=root,
             capture_output=True,
             text=True,
             timeout=30,
@@ -287,6 +327,11 @@ def payload_source_is_committed(name: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return out.returncode == 0 and not out.stdout.strip()
+
+
+def payload_source_is_committed(name: str) -> bool:
+    """``source_is_committed_in`` bound to this checkout."""
+    return source_is_committed_in(ROOT, name)
 
 
 def test_the_payload_list_was_parsed_from_the_installer() -> None:
@@ -826,4 +871,308 @@ def test_the_installed_shim_matches_the_installer_here_string(var: str) -> None:
         f"    git log --oneline -5 -- scripts/coord/install-git-hooks.ps1\n"
         f"Only once THIS checkout is confirmed the newer of the two, from a plain terminal:\n"
         f"    pwsh -NoProfile -File scripts\\coord\\install-git-hooks.ps1"
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# The OTHER governed roots -- the third mechanism described in the module docstring (BACKLOG #1376).
+# Everything above roots its git-hook half at THIS repository. A second primary checkout on the same
+# box that also ships install-git-hooks.ps1 installs its own payloads into its own common git dir, and
+# nothing anywhere compared them. Read the comparison rule in the docstring before editing anything
+# here: every check below is PER-ROOT and SELF-REFERENTIAL, and it must stay that way while which
+# checkout's copy of a shared script is authoritative remains an open owner ruling.
+
+# The worktree gate's machine allowlist, resolved the way scripts/hooks/worktree_gate.ps1's $ReposFile
+# default resolves it: USERPROFILE first, the user-profile folder otherwise. Not a repository file --
+# it names checkouts, so it cannot live in one of them, and that is why CI has none and these skip
+# there. tests/test_worktree_gate_default_reposfile.py pins the gate's half of this path.
+GATE_REPOS_FILE = (
+    Path(os.environ.get("USERPROFILE") or Path.home())
+    / ".claude"
+    / "hooks"
+    / "worktree-gate.repos.txt"
+)
+
+
+def read_governed_roots(repos_file: Path) -> list[Path]:
+    """The primary checkouts named by the allowlist: one path per line, ``#`` comments and blanks out.
+
+    Returns [] for an absent or unreadable file rather than raising. An absent allowlist means the gate
+    is off everywhere -- the documented kill switch -- so there is no governed set to audit, and that is
+    a skip these tests must be able to print.
+    """
+    try:
+        text = repos_file.read_text(encoding="utf-8-sig")
+    except OSError:
+        return []
+    return [
+        Path(s) for s in (line.strip() for line in text.splitlines()) if s and not s.startswith("#")
+    ]
+
+
+def _key(path: Path) -> str:
+    """A comparable spelling of a path, for asking whether two roots share one hooks directory."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def audit_governed_root(root: Path, hooks_dir: Path | None) -> tuple[list[str], list[str]]:
+    """Does ``root`` run the hook payloads ``root`` itself committed? Returns (findings, notes).
+
+    Findings are the assertion; notes are printed either way so a run that compared nothing says so
+    rather than looking like a run that compared everything and agreed. A root is only ever measured
+    against its own installer and its own source -- see the module docstring.
+
+    ``hooks_dir`` is passed in rather than resolved here because the caller has already resolved it to
+    decide whether this root is the one the tests above already cover. Resolving it twice would be two
+    git reads that could, in principle, disagree -- and then the directory reported would not be the
+    directory compared.
+
+    Four conditions are deliberately NOT findings, because each is a normal state rather than drift:
+    a root that ships no install-git-hooks.ps1 is not running this machinery at all; git declining to
+    name a hooks directory is a broken-git condition the caller cannot act on; a payload with no
+    installed copy just means nobody has run that root's installer on this box, which is a human step
+    CI never performs; and an uncommitted source is SUPPOSED to differ mid-edit.
+    """
+    findings: list[str] = []
+    notes: list[str] = []
+
+    installer = root / "scripts" / "coord" / "install-git-hooks.ps1"
+    if not installer.is_file():
+        notes.append(f"  {root}: no scripts/coord/install-git-hooks.ps1 -- not governed by this")
+        return findings, notes
+
+    payloads = payloads_declared_by(root)
+    if not payloads:
+        findings.append(
+            f"{root}: UNAUDITABLE. Its install-git-hooks.ps1 is present but declares no $payloads list "
+            f"this parser can read, so NOTHING about what that root runs was compared -- and an empty "
+            f"payload list reads exactly like agreement, which is the state BACKLOG #1376 filed. "
+            f"REMEDY: either that root's installer gains the $payloads declaration this one has, or "
+            f"payloads_declared_by learns that installer's shape. WHICH OF THE TWO is the open ruling "
+            f"in #1376; do not guess a payload list for a shape nobody has read, because a wrong guess "
+            f"reports confident parity over the wrong files"
+        )
+        return findings, notes
+
+    if hooks_dir is None:
+        notes.append(f"  {root}: git named no hooks directory -- nothing compared")
+        return findings, notes
+
+    notes.append(f"  {root}: payloads={payloads} hooks_dir={hooks_dir}")
+    for name in payloads:
+        source = root / "scripts" / "hooks" / name
+        installed = hooks_dir / name
+        if not source.is_file():
+            findings.append(
+                f"{root}: its installer lists {name}, which has no source at scripts/hooks/{name} -- "
+                f"installing there would fail, and until then that hook runs from whatever copy is "
+                f"already in place. REMEDY: reconcile that root's installer with that root's sources"
+            )
+            continue
+        if not installed.is_file():
+            notes.append(f"    {name}: not installed at {installed} -- nothing compared")
+            continue
+        if not source_is_committed_in(root, name):
+            notes.append(f"    {name}: source is uncommitted there -- nothing compared")
+            continue
+        installed_hash = content_hash(installed.read_bytes())
+        source_hash = content_hash(source.read_bytes())
+        notes.append(
+            f"    {name}: installed={installed_hash[:12]} source={source_hash[:12]} "
+            f"{'match' if installed_hash == source_hash else 'DIFFER'}"
+        )
+        if installed_hash != source_hash:
+            findings.append(
+                f"{root}: CONTENT DRIFT. The {name} that RUNS there is not the one that checkout "
+                f"committed (installed={installed_hash[:12]} at {installed}, "
+                f"source={source_hash[:12]}). Line endings are folded out of this comparison, so they "
+                f"differ in content. REMEDY: work out which copy is older FIRST -- "
+                f"`git -C {root} log --oneline -5 -- scripts/hooks/{name}` -- then, only if that "
+                f"checkout is the newer of the two, run its own installer from a plain terminal IN "
+                f"THAT ROOT. Re-installing from the older side downgrades the hook for every worktree "
+                f"of that repository"
+            )
+    return findings, notes
+
+
+def test_every_governed_root_runs_the_hook_payloads_its_own_checkout_committed() -> None:
+    """BACKLOG #1376. A second governed checkout's per-repo hooks were covered by nothing at all.
+
+    ``test_the_installed_coord_hook_matches_the_committed_source`` above roots at THIS repository, so it
+    would go red for this checkout's hooks and stay green while another governed root ran a payload
+    months out of date. ``test_gate_installed_parity.py`` does not cover the difference either: the
+    worktree gate installs ONE shared copy under ``~/.claude/hooks`` for the whole box, while these
+    payloads are installed per repository into each root's own common git dir.
+
+    Reports, and never decides, which copy is right. Each root is measured against its own committed
+    source only.
+    """
+    roots = read_governed_roots(GATE_REPOS_FILE)
+    print(f"allowlist: {GATE_REPOS_FILE}")
+    print(f"governed roots: {[str(r) for r in roots] or 'NONE'}")
+    if not roots:
+        pytest.skip(
+            "SKIP (nothing compared): no worktree-gate allowlist on this box, so no governed set "
+            "(printed above). CI has none by construction"
+        )
+
+    # Do not report this checkout's own hooks directory twice: the parametrized test above already
+    # asserts on it, against THIS worktree's source rather than the primary's, and two verdicts on one
+    # directory from two different sources is the ambiguity the module exists to remove.
+    already = hooks_dir_for(ROOT)
+    already_key = _key(already) if already else None
+
+    findings: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            print(f"  {root}: allowlisted but not present on this box -- nothing compared")
+            continue
+        hooks_dir = hooks_dir_for(root)
+        if hooks_dir is not None and already_key is not None and _key(hooks_dir) == already_key:
+            print(f"  {root}: shares this checkout's hooks dir -- covered by the test above")
+            continue
+        root_findings, notes = audit_governed_root(root, hooks_dir)
+        for line in notes:
+            print(line)
+        findings.extend(root_findings)
+
+    assert not findings, (
+        "A CHECKOUT ON THE WORKTREE GATE'S ALLOWLIST IS NOT KNOWN TO RUN WHAT IT COMMITTED. Each "
+        "finding carries its own remedy; read the one that fired, they are not the same repair:\n\n"
+        + "\n\n".join(f"  * {f}" for f in findings)
+        + "\n\nEvery root above was measured ONLY against its own installer and its own committed "
+        "scripts/hooks/ source. Nothing here compares one checkout's copy against another's, so no "
+        "finding above says which checkout's copy of a shared script is authoritative -- that is the "
+        "open owner ruling in BACKLOG #1376, and this test deliberately does not answer it.\n"
+        "This is a developer-box condition, not a repository one: it is fixed by an operator action in "
+        "the root that is named, not by an edit here. Do not delete or deselect this test to get a "
+        "green -- that restores the exact blindness #1376 was filed for."
+    )
+
+
+def _seed_governed_root(root: Path, payloads: list[str], body: bytes) -> None:
+    """A throwaway checkout shaped like a governed root: an installer, committed sources, a hooks dir."""
+    (root / "scripts" / "coord").mkdir(parents=True)
+    (root / "scripts" / "hooks").mkdir(parents=True)
+    decl = ", ".join(f'"{p}"' for p in payloads)
+    (root / "scripts" / "coord" / "install-git-hooks.ps1").write_text(
+        f"# fixture installer\n$payloads = @({decl})\n", encoding="utf-8"
+    )
+    for name in payloads:
+        (root / "scripts" / "hooks" / name).write_bytes(body)
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "t@example.invalid"),
+        ("config", "user.name", "T"),
+        ("add", "--", "scripts"),
+        ("commit", "-q", "-m", "seed"),
+    ):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
+
+
+def test_the_governed_root_audit_detects_a_root_running_something_it_did_not_commit(
+    tmp_path: Path,
+) -> None:
+    """ANTI-VACUITY CONTROL, with the untouched baseline beside it.
+
+    A per-root audit that reported nothing no matter what it was pointed at would pass on this box
+    forever and read as coverage -- which is the exact state BACKLOG #1376 filed. So drive the audit
+    against a constructed root in BOTH conditions: one whose installed payload matches its committed
+    source, and one whose does not. Only the pair proves the predicate can tell them apart; the drifted
+    case alone cannot rule out an audit that finds a problem everywhere.
+
+    Built in tmp_path and never against a real root. The installed payloads on this box fire on every
+    commit and push in every worktree of their repository, and the machine allowlist is the worktree
+    gate's kill switch -- a test may not take either out from under a concurrent session.
+    """
+    committed = b"#!/usr/bin/env python3\nprint('the committed payload')\n"
+
+    clean = tmp_path / "Clean"
+    clean.mkdir()
+    _seed_governed_root(clean, ["claim_check.py"], committed)
+    clean_hooks = hooks_dir_for(clean)
+    assert clean_hooks is not None, "the fixture root resolved no hooks dir -- control is vacuous"
+    (clean_hooks / "claim_check.py").write_bytes(committed.replace(b"\n", b"\r\n"))
+
+    drifted = tmp_path / "Drifted"
+    drifted.mkdir()
+    _seed_governed_root(drifted, ["claim_check.py"], committed)
+    drifted_hooks = hooks_dir_for(drifted)
+    assert drifted_hooks is not None, "the fixture root resolved no hooks dir -- control is vacuous"
+    (drifted_hooks / "claim_check.py").write_bytes(committed + b"print('installed months ago')\n")
+
+    clean_findings, clean_notes = audit_governed_root(clean, clean_hooks)
+    drift_findings, drift_notes = audit_governed_root(drifted, drifted_hooks)
+    for line in (*clean_notes, *drift_notes):
+        print(line)
+
+    # The baseline first. Without it a finding on the drifted root proves only that the audit reports
+    # something, not that it reports drift -- and the CRLF copy also pins that the eol fold still holds
+    # here, so a re-encoding cannot masquerade as content drift one root over.
+    assert not clean_findings, (
+        f"the audit reported drift for a root whose installed payload matches its committed source, "
+        f"differing only in line endings: {clean_findings}"
+    )
+    assert drift_findings, (
+        "the audit found nothing for a root whose installed payload differs in content from the source "
+        "that root committed -- it cannot detect the condition it exists to detect"
+    )
+    assert str(drifted) in drift_findings[0] and "claim_check.py" in drift_findings[0], (
+        f"the finding names neither the root nor the payload, so a reader cannot act on it: "
+        f"{drift_findings[0]}"
+    )
+
+
+def test_the_governed_root_audit_reports_an_installer_whose_payload_list_it_cannot_read(
+    tmp_path: Path,
+) -> None:
+    """The other way this audit goes silently vacuous: an installer it cannot parse.
+
+    An unparseable ``$payloads`` yields an empty list, every payload loop body is skipped, and the root
+    reports clean -- indistinguishable from a root with nothing wrong. That is the same defect
+    ``test_the_payload_list_was_parsed_from_the_installer`` guards one level up, and it arrives here for
+    free the moment a second checkout's installer is written a little differently.
+    """
+    root = tmp_path / "Unparseable"
+    root.mkdir()
+    _seed_governed_root(root, ["claim_check.py"], b"x\n")
+    (root / "scripts" / "coord" / "install-git-hooks.ps1").write_text(
+        "# an installer this parser cannot read\n$hookPayloads = @('claim_check.py')\n",
+        encoding="utf-8",
+    )
+
+    findings, notes = audit_governed_root(root, hooks_dir_for(root))
+    for line in notes:
+        print(line)
+    assert findings and "UNAUDITABLE" in findings[0], (
+        f"a governed root whose installer cannot be parsed reported clean: {findings}"
+    )
+    assert "$payloads" in findings[0], (
+        f"the finding does not name what could not be read, so a reader cannot act on it: {findings[0]}"
+    )
+
+
+def test_the_allowlist_reader_skips_comments_and_blanks_and_keeps_paths(tmp_path: Path) -> None:
+    """The allowlist's real shape carries a comment header, and a reader that kept it would audit a
+    root named ``# Primary checkouts governed by...`` -- which is not a directory, so the report would
+    carry a line nobody can act on.
+
+    The kept lines are compared WHOLE, never by ``Path.name``. This allowlist is a Windows file -- it
+    resolves under ``USERPROFILE`` and its lines are drive-letter paths -- but the reader is ordinary
+    ``pathlib``, and a backslash is not a separator on POSIX. Measured on both: the two lines below
+    parse as two paths either way, and the leaf of the first is ``Alpha`` on Windows and the ENTIRE
+    line on Linux, so a ``.name`` assertion means two different things for one input and reds the
+    Linux leg. The whole spelling pins more of each line than the leaf did and reads the same on both.
+    """
+    kept = ["C:\\Users\\X\\Code\\Alpha", "C:\\Users\\X\\Code\\Beta"]
+    f = tmp_path / "repos.txt"
+    f.write_text(f"# a comment header\n\n{kept[0]}\n   \n{kept[1]}\n", encoding="utf-8")
+    roots = read_governed_roots(f)
+    print(f"parsed: {[str(r) for r in roots]}")
+    assert [str(r) for r in roots] == kept, (
+        "the reader must drop the comment header and both blank-ish lines and keep every remaining "
+        "line exactly as written"
+    )
+    assert read_governed_roots(tmp_path / "absent.txt") == [], (
+        "an absent allowlist is the documented kill switch and must read as an empty governed set"
     )

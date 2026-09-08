@@ -47,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
@@ -56,6 +57,11 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     register_destination,
+)
+from messagefoundry.transports.bounded_read import (
+    ResponseTooLargeError,
+    read_bounded,
+    read_bounded_text,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
@@ -76,6 +82,7 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -91,6 +98,49 @@ logger = logging.getLogger(__name__)
 
 _INTERACTIONS = ("create", "update", "transaction", "batch")
 _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
+
+#: The SMART v2 permission letters each declared shape can actually spend, keyed the way
+#: :meth:`FhirDestination._resolve_request` dispatches — ``conditional`` FIRST, then ``interaction``.
+#: That order is the whole point: ``conditional-update`` and ``if-match`` both return PUT even when
+#: ``interaction`` is the default ``"create"``, so keying on ``interaction`` alone would compute ``c``
+#: for a connection that only ever issues PUT. Kept HERE, beside the dispatch it mirrors, so a change
+#: to the method table is visibly a change to the letter table (#1159).
+_CONDITIONAL_SCOPE_LETTERS = {
+    # search-based PUT: the server searches on the client's behalf, then updates
+    "conditional-update": frozenset("us"),
+    # POST with If-None-Exist: the server searches on the client's behalf, then creates
+    "if-none-exist": frozenset("cs"),
+    # version-aware PUT: the ETag comes from the outgoing body's meta.versionId, so no search
+    "if-match": frozenset("u"),
+}
+_INTERACTION_SCOPE_LETTERS = {"create": frozenset("c"), "update": frozenset("u")}
+
+
+def scope_letters_for_shape(interaction: str, conditional: str | None) -> frozenset[str] | None:
+    """The SMART v2 permission letters an outbound FHIR connection's DECLARED shape can spend, or
+    ``None`` when the shape does not determine them (#1159, ASVS 10.2.3).
+
+    ``None`` for ``transaction``/``batch`` — the Bundle carries arbitrary methods over arbitrary
+    types, so no letter set is determinate — and for any interaction word this table does not know.
+    Quiet is the safe failure for the advisory that reads this: whoever adds an interaction to
+    :data:`_INTERACTIONS` or a knob to :data:`_CONDITIONALS` must extend these tables, or a new shape
+    silently stops being graded.
+
+    It reads ``conditional`` first because :meth:`FhirDestination._resolve_request` does. Construction
+    refuses ``conditional`` only against ``transaction``/``batch``, so ``interaction="create"`` (the
+    default) with ``conditional="conditional-update"`` is a legal, shipped shape that issues PUT.
+
+    The RESOURCE half of a scope is deliberately absent: ``_resolve_request`` reads the resourceType
+    from the OUTGOING MESSAGE BODY, so it varies per message and is not derivable at config time.
+
+    Pure — two declared values in, a letter set out."""
+    if interaction in ("transaction", "batch"):
+        return None
+    if conditional:
+        return _CONDITIONAL_SCOPE_LETTERS.get(conditional)
+    return _INTERACTION_SCOPE_LETTERS.get(interaction)
+
+
 # FHIR transient IssueType group (children of `transient`): a retry may succeed.
 # https://www.hl7.org/fhir/valueset-issue-type.html
 _TRANSIENT_ISSUE_CODES = frozenset(
@@ -375,13 +425,20 @@ class FhirDestination(DestinationConnector):
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #1180 (ADR 0093): the client trust anchor for this https hop.
+            anchor = http_family_trust_anchor(
+                s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
+            )
             if bool(s.get("tls_allow_expired", False)):
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.base_url).hostname or "", *proxy_handlers
+                    urllib.parse.urlsplit(self.base_url).hostname or "",
+                    *proxy_handlers,
+                    trust_anchor=anchor,
                 )
-            elif proxy_handlers:
+            elif proxy_handlers or anchor.narrows:
                 # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
-                self._opener = _no_redirect_opener(*proxy_handlers)
+                # A narrowed trust anchor needs its own opener for the same reason.
+                self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -573,7 +630,10 @@ class FhirDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
+                # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
+                # largest honest reply here and sits far under the 16 MiB ceiling.
+                read_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -637,7 +697,13 @@ class FhirDestination(DestinationConnector):
                 method=method,
             )
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
+                # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
+                body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(self.base_url)}",
+                    encoding=self.encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(
@@ -646,7 +712,23 @@ class FhirDestination(DestinationConnector):
                 return body, status, headers_out
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read().decode(self.encoding, errors="replace")
+                # ASVS 15.2.2: the error body is bounded too. It is only ever read to CLASSIFY the
+                # non-2xx, so an over-cap one is logged and dropped rather than raised: the delivery
+                # already fails below on the status, and raising here would swap a classified
+                # failure for an unclassified one.
+                body = read_bounded_text(
+                    exc,
+                    connector=f"FHIR {_redact_url(self.base_url)} error body",
+                    encoding=self.encoding,
+                )
+            except ResponseTooLargeError:
+                logger.warning(
+                    "FHIR %s returned an HTTP %s error body over the response bound; "
+                    "classifying on the status alone",
+                    _redact_url(self.base_url),
+                    exc.code,
+                )
+                body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             if self._token_provider is not None and exc.code == 401:
@@ -697,12 +779,30 @@ register_destination(ConnectorType.FHIR, FhirDestination)
 
 
 def _encode_search_params(params: Mapping[str, str | list[str]]) -> str:
-    """Percent-encode a structured search into a URL query string, so a **value** can never inject an
-    extra FHIR search parameter (CWE-88 argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote,
-    safe="")`` encodes **every** reserved char in each key/value — an ``&``/``=``/``|``/``#`` in a value
-    becomes ``%26``/``%3D``/``%7C``/``%23`` and stays a literal, never a separator. ``doseq=True`` expands
-    a ``list[str]`` value into repeated params (``identifier=a&identifier=b``); a ``str`` value stays a
-    single param. Returns ``""`` for empty ``params`` (a search of the whole resource type)."""
+    """Percent-encode a structured search into a URL query string.
+
+    **What this guarantees.** A **value** can never inject an extra FHIR search *parameter* (CWE-88
+    argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote, safe="")`` encodes **every** reserved
+    char in each key/value, so an ``&``/``=``/``#`` in a value becomes ``%26``/``%3D``/``%23`` and the
+    server parses back exactly the parameters this function was handed — one value stays one value.
+    ``doseq=True`` expands a ``list[str]`` value into repeated params (``identifier=a&identifier=b``); a
+    ``str`` value stays a single param. Returns ``""`` for empty ``params`` (a search of the whole
+    resource type).
+
+    **What this does NOT do: it does not neutralise FHIR's own value-layer separators ``,`` ``|``
+    ``$``.** Percent-encoding protects the **URL** layer only. A server percent-decodes first and
+    *then* reads FHIR's syntax inside the decoded value, so the decode re-forms a ``,`` (OR within one
+    parameter), a ``|`` (a ``system|code`` token) or a ``$`` (an operation sigil) with its separator
+    meaning intact: ``{"code": "sys|val"}`` goes on the wire as ``code=sys%7Cval`` and arrives at the
+    FHIR value layer as ``sys|val``. A message-derived value carrying one therefore still changes what
+    the search *means*, one layer above the URL. Treat any value that may carry message data as
+    untrusted at that layer and screen it in the Handler.
+
+    Closing that gap is **BACKLOG #1243 (Limb B)**, which is **blocked by an owner ruling pending a
+    real FHIR server** rather than merely unfinished: the escape cannot be settled against this
+    repository's own suite, which pins the percent-encoded pipe on the wire in five places and so
+    cannot disagree with itself. Write Handlers against the behaviour described here, not against an
+    assumed future fix."""
     return urllib.parse.urlencode(params, doseq=True, quote_via=urllib.parse.quote, safe="")
 
 
@@ -721,9 +821,11 @@ def _resolve_read_url(
 
     **There is exactly one search form, and it is encoded by construction** (ASVS 1.2.2, BACKLOG #1243).
     Every value goes through :func:`_encode_search_params`, so a value can never inject an extra search
-    parameter. A ``?``-query in ``query`` is **refused**: the flat author-encoded form was removed rather
-    than gated behind a setting, because a setting leaves the unencoded sink one config edit away and
-    closes the requirement on a default instead of on the absence of the sink.
+    parameter — **but that is a URL-layer guarantee only, and #1243 is open on the value layer; see
+    that function's docstring before passing message-derived data.** A ``?``-query in ``query`` is
+    **refused**: the flat author-encoded form was removed rather than gated behind a setting, because a
+    setting leaves the unencoded sink one config edit away and closes the requirement on a default
+    instead of on the absence of the sink.
 
     Raises a PHI-safe ``ValueError`` (it names only the offending shape/segment, never the query's
     parameter values)."""
@@ -775,8 +877,17 @@ class FhirLookupExecutor:
     ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
     values, or the SMART token."""
 
-    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        connections: Mapping[str, Mapping[str, Any]],
+        *,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
+    ) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
+        # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
+        # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
+        # all. `None` (a direct test build) = the OS trust store, byte-identical.
         from messagefoundry.transports.smart import token_provider_from_settings
 
         self._base: dict[str, str] = {}
@@ -856,8 +967,16 @@ class FhirLookupExecutor:
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
+                # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
+                # server is the most on-point instance of 12.3.4's condition in the product, and it
+                # could not name an anchor at all.
+                lookup_anchor = http_family_trust_anchor(
+                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                )
                 self._opener[cname] = (
-                    _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+                    _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
+                    if proxy_handlers or lookup_anchor.narrows
+                    else _NO_REDIRECT_OPENER
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
@@ -903,11 +1022,13 @@ class FhirLookupExecutor:
     ) -> dict[str, Any]:
         """Issue a read-only ``GET`` for ``query`` against ``connection`` and return the parsed result.
 
-        When ``params`` is given (the safe structured search form, BACKLOG #204), each value is
-        percent-encoded into the URL query so a value can never inject an extra FHIR search parameter;
-        otherwise the flat ``query`` string is used (author-encoded, defense-in-depth-screened). Runs the
-        blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup`` bridges in from
-        the handler's worker thread via ``run_coroutine_threadsafe``). Raises
+        ``query`` and ``params`` are resolved by :func:`_resolve_read_url`, which refuses a ``?``-query
+        and encodes each value via :func:`_encode_search_params`. **Read that function's docstring
+        before passing message-derived data:** its encoding is a URL-layer control, and it does not
+        neutralise FHIR's own value-layer separators.
+
+        Runs the blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup``
+        bridges in from the handler's worker thread via ``run_coroutine_threadsafe``). Raises
         :class:`~messagefoundry.config.fhir_lookup.FhirLookupError` (PHI/secret-safe) on an unknown
         connection, an invalid query path, a non-2xx, an unparseable body, or a network/timeout error."""
         # Lazy import keeps transports/ from importing config at module load (config imports transports).
@@ -961,9 +1082,21 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                read_body = resp.read().decode(encoding, errors="replace")
+                # ASVS 15.2.2 -- the byte bound on the live lookup (ADR 0043). This is the one egress
+                # read whose size a Handler's own query shapes: a `_count` the Handler chose, or a
+                # partner that ignores paging, would otherwise buffer a whole searchset inside the
+                # transform worker, where it is charged against the engine and not against a message.
+                read_body = read_bounded_text(
+                    resp,
+                    connector=f"FHIR {_redact_url(base)} lookup",
+                    encoding=encoding,
+                )
                 status = int(getattr(resp, "status", 200))
                 return read_body, status
+        except ResponseTooLargeError as exc:
+            # A FhirLookupError, not a delivery error: this read runs inside a Handler, so there is
+            # no message to dead-letter and the Handler sees the failure directly.
+            raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if token is not None and exc.code == 401:
                 token.invalidate()  # the bearer may have expired between mint and use — drop it
@@ -1026,7 +1159,11 @@ class FhirLookupExecutor:
         )
         try:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
-                resp.read()
+                # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
+                # reachability check be turned into a memory exhaustion.
+                read_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+        except ResponseTooLargeError as exc:
+            raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise FhirLookupError(

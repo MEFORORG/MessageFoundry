@@ -381,9 +381,17 @@ class WebhookTransport:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
+        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
+        # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
+        # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
+        # here, and the engine's own message flow is untouched.
+        from messagefoundry.transports.bounded_read import read_bounded
+
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-            resp.read()  # drain so the connection can be reused/closed cleanly
+            # Drain (bounded) so the connection can be reused/closed cleanly.
+            read_bounded(resp, connector=f"alert webhook {host}")
 
 
 def send_plain_email(
@@ -482,14 +490,13 @@ def send_plain_email(
             # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
             # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
             # channel_encrypted is not merely asserted -- it is the same value that gate read.
-            # escape_permitted=False: this cell's cleartext-credential refusal has no escape,
-            # matching the two connectors rather than introducing a third posture.
+            # The helper's own cleartext-AUTH refusal is absolute, matching that gate: this cell
+            # has no escape, and neither do the two connectors.
             smtp_login_approved(
                 smtp,
                 username,
                 password or "",
                 channel_encrypted=use_tls,
-                escape_permitted=False,
                 cell="alerts SMTP transport",
             )
         smtp.send_message(msg)

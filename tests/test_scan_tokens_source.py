@@ -1378,3 +1378,277 @@ def test_allowlist_rejects_an_entry_broad_enough_to_disable_the_estate_shape(
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         assert bool(mod.ALLOWLIST) is keep, entry  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------------------------------
+# PRIVATE ARTIFACT URL (BACKLOG #1454)
+#
+# The gate carried four structural detectors and NO URL detector of any kind, so an artifact link
+# pasted into a doc, an ADR or a handoff would have committed clean. Every other detector here
+# recognises something that IDENTIFIES a party; this one recognises something that GRANTS ACCESS,
+# which is why none of them stands in for it.
+#
+# The arms below are deliberately paired, and the mutation test at the end is what makes the pairing
+# mean something: a suite of must-trip cases alone is satisfied by a pattern matching everything, and
+# a suite of must-not-trip cases alone by a pattern matching nothing.
+# --------------------------------------------------------------------------------------------------
+
+#: A real-SHAPED artifact UUID and the URL halves, assembled from parts for exactly the reason the
+#: slug fixtures above are: THIS FILE IS SCANNED BY THE GATE IT TESTS, so no single SOURCE line here
+#: may be a full match. A whole literal would make the suite trip its own detector, and the remedy
+#: on offer would be an allowlist line -- a per-line veto over every OTHER detector on that line.
+_ART_UUID = "3f2a91c4-" + "b6d8-" + "4e1f-" + "9a07-" + "c5e2d4180b73"
+_ART_HOST = "claude." + "ai/"
+_ART_SEG = "artifact/"
+_ART_FRAME = "frame/"
+_ART_URL = _ART_HOST + "code/" + _ART_SEG + _ART_UUID
+#: The direct content host, where the UUID is a SUBDOMAIN and the string `claude.ai` is absent.
+_ART_CDN = _ART_UUID + ".frame." + "claudeusercontent" + ".com"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        (f"banked at https://{_ART_URL}", "the canonical form, with a scheme"),
+        (f"see {_ART_HOST}{_ART_SEG}{_ART_UUID} for the board", "no code/ segment"),
+        (f"[the board](https://{_ART_URL})", "wrapped in a markdown link"),
+        (f"handed over {_ART_HOST}code/{_ART_SEG}{_ART_UUID.upper()}", "upper-cased UUID"),
+        (f"<https://{_ART_URL}>", "angle-bracketed, as a bare autolink"),
+        (f"the write-up is at {_ART_URL}.", "a sentence-final period butted against it"),
+        # THE FOUR FORMS THE FIRST SHIPPED PATTERN MISSED, each read off the vendor's own grammar
+        # in the installed client rather than guessed. The vanity one is the form that matters
+        # most: it is what a person's address bar produces, and pasting is the arrival path this
+        # detector exists for.
+        (
+            f"banked at https://{_ART_HOST}code/{_ART_SEG}q4-migration-plan-{_ART_UUID}",
+            "a human-readable vanity segment before the UUID",
+        ),
+        (
+            f"see https://{_ART_HOST}code/{_ART_FRAME}{_ART_UUID}",
+            "the frame path, a sibling of artifact in the grammar",
+        ),
+        (
+            f"see https://{_ART_HOST}code/{_ART_FRAME}my-board-{_ART_UUID}",
+            "frame and vanity together",
+        ),
+        (f"served from https://{_ART_CDN}/", "the content host, where claude.ai never appears"),
+        (
+            f"served from https://{_ART_UUID}.frame.staging.claudeusercontent.com/",
+            "the staging content host",
+        ),
+        (f"asset at https://{_ART_URL}/index.html", "an asset sub-path below the UUID"),
+    ],
+)
+def test_a_private_artifact_url_is_flagged_without_any_token_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str, why: str
+) -> None:
+    """The MUST-TRIP arm, and it must hold with the token tables empty.
+
+    The URL is a CAPABILITY, not a name: whoever holds it can fetch the content. So it is a
+    disclosure by shape, like the slug and the home path, and a fork with no token source has
+    exactly as much need of it as CI does.
+    """
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    f = tmp_path / "handoff.md"
+    f.write_text(body + "\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/handoff.md")  # type: ignore[attr-defined]
+    assert any("private artifact URL" in h for h in hits), why
+
+
+#: THE NEGATIVE CORPUS, named rather than inlined so the mutation test below can COUNT it. A
+#: disjointness assertion is a BOOLEAN over two sets whose SIZE is the thing actually at risk:
+#: {3} against {1} and {3} against {4} are both "disjoint", and only the second survives an
+#: unrelated edit to this list. The count is the margin, and the boolean hides it.
+_ART_NEGATIVE: tuple[tuple[str, str], ...] = (
+    # THE DOCUMENTATION PLACEHOLDER. This is the case the UUID requirement exists for: the
+    # detector's own comment block, this repo's backlog row and any future ADR all have to print
+    # the shape they are describing. A detector that refuses its own manual earns an allowlist
+    # line, and that line vetoes every other detector on it.
+    (f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff", "the doc placeholder"),
+    # The same placeholder on the frame path. Widening to cover `frame` must not cost the
+    # self-documentation property that the UUID requirement buys.
+    (f"or a {_ART_HOST}code/{_ART_FRAME}<uuid> link", "the doc placeholder, frame path"),
+    # The needle line the detector's own comment block prints. A detector that reds the file
+    # explaining it is the exact pressure that earns an allowlist entry.
+    (r"needle='claude\.ai/(code/)?artifact/<uuid-shape>'", "the comment's own needle line"),
+    # A DELIBERATELY PUBLISHED artifact. The path segment is plural, so the literal `artifact/`
+    # cannot reach it -- and a link its owner chose to publish is not a disclosure.
+    (f"published at {_ART_HOST}public/artifacts/{_ART_UUID}", "a public artifact, plural path"),
+    # A BARE UUID. Measured over the tracked tree at 16efb8cde, a bare-UUID detector would fire
+    # on 35 lines across 8 innocent files -- a CLA action bundle, a deployment guide, an HL7
+    # sample and five test modules that build session ids. It names no host and no account; it
+    # becomes a disclosure only when something says what it addresses.
+    (f"the session id is {_ART_UUID} for this run", "a bare UUID with no URL around it"),
+    # ORDINARY PROSE using the word. Lifted from CLAUDE.md section 0, which this repo reads
+    # constantly -- a word-alone pattern would red the project's own governing document.
+    ("a release artifact on an index is not a running instance", "the word in ordinary prose"),
+    # ANOTHER HOST's artifact path. A CI build artifact is not a private Claude artifact, and the
+    # host is the whole of what makes this class a disclosure.
+    (f"github.com/o/r/actions/runs/1/{_ART_SEG}{_ART_UUID}", "an artifact path off-host"),
+    # NON-ARTIFACT claude.ai LINKS CARRYING A UUID. These are the cases that give the arm WIDTH
+    # discrimination rather than mere presence discrimination: they are on the right host and do
+    # carry a real UUID, so the only thing keeping them silent is the PATH. Without them the
+    # only case refusing a path-widened pattern is the public-plural one, and a negative corpus
+    # resting on a single case is one edit away from having none. This detector's scope is
+    # artifact addresses; a conversation URL is a different class and not this row's business.
+    (f"the thread is at {_ART_HOST}chat/{_ART_UUID}", "a conversation link, right host"),
+    (f"see {_ART_HOST}recents/{_ART_UUID}", "another non-artifact claude.ai path"),
+    # A TRUNCATED id. Not a UUID, so not an addressable artifact.
+    (f"see {_ART_HOST}code/{_ART_SEG}{_ART_UUID.split('-')[0]}", "a truncated UUID"),
+)
+
+
+@pytest.mark.parametrize(("body", "why"), _ART_NEGATIVE)
+def test_prose_about_artifact_urls_does_not_fire(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str, why: str
+) -> None:
+    """The MUST-NOT-TRIP arm, and it is the half that keeps the guard usable.
+
+    This repo's own docs discuss artifact URLs as a concept, so a pattern matching the word, the
+    host or the path segment alone fires on the prose that explains it. Requiring the full UUID is
+    what buys every case here at once, with no allowlist entry spent.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "prose.md"
+    f.write_text(body + "\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/prose.md")  # type: ignore[attr-defined]
+    assert not any("private artifact URL" in h for h in hits), why
+
+
+def test_the_artifact_url_detector_reports_no_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The URL IS the access, so the reason must never echo it into a public CI log.
+
+    The sibling reason-only detectors withhold their match because it NAMES someone. This one
+    withholds it for a stronger reason: printing it into a public log would hand out the capability
+    the hit is reporting.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "handoff.md"
+    f.write_text(f"banked at https://{_ART_URL}\n", encoding="utf-8")
+    hits = [h for h in mod.scan_file(f, "docs/handoff.md") if "private artifact URL" in h]  # type: ignore[attr-defined]
+    assert hits, "the fixture must fire, or this asserts nothing"
+    for h in hits:
+        assert _ART_UUID.lower() not in h.lower(), f"the reason echoed the UUID: {h!r}"
+        assert _ART_HOST not in h, f"the reason echoed the URL: {h!r}"
+    # show_context is the LOCAL-TRIAGE path, and it must not open the value either.
+    ctx_hits = [
+        h
+        for h in mod.scan_file(f, "docs/handoff.md", show_context=True)  # type: ignore[attr-defined]
+        if "private artifact URL" in h
+    ]
+    assert ctx_hits, "the fixture must fire under show_context too"
+    for h in ctx_hits:
+        assert _ART_UUID.lower() not in h.lower(), f"show_context leaked the UUID: {h!r}"
+
+
+def test_the_two_arms_are_DISJOINT_under_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Neither arm alone constrains the pattern; this asserts that together they pin it from BOTH
+    sides.
+
+    A must-trip suite is satisfied by a pattern that matches everything, and a must-not-trip suite
+    by one that matches nothing. Paired arms still miss an OVER-CORRECTION unless each direction of
+    mutation reds a DIFFERENT arm -- so the two mutations below must produce DISJOINT reds. If one
+    mutation reds both, or neither, the pairing is decorative.
+    """
+    mod = _load(None, monkeypatch)
+    trip = f"banked at https://{_ART_HOST}{_ART_SEG}{_ART_UUID}"  # no code/ segment
+    keep = f"paste a {_ART_HOST}code/{_ART_SEG}<uuid> into the handoff"  # the doc placeholder
+
+    def fires(body: str) -> bool:
+        f = tmp_path / "probe.md"
+        f.write_text(body + "\n", encoding="utf-8")
+        return any(
+            "private artifact URL" in h
+            for h in mod.scan_file(f, "docs/probe.md")  # type: ignore[attr-defined]
+        )
+
+    # The SHIPPED pattern: fires on the must-trip case, silent on the must-not-trip case.
+    assert fires(trip) and not fires(keep), "precondition: the shipped pattern satisfies both arms"
+
+    # MUTATION A -- OVER-BROAD. Drop the UUID requirement, which is the guard the must-not-trip arm
+    # exists to hold. The must-trip case still fires; the placeholder now fires too.
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/(?:code/)?artifact/", re.IGNORECASE
+    )
+    assert fires(trip), (
+        "over-broad must still satisfy the must-trip arm, or the reds are not disjoint"
+    )
+    assert fires(keep), "over-broad must red the must-NOT-trip arm"
+
+    # MUTATION B -- OVER-NARROW. Make the `code/` segment mandatory. The placeholder stays silent;
+    # the code/-less URL, which is a real form, stops firing.
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/code/artifact/"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    assert not fires(trip), "over-narrow must red the must-trip arm"
+    assert not fires(keep), (
+        "over-narrow must leave the must-NOT-trip arm green, or the reds are not disjoint"
+    )
+
+    # MUTATION D -- OVER-BROAD IN THE OTHER DIRECTION: keep the UUID requirement, widen the PATH to
+    # any segment. This is the widening a paired arm most easily misses, because it still demands a
+    # real UUID and so leaves every placeholder case silent -- the must-trip arm passes, and the
+    # must-not-trip cases that refuse mutation A do not refuse this one. Only a negative case that
+    # is on the RIGHT HOST with a REAL UUID and merely the wrong path can catch it. The reds must be
+    # DISJOINT from mutation A's: if one case refused both, the arm would have presence
+    # discrimination and no width discrimination, which for a leak gate is the difference between
+    # "detects artifact URLs" and "detects URLs".
+    # COUNTED OVER THE WHOLE CORPUS, not against two hand-picked strings, and the count is the
+    # point. Disjointness is a boolean over two sets whose SIZE is what is actually at risk: {3}
+    # against {1} and {3} against {4} are both "disjoint", and only the second survives an unrelated
+    # edit to `_ART_NEGATIVE`. This suite WAS in the {3}-against-{1} state -- the single case
+    # refusing a path-widening was the public-plural one, present for an unrelated reason -- and
+    # disjointness alone reported that as healthy.
+    def reds(pattern: re.Pattern[str]) -> set[str]:
+        mod._ARTIFACT_URL = pattern  # type: ignore[attr-defined]
+        return {why for body, why in _ART_NEGATIVE if fires(body)}
+
+    a_reds = reds(re.compile(r"claude\.ai/(?:code/)?(?:artifact|frame)/", re.IGNORECASE))
+    d_reds = reds(
+        re.compile(
+            r"claude\.ai/(?:[A-Za-z0-9_/-]+/)?"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        )
+    )
+    assert not (a_reds & d_reds), (
+        f"the two widenings must red DISJOINT cases; both are refused by {sorted(a_reds & d_reds)}"
+    )
+    # FLOOR OF 2, against a measured margin of 3 each. Two rather than three leaves one case of
+    # slack for a legitimate edit to the corpus, while still refusing the single-case state above.
+    # Raise it if the margin grows; never lower it to make a corpus edit pass.
+    assert len(a_reds) >= 2, f"presence discrimination is down to {len(a_reds)}: {sorted(a_reds)}"
+    assert len(d_reds) >= 2, f"width discrimination is down to {len(d_reds)}: {sorted(d_reds)}"
+
+    # MUTATION C -- THE PATTERN AS FIRST SHIPPED, before the vendor grammar was read. It satisfies
+    # BOTH arms above, which is exactly why those two mutations cannot protect the vanity form: a
+    # suite that only pins the bare shape accepts a pattern blind to the address a person's browser
+    # actually produces. This is the regression the third mutation exists to catch.
+    vanity = f"banked at https://{_ART_HOST}code/{_ART_SEG}q4-migration-plan-{_ART_UUID}"
+    mod._ARTIFACT_URL = re.compile(  # type: ignore[attr-defined]
+        r"claude\.ai/(?:code/)?artifact/"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    assert fires(trip) and not fires(keep), (
+        "precondition: the first-shipped pattern satisfies both of the arms above, which is what "
+        "makes it invisible to them"
+    )
+    assert not fires(vanity), "the first-shipped pattern is blind to the vanity form"
+
+    # And the SHIPPED pattern sees it. Reload rather than reassign, so this asserts against the
+    # real module rather than against a pattern this test typed.
+    fresh = _load(None, monkeypatch)
+    f = tmp_path / "vanity.md"
+    f.write_text(vanity + "\n", encoding="utf-8")
+    assert any(
+        "private artifact URL" in h
+        for h in fresh.scan_file(f, "docs/vanity.md")  # type: ignore[attr-defined]
+    ), "the shipped pattern must see the vanity form"

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""The cross-site refusal reaches the /ui/static MOUNT, and does not overreach (BACKLOG #1122).
+"""The cross-site refusal reaches the /ui/static MOUNT, and does not overreach (BACKLOG #1371).
+
+The middleware itself landed under #1371 -- this header previously cited #1122, which is the ASVS
+3.5.3 research item and a different subject; the miscitation is recorded as debt on #1334. #1122 then
+TIGHTENED the carve-out here (the destination allowlist and the same-site user-activation rule), and
+the tests carrying that work name it individually below.
 
 ``assert_not_cross_site`` runs as a route dependency, and ``/ui/static`` is a Starlette ``Mount``
 rather than an ``APIRoute`` — a dependency never runs for it, so the asset tier was the one /ui
@@ -68,11 +73,20 @@ async def test_a_headerless_request_is_allowed_because_the_tray_sends_none(
     ``Sec-Fetch-Site`` is browser-populated. The tray probe, every non-browser client and 332 call
     sites in this corpus omit it entirely. This must NOT 403 — if it does, the tray's console item
     and most of this suite go with it.
+
+    **This is also the fence on the half #1122 deliberately did NOT change.** Every rule #1122 added
+    is reached only after ``Sec-Fetch-Site`` arrived, so a client sending no fetch metadata is exactly
+    as unaffected as before. Measured 2026-09-04 by inverting that one condition and running this
+    suite: **231 of 408 tests** go red. Failing closed is a browser-support decision, not a hardening
+    pass, and it is not taken. The three paths span the mount, an HTML route and a PHI route.
     """
     service = await _service(engine)
     async with _client(engine, service) as c:
-        r = await c.get("/ui/static/app.css")
-    assert r.status_code != 403, "a headerless request was refused; absence must be allowed"
+        for path in ("/ui/static/app.css", "/ui", "/ui/messages/m1/attachments/a1"):
+            r = await c.get(path)
+            assert r.status_code != 403, (
+                f"a headerless request to {path} was refused; absence must be allowed"
+            )
 
 
 async def test_a_refusal_is_403_and_never_404_because_404_disables_the_tray(
@@ -108,12 +122,26 @@ async def test_a_cross_site_top_level_navigation_is_allowed_because_a_real_login
     ``Sec-Fetch-Site: cross-site`` with ``Sec-Fetch-Mode: navigate``. ``_auth``'s per-route helper never
     sees one — its callers are a CSP sink and state-changing POSTs — so lifting its membership test to
     every /ui request without also reading the MODE refuses traffic the product depends on.
+
+    **It is ALSO the pin on #1122's asymmetry: the cross-site half is deliberately not asked for
+    ``Sec-Fetch-User``.** Demanding ``?1`` on both halves would look symmetrical and would refuse
+    silent re-authentication — the IdP's redirect back is a server-driven 302 with no user activation
+    once the IdP session is established. A cross-site request also arrives with no cookie under
+    ``SameSite=Strict``, so it carries none of the authority that makes the same-site rule necessary.
+    Mutating the middleware to require ``?1`` on both halves turns this test red.
     """
     service = await _service(engine)
     async with _client(engine, service) as c:
         r = await c.get(
             "/ui",
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                # A real browser ALWAYS sends this on a top-level navigation. It became load-bearing
+                # in #1122, which made the destination an allowlist; before that the header was
+                # omitted here and the request passed a denylist unread.
+                "Sec-Fetch-Dest": "document",
+            },
         )
     assert r.status_code != 403, (
         "a cross-site TOP-LEVEL NAVIGATION was refused — this is what an intranet link and the OIDC "
@@ -149,7 +177,14 @@ async def test_a_cross_site_navigation_carrying_a_post_is_refused(engine: Engine
     async with _client(engine, service) as c:
         r = await c.post(
             "/ui",
-            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                # Sent so the METHOD is the only thing left to refuse it. Without this the request
+                # would now also fail the #1122 destination allowlist, and the test would pass for
+                # a reason it does not name.
+                "Sec-Fetch-Dest": "document",
+            },
         )
     assert r.status_code == 403, (
         f"a cross-site POST navigation was not refused (got {r.status_code}) — that is a CSRF form "
@@ -157,24 +192,89 @@ async def test_a_cross_site_navigation_carrying_a_post_is_refused(engine: Engine
     )
 
 
-async def test_object_and_embed_do_not_get_the_navigation_carve_out(engine: Engine) -> None:
-    """``object``/``embed`` report ``Sec-Fetch-Mode: navigate`` while loading INTO someone else's page.
+async def test_only_a_document_destination_gets_the_navigation_carve_out(engine: Engine) -> None:
+    """``object``/``embed``/``iframe``/``frame`` report ``Sec-Fetch-Mode: navigate`` while loading INTO
+    someone else's page. That is framing rather than navigation, so the destination has to be checked
+    too or the carve-out hands back the embedding it was meant to refuse.
 
-    That is framing rather than navigation, so the destination has to be checked too or the carve-out
-    hands back the embedding it was meant to refuse.
+    **This is one ALLOWLIST test rather than two denylist tests, and #1122 is why.** The rule shipped
+    naming ``object`` and ``embed`` -- the two framing destinations anyone thinks of. Measured on the
+    built app before the fix: those two were refused, while ``iframe``, ``frame`` and a request
+    carrying NO ``Sec-Fetch-Dest`` at all were served. All five are now one condition, so they belong
+    in one loop; splitting them again would encode the shape of the denylist rather than of the code.
+    ``None`` here means the header is omitted, which is how a denylist is skipped unread.
     """
     service = await _service(engine)
     async with _client(engine, service) as c:
-        for dest in ("object", "embed"):
+        for dest in ("object", "embed", "iframe", "frame", None):
+            headers = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+            if dest is not None:
+                headers["Sec-Fetch-Dest"] = dest
+            r = await c.get("/ui", headers=headers)
+            assert r.status_code == 403, (
+                f"Sec-Fetch-Dest: {dest or '<omitted>'} was allowed through the navigation carve-out "
+                f"(got {r.status_code}) — only 'document' is a top-level navigation"
+            )
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #1122. The same-site half of the refused set arrives WITH the session cookie attached, and
+# the shipped carve-out waved it through. The destination half of #1122's fix is folded into
+# test_only_a_document_destination_gets_the_navigation_carve_out above rather than repeated here.
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_a_same_site_navigation_needs_user_activation_because_the_cookie_rides_along(
+    engine: Engine,
+) -> None:
+    """THE ONE REFUSED CLASS THAT ARRIVES WITH AUTHORITY, and why this half is not like the other.
+
+    ``SameSite=Strict`` keys on the SITE, and a site ignores the port. On the shipped loopback default
+    ``http://127.0.0.1:9999`` is therefore SAME-SITE to the console, so a page there can script
+    ``window.open`` at a /ui URL and the operator's session cookie is attached — which a cross-site
+    page cannot do. ``Sec-Fetch-User`` is what separates the operator's own click from that script:
+    a scripted ``window.open``, a ``location =`` and a ``<meta http-equiv=refresh>`` all navigate
+    without it.
+    """
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        for label, extra in (
+            ("no Sec-Fetch-User at all", {}),
+            ("Sec-Fetch-User: ?0", {"Sec-Fetch-User": "?0"}),
+        ):
             r = await c.get(
-                "/ui",
+                "/ui/messages/m1/attachments/a1",
                 headers={
-                    "Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-Site": "same-site",
                     "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Dest": dest,
+                    "Sec-Fetch-Dest": "document",
+                    **extra,
                 },
             )
             assert r.status_code == 403, (
-                f"Sec-Fetch-Dest: {dest} was allowed through the navigation carve-out (got "
-                f"{r.status_code}) — that is cross-site framing, not navigation"
+                f"a same-site navigation with {label} was allowed (got {r.status_code}) — that is a "
+                "sibling local port scripting a navigation with the operator's cookie attached"
             )
+
+
+async def test_an_operator_click_from_a_sibling_port_is_still_allowed(engine: Engine) -> None:
+    """POSITIVE CONTROL for the rule above: it must refuse the script, not the human.
+
+    Without this, refusing every same-site navigation outright would satisfy the previous test and
+    would break a genuine same-site intranet link (``wiki.corp.example`` to ``console.corp.example``).
+    """
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        r = await c.get(
+            "/ui",
+            headers={
+                "Sec-Fetch-Site": "same-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-User": "?1",
+            },
+        )
+    assert r.status_code != 403, (
+        "a USER-ACTIVATED same-site navigation was refused — that is an operator clicking an "
+        "intranet link, and refusing it breaks a supported deployment shape"
+    )

@@ -328,3 +328,35 @@ def test_a_merge_carrying_a_HAND_RESOLUTION_still_trips(repo: Path) -> None:
     r = check(repo)
     assert r.returncode == 1, "a hand-resolved merge is NOT re-derivable\n" + r.stdout + r.stderr
     assert "exist on no remote" in r.stdout
+
+
+# --- BACKLOG #1349: the printed remedy must not write an unverifiable ref -----------------------
+
+
+def test_the_printed_remedy_writes_a_ref_that_can_be_VERIFIED_LATER(repo: Path) -> None:
+    """The tool's own advice used to produce the defect its sibling audit reports.
+
+    The remedy block printed a bare
+    ``git push --force <remote> <branch>:refs/tags/rescue/branch/<branch>``, which writes a ref
+    recording nothing about what it captured. Such a ref can only be graded against a branch that
+    still exists -- and a rescue ref is read once, after the branch it names is already gone.
+
+    Measured 2026-09-03 in the live checkout: ``rescue.ps1 -Check`` examined 1671 refs and returned
+    UNVERIFIABLE for all 1671, every one of them written by a push of exactly that shape. So this
+    asserts BOTH halves: the bare form is gone, and ``-Anchor`` is what replaced it. Asserting only
+    that ``-Anchor`` appears would pass a block that printed both and left the reader to choose.
+    """
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "g.txt").write_text("this exists on exactly one disk", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "real work")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Remedy" in r.stdout
+    assert "rescue.ps1 -Anchor" in r.stdout
+    assert ":refs/tags/rescue/branch/" not in r.stdout, (
+        "still printing the bare push that writes an unverifiable ref"
+    )
+    # The reason has to travel with the command, or the extra step reads as ceremony and gets cut.
+    assert "A bare push records none of that" in r.stdout

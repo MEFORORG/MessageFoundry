@@ -26,6 +26,14 @@ name: quality-advisory
 #                                                         PRs too; survivor table in the step summary.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
+# ONE JOB HERE IS NOT A RUBRIC SIGNAL, AND IT IS HERE ON PURPOSE (BACKLOG #1431). `dangling-citations`
+# reports backlog `#N` references that name no filed item in either ledger. It is a LEDGER-hygiene check,
+# not a code-quality measurement, and its natural sibling -- backlog-hygiene.yml -- is the wrong home:
+# that workflow's only job IS a required context, so a step added there could block every merge. This
+# file is the repository's one place where a check can report without being able to gate, which is the
+# property that job needs. Promoting it to blocking is an owner decision and is deliberately untaken;
+# see the item for the reasoning and for what the nine current findings actually are.
+#
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
 # assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF
 # upload back:
@@ -765,6 +773,73 @@ jobs:
           # Deliberately `warn`, not `ignore`: if mutmut ever renames its cache, that must be visible in
           # the log rather than silently swallowed.
           if-no-files-found: warn
+
+  dangling-citations:
+    # BACKLOG #1431 -- a working detector that ran nowhere.
+    #
+    # `scripts/docs/dangling_citation_check.py` reports a `#N` backlog citation that names no item in
+    # EITHER ledger. Until this job, the SCRIPT was invoked by no workflow and no pre-commit hook:
+    # measured at 46ea10a78 with controls in the same pass, the script path occurs 0 times across
+    # .github/ plus .pre-commit-config.yaml, while backlog_citation_check.py (a real `run:`) occurs
+    # once and an invented path occurs 0 times. Only its TEST was wired, via ci.yml's DOC_GUARDS.
+    #
+    # WHY IT RUNS HERE AND CANNOT GATE. Four independent things keep it advisory, and
+    # tests/test_dangling_citation_advisory.py pins the three a repository test can see:
+    #   1. this workflow holds no required context (.github/required-contexts.txt records that it must
+    #      never be promoted) -- branch-protection membership is the only thing that decides gating;
+    #   2. `--advisory` makes a live-shape finding exit 0 rather than 1, which is this tool's default;
+    #   3. `continue-on-error: true` means even the checker's own empty-population REFUSAL cannot fail
+    #      the job -- it shows as a warning on a green job, which is the visibility this wants;
+    #   4. this job is deliberately absent from `liveness`'s `needs`, so it cannot redden the one job
+    #      in this file that is built to go red.
+    #
+    # THE EXIT CODE IS NOT SWALLOWED WITH `|| true`, and that is the point of (3). With `--advisory`
+    # the only way this tool exits non-zero is a GENUINE malfunction -- most plausibly its refusal to
+    # report on an empty population, which is what running from the wrong directory looks like. A
+    # clean scan and a scan that read nothing must not render alike, so that case stays visible as a
+    # red step inside a green job rather than being turned into a silent success.
+    #
+    # NO PATHS FILTER ON THIS WORKFLOW, which is what makes the job worth having: a citation is
+    # introduced by editing PROSE, and the pytest tier that holds this tool's unit test is skipped on
+    # a documentation-only pull request. This job runs on all of them.
+    name: dangling backlog citations (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report backlog citations that name no filed item (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== backlog citations under docs/ that name no item in either ledger =="
+          echo "== advisory: this reports, it never gates a merge =="
+          TOOL_STATUS=0
+          python3 scripts/docs/dangling_citation_check.py --advisory \
+            > dangling-citations.txt 2>&1 || TOOL_STATUS=$?
+          cat dangling-citations.txt
+          {
+            echo "## Dangling backlog citations"
+            echo ""
+            echo "Advisory only. A reported token is an UPPER BOUND ON CITATIONS, not a count of"
+            echo "defects: a number at or below the allocator high-water mark can never be issued,"
+            echo "and a PR, issue or foreign-repo reference is not a backlog citation at all. Both"
+            echo "kinds are printed so a human judges them. See BACKLOG item 1431 for the triage."
+            echo ""
+            echo '```'
+            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+            # ENTIRELY, so truncate rather than silently lose the whole summary.
+            head -c 200000 dangling-citations.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Dangling-citation scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means a malfunction rather than a finding. See the job log."
+          fi
+          # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
+          # broken scan distinguishable from a clean one.
+          exit "$TOOL_STATUS"
 
   liveness:
     # THE META-GATE. Every other job here is built so it can never fail; this one is built so it CAN.

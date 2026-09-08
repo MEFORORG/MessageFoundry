@@ -17,8 +17,8 @@ fencing yet — but per-message finalize, the audit chain, and schema init are s
 
 * **H-6** — the pool sets ``command_timeout`` so a statement actually times out (the SQL Server
   backend's per-connection timeout was inert on some drivers).
-* **H-7** — ``record_audit`` and ``_backfill_audit_chain`` take ``pg_advisory_xact_lock`` on the audit
-  chain before read-tail + insert, so concurrent writers can't fork the chain.
+* **H-7** — ``record_audit`` takes ``pg_advisory_xact_lock`` on the audit chain before read-tail +
+  insert, so concurrent writers can't fork the chain.
 * **H-8** — :meth:`_maybe_finalize_message` ports the full multi-stage finalizer (not the simpler
   outbound-only one) and is serialized per ``message_id`` with a per-message advisory lock, so it
   re-counts on a fresh snapshot — no double-finalize; different ids never contend. A finalizer that
@@ -151,6 +151,8 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
+    require_notify_email,
+    seed_notify_email,
     should_record_event,
 )
 
@@ -161,6 +163,12 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
+# batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
+# DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
+# which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
+# single transaction while the store is still opening.
+_ATTACHMENT_CHUNK_BATCH = 16
 
 # Advisory-lock keys passed to the TWO-key pg_advisory_xact_lock(classid, hashtext($key)). They
 # serialize the audit-chain append (H-7) and schema init across concurrent opens; the finalize lock is
@@ -476,7 +484,9 @@ _SCHEMA: list[str] = [
         channel_id TEXT,
         detail     TEXT,
         client     TEXT,
-        row_hash   TEXT
+        -- NOT NULL (BACKLOG #1198): every row the engine writes is chained at INSERT, so an unchained
+        -- row has no legitimate producer. See the SQLite `_SCHEMA` for the full reasoning.
+        row_hash   TEXT NOT NULL
     )""",
     # ADR 0150 client attribution for a pre-existing audit_log. Nullable with NO default: NULL on every
     # existing row is CORRECT (their address was never captured) and is exactly what preserves their
@@ -526,7 +536,11 @@ _SCHEMA: list[str] = [
         username             TEXT NOT NULL UNIQUE,
         auth_provider        TEXT NOT NULL,
         display_name         TEXT,
+        -- BACKLOG #1139: `email` is the PROFILE address / directory mirror (overwritten from the
+        -- directory `mail` attribute on every AD login); `notify_email` is the ENGINE-OWNED
+        -- notification target, seeded once at creation and never written by the directory sync.
         email                TEXT,
+        notify_email         TEXT,
         disabled             BOOLEAN NOT NULL DEFAULT FALSE,
         created_at           DOUBLE PRECISION NOT NULL,
         updated_at           DOUBLE PRECISION NOT NULL,
@@ -684,7 +698,10 @@ _SCHEMA: list[str] = [
 # Leaning on that coincidence is the trap the contract exists to close — a later edit confined to
 # _migrate_lease_columns would move nothing, and an already-open DB would take the schema_meta fast
 # path straight past it.
-_MIGRATION_REV = 2
+# 3 (BACKLOG #1139): the users.notify_email ADD + its one-time seed land in the same function, for the
+# same reason and with the same caveat — the users CREATE TABLE in _SCHEMA moved too, so the hash would
+# shift without this bump, and relying on that is the trap the paragraph above names.
+_MIGRATION_REV = 3
 
 
 def _schema_hash() -> str:
@@ -992,7 +1009,6 @@ class PostgresStore:
         # the cipher carries no bound (keyless / `vault_transit`).
         await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
         await (
             store._load_state_cache()
@@ -1149,6 +1165,15 @@ class PostgresStore:
                 "UPDATE users SET password_claimed_at = password_changed_at"
                 " WHERE must_change_password = FALSE AND password_hash IS NOT NULL"
             )
+        # The engine-owned notification address (BACKLOG #1139). NULL on an existing row would read as
+        # "no address on file", which excludes the account from every out-of-band security notice — so
+        # the ADD is paired with a one-time seed from the column that IS the notification target today.
+        # The seed MUST stay inside this creation guard: hoisted out it becomes a permanent SECOND
+        # writer, and every directory login would then copy the directory's address back over the
+        # engine's, restoring the exact defect the split removes.
+        if "notify_email" not in users_cols:
+            await conn.execute("ALTER TABLE users ADD COLUMN notify_email TEXT")
+            await conn.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
             " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
@@ -1586,34 +1611,7 @@ class PostgresStore:
             refreshed.append(ns)
         return refreshed
 
-    async def _backfill_audit_chain(self) -> None:
-        """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent; fills only
-        NULLs, chained from the prior row). H-7: takes the audit-chain advisory lock first so a
-        concurrent ``record_audit`` can't fork the chain while this backfills."""
-        async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            rows = await conn.fetch(
-                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
-                " ORDER BY id"
-            )
-            prev = ""
-            updates: list[tuple[str, int]] = []
-            for r in rows:
-                if r["row_hash"]:
-                    prev = r["row_hash"]
-                    continue
-                prev = audit_row_hash(
-                    prev,
-                    ts=r["ts"],
-                    actor=r["actor"],
-                    action=r["action"],
-                    channel_id=r["channel_id"],
-                    detail=r["detail"],
-                    client=r["client"],
-                )
-                updates.append((prev, r["id"]))
-            for row_hash, rid in updates:
-                await conn.execute("UPDATE audit_log SET row_hash=$1 WHERE id=$2", row_hash, rid)
+    # `_backfill_audit_chain` was deleted with BACKLOG #1198 — see the SQLite twin for why.
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
@@ -1727,6 +1725,21 @@ class PostgresStore:
                 encrypt=True,
                 value_col=col,
             )
+        # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) with the
+        # composite PK (attachment_id, seq), so it can't ride the id-keyed loop either. Its ROTATION
+        # pass already existed; this ON-OPEN pass did not, so a keyless→keyed transition left legacy
+        # plaintext chunks unsealed on this backend while SQLite sealed them (BACKLOG #1169).
+        # A SMALL batch, unlike every sibling above: each row is one DETACH_CHUNK_BYTES (1 MiB) slice
+        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident in one transaction
+        # while the store is still opening.
+        total += await self._encrypt_existing_composite(
+            "attachment_chunk",
+            ("attachment_id", "seq"),
+            like,
+            encrypt=True,
+            value_col="ciphertext",
+            limit=_ATTACHMENT_CHUNK_BATCH,
+        )
         # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True; see
         # _CIPHER_COLUMNS) — their own composite migration passes (ASVS 11.3.3).
         total += await self._encrypt_existing_composite(
@@ -1765,6 +1778,7 @@ class PostgresStore:
         encrypt: bool,
         value_col: str = "value",
         id_keyed: bool = False,
+        limit: int = 500,
     ) -> int:
         """Encrypt the ``value_col`` of a non-id-keyed table in place — the migration loop for tables that
         can't ride the id-keyed loop. Each value binds to ``cell_aad(table, value_col, *aad_cols)`` (ASVS
@@ -1773,7 +1787,11 @@ class PostgresStore:
         ``response`` passes ``body``/``detail``. ``aad_cols`` are the composite PK for state/reference/
         response; for the BIGSERIAL-id tables (``message_events``/``connection_event``/``alert_instance``)
         set ``id_keyed=True`` — the AAD then comes from ``aad_cols`` (insert-time-known natural columns)
-        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row)."""
+        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row).
+
+        ``limit`` is the rows held in memory per batch. 500 suits the KILOBYTE-shaped columns this
+        started with (state/reference/response); ``attachment_chunk`` holds one 1 MiB slice per row,
+        where 500 would be ~650 MiB resident inside a single transaction at store open."""
         rotated = 0
         select_cols = ("id", *aad_cols) if id_keyed else aad_cols
         pk_select = ", ".join(select_cols)
@@ -1783,7 +1801,7 @@ class PostgresStore:
         while True:
             rows = await self._fetchall(
                 f"SELECT {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT 500",
+                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT {int(limit)}",
                 like,
             )
             if not rows:
@@ -1811,7 +1829,27 @@ class PostgresStore:
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
-            return 0  # identity cipher (no key) — nothing to rotate
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
         # so a v2-active rotation matches v2 rows and the loop terminates.
@@ -4872,18 +4910,18 @@ class PostgresStore:
     ) -> tuple[str, list[Any]]:
         """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_dead_letters`' attachment
         release: the messages owning a dead row purged in this window whose LAST replayable row is now
-        gone. ``$1``=OUTBOUND stage, ``$2``=DEAD status, cutoff from ``$3``. Mirrors SQLite."""
+        gone. ``$1``=DEAD status, cutoff from ``$2``. Mirrors SQLite — stage-agnostic since #1188, so a
+        message whose last replayable row is a dead INGRESS row releases its attachment here too."""
         cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
-            "q0.destination_name", older_than, connection_cutoffs, start=3
+            "q0.destination_name", older_than, connection_cutoffs, start=2
         )
         still = self._attachment_still_referenced_sql("q0.message_id", idx, idx + 1)
         where = (
             "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
-            f" WHERE q0.stage=$1 AND q0.status=$2 AND q0.updated_at < {cutoff_sql}"
+            f" WHERE q0.status=$1 AND q0.updated_at < {cutoff_sql}"
             f" AND NOT {still})"
         )
         params = [
-            Stage.OUTBOUND.value,
             OutboxStatus.DEAD.value,
             *cutoff_params,
             [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
@@ -5945,9 +5983,11 @@ class PostgresStore:
                 key=_key,
                 mac=_mac,
             )
-            await conn.execute(
+            # RETURNING gives the anchor id without a second round trip or a currval() read that
+            # another session's insert could race.
+            new_id = await conn.fetchval(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
                 now,
                 actor,
                 action,
@@ -5959,7 +5999,14 @@ class PostgresStore:
         # Tee off-box AFTER the transaction commits + the connection is released (only forward what
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
         emit_audit_tee(
-            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+            action=action,
+            actor=actor,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            ts=now,
+            row_id=int(new_id or 0),
+            row_hash=row_hash,
         )
 
     async def list_audit(
@@ -6285,15 +6332,16 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "INSERT INTO users (id, username, auth_provider, display_name, email, disabled,"
-            " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+            "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
+            " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until)"
-            " VALUES ($1,$2,$3,$4,$5,FALSE,$6,$6,NULL,$7,$8,$9,0,NULL)",
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL)",
             user_id,
             username,
             auth_provider,
             display_name,
             email,
+            seed_notify_email(email),
             now,
             password_hash,
             now if password_hash is not None else None,
@@ -6450,6 +6498,10 @@ class PostgresStore:
         email: str | None,
         now: float | None = None,
     ) -> None:
+        """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
+        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        #1139). Adding that column to this SET list would hand the directory the notification target
+        back and restore the defect the split removes."""
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",
@@ -6457,6 +6509,20 @@ class PostgresStore:
             email,
             now,
             user_id,
+        )
+
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
+    ) -> None:
+        """Repoint the account's engine-owned notification address (BACKLOG #1139).
+
+        The parameter is ``str``, so a clear is unrepresentable; :func:`require_notify_email` rejects
+        the whitespace-only string that would mean the same thing. That refusal is the durability rule.
+        """
+        cleaned = require_notify_email(email)
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET notify_email=$1, updated_at=$2 WHERE id=$3", cleaned, now, user_id
         )
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
@@ -7088,24 +7154,33 @@ class PostgresStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their
-        own retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
+        retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
         Ported, not stubbed. Returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
+        ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
+        message is body-purge-eligible: the outbound-only scope blanked ``messages.raw`` while that raw
+        survived in the queue row unreachable by any sweep. :meth:`replay` re-queues such a row from its
+        own payload, so it is replayable-until-purged exactly as a dead outbound row is. The stage
+        predicate is dropped rather than widened to a list, so a later stage is covered by construction.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
-        the prior behaviour."""
+        the prior behaviour. An ingress/routed/response row has a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` matches no arm and it takes the ``ELSE`` — always the global dead-letter
+        window (``dead_letter_days`` is declared on an OUTBOUND connection, so there is no inbound-keyed
+        override to honour)."""
         now = time.time() if now is None else now
-        # stage/status are $1/$2; the cutoff CASE (#34) numbers from $3 onward.
+        # status is $1; the cutoff CASE (#34) numbers from $2 onward.
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
-            "destination_name", older_than, connection_cutoffs, start=3
+            "destination_name", older_than, connection_cutoffs, start=2
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
-                    Stage.OUTBOUND.value,
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

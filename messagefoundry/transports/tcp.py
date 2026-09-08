@@ -48,6 +48,8 @@ from messagefoundry.transports.mllp import (
     DEFAULT_MAX_FRAME_BYTES,
     DEFAULT_RECEIVE_TIMEOUT,
     InsecureHopGuard,
+    _MessagePacer,
+    _pacing_settings,
     _peer_host,
 )
 
@@ -408,6 +410,11 @@ class TcpSource(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
+        # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
+        # port changed REACHABILITY (raw TCP had no rate control in any configuration), never the
+        # default -- a stock raw-TCP inbound still has no rate bound.
+        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -506,7 +513,11 @@ class TcpSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = self.codec.decoder(max_frame_bytes=self.max_frame_bytes)
+                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
                 while True:
+                    # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
+                    if pacer is not None:
+                        await pacer.pace()
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
@@ -518,11 +529,16 @@ class TcpSource(SourceConnector):
                     if not chunk:
                         break
                     try:
+                        decoded = 0
                         for message in decoder.feed(chunk):
+                            decoded += 1
                             reply = await self._handler(message)
                             if reply is not None:
                                 writer.write(self.codec.frame(reply, self.encoding))
                                 await writer.drain()
+                        # Charge AFTER the messages in this chunk are fully handled.
+                        if pacer is not None:
+                            pacer.settle(decoded)
                     except FrameError as exc:
                         peer = writer.get_extra_info("peername")
                         logger.warning(

@@ -826,6 +826,9 @@ class UserRecord:
     username: str
     auth_provider: str  # 'local' | 'ad'
     display_name: str | None
+    # The account's PROFILE address, and on an AD/OIDC account the directory's mirror: every
+    # directory login overwrites it from the principal's ``mail`` attribute. NOT the notification
+    # target -- see ``notify_email`` below (BACKLOG #1139).
     email: str | None
     disabled: bool
     created_at: float
@@ -860,6 +863,28 @@ class UserRecord:
     # cannot stand in for it: a rotation clears that flag and an admin reset re-sets it, so no reader can
     # tell "never claimed" from "claimed, then reset".
     password_claimed_at: float | None = None
+    # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
+    # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # touches ``display_name`` and ``email`` only.
+    #
+    # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
+    # directory's mirror and the notification target, so a directory repoint would replace the very
+    # address the resulting notice had to reach, and "which address do we notify when the directory
+    # owns the attribute" had no answer. Separated, the notice goes to an address that the repoint is
+    # not replacing, and the question dissolves.
+    #
+    # SEEDED ONCE, AT ACCOUNT BIRTH, from whatever address ``create_user`` carried -- there is exactly
+    # one address at that instant and no reason for the two to differ. After that the only writer is
+    # ``set_user_notify_email``, which takes a non-empty ``str`` and so CANNOT express a clear. That
+    # refusal is the durability rule: a repoint is allowed, an erasure is not. Without it, making an
+    # address mandatory at creation would still leave an explicit null able to strip it afterwards.
+    #
+    # NULL means the account has never carried an address, and such an account is excluded from every
+    # out-of-band notice (``SecurityEventNotifier.notify`` returns early). NOT NULL was the other way
+    # to meet the durability rule and is deliberately not taken: accounts may still be created without
+    # an address, so the column would need a placeholder the notifier treats as absent anyway.
+    notify_email: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -888,6 +913,11 @@ class UserRecord:
             # retired. Failing loudly on a mapping that lacks the column beats silently retiring a
             # claimed account. Every reader is a SELECT *, so the column is present once migrated.
             password_claimed_at=_opt_float(d["password_claimed_at"]),
+            # Hard subscript for the same reason as its neighbour above (BACKLOG #1139): a missing key
+            # would decode as None, None means "no address on file", and an account read that way is
+            # silently excluded from every security notice. A loud failure on a mapping that lacks the
+            # column beats a quiet, permanent loss of the notification channel.
+            notify_email=d["notify_email"],
         )
 
 
@@ -1096,9 +1126,11 @@ def audit_mac_bytes(value: str | None) -> bytes:
     and fires **no** ``integrity_drift`` alert. A forged row carrying one non-ASCII character would then
     silently downgrade a tamper alarm to a log breadcrumb. Encoding first makes the comparison total.
 
-    ``row_hash`` is also NULLable on all three backends (rows written before hash-chaining, until
-    :meth:`MessageStore._backfill_audit_chain` fills them), so ``None`` maps to empty bytes — which can
-    never equal a real digest, preserving today's "a NULL hash is a break" outcome without a type error.
+    ``row_hash`` is NOT NULL on all three backends since BACKLOG #1198, so the engine cannot produce a
+    ``None`` here. The mapping stays TOTAL anyway, and deliberately: the column lives in a store the
+    operator owns, so a NULL arriving out-of-band is exactly the tampering this comparison exists to
+    report. ``None`` maps to empty bytes, which can never equal a real digest, so such a row is a
+    reported break rather than a ``TypeError`` that would fail open.
 
     ``surrogatepass`` keeps the mapping TOTAL and injective for every ``str`` CPython can hold: a lone
     surrogate smuggled into the column encodes rather than raising, and two distinct strings can never
@@ -1344,6 +1376,45 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
 def _opt_float(value: Any) -> float | None:
     """Coerce a possibly-NULL epoch column to ``float | None`` (a backend may return int/Decimal)."""
     return None if value is None else float(value)
+
+
+def seed_notify_email(email: str | None) -> str | None:
+    """The ``users.notify_email`` value a ``create_user`` INSERT binds — shared by all three backends
+    so the seeding rule is stated once (BACKLOG #1139).
+
+    Account birth is the ONE moment the engine adopts an address without a separate decision: there is
+    exactly one address in hand and no reason for the mirror and the notification target to differ.
+    After it, the directory can never move the notification address again — ``update_user_profile``,
+    the only call the AD/OIDC upsert makes on an existing account, does not name this column.
+
+    Blank is normalised to NULL so ``""`` cannot enter the column and read as an address that is
+    present but undeliverable. NULL states plainly that the account has never carried one.
+    """
+    return email.strip() or None if email is not None else None
+
+
+def require_notify_email(email: str) -> str:
+    """Validate a new ``users.notify_email`` value — shared by all three backends (BACKLOG #1139).
+
+    **THIS IS THE DURABILITY RULE, and it is the reason the parameter is ``str`` and not
+    ``str | None``.** Making an address mandatory at creation does not make it durable: an explicit
+    null still strips it afterwards, and once stripped the account is excluded from every later
+    out-of-band notice because ``SecurityEventNotifier.notify`` returns early on an empty address. So
+    the notification address is REPOINTABLE BUT NOT ERASABLE — the type refuses ``None`` at every call
+    site, and this refuses the whitespace-only string that would slip past the type and mean the same
+    thing in practice.
+
+    The other way to meet the rule was a NOT NULL column, and it is deliberately not taken: accounts
+    may still be created with no address at all, so NOT NULL would need a placeholder value that the
+    notifier treats as absent anyway — a constraint that reads as a guarantee and delivers none.
+    """
+    cleaned = email.strip()
+    if not cleaned:
+        raise ValueError(
+            "notify_email must be a non-empty address: the engine-owned notification address can be"
+            " repointed but never cleared (BACKLOG #1139)"
+        )
+    return cleaned
 
 
 def password_claim_set(must_change_password: bool, placeholder: str) -> str:
@@ -1710,7 +1781,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     channel_id  TEXT,
     detail      TEXT,                 -- JSON: filter, counts, exposed ids, ...
     client      TEXT,                 -- WHERE from: caller's network address; NULL for engine-internal writes
-    row_hash    TEXT                  -- sha256/hmac chain over (prev_hash + this row): tamper-evidence
+    -- sha256/hmac chain over (prev_hash + this row): tamper-evidence. NOT NULL — every row the engine
+    -- writes is chained at INSERT, so an unchained row has no legitimate producer and the column
+    -- refuses one rather than leaving a hole a verify has to interpret (BACKLOG #1198).
+    row_hash    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 
@@ -1771,7 +1845,8 @@ CREATE TABLE IF NOT EXISTS users (
     username             TEXT NOT NULL UNIQUE,
     auth_provider        TEXT NOT NULL,        -- 'local' | 'ad'
     display_name         TEXT,
-    email                TEXT,
+    email                TEXT,                 -- BACKLOG #1139: the PROFILE address / directory mirror. Overwritten from the directory `mail` attribute on every AD login. NOT the notification target.
+    notify_email         TEXT,                 -- BACKLOG #1139: the ENGINE-OWNED notification address. Seeded once at creation; thereafter written only by set_user_notify_email, which cannot express a clear. The directory sync never touches it.
     disabled             INTEGER NOT NULL DEFAULT 0,
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
@@ -2208,7 +2283,6 @@ class MessageStore:
         # the cipher carries no bound (keyless / `vault_transit`).
         await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
         await (
             store._load_state_cache()
@@ -2381,35 +2455,11 @@ class MessageStore:
                 )
         self._reference_cache = cache
 
-    async def _backfill_audit_chain(self) -> None:
-        """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent).
-
-        Only rows missing a hash are filled, chained from the prior row — existing valid hashes are
-        left untouched (so this can't silently re-bless a tampered row)."""
-        cur = await self._db.execute(
-            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log ORDER BY id"
-        )
-        prev = ""
-        updates: list[tuple[str, int]] = []
-        for r in await cur.fetchall():
-            if r["row_hash"]:
-                prev = r["row_hash"]
-                continue
-            prev = audit_row_hash(
-                prev,
-                ts=r["ts"],
-                actor=r["actor"],
-                action=r["action"],
-                channel_id=r["channel_id"],
-                detail=r["detail"],
-                client=r["client"],
-            )
-            updates.append((prev, r["id"]))
-        if updates:
-            async with self._lock:
-                await self._db.executemany("UPDATE audit_log SET row_hash=? WHERE id=?", updates)
-                await self._commit()
+    # `_backfill_audit_chain` was deleted with BACKLOG #1198. It filled `row_hash` on audit rows
+    # written before hash-chaining existed. At zero deployments no such row exists, so the method was a
+    # compatibility path for a population that was never created, and it was the one audit-row UPDATE a
+    # reader had to read the guard of before believing the log is append-only. Do not reintroduce it:
+    # `row_hash` is NOT NULL, so the rows it existed to repair can no longer be written at all.
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark and, for a FRESH encrypted store, auto-enable
@@ -2846,7 +2896,27 @@ class MessageStore:
         number of values rewritten."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
-            return 0  # identity cipher (no key) — nothing to rotate
+            # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
+            # and the comment named only the harmless one. IdentityCipher means NO key is
+            # configured, so there is genuinely nothing to rotate and 0 is the truthful answer.
+            # Any OTHER non-AesGcmCipher -- today TransitCipher, whose keys live in Vault --
+            # HOLDS keys this loop cannot rewrite, and answering 0 there made
+            # `messagefoundry rotate-key` print "OK: re-encrypted 0 value(s) under the active
+            # key" and exit 0 having rotated nothing. A rotation that silently rotates nothing
+            # is precisely what 11.2.2's "keys replaceable with data re-encrypted" clause exists
+            # to prevent, and on a first deployment an operator would believe it.
+            #
+            # NotImplementedError deliberately: `messagefoundry rotate-key` already catches it,
+            # prints the message and exits 2, so the refusal reaches the operator as an error
+            # rather than as a success with a zero in it.
+            if not isinstance(cipher, IdentityCipher):
+                raise NotImplementedError(
+                    f"{type(cipher).__name__} cannot re-encrypt store values in place: its keys"
+                    " are held by the provider, not by this engine, so rotation happens at the"
+                    " provider. Reporting 0 rewritten values here would be indistinguishable"
+                    " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
+                )
+            return 0  # identity cipher (no key) -- nothing to rotate
         # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
         # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Rotation rewrites everything NOT already under this
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
@@ -3216,8 +3286,10 @@ class MessageStore:
                 await db.execute(f"ALTER TABLE messages ADD COLUMN {column} {decl}")
         cur = await db.execute("PRAGMA table_info(audit_log)")
         audit_cols = {row["name"] for row in await cur.fetchall()}
-        if "row_hash" not in audit_cols:
-            await db.execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT")
+        # There is deliberately NO `row_hash` ADD COLUMN here. It existed for stores written before
+        # hash-chaining; the column is now NOT NULL in `_SCHEMA` and an ALTER cannot add a NOT NULL
+        # column to a populated SQLite table without a default, so the shim and the constraint are
+        # mutually exclusive. The constraint is the one worth having (BACKLOG #1198).
         # ADR 0150 client attribution: a pre-existing DB's audit_log predates the column. NULL on every
         # existing row is CORRECT (their address was never captured) *and* is what keeps their row_hash
         # valid — audit_row_hash omits the 7th element entirely when client is None.
@@ -3264,6 +3336,15 @@ class MessageStore:
                 "UPDATE users SET password_claimed_at = password_changed_at"
                 " WHERE must_change_password = 0 AND password_hash IS NOT NULL"
             )
+        # The engine-owned notification address (BACKLOG #1139). NULL on an existing row would read as
+        # "no address on file", which excludes the account from every out-of-band security notice — so
+        # the ADD is paired with a one-time seed from the column that IS the notification target today.
+        # The seed MUST stay inside this creation guard: hoisted out it becomes a permanent SECOND
+        # writer, and every directory login would then copy the directory's address back over the
+        # engine's, restoring the exact defect the split removes.
+        if "notify_email" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN notify_email TEXT")
+            await db.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         # Step B adds the routed stage, which carries the handler to run in queue.handler_name. A
         # Step-A DB's queue table predates the column — ALTER it in (NULL on existing ingress/outbound
         # rows is correct). The queue table always exists here (CREATE IF NOT EXISTS ran in _SCHEMA).
@@ -7563,16 +7644,24 @@ class MessageStore:
                 key=_key,
                 mac=_mac,
             )
-            await self._db.execute(
+            ins = await self._db.execute(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
                 " VALUES (?,?,?,?,?,?,?)",
                 (now, actor, action, channel_id, detail, client, row_hash),
             )
+            row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             await self._commit()
         # Tee off-box AFTER commit (only forward what truly persisted) and OUTSIDE the lock (a
         # synchronous syslog send must never hold the write lock or block the event loop under it).
         emit_audit_tee(
-            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+            action=action,
+            actor=actor,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            ts=now,
+            row_id=row_id,
+            row_hash=row_hash,
         )
 
     async def list_audit(
@@ -7972,16 +8061,17 @@ class MessageStore:
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
-                "INSERT INTO users (id, username, auth_provider, display_name, email, disabled,"
-                " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+                "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
+                " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
                 " must_change_password, failed_attempts, locked_until)"
-                " VALUES (?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
                 (
                     user_id,
                     username,
                     auth_provider,
                     display_name,
                     email,
+                    seed_notify_email(email),
                     now,
                     now,
                     password_hash,
@@ -8062,11 +8152,33 @@ class MessageStore:
         email: str | None,
         now: float | None = None,
     ) -> None:
+        """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
+        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        #1139). Adding that column to this SET list would hand the directory the notification target
+        back and restore the defect the split removes."""
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
+            )
+            await self._commit()
+
+    async def set_user_notify_email(
+        self, user_id: str, *, email: str, now: float | None = None
+    ) -> None:
+        """Repoint the account's engine-owned notification address (BACKLOG #1139).
+
+        The parameter is ``str``, so a clear is unrepresentable; :func:`require_notify_email` rejects
+        the whitespace-only string that would mean the same thing. That refusal is the durability rule
+        — see the helper for why it is this rather than a NOT NULL column.
+        """
+        cleaned = require_notify_email(email)
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET notify_email=?, updated_at=? WHERE id=?",
+                (cleaned, now, user_id),
             )
             await self._commit()
 
@@ -9154,12 +9266,30 @@ class MessageStore:
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` —
-        their own retention window, separate from :meth:`purge_message_bodies` because a dead row stays
+        """Null the bodies of dead-lettered rows last updated before ``older_than`` — their own
+        retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
         Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+
+        **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
+        ``ingress`` row and a handler raise the ``routed`` row
+        (:meth:`wiring_runner._apply_router_internal_error` / ``_apply_transform_internal_error``), and
+        both carry the full raw body in ``payload``. Such a row is ``dead``, so it is neither
+        ``pending`` nor ``inflight`` — which makes its message ELIGIBLE for
+        :meth:`purge_message_bodies`. Scoping this purge to ``stage='outbound'`` therefore blanked
+        ``messages.raw`` (the message reads as purged) while a full raw PHI body survived in the queue
+        row with no sweep able to reach it, indefinitely.
+
+        Riding this window is the SYMMETRIC answer rather than a widening of convenience: :meth:`replay`
+        recovers "a dead-lettered ingress/routed row" by re-queueing it in place from its OWN payload,
+        so such a row is replayable-until-purged in exactly the sense that justified giving dead
+        outbound rows a later window than the body. The stage predicate is DROPPED rather than widened
+        to a three-stage list, so a stage added later is covered by construction instead of silently
+        re-opening this gap. The dead-letter VIEW stays outbound-only by design (:meth:`list_dead`,
+        :meth:`replay_dead`): what an operator can enumerate is a separate question from what retention
+        must delete, and an unenumerable body is the stronger reason to bound it.
 
         When blanking a ``dead`` row removes a message's **last** replayable queue row, this also releases
         that message's streaming attachment (#149, ADR 0105 Phase 3a) — the deferred half of the
@@ -9169,7 +9299,13 @@ class MessageStore:
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{destination_name -> cutoff}`` map of
         per-connection overrides: a dead row is purged at its outbound's own cutoff (``float('-inf')`` =
         keep forever) instead of the global ``older_than``; an outbound absent from the map falls back to
-        ``older_than``. Default empty ⇒ a single global cutoff, byte-identical to the prior behaviour."""
+        ``older_than``. Default empty ⇒ a single global cutoff, byte-identical to the prior behaviour.
+        An ingress/routed/response row keys by ``channel_id`` and carries a NULL ``destination_name``, so
+        ``CASE NULL WHEN ...`` never matches a ``WHEN`` arm and it takes the ``ELSE`` — i.e. it always
+        rides the GLOBAL dead-letter window. That is deliberate: ``dead_letter_days`` is declared on an
+        OUTBOUND connection (see ``OutboundConnection``), so honouring an inbound-keyed override here
+        would invent a per-connection semantic no configuration surface declares. Giving these stages
+        their own inbound-keyed override is a separate, unallocated follow-up."""
         now = time.time() if now is None else now
         cutoff_sql, cutoff_params = _qmark_cutoff_case(
             "destination_name", older_than, connection_cutoffs
@@ -9179,15 +9315,18 @@ class MessageStore:
                 await self._db.execute("BEGIN")
                 # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
                 # before blanking, so a shared body outlives its last dead referrer no longer than this.
+                # This one STAYS scoped to outbound, and that is not an oversight: `body_ref` is written
+                # only by _insert_outbound_deliveries, so an ingress/routed/response row always carries an
+                # inline payload and a NULL body_ref. A wider scope here would match nothing extra.
                 await self._release_outbound_body_refs(
                     f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                     (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 cur = await self._db.execute(
                     "UPDATE queue SET payload='', last_error=NULL "
-                    "WHERE stage=? AND status=? AND (payload <> '' OR last_error IS NOT NULL) "
+                    "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
                     f"AND updated_at < {cutoff_sql}",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                    (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
                 # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
@@ -9199,10 +9338,9 @@ class MessageStore:
                 # dead rows already read as non-replayable (payload='' AND body_ref NULL).
                 await self._release_message_attachments(
                     "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0 "
-                    f"WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql} "
+                    f"WHERE q0.status=? AND q0.updated_at < {cutoff_sql} "
                     f"AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
                     (
-                        Stage.OUTBOUND.value,
                         OutboxStatus.DEAD.value,
                         *cutoff_params,
                         OutboxStatus.PENDING.value,

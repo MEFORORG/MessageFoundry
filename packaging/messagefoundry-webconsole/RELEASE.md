@@ -2,12 +2,16 @@
 
 # Release checklist — `messagefoundry-webconsole` (OWNER-ONLY)
 
-> **OWNER-ONLY / outward-facing.** This is the checklist to **publish the second wheel** — everything up
-> to and including the publish button. It is **not automated and deliberately not wired yet**: the engine
-> `[webconsole]` extra is removed, no PyPI-publishing job for this wheel exists, and the compat ranges
-> are unset, because an unpublished dependency would break `uv lock`. Do these steps only when you intend
-> to publish. Until then, the console installs by path (`pip install -e packaging/messagefoundry-webconsole`)
-> and the seam handshake is exercised in CI without any published artifact.
+> **OWNER-ONLY / outward-facing.** This is the checklist for the **engine-side wiring** a console
+> release still needs. **The publish itself is automated and the name is claimed** (corrected
+> 2026-09-03, [BACKLOG #1193](../../docs/BACKLOG.md)): the `release-webconsole` job in
+> [`.github/workflows/release.yml`](../../.github/workflows/release.yml) builds and publishes this wheel
+> on its own `webconsole-v*` tag, and `messagefoundry-webconsole` has been registered on PyPI since the
+> first such release on 2026-07-29. What is still unwired is the **engine** side: the engine
+> `pyproject.toml` declares no `webconsole` extra and the compat ranges are unset, so the pair cannot yet
+> be installed as one. From a checkout the console installs by path
+> (`pip install -e packaging/messagefoundry-webconsole`), and the seam handshake is exercised in CI
+> against the source tree.
 
 Context: the console is a separately-versioned second distribution mounted same-origin onto the engine
 (Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the seam, and the
@@ -16,9 +20,9 @@ The **`ENGINE_UI_SEAM` handshake means the engine and console versions can move 
 compat range** — you do not have to release them lockstep; you must only keep the range and the seam
 integers honest.
 
-The `messagefoundry-harness` `release-harness` job in
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) is the working precedent for a
-second-wheel release job — mirror it (with the console's **own** version, since it is not lockstep).
+The console's own `release-webconsole` job already exists in
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml), modelled on `release-harness`
+but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep with the engine.
 
 ---
 
@@ -41,8 +45,9 @@ second-wheel release job — mirror it (with the console's **own** version, sinc
       webconsole = ["messagefoundry-webconsole>=A,<B"]
       ```
 
-      This is safe to re-add **only after** the wheel exists on the index (a bare/unpublished dep breaks
-      `uv lock`, which is why it is removed today).
+      The wheel **is** on the index, so this dependency resolves. It was removed while the name was
+      unclaimed; re-adding it is the point of this step, and step 3 re-locks to confirm the cycle
+      resolves under both `uv lock` and plain `pip`.
 
 ## 2. Set the package's engine dependency range
 

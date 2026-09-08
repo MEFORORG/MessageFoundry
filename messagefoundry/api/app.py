@@ -69,10 +69,12 @@ from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
+    CSP_HEADER,
+    FRAME_ANCESTORS_CSP,
     HSTS_HEADER,
     HSTS_VALUE,
     SecurityHeaderFloorMiddleware,
-    hsts_applies,
+    hsts_notable,
 )
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
@@ -663,12 +665,18 @@ _BROWSER_ACTIVE_SUBTYPE_TOKENS = ("html", "xml", "script", "svg")
 #: Top-level types that are browser-active whatever the subtype (``multipart/x-mixed-replace`` renders).
 _BROWSER_ACTIVE_TYPES = ("multipart",)
 
-#: The attachment download's Content-Security-Policy (ASVS 1.3.4). ``default-src 'none'`` denies every
-#: subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique opaque
-#: origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
+#: The attachment download's Content-Security-Policy (ASVS 1.3.4 + 3.4.6). ``default-src 'none'`` denies
+#: every subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique
+#: opaque origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
 #: downgrade, the unconditional ``Content-Disposition: attachment`` and the global ``nosniff``, so even
 #: a representation a browser would otherwise treat as markup cannot execute in the application origin.
-_ATTACHMENT_CSP = "default-src 'none'; sandbox"
+#:
+#: ``frame-ancestors 'none'`` is NAMED HERE rather than left to the header floor's appended policy,
+#: because ``frame-ancestors`` takes no fallback from ``default-src``: without it this response -- the
+#: strictest policy the engine writes -- was the one document family carrying no framing decision at
+#: all. The floor's carrier now skips a response whose policy already names the directive, so this
+#: constant is what that response is governed by, and it stays correct if the floor is ever removed.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
 #: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
 #: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
@@ -1285,7 +1293,10 @@ def create_app(
         # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
         # them. Status and body are unchanged: this adds headers only.
         headers = dict(BASELINE_SECURITY_HEADERS)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # ASVS 3.4.6: the floor's frame-ancestors carrier cannot reach this response either, and a
+        # 500 is as navigable as any other, so the same directive is set here by hand.
+        headers[CSP_HEADER] = FRAME_ANCESTORS_CSP
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
@@ -1341,7 +1352,11 @@ def create_app(
         # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
         for name, value in BASELINE_SECURITY_HEADERS:
             response.headers.setdefault(name, value)
-        if hsts_applies(request.url.scheme, exposure_protected):
+        # hsts_notable, NOT hsts_applies: this middleware is the INNERMOST writer, so it wins the
+        # setdefault race against the floor. Leaving the bare scheme test here would put HSTS on
+        # every routed response of the minted-certificate default and the floor could never take it
+        # off again -- the guard has to hold at both emitters or it holds at neither.
+        if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
@@ -1586,6 +1601,11 @@ def create_app(
         # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
         # graph loaded, unlike the connection-scoped cleartext_accepted set below.
         alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
+        # BACKLOG #1004: [secret_rotation] carries the store DEK's calendar-expiry opt-out. Same
+        # stash-or-default pattern — settings-scoped, so this route reports it completely with no graph.
+        secret_rotation_settings = (
+            getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
+        )
         # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
         # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
         # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
@@ -1616,6 +1636,7 @@ def create_app(
                 store,
                 auth_settings,
                 alerts_settings,
+                secret_rotation_settings,
                 cleartext_hops,
                 expired_hops,
                 db_hops,
@@ -3481,9 +3502,9 @@ def create_app(
         # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
-            update={"outbox": outbox, "events": events}
-        )
+        detail = redact_unauthorized(
+            detail, identity, revealed=frozenset({"summary", "metadata"})
+        ).model_copy(update={"outbox": outbox, "events": events})
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)
         if exposed or masked:
@@ -5436,12 +5457,15 @@ def create_app(
         try:
             from messagefoundry_webconsole import assert_engine_seam, mount_ui
         except ImportError as exc:  # pragma: no cover
-            # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste. It named a
-            # `webconsole` EXTRA that does not exist (pyproject deliberately withholds it until the
-            # wheel is published — see the note beside [project.optional-dependencies]),
-            # so the command failed; and an instruction to fetch an UNPUBLISHED distribution name from
-            # a public index is the dependency-confusion surface this cell is about. Point at the path
-            # install, which is what actually works today and resolves no index at all.
+            # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste, so what it
+            # names has to be true. It once named a `webconsole` EXTRA that pyproject does not declare,
+            # so the command simply failed. It now names the DISTRIBUTION, whose name has been
+            # registered on PyPI since 2026-07-29 — a bare-name install of a CLAIMED name resolves to
+            # this project's own wheel, which is what takes it out of dependency-confusion territory.
+            # The previous wording here said to "point at the path install" while the string beneath it
+            # already named the distribution; the comment is corrected rather than the string (BACKLOG
+            # #1193). tests/test_install_instruction_provenance.py holds that classification and fails
+            # if this drifts back to an extra that does not exist or a name nobody has claimed.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
                 "distribution: `pip install messagefoundry-webconsole`, or set [api].serve_ui=false "
@@ -5615,11 +5639,19 @@ async def _assert_security_notice_is_deliverable(
     place the store and the freshly minted bootstrap admin are both in hand -- which is why the
     owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
 
-    **Why deliverability rather than "require an email at creation".** ``update_user_profile`` issues
-    ``UPDATE users SET display_name=?, email=?`` unconditionally on every directory login, so any
-    address a human sets on an AD or OIDC account is overwritten at that holder's next sign-in. A fix
-    resting on an OPERATOR ACTION cannot cover that population; a startup assertion about the state
-    of the table can.
+    **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
+    ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
+    table can. This paragraph used to justify that by saying an address a human sets on an AD or OIDC
+    account is overwritten at the holder's next sign-in, and **BACKLOG #1139 made that half false**:
+    ``update_user_profile`` still issues ``UPDATE users SET display_name=?, email=?`` unconditionally
+    on every directory login, but ``email`` is now the mirror only. The address this check reads --
+    ``notify_email`` -- is engine-owned and named by no directory-sync statement, so a directory login
+    no longer moves it. The conclusion stands on the narrower ground: an operator can still forget,
+    and a first-run bootstrap administrator is still minted with no address at all.
+
+    **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
+    columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
+    the instrument answering the adjacent question (SDS-3.8).
 
     Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
@@ -5635,17 +5667,21 @@ async def _assert_security_notice_is_deliverable(
     if data_class is not DataClass.PHI:
         return
     for user in await store.list_users():
-        if user.disabled or not user.email:
+        if user.disabled or not user.notify_email:
             continue
         if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
             return
     detail = (
-        "no enabled Administrator has an email address, so every out-of-band security notice about "
+        "no enabled Administrator has a notification address, so every out-of-band security notice about "
         "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
         "early when the recipient has no address). The [alerts] SMTP transport being configured "
         "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
         "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
-        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false. "
+        "(On a NEW install, `messagefoundry provision-admin --username <name> --email <address>` "
+        "before the first serve avoids this state entirely -- BACKLOG #1136. It is not a fix for "
+        "the instance that just refused: it declines once an enabled Administrator exists, which "
+        "by this point one does.)"
     )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
@@ -6143,6 +6179,10 @@ def create_managed_app(
             # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
             # for a monitoring signal, and byte-identical to before.
             app.state.cert_monitor_settings = cert_monitor_settings
+            # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
+            # None (direct create_app / embedding) leaves the route on shipped defaults, which report
+            # nothing — correct, because an app built without [secret_rotation] has not opted out.
+            app.state.secret_rotation_settings = secret_rotation_settings
             # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
