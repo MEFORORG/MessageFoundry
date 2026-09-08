@@ -39,10 +39,25 @@ paragraphs above spell out the loss and not only the replacement.
 
 It does NOT regression-cover wall #1 (executor) or wall #2 (pool) as REAL curves: at small N on
 SQLite the pool wall is a documented no-op and the executor is under-threshold — stated honestly here.
-The Postgres CI leg (pool_size forced to 1-2) gives the acquire-wait wall real small-N coverage.
+The Postgres CI leg gives the acquire-wait wall its real small-N coverage. It forces the pool to 4,
+NOT 1-2: ``.github/workflows/ci.yml`` sets ``MEFOR_STORE_POOL_SIZE: "4"`` on the ``postgres-store``
+job, and the comment above it records that "4 (not 1-2) is deliberate". That job runs ``pytest
+tests/test_connscale_postgres.py -v``. Its ``if`` is ``schedule || workflow_dispatch || merge_group
+|| serverdb == 'true'``, so an ordinary push build does not run it.
 
-A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``connscale-smoke`` profile
-(N=50/100), run via the ``--connscale`` CLI in CI, is the larger-N variant.
+A small N (12 to 24) keeps this module inside the pytest-timeout budget. THE SHIPPED
+``connscale-smoke`` PROFILE (N=50/100) IS NOT A CI VARIANT, AND THIS DOCSTRING USED TO SAY IT WAS
+(BACKLOG #1419). No workflow invokes it, and ``--connscale`` occurs nowhere under ``.github/``. The
+measurement is at ``harness/load/profiles/connscale-smoke.toml:6-12``; its ``description`` field and
+``tests/test_connscale_empty_claims_per_msg.py`` agree. Read it there, not here.
+
+CI'S CONNECTION-SCALE COVERAGE IS THIS MODULE'S OWN INLINE N=12/24 SWEEP. The whole-suite step
+``Tests (pytest)`` (``id: tests`` in ``ci.yml``) collects it. This file is not in
+``tests/tooling_manifest.txt``, and ``tests/conftest.py`` derives the ``tooling`` mark from that
+manifest by basename, so ``-m 'not tooling'`` does not filter it out. That step's ``if`` is ``code ==
+'true' || push || workflow_dispatch || merge_group``, so a pull request touching no code skips the
+step, and this coverage does not happen. Wiring a real N=50/100 leg up is PERF-36, named at
+``connscale-smoke.toml:11-12`` and stranded with the master-test-plan directory described above.
 """
 
 from __future__ import annotations
@@ -65,7 +80,11 @@ from harness.load.connscale.report import (
     ConnScaleReport,
     herd_floor_readings,
 )
-from harness.load.connscale.runner import _MONOTONIC_TOLERANCE, run_connscale
+from harness.load.connscale.runner import (
+    _MIN_IN_HOLD_SAMPLES,
+    _MONOTONIC_TOLERANCE,
+    run_connscale,
+)
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
     INBOUND_PORT_LO,
@@ -476,6 +495,31 @@ def test_the_sweep_produces_one_record_per_mode_and_count(smoke_report: ConnScal
         ("fixed_per_conn", 12),
         ("fixed_per_conn", 24),
     }
+
+
+def test_every_step_took_at_least_two_in_hold_samples(smoke_report: ConnScaleReport) -> None:
+    """BACKLOG #1430, END TO END: the hold must produce a WINDOW, not a point.
+
+    Every rate and every peak this record carries is derived from the step's in-hold readings, and a
+    step that took one reading has a window of zero width -- ``_empty_claim_rates`` and
+    ``_throughput_rates`` then reach two samples only by counting the post-drain final, and
+    ``in_pipeline_peak`` and the wall #1/#2 peaks are each a single instant wearing the word "peak".
+    That was the state in 20 of 20 cells, and NOTHING FAILED ON IT: no test asserted a floor on the
+    sample count, and ``report.py``'s diagnostic text calls a low probe-tick count "a coarse gauge,
+    not a fault". This assertion is what makes the state visible.
+
+    It is asserted HERE, on a real sweep, as well as at the loop in
+    ``tests/test_connscale_sample_floor.py``. The unit tests pin the floor's mechanism against a fake
+    poller; only a live cell can show that the cadence survives an engine, a driver, an OS probe and a
+    mid-hold reload probe all competing for the same host."""
+    for r in smoke_report.records:
+        assert r.in_hold_samples >= _MIN_IN_HOLD_SAMPLES, (
+            f"{r.sweep_mode}@N={r.count} took {r.in_hold_samples} in-hold sample(s), under the floor "
+            f"of {_MIN_IN_HOLD_SAMPLES}. Every window derived from this step spans a single reading "
+            f"(BACKLOG #1430). The floor supplied {r.in_hold_floor_ticks} of them, and the FD probe "
+            f"read {r.fd_probe_degraded_ticks}/{r.fd_probe_ticks} tick(s) degraded "
+            f"{tuple(r.fd_probe_degraded)}."
+        )
 
 
 def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None:

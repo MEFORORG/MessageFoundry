@@ -68,6 +68,7 @@ from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
     SecretRotationRunner,
     SecretStamp,
+    enforce_store_key_expiry,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
@@ -1065,6 +1066,26 @@ class Engine:
                     log.exception(
                         "secret-rotation stamp reconcile failed; continuing with config dates"
                     )
+                # ASVS 13.3.4 / BACKLOG #1004 — the DEK's CALENDAR expiry refusal, and its placement is
+                # the control. It sits OUTSIDE the `except Exception` directly above ON PURPOSE: that
+                # handler's entire body is a log call, so a refusal raised beneath it would be logged
+                # and stepped over, and the engine would start normally on an expired key. A gate a
+                # handler swallows is a traceback, not a control. From here it propagates out of
+                # Engine.start() and aborts the ASGI lifespan.
+                #
+                # It also covers the SECOND-ORDER swallow: when the reconcile above fails, the stamps
+                # stay empty, so a gate written to read them would silently not fire. An undetermined
+                # age REFUSES rather than reading as a young one (the item's ruling). `cipher_info()`
+                # is re-read rather than hoisted so the reconcile's own guarded call keeps its
+                # behaviour; if it were to fail here the engine refuses to start, which is the
+                # fail-closed direction.
+                enforce_store_key_expiry(
+                    self._secret_rotation_settings,
+                    self._secret_rotation_stamps,
+                    enforcement=self._security_enforcement,
+                    dek_key_id=self.store.cipher_info().active_key_id,
+                    alert_sink=self._alert_sink,
+                )
             self._secret_rotation_runner = SecretRotationRunner(
                 self._tracked_secrets,
                 self._secret_rotation_settings,
