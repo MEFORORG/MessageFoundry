@@ -47,6 +47,7 @@ from typing import Any
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from messagefoundry.api.header_floor import CSP_HEADER, FRAME_ANCESTORS_CSP
 from messagefoundry.netaddr import client_network_allowed
 
 _log = logging.getLogger(__name__)
@@ -79,13 +80,29 @@ _DENIAL_HEADERS = {
     # UiSecurityHeadersMiddleware, so set the baseline directly rather than ship a 403 with none of
     # them. api.header_floor.SecurityHeaderFloorMiddleware is registered further out still and
     # setdefaults the same names, so these are now a belt to its braces — and it, not this dict, is
-    # what supplies the Strict-Transport-Security a static header set cannot decide on.
+    # what supplies the Strict-Transport-Security a static header set cannot decide on. The floor
+    # ALSO appends a frame-ancestors policy, but only where none is present: both denial arms below
+    # name the directive in their own CSP, so what a denial serves is that policy and not a second
+    # one (ASVS 3.4.6).
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
     "Cache-Control": "no-store",
     DENIAL_HEADER: DENIAL_MARKER,
 }
+
+#: The denial page's own policy. Self-contained page, no external assets: a locked-out browser cannot
+#: fetch /ui/static either (this gate covers the mount), so anything external would 403. ``default-src
+#: 'none'`` means NO script can run at all; ``style-src 'unsafe-inline'`` is for the one inline
+#: ``<style>`` block and carries no injection surface -- the whole page is engine-authored and the
+#: single interpolated value is an HTML-escaped address that has already been rejected as an IP by the
+#: matcher. ``frame-ancestors`` is appended from the shared constant (ASVS 3.4.6) because it takes no
+#: fallback from ``default-src``: an engine-authored page naming the operator's own configuration key
+#: is worth denying to a framing attacker, and this response short-circuits every /ui CSP writer.
+_DENIAL_HTML_CSP = f"default-src 'none'; style-src 'unsafe-inline'; {FRAME_ANCESTORS_CSP}"
+#: The JSON arm carried NO policy at all until ASVS 3.4.6. A 403 JSON body is still a navigable
+#: document, so it gets the same deny-everything policy without the style carve-out the page needs.
+_DENIAL_JSON_CSP = f"default-src 'none'; {FRAME_ANCESTORS_CSP}"
 
 _DENIAL_HTML = """<!doctype html>
 <meta charset="utf-8">
@@ -181,16 +198,7 @@ class ClientNetworkMiddleware:
             response = HTMLResponse(
                 _DENIAL_HTML.format(observed=_escape(observed)),
                 status_code=403,
-                headers={
-                    # Self-contained page, no external assets: a locked-out browser cannot fetch
-                    # /ui/static either (this gate covers the mount), so anything external would 403.
-                    # default-src 'none' means NO script can run at all; style-src 'unsafe-inline' is
-                    # for the one inline <style> block and carries no injection surface — the whole
-                    # page is engine-authored and the single interpolated value is an HTML-escaped
-                    # address that has already been rejected as an IP by the matcher.
-                    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
-                    **_DENIAL_HEADERS,
-                },
+                headers={CSP_HEADER: _DENIAL_HTML_CSP, **_DENIAL_HEADERS},
             )
         else:
             response = JSONResponse(
@@ -206,7 +214,7 @@ class ClientNetworkMiddleware:
                     "observed_client": host,
                 },
                 status_code=403,
-                headers=dict(_DENIAL_HEADERS),
+                headers={CSP_HEADER: _DENIAL_JSON_CSP, **_DENIAL_HEADERS},
             )
         await response(scope, receive, send)
 
