@@ -25647,6 +25647,37 @@ I read only `roles/` in the vault and ran no git history there, so I cannot date
 
 
 
+## 1462. RETIRED -- folded into BACKLOG #1460, which is the primary row for this fix
+
+> 🔢 **Filed and retired in place 2026-09-05.** Value **5/10** · Difficulty **2/10** · _quick win_. The number is kept because commits, a PR title and a claim already cite it; the banner and fields stay exactly as filed, per the retire-in-place convention this ledger uses.
+
+**RETIRED IN PLACE.** Superseded by BACKLOG #1460, which was filed as the primary row for the same fix and carries the joint measurement set. This row SHOULD NOT BE BUILT.
+
+**Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Coordination prose read at dispatch time. No engine behaviour, no shipped artifact, no PHI.
+
+### Why it was retired rather than deleted
+
+Two rows describing one fix is the ledger decay this fleet spent 2026-09-05 correcting -- three rows read "not started" over shipped work and cost three sessions a wrong premise. #1460 was allocated first, as the primary, with the fuller scope. Adding a second row for the same sentence would have been a fresh instance of the defect being fixed.
+
+Deleting the number was not an option: `git log` carries it, PR 937's title cites it, and `claim.ps1` holds it. A deleted number turns those into citations that resolve to nothing, and the day someone re-allocates 1462 they start resolving to unrelated work.
+
+### The risk this retirement takes, stated plainly
+
+**BACKLOG #1460 is not on `main`.** It lives on `origin/builder-seat-name-filing` behind PR 936, open and unmerged; both its heading and #1461's were verified there. **If PR 936 is rejected outright, #1460 never exists and this retirement stranded the only surviving row for work that shipped.** That is the accepted trade, not an overlooked one. PR 936 should land before PR 937 so the citation resolves.
+
+### What shipped under this number, so the record is not empty
+
+PR 937 repaired both of the dispatch gate's seat maps: `CLOSING_SEAT` in `scripts/docs/backlog_status_check.py` (3 of 4 values named the ASVS Tracker, the Liaison or the Dispatcher) and `GATED_VERDICTS` in `scripts/coord/dispatch_gate.py` (the Liaison in both values, the Dispatcher in one). Reach, measured by calling `judge()` over each of `origin/main`'s 434 rows: ASVS Tracker 97, LIAISON 35, Dispatcher 33 -- 132 distinct rows, 130 open.
+
+The stale `BUILDER.md:253` and `:148` citations became quotes of their claims; the file lives in the vault, so no checkout of this repository could ever have resolved them, and `citation_line_check.py` refuses bare filenames besides. Two paired regression arms walk both maps, mutation-tested three ways.
+
+**Severity bound, so #1460 is not over-scored:** replacing every value in both maps changes the gate level on **0** rows, against 161 for the positive control of emptying `BUILDER_CLOSABLE_ACTS`. No workflow and no pre-commit hook invokes `dispatch_gate.py`. This was stale prose with a tool as its delivery channel.
+
+### A correction to this row's first version
+
+It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live playbook sources". **That was wrong.** `.github/workflows/backlog-hygiene.yml` and CLAUDE.md section 5's Builder row AGREE -- both put the `docs/BACKLOG.md` edit in the same PR that carries the code, and that PR is the Builder's. The source that disagrees is the vault `roles/BUILDER.md` line 216, which is stale rather than live, because section 5 replaced the method those lines assume. The vault half is #1461. Left to #1460 either way, but for the right reason.
+
 ## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
 
 > 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
