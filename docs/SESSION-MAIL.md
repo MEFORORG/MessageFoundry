@@ -337,10 +337,13 @@ that the message cap is the one that binds. That derivation is the correction BA
 - `announce-session.ps1` folds and caps every peer-supplied field through its `Get-Clean` helper, at
   caps of 16, 24, 40, 60, 80, 160 and 200 characters. 2,000 bytes is ten times the largest
   peer-authored string this repo renders anywhere else.
-- `docs/STEERING.md` -- the entire document for the sibling steering channel -- is **3,504 bytes**. A
-  2,000-byte message is over half a complete document. Anything larger is a document: write it to a
-  file in your worktree and mail the path. That is the same answer the content rule above gives, so
-  the two rules pull in the same direction.
+- `docs/STEERING.md` -- the entire document for the sibling steering channel -- is **4,240 bytes**,
+  measured 2026-09-06 on a CRLF checkout. A 2,000-byte message is about half a complete document.
+  Anything larger is a document: write it to a file in your worktree and mail the path. That is the
+  same answer the content rule above gives, so the two rules pull in the same direction. (It read
+  **3,504** when this line was written -- the same instrument, at `HEAD` before BACKLOG #1424 added
+  two bullets to that page. The denominator moves here too; re-measure rather than quoting either
+  number.)
 - **5 messages** because it caps ONE INJECTION, and an injection is what a reader pays for in context.
   The asymmetry decides the exact number: an over-tight cap costs one turn of delay, an over-loose one
   spends the recipient's context with no undo. (The rationale this replaced -- "a box accumulates only
