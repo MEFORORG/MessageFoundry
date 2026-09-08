@@ -26216,7 +26216,7 @@ Name the ref (`git log ... origin/main --`) and confirm ancestry with `git merge
 
 ---
 
-## 1490. unread-signal.yml spends 440 runner-minutes a day reporting on a review gate that no longer exists, and it is DISABLED MANUALLY right now
+## 1490. unread-signal.yml takes a runner SLOT on every workflow completion, reporting on a review gate that no longer exists, and it is DISABLED MANUALLY right now
 
 > 🔢 **Filed 2026-09-08 -- the workflow is already off; the tree does not say so.** Owner
 > ruling 2026-09-08: turn it off. Done the same hour with `gh workflow disable unread-signal.yml`,
@@ -26232,26 +26232,51 @@ Name the ref (`git log ... origin/main --`) and confirm ancestry with `git merge
 > closing the gap between a disabled workflow and a tree that still shows it live. Difficulty
 > 4 -- twelve coupled files, two of them test manifests that fail loudly if a name is missed.
 
-### What was measured, 2026-09-08, over the CT day so far
+### THE FIRST FILING OF THIS ROW CITED 440 RUNNER-MINUTES A DAY. THAT NUMBER WAS WRONG.
 
-Completed runs only, duration taken as `updated_at - run_started_at`, summed per workflow:
+It came from `updated_at - run_started_at` at the RUN level, which is wall-clock **occupancy**, not
+work. Under runner starvation occupancy is mostly the starvation itself, so the figure was largely
+measuring the queue this workflow was waiting in. Corrected the same day, after a peer session
+pulled job-level data and inverted the conclusion; re-measured here independently before amending.
 
-| workflow | wall-clock min | runs | avg s |
-|---|---|---|---|
-| CI | 475 | 26 | 1097 |
-| **unread signal** | **440** | **125** | **211** |
-| Security | 210 | 32 | 393 |
-| quality-advisory | 142 | 7 | 1215 |
+**The old metric is self-refuting, and this is the cheapest way to see it.** Twelve completed runs
+per workflow, run-level occupancy against the sum of `completed_at - started_at` over each run's
+jobs:
 
-Signal and notice workflows together were **474 of 1870 minutes, 25.3%**. `unread signal` alone is
-**23.5%**, second only to CI, and it finished more runs than every other workflow combined.
+| workflow | run-min (occupancy) | job-min (work) | jobs | wait |
+|---|---|---|---|---|
+| CI | 568.0 | 635.2 | 142 | **-11.8%** |
+| unread signal | 308.1 | **2.8** | 10 | 99.1% |
+| failure signal | 10.8 | 0.1 | 1 | 99.2% |
+| Security | 318.9 | 52.3 | 84 | 83.6% |
+| quality-advisory | 439.0 | 234.8 | 84 | 46.5% |
+| CLA Assistant | 107.1 | 1.7 | 12 | 98.5% |
 
-### Why the volume is structural, not a spike
+**CI's job-minutes EXCEED its wall-clock**, because its jobs run in parallel. A metric that can be
+exceeded by the work it claims to measure was never measuring work. That row is the control, and
+nothing about it needed a second opinion.
 
-It fires on `workflow_run: completed`. Every CI, Security, CodeQL or backlog-hygiene run that
-finishes starts one. So a single push costs about seven CI runs **and** about seven signal runs, and
-the signal half scales with the CI half forever. Ten pushes in forty minutes on 2026-09-08 put 73
-runs in the queue against 3 running.
+**What `unread signal` actually costs: 2.8 job-minutes across 12 runs, about 17 seconds of work
+each.** Cutting every signal and notice workflow saves well under 1% of runner time, not the 25%
+the first filing implied.
+
+### The real cost is SLOTS, and that argument is unchanged
+
+A job holds a runner slot whatever its duration, and slots are what the merge queue competes for.
+`unread signal` fires on `workflow_run: completed`, so every CI, Security, CodeQL or
+backlog-hygiene run that finishes starts one: a single push costs about seven CI runs **and about
+seven signal runs**, and the signal half scales with the CI half forever. Ten pushes in forty
+minutes on 2026-09-08 put 73 runs in the queue against 3 running.
+
+**So the decision to disable it stands on the SLOT argument, not on the minutes argument.** State
+it that way in anything citing this row. Relieving the merge queue and saving compute are two
+different rankings and they disagree; this row is the first.
+
+**A larger win sits next door and is NOT this row's to take.** `Security` runs ten near-trivial
+jobs, roughly 4.3 job-minutes against 126 queue-minutes per run, and is about a fifth of every slot
+contended for. Consolidating those ten into two or three composite jobs would cut that pressure
+**without removing a single scan** -- same coverage, same seven required contexts, fewer slots.
+Attributed to a peer session's 7-day job-level census, not re-measured here.
 
 ### The gate it was built for is gone, confirmed three ways
 
