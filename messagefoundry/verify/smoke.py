@@ -10,24 +10,66 @@
 * store     — open the configured store backend and confirm it connects (no writes beyond the
   idempotent schema-ensure ``open_store`` already does).
 
-Synthetic HL7 only (the engine's own generators) — never real PHI.
+Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
+the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
 """
 
 from __future__ import annotations
 
-import importlib
 import socket
+import ssl
+from typing import Final
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.tls_policy import (
+    harden_cipher_suites,
+    harden_kex_groups,
+    harden_verify_flags,
+)
 from messagefoundry.verify.model import CheckResult, Status
+
+#: The smoke message, segment by segment.
+#:
+#: **Why it is a literal.** The deployment verifier is the one tool an operator runs on a real box,
+#: so anything it imports is functionality that install is required to carry. Generating the message
+#: pulled the whole ``messagefoundry.generators`` package — development tooling — into the verifier's
+#: runtime dependency set. Inlining removes that edge. Nothing else under ``messagefoundry/verify/``
+#: touches the generators, and ``tests/test_verify.py`` pins that.
+#:
+#: **Where it came from.** ``generate_message("ADT", "A01", 0)`` from the engine's own ADT generator
+#: at ``744a7a434``, verbatim, except that every person name was replaced with the ``ZZZTEST`` family
+#: so an operator who finds this message in their own store reads it as a probe rather than a
+#: patient. The edited form was re-checked through the generator's compliance gate and hl7apy strict
+#: validation at 2.5.1 before being pasted here, and ``tests/test_verify.py`` re-runs that validation
+#: on every test run — so the literal cannot rot into a non-conformant message unnoticed.
+#:
+#: Every value is fabricated: the demographics come from the generator's synthetic pools, the phone
+#: sits in the reserved 555-01xx fictional range, and MSH-10 carries the tool's own ``MEFOR`` prefix.
+#: No real PHI (CLAUDE.md section 9).
+_SYNTHETIC_ADT_A01_SEGMENTS: Final[tuple[str, ...]] = (
+    r"MSH|^~\&|ADT|MAINHOSP|PHARMACY|MAINHOSP|20260202114200||ADT^A01^ADT_A01"
+    r"|MEFORADTA0100000|P|2.5.1",
+    "EVN|A01|20260202114200||||20260202114200",
+    "PID|1||6824181^^^HOSP^MR||ZZZTEST^SYNTHETIC^C||20081018|U|||"
+    "26 HILLCREST AVE^^CLAYTON^MO^63105^USA||(834)555-0120|||||V2167387^^^HOSP^AN",
+    "NK1|1|ZZZTEST^KINONE|CHD^Child^HL70063",
+    "NK1|2|ZZZTEST^KINTWO|FND^Friend^HL70063",
+    "PV1|1|R|MATERNITY^412^B^SOUTH||||1008^ZZZTEST^PROVONE|||URO|||||||1006^ZZZTEST^PROVTWO"
+    "||V2167387^^^HOSP^VN|||||||||||||||||||||||||20260202114200",
+    "PV2|||R07.9^Chest pain unspecified^I10",
+    "DB1|1|PT",
+    "DB1|2|PT",
+    "OBX|1|NM|8302-2^Body height^LN||170|cm|||||F",
+    "AL1|1|DA^Drug allergy^HL70127|SULFA^Sulfa drugs^L|MO",
+)
+
+#: ``\r``-delimited with a trailing ``\r``, the form the generator emits and an MLLP frame carries.
+SYNTHETIC_ADT_A01: Final[str] = "\r".join(_SYNTHETIC_ADT_A01_SEGMENTS) + "\r"
 
 
 def synthetic_message() -> str:
-    """One conformant synthetic ADT^A01 (no PHI) from the engine's generators."""
-    importlib.import_module("messagefoundry.generators.all_types")  # registers built-in types
-    from messagefoundry.generators import _core
-
-    return _core.generate_message("ADT", "A01", 0)
+    """One conformant synthetic ADT^A01 (no PHI). See :data:`SYNTHETIC_ADT_A01`."""
+    return SYNTHETIC_ADT_A01
 
 
 def smoke_self(
@@ -61,15 +103,7 @@ def smoke_self(
             Status.FAIL,
             f"config failed to load: {exc}",
         )
-    try:
-        msg = synthetic_message()
-    except Exception as exc:  # generator failure is a tool/install problem
-        return CheckResult(
-            "smoke.self",
-            "Self smoke (dry-run routing)",
-            Status.ERROR,
-            f"could not generate a synthetic message: {exc}",
-        )
+    msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
     except ValueError as exc:  # ambiguous/unknown inbound
@@ -119,13 +153,68 @@ def _ack_code(frame: bytes) -> str | None:
     return None
 
 
-def smoke_live(*, host: str, port: int, message: str, timeout: float = 10.0) -> CheckResult:
-    """MLLP-send ``message`` to the running engine and confirm an AA ACK."""
+def live_smoke_ssl_context(*, ca_file: str | None = None) -> ssl.SSLContext:
+    """The client TLS context for a live smoke against a ``tls = true`` MLLP inbound (BACKLOG #1178).
+
+    Hardened the same way every other context the engine builds is: a TLS 1.2 floor, the approved
+    key-exchange groups, the forward-secrecy assertion (ASVS 12.1.2) and strict RFC 5280 validation
+    (ASVS 12.1.4). Inheriting the interpreter's defaults without asserting them is the residual the
+    hardening helpers exist to close, and a verifier is not exempt from it.
+
+    ``ca_file`` anchors the engine's certificate when it is not in the system trust store, which is
+    the usual case: the engine mints a self-signed pair on first run (ADR 0172). There is
+    deliberately **no** verify-off switch — a smoke that accepts any certificate proves the port
+    answers, not that the hop is the engine, and this whole item is about not weakening a hop to
+    make a test pass."""
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = True
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="verify live smoke")  # forward secrecy (ASVS 12.1.2)
+    harden_verify_flags(ctx)  # strict RFC 5280 validation of the engine cert (ASVS 12.1.4)
+    return ctx
+
+
+def smoke_live(
+    *,
+    host: str,
+    port: int,
+    message: str,
+    timeout: float = 10.0,
+    ssl_context: ssl.SSLContext | None = None,
+    server_hostname: str | None = None,
+) -> CheckResult:
+    """MLLP-send ``message`` to the running engine and confirm an AA ACK.
+
+    ``ssl_context`` makes the smoke speak the protocol the target inbound speaks (BACKLOG #1178,
+    ASVS 12.3.1). Without it this call writes a whole MLLP frame — a synthetic message body, but a
+    body — onto a bare socket before it has any evidence the peer is a cleartext listener. ``None``
+    keeps that plaintext path, which is correct for a plaintext inbound and only for one.
+
+    The switch is the caller's to make and is never inferred: probing in the clear and retrying over
+    TLS (or the reverse) is exactly the protocol fall-back 12.3.1 forbids, so a mismatch fails and
+    says so instead."""
     frame = b"\x0b" + message.encode("utf-8") + b"\x1c\x0d"
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(frame)
-            reply = _recv_mllp(sock, timeout)
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            # Handshake FIRST when TLS is asked for, so no application byte can precede it.
+            # wrap_socket detaches `raw`, so the outer context manager's close is a no-op and the
+            # descriptor is closed exactly once, by the inner one.
+            sock = (
+                raw
+                if ssl_context is None
+                else ssl_context.wrap_socket(raw, server_hostname=server_hostname or host)
+            )
+            with sock:
+                sock.sendall(frame)
+                reply = _recv_mllp(sock, timeout)
+    except ssl.SSLError as exc:  # an OSError subclass, so it must be caught before the arm below
+        return CheckResult(
+            "smoke.live",
+            "Live smoke (MLLP + ACK)",
+            Status.FAIL,
+            f"TLS handshake with the engine inbound at {host}:{port} failed: {exc}",
+        )
     except OSError as exc:
         return CheckResult(
             "smoke.live",
@@ -148,12 +237,21 @@ def smoke_live(*, host: str, port: int, message: str, timeout: float = 10.0) -> 
             Status.FAIL,
             f"engine NAK'd the message: MSA-1={code}",
         )
-    return CheckResult(
-        "smoke.live",
-        "Live smoke (MLLP + ACK)",
-        Status.FAIL,
-        f"no parseable ACK from {host}:{port} ({len(reply)} bytes received)",
-    )
+    detail = f"no parseable ACK from {host}:{port} ({len(reply)} bytes received)"
+    if not reply and ssl_context is None:
+        # A TLS listener handed a cleartext MLLP frame fails the handshake and closes, so the
+        # client sees an accepted connection and zero bytes — indistinguishable, from here, from a
+        # plaintext listener that hung up. Name the possibility rather than act on it: switching
+        # protocols on this evidence is the fall-back ASVS 12.3.1 forbids, and the operator knows
+        # which one their inbound is.
+        detail += (
+            "; the listener accepted the connection and closed without a byte, which is also what "
+            "a tls = true MLLP inbound does to a cleartext frame. If this inbound is TLS, the "
+            "synthetic message has already crossed in the clear; re-run with --smoke-tls (and "
+            "--smoke-tls-ca for a self-signed engine certificate). The smoke never retries over "
+            "TLS on its own"
+        )
+    return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, detail)
 
 
 def check_store_connectivity(store: StoreSettings) -> CheckResult:

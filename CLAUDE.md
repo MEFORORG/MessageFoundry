@@ -338,6 +338,29 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
    at spawn, because no hook will invent a goal, by design: a machine that invents one writes a
    record that looks declared and says nothing.
 
+6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
+   the tree before you act on it: read the diff of **every PR it names**, at hunk granularity, and
+   re-locate every line number by symbol. **Where the brief and the tree disagree, the tree wins.**
+   ***Do not scope this check to how recently the brief was written.*** Two windows give the same
+   symptom and **the wider one dominates**: a brief goes stale AFTER dispatch, in minutes, and it is
+   written stale because the ITEM it was cut from is stale, over weeks. A Manager seat reported six
+   of eleven briefed items already answered at spawn on 2026-09-04 -- by an ADR accepted before the
+   brief, by work shipped under a different number, by a PR the item itself says not to rebuild.
+   **Attributed, not verified here.** The structural cause is that an item records its own research
+   and nothing records the work that ANSWERS it, so a settled row still reads as current.
+   **Line numbers are navigation aids and never evidence** -- the same seat measured four anchors
+   adrift by 50, 86, 581 and 593 lines in one day, one item with both of its anchors dead.
+   Measured here 2026-09-04, the after-dispatch window: a chip named three drift sites, and minutes
+   later the spawner took item 3 itself and pushed it as `c2f549f42` on PR 837. The receiver read
+   that diff before touching anything, saw both hunks already rewritten, and skipped it. Trusting
+   the brief would have put two PRs on the same two comment blocks, to meet at merge with the Lander
+   resolving prose by hand. **Two of the same brief's other three items also failed to survive a
+   read of their sources**, so one confirmed drift is a reason to re-check the rest, not to correct
+   that line and carry on. ***"The brief is disposable" above says it may be thrown away; it does
+   not say it was true when written.*** **Finding an item already answered is a GOOD outcome** --
+   record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
+   as #1391.
+
 ### The Console plans, spawns, and holds the owner's attention
 
 - **Plan first, then spawn.** For anything past a trivial change the Console produces a plan and
@@ -349,6 +372,13 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
 - One brief per Builder. After about two failed attempts at the same problem, spawn a fresh Builder
   with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
+- **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
+  update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
+  started one stays live and frozen around your stale text, and no channel carries the correction.
+  Say which item is already done and where it landed. **This binds whichever seat dispatched, not
+  only the Console:** any seat can raise a chip, and in the 2026-09-04 case above the spawner was
+  the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
+  still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
 - Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
   `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
   PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
@@ -381,16 +411,43 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
 - Rules a Builder needs belong in the **account's** `settings.json`, outside git.
   `.claude/settings.json` is tracked, and every worktree carries its own copy from its own branch, so
   an uncommitted edit to the primary checkout reaches nothing else.
-- Read a role playbook from the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault
-  commit `5e361756`). That exception covers `roles/` and nothing else in that tree: the rest of the
-  checkout sits on a branch that is not an ancestor of `origin/main`, and an `ls` of a directory is
-  not evidence that you have a file.
+- Read a role playbook from the **`wshallwshall/korus`** repository, and read it at `origin/main`
+  rather than out of a working tree. Owner ruling 2026-09-04.
+
+      git -C <korus clone> fetch origin
+      git -C <korus clone> show origin/main:roles/BUILDER.md
+
+- **SUPERSEDED 2026-09-05, recorded rather than deleted because seats still quote it.** This line
+  named the `MessageFoundry-vault` primary's `roles/` folder (owner ruling, vault commit
+  `5e361756`).
+- **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
+  warned that a checkout is not a ref. Both halves were right and the first one won.
+- **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
+  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  on `origin/main`.
+- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+  is not evidence that you have a file, and a missing file is the quietest failure in this list.
+- **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
+  two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and
+  this line was not changed until 2026-09-06, so every seat in between read a stale copy and no
+  gate reported it.
 
 ### Branch, commit one layer, open the PR
 
-- **Never arm auto-merge.** Enqueuing is the Console's call and merging is the Lander's. Auto-merge
-  fires on the head it saw, so a later push is dropped: the PR reads MERGED, the branch stays alive,
-  and nothing reports a problem.
+- **"Merge when ready" is the ENQUEUE action here and is permitted. Arming auto-merge on a branch
+  that would merge WITHOUT the queue stays forbidden.** Enqueuing is still the Console's call and
+  merging still the Lander's — that division is unchanged. What changed is the reading of the
+  button: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue
+  entry rather than merging on green. **Owner ruling 2026-09-05**, given when a seat stopped and
+  asked rather than guess which of the two operations it was.
+
+  **The hazard this bullet was written against is KEPT, not deleted, because nobody has measured it
+  under a queue.** It read, in full: *"Never arm auto-merge. Auto-merge fires on the head it saw, so
+  a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports a
+  problem."* Whether a QUEUED entry does that when its branch is pushed underneath it is
+  **unmeasured** — what is measured on this repository is eviction and group rebuild, which is a
+  different event with a different cause. Until somebody watches a push land under a live entry, the
+  safe course is to dequeue before pushing, and the claim above must not be read as covering it.
 
 - Work on a feature branch and open a PR. Commit at logical stops, **one coherent layer per commit**,
   with clear messages. Direct pushes to `main` stay blocked by the harness.
@@ -611,15 +668,29 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 
   **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
   is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
-  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
-  recorded here so nobody re-derives the false zero that stalled this question once already: 496
-  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
-  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
-  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
-  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
-  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
-  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
-  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+  anywhere; it is decoration, which the rule above forbids outright. Retiring it is **BACKLOG #1265**,
+  a filed migration — *not* a licence to start editing the lines that remain, and not a cp1252 hazard
+  (the cp1252 gate covers `scripts/**/*.py`, which contains none of them).
+
+  **The measured population is recorded here so nobody re-derives the false zero that stalled this
+  question once already. Censused over git-tracked files at `172b1327c`: 496 occurrences across 75
+  files, and 479 across 70 once #1265's first slice landed.** That slice was the five shipped operator
+  docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — now at zero
+  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left: 430 under `docs/`
+  (127 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 38 in `docs/adr/`), 26 in `harness/`, 10 in
+  `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across repository-root and
+  `.github/` files, and **zero in `scripts/` and in this file**. Those buckets sum to the total; the
+  filed table's did not.
+
+  **Two rows of the filed table were instrument errors, both SDS-3.8.** It read the web console as
+  zero by counting `packaging/`; the console's source is `messagefoundry_webconsole/`, which carries
+  **2**. And it had no `harness/` row at all, so **26** occurrences sat outside every bucket while the
+  buckets still printed a confident total.
+
+  **Census this population only with the ledger counts as a positive control** — the first attempt
+  returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere is
+  indistinguishable from a clean repo. `docs/BACKLOG.md` at 127 and `BACKLOG-CLOSED.md` at 93 are that
+  control: an instrument that cannot find those proves nothing by returning zero anywhere else.
 
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
   re-derive it.** It *defines* item status — the banner block ends at the first line that is neither

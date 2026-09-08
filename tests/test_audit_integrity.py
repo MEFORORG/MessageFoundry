@@ -83,21 +83,34 @@ async def test_tail_truncation_caught_only_with_external_anchor(store: MessageSt
     assert not ok and "anchor" in (message or "")  # the external anchor does
 
 
-async def test_backfill_chains_legacy_unhashed_rows(tmp_path: Path) -> None:
-    db = tmp_path / "legacy.db"
-    store = await MessageStore.open(db)
+async def test_row_hash_is_not_nullable_so_an_unchained_row_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1198: the schema refuses an unchained audit row instead of leaving a hole a verify has
+    to interpret.
+
+    This replaced ``test_backfill_chains_legacy_unhashed_rows``, which proved the deleted
+    ``_backfill_audit_chain`` could repair rows written before hash-chaining existed. That population
+    was never created (zero deployments), and the constraint is the stronger end state: the rows the
+    backfill existed to fix can no longer be inserted at all, so the engine's audit-write path holds no
+    UPDATE a reader has to check the guard of."""
+    store = await MessageStore.open(tmp_path / "notnull.db")
     try:
-        # Simulate rows written before hash-chaining: row_hash NULL.
-        for i in range(3):
+        # POSITIVE CONTROL: the same INSERT with a hash present must succeed, or the refusal below
+        # could be any other schema error and would prove nothing about row_hash.
+        await store._db.execute(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
+            " VALUES (?,?,?,?,?,?)",
+            (1.0, "u", "chained", None, None, "0" * 64),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
             await store._db.execute(
                 "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
                 " VALUES (?,?,?,?,?,NULL)",
-                (float(i), "u", "legacy", None, None),
+                (2.0, "u", "unchained", None, None),
             )
-        await store._db.commit()
-        await store._backfill_audit_chain()
-        ok, _ = await store.verify_audit_chain()
-        assert ok  # backfill established a continuous chain over the legacy rows
+        # And the deleted repair path is really gone, not merely unused.
+        assert not hasattr(store, "_backfill_audit_chain")
     finally:
         await store.close()
 

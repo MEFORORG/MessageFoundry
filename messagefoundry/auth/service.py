@@ -107,6 +107,65 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
 
+#: ASVS 6.3.8 — the fixed budget every FAILED authentication response is held to, so the branch a
+#: challenge took cannot be read off its latency (BACKLOG #1140). Successes are never padded: a valid
+#: credential already tells the caller the account exists, and enumeration is about telling two
+#: FAILURES apart.
+#:
+#: 0.5 s is sized from measurement, not taste. Measured 2026-09-05 in-process against a real SQLite
+#: store, warmed and interleaved, 25 samples per branch: every local failure branch lands at 46-50 ms
+#: median with a p90 of 57 ms, dominated by the one argon2id verify (~40 ms at the pinned t=3, 64 MiB,
+#: p=4 parameters). 0.5 s is roughly 9x that p90, which leaves room for a slower CPU and for the
+#: `_argon2_sem` queue under a login flood. It is a MODULE constant rather than an operator setting on
+#: purpose: an operator who could lower it could silently disable the control, and no site-specific
+#: fact the right value depends on is left unfixed by the argon2 parameters.
+_FAILURE_BUDGET_SECONDS = 0.5
+
+#: Per-process, per-seam latch for the budget-overrun warning. Deliberately module-level and not
+#: per-instance: the warning reports that THIS DEPLOYMENT's budget is too small for its hardware,
+#: which is a fact about the process, not about one service object. One warning per seam per process
+#: — the login surface is unauthenticated, so warning on every overrun would be the same unbounded
+#: log amplifier the rate-limited audit paths already exist to avoid.
+_BUDGET_OVERRUN_WARNED: set[str] = set()
+
+
+def _failure_deadline(started: float, now: float, budget: float | None = None) -> float:
+    """The instant a failed challenge that began at ``started`` is allowed to answer.
+
+    Returns the first whole multiple of ``budget`` after ``started`` that is strictly later than
+    ``now`` — normally the first slot, since the budget is sized above every failure branch.
+
+    **The quantization is the fail-SAFE, and it is why this is not simply ``started + budget``.** A
+    pad that gives up once the work has outrun its budget fails open exactly when it matters: under
+    the load that made the work slow, the raw elapsed goes back on the wire. Rounding up to the next
+    slot instead means an overrun discloses only WHICH SLOT the work landed in, never the elapsed
+    itself, and it cannot fail open at all — the returned deadline is always strictly ahead of ``now``.
+
+    Quantizing does mean a pair of branches that straddle a slot boundary stay distinguishable, and
+    more visibly than their raw few-millisecond gap would be. That is not extra disclosure: a slot
+    index is a lossy function of the elapsed, so it cannot carry more than the elapsed already did,
+    and the budget is sized so that every branch lands in slot 1 with an order of magnitude to spare.
+
+    ``budget`` reads :data:`_FAILURE_BUDGET_SECONDS` at CALL time when omitted, so a test can lower
+    it; it must be > 0. ``now`` before ``started`` (a clock that ran backwards — ``time.monotonic``
+    does not, but a caller can still hand one in) collapses to slot 1 rather than to a past deadline.
+    """
+    span = _FAILURE_BUDGET_SECONDS if budget is None else budget
+    slots = max(1, int((now - started) // span) + 1)
+    return started + slots * span
+
+
+async def _sleep_until(deadline: float) -> None:
+    """Await until the monotonic instant ``deadline``, returning at once if it has already passed.
+
+    A named module-level function so the pad has exactly one sleep site to audit, and so a test can
+    replace it and read back the deadline a seam computed without paying a wall-clock wait.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
 # Global safety bound on outstanding single-use per-action step-up grants (ADR 0077). Each grant is
 # consumed on the next matching sensitive request (or expires with the step-up window), so the live set
 # is normally tiny; this only caps a pathological accumulation. On overflow the OLDEST grant is evicted
@@ -204,6 +263,23 @@ class BootstrapAdmin:
     expires_at: float | None = None
 
 
+class FirstAdministratorRefused(RuntimeError):
+    """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
+
+
+@dataclass(frozen=True)
+class ProvisionedAdministrator:
+    """The outcome of an offline first-administrator provision (BACKLOG #1136).
+
+    ``repaired`` distinguishes a fresh provision from completing one an earlier run left half-written,
+    so the CLI can say which happened rather than reporting both as "created".
+    """
+
+    user_id: str
+    username: str
+    repaired: bool
+
+
 @dataclass(frozen=True)
 class CustomRoleInfo:
     """An admin-defined custom role and its resolved permission subset (ADR 0045)."""
@@ -278,19 +354,7 @@ class AuthService:
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
         # email push (the audited /me/security-events feed still records everything). Best-effort.
         self._security_notifier = security_notifier
-        self._policy = PasswordPolicy(
-            min_length=settings.password_min_length,
-            require_uppercase=settings.password_require_uppercase,
-            require_lowercase=settings.password_require_lowercase,
-            require_digit=settings.password_require_digit,
-            require_symbol=settings.password_require_symbol,
-            check_breached=settings.password_check_breached,
-            check_context=settings.password_check_context,
-            check_username=settings.password_check_username,
-            breach_corpus_file=settings.password_breach_corpus_file,
-            lockout_threshold=settings.lockout_threshold,
-            lockout_minutes=settings.lockout_minutes,
-        )
+        self._policy = PasswordPolicy.from_settings(settings)
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
         if ldap is not None:
             self._ldap: LdapAuthenticator | None = ldap
@@ -617,14 +681,163 @@ class AuthService:
                 return candidate
         return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
 
-    async def _other_enabled_admin_exists(self, exclude_id: str) -> bool:
-        """True iff some enabled administrator other than ``exclude_id`` exists."""
+    async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
+        """True iff some enabled administrator other than ``exclude_id`` exists.
+
+        ``exclude_id`` is optional so :meth:`has_enabled_administrator` can ask the unrestricted
+        question without a sentinel value.
+        """
         for user in await self._store.list_users():
             if user.disabled or user.id == exclude_id:
                 continue
             if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
                 return True
         return False
+
+    async def has_enabled_administrator(self) -> bool:
+        """True iff some enabled account holds Administrator.
+
+        Delegates rather than re-looping, so the provisioning refusal below and the WP-3 supersession
+        test share ONE definition of "an enabled account holding Administrator" and cannot drift
+        apart. (Three further open-coded copies of that enumeration already exist -- see
+        :meth:`has_notifiable_admin` -- and unifying them is its own item, not this one.)
+        """
+        return await self._other_enabled_admin_exists()
+
+    async def provision_first_administrator(
+        self,
+        *,
+        username: str,
+        password: str,
+        display_name: str | None = None,
+        notify_email: str | None = None,
+        actor: str,
+    ) -> ProvisionedAdministrator:
+        """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        THIS IS THE "NOT PRESENT" ARM OF ASVS 6.3.2, and it is the half that has to exist before the
+        other half can be built. The verb asks that default user accounts "are not present in the
+        application or are disabled". The disabled arm is unexpressible at two altitudes --
+        ``Store.create_user`` carries no ``disabled`` parameter and all three backends hardcode the
+        column -- so the honest route is that no account is minted at all until an operator names one.
+        An operator who runs this before the first ``serve`` gets an install with no account named
+        ``admin``, because :meth:`_ensure_bootstrap_admin` then sees a non-empty table and declines.
+
+        **The way in is filesystem authority over the store, not an account** -- the host gate argued
+        once on :func:`messagefoundry.__main__._admin_unlock` and in ADR 0171, and not restated here.
+
+        **THE REFUSAL ASKS FOR AN ENABLED ADMINISTRATOR, NOT AN EMPTY TABLE, AND THE DIFFERENCE IS
+        THIS ITEM'S OWN NAMED RISK.** ``count_users() == 0`` is safe only while nothing else can put
+        the first row in; a directory sign-in can. ``_upsert_ad_user`` calls ``create_user`` and
+        assigns no role, so one completed sign-in leaves a roleless row, a non-empty table, and no
+        administrator -- reached entirely through shipped code. A command guarded on emptiness would
+        refuse exactly there, which is the state where the install has no way in. That refusal is
+        wider than the bootstrap guard by design: it makes this a standing recovery path whenever
+        every administrator is lost, which overlaps BACKLOG #1236's subject on the same host boundary.
+
+        **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
+        The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
+        "the holder set their own credential" is already true and ``users.password_claimed_at`` is
+        stamped here rather than deferred to a forced rotation. ASVS 6.4.6's one-time temp governs an
+        admin-ISSUED credential handed to a second party; there is no second party here. The stamp is
+        also load-bearing against WP-3: an operator who names this account ``admin`` would otherwise
+        satisfy :meth:`_unclaimed_bootstrap`, and the retirement sweep would disable the only
+        administrator on the deployment at ``bootstrap_expiry_hours``.
+
+        **EVERY INTERRUPTION POINT LEAVES A RECOVERABLE STORE, and the test for that is HOLDS NO
+        ROLES -- one signal, chosen because it is the only one true at both of them.** The row is
+        created with no password hash, then the credential is set, then the role is assigned, so the
+        two states a crash can leave are *no hash, no roles* and *hash, no roles*. An earlier draft
+        also refused a stamped ``password_claimed_at``, which is set by the credential write: that
+        refused the SECOND state, leaving a row this command could never complete and WP-3 could never
+        retire -- a stranded install, which is exactly the risk the design exists to avoid. Roleless
+        is also what makes the takeover safe rather than merely convenient: the account holds no
+        permission to inherit, and this branch is reachable only when the store has no enabled
+        administrator at all, which is already the state an operator needs recovering from.
+
+        Not reused from :meth:`create_local_user`, which does the same four writes: that method
+        creates WITH a hash and forces a rotation, and the ordering above is a durability property
+        rather than a preference. The divergence is deliberate and is recorded in ADR 0183.
+
+        Raises :class:`FirstAdministratorRefused` on every declined case, with operator-facing text.
+        """
+        username = username.strip()
+        # Normalized ONCE, so the three later readers cannot disagree about what "an address was
+        # supplied" means: a whitespace-only --email must not reach `users.email` untrimmed on the
+        # create, and must not audit as `"notified": true`.
+        notify_email = (notify_email or "").strip() or None
+        if not username:
+            raise FirstAdministratorRefused("a username is required and must not be blank")
+        if await self.has_enabled_administrator():
+            raise FirstAdministratorRefused(
+                "this store already has an enabled Administrator, so there is nothing to provision "
+                "-- create further accounts from the web console, and use `admin-unlock` if the "
+                "administrator is locked out"
+            )
+        violations = self._policy.violations(password, username=username)
+        if violations:
+            raise FirstAdministratorRefused("; ".join(violations))
+
+        existing = await self._store.get_user_by_username(username)
+        repaired = existing is not None
+        if existing is not None:
+            # A directory identity draws its authority from the directory, so it is never promoted
+            # here whatever its role state -- provision a separate local account instead.
+            if existing.auth_provider != AuthProvider.LOCAL.value:
+                raise FirstAdministratorRefused(
+                    f"{username!r} is a {existing.auth_provider} account -- provision a separate "
+                    "local administrator under a different name"
+                )
+            # Refused rather than re-enabled: an operator who disabled this account did so on
+            # purpose, and silently reviving it under a new credential is not a recovery.
+            if existing.disabled:
+                raise FirstAdministratorRefused(
+                    f"the account named {username!r} is disabled -- re-enable it from the web "
+                    "console, or provision under a different username"
+                )
+            if await self._store.get_user_role_ids(existing.id):
+                raise FirstAdministratorRefused(
+                    f"an account named {username!r} already exists and holds roles -- choose "
+                    "another username"
+                )
+            user_id = existing.id
+        else:
+            user_id = uuid4().hex
+            await self._store.create_user(
+                user_id=user_id,
+                username=username,
+                auth_provider=AuthProvider.LOCAL.value,
+                display_name=display_name,
+                # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column the
+                # PHI security-notice start gate reads.
+                email=notify_email,
+                # No hash yet, deliberately: an account with no credential cannot be signed into, so
+                # the window before `set_password` below admits nobody. The flag is therefore
+                # unobservable until that write, which is what actually decides it.
+                password_hash=None,
+                must_change_password=True,
+            )
+        await self._seed_roles()
+        await self._store.set_password(
+            user_id,
+            password_hash=await self._argon2(hash_password, password),
+            must_change_password=False,
+        )
+        if notify_email is not None:
+            # Unconditional rather than fresh-path-only, because the invariant "the supplied address
+            # always lands" is simpler than the case analysis. On the fresh path `create_user` already
+            # seeded the same value; on a REPAIRED row an earlier run created the account, so this
+            # write is the only one that carries it.
+            await self._store.set_user_notify_email(user_id, email=notify_email)
+        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        await self._audit(
+            "auth.first_administrator_provisioned",
+            actor=actor,
+            detail=_json(
+                {"username": username, "repaired": repaired, "notified": bool(notify_email)}
+            ),
+        )
+        return ProvisionedAdministrator(user_id=user_id, username=username, repaired=repaired)
 
     async def _unclaimed_bootstrap(self) -> UserRecord | None:
         """The first-run bootstrap admin while it is still present, enabled and **never claimed** —
@@ -733,7 +946,73 @@ class AuthService:
 
     # --- login ---------------------------------------------------------------
 
+    async def _equalize_failure(
+        self, outcome: LoginOutcome, started: float, *, seam: str
+    ) -> LoginOutcome:
+        """Hold a FAILED ``outcome`` until this challenge's deadline, then return it unchanged.
+
+        ASVS 6.3.8 asks that valid users not be deducible from failed challenges, *including by
+        different response times*. Messages and status codes on the challenge seams are already
+        collapsed; this closes the remaining channel by making every failure answer at an instant
+        fixed before dispatch, so the latency is a function of ``started`` and nothing else — not of
+        which branch ran, and so not of anything about the username.
+
+        **Successes return unpadded, deliberately.** A valid credential has already told the caller
+        the account exists; enumeration is about telling two FAILURES apart, and padding the success
+        path would only make every real sign-in slower.
+
+        **Exceptions propagate unpadded, also deliberately.** An unhandled store or directory error
+        becomes a 500, which is a far louder signal than any timing difference, so padding it would
+        buy nothing while delaying a genuine fault.
+
+        The pad is an ``asyncio.sleep``, so it holds a connection open but never the event loop; the
+        sign-in rate limiter bounds how many a caller can hold at once.
+        """
+        if outcome.ok:
+            return outcome
+        now = time.monotonic()
+        elapsed = now - started
+        if elapsed > _FAILURE_BUDGET_SECONDS and seam not in _BUDGET_OVERRUN_WARNED:
+            # The budget is too small for this hardware, so failures are landing in a later slot than
+            # the control assumes. It still cannot fail open (`_failure_deadline` always rounds up),
+            # but a pair of branches straddling the slot boundary would stay distinguishable.
+            _BUDGET_OVERRUN_WARNED.add(seam)
+            _log.warning(
+                "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
+                "responses are being padded to a later slot (further overruns are not logged)",
+                seam,
+                elapsed,
+                _FAILURE_BUDGET_SECONDS,
+            )
+        await _sleep_until(_failure_deadline(started, now))
+        return outcome
+
     async def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        provider: AuthProvider = AuthProvider.LOCAL,
+        client: str | None = None,
+    ) -> LoginOutcome:
+        """The credential sign-in seam, with every failed outcome held to a fixed deadline.
+
+        A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
+        added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
+
+        **The inner method is ``_dispatch_login`` and NOT ``_login``, which is load-bearing.**
+        ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine returning a
+        ``LoginOutcome`` as a per-provider authentication pathway owing a comparative-strength row in
+        ``docs/SECURITY.md`` (ASVS 6.1.3). Naming this one ``_login`` would have made a pure
+        refactoring look like a new pathway and forced that guard to be loosened to accommodate it —
+        which is how a guard stops catching the thing it was built for. Staying out of the namespace
+        keeps ``_login*`` meaning exactly what it meant.
+        """
+        started = time.monotonic()
+        outcome = await self._dispatch_login(username, password, provider=provider, client=client)
+        return await self._equalize_failure(outcome, started, seam="login")
+
+    async def _dispatch_login(
         self,
         username: str,
         password: str,
@@ -926,6 +1205,34 @@ class AuthService:
         return attempts, locked_until is not None
 
     async def authenticate_kerberos(
+        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+    ) -> LoginOutcome:
+        """The browser/API Windows-SSO seam, with every failed outcome held to a fixed deadline.
+
+        **This is the SECOND challenge seam, and siting the pad here is what covers it** (BACKLOG
+        #1140). ``GET /ui/sso`` calls this method directly and never touches :meth:`login`, so a pad
+        on the sign-in seam alone would have left this one open; putting it on the service method
+        rather than in the route means every caller inherits it, the JSON API leg included.
+
+        **What the pad buys here.** The route already collapses every reject to one 303 to
+        ``/ui/login?e=sso_failed``, so latency was the last channel separating them: an unresolvable
+        principal costs a directory search, a like-named local account costs that search plus a store
+        lookup, a directory outage costs the full ``ad_connect_timeout``, and "SSO is not configured"
+        costs nothing. They now answer together.
+
+        **What it does NOT buy, and this is the honest limit.** The attacker does not choose the
+        username on this path — SPNEGO supplies it from a ticket the KDC issued — so equalizing these
+        branches is not username enumeration protection in 6.3.8's sense. What it removes is a caller
+        learning, about the one principal it can present, which of the reject branches it landed in.
+        It also does not cover ``kerberos_available == False``: the route redirects with a *different*
+        error code before reaching the service, and that is a server-wide configuration fact,
+        identical for every principal and already disclosed in the redirect.
+        """
+        started = time.monotonic()
+        outcome = await self._authenticate_kerberos(token, client=client, seed_reauth=seed_reauth)
+        return await self._equalize_failure(outcome, started, seam="kerberos")
+
+    async def _authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
     ) -> LoginOutcome:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
@@ -3240,19 +3547,59 @@ class AuthService:
                 return True
         return False
 
+    async def _revoke_ad_sessions(self) -> int:
+        """Revoke every live session held by a directory account. Returns the number revoked.
+
+        BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
+        the group maps resolve to role sets and to channel scope, which is exactly what an
+        authorization decision reads. Every SIBLING mutator already revokes -- :meth:`set_roles`,
+        :meth:`set_channel_scope`, custom-role update and delete, disable, password reset -- so an
+        edit here was the one that did not apply until the affected principals happened to log in
+        again. On a first deployment that would leave a session running on the pre-edit mapping for
+        as long as it stayed alive, which the requirement's first arm ("applied immediately") does
+        not allow and which no mitigating control covered.
+
+        **Scoped to AD accounts, and deliberately not narrowed further.** Resolving which principals
+        a map edit actually affects would mean re-binding to the directory, and both a removed
+        mapping and an added one change an outcome, so the affected set is not derivable from the
+        entries alone. Local accounts read neither map and are left alone.
+
+        Enumerates the way the reconciler does -- ``list_users`` filtered on provider and disabled,
+        then ``list_sessions`` -- so this needs no schema change on any backend. Unlike the
+        reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
+        a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
+        """
+        revoked = 0
+        for user in await self._store.list_users():
+            if user.auth_provider != AuthProvider.AD.value or user.disabled:
+                continue
+            if not await self._store.list_sessions(user.id):
+                continue
+            revoked += await self._store.revoke_user_sessions(user.id)
+        return revoked
+
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
+        """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
         await self._store.set_ad_group_role_map(entries)
+        revoked = await self._revoke_ad_sessions()
         await self._audit(
-            "ad_group_map.updated", actor=actor, detail=_json({"count": len(entries)})
+            "ad_group_map.updated",
+            actor=actor,
+            detail=_json({"count": len(entries), "sessions_revoked": revoked}),
         )
 
     async def set_ad_group_scope_map(
         self, entries: Sequence[tuple[str, str]], *, actor: str
     ) -> None:
-        """Replace the AD-group → channel-scope map (C3). Takes effect on each AD user's next login."""
+        """Replace the AD-group → channel-scope map (C3). Revokes directory sessions so it applies
+        at once. This docstring used to end "Takes effect on each AD user's next login", which was
+        an accurate description of the defect BACKLOG #1154 names and is no longer true."""
         await self._store.set_ad_group_scope_map(entries)
+        revoked = await self._revoke_ad_sessions()
         await self._audit(
-            "ad_group_scope_map.updated", actor=actor, detail=_json({"count": len(entries)})
+            "ad_group_scope_map.updated",
+            actor=actor,
+            detail=_json({"count": len(entries), "sessions_revoked": revoked}),
         )
 
     # --- audit ---------------------------------------------------------------

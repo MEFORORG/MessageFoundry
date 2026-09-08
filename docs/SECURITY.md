@@ -69,6 +69,32 @@ auto-retirement is not the only way to lose an administrator: the failed-attempt
 bootstrap login is refused like any other invalid credential and the retirement is audited
 (`auth.bootstrap_admin_retired`).
 
+### Provisioning the first administrator instead (ASVS 6.3.2)
+
+**Run `messagefoundry provision-admin --username <name> --email <address>` before the first `serve`
+and no bootstrap admin is ever created** — the seeding above fires only on an empty user table, so an
+operator-named administrator pre-empts it and the account named `admin` never exists. That is the
+"not present" arm of ASVS 6.3.2, and it is why the command exists
+([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md),
+BACKLOG #1136). **The shipped default is unchanged:** skip this and you still get the bootstrap
+account described above.
+
+Four properties are load-bearing rather than incidental:
+
+- **The gate is host access**, the same one `messagefoundry admin-unlock` ships on
+  ([ADR 0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)):
+  the service config, the store path and, on an encrypted store, the key material. Nothing is
+  reachable over the network.
+- **The password is read from a terminal.** There is deliberately no `--password` and no
+  `--password-file`: either would put a standing Administrator credential in argv or on disk, so
+  unattended provisioning is refused rather than given a hatch.
+- **It refuses when an enabled Administrator already exists** — not merely when the table is empty,
+  because a directory sign-in can fill the table without producing an administrator.
+- **The credential is claimed at creation**, so the account is a normal administrator from birth and
+  WP-3 auto-retirement never applies to it, even under the name `admin`.
+
+Re-running with the same username completes a provision an earlier run left half-written, and says so.
+
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
 An administrator (`users:manage`) recovers a locked-out or compromised **local** account with
@@ -540,7 +566,7 @@ PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `
 them carry an explicit PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3
 and `POST /uploads/{id}/resend`) return no body content of their own.
 
-**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least ten more** emit PHI. ⚠️ **This is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine `core.get_message` detail and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are those passing `phi=True` to `require_ui` / `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`) **or** that reach `enforce_phi_read_pacing` some other way — a reused engine handler that paces in its own body (`search_messages` / `layered_search` / `browse_uploaded_file`), or a console route that charges it inline on a short-circuit render (BACKLOG #1025). Known today:
+**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least ten more** emit PHI. **CAUTION: this is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine `core.get_message` detail and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are those passing `phi=True` to `require_ui` / `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`) **or** that reach `enforce_phi_read_pacing` some other way — a reused engine handler that paces in its own body (`search_messages` / `layered_search` / `browse_uploaded_file`), or a console route that charges it inline on a short-circuit render (BACKLOG #1025). Known today:
 `GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/parse-tree`,
 `/ui/messages/{id}/attachments/{id}`, `/ui/messages/{id}/edit`, `POST /ui/messages/{id}/edit-resend`,
 `GET /ui/messages/search`, `/ui/messages/search/layered`, `/ui/dead-letters` and
@@ -737,14 +763,32 @@ the same permission set on the same method reds CI until it is listed here.
 
 > **Per-channel scoping (DLQ-SCOPE).** Operational permissions can be confined to a set of
 > connections per user via `users.channel_scope` (`PUT /users/{id}/channel-scope`; `null` = all,
-> the default). When a user is scoped, `messages:read/view_raw/replay`, dead-letter list/replay, and
-> `connections:control` are restricted to their channels (out-of-scope message access returns 404 to
-> avoid leaking existence; connection control returns 403; denials are audited `auth.channel_denied`).
-> **Administrators are always all-channels.** Monitoring dashboards stay global. A channel-scoped user
+> the default). When a user is scoped, **at least** `messages:read/view_raw/replay`, dead-letter
+> list/replay, `connections:control` and both monitoring permissions are restricted to their channels
+> (out-of-scope message access returns 404 to avoid leaking existence; connection control returns 403;
+> denials are audited `auth.channel_denied`). The scoped set is whichever route narrows on
+> `Identity.can_access_channel`, not a fixed list — treat the names here as examples, not an
+> enumeration. **Administrators are always all-channels.** A channel-scoped user
 > **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit their
 > scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on login the
 > group-derived scope is persisted and stale sessions revoked. It's opt-in — with no matching mapped
 > group, the user's existing scope (all by default) is left untouched.
+>
+> **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
+> caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
+> return only their own inbound connections, and every **shared outbound** is suppressed outright
+> rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
+> an outbound spans channels and its state can reflect another channel's downstream.
+> `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
+> What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
+> `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
+> whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
+> `GET /metrics` is the exception in the other direction: the Prometheus exposition is keyed by
+> connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
+> holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
+> This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
+> route above against a scoped caller with an unscoped caller as the control, and reds if the prose
+> and the app disagree.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
@@ -837,8 +881,8 @@ The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery 
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
 clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s step only** — strictest
 replay window, ASVS 6.5.5; set `1`/`2` to restore RFC-6238 ±1 network-delay tolerance, the forward step
-clamped to the current step to avoid a self-inflicted lockout). ⚠️ **Single-use (ASVS 6.5.1) holds only at
-the default `0`.** At `totp_skew_steps >= 1` the clamp records a tolerated *future* code against the
+clamped to the current step to avoid a self-inflicted lockout). **WARNING: single-use (ASVS 6.5.1) holds
+only at the default `0`.** At `totp_skew_steps >= 1` the clamp records a tolerated *future* code against the
 current step, leaving that code's own step unspent — so the **same code verifies a second time** once the
 clock reaches it. That is the cost of the opt-out, and it is why the default is `0`. TOTP is a
 shared-secret factor — L3 *prefers*
@@ -1175,7 +1219,7 @@ same matcher, but deliberately different carve-outs. `[security].allowed_client_
 **operator surface** (JSON API + `/ui` + `/ws/stats`) and **never** restricts an ingest listener;
 loopback is always allowed there. The per-connection `source_ip_allowlist` restricts **one ingest
 listener** and deliberately does **not** inherit the loopback carve-out — an allow-list naming a partner
-must not also admit anything running on the local box. ⚠️ That one is an **`inbound(...)` keyword** (or
+must not also admit anything running on the local box. **NOTE:** that one is an **`inbound(...)` keyword** (or
 the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
 `[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after` and
 `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so
@@ -1254,7 +1298,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **DICOM** — calling AE | the requesting AE's Calling AE Title, at **association negotiation** | `calling_ae_allowlist` set and the title is not in it | **DENY** — the association is rejected by pynetdicom before any C-STORE callback runs (`ae.require_calling_aet`). `None` = any AE the peer-IP allow-list admits |
 | **DICOM** — called AE | the AE Title the peer addressed the association to | not this engine's own `ae_title` | **DENY** at negotiation (`ae.require_called_aet`); **default `require_called_ae_title = true`** |
-| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of a **verifiable** peer control | non-loopback bind with **neither** `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`) **nor** mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`). ⚠️ `calling_ae_allowlist` does **not** satisfy this gate alone (BACKLOG #316): an AE Title is caller-asserted with no cryptographic binding, so it is still enforced as a filter but must be **paired** with one of the two above | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
+| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of a **verifiable** peer control | non-loopback bind with **neither** `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`) **nor** mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`). **NOTE:** `calling_ae_allowlist` does **not** satisfy this gate alone (BACKLOG #316): an AE Title is caller-asserted with no cryptographic binding, so it is still enforced as a filter but must be **paired** with one of the two above | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
 
 > **Telemetry honesty.** The `peer_not_allowlisted` connection event is durable when the connection's
 > `capture_connection_errors` is `true`, **or is unset (`None`, the default) and the
@@ -1746,7 +1790,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
 | `POST /ui/login` | sign-in window | 429 carries `Retry-After: 30` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
-| `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window | one browser login charges it **twice**. ⚠️ The start leg is a **POST** since the ASVS 3.7.3 interstitial: `GET /ui/oidc/start` now renders the "you are leaving this site" page and mints **no** flow, so it charges no limiter — the flow starts only when the operator confirms. |
+| `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window | one browser login charges it **twice**. **Note the verb.** The start leg is a **POST** since the ASVS 3.7.3 interstitial: `GET /ui/oidc/start` now renders the "you are leaving this site" page and mints **no** flow, so it charges no limiter — the flow starts only when the operator confirms. |
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |
 | `POST /me/reauth` | per-actor ceremony budget | |
 | `POST /me/mfa/confirm` | per-actor ceremony budget | |
@@ -1771,10 +1815,10 @@ write) and the two pending-flow caches are **in-process, per API process** — N
 unified store), so they are **shared** by every API process and are **not** multiplied by N. The
 per-uploader file/byte quota is also **not** multiplied by N: it is scoped to the `uploads_dir` (an
 uncached sidecar scan) with its check-then-write held as an atomic reservation on that same unified
-store, so shards sharing one dir enforce one budget between them. The request-body cap and the
-remote-file retrieve bound are **stateless** — a per-request and a per-file test that carry no budget
-at all. An exposed or multi-host deployment must additionally front the API with a proxy/WAF limiter
-and TLS.
+store, so shards sharing one dir enforce one budget between them. The request-body cap, the
+remote-file retrieve bound and the egress response bound are **stateless** — a per-request, a per-file
+and a per-response test that carry no budget at all. An exposed or multi-host deployment must
+additionally front the API with a proxy/WAF limiter and TLS.
 
 | Limit | Setting(s) | Default | Window | Per-user | Global | Per-IP | Scope | On breach |
 |---|---|---|---|---|---|---|---|---|
@@ -1788,6 +1832,7 @@ and TLS.
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
+| Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`, so the message retries and then dead-letters like any other reply the engine could not read; a `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
 | **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, and `connections.toml` desugars through those same factories, so **the code-first and the TOML surface both express them** (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Not covered even when set:** the DICOM C-STORE SCP (a pace-before-decode bound does not transfer to an association), the File / RemoteFile / Database poll sources (they bind nothing and need a per-tick ceiling instead — a different shape), and any per-peer bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
@@ -1863,9 +1908,10 @@ while the chain is still quiesced (a maintenance window, a DB move, a backup/res
 hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
 re-checked against a **running** engine alarms on every boot, because a running engine writes audit
 rows; for continuous coverage the off-box tee is still the control ([BACKLOG #328](BACKLOG.md); the
-`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record). Rows
-written
-before the feature are chained on first start. The `client` address is folded **inside** the chained
+`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record). Every audit row carries a
+`row_hash` from the moment it is written: the column is `NOT NULL` on all three backends and the
+startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
+row it could repair can no longer be written. The `client` address is folded **inside** the chained
 payload — deliberately, since attribution an attacker could rewrite without breaking tamper-evidence
 would be worse than none — as a **conditional trailing element**, appended only when non-`NULL`. A
 row with no client therefore hashes exactly as it did before the column existed, so legacy rows keep
@@ -2010,26 +2056,41 @@ All knobs live in the `[auth]` section of `messagefoundry.toml` (the AD bind pas
 
 ## Supply-chain & CI security
 
-Automated security scanning runs in CI (`.github/workflows/security.yml`), so it lives there
-rather than in the per-author `messagefoundry check` gate:
+Automated security scanning runs in CI ([`.github/workflows/security.yml`](../.github/workflows/security.yml)),
+so the enforced set lives there rather than in the per-author `messagefoundry check` gate. Read that
+workflow for what each job does and whether it blocks;
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) is the authority on which checks
+branch protection requires. At least these run:
 
 - **pip-audit** — audits the **committed lockfile** (`requirements.lock`) for known-CVE dependencies,
-  so the audit is reproducible rather than auditing a fresh latest-resolve (advisory for now).
-- **bandit** — Python SAST over `messagefoundry/` (advisory).
+  so the audit is reproducible rather than auditing a fresh latest-resolve.
+- **bandit** — Python SAST over `messagefoundry/`.
+- **gitleaks** — the secret scan, in the job named `gitleaks (secret scan)`. Its step is *Scan the ref
+  under test for secrets*, and that step's comment states the scan's scope and the reason for it. Read
+  it there; this page does not restate it. A `gitleaks` hook in
+  [`.pre-commit-config.yaml`](../.pre-commit-config.yaml) runs the same tool before a commit. That hook
+  is a local aid, not a second gate: a fresh clone lacks it until `pre-commit install` runs, and
+  `git commit --no-verify` skips it.
+- **SBOMs** — CycloneDX bills of materials for the Python engine, the VS Code extension, and the
+  container image, kept as build artifacts, so "are we exposed to CVE-X?" is answerable from a recorded
+  bill of materials rather than a fresh resolve. Advisory, and generated on a cron rather than per pull
+  request. How they are built, scored, and used: [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) and
+  [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality-gate.md).
 - **Dependabot** (`.github/dependabot.yml`) — weekly PRs for `pip` and `github-actions` updates.
 - A private vulnerability-disclosure policy lives at [`.github/SECURITY.md`](../.github/SECURITY.md).
 
-Enable via **GitHub Advanced Security** in repo settings (they need GHAS on a private repo, so they
-can't be added by file alone): **CodeQL** code scanning and **secret scanning** + push protection.
+**CodeQL** runs from [`.github/workflows/codeql.yml`](../.github/workflows/codeql.yml). This repository
+is public, so CodeQL is free here and needs no GitHub Advanced Security licence. GitHub's own **secret
+scanning** and push protection are repository settings rather than files in the tree. Read the settings
+for their current state; this page does not track them.
 
-**Planned CI additions:**
-
-- **SBOM** — generate a CycloneDX SBOM (e.g. `cyclonedx-py`) from the committed lockfile in CI and keep it
-  as a build artifact, so "are we exposed to CVE-X?" is answerable from a recorded bill of materials rather
-  than a fresh resolve.
-- **Secret-history scan** — a `gitleaks` (or trufflehog) job over the **full git history** in CI, to
-  complement GHAS secret scanning above. Kept in CI rather than a per-author pre-commit hook, to match the
-  pip-audit/bandit stance (one enforced gate, not optional local tooling).
+**What this section used to say, named so a reader who believed it can recognise the shape.** Until
+2026-09-07 it filed the gitleaks and SBOM jobs under "Planned CI additions", called pip-audit and bandit
+advisory, and told the reader to turn CodeQL on through Advanced Security. Every job it named was already
+built, and pip-audit and bandit had stopped being advisory. The gitleaks entry also said the scan was kept
+in CI "rather than a per-author pre-commit hook", while that hook sat pinned in the same tree, and it
+described the scan as covering the full git history, which BACKLOG #1479 changed. Corrected under
+BACKLOG #1485.
 
 ### Dependency lockfile (DEP-1)
 
