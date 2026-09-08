@@ -25824,6 +25824,125 @@ I did not read gitleaks' source, so "walks every ref when the flag is unset" res
 
 
 
+## 1480. an append that absorbs the next item heading deletes an item with every ledger gate green -- compare the ranked table's rows against the parsed items
+> 🔢 **Filed 2026-09-07 (youthful-stonebraker-883561) -- the detector is measured and ships with a positive control on both sides; whether to BUILD it is a separate owner decision and is NOT part of this filing.** Value **5/10** · Difficulty **2/10** · _quick win_. Value 5 because this class deletes a whole item while every wired gate stays green: it has fired once, on `#1147`, and neither CI nor `pre-commit` reported anything. It is ledger integrity only, with no engine, PHI or deployment axis (sec. 0). Difficulty 2 for roughly fifteen lines that reuse `parse_items`, against a fixture frozen in history and a control measured in both states.
+>
+> Verdict: owner-ruling
+> Research: done 2026-09-07 -- the detector, its control, and the dead end are all measured below
+> Closing-act: owner-ruling
+
+**Cluster:** Ledger integrity / repository gates. **Priority:** P2. **Verdict:** owner-ruling.
+**Severity:** no engine effect and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The cost falls on the record. An item's entire body, its status banner and its fields stay in the file, silently re-attributed to the item above it, while the ranked table still carries a row promising a section that no longer exists. A reader following that row finds nothing. A seat dispatching from the ledger cannot see the item at all, and no instrument says so.
+
+### What happened, and the diffstat is the part that should worry you
+
+Commit `642225f78` appended three `#1146` re-verification paragraphs to `docs/BACKLOG.md`. Its last appended line absorbed the `## 1147.` heading that followed it. The `## 1147. ` prefix was deleted outright and the title text was concatenated onto the tail of the `#1146` paragraph, where it still sits on `main`:
+
+```
+... **The cell should not move on this commit** -- a suite that pins the gap is not the gap
+closed. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the
+MFA-change ceremony rather than beside it
+```
+
+The diffstat read **5 insertions, 1 deletion**, and the commit message never mentioned `#1147`. The deletion is the heading; nothing in the diff names the item that was destroyed.
+
+**The general rule, because a reviewer will ask whether a diff would not have shown this.** No: **the summary of a change to a structured record does not describe what the change did.** Diffstat, subject line and line count are all summaries, and all three are blind in this family -- the negative control below deletes a heading prefix and moves the line count by exactly zero. This is not a one-off. A second instance was measured in the same week, in a different structured record in this project and by a different mechanism: a commit whose subject announced a single change while its blob carried several more (details are maintainer-internal; ask rather than assuming this file is the only record affected). So for any file whose **meaning is carried by structure rather than by lines**, verification has to parse the structure on both sides and compare the parsed results. Reading the subject, counting lines, and trusting a diffstat are the three ways this is usually done instead, and all three failed inside one week on two different files. `#1147`'s body, its `🔢` banner and its three fields all survived on `main`, re-attributed to `#1146`. PR 975 split the fused line back apart.
+
+### Why no wired gate sees it
+
+`parse_items` in [`scripts/docs/backlog_status_check.py`](../scripts/docs/backlog_status_check.py) reads only an item's **leading** blockquote block -- the block ends at the first line that is neither blank nor a blockquote. The orphaned banner sat *below* `#1146`'s own block, so it parsed as ordinary mid-item prose. The ledger stayed structurally valid with a whole item missing from it. `backlog_citation_check` and `ledger_check` were green as well. There is nothing to fix in any of the three: each answers the question it was built to answer, and none of them is asked whether the file still contains every item the file itself points at.
+
+### The detector, and it is one-directional by construction
+
+Compare the **ranked tables' row set** against the **parsed-item set**, taking items from BOTH ledger files (`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`) into one namespace. Import `parse_items`; never hand-roll the scan (CLAUDE.md sec. 11). Rows extract with:
+
+```python
+ROW = re.compile(r"^\|\s*(?:\d+\s*\|\s*)?\*\*#(\d+)\*\*\s*\|")          # the rank cell is optional
+HDR = re.compile(r"^\|.*\|\s*V\s*\|\s*D\s*\|\s*Quadrant\s*\|\s*Tier\s*\|")   # ...but the TABLE must be ranked
+```
+
+Keep a row only when the header of **its own table block** matches `HDR` -- walk up from the row while the previous line still starts with `|`. The regex needs **widening and bounding, in opposite directions**, and the next two paragraphs are why each half is load-bearing.
+
+**Make the rank column optional, as above. The obvious regex requires it and is blind to a whole table.** Measured at `68693cfc2`: requiring a leading `| N |` rank cell sees **444** distinct numbers, and the optional form sees **459**. The 15 it adds are `#207`-`#222` less `#214`, whose only rows live in *Post-re-score additions -- #206-#222*, a table that carries no rank column at all -- its rows open `| **#219** |`. Nor is that the only one: `#1415` sits in a two-row continuation table introduced by a **bolded lead-in rather than a heading**. **State the consequence as a property of the guard, not as a past mistake.** It is not that the strict regex was wrong; it is that **the strict form can never report an absorbed heading for the 15 rows of the unranked table**, whatever the ledger does. That sentence survives a reader who thinks a small widening has fixed it; "the regex was wrong" does not. All 15 have parsed items today, so the blind spot holds no defect and the check would read correct forever -- **a gate that cannot fail, which is indistinguishable from a clean result.** That is the shape this repo keeps finding, and it is why the census above names its instrument. Both forms return the same `[1147]` on the control below, so a green run discriminates between them not at all.
+
+**The bound is the other half, and widening WITHOUT it trades a blind spot for a false-positive source.** `ROW` alone matches **any** markdown row whose first or second cell is a bolded item number, and two items carry exactly that shape in their own bodies. Every rank-less row on `origin/main`:
+
+| lines | numbers | the header of its table | verdict |
+|---|---|---|---|
+| 609 | `#1415` | `\| Item \| Title \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 983-998 | `#207`-`#222` | `\| # \| Item \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 3958-3961 | `#99 #98 #320 #351` | `\| Item \| The run \| What it needs \|` | prose in `## 1003.`, drop |
+| 22709-22710 | `#1040 #1229` | `\| item \| what had already landed \| ... \|` | prose in `## 1426.`, drop |
+
+Injecting one prose row citing an unfiled number into the `## 1426.` table gives `[1147, 99999]` unbounded against `[1147]` bounded. **A detector that fires on correct prose is worse than none**, because it sends a reader hunting a heading that was never meant to exist -- and prose citing a number with no section is a sanctioned pattern, not a defect.
+
+**Do not reach for a positional rule. It fails in both directions, and this was built and measured before being discarded.** "No `## N.` heading nearer than the last table heading" reports the `## 1426.` prose rows as unenclosed, because item bodies carry `###` subheadings and the walk stops at `### The defect, measured twice on one day`. In the other direction, `#1415`'s table has no heading of any level above it, only a bolded lead-in. **Position is the wrong key; the table's own header is the right one**, because it describes what the table *is* rather than where it sits.
+
+**Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** 459 rows against 679 parsed items at the same ref, so most items legitimately carry no row. Every ranked table found is a *dated scoring-pass snapshot* (`re-scored 2026-08-20`, `re-scored 2026-08-03`, `re-scored 2026-07-10`, `first score 2026-09-03`, and the rank-less additions table), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file. That census was taken by walking every contiguous run of matching rows up to its nearest heading, so it covers **at least** those five; a table shaped unlike all of them would not be reached by the instrument that found these.
+
+### The positive control, on a fixture that cannot perish
+
+| state | ref | rows | parsed items | rows with no item |
+|---|---|--:|--:|---|
+| pre-fix | `68693cfc2` (`main` tip that day) | 459 | 679 | **`[1147]`** |
+| the causing commit | `642225f78` | 459 | 679 | **`[1147]`** |
+| post-fix | PR 975 head | 459 | 680 | none |
+
+Row counts are the optional-rank regex above; the strict form reads 444 in all three rows and returns the same verdict.
+
+It fires on the one real case and is silent otherwise. **Both pre-fix shas are ancestors of `origin/main`** (`git merge-base --is-ancestor` returns true for each, measured 2026-09-07), so PR 975 merging does not take the fixture away -- a merge adds a commit, it removes nothing from history. Anyone told to capture the pre-fix state before PR 975 lands has been told something false; cite the sha instead.
+
+### DEAD END: the mid-line heading probe. Do not build on it
+
+The obvious signature is a `## N.` heading appearing **mid-line**, and it is worthless here. The absorbed heading loses its `## ` prefix *and* its number entirely rather than losing its newline, so no heading-shaped remnant survives the fusion at all. Measured on `origin/main`: a mid-line `## N.` scan returns six hits -- `1022`, `1203`, `1204`, `1379` twice, and `1431` -- and **all six are prose**, items quoting a heading inside a sentence or in backticks. Zero are absorbed headings, in either state. **Write the probe loosely or it lies to you differently.** A first pass requiring whitespace after the period returned nothing at all, because every real occurrence is followed by a quote character or a backtick; that produced a true statement about one regex, published as a fact about the signature. A guard built on that signature reports a clean repository forever while producing a steady trickle of false positives, which is the worst pair of properties available. That negative result is the reason the row-versus-item comparison is the right instrument.
+
+### If you ever act on a hit, WHERE you re-insert the heading changes the outcome
+
+A restored heading has to go **above the banner that carries the status glyph**, which is not always the earliest banner. `#1147`'s block opens with `Re-scored 2026-08-20 -> P2`, carrying both the score and the `🔢`; its `Filed 2026-08-08` banner comes later and carries no glyph. Measured counterfactual on the two placements:
+
+| heading placed above | status banners | score | fields |
+|---|--:|---|---|
+| the `Re-scored` banner (what PR 975 did) | 1 (`🔢`) | 5 | 3 of 3 |
+| the `Filed` banner | **0** | **None** | 2 of 3 (`research` lost) |
+
+Zero banners is a hard error in `backlog_status_check` -- *"Every backlog item must declare exactly one status banner"* -- so the wrong placement trades a silent orphan for a broken gate, which is louder but not better. **Read `main`, not a branch.** Unmerged branches open their copy of the item with the `Filed` banner because they predate the re-score, so branch text actively misleads about placement.
+
+### Siblings, not duplicates. Closing one for the other loses a real guard
+
+A session working the ASVS scorecard has filed an item proposing two guards for the **vault scorecard**: refuse a write from a clone behind its remote, and compare the cells a payload NAMES against the cells the write actually CHANGES. That second guard and this row-versus-item comparison ask the same shape of question about **different files with different tools**, and neither covers the other. Both will read as "the out-of-scope-edit guard" to whoever picks either one up, and building one invites closing the other. **They are siblings. Do not close either for the other.** That item's number was allocated but was not on `main` as of 2026-09-07, so it is named here by subject rather than by number -- CLAUDE.md forbids citing a `#N` that cannot resolve.
+
+### Scope: this filing is the ask. Building it is a separate owner decision
+
+Nothing here assumes the check gets built. If the owner rules to build it, the natural home is **beside the existing advisory checks** -- the way `dangling backlog citations (advisory)` is wired in `.github/workflows/quality-advisory.yml`, which reports into the step summary, never gates a merge, and carries no paths filter (a defect of this class is introduced by editing prose, so a paths-filtered job would miss it). It should not be a new hard gate: the population it screens is a single number today, and a gate that has fired once has not yet earned the right to block anyone.
+
+### The WIRING is the load-bearing half, and this repo already holds the counter-example
+
+**A correct checker that nothing runs is not a weak guard, it is worse than none**, because it reads in the tree as though the class is covered. Do not accept a build of this that adds `scripts/docs/*.py` and stops there.
+
+Measured 2026-09-07: [`scripts/docs/citation_line_check.py`](../scripts/docs/citation_line_check.py) exists and is referenced **zero** times under `.github/workflows/` and **zero** times in `.pre-commit-config.yaml`. Tracked mentions are its own test, `tests/tooling_manifest.txt`, and this file. Nothing runs it, so nothing reports what it finds. `backlog_status_check.py` sits in `.pre-commit-config.yaml`, which is exactly why its failures get noticed at all. The two tools differ in wiring, not in quality.
+
+So the acceptance test for a build is a **wiring** entry plus a **negative control**, not a passing run:
+
+1. Add the workflow step or hook entry in the same change as the checker.
+2. **Deliberately break a row and confirm the guard reds.** A guard whose only true positive was repaired before the test existed has never been observed failing, and a green run proves nothing about it. This trick is how a builder established that `citation_line_check.py` does not cover `docs/BACKLOG.md` citations at all -- they corrupted one of their own citations, watched the checker pass, and reported the gap rather than claiming coverage.
+
+   **Already run, so the acceptance test is demonstrated rather than proposed.** Deleting the `## 3. ` prefix from item `#3` -- which carries a ranked row -- moved the verdict from `[1147]` to `[3, 1147]` on this branch. **The file's line count did not change at all**, which is the same measurement as check 2 above and the reason a diffstat cannot be trusted here: `642225f78` reported one deletion for an item it destroyed.
+
+### The guard's first real user is whoever lands it
+
+New items append at the ledger tail, so concurrent filings are scheduled conflicts against one boundary, and the resolution is keep-both. **That manoeuvre is how `#1147` died** -- `642225f78` was itself a tail append. So this detector is the post-rebase verification for its own merge, and for every ledger rebase after it. Three checks, in order:
+
+1. Count parsed items before and after. It must rise by **exactly** the number of item headings added -- not roughly, and not "the file got longer". **Compute that expected number at merge time from the diffs of the pull requests that actually landed; never carry a remembered constant.** Count headings, not pull requests: three queued PRs added four items here, because one of them filed two. The error is not symmetric -- expect one too few and a clean merge merely raises a phantom, but expect one too few while exactly one heading is absorbed and **the count matches, the check passes, and the absorption ships**. An off-by-one blinds this check to precisely one absorbed item, which is the modal case: `642225f78` absorbed exactly one.
+2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
+
+   **A missing blank line before the heading is NOT this defect, and believing it is buys a false control.** Measured: with the blank line, without it, and with the `## ` prefix deleted, `parse_items` returns both items in the first two cases and loses one only in the third. An ATX heading interrupts a paragraph without a blank line, in CommonMark and in this parser alike. Restoring the separator at a merge boundary is good hygiene and worth doing -- it is simply **not** what stops an absorption, so a resolver who adds it and moves on has checked nothing. Only the count in check 1 catches the real shape.
+3. Run the row-versus-item comparison in its bounded form, and **read it differentially: compare the merged tree's orphan set against `main`'s at that same moment, not against empty.** A pre-existing orphan is not yours. Measured 2026-09-07: this branch's own merge reported `[1147]`, which is the defect this item documents, still on `main` because its fix had not landed -- a first-time runner sees a non-empty result and reasonably suspects their own resolve. **Do not write the expected value down either.** `[1147]` stops being the baseline the moment that fix merges, exactly as the item counts went stale at 442, then 443, then 444 inside two hours. Compute both sides at merge time; the check is `merged_orphans - main_orphans`, and only that difference is yours.
+
+### Two traps that cost measurement time
+
+1. **Set `PYTHONIOENCODING=utf-8` before printing anything derived from the banner alphabet.** A stock Windows console is cp1252 and raises `UnicodeEncodeError` on the status glyphs. It cost two separate runs here.
+2. **Deduplicate the row set.** At `68693cfc2` the regex above returns **570** raw matches against **459** distinct numbers (the strict rank-requiring form: **547** against **444**), because the dated scoring passes re-rank many of the same items. Comparing the raw list instead of the set inflates every count and makes the control unreproducible.
+
 ## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
 
 > 🔢 **Filed 2026-09-06 -- the fix rides the PR that files this row; the banner stays open until the Lander flips it on merge.** Value **6/10** · Difficulty **3/10** · _fill-in_. `support/redact.py` chose its credential words by hand, so the engine's own credential registry could grow past what its log redactor can see and nothing would report it. **Measured 2026-09-06** against `_SECRET_SETTING_KEYS | _FILE_SECRET_KEYS` (30 names): **27 printed verbatim** before #1183's snake_case label prefix, **11 after it**, **6 after this row's key-material pattern** -- and those 6 are the whole username class, which is out on measured grounds recorded in the guard.
