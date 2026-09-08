@@ -71,6 +71,15 @@ on:
     # Coverage is PR-only -- it needs a base ref to diff against -- so it no-ops here.
     - cron: "23 4 * * *"
 
+concurrency:
+  # security.yml's pattern, and its note there is the reasoning: per-ref for PR events so a rapid
+  # re-push supersedes its own in-flight run; schedule/dispatch runs get a unique group (run_id) and
+  # are never superseded, never cancelled. This file is the repository's second-largest consumer of
+  # runner minutes, so leaving seven superseded jobs alive per re-push was the costliest instance of
+  # the gap. Nothing here is a required context, so a cancelled run gates nothing.
+  group: quality-advisory-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Deny-by-default at the workflow level; each job grants only what it needs.
 permissions: {}
 
