@@ -20,12 +20,19 @@ name: Nightly failure notice
 # SCOPE: schedule-only, deliberately. A push/PR failure is already visible on the PR itself; alerting
 # there would be pure noise, and `workflow_run` fires for every CI completion regardless of trigger.
 #
-# THREE WORKFLOWS, ONE ISSUE PER WORKFLOW. `Security` was added because its daily cron carries jobs
+# ONE ISSUE PER WATCHED WORKFLOW. `Security` was added because its daily cron carries jobs
 # that do not run on a PR -- `released-line-audit` most of all, whose whole subject (the LATEST
 # RELEASE) no PR can change. `DAST` was added for a stronger version of the same reason (BACKLOG
 # #318): it has NO `pull_request` trigger AT ALL, deliberately, so before this every DAST finding
 # surfaced in the Actions tab and nowhere else -- an authenticated authorization sweep reporting into
 # the void, which is precisely the shape this workflow exists to end.
+#
+# `Stalled PRs` was added for the same reason as DAST, after the gap stopped being hypothetical. It is
+# schedule-and-dispatch only, so it can never report on a pull request, and its daily 07:05 UTC run
+# FAILED THREE MORNINGS RUNNING -- 2026-09-03, 09-04 and 09-05 -- with nothing anywhere saying so. It
+# reports on OTHER pull requests, so its own silence is indistinguishable from a clean sweep: a day
+# with no report reads exactly like a day with nothing to report. That is a detector whose failure
+# hides itself, which is one level worse than the defect it was built to catch.
 #
 # A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
 # run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
@@ -42,7 +49,7 @@ name: Nightly failure notice
 # every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
-    workflows: ["CI", "Security", "DAST"]
+    workflows: ["CI", "Security", "DAST", "Stalled PRs"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.

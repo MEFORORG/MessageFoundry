@@ -106,7 +106,12 @@ from messagefoundry.parsing.binary import (
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.parsing.sniff import attachment_mime_agrees, b64_head
+from messagefoundry.parsing.sniff import (
+    _content_matches_declared,
+    attachment_mime_agrees,
+    b64_head,
+    text_sniff_head,
+)
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -1564,7 +1569,10 @@ class RegistryRunner:
         # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
         # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
         with active_hop_posture(self._hop_posture):
-            return FhirLookupExecutor(resolved)
+            # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
+            # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
+            # against an internal FHIR server could otherwise never name an internal CA.
+            return FhirLookupExecutor(resolved, trust_anchor_policy=self._trust_anchor_policy)
 
     def _run_fhir_lookup(
         self,
@@ -3739,6 +3747,46 @@ class RegistryRunner:
 
         return on_request
 
+    async def _declared_content_mismatch(
+        self, ic: InboundConnection, raw: bytes, *, text: str | None = None
+    ) -> bool:
+        """Whether a NON-HL7 ingress body contradicts its inbound's declared ``content_type`` (ASVS
+        5.2.2, BACKLOG #1109). ``True`` means the body was dead-lettered here and the caller must stop;
+        ``False`` means it matched (or the type carries no reliable signature) and ingress continues.
+
+        The file sources have run this same :func:`_content_matches_declared` since the 5.2.2 hardening,
+        quarantining a mismatch to their ``.error`` directory. A socket has no ``.error`` directory, so
+        the disposition that fits here is the one the decode/NUL/size guards beside this already use: a
+        persisted ``ERROR`` row. That keeps the count-and-log invariant (CLAUDE.md section 2) — the body
+        is recorded, never accepted-and-dropped — and it makes the check *decide* rather than merely
+        detect, which a log line would not.
+
+        Keyed on ``content_type``, never on connector type, so it reaches every source that arrives
+        through the shared handlers without the pipeline special-casing a connection type (CLAUDE.md
+        section 4). Deliberately NOT applied to the ``hl7v2`` branch: ``Peek.parse`` already rejects
+        every body this sniff would (measured — it additionally rejects an FHS/BHS batch header the
+        sniff accepts), so adding it there would be a strictly weaker duplicate check.
+
+        ``text`` is the decoded body for a text content type; passing it selects the encoding-independent
+        head (see :func:`text_sniff_head`) and stores the readable decoded view in the ERROR row, exactly
+        as the size guard beside it does. Omit it for a binary content type, whose bytes are the body."""
+        head = raw if text is None else text_sniff_head(text)
+        if _content_matches_declared(ic.content_type, head):
+            return False
+        # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
+        await self.store.record_received(
+            channel_id=ic.name,
+            raw=text if text is not None else _nul_safe_error_raw(raw, ic.content_type.value),
+            status=MessageStatus.ERROR,
+            error=(
+                f"ingress body does not match its declared content type "
+                f"{ic.content_type.value!r} (no matching magic bytes)"
+            ),
+            source_type=ic.spec.type.value,
+            message_type=ic.content_type.value,
+        )
+        return True
+
     async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
         """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
         first-slice receipt, ADR 0023 D3). Returns ``None`` when the body was NOT committed — a
@@ -3766,6 +3814,8 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
+            if await self._declared_content_mismatch(ic, raw):
+                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
@@ -3822,6 +3872,8 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
+            if await self._declared_content_mismatch(ic, raw, text=text):
+                return None  # ERROR recorded; HTTP owns its own 202/4xx receipt (no HL7 ACK)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,
@@ -3997,6 +4049,8 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
+            if await self._declared_content_mismatch(ic, raw):
+                return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
             # truncated (SQLite/SQL Server). Base64-carry them at the source boundary via
@@ -4099,6 +4153,8 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
+            if await self._declared_content_mismatch(ic, raw, text=text):
+                return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
             # HL7 ACK. The decoded body is committed verbatim and the router/transform workers route it
             # as a RawMessage; the source connector owns its own receive-time response (no MLLP ACK).
@@ -6492,7 +6548,8 @@ def _build_check_connectors(
         resolved_fhir_lookups[fname] = fsettings
     if resolved_fhir_lookups:
         # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
-        FhirLookupExecutor(resolved_fhir_lookups)
+        # #1180: the same anchor policy the live build uses, so build_check resolves what serve does.
+        FhirLookupExecutor(resolved_fhir_lookups, trust_anchor_policy=trust_anchor_policy)
 
 
 def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:

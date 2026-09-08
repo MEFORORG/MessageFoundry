@@ -3,16 +3,19 @@
 """Negative controls for the required merge contexts that had none (BACKLOG #1000).
 
 A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Thirteen contexts are the entire
-merge gate as of 2026-09-05, and several of them were guarded only by the property that they exist.
+merge gate as of 2026-09-04, and several of them were guarded only by the property that they exist.
 This file supplies the missing plant-and-observe controls; ``tests/negative_controls.toml`` records
 which control belongs to which context and ``tests/test_negative_controls.py`` fails when a context has
 none.
 
 THE COUNT IS RECORDED HERE, NEVER DERIVED HERE. ``.github/required-contexts.txt`` is the checked-in
-claim and the only thing this file reads. It went to fourteen when ``a reviewer has read this`` was
-reconciled onto it (BACKLOG #1404) and back to thirteen when that gate was REMOVED on 2026-09-05. That
-churn is the point: the reconciliation is driven by the LIVE required set, so a newly-required context
-lands with zero controls and SAYS SO, rather than quietly not being looked at.
+claim and the only thing this file reads. Three readings, kept because the movement is the point: it
+said thirteen before 2026-08-31, fourteen once ``a reviewer has read this`` was reconciled onto it
+(BACKLOG #1404), and thirteen again on 2026-09-04 when the owner retired the review requirement and
+that context left protection. The arming is how a context arrives here unproven -- the reconciliation
+is driven by the LIVE required set, so a newly-required context lands with zero controls and SAYS SO,
+rather than quietly not being looked at. The retirement is the other direction, and the end of this
+file records what its controls measured before they went.
 
 EVERY CONTROL HERE IS ASYMMETRIC, and that is the part most likely to be skipped. It is not enough that
 neutering a rule turns a control red -- the control must fail for exactly the shapes that rule covers
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -48,7 +52,7 @@ from typing import Any
 import pytest
 from _bash_resolver import CANNOT_RUN_CODES, bash_sees, require_bash
 
-from tests._workflow_contexts import ROOT, jobs_of, load_workflow
+from tests._workflow_contexts import ROOT, jobs_of, load_workflow, required_contexts, resolve
 
 _TIMEOUT = 300
 
@@ -508,14 +512,26 @@ def _run_hygiene(
     return proc.returncode, out
 
 
-@pytest.fixture
-def hygiene(tmp_path: Path) -> tuple[str, str, Path, dict[str, str], str, str]:
+def _hermetic_git_env(tmp_path: Path) -> dict[str, str]:
+    """A child environment in which `git` cannot read the developer's own global config.
+
+    ONE COPY, because this is the isolation contract rather than a convenience. A global
+    `core.autocrlf`, a global hooks path or a global `init.defaultBranch` would otherwise make a
+    result here a fact about the machine. Two copies can be relaxed one at a time, and the relaxed
+    one goes on passing.
+    """
     env = _child_env(
         HOME=str(tmp_path),
         GIT_CONFIG_GLOBAL=str(tmp_path / "gitconfig"),
         GIT_CONFIG_SYSTEM=str(tmp_path / "gitconfig"),
     )
     (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    return env
+
+
+@pytest.fixture
+def hygiene(tmp_path: Path) -> tuple[str, str, Path, dict[str, str], str, str]:
+    env = _hermetic_git_env(tmp_path)
     bash = _require_bash(tmp_path)
     repo, base_c, head_b, _base_a = _fixture_repo(tmp_path, env)
     return bash, _hygiene_script(), repo, env, base_c, head_b
@@ -733,6 +749,226 @@ def test_the_gitleaks_config_still_extends_the_default_ruleset() -> None:
 
 
 # ===================================================================================================
+# `gitleaks (secret scan)` again -- WHICH COMMITS it grades, which is not the same question as what it
+# is allowed to ignore (BACKLOG #1479). The allowlist controls above ask what the scanner may skip
+# inside the diff it reads; this asks whose diffs it reads at all.
+# ===================================================================================================
+#: Options that put refs OTHER than the one under test back into the walk. `git log` accepts each of
+#: these to widen beyond HEAD, so `--log-opts` carrying any of them re-opens the defect while still
+#: LOOKING scoped -- which is the whole reason this is a list and not an `"--all" not in value` check.
+#:
+#: IT IS A DENYLIST, AND THAT RESIDUAL IS STATED RATHER THAN LEFT FOR SOMEBODY TO FIND. A scope widened
+#: by naming a second REVISION -- `--log-opts "HEAD other-branch"` -- carries none of these options and
+#: passes here. The behavioural control below is what catches that shape, which is the reason it walks
+#: real commits instead of only reading the flag.
+_REF_WIDENING = (
+    "--all",
+    "--branches",
+    "--remotes",
+    "--tags",
+    "--glob",
+    "--reflog",
+    "--alternate-refs",
+)
+
+
+def _gitleaks_scan_command() -> str:
+    """The gitleaks scan step's `run:` body, selected by WHAT IT RUNS rather than by its label.
+
+    The step's `name:` is prose and was itself renamed by the change these controls arrived with. A
+    selector keyed on it turns a later wording tweak into `has no step named like ...` on a required
+    leg, which reads as a deleted step -- so three controls would fail for a reason unrelated to any
+    of them. `gitleaks detect` is the shipped configuration and is what they are actually about.
+    """
+    steps = jobs_of("security.yml")["gitleaks"].get("steps", [])
+    scans = [
+        str(s.get("run", ""))
+        for s in steps
+        if re.search(r"\bgitleaks\s+detect\b", str(s.get("run", "")))
+    ]
+    assert len(scans) == 1, (
+        f"expected exactly ONE `gitleaks detect` step in the gitleaks job, found {len(scans)}; these "
+        "controls assert the scope of THAT step and cannot pick between several"
+    )
+    return scans[0]
+
+
+def _log_opts_of(command: str) -> str | None:
+    """The `--log-opts` value on a scan command, or None when the flag is absent.
+
+    Both spellings are read. `--log-opts=X` and `--log-opts X` are the same flag to the scanner, and a
+    detector that knew only one would report the gate unscoped after a purely cosmetic edit.
+    """
+    # `comments=True` is the suite's existing idiom for this (tests/test_ci_faulthandler_belts.py
+    # among others). It also avoids a second copy of the hand-rolled "drop lines starting with #"
+    # normaliser that `_muted` below carries -- two copies of that are free to drift apart.
+    argv = shlex.split(command, comments=True)
+    for i, arg in enumerate(argv):
+        if arg.startswith("--log-opts="):
+            return arg.partition("=")[2]
+        if arg == "--log-opts":
+            return argv[i + 1] if i + 1 < len(argv) else ""
+    return None
+
+
+def _unscoped(command: str) -> list[str]:
+    """Why this scan command grades refs other than the one under test. Empty means it is scoped."""
+    value = _log_opts_of(command)
+    if value is None:
+        return ["no --log-opts at all, so the scanner walks every ref it can reach"]
+    if not value.strip():
+        return ["an empty --log-opts, which the scanner treats as its unset default: every ref"]
+    return [
+        opt for opt in _REF_WIDENING if re.search(rf"(?<![\w-]){re.escape(opt)}(?![\w-])", value)
+    ]
+
+
+def test_the_gitleaks_scan_is_scoped_to_the_ref_under_test() -> None:
+    """PLANTED HISTORICALLY, not synthetically: this is the state `main` shipped until this change.
+
+    With `--log-opts` unset the scanner walks EVERY ref, and the job's `fetch-depth: 0` has fetched
+    every branch and tag -- so a required context named for one ref graded the whole repository. On
+    2026-09-06 a synthetic fixture at `0b47402cd`, live only on the unmerged branch
+    `origin/redact-domain-e1` and never an ancestor of `main`, turned this context red after three
+    clean runs. The workflow also runs on `merge_group`, so it reddened the queue too: merging was
+    frozen for over four hours and five entries were evicted. It then fired AGAIN on 2026-09-07 from a
+    different branch (`c456ee586`, carried only by `origin/log-filter-domain-f1`), which is what makes
+    it a class rather than an incident.
+
+    THE CLASS IS WORSE THAN THE OUTAGE. Anyone able to push a branch could red `main`'s required
+    secret gate and stop all merging, with no pull request and no review -- an availability lever that
+    here fired by accident.
+    """
+    command = _gitleaks_scan_command()
+    reasons = _unscoped(command)
+    print(
+        f"[#1479] gitleaks --log-opts = {_log_opts_of(command)!r}, checked against "
+        f"{len(_REF_WIDENING)} ref-widening options"
+    )
+    assert not reasons, (
+        f"the secret scan grades refs beyond the one under test ({reasons}). A branch nobody has "
+        f"reviewed can then red this required context and freeze the queue. Command: {command!r}"
+    )
+
+
+def test_the_scope_detector_fires_on_the_invocation_this_replaced() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL, and the ASYMMETRY that decides whether it is worth having.
+
+    "The shipped command is scoped" and "the detector matches nothing" are the same green. The first
+    row below is the EXACT command `main` carried before this fix, so the detector is shown reddening
+    on the real defect rather than on a fabricated one.
+
+    The asymmetry is the green rows. A legitimate scope may be a bare ref, either flag spelling, a
+    two-dot range or a three-dot range, and a detector that flagged any of those would be "fixed" by
+    deleting the flag -- reinstating the defect it exists to catch.
+    """
+    shipped_before = "gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner"
+    assert _unscoped(shipped_before), "the detector cannot see the unscoped command this replaced"
+    assert _unscoped("gitleaks detect --log-opts '--all' --redact") == ["--all"]
+    assert _unscoped("gitleaks detect --log-opts --branches --redact") == ["--branches"]
+    assert _unscoped("gitleaks detect --log-opts '' --redact"), (
+        "an empty scope is the unset default"
+    )
+    assert _unscoped("gitleaks detect --log-opts HEAD --redact") == []
+    assert _unscoped("gitleaks detect --log-opts=HEAD --redact") == []
+    assert _unscoped("gitleaks detect --log-opts origin/main..HEAD --redact") == []
+    assert _unscoped("gitleaks detect --log-opts origin/main...HEAD --redact") == []
+
+
+def test_the_gitleaks_checkout_still_fetches_the_full_history_of_that_ref() -> None:
+    """A COUPLING THIS FIX CREATED, asserted because its failure is silent.
+
+    `--log-opts HEAD` walks every ancestor of HEAD, which a shallow clone has not fetched. Before the
+    scoping, losing `fetch-depth: 0` cost history depth on a scan that was over-broad anyway; now it
+    would quietly reduce a required secret gate to a single commit while it went on reporting success.
+    """
+    steps = jobs_of("security.yml")["gitleaks"].get("steps", [])
+    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+    assert checkouts, "the gitleaks job checks out nothing, so the scan has no tree to walk"
+    # THE SUBJECT IS THE TREE THE SCAN WALKS, NOT THE NUMBER OF CHECKOUTS. An earlier version asserted
+    # exactly one, which would have reddened this required leg for adding a second checkout at a
+    # `path:` (the sparse pattern asvs-anchor-report.yml already uses) while the property under test
+    # sat untouched. Only a checkout into the workspace root supplies the scanned history.
+    into_root = [c for c in checkouts if not (c.get("with") or {}).get("path")]
+    assert into_root, "no checkout into the workspace root; the scan would walk someone else's tree"
+    shallow = {str((c.get("with") or {}).get("fetch-depth")) for c in into_root} - {"0"}
+    assert not shallow, (
+        f"a gitleaks checkout into the workspace root fetches depth {sorted(shallow)}, but the scan "
+        "walks HEAD's ancestors. A shallow clone would scan what happened to be fetched and still "
+        "report success."
+    )
+
+
+def test_a_commit_on_an_unmerged_branch_is_outside_the_shipped_scope(tmp_path: Path) -> None:
+    """THE BEHAVIOURAL PLANT, run against real `git` rather than against the workflow text.
+
+    The suite does not install gitleaks, so what is exercised here is the mechanism the scanner
+    delegates to: the commit set a `git log` walk reaches under the shipped `--log-opts`. Two markers
+    are planted -- one on an unmerged branch, one on the ref under test -- and the control is only
+    meaningful because the same harness must report them differently.
+
+    THE THIRD ARM IS THE ONE THAT MAKES THE OTHER TWO EVIDENCE. Walking the pre-fix default must find
+    the unmerged marker; without it, "the scoped walk found nothing" and "this harness finds nothing"
+    are indistinguishable, which is the exact shape of the defect being fixed.
+    """
+    env = _hermetic_git_env(tmp_path)
+    repo = tmp_path / "scope"
+    repo.mkdir()
+    _run(["git", "init", "-b", "main", "."], repo, env)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    _run(["git", "add", "-A"], repo, env)
+    _run(["git", "commit", "-m", "base"], repo, env)
+
+    # Assembled at runtime, never committed as literals -- the reason the sibling fixtures are.
+    off_ref = "unmerged-" + "needle" + "-4a7f"
+    on_ref = "onref-" + "needle" + "-9c2e"
+
+    _run(["git", "checkout", "-b", "someone-elses-branch"], repo, env)
+    (repo / "leak.txt").write_text(f"{off_ref}\n", encoding="utf-8")
+    _run(["git", "add", "-A"], repo, env)
+    _run(["git", "commit", "-m", "a commit nobody has opened a pull request for"], repo, env)
+    _run(["git", "checkout", "main"], repo, env)
+    (repo / "b.txt").write_text(f"{on_ref}\n", encoding="utf-8")
+    _run(["git", "add", "-A"], repo, env)
+    _run(["git", "commit", "-m", "a commit on the ref under test"], repo, env)
+
+    scope = _log_opts_of(_gitleaks_scan_command())
+    assert scope, "no shipped --log-opts to exercise; the assertion above covers that case"
+
+    # THE PRECONDITION IS "THIS SCOPE PRODUCES A WALK", NOT "THIS SCOPE IS ONE REVISION", and the
+    # difference was measured rather than reasoned. The first version verified the value with
+    # `git rev-parse --verify`, which rejects every multi-revision and option-carrying scope -- so
+    # against a re-widened `--log-opts "--all"` it fired HERE, before the needle assertions below,
+    # and those assertions were never observed doing any work. A guard that pre-empts the control it
+    # guards, on exactly the shapes the control exists for, is the defect this file is full of.
+    #
+    # The value is split the way the scanner splits it: on whitespace, into separate argv entries.
+    walk = ["git", "log", "-p", "-U0"]
+    probe = _run([*walk, *scope.split()], repo, env)
+    assert probe.returncode == 0 and probe.stdout.strip(), (
+        f"the shipped --log-opts {scope!r} produces no walk at all in a plain repository, so this "
+        f"control cannot exercise it. Update the control alongside whatever replaced the flag.\n"
+        f"{_ascii(_text(probe))}"
+    )
+    scoped = _text(probe)
+    unscoped = _text(_run([*walk, "--full-history", "--all"], repo, env))
+    print(f"[#1479] walked {scope!r} vs the pre-fix `--full-history --all` over 3 commits")
+
+    assert on_ref in scoped, (
+        f"the shipped scope {scope!r} does not reach a commit on the ref under test. The gate would "
+        "grade nothing that matters -- this is the failure that must never be traded for the fix."
+    )
+    assert off_ref in unscoped, (
+        "the pre-fix walk did not reach the unmerged branch either, so this harness cannot tell a "
+        "scoped walk from a broken one. The control below would pass for the wrong reason."
+    )
+    assert off_ref not in scoped, (
+        f"a commit on an unmerged branch is still inside {scope!r}. A branch nobody has reviewed can "
+        "red this required context and freeze the merge queue."
+    )
+
+
+# ===================================================================================================
 # `bandit (Python SAST)` and `npm-audit` -- a severity floor mutes a gate without touching its scope.
 # ===================================================================================================
 def _step_run(workflow: str, job: str, name_fragment: str) -> str:
@@ -941,18 +1177,20 @@ def test_the_hygiene_gate_does_not_read_a_squash_suffix_as_an_item(
 
 
 # ===================================================================================================
-# A CONTEXT THAT CAN GO ABSENT
+# A CONTEXT THAT CAN GO ABSENT -- the required-check failure with the least warning attached.
 # ===================================================================================================
 #
-# A required check that never REPORTS blocks every pull request forever, and it is the failure with
-# the least warning attached: nothing turns red, pull requests simply stop becoming mergeable.
-# codeql.yml's header records the measured case. On 2026-08-27 the first entry this repository's merge
-# queue ever held sat AWAITING_CHECKS with 32 check-runs green and three CodeQL contexts absent,
-# because that workflow declared no `merge_group:` trigger (BACKLOG #340).
+# A required check that never REPORTS blocks every pull request forever, and nothing turns red when it
+# happens: pull requests simply stop becoming mergeable. codeql.yml's header records the measured case.
+# On 2026-08-27 the first entry this repository's merge queue ever held sat AWAITING_CHECKS with 32
+# check-runs green and three CodeQL contexts absent, because that workflow declared no `merge_group:`
+# trigger (BACKLOG #340).
 #
-# The detector is written once here rather than inline where it could grow a second copy free to
-# disagree. It applied to `a reviewer has read this` until that gate was removed on 2026-09-05; every
-# remaining required context is exposed to the same failure, which is why it outlived that one caller.
+# THIS DETECTOR WAS WRITTEN FOR ONE CONTEXT AND OUTLIVED IT. It was added on 2026-08-31 for `a
+# reviewer has read this`, which the owner retired on 2026-09-04 (the retirement note at the end of
+# this file records what its controls measured). The hazard was never that context's: it belongs to
+# every required check, so the detector is pointed at EVERY context in `.github/required-contexts.txt`
+# rather than at a single workflow.
 
 
 def _triggers_of(workflow: str) -> dict[str, Any]:
@@ -989,12 +1227,18 @@ def _absence_risks(triggers: dict[str, Any]) -> list[str]:
 
 
 def test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet() -> None:
-    """NEGATIVE CONTROL OF THE DETECTOR, and the asymmetry the two controls below rest on.
+    """NEGATIVE CONTROL OF THE DETECTOR, and the asymmetry the control below rests on.
 
     "The shipped triggers are safe" and "the detector matches nothing" are the same green, which is
     the pair this registry exists to separate. Three planted trigger sets must each be named -- and a
     set carrying EXTRA events must stay clean, because widening when a workflow reports is legitimate
     and a detector that flagged it would be "fixed" by deleting a cron nobody wanted removed.
+
+    THE PLANTED SETS ARE LITERALS, never derived from a shipped workflow. A control built by editing
+    the file it judges moves with that file: mutate the workflow and this test fails for its own
+    reasons, which buries the ONE test that should be naming the mutation under a second red that is
+    only bookkeeping. That rule was learned on the review gate's controls and is recorded in full in
+    the retirement note at the end of this file.
     """
     assert _absence_risks({"push": None}), "the detector cannot see a missing pull-request trigger"
     assert _absence_risks({"pull_request": None}), "the detector cannot see a missing merge_group"
@@ -1016,24 +1260,96 @@ def test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet() -> None
     ), "the detector flagged a trigger set that only ADDS events; widening is not the hazard"
 
 
-def test_the_absence_detector_is_pointed_at_a_workflow_that_still_gates_a_merge() -> None:
-    """The POSITIVE arm, and the reason this section outlived the gate it was written for.
+def test_no_required_context_sits_in_a_workflow_that_can_go_absent() -> None:
+    """THE DETECTOR AGAINST THE SHIPPED WORKFLOWS, which is the half that can actually go wrong.
 
-    `_absence_risks` was added for `a reviewer has read this`, which was removed on 2026-09-05.
-    Deleting that gate left the detector exercised ONLY by its own planted inputs -- a check that
-    tests itself and no shipped artifact, which is the shape that reads as coverage and is not. The
-    hazard it detects did not go away with that one context: a required check that never REPORTS
-    still blocks every pull request forever, silently, and there are twelve other required contexts.
+    The control above proves the detector CAN fire; this one is what it fires at. Every context in
+    `.github/required-contexts.txt` is resolved to the job that reports it, and that job's workflow
+    has to carry a trigger set that always reports -- on a pull request and on a merge-queue entry,
+    with no paths filter letting a skip stand in for a verdict.
 
-    So it is re-pointed rather than removed. `backlog-hygiene.yml` backs a live required context,
-    triggers on `pull_request` with no paths filter, and declares `merge_group:` -- exactly the
-    properties the detector reads.
+    A context nothing can report is a failure here rather than a skip. That IS the required-but-absent
+    trap: `resolve` returning None means no workflow in this repository will ever report a check
+    branch protection waits for, so every pull request wedges and nothing anywhere turns red.
     """
-    triggers = _triggers_of("backlog-hygiene.yml")
-    assert triggers, "backlog-hygiene.yml declares no `on:` block; the detector lost its subject"
-    assert _absence_risks(triggers) == [], (
-        "backlog-hygiene.yml backs the required context `a PR that implements BACKLOG #N must "
-        f"update BACKLOG.md`, and its triggers can now go absent: {_absence_risks(triggers)}. A "
-        "required context whose workflow does not report wedges every pull request with nothing "
-        "turning red."
+    problems: list[str] = []
+    for context in required_contexts():
+        where = resolve(context)
+        if where is None:
+            problems.append(
+                f"{context!r}: no workflow in .github/workflows reports this context at all, so "
+                "every pull request waits for a check that never arrives"
+            )
+            continue
+        workflow, _job = where
+        problems.extend(
+            f"{context!r} ({workflow}): {risk}" for risk in _absence_risks(_triggers_of(workflow))
+        )
+    assert not problems, (
+        "a required context can fail to report, which blocks every pull request with nothing going "
+        "red:\n  " + "\n  ".join(problems)
     )
+
+
+# ===================================================================================================
+# RETIRED 2026-09-04: `a reviewer has read this`, and what its controls measured before they went.
+# ===================================================================================================
+#
+# The owner retired the reviewer requirement on 2026-09-04. The context left branch protection (the
+# required set went from fourteen to thirteen, read from the API that day), review-gate.yml was
+# deleted, and the eight controls this file ran against that workflow went with the file they read:
+#
+#   test_the_review_gate_refuses_a_pull_request_nobody_has_marked_read
+#   test_the_review_gate_refuses_a_synchronize_even_when_the_payload_shows_the_label
+#   test_the_review_gate_passes_a_pull_request_a_reviewer_has_marked_read
+#   test_the_review_gate_still_reports_under_the_required_context_string
+#   test_nothing_in_the_review_gate_adds_the_label_it_checks_for
+#   test_the_review_gate_lets_a_merge_queue_entry_through
+#   test_the_review_gate_reruns_when_a_reviewer_adds_the_label
+#   test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label
+#
+# THE RECORDED STATE, so nobody re-derives it as a gap: `required_approving_review_count` is 0 and has
+# to stay 0 -- every session on this machine pushes as ONE GitHub identity, CODEOWNERS assigns every
+# path to that account, and GitHub refuses to let an author approve their own pull request, so raising
+# the count to 1 wedges every pull request instead of reviewing any. With that context gone, no
+# automated control requires that a change be read before it merges. That is the owner's decision, and
+# docs/CI.md records it in the same terms.
+#
+# The `reviewed` label itself still exists and still drives .github/workflows/unread-signal.yml, which
+# REPORTS on unread pull requests and gates nothing. Seeing the label in the tree is not evidence the
+# merge gate came back; `.github/required-contexts.txt` is.
+#
+# THREE FINDINGS SURVIVE THE MECHANISM. Each was paid for once and applies to the next control anyone
+# adds here, so they are kept rather than deleted with the tests that produced them.
+#
+# 1. A CONTROL THAT REDDENS NOTHING WHEN YOU BREAK IT WAS NEVER TESTING ANYTHING. Measured 2026-08-31:
+#    dropping `labeled` from review-gate.yml's `types:` list and running
+#    `python -m pytest tests/test_merge_gate_controls.py -q` passed 65 tests. That one edit made the
+#    gate unclearable -- the context reports on `opened`, goes red, a reviewer adds the label, and with
+#    `labeled` absent the label emits no run at all, so the red check-run stands with the label already
+#    applied. The only trigger left that re-runs the job was `synchronize`, whose first step REMOVES
+#    the label; with `strict = true` the pull request could not even be brought up to date past the
+#    block. The absence detector above could not see it, because it reads `pull_request`, `merge_group`
+#    and `paths` and never looked at `types`. With the control written, the same mutation on the same
+#    day turned EXACTLY ONE test red by name --
+#    test_the_review_gate_reruns_when_a_reviewer_adds_the_label -- and 62 passed. One red and not two
+#    is the measurement: a control whose own negative control is built from the shipped file reddens
+#    twice and buries the finding.
+#
+#    THE GENERAL SHAPE, which is why this outlives the gate: a workflow edit that turns nothing red is
+#    not evidence the edit is safe. It is evidence that nothing was watching. Before trusting a control
+#    here, break the thing it guards and confirm it names the break.
+#
+# 2. A DETECTOR'S NEGATIVE CONTROL MUST FEED LITERALS, not values subtracted from the artifact it
+#    judges. A control derived from the shipped file moves with that file, so a real mutation reddens
+#    the control as well as the test that should be naming the mutation -- two reds, one of them
+#    bookkeeping. test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet above still obeys
+#    this, and its docstring says so, so the rule has a live instance rather than only a memorial.
+#
+# 3. A SUBSTRING DETECTOR CAN COUNT ITS OWN ERROR TEXT. The removed control asserted that nothing in
+#    the review gate ran `gh pr edit --add-label reviewed` -- a gate that can satisfy itself is not a
+#    gate. The obvious spelling, `"--add-label" in body`, fired on the workflow's own message telling a
+#    reviewer to run that command, and the "fix" it invites is deleting the one line that told an
+#    author how to clear the check. The working detector matched a gh INVOCATION at the start of a line
+#    rather than the phrase anywhere. The identical trap is recorded live one module over, in
+#    tests/test_security_posture.py's `_gating_text`.

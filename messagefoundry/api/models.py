@@ -752,7 +752,11 @@ class LogTailPage(BaseModel):
     ``total_lines`` is that file's line count, so the viewer can page. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists (the viewer degrades gracefully).
     Best-effort redaction — a residual single-token identifier can survive, so this route is RBAC-gated +
-    audited like a message view."""
+    audited like a message view. **That residual includes an operator USERNAME**, which the engine's own
+    settings classifier calls a credential; BACKLOG #1475 and the exclusion table in
+    ``tests/test_log_redaction_secret_domain.py`` record why the username class is deliberately not
+    scrubbed. Stated here as well as on the support bundle because both surfaces share this one
+    redactor, so whatever survives it surfaces twice."""
 
     lines: list[str]
     total_lines: int
