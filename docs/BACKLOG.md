@@ -24576,6 +24576,45 @@ The round-number rows are dead on an assumption worth naming: **that an estate c
 
 **Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
 
+## 1446. Rule 3c resolves a relative -C against the session cwd when a chdir in the guard window has already moved the shell
+
+> 🔢 **Filed 2026-09-04 (builder) -- MEASURED IN BOTH DIRECTIONS, INHERITED RATHER THAN INTRODUCED, AND DELIBERATELY NOT FIXED IN THE ACT THAT FOUND IT.** Found by the adversarial pass on #1065's chdir-window fix, measured against `origin/main`'s gate and against the branch that closes that one, and byte-identical on both.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build.
+
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)* It is a **fail-open in an enforcement control** whose mirror is a **false deny naming a repository the write never touches**, and both are reached by ordinary tokens.
+
+**What.** `Get-GitTargetCandidatesRaw` roots a relative `-C` against the session cwd, composing it with a chdir it can see in the PREFIX (#1085). It cannot see a chdir sitting BETWEEN the first git token and the disarm, because the prefix is sliced at the first git token. So when the disarming invocation carries its own relative `-C` and a chdir has already moved the shell, the gate measures that `-C` against the directory the session started in rather than the one git will stand in.
+
+**Measured 2026-09-04.** Throwaway governed rig -- a primary, a nested worktree, a linked worktree and an independent clone -- with the hook subprocess cwd set equal to the payload cwd. Identical verdicts on `origin/main` and on the #1065 chdir-window branch:
+
+```
+cwd = an UNGOVERNED clone
+  git commit -C HEAD && cd "<primary>" && git -C . config core.hooksPath /nope     ALLOW
+  reality: the write lands in the GOVERNED primary's shared config
+
+cwd = the GOVERNED primary
+  git commit -C HEAD && cd "<ungoverned>" && git -C . config core.hooksPath /nope  DENY
+  reality: the write lands in the ungoverned clone, and the refusal names the primary
+
+controls, the same `-C .` with no chdir on the line
+  from the primary            DENY
+  from the ungoverned clone   ALLOW
+```
+
+The controls are what make the two rows above readable: `-C .` alone is judged correctly in both directions, so the chdir is the only variable.
+
+**ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS**, which is a signature this file already records twice -- a base that is not the base. A fix aimed only at the ALLOW direction produces the DENY direction, and #1085 is this same defect one window earlier on the line.
+
+**WHY #1065's ACT STOPPED SHORT, stated so the gap is not read as an oversight.** That fix appends the followed chdir as a candidate ONLY when the disarming invocation names no repository of its own. The gate is deliberate: when an explicit `-C` or `--git-dir` IS present, that token decides where the write lands, and letting a governed chdir outrank it manufactures exactly the false deny above. Closing THIS row instead means composing the window chdir into the **`-C` branch** of the resolver -- widening the base every `-C` on every calling rule is measured against -- and that is the class of change two rejected rounds of #1065 died of, both times because the replacement turned out narrower or wider than the matching it displaced.
+
+**ANY FIX MUST PIN BOTH DIRECTIONS PLUS AN UNGOVERNED CONTROL**, red-first against the pre-fix gate in each direction. A suite carrying only the fail-open row passes against a rule that denies everything, and the false-deny row is the one that actively misinforms the session reading it.
+
+**Related:** #1065 (the pass that measured this, and whose fix deliberately stops at the gate described above), #1085 (the same COMPOSE-versus-PREFER defect in the prefix window, fixed and verified), #1066 (declined-by-design 2026-08-25, the residual family this joins), #1000 (a control green because it cannot see the class it covers).
+
+**Source:** the adversarial pass on #1065's own chdir-window fix, tasked with finding the shapes the new matching does not catch rather than confirming the ones it does.
+
+
 ## 1441. Non-serve CLI subcommands run with no root logging handler, so WARNING+ records bypass the PHI filter chain via logging.lastResort
 
 > 🔢 **Filed 2026-09-03 -- not started.** Two of the CLI's 32 subcommands install a root logging handler. The other 30 run with an empty root handler list, so the standard library services their records through `logging.lastResort`. That handler carries `filters=[]` and `formatter=None`. Every `RedactionFilter`, `CredentialQueryScrubFilter` and `ControlCharScrubFilter` that `logging_setup._install_phi_filters` puts on a configured handler is therefore absent, and a WARNING or above prints to stderr as written. **On a first deployment an operator running `backup`, `restore-verify`, `rekey-audit`, `rotate-key` or `admin-unlock` would get any such record, and any traceback attached to it, rendered raw.** Measured below with a paired control. **#1199's fix, [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), has since merged and was re-checked against this at `a2eef0f37`; it does not close it** -- it is per-logger with one call site, and it never touches `__main__.py`.
@@ -25577,42 +25616,4 @@ A sixth line was stale in a different direction: the section told the reader to 
 ### Not taken here, and it is the same fact
 
 `docs/Secure_Build_Scorecard_MEFOR.md` says "gitleaks full-history" in three places (lines 31, 58 and 93), one of them the evidence for signal 5 graded **Built -- Strong**. That evidence is now overstated by exactly the scope BACKLOG #1479 removed. It is **not edited here**: that file is a dated scoring snapshot ("Scored 2026-07-14, against HEAD") whose own convention is that re-scoring is an owner act, and it already carries a precedent blockquote flagging a correction for the next re-sign rather than folding it silently. Naming the three lines is the handoff; whoever re-signs the scorecard folds them.
-
-## 1446. Rule 3c resolves a relative -C against the session cwd when a chdir in the guard window has already moved the shell
-
-> 🔢 **Filed 2026-09-04 (builder) -- MEASURED IN BOTH DIRECTIONS, INHERITED RATHER THAN INTRODUCED, AND DELIBERATELY NOT FIXED IN THE ACT THAT FOUND IT.** Found by the adversarial pass on #1065's chdir-window fix, measured against `origin/main`'s gate and against the branch that closes that one, and byte-identical on both.
-
-**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build.
-
-**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)* It is a **fail-open in an enforcement control** whose mirror is a **false deny naming a repository the write never touches**, and both are reached by ordinary tokens.
-
-**What.** `Get-GitTargetCandidatesRaw` roots a relative `-C` against the session cwd, composing it with a chdir it can see in the PREFIX (#1085). It cannot see a chdir sitting BETWEEN the first git token and the disarm, because the prefix is sliced at the first git token. So when the disarming invocation carries its own relative `-C` and a chdir has already moved the shell, the gate measures that `-C` against the directory the session started in rather than the one git will stand in.
-
-**Measured 2026-09-04.** Throwaway governed rig -- a primary, a nested worktree, a linked worktree and an independent clone -- with the hook subprocess cwd set equal to the payload cwd. Identical verdicts on `origin/main` and on the #1065 chdir-window branch:
-
-```
-cwd = an UNGOVERNED clone
-  git commit -C HEAD && cd "<primary>" && git -C . config core.hooksPath /nope     ALLOW
-  reality: the write lands in the GOVERNED primary's shared config
-
-cwd = the GOVERNED primary
-  git commit -C HEAD && cd "<ungoverned>" && git -C . config core.hooksPath /nope  DENY
-  reality: the write lands in the ungoverned clone, and the refusal names the primary
-
-controls, the same `-C .` with no chdir on the line
-  from the primary            DENY
-  from the ungoverned clone   ALLOW
-```
-
-The controls are what make the two rows above readable: `-C .` alone is judged correctly in both directions, so the chdir is the only variable.
-
-**ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS**, which is a signature this file already records twice -- a base that is not the base. A fix aimed only at the ALLOW direction produces the DENY direction, and #1085 is this same defect one window earlier on the line.
-
-**WHY #1065's ACT STOPPED SHORT, stated so the gap is not read as an oversight.** That fix appends the followed chdir as a candidate ONLY when the disarming invocation names no repository of its own. The gate is deliberate: when an explicit `-C` or `--git-dir` IS present, that token decides where the write lands, and letting a governed chdir outrank it manufactures exactly the false deny above. Closing THIS row instead means composing the window chdir into the **`-C` branch** of the resolver -- widening the base every `-C` on every calling rule is measured against -- and that is the class of change two rejected rounds of #1065 died of, both times because the replacement turned out narrower or wider than the matching it displaced.
-
-**ANY FIX MUST PIN BOTH DIRECTIONS PLUS AN UNGOVERNED CONTROL**, red-first against the pre-fix gate in each direction. A suite carrying only the fail-open row passes against a rule that denies everything, and the false-deny row is the one that actively misinforms the session reading it.
-
-**Related:** #1065 (the pass that measured this, and whose fix deliberately stops at the gate described above), #1085 (the same COMPOSE-versus-PREFER defect in the prefix window, fixed and verified), #1066 (declined-by-design 2026-08-25, the residual family this joins), #1000 (a control green because it cannot see the class it covers).
-
-**Source:** the adversarial pass on #1065's own chdir-window fix, tasked with finding the shapes the new matching does not catch rather than confirming the ones it does.
-
+
