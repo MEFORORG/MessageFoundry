@@ -26761,3 +26761,108 @@ Name the ref (`git log ... origin/main --`) and confirm ancestry with `git merge
 **Source:** measured 2026-09-06 while putting the cell's retirement question to adversarial review. Two of three independent readers found the revert; the hash comparison and the ancestry trap above were confirmed directly afterwards.
 
 ---
+
+## 1490. unread-signal.yml takes a runner SLOT on every workflow completion, reporting on a review gate that no longer exists, and it is DISABLED MANUALLY right now
+
+> 🔢 **Filed 2026-09-08 -- the workflow is already off; the tree does not say so.** Owner
+> ruling 2026-09-08: turn it off. Done the same hour with `gh workflow disable unread-signal.yml`,
+> so the live state is `disabled_manually` while `.github/workflows/unread-signal.yml` is still in
+> the tree and still reads as a live workflow. **That gap is the reason this row exists** -- it is
+> the exact shape of the 2026-07-30 incident `tests/test_required_workflow_state.py` was built for,
+> where ten required contexts sat on `disabled_manually` workflows that kept their files and job
+> names. This one is not required, so nothing is ungated, but the invisible state must not stand
+> undocumented.
+>
+> **Scored 2026-09-08 -> P2.** Value **5/10** · Difficulty **4/10**. Value 5 -- the runner
+> saving is already banked by the disable, so what is left is removing dead machinery and
+> closing the gap between a disabled workflow and a tree that still shows it live. Difficulty
+> 4 -- twelve coupled files, two of them test manifests that fail loudly if a name is missed.
+
+### THE FIRST FILING OF THIS ROW CITED 440 RUNNER-MINUTES A DAY. THAT NUMBER WAS WRONG.
+
+It came from `updated_at - run_started_at` at the RUN level, which is wall-clock **occupancy**, not
+work. Under runner starvation occupancy is mostly the starvation itself, so the figure was largely
+measuring the queue this workflow was waiting in. Corrected the same day, after a peer session
+pulled job-level data and inverted the conclusion; re-measured here independently before amending.
+
+**The old metric is self-refuting, and this is the cheapest way to see it.** Twelve completed runs
+per workflow, run-level occupancy against the sum of `completed_at - started_at` over each run's
+jobs:
+
+| workflow | run-min (occupancy) | job-min (work) | jobs | wait |
+|---|---|---|---|---|
+| CI | 568.0 | 635.2 | 142 | **-11.8%** |
+| unread signal | 308.1 | **2.8** | 10 | 99.1% |
+| failure signal | 10.8 | 0.1 | 1 | 99.2% |
+| Security | 318.9 | 52.3 | 84 | 83.6% |
+| quality-advisory | 439.0 | 234.8 | 84 | 46.5% |
+| CLA Assistant | 107.1 | 1.7 | 12 | 98.5% |
+
+**CI's job-minutes EXCEED its wall-clock**, because its jobs run in parallel. A metric that can be
+exceeded by the work it claims to measure was never measuring work. That row is the control, and
+nothing about it needed a second opinion.
+
+**What `unread signal` actually costs: 2.8 job-minutes across 12 runs, about 17 seconds of work
+each.** Cutting every signal and notice workflow saves well under 1% of runner time, not the 25%
+the first filing implied.
+
+### The real cost is SLOTS, and that argument is unchanged
+
+A job holds a runner slot whatever its duration, and slots are what the merge queue competes for.
+`unread signal` fires on `workflow_run: completed`, so every CI, Security, CodeQL or
+backlog-hygiene run that finishes starts one: a single push costs about seven CI runs **and about
+seven signal runs**, and the signal half scales with the CI half forever. Ten pushes in forty
+minutes on 2026-09-08 put 73 runs in the queue against 3 running.
+
+**So the decision to disable it stands on the SLOT argument, not on the minutes argument.** State
+it that way in anything citing this row. Relieving the merge queue and saving compute are two
+different rankings and they disagree; this row is the first.
+
+**A larger win sits next door and is NOT this row's to take.** `Security` runs ten near-trivial
+jobs, roughly 4.3 job-minutes against 126 queue-minutes per run, and is about a fifth of every slot
+contended for. Consolidating those ten into two or three composite jobs would cut that pressure
+**without removing a single scan** -- same coverage, same seven required contexts, fewer slots.
+Attributed to a peer session's 7-day job-level census, not re-measured here.
+
+### The gate it was built for is gone, confirmed three ways
+
+Its header states the purpose (BACKLOG #1413): `a reviewer has read this` became a required context
+on 2026-08-31, and nothing reported that a green pull request was sitting unread. That gate is now
+absent:
+
+1. branch protection lists **13** required contexts and **none** names review or read;
+2. `.github/workflows/review-gate.yml` is **not in the tree**;
+3. `required_approving_review_count` is **0**.
+
+Nothing reads its label either. `gh pr list --label unread` is a convenience for a seat, not a gate,
+and no workflow keys on it -- consistent with CLAUDE.md, which records that no label any signal
+workflow applies gates a merge.
+
+### What it cost, concretely
+
+PR 859 entered the merge queue at 18:07:11Z fully green and was removed at 18:29:06Z having failed
+nothing. Its merge_group batch (`95734a3c`) had `CI` still `queued` and never started, while the
+sibling batch (`e215f25d`) got a runner and survived. The queue drops an entry whose checks do not
+start; the starvation was 58 queued runs against 9 in progress.
+
+### What is left to do, and why it was not done in this pull request
+
+The disable stops the cost. The tree still carries the machinery, and removing it touches at least:
+
+    .github/workflows/unread-signal.yml      scripts/ci/check_unread_prs.py
+    tests/test_unread_signal.py              tests/test_unread_prs.py
+    tests/test_merge_gate_controls.py        tests/negative_controls.toml
+    tests/tooling_manifest.txt               .github/zizmor.yml
+    .github/required-contexts.txt (comment)  CLAUDE.md, docs/CI.md, docs/METHOD.md
+
+That is a coupled change with real breakage risk in the manifest and negative-control tests, and it
+is a Builder's change, not a merge repair. **Whoever takes it must re-run
+`scripts/ci/check_required_workflow_state.py --states-json <live>` afterwards**; it passed at the
+time of the disable, reporting all 13 required contexts on active workflows.
+
+**Do not simply re-enable it to make the tree agree.** The measurement above is the reason it is
+off; if it is re-enabled, this row is the thing to argue with.
+
+**Source:** measured 2026-09-08 by the Lander while draining the merge queue, after the queue
+dropped a green pull request for want of a runner.
+---
