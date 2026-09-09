@@ -51,7 +51,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
-    DataClass,
     SecurityEnforcement,
 )
 from messagefoundry.config.models import (
@@ -104,7 +103,6 @@ __all__ = [
     "AiSettings",
     "AiMode",
     "AiDataScope",
-    "DataClass",
     "SecurityEnforcement",
     "EgressSettings",
     "ShadowSettings",
@@ -272,8 +270,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
     CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
 
-    The is_phi-blind **weakened-TLS / cleartext-escape** cells route their global-escape check through
-    here so the blunt escape can no longer silence an **enforcing PHI** refusal (matching the
+    The **weakened-TLS / cleartext-escape** cells route their global-escape check through
+    here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
     and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
@@ -286,12 +284,16 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     be set at all, AND the hop must not be enforcing PHI. ``None``
     (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
     escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
-    production posture, so this fallback never loosens the clamp."""
+    production posture, so this fallback never loosens the clamp.
+
+    The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
+    (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
+    escape is inert, full stop."""
     if not insecure_tls_allowed():
         return False
     if posture is None:
         return True
-    return not (posture.enforcing and posture.is_phi)
+    return not posture.enforcing
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -418,16 +420,16 @@ class StoreSettings(_Section):
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
     # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
     encryption_keys_retired: str = ""
-    # When true, `serve` refuses to start without an encryption key (any environment, any data_class).
-    # Off by default. See docs/PHI.md §3. (Independent of the data_class-gated keyless refusal below:
-    # this forces the refusal even for a synthetic/non-PHI instance.)
+    # When true, `serve` refuses to start without an encryption key even when the audited opt-out
+    # below is set. Off by default. See docs/PHI.md §3.
     require_encryption: bool = False
-    # Explicit, audited opt-out of the data_class-gated keyless refusal (H3, OWASP *Fail Securely* / SDS
-    # §4.3 PW.9). By default a PHI-carrying instance (`[ai].data_class == phi`, ANY environment) REFUSES
-    # to start with no encryption key — secure-by-default. Setting this true is the loud, deliberate
-    # override that lets such an instance start keyless (it still emits the UNENCRYPTED-at-rest warning
-    # and the override is audited at startup). It does NOT override `require_encryption=true` (that wins).
-    # A synthetic/non-PHI instance never needs this — it stays key-free regardless (CI parity).
+    # Explicit, audited opt-out of the keyless-start refusal (H3, OWASP *Fail Securely* / SDS §4.3
+    # PW.9). Every instance carries patient data (BACKLOG #1279), so by default EVERY instance, in
+    # ANY environment, REFUSES to start with no encryption key — secure-by-default. Setting this true
+    # is the loud, deliberate override that lets one start keyless (it still emits the
+    # UNENCRYPTED-at-rest warning and the override is audited at startup). It does NOT override
+    # `require_encryption=true` (that wins). Under [security].enforcement = enforce it needs a SECOND
+    # acknowledgment, `allow_unencrypted_phi_under_strict_enforcement` (ADR 0140).
     allow_unencrypted_phi: bool = False
     # Windows DPAPI-protected key file (WP-11d, ASVS 13.3.1): a path produced by
     # `messagefoundry protect-key`. When `encryption_key` is unset and this is set, the active key is
@@ -2574,20 +2576,22 @@ class AuthSettings(_Section):
 #: it must be a safe single path segment).
 _ENV_NAME_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
-#: Built-in environment names whose security posture (data_class, production) is derived when
-#: ``[ai].data_class`` / ``[ai].production`` are left unset — back-compat with the original
-#: dev/staging/prod tiers. A CUSTOM name must set posture explicitly (it is never inferred from a
-#: free-form string), so a 'test'/'poc' instance can never default permissive (ADR 0017).
-#: GIVEN 1 (ADR 0148): the default env ``dev`` derives **PHI** too — the default/CI path runs the
-#: PHI-carrying posture (secure-by-default, so encryption/egress/retention are exercised, not first met
-#: in production). A genuinely-synthetic dev/CI box must declare ``[security].handles_real_patient_data
-#: = false`` — a loud, audited opt-out. Only ``production`` still differs across the three (prod alone is
-#: the production tier, which drives the AI data-scope ceiling + the DEBUG-log refusal, not the security
-#: refuse/warn dial — that is ``[security].enforcement``, GIVEN 2).
-_KNOWN_ENV_POSTURE: dict[str, tuple[DataClass, bool]] = {
-    "dev": (DataClass.PHI, False),
-    "staging": (DataClass.PHI, False),
-    "prod": (DataClass.PHI, True),
+#: Built-in environment names whose **production tier** is derived when ``[security]
+#: .production_instance`` is left unset — back-compat with the original dev/staging/prod tiers. A
+#: CUSTOM name must set it explicitly (it is never inferred from a free-form string), so a
+#: 'test'/'poc' instance can never default permissive (ADR 0017).
+#:
+#: **This used to carry a data class as well, and no longer does (BACKLOG #1279).** ADR 0148 GIVEN 1
+#: had already made all three names derive PHI; what remained was a per-instance opt-out
+#: (``[security].handles_real_patient_data = false``) that silenced the whole PHI gate family at
+#: once. That combined override is retired: every instance carries patient data, and an operator who
+#: needs a specific gate relaxed uses that gate's own switch. The tier below still differs across the
+#: three — prod alone is the production tier, which drives the AI data-scope ceiling and the
+#: DEBUG-log refusal, not the security refuse/warn dial (that is ``[security].enforcement``).
+_KNOWN_ENV_POSTURE: dict[str, bool] = {
+    "dev": False,
+    "staging": False,
+    "prod": True,
 }
 
 #: BACKLOG #95 -- the ``[ai].provider`` values the engine can actually SERVICE.
@@ -2616,9 +2620,10 @@ class AiSettings(_Section):
     ``environment`` is the **free-form** active-environment name (ADR 0017): it selects
     ``environments/<name>.toml`` and is what ``current_environment()`` returns. It has **no default** —
     ``serve`` requires it, so a missing env can never silently resolve another environment's
-    values/secrets. ``data_class`` / ``production`` are the explicit security posture, **decoupled from
-    the name**: for the built-in names dev/staging/prod they are derived when unset, but a custom name
-    must set them (see :meth:`require_posture`)."""
+    values/secrets. ``production`` is the explicit production **tier**, **decoupled from the name**:
+    for the built-in names dev/staging/prod it is derived when unset, but a custom name must set it
+    (see :meth:`require_posture`). There is no data-class axis — every instance carries patient data
+    (BACKLOG #1279)."""
 
     mode: AiMode = AiMode.BYO
     data_scope: AiDataScope = AiDataScope.CODE_ONLY
@@ -2626,10 +2631,9 @@ class AiSettings(_Section):
     # current_environment() returns. No default — serve requires it (a missing env must never silently
     # resolve another env's values/secrets).
     environment: str | None = None
-    # Explicit security POSTURE, decoupled from the name. Unset is derived from a built-in name
-    # (ADR 0148 GIVEN 1: dev->phi/non-prod, staging->phi/non-prod, prod->phi/prod); a custom name must
-    # set them. The refuse/warn dial is [security].enforcement (GIVEN 2), not `production`.
-    data_class: DataClass | None = None
+    # Explicit production TIER, decoupled from the name. Unset is derived from a built-in name
+    # (dev/staging -> non-prod, prod -> prod); a custom name must set it. The refuse/warn dial is
+    # [security].enforcement (ADR 0148 GIVEN 2), not `production`.
     production: bool | None = None
 
     # --- engine broker (ADR 0135 / BACKLOG #95) ------------------------------------------------
@@ -2682,64 +2686,47 @@ class AiSettings(_Section):
             )
         return v
 
-    def derived_posture(self) -> tuple[DataClass | None, bool | None]:
-        """``(data_class, production)`` with built-in-name derivation applied where each is unset.
+    def derived_posture(self) -> bool | None:
+        """The production **tier** with built-in-name derivation applied when it is unset.
 
-        Either element may still be ``None`` when a *custom* environment name leaves it unset — callers
-        that need a definite posture use :meth:`require_posture` (fail-closed) or default the missing
-        ``production`` to ``True`` (strictest ceiling) for an advisory read."""
-        dc, prod = self.data_class, self.production
-        known = _KNOWN_ENV_POSTURE.get(self.environment or "")
-        if known is not None:
-            if dc is None:
-                dc = known[0]
-            if prod is None:
-                prod = known[1]
-        return dc, prod
+        Still ``None`` when a *custom* environment name leaves it unset — callers that need a definite
+        answer use :meth:`require_posture` (fail-closed) or default it to ``True`` (strictest ceiling)
+        for an advisory read.
 
-    def require_posture(self) -> tuple[DataClass, bool]:
-        """The fail-closed ``(data_class, production)`` posture; raises ``ValueError`` when a custom or
-        unset environment name has no explicit posture. Used at ``serve`` so a custom env never defaults
-        permissive (ADR 0017)."""
-        dc, prod = self.derived_posture()
-        if dc is None or prod is None:
+        It no longer returns a data class. Every instance carries patient data (BACKLOG #1279), so
+        there is nothing left to derive on that axis and no caller has to ask."""
+        if self.production is not None:
+            return self.production
+        return _KNOWN_ENV_POSTURE.get(self.environment or "")
+
+    def require_posture(self) -> bool:
+        """The fail-closed production tier; raises ``ValueError`` when a custom or unset environment
+        name has no explicit tier. Used at ``serve`` so a custom env never defaults permissive
+        (ADR 0017)."""
+        prod = self.derived_posture()
+        if prod is None:
             raise ValueError(
                 f"environment {self.environment!r} has no built-in security posture (not one of "
-                "dev/staging/prod); set [security].handles_real_patient_data (true|false) and "
-                "[security].production_instance (true|false) explicitly"
+                "dev/staging/prod); set [security].production_instance (true|false) explicitly"
             )
-        return dc, prod
+        return prod
 
 
 def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> HopPosture:
     """The instance's :class:`~messagefoundry.config.tls_policy.HopPosture` for the #200 hop-refusal gate.
 
-    Maps the AI section's *derived* ``is_phi`` (built-in dev/staging/prod derivation applied) plus the
-    explicit ``[security].enforcement`` level onto the ``(is_phi, enforcing)`` the transport cells decide
-    on. ``is_phi`` keys on ``data_class == phi`` being *explicitly* declared — an **undeclared**
-    ``data_class`` is **not** PHI, exactly as the keyless-refusal (§3), ``[egress]`` and #906 Posture-B
-    gates all key on ``data_class == phi`` being set: a bare/default on-prem config carries no PHI
-    assertion, so its hops stay byte-identical (never newly refused). ``enforcing`` is
-    ``enforcement is ENFORCE`` (the secure default), which re-keys the REFUSE/WARN dial off the old
-    production-tier flag onto the explicit enforcement level: at the default it reproduces the historical
-    ``production=True`` refuse — splitting a declared-PHI hop between ENFORCE-REFUSE and WARN-WARN. The
-    construction gate stamps the result via ``tls_policy.active_hop_posture`` (ADR 0092)."""
-    data_class, _production = ai.derived_posture()
-    if data_class is not None:
-        # Resolved (a known env or an explicit data_class): PHI only if it is *phi*.
-        is_phi: bool | None = data_class is DataClass.PHI
-    elif ai.environment is None:
-        # Bare/default config — no environment AND no data_class declared. This carries no PHI
-        # assertion, so it is NOT PHI: its hops stay byte-identical (never newly refused), exactly
-        # as the keyless-refusal / [egress] / #906 gates all key on data_class == phi being set.
-        is_phi = False
-    else:
-        # A *custom* env is declared but leaves data_class unresolved — the operator asserted a
-        # non-standard deployment without a posture; fail closed (serve refuses such a start anyway).
-        is_phi = None
-    return HopPosture.fail_closed(
-        is_phi=is_phi, enforcing=(enforcement is SecurityEnforcement.ENFORCE)
-    )
+    Maps the explicit ``[security].enforcement`` level onto the ``enforcing`` the transport cells
+    decide on. ``enforcing`` is ``enforcement is ENFORCE`` (the secure default), which keys the
+    REFUSE/WARN dial off the explicit enforcement level rather than the production tier (ADR 0148
+    GIVEN 2). The construction gate stamps the result via ``tls_policy.active_hop_posture``
+    (ADR 0092).
+
+    **The ``is_phi`` axis is gone (BACKLOG #1279).** It used to key on ``data_class == phi`` being
+    explicitly declared, which made a bare/default config's hops non-PHI and left the whole family
+    relaxable by one switch. Every instance now carries patient data, so the only question a hop asks
+    is whether the instance is enforcing. ``ai`` stays in the signature because the tier it derives is
+    still read by the callers that report posture."""
+    return HopPosture(enforcing=(enforcement is SecurityEnforcement.ENFORCE))
 
 
 def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDisposition:
@@ -2761,29 +2748,24 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
-    #. synthetic instance (not ``is_phi``) → ALLOW — silent, nothing sensitive rides the hop. Applied
-       HERE (not by the shared authority, which ADR 0153 stripped of the label) — see below.
     #. ``forward_hop_attested`` → ALLOW — the acknowledged, reasoned opt-out (a trusted management
        segment), the ``[logging]`` sibling of a connection's ``tls_hop_attested``.
     #. the CLAMPED global escape → WARN (never fires under ENFORCE — see
        :func:`hop_insecure_escape_downgrades`).
-    #. enforcing PHI → REFUSE. #. else (non-enforcing PHI) → WARN.
+    #. enforcing → REFUSE. #. else (non-enforcing) → WARN.
 
     Callers that have not resolved a posture pass the fail-closed one; ``serve`` supplies
     :func:`hop_posture_from_ai`. Pure so the gate is unit-testable without standing up ``serve``.
 
-    **ADR 0153 leaves this cell keyed on the data label, deliberately** (its *Explicitly out of scope*
-    table: "Stays keyed on posture; a ``[logging]`` sibling of ``cleartext_accepted`` is a follow-up").
-    The forwarder is not a connection, so it has nowhere to carry a per-hop declaration, and refusing
-    it instead would create a deviation the loosening registry cannot express. The ``not is_phi`` ALLOW
-    arm 0153 deleted from the shared authority is therefore restated HERE, explicitly, rather than
-    inherited — the scope limit is a written decision at the one place it applies, not an emergent
-    property of a signature change."""
+    **ADR 0153 left this cell keyed on the data label; BACKLOG #1279 removed the label.** 0153's
+    scope reasoning stands and is kept: the forwarder is not a connection, so it has nowhere to carry
+    a per-hop declaration, and refusing outright would create a deviation the loosening registry
+    cannot express. What that reasoning bought was a restated ``not is_phi`` ALLOW arm, and with every
+    instance carrying patient data there is no instance left for it to fire on, so it is gone. A
+    ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
+    way this cell could express an acceptance."""
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
-        return HopDisposition.ALLOW
-    if not posture.is_phi:
-        # ADR 0153 scope carve-out — see the docstring. Restated here, not inherited.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
@@ -4024,12 +4006,21 @@ class SecuritySettings(_Section):
     # field this desugars to. Setting it false is now a LOOSENING and security_loosenings() names it.
     audit_all_authorization_decisions: bool = True
 
-    # ── What this instance handles (the master posture lever) ────────
-    # None (the default) = DERIVE from the [ai].environment name (dev→synthetic, staging/prod→phi; a
-    # custom name must declare a posture or serve fails closed via require_posture — parity with today).
-    # true/false are explicit overrides. The §1 "= true" in ADR 0118 is the RESOLVED secure position for a
-    # production instance, not the raw default; a stock dev/staging/prod instance needs no value here.
-    handles_real_patient_data: bool | None = None  # was [ai].data_class = "phi"
+    # ── What this instance handles ───────────────────────────────────
+    # `handles_real_patient_data` USED TO SIT HERE and is retired (BACKLOG #1279). Every instance
+    # carries patient data, so there is no declaration to make: the PHI gates apply unconditionally.
+    # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
+    # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
+    # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
+    # cleartext_accepted / tls_revocation_attested, or the [security].enforcement dial. Each of those
+    # is separately named, separately audited and separately reported; the retired lever was none of
+    # those things, and it silenced nineteen gates at once. Setting it is now REFUSED at load with a
+    # message naming this decision (see `_REMOVED_KEYS`).
+    #
+    # The production TIER stays: it is a true property of the instance and it drives the AI
+    # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
+    # None (the default) = DERIVE from the [ai].environment name (dev/staging -> false, prod -> true);
+    # a custom name must declare it or serve fails closed via require_posture.
     production_instance: bool | None = None  # was [ai].production
 
     # ── Leaving the organization: the ASVS 3.7.3 interstitial ────────
@@ -4406,8 +4397,35 @@ _RELOCATED_TO_SECURITY: dict[tuple[str, str], str] = {
     ("retention", "messages_days"): "delete_message_bodies_after_days",
     ("retention", "allow_unbounded_phi"): "allow_keeping_phi_indefinitely",
     ("diagnostics", "audit_all_authz"): "audit_all_authorization_decisions",
-    ("ai", "data_class"): "handles_real_patient_data",
     ("ai", "production"): "production_instance",
+}
+
+#: ``(section, key)`` → why it is REFUSED, for a key that was **removed** rather than relocated. A
+#: relocated key has somewhere to go and :data:`_RELOCATED_TO_SECURITY` says where; these have
+#: nowhere, so the message has to carry the decision instead of a forwarding address.
+#:
+#: Both spellings of the retired data-class lever are here (BACKLOG #1279). Refusing rather than
+#: ignoring matters more for a REMOVED posture switch than for a misspelled one: an operator whose
+#: config says ``handles_real_patient_data = false`` believes nineteen gates are off. Ignoring the key
+#: would start the engine with all nineteen ON, which is the safe direction but a silent contradiction
+#: of what their config says — and the next person to read that file would draw the wrong conclusion
+#: about what the running instance is doing.
+_REMOVED_KEYS: dict[tuple[str, str], str] = {
+    ("security", "handles_real_patient_data"): (
+        "every instance now carries patient data, so there is no data-class declaration to make "
+        "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
+        "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
+        "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted / "
+        "tls_revocation_attested, or the [security].enforcement dial. Relax the one you mean, or "
+        "delete this line"
+    ),
+    ("ai", "data_class"): (
+        "the data class was removed, not relocated: every instance now carries patient data "
+        "(BACKLOG #1279). [ai].data_class had already moved to "
+        "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
+        "this line"
+    ),
 }
 
 #: ``[security]`` key → ``(section, field)`` for the switches that map 1:1 onto a settable internal field.
@@ -4431,7 +4449,19 @@ _SECURITY_PASSTHROUGH: tuple[tuple[str, str, str], ...] = (
 def _reject_relocated_keys(data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if a relocated posture key is set in its OLD section (ADR 0118 AC-1). The
     switch moved to ``[security]``; accepting it in two places would defeat the single-canonical-home
-    goal and could silently disagree with ``[security]``. Checked against file+env (not CLI plumbing)."""
+    goal and could silently disagree with ``[security]``. Checked against file+env (not CLI plumbing).
+
+    Also refuses the keys in :data:`_REMOVED_KEYS`, which went away entirely rather than moving. That
+    arm runs FIRST: ``[security].handles_real_patient_data`` is no longer a model field, so without it
+    the generic unknown-key refusal in :func:`_desugar_security` would fire and offer a spelling
+    suggestion for a key that is not misspelled."""
+    for (section, key), reason in _REMOVED_KEYS.items():
+        sect = data.get(section)
+        if isinstance(sect, dict) and key in sect:
+            raise ValueError(
+                f"[{section}].{key} was REMOVED and is no longer accepted: {reason} "
+                "(see docs/CONFIGURATION.md)."
+            )
     for (section, key), replacement in _RELOCATED_TO_SECURITY.items():
         sect = data.get(section)
         if isinstance(sect, dict) and key in sect:
@@ -4528,10 +4558,9 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
             sec.allow_unencrypted_phi or not sec.encrypt_stored_data,
         )
 
-    # Master posture lever: bool → DataClass string. None (unset) is NOT written, so the posture derives
-    # from the [ai].environment name exactly as today (parity; custom-unset still fails closed).
-    if sec.handles_real_patient_data is not None:
-        _set("ai", "data_class", "phi" if sec.handles_real_patient_data else "synthetic")
+    # The master posture lever USED TO BE DESUGARED HERE, into [ai].data_class. Both keys are retired
+    # (BACKLOG #1279) and `_reject_relocated_keys` refuses either spelling before this runs, so there
+    # is nothing left to translate. The production tier still passes through `_SECURITY_PASSTHROUGH`.
 
 
 def security_loosenings(

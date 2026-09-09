@@ -47,7 +47,6 @@ from messagefoundry.api.validation import (
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
-    DataClass,
     SecurityEnforcement,
 )
 
@@ -1036,7 +1035,6 @@ class AiPolicy(BaseModel):
     mode: AiMode
     data_scope: AiDataScope
     environment: str | None  # the free-form active-environment NAME (ADR 0017)
-    data_class: DataClass | None = None  # PHI posture (synthetic|phi), if resolvable
     production: bool | None = None  # production-tier posture, if resolvable
     assist_permitted: bool | None
     reason: str | None = None
@@ -1107,14 +1105,13 @@ class SecurityPosture(BaseModel):
 
     **No secret material ever appears here** (SECRET-1): ``key_id`` is only the active key's one-way
     **fingerprint** (the first 16 hex of SHA-256(key)), never key bytes, and ``key_source`` is the
-    provider *name*, not a credential. ``data_class``/``production`` are the resolved posture;
+    provider *name*, not a credential. ``production`` is the resolved tier;
     ``encryption_enabled`` is read from the *live* store cipher (not just config). ``plaintext_columns``
     lists any PHI-bearing columns that stay UNENCRYPTED at rest on the active backend — ``[]`` on every
     backend now (the SQL Server ``error``/``last_error``/``message_events.detail`` residual was retired
     by H4; SQLite, Postgres, and SQL Server all have full at-rest coverage of the PHI-bearing columns).
     """
 
-    data_class: DataClass | None = None  # resolved PHI posture (synthetic|phi), if resolvable
     production: bool | None = None  # production-tier posture, if resolvable
     # The security REFUSE/WARN dial (this refactor): enforce (secure default) reproduces the historical
     # production=True refuse posture; warn reproduces the non-production warn+continue. Decoupled from the
@@ -1127,7 +1124,7 @@ class SecurityPosture(BaseModel):
     key_id: str | None = (
         None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
     )
-    require_encryption: bool  # whether keyless start is refused regardless of data_class
+    require_encryption: bool  # forces the keyless refusal even past allow_unencrypted_phi
     allow_unencrypted_phi: bool  # whether the audited keyless-PHI override is set
     # PHI-bearing columns NOT encrypted at rest on this backend; empty on every backend (the SQL Server
     # error/last_error/detail residual was retired by H4) or when encryption is off, where it is N/A.
@@ -1150,9 +1147,10 @@ class SecurityPosture(BaseModel):
     store_privilege: StorePrivilegeView = Field(
         default_factory=lambda: StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
     )
-    # Set WHERE handles_real_patient_data=false: the strict PHI-only controls (at-rest-encryption refusal,
-    # deny-by-default egress, bounded retention) are relaxed because the instance carries no ePHI (AC-6).
-    synthetic_relaxation: str | None = None
+    # `synthetic_relaxation` SAT HERE and is gone with the declaration it described (BACKLOG #1279).
+    # It reported that the strict PHI controls were relaxed instance-wide. Every instance carries
+    # patient data now, so there is no such state to report: a relaxed control is a per-gate switch and
+    # appears in `loosenings` above, named individually.
     # FIPS-provider attestation (report-only, #73 / ADR 0120). ``fips_mode`` is the FIPS-provider state of
     # the INTERPRETER's ssl/_hashlib OpenSSL (True/False, or None = undeterminable on a non-OpenSSL build);
     # ``openssl_version`` is that OpenSSL's version string. Metadata only — NOT secret material (SECRET-1),
@@ -1195,8 +1193,7 @@ class SecurityPosture(BaseModel):
     # The disclaimer that TRAVELS WITH THE ARTIFACT. ADR 0152 designates this endpoint the evidence
     # artifact for 11.7.1, and every other disclaimer this feature writes lives where an assessor
     # never looks (comments, docstrings, the ADR, the console HTML). Always populated, on every
-    # posture, precisely so no reading of this response is missing it. Prose-in-posture has precedent
-    # on this same model — see ``synthetic_relaxation`` above.
+    # posture, precisely so no reading of this response is missing it.
     memory_encryption_note: str | None = None
     # [security].allowed_client_networks observability. A control nobody can see firing is a control
     # that gets ripped back out the first time someone cannot reach the console, so these answer "is it

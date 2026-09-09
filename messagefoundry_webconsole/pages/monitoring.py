@@ -389,7 +389,6 @@ def status(
             ["Encryption at rest", _yn(posture.encryption_enabled)],
             ["Key source", posture.key_source],
             ["Key fingerprint", _opt(posture.key_id)],
-            ["Data class", _opt(posture.data_class)],
             ["Production", _yn(posture.production)],
             ["Environment", _opt(posture.environment)],
             # FIPS-provider attestation (report-only, #73 / ADR 0120). Scoped wording: this is the
@@ -483,17 +482,11 @@ def status(
             ["Delete message bodies after (days)", _sec("delete_message_bodies_after_days")],
             ["Allow keeping PHI indefinitely", _sec("allow_keeping_phi_indefinitely")],
             ["Audit all authz decisions", _sec("audit_all_authorization_decisions")],
-            [
-                "Handles real patient data",
-                _sec("handles_real_patient_data", "(derived from environment)"),
-            ],
             ["Production instance", _sec("production_instance", "(derived from environment)")],
         ],
         adjustable=False,
     )
     security_section: list[object] = [el("h2", "Security posture"), security_tbl]
-    if posture.synthetic_relaxation:
-        security_section.append(el("p", posture.synthetic_relaxation, class_="muted"))
     if posture.loosenings:
         security_section.append(
             el("p", "Protections loosened from the secure defaults:", class_="banner")

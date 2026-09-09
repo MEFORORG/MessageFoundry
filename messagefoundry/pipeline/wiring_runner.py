@@ -7215,7 +7215,7 @@ def _inbound_insecure_bind_permitted(
         return False
     if posture is None:
         return True  # un-postured (direct/embedding) call: preserve the shipped warn (see above)
-    return not (posture.enforcing and posture.is_phi)
+    return not posture.enforcing  # the `and posture.is_phi` conjunct went with BACKLOG #1279
 
 
 def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -7229,8 +7229,8 @@ def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | N
 
     An **unstamped** posture (``None``) permits it, for the same reason the sibling does: the check
     ran outside the ENFORCED gate, so this is a direct / embedding call and must never acquire a new
-    refusal there. Otherwise it is refused only on an instance that is BOTH enforcing AND PHI --
-    every other instance warns and crosses.
+    refusal there. Otherwise it is refused on an enforcing instance -- a non-enforcing one
+    warns and crosses. It required enforcing AND PHI until BACKLOG #1279 made every instance PHI.
 
     There is deliberately NO blunt process-wide escape here. ``MEFOR_ALLOW_INSECURE_TLS`` governs
     weakened TLS, and a listener that verifies its peers correctly but does not check revocation is
@@ -7240,7 +7240,7 @@ def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | N
         return True
     if posture is None:
         return True  # un-postured (direct/embedding) call: never a new refusal (see above)
-    return not (posture.enforcing and posture.is_phi)
+    return not posture.enforcing  # the `and posture.is_phi` conjunct went with BACKLOG #1279
 
 
 def check_inbound_revocation(
@@ -7548,9 +7548,9 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
         "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
         "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
     )
-    if posture is not None and posture.enforcing and posture.is_phi:
+    if posture is not None and posture.enforcing:
         raise WiringError(detail)
-    log.warning("%s (warned, not refused: this instance is not an enforcing PHI posture)", detail)
+    log.warning("%s (warned, not refused: this instance is not enforcing)", detail)
 
 
 def check_dimse_tls_exposure(

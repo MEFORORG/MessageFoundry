@@ -86,8 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         "--env",
         default=None,
         help="active environment NAME (overrides [ai].environment; selects environments/<env>.toml "
-        "values). Built-in names dev/staging/prod carry a default posture; a custom name also needs "
-        "[ai].data_class + [ai].production set.",
+        "values). Built-in names dev/staging/prod carry a default production tier; a custom name also "
+        "needs [security].production_instance set.",
     )
     serve.add_argument(
         "--project-root",
@@ -1457,20 +1457,22 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
 
     # Active environment is REQUIRED (ADR 0017): no silent default, so a missing env can never resolve
-    # another environment's values/secrets. Its security POSTURE (data_class / production) is derived
-    # for the built-in names dev/staging/prod and must be explicit for a custom name.
-    from messagefoundry.config.ai_policy import DataClass, SecurityEnforcement
+    # another environment's values/secrets. Its production TIER is derived for the built-in names
+    # dev/staging/prod and must be explicit for a custom name. There is no data-class axis to derive:
+    # every instance carries patient data, so every PHI gate below applies unconditionally
+    # (BACKLOG #1279).
+    from messagefoundry.config.ai_policy import SecurityEnforcement
 
     if settings.ai.environment is None:
         print(
             "error: no active environment set — pass --env <name> or set [ai].environment. It selects "
-            "environments/<name>.toml and, with [security].handles_real_patient_data/production_instance, "
-            "the instance's PHI posture.",
+            "environments/<name>.toml and, with [security].production_instance, the instance's "
+            "production tier.",
             file=sys.stderr,
         )
         return 2
     try:
-        data_class, production = settings.ai.require_posture()
+        production = settings.ai.require_posture()
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1513,11 +1515,12 @@ def _serve(args: argparse.Namespace) -> int:
         )
 
     # PHI-at-rest posture (H3, OWASP *Fail Securely* / SDS §4.3 PW.9 secure-by-default): with no key
-    # configured, a PHI-carrying instance — gated on data_class == phi, NOT the environment label, so a
-    # custom-named dev/test box holding near-real PHI is covered the same as prod — REFUSES to start
-    # (fail-closed). The refusal fires in EVERY environment (dev/staging/prod) once data_class is phi.
-    # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets such an
-    # instance start keyless (warn). A synthetic/non-PHI instance stays key-free (CI parity), and
+    # configured the instance REFUSES to start (fail-closed), in EVERY environment. It is not gated on
+    # the environment label, and since BACKLOG #1279 it is not gated on a data class either: every
+    # instance carries patient data, so a custom-named dev/test box holding near-real PHI is covered
+    # exactly as prod is, with no declaration able to exempt it.
+    # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets an
+    # instance start keyless (warn) — the per-gate switch that replaced the old blanket opt-out, and
     # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error.
@@ -1530,66 +1533,65 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if data_class is DataClass.PHI:
-            if not settings.store.allow_unencrypted_phi:
-                # Secure-by-default: any PHI instance (data_class==phi), in any environment, refuses to
-                # run keyless. This is the H3 tightening — previously prod refused and non-prod only
-                # warned (fail-open), but dev/staging routinely hold near-real PHI.
-                print(
-                    f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
-                    f"PHI instance (environment {env_name!r}, [ai].data_class=phi); refusing to start "
-                    "— PHI bodies and the summary/metadata (MRN + patient name) and "
-                    "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
-                    "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
-                    "protect-key`) and configure it; or, to deliberately run without at-rest "
-                    "encryption, set [security].allow_unencrypted_phi=true (audited).",
-                    file=sys.stderr,
-                )
-                return 2
-            if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
-                # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
-                # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
-                # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
-                # rest. Under warn enforcement PHI keeps the single-flag audited override below.
-                print(
-                    "error: [security].allow_unencrypted_phi=true on a PHI instance under strict "
-                    f"enforcement (environment {env_name!r}), but "
-                    "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
-                    "start — PHI bodies and the summary/metadata (MRN + patient name) and "
-                    "error/last_error/detail columns would be stored UNENCRYPTED at rest. Configure a "
-                    "key (MEFOR_STORE_ENCRYPTION_KEY), or set "
-                    "[security].allow_unencrypted_phi_under_strict_enforcement=true to deliberately run "
-                    "keyless under strict enforcement (audited).",
-                    file=sys.stderr,
-                )
-                return 2
-            # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
-            # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
-            # never silent. (Logging isn't configured yet here, so this goes through the root logger,
-            # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
-            # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
-            # was verified above, so the AUDIT line names both flags; the warn posture names just the one.
-            logging.getLogger(__name__).warning(
-                "AUDIT: starting keyless on a %sPHI instance (environment %r, data_class=phi) because "
-                "[security].allow_unencrypted_phi=true%s — PHI is stored UNENCRYPTED at rest "
-                "(at-rest encryption opt-out override).",
-                "production " if production else "",
-                env_name,
-                " + [security].allow_unencrypted_phi_under_strict_enforcement=true"
-                if enforcing
-                else "",
-            )
+        if not settings.store.allow_unencrypted_phi:
+            # Secure-by-default: any instance, in any environment, refuses to run keyless. This is
+            # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
+            # dev/staging routinely hold near-real PHI.
             print(
-                f"warning: [security].allow_unencrypted_phi=true — starting a "
-                f"{'production ' if production else ''}PHI environment "
-                f"({env_name!r}) keyless; PHI bodies and the summary/metadata (MRN + patient name) and "
-                "error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
-                "encryption protects them). Configure MEFOR_STORE_ENCRYPTION_KEY to encrypt them.",
+                f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set "
+                f"(environment {env_name!r}); refusing to start "
+                "— PHI bodies and the summary/metadata (MRN + patient name) and "
+                "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
+                "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
+                "protect-key`) and configure it; or, to deliberately run without at-rest "
+                "encryption, set [security].allow_unencrypted_phi=true (audited).",
                 file=sys.stderr,
             )
+            return 2
+        if enforcing and not settings.security.allow_unencrypted_phi_under_strict_enforcement:
+            # Secure-by-default under STRICT ENFORCEMENT (ADR 0140): keyless PHI under enforcement
+            # requires a SECOND acknowledgment beyond [security].allow_unencrypted_phi — the highest-
+            # risk posture (real PHI + strict enforcement) is never one flag away from plaintext at
+            # rest. Under warn enforcement PHI keeps the single-flag audited override below.
+            print(
+                "error: [security].allow_unencrypted_phi=true on a PHI instance under strict "
+                f"enforcement (environment {env_name!r}), but "
+                "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
+                "start — PHI bodies and the summary/metadata (MRN + patient name) and "
+                "error/last_error/detail columns would be stored UNENCRYPTED at rest. Configure a "
+                "key (MEFOR_STORE_ENCRYPTION_KEY), or set "
+                "[security].allow_unencrypted_phi_under_strict_enforcement=true to deliberately run "
+                "keyless under strict enforcement (audited).",
+                file=sys.stderr,
+            )
+            return 2
+        # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
+        # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
+        # never silent. (Logging isn't configured yet here, so this goes through the root logger,
+        # which emits >=WARNING to stderr by default — a durable startup audit line.) Under strict
+        # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
+        # was verified above, so the AUDIT line names both flags; the warn posture names just the one.
+        logging.getLogger(__name__).warning(
+            "AUDIT: starting keyless on a %sinstance (environment %r) because "
+            "[security].allow_unencrypted_phi=true%s — PHI is stored UNENCRYPTED at rest "
+            "(at-rest encryption opt-out override).",
+            "production " if production else "",
+            env_name,
+            " + [security].allow_unencrypted_phi_under_strict_enforcement=true"
+            if enforcing
+            else "",
+        )
+        print(
+            f"warning: [security].allow_unencrypted_phi=true — starting a "
+            f"{'production ' if production else ''}PHI environment "
+            f"({env_name!r}) keyless; PHI bodies and the summary/metadata (MRN + patient name) and "
+            "error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
+            "encryption protects them). Configure MEFOR_STORE_ENCRYPTION_KEY to encrypt them.",
+            file=sys.stderr,
+        )
 
-    # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY PHI
-    # instance (data_class==phi), not only a production one — the keyless gate ABOVE already fails
+    # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY
+    # instance, not only a production one — the keyless gate ABOVE already fails
     # closed in every environment unless an encryption key is configured or the audited
     # [security].allow_unencrypted_phi opt-out is set, so by the time control reaches here a PHI instance
     # necessarily has a key or the explicit opt-out. No further runtime check is added: an executable
@@ -1612,49 +1614,48 @@ def _serve(args: argparse.Namespace) -> int:
     # the flip below turns deny-by-default ON for, so such an instance still starts fail-closed. An
     # instance that explicitly opted OUT of deny-by-default is deliberately unchanged: it cannot
     # satisfy this gate on smtp/direct alone, because there the other six transports stay allow-any.
-    if data_class is DataClass.PHI:
-        eg = settings.egress
-        listed = (
-            eg.allowed_mllp
-            or eg.allowed_tcp
-            or eg.allowed_http
-            or eg.allowed_db
-            or eg.allowed_remote
-            or eg.allowed_file_dirs
+    eg = settings.egress
+    listed = (
+        eg.allowed_mllp
+        or eg.allowed_tcp
+        or eg.allowed_http
+        or eg.allowed_db
+        or eg.allowed_remote
+        or eg.allowed_file_dirs
+    )
+    if "deny_by_default" not in eg.model_fields_set:
+        listed = listed or eg.allowed_smtp or eg.allowed_direct
+    egress_open = not eg.deny_by_default and not listed
+    if egress_open:
+        # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when
+        # [security].block_unlisted_outbound was set explicitly (otherwise those two count above), so
+        # name that override rather than leaving the operator to wonder why a declared allowlist did
+        # not satisfy the gate.
+        mail_only_note = (
+            " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this gate "
+            "only when [security].block_unlisted_outbound is left unset — setting it false opts out "
+            "of the deny-by-default flip, which would leave every OTHER transport allow-any. Remove "
+            "that override (or set it true) and a mail-only/Direct-only allowlist is accepted."
+            if (eg.allowed_smtp or eg.allowed_direct)
+            else ""
         )
-        if "deny_by_default" not in eg.model_fields_set:
-            listed = listed or eg.allowed_smtp or eg.allowed_direct
-        egress_open = not eg.deny_by_default and not listed
-        if egress_open:
-            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when
-            # [security].block_unlisted_outbound was set explicitly (otherwise those two count above), so
-            # name that override rather than leaving the operator to wonder why a declared allowlist did
-            # not satisfy the gate.
-            mail_only_note = (
-                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this gate "
-                "only when [security].block_unlisted_outbound is left unset — setting it false opts out "
-                "of the deny-by-default flip, which would leave every OTHER transport allow-any. Remove "
-                "that override (or set it true) and a mail-only/Direct-only allowlist is accepted."
-                if (eg.allowed_smtp or eg.allowed_direct)
-                else ""
-            )
-            if enforcing:
-                print(
-                    f"error: outbound egress is UNRESTRICTED on a "
-                    f"{'production ' if production else ''}PHI instance "
-                    f"({env_name!r}); refusing to start — a transform could send PHI to any "
-                    "destination. Set [security].block_unlisted_outbound=true, or declare the permitted "
-                    f"destinations with per-transport [egress].allowed_* allowlists.{mail_only_note}",
-                    file=sys.stderr,
-                )
-                return 2
+        if enforcing:
             print(
-                f"warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
-                f"({env_name!r}) — a transform may send to any destination. Set "
-                "[security].block_unlisted_outbound or per-transport [egress].allowed_* allowlists to fail "
-                "closed.",
+                f"error: outbound egress is UNRESTRICTED on a "
+                f"{'production ' if production else ''}PHI instance "
+                f"({env_name!r}); refusing to start — a transform could send PHI to any "
+                "destination. Set [security].block_unlisted_outbound=true, or declare the permitted "
+                f"destinations with per-transport [egress].allowed_* allowlists.{mail_only_note}",
                 file=sys.stderr,
             )
+            return 2
+        print(
+            f"warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
+            f"({env_name!r}) — a transform may send to any destination. Set "
+            "[security].block_unlisted_outbound or per-transport [egress].allowed_* allowlists to fail "
+            "closed.",
+            file=sys.stderr,
+        )
 
     # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): a PRODUCTION PHI instance
     # defaults to FAIL-CLOSED egress. Unless the operator explicitly set [security].block_unlisted_outbound, turn
@@ -1669,38 +1670,37 @@ def _serve(args: argparse.Namespace) -> int:
     # instance hits that gate's refusal first. settings.egress is the same object later passed to
     # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
     # (no forbidden-file edit).
-    if data_class is DataClass.PHI:
-        if "deny_by_default" not in settings.egress.model_fields_set:
-            settings.egress.deny_by_default = True
-            # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
-            # like the sibling posture gates rather than logging.info.
-            print(
-                f"info: [security].block_unlisted_outbound defaulted ON for a "
-                f"{'production ' if production else ''}PHI instance "
-                f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
-                "destination of that type (secure-by-default). Declare the permitted destinations per "
-                "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
-                file=sys.stderr,
-            )
-        elif not settings.egress.deny_by_default:
-            # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
-            # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-            # line is WARNING-level so the root lastResort handler still surfaces it before
-            # configure_logging.
-            logging.getLogger(__name__).warning(
-                "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
-                "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
-                "send to ANY destination of that type); the secure-by-default deny is opted out.",
-                "production " if production else "",
-                env_name,
-            )
-            print(
-                f"warning: [security].block_unlisted_outbound=false on a "
-                f"{'production ' if production else ''}PHI instance ({env_name!r}) "
-                "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
-                "that type. Remove the override (or set it true) to fail closed.",
-                file=sys.stderr,
-            )
+    if "deny_by_default" not in settings.egress.model_fields_set:
+        settings.egress.deny_by_default = True
+        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
+        # like the sibling posture gates rather than logging.info.
+        print(
+            f"info: [security].block_unlisted_outbound defaulted ON for a "
+            f"{'production ' if production else ''}PHI instance "
+            f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
+            "destination of that type (secure-by-default). Declare the permitted destinations per "
+            "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
+            file=sys.stderr,
+        )
+    elif not settings.egress.deny_by_default:
+        # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
+        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
+        # line is WARNING-level so the root lastResort handler still surfaces it before
+        # configure_logging.
+        logging.getLogger(__name__).warning(
+            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
+            "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
+            "send to ANY destination of that type); the secure-by-default deny is opted out.",
+            "production " if production else "",
+            env_name,
+        )
+        print(
+            f"warning: [security].block_unlisted_outbound=false on a "
+            f"{'production ' if production else ''}PHI instance ({env_name!r}) "
+            "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
+            "that type. Remove the override (or set it true) to fail closed.",
+            file=sys.stderr,
+        )
 
     # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
     # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
@@ -1946,11 +1946,11 @@ def _serve(args: argparse.Namespace) -> int:
     env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
     env_file = env_base / settings.environments.dir / f"{env_name}.toml"
     # Announce the active environment + posture so an operator can see which env() values resolve and
-    # the PHI posture in effect (the env is required — there is no silent default).
+    # the tier in effect (the env is required — there is no silent default). Every instance carries
+    # patient data (BACKLOG #1279), so there is no data class to report: the PHI gates always apply.
     logging.getLogger(__name__).info(
-        "active environment: %s (data_class=%s, production=%s; env() values from %s + MEFOR_VALUE_*)",
+        "active environment: %s (production=%s; env() values from %s + MEFOR_VALUE_*)",
         env_name,
-        data_class.value,
         production,
         env_file,
     )
@@ -1975,7 +1975,7 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.api.host,
                 settings.api.trusted_proxies,
             )
-        elif insecure_bind_ok and not (data_class is DataClass.PHI and enforcing):
+        elif insecure_bind_ok and not enforcing:
             print(
                 f"warning: API bound to non-loopback host {settings.api.host!r} with "
                 "--allow-insecure-bind and NO TLS; bearer tokens and PHI cross the network in "
@@ -2071,7 +2071,7 @@ def _serve(args: argparse.Namespace) -> int:
             )
         if not settings.api.proxy_tls_floor_declared:
             posture_b_missing.append("[api].proxy_tls_min_version (attested proxy TLS/KEX floor)")
-        if posture_b_missing and data_class is DataClass.PHI:
+        if posture_b_missing:
             missing_desc = "; ".join(posture_b_missing)
             if enforcing and not settings.api.is_loopback:
                 print(
@@ -2109,7 +2109,6 @@ def _serve(args: argparse.Namespace) -> int:
         if proxy_mtls_declared_but_unverified(
             declared=settings.api.proxy_intra_service_auth,
             client_ca_configured=bool(settings.api.tls_client_ca_file),
-            is_phi=data_class is DataClass.PHI,
         ):
             print(
                 "warning: [api].proxy_intra_service_auth is declared 'mtls' but this engine verifies "
@@ -2310,11 +2309,7 @@ def _serve(args: argparse.Namespace) -> int:
             "reverse-proxy-mTLS guidance in docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ASVS 8.4.2).",
             file=sys.stderr,
         )
-        if (
-            settings.auth.enabled
-            and not settings.auth.admin_new_ip_step_up
-            and data_class is DataClass.PHI
-        ):
+        if settings.auth.enabled and not settings.auth.admin_new_ip_step_up:
             # Advisory only — the default deliberately stays False, because a flip would churn
             # NAT'd hospital networks and, on the shipped loopback bind, would change nothing at
             # all: _same_host folds 127.0.0.1 and ::1 into one host, so the flipped control still
@@ -2421,38 +2416,37 @@ def _serve(args: argparse.Namespace) -> int:
             else "admin interface reached through a declared reverse proxy "
             "([api].tls_terminated_upstream)"
         )
-        if data_class is DataClass.PHI:
-            if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
-                print(
-                    f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
-                    f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
-                    "Administrator role would authenticate with a single factor over the network. "
-                    "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                    "API (on an AD-only deployment it binds directory principals too, each enrolling "
-                    "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
-                    "deliberately permit single-factor admin at exposure (audited).",
-                    file=sys.stderr,
-                )
-                return 2
-            if enforcing:
-                # ADR 0140: single-factor admin at exposure under strict enforcement was explicitly
-                # acknowledged — emit a loud WARNING-level AUDIT line, then fall through to the shared
-                # warn posture (permitted-but-audited, never silent).
-                logging.getLogger(__name__).warning(
-                    "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
-                    "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
-                    "account in [security].require_mfa_scope is single-factor over the network.",
-                    exposure_desc,
-                    "production " if production else "",
-                    env_name,
-                )
+        if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
-                f"warning: {exposure_desc} in a PHI-carrying "
-                f"environment ({env_name!r}) with [security].require_mfa off — every account in "
-                "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
-                "before exposure.",
+                f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
+                f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
+                "Administrator role would authenticate with a single factor over the network. "
+                "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
+                "API (on an AD-only deployment it binds directory principals too, each enrolling "
+                "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
+                "deliberately permit single-factor admin at exposure (audited).",
                 file=sys.stderr,
             )
+            return 2
+        if enforcing:
+            # ADR 0140: single-factor admin at exposure under strict enforcement was explicitly
+            # acknowledged — emit a loud WARNING-level AUDIT line, then fall through to the shared
+            # warn posture (permitted-but-audited, never silent).
+            logging.getLogger(__name__).warning(
+                "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
+                "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
+                "account in [security].require_mfa_scope is single-factor over the network.",
+                exposure_desc,
+                "production " if production else "",
+                env_name,
+            )
+        print(
+            f"warning: {exposure_desc} in a PHI-carrying "
+            f"environment ({env_name!r}) with [security].require_mfa off — every account in "
+            "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
+            "before exposure.",
+            file=sys.stderr,
+        )
 
     # --- the UNDECLARED-proxy residual of the gate above, made visible (BACKLOG #326) ---------------
     # `instance_exposed` is deliberately narrow, so a set `public_origin` on a loopback bind with no
@@ -2469,7 +2463,6 @@ def _serve(args: argparse.Namespace) -> int:
         and settings.api.public_origin
         and settings.auth.enabled
         and not settings.auth.require_mfa
-        and data_class is DataClass.PHI
     ):
         print(
             "warning: [api].public_origin is set with no declared TLS terminator on a PHI instance "
@@ -2490,8 +2483,9 @@ def _serve(args: argparse.Namespace) -> int:
     # connection with no second sign-off. Key on the SAME exposure signal as the MFA gate above
     # (admin_exposed = instance_exposed = off-loopback bind OR a declared TLS-terminating proxy), so a
     # plain loopback default is byte-identical (admin_exposed is False → this never trips, BACKLOG #326
-    # preserved that property deliberately) and a synthetic instance stays quiet
-    # (gated on data_class is PHI). This is WARN-ONLY by design (the reviewed default): dual-control is
+    # preserved that property deliberately). It used to stay quiet on an instance declared synthetic;
+    # that declaration is retired (BACKLOG #1279).
+    # This is WARN-ONLY by design (the reviewed default): dual-control is
     # off-by-default precisely so a genuine single-operator hospital deployment is never wedged, so
     # refusing to start on its absence would break a supported topology.
     #
@@ -2499,7 +2493,7 @@ def _serve(args: argparse.Namespace) -> int:
     # the sec-mfa-on / retention / notifications prod-refuse ladder above, returning 2) instead of
     # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
     # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
-    if admin_exposed and not settings.approvals.enabled and data_class is DataClass.PHI:
+    if admin_exposed and not settings.approvals.enabled:
         approvals_exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
             if not settings.api.is_loopback
@@ -2557,12 +2551,7 @@ def _serve(args: argparse.Namespace) -> int:
     # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
     # the only end where the control measures its own posture instead of measuring whether someone
     # happened to configure an unrelated console setting.
-    if (
-        settings.api.tls_terminated_upstream
-        and data_class is DataClass.PHI
-        and enforcing
-        and not settings.api.public_origin
-    ):
+    if settings.api.tls_terminated_upstream and enforcing and not settings.api.public_origin:
         # THE REMEDIATION NAMES THE KEY THE LOADER ACCEPTS, NOT THE FIELD THIS CODE READS
         # (BACKLOG #1026). `[api].public_origin` is the INTERNAL field; ADR 0118 relocated the
         # operator-facing key to `[security].web_console_public_address` and REJECTS the old
@@ -2593,12 +2582,7 @@ def _serve(args: argparse.Namespace) -> int:
     # call needs. Before #1026 this comment named three conditions while the gate had four, and the
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
-    if (
-        settings.api.tls_terminated_upstream
-        and data_class is DataClass.PHI
-        and enforcing
-        and settings.api.public_origin
-    ):
+    if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
         try:
@@ -2644,135 +2628,134 @@ def _serve(args: argparse.Namespace) -> int:
     # [security].allow_keeping_phi_indefinitely=true, which downgrades the production refusal to a loud audited
     # warning (and suppresses the non-production auto-bound). Placed after the exposure gates so an
     # exposed instance's cleartext/MFA refusals surface first.
-    if data_class is DataClass.PHI:
-        # WP243 (#243, ASVS 14.2.7): a NON-PRODUCTION PHI instance auto-bounds each UNSET PHI-body
-        # retention window to 30 days (secure-by-default), mirroring the egress deny_by_default flip
-        # above. PRODUCTION PHI is deliberately EXCLUDED so the #186(a) refuse-to-start gate below is
-        # unchanged (a silent auto-bound there would mask the deliberate fail-closed refusal). Only an
-        # UNSET window is defaulted (model_fields_set), so an explicit value — including an explicit 0 —
-        # is respected; the audited keep-forever opt-out is [security].allow_keeping_phi_indefinitely=true.
-        # settings.retention is the same object later passed to create_managed_app, so the in-place
-        # default threads through to the RetentionRunner (no forbidden-file edit).
-        # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
-        # dead_letter_days stays [retention] plumbing — label each window at its real home.
-        # ASVS 14.2.7: the tier list is GENERATED from the classification in
-        # config/retention_classification.py, which a drift test holds equal — in both directions — to
-        # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
-        # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
-        # binding to the classification is the same defect with more characters.
-        from messagefoundry.config.retention_classification import (
-            MIN_PHI_RETENTION_WINDOWS,
-            PHI_RETENTION_WINDOWS,
-            auto_bounded_windows,
-        )
-        from messagefoundry.config.retention_classification import (
-            unbounded_windows as _unbounded_windows,
-        )
+    # WP243 (#243, ASVS 14.2.7): a NON-PRODUCTION PHI instance auto-bounds each UNSET PHI-body
+    # retention window to 30 days (secure-by-default), mirroring the egress deny_by_default flip
+    # above. PRODUCTION PHI is deliberately EXCLUDED so the #186(a) refuse-to-start gate below is
+    # unchanged (a silent auto-bound there would mask the deliberate fail-closed refusal). Only an
+    # UNSET window is defaulted (model_fields_set), so an explicit value — including an explicit 0 —
+    # is respected; the audited keep-forever opt-out is [security].allow_keeping_phi_indefinitely=true.
+    # settings.retention is the same object later passed to create_managed_app, so the in-place
+    # default threads through to the RetentionRunner (no forbidden-file edit).
+    # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
+    # dead_letter_days stays [retention] plumbing — label each window at its real home.
+    # ASVS 14.2.7: the tier list is GENERATED from the classification in
+    # config/retention_classification.py, which a drift test holds equal — in both directions — to
+    # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
+    # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
+    # binding to the classification is the same defect with more characters.
+    from messagefoundry.config.retention_classification import (
+        MIN_PHI_RETENTION_WINDOWS,
+        PHI_RETENTION_WINDOWS,
+        auto_bounded_windows,
+    )
+    from messagefoundry.config.retention_classification import (
+        unbounded_windows as _unbounded_windows,
+    )
 
-        # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
-        # tuple, so a bad merge dropping most entries would leave this gate checking one window while
-        # reporting success — the precise shape of failure this whole change set exists to remove.
-        if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+    # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
+    # tuple, so a bad merge dropping most entries would leave this gate checking one window while
+    # reporting success — the precise shape of failure this whole change set exists to remove.
+    if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+        print(
+            f"error: the PHI retention classification has shrunk to "
+            f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
+            "to start rather than gate on a partial classification. This is a build defect, not a "
+            "configuration one — see messagefoundry/config/retention_classification.py.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
+    # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+    # `enforce` posture an unset window took the refusal below instead of a default.
+    #
+    # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
+    # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
+    # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
+    # still refused unless the audited opt-out is set. So "unbounded by accident" is still
+    # prevented; "unbounded by inattention" becomes "30 days by inattention".
+    #
+    # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
+    # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
+    # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+    if not settings.retention.allow_unbounded_phi:
+        defaulted = [
+            w
+            for w in auto_bounded_windows()
+            if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
+        ]
+        for window in defaulted:
+            setattr(
+                getattr(settings, window.reads_from.strip("[]")),
+                window.field,
+                window.auto_bound_days,
+            )
+        if defaulted:
             print(
-                f"error: the PHI retention classification has shrunk to "
-                f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
-                "to start rather than gate on a partial classification. This is a build defect, not a "
-                "configuration one — see messagefoundry/config/retention_classification.py.",
+                f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
+                f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
+                "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
+                "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
                 file=sys.stderr,
             )
-            return 2
 
-        # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
-        # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
-        # `enforce` posture an unset window took the refusal below instead of a default.
-        #
-        # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
-        # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
-        # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
-        # still refused unless the audited opt-out is set. So "unbounded by accident" is still
-        # prevented; "unbounded by inattention" becomes "30 days by inattention".
-        #
-        # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
-        # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
-        # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+    # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
+    # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
+    # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
+    # [logging].log_dir there is nothing for the app-log sweep to sweep.
+    still_unbounded = _unbounded_windows(settings)
+    refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
+    warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
+
+    if warn_only:
+        # Classified and warned, never refused. Naming the tier AND its protection level is the
+        # point: an operator who sees "PL-1" knows a full body is involved.
+        print(
+            "warning: these classified PHI tiers have no retention window on a PHI instance "
+            f"({env_name!r}) and will accumulate without bound: "
+            + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
+            + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
+            "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
+            file=sys.stderr,
+        )
+
+    if refusable:
+        windows_desc = ", ".join(w.setting for w in refusable)
         if not settings.retention.allow_unbounded_phi:
-            defaulted = [
-                w
-                for w in auto_bounded_windows()
-                if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
-            ]
-            for window in defaulted:
-                setattr(
-                    getattr(settings, window.reads_from.strip("[]")),
-                    window.field,
-                    window.auto_bound_days,
-                )
-            if defaulted:
+            if enforcing:
                 print(
-                    f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
-                    f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
-                    "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
-                    "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
+                    f"error: a data-retention window is explicitly disabled for {windows_desc} on "
+                    f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
+                    "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
+                    "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
+                    "(e.g. 30); or, to deliberately retain forever, set "
+                    "[security].allow_keeping_phi_indefinitely=true (audited).",
                     file=sys.stderr,
                 )
-
-        # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
-        # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
-        # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
-        # [logging].log_dir there is nothing for the app-log sweep to sweep.
-        still_unbounded = _unbounded_windows(settings)
-        refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
-        warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
-
-        if warn_only:
-            # Classified and warned, never refused. Naming the tier AND its protection level is the
-            # point: an operator who sees "PL-1" knows a full body is involved.
+                return 2
             print(
-                "warning: these classified PHI tiers have no retention window on a PHI instance "
-                f"({env_name!r}) and will accumulate without bound: "
-                + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
-                + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
-                "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
+                f"warning: no data-retention window is configured for {windows_desc} in a "
+                f"PHI-carrying environment ({env_name!r}) — PHI message bodies accumulate without "
+                "bound. Set the window(s) to bound PHI at rest (ASVS 14.2.4).",
                 file=sys.stderr,
             )
-
-        if refusable:
-            windows_desc = ", ".join(w.setting for w in refusable)
-            if not settings.retention.allow_unbounded_phi:
-                if enforcing:
-                    print(
-                        f"error: a data-retention window is explicitly disabled for {windows_desc} on "
-                        f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
-                        "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
-                        "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
-                        "(e.g. 30); or, to deliberately retain forever, set "
-                        "[security].allow_keeping_phi_indefinitely=true (audited).",
-                        file=sys.stderr,
-                    )
-                    return 2
-                print(
-                    f"warning: no data-retention window is configured for {windows_desc} in a "
-                    f"PHI-carrying environment ({env_name!r}) — PHI message bodies accumulate without "
-                    "bound. Set the window(s) to bound PHI at rest (ASVS 14.2.4).",
-                    file=sys.stderr,
-                )
-            elif enforcing:
-                # Explicit, audited override: unbounded PHI retention under strict enforcement.
-                logging.getLogger(__name__).warning(
-                    "AUDIT: starting a %sPHI instance (environment %r) with unbounded data "
-                    "retention ([security].allow_keeping_phi_indefinitely=true; %s = 0) — PHI message "
-                    "bodies are retained INDEFINITELY (retention opt-out override).",
-                    "production " if production else "",
-                    env_name,
-                    windows_desc,
-                )
-                print(
-                    f"warning: [security].allow_keeping_phi_indefinitely=true — a "
-                    f"{'production ' if production else ''}PHI instance "
-                    f"({env_name!r}) retains PHI message bodies indefinitely ({windows_desc} unset). "
-                    "Configure a window to bound PHI at rest.",
-                    file=sys.stderr,
-                )
+        elif enforcing:
+            # Explicit, audited override: unbounded PHI retention under strict enforcement.
+            logging.getLogger(__name__).warning(
+                "AUDIT: starting a %sPHI instance (environment %r) with unbounded data "
+                "retention ([security].allow_keeping_phi_indefinitely=true; %s = 0) — PHI message "
+                "bodies are retained INDEFINITELY (retention opt-out override).",
+                "production " if production else "",
+                env_name,
+                windows_desc,
+            )
+            print(
+                f"warning: [security].allow_keeping_phi_indefinitely=true — a "
+                f"{'production ' if production else ''}PHI instance "
+                f"({env_name!r}) retains PHI message bodies indefinitely ({windows_desc} unset). "
+                "Configure a window to bound PHI at rest.",
+                file=sys.stderr,
+            )
 
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
@@ -2788,7 +2771,7 @@ def _serve(args: argparse.Namespace) -> int:
     # writing). "Effective channel" == notify_security_events on + SMTP host + sender (parity with the
     # app.py notifier wiring). Skipped when auth is disabled (no accounts to notify — a non-loopback
     # no-auth serve is already refused elsewhere).
-    if data_class is DataClass.PHI and settings.auth.enabled:
+    if settings.auth.enabled:
         security_channel_ready = bool(
             settings.auth.notify_security_events
             and settings.alerts.email_smtp_host
@@ -2856,11 +2839,7 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
     # and the #188 gate above already owns the "no channel at all" case.
-    if (
-        data_class is DataClass.PHI
-        and settings.alerts.email_smtp_host
-        and settings.alerts.email_from
-    ):
+    if settings.alerts.email_smtp_host and settings.alerts.email_from:
         if not settings.alerts.email_use_tls:
             hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"
         elif not settings.alerts.email_tls_verify:
@@ -2946,8 +2925,9 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # WARN BY DEFAULT; REFUSE ONLY ON AN OPT-IN. This is the load-bearing scoping decision and it is
     # not a softening — it is the only shape that does not hard-stop deployments that boot today:
-    #   * ADR 0148 makes EVERY built-in environment name derive DataClass.PHI, `dev` included, so an
-    #     exposed dev/test instance that declared nothing at all is a PHI instance by derivation;
+    #   * every instance carries patient data (BACKLOG #1279, after ADR 0148 GIVEN 1 made every
+    #     built-in environment name derive PHI), so an exposed dev/test instance that declared
+    #     nothing at all is in scope and nothing can declare it out;
     #   * "exposed" includes the loopback-behind-proxy topology OFF-LOOPBACK-DEPLOYMENT.md actually
     #     RECOMMENDS (it declares tls_terminated_upstream), which the Posture-B gate 400 lines above
     #     deliberately spares from its own refusal for exactly this reason;
@@ -2988,9 +2968,7 @@ def _serve(args: argparse.Namespace) -> int:
     # is exactly how the ASVS 11.7.1 arm and the ASVS 6.3.3 arm came to disagree about whether the same
     # boot was exposed.
     memory_declared = settings.security.memory_encryption_operator_declared
-    memory_undeclared_at_exposure = (
-        instance_exposed and data_class is DataClass.PHI and not memory_declared
-    )
+    memory_undeclared_at_exposure = instance_exposed and not memory_declared
     # Read the platform ONLY when one of the two branches below will consume the answer. A stock
     # loopback/synthetic start must not pay for a read it discards — on Linux that is a
     # /proc/cpuinfo read (hundreds of KB on a large host) plus two device stats.
@@ -4992,14 +4970,13 @@ def _ai_policy(args: argparse.Namespace) -> int:
         return 2
 
     ai = settings.ai
-    data_class, prod = ai.derived_posture()
-    production = True if prod is None else prod  # unresolved posture -> strictest ceiling
+    prod = ai.derived_posture()
+    production = True if prod is None else prod  # unresolved tier -> strictest ceiling
     eff = resolve_effective_policy(mode=ai.mode, data_scope=ai.data_scope, production=production)
     payload = {
         "mode": eff.mode.value,
         "data_scope": eff.data_scope.value,
         "environment": ai.environment,
-        "data_class": data_class.value if data_class is not None else None,
         "production": production,
         "assist_permitted": None,  # RBAC is not evaluable offline
         "reason": eff.reason,

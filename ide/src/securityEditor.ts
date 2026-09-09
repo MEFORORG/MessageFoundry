@@ -82,8 +82,9 @@ const FIELDS: Field[] = [
     desc: "PHI access is ALWAYS audited; this records the grant for every authorization decision on top. On by default (BACKLOG #1277).",
     insecure: false, risk: "every authenticated READ is authorized but NOT recorded — what an account reached cannot be reconstructed afterwards" },
   // ── What this instance handles ──────────────────────────────────
-  { key: "handles_real_patient_data", label: "Handles real patient data", type: "tristate", group: "What this instance handles",
-    desc: "The master posture lever. Derived from the environment name when unset (dev → no, staging/prod → yes)." },
+  // `handles_real_patient_data` sat here and is retired (BACKLOG #1279): every instance carries
+  // patient data, so there is no declaration to edit. The engine REFUSES the key at load, so leaving
+  // a row here would offer an edit that breaks the config it writes.
   { key: "production_instance", label: "Production instance", type: "tristate", group: "What this instance handles",
     desc: "Production-tier posture. Derived from the environment name when unset." },
 ];

@@ -380,9 +380,7 @@ def in_process_tls_revocation_refused(
     return True
 
 
-def proxy_mtls_declared_but_unverified(
-    *, declared: str, client_ca_configured: bool, is_phi: bool
-) -> bool:
+def proxy_mtls_declared_but_unverified(*, declared: str, client_ca_configured: bool) -> bool:
     """Whether ``serve`` must WARN that the Posture-B mTLS attestation contradicts this engine's config.
 
     ``[api].proxy_intra_service_auth = "mtls"`` says the proxy PRESENTS A CLIENT CERTIFICATE on the
@@ -406,8 +404,12 @@ def proxy_mtls_declared_but_unverified(
     value, and :func:`validate_proxy_tls_posture` below is the sibling coherence check on the other
     Posture-B attestation. Pure predicate so the ``_serve`` gate stays a one-liner and the truth table is
     testable without a settings load -- the same reason :func:`in_process_tls_revocation_refused` above
-    is one."""
-    return declared == "mtls" and not client_ca_configured and is_phi
+    is one.
+
+    It used to carry an ``is_phi`` conjunct, so a box declared synthetic never saw the contradiction.
+    Every instance carries patient data now (BACKLOG #1279), so the diagnostic fires wherever the
+    declaration and the configuration disagree."""
+    return declared == "mtls" and not client_ca_configured
 
 
 def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> None:
@@ -919,30 +921,29 @@ class InsecureHopRefused(ValueError):
 class HopPosture:
     """The instance security posture an insecure-hop decision is keyed on (#200).
 
-    ``is_phi`` — the instance carries real PHI (``[ai].data_class == phi``), independent of the
-    environment name. ``enforcing`` — whether the security REFUSE/WARN dial is at ENFORCE
+    ``enforcing`` — whether the security REFUSE/WARN dial is at ENFORCE
     (``[security].enforcement == enforce``, the secure default); it re-keys the ADR 0092 refuse/clamp
-    dial off the old production-tier flag onto the explicit enforcement level (this refactor). Both are
-    the *derived* posture (built-in dev/staging/prod derivation applied for ``is_phi``); an unresolved
-    custom-env ``is_phi`` fails closed to ``True`` via :meth:`fail_closed` — see decision 7 of ADR 0092.
-    Held in a contextvar for the duration of connector construction (:func:`active_hop_posture`)."""
+    dial off the old production-tier flag onto the explicit enforcement level (ADR 0148 GIVEN 2).
+    Held in a contextvar for the duration of connector construction (:func:`active_hop_posture`).
 
-    is_phi: bool
+    **``is_phi`` was the other dimension and is gone (BACKLOG #1279).** Every instance carries patient
+    data, so the answer was about to be ``True`` everywhere; a field that cannot vary is not a posture
+    dimension, it is a constant with a fail-closed rule attached. ADR 0153 had already removed it from
+    :func:`insecure_hop_disposition`, the widest consumer; this removes the remaining three. Whether a
+    hop may be crossed now turns on the hop's own facts (loopback, attested, accepted) and the
+    enforcement dial — never on a data label the same file could typo."""
+
     enforcing: bool
 
     @classmethod
-    def fail_closed(cls, *, is_phi: bool | None, enforcing: bool | None) -> HopPosture:
-        """Build a posture, defaulting an *unknown* (``None``) dimension to the strict value.
+    def fail_closed(cls, *, enforcing: bool | None) -> HopPosture:
+        """Build a posture, defaulting an *unknown* (``None``) dial to the strict value.
 
-        A custom-env instance may leave ``data_class`` unresolved (``serve`` refuses such a start, but an
-        offline build-check / embedding may still construct connectors). An unknown dimension defaults to
-        the fail-closed value — ``is_phi=True`` / ``enforcing=True`` — so an unproven posture never
-        *relaxes* a hop decision. A fully-declared config passes its real values through unchanged
-        (decision 7: resolve to the declared posture, not strictest-by-default)."""
-        return cls(
-            is_phi=True if is_phi is None else is_phi,
-            enforcing=True if enforcing is None else enforcing,
-        )
+        An offline build-check or embedding may construct connectors without a resolved enforcement
+        level. Unknown defaults to ``enforcing=True`` so an unproven posture never *relaxes* a hop
+        decision; a declared config passes its real value through unchanged (ADR 0092 decision 7:
+        resolve to the declared posture, not strictest-by-default)."""
+        return cls(enforcing=True if enforcing is None else enforcing)
 
 
 def is_loopback_hop_host(host: str) -> bool:
@@ -1126,24 +1127,28 @@ def phi_read_hop_disposition(
     identically to the transport cells, and the production-PHI clamp (``audited_opt_out``, supplied
     already clamped by the caller) stays the single authority for the global escape.
 
-    ``posture is None`` (an embedding / test that declared no ``[ai]`` posture, so ``is_phi`` is unknown)
-    → :attr:`~HopDisposition.ALLOW` — byte-identical to the pre-residual behaviour, so the loopback/dev
-    default and every non-PHI embedding are untouched. A ``serve_hop_secure`` hop is modelled as the
+    ``posture is None`` (an embedding / test outside the construction gate, where no enforcement level
+    was ever stamped) → :attr:`~HopDisposition.ALLOW` — byte-identical to the pre-residual behaviour,
+    so the loopback/dev default and every embedding are untouched. A ``serve_hop_secure`` hop is modelled as the
     authority's on-box carve-out (``is_loopback_hop``): a loopback / TLS / proxy-terminated serve hop is
     not an insecure network exposure, so PHI may cross (the serve-start exposed-gate already vetted it).
     There is no per-hop attestation for the API serve hop — the serve gate's proxy/TLS declarations are
     what prove it secure — so ``hop_attested`` is always ``False`` here.
 
-    **ADR 0153 leaves this cell keyed on the data label, deliberately** (its *Explicitly out of scope*
-    table): the API serve hop is not a connection, so it has nowhere to carry a per-hop
-    ``cleartext_accepted`` declaration, and refusing it instead would create a deviation the loosening
-    registry cannot express. The ``not is_phi`` ALLOW arm 0153 deleted from the shared authority is
-    therefore restated HERE, explicitly, rather than inherited — so the scope limit is a written
-    decision at the one place it applies, not an accident of a signature. A ``[security]``-level
-    declaration for this cell is the recorded follow-up."""
+    **ADR 0153 left this cell keyed on the data label; BACKLOG #1279 removed the label.** 0153's
+    reasoning for the carve-out stands and is recorded here rather than deleted: the API serve hop is
+    not a connection, so it has nowhere to carry a per-hop ``cleartext_accepted`` declaration, and
+    refusing outright would create a deviation the loosening registry cannot express. What that
+    reasoning bought was a ``not is_phi`` ALLOW arm, and with every instance carrying patient data
+    there is no longer an instance for it to fire on. So the arm is gone and the escape below is what
+    remains — ``MEFOR_ALLOW_INSECURE_TLS``, already clamped inert by the caller under ``enforce``.
+
+    **The ``posture is None`` arm stays and is now the only unconditional ALLOW.** It covers an
+    embedding or test that declared no posture at all, where the serve gate never ran to vet the hop.
+    A ``[security]``-level declaration for this cell remains the recorded follow-up, and removing the
+    data label makes it load-bearing rather than optional: under ``enforce`` an unproven serve hop now
+    has no per-cell way to say yes."""
     if posture is None:
-        return HopDisposition.ALLOW
-    if not posture.is_phi:
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
@@ -1175,7 +1180,6 @@ def phi_read_hop_disposition(
 
 def revocation_hop_disposition(
     *,
-    is_phi: bool,
     enforcing: bool,
     is_loopback_hop: bool,
     proxy_proven: bool,
@@ -1193,13 +1197,15 @@ def revocation_hop_disposition(
        revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        this hop (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``).
-    #. not ``is_phi`` (synthetic instance) → :attr:`~HopDisposition.ALLOW` — no PHI rides the hop.
-    #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing PHI hop with unchecked revocation.
-    #. else (non-enforcing PHI — the WARN posture) → :attr:`~HopDisposition.WARN`.
+    #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
+    #. else (non-enforcing — the WARN posture) → :attr:`~HopDisposition.WARN`.
+
+    A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
+    so it could no longer fire and its removal leaves the remaining three relaxations as the whole set.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
-    ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator, an operator
-    attestation, or a synthetic instance. This never turns verification off (the caller has already built
+    ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator and an operator
+    attestation. This never turns verification off (the caller has already built
     a verifying context) — it only decides whether the *unchecked-revocation* property of that verified
     hop is tolerable, so it composes with (never weakens) the #200 cleartext/verify-off refusals."""
     if is_loopback_hop:
@@ -1207,8 +1213,6 @@ def revocation_hop_disposition(
     if proxy_proven:
         return HopDisposition.ALLOW
     if attested:
-        return HopDisposition.ALLOW
-    if not is_phi:
         return HopDisposition.ALLOW
     if enforcing:
         return HopDisposition.REFUSE
@@ -1264,7 +1268,6 @@ class RevocationHopGuard:
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return revocation_hop_disposition(
-            is_phi=posture.is_phi,
             enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
             proxy_proven=self.proxy_proven,
@@ -1293,7 +1296,6 @@ class RevocationHopGuard:
         if (
             disposition is HopDisposition.ALLOW
             and (self.attested or self.proxy_proven)
-            and posture.is_phi
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):

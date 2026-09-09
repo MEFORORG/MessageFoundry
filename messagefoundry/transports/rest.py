@@ -365,7 +365,7 @@ def _current_hop_posture_fail_closed() -> HopPosture:
     send-time recompute which runs past that scope) sees ``None`` and fails closed — treats the hop as
     production PHI so an unproven posture never *relaxes* a refusal (ADR 0092 decision 7)."""
     posture = current_hop_posture()
-    return HopPosture(is_phi=True, enforcing=True) if posture is None else posture
+    return HopPosture(enforcing=True) if posture is None else posture
 
 
 def _shipped_strict_disposition(

@@ -133,11 +133,20 @@ class EngineNode:
         self._env.setdefault("MEFOR_API_TLS_KEY_FILE", _key)
         #: The PEM a client must pin to reach THIS node (EngineClient(cacert=...)).
         self.cacert = self._env["MEFOR_API_TLS_CERT_FILE"]
-        # GIVEN 1 (ADR 0148): the default env `dev` now derives PHI, so a bare `serve --env dev` runs the
-        # secure PHI posture (keyless/egress/retention/notify refusals). This harness node serves the
-        # SYNTHETIC load graph (no real PHI), so declare the loud opt-out — matching the `--env dev`
-        # "synthetic-only env" intent in start(). setdefault so a PHI scenario can still override it.
-        self._env.setdefault("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
+        # Every instance carries patient data (BACKLOG #1279), so `serve --env dev` runs the secure PHI
+        # posture: keyless / egress / retention / notify gates all apply. This node serves the SYNTHETIC
+        # load graph and measures throughput, so it takes the three PER-GATE relaxations that reproduce
+        # the posture it measured under before, each named and audited rather than folded into one
+        # declaration:
+        #   * enforcement=warn      -- the gates warn and continue instead of refusing
+        #   * allow_unencrypted_phi -- no store key, so the benchmark measures the same write path it
+        #                              always did (adding one here would change the number, not the risk)
+        #   * block_unlisted_outbound=false -- the load graph fans out to loopback sinks chosen at run
+        #                              time, which no static allowlist can name
+        # setdefault throughout, so a scenario that wants the enforcing posture can still override.
+        self._env.setdefault("MEFOR_SECURITY_ENFORCEMENT", "warn")
+        self._env.setdefault("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
+        self._env.setdefault("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "false")
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None

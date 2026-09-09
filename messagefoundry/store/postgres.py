@@ -806,7 +806,6 @@ def _refuse_store_revocation(*, host: str, posture: HopPosture | None) -> None:
     if posture is None:
         return
     disposition = revocation_hop_disposition(
-        is_phi=posture.is_phi,
         enforcing=posture.enforcing,
         is_loopback_hop=is_loopback_hop_host(host),
         proxy_proven=False,
