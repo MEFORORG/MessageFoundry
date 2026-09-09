@@ -774,8 +774,8 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 
 > **What changed, and why to trust it.** The 2026-07-09 pass below scored open items on a **five**-level
 > scale that had collapsed — **105 of 113** scored items sat on value `2`/`3` — and it never reached the 21
-> ASVS 5.0 L3 findings (**#185–#205**), which landed in [#854](https://github.com/wshallwshall/MessageFoundry/pull/854)
-> after the [#851](https://github.com/wshallwshall/MessageFoundry/pull/851) prioritization. All **134
+> ASVS 5.0 L3 findings (**#185–#205**), which landed in [#854](https://github.com/wshallwshall/MessageFoundry-vault/pull/854)
+> after the [#851](https://github.com/wshallwshall/MessageFoundry-vault/pull/851) prioritization. All **134
 > open items are re-scored here on a ten-level scale**, from each item's own `Scope` / `Why` / `Trigger` /
 > `Nearest existing mechanism` text — not rescaled from the old numbers.
 >
@@ -4184,7 +4184,7 @@ cell's re-score triggers — a third reason the vault change cannot lag the engi
 
 **ORDERING WITHIN THE LOCKSTEP -- ADDED 2026-08-21, because the sentence directly above is the WEAKER constraint and permits the case that must not happen.** Re-key the absence check on BEHAVIOUR **STRICTLY BEFORE** the engine change. Not "together", not "in lockstep", and **not** "cannot lag" -- which is what this item already says, and is exactly what leaves the door open.
 
-**WHY "CANNOT LAG" IS NOT MERELY VAGUE: IT PERMITS A RACE, AND THE RACE IS WRONG HALF THE TIME.** "Cannot lag" reads as licensing *simultaneous*, and **simultaneous is not an available option.** The two halves live in **two different repositories with different remotes** -- engine `github.com/MEFORORG/MessageFoundry.git`, vault `github.com/wshallwshall/MessageFoundry.git`, verified by reading both remotes -- and **there is no atomic cross-repo merge. One PR merges first.** So the choice is never between "before" and "at the same time"; it is between "before" and "a coin flip". If the engine PR wins the flip, then for that window the engine carries the refusal while the record still carries the name-keyed claim -- **green and false**, which is precisely the silent-green window the ordering exists to prevent. Re-keying first keeps the claim true and the gate green until the engine change turns it red, and **this item already calls that red the safe outcome.**
+**WHY "CANNOT LAG" IS NOT MERELY VAGUE: IT PERMITS A RACE, AND THE RACE IS WRONG HALF THE TIME.** "Cannot lag" reads as licensing *simultaneous*, and **simultaneous is not an available option.** The two halves live in **two different repositories with different remotes** -- engine `github.com/MEFORORG/MessageFoundry.git`, vault `github.com/wshallwshall/MessageFoundry-vault.git`, verified by reading both remotes -- and **there is no atomic cross-repo merge. One PR merges first.** So the choice is never between "before" and "at the same time"; it is between "before" and "a coin flip". If the engine PR wins the flip, then for that window the engine carries the refusal while the record still carries the name-keyed claim -- **green and false**, which is precisely the silent-green window the ordering exists to prevent. Re-keying first keeps the claim true and the gate green until the engine change turns it red, and **this item already calls that red the safe outcome.**
 
 **PROVENANCE, RECORDED AS PROVENANCE RATHER THAN AS A RULING.** An owner ratification of this ordering, dated 2026-08-21, is **claimed by two sessions and was not witnessed by whoever wrote this line.** The argument above stands on its own engineering merits and needs no ratification to be correct; the *attribution* does. **Confirm it with the owner before citing it as a ruling.** This is written the long way round deliberately: a constraint once entered this project's durable record without its provenance, was cited back as owner authority twice, and had never been issued. A claim recorded WITH its unwitnessed status cannot harden into that; a claim recorded without it always does.
 
@@ -26330,6 +26330,58 @@ The stale `BUILDER.md:253` and `:148` citations became quotes of their claims; t
 ### A correction to this row's first version
 
 It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live playbook sources". **That was wrong.** `.github/workflows/backlog-hygiene.yml` and CLAUDE.md section 5's Builder row AGREE -- both put the `docs/BACKLOG.md` edit in the same PR that carries the code, and that PR is the Builder's. The source that disagrees is the vault `roles/BUILDER.md` line 216, which is stale rather than live, because section 5 replaced the method those lines assume. The vault half is #1461. Left to #1460 either way, but for the right reason.
+
+## 1463. nothing checks that a verbatim-installed git hook matches its source
+
+> 🔢 **Filed 2026-09-05, found while landing the vault rename (PR 928). Not started.** Value **4/10** · Difficulty **2/10** · _quick win_. `install-git-hooks.ps1` lays `scripts/hooks/durability_push.sh` down as `.git/hooks/post-commit` VERBATIM, and every instrument that could report it drifting tests a MARKER instead of the content. The two `.py` payloads installed beside it are content-hashed in both directions. This one IS the implementation, and nothing hashes it.
+
+**Cluster:** repository gates / installed-copy parity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). A developer-box hook installed from a checkout. No engine behaviour, no shipped artifact, no PHI.
+
+### The measured instance
+
+2026-09-05. The vault repository was renamed, and `scripts/hooks/durability_push.sh` carries a table naming which remote is safe, because `git push` with no remote resolves to the PUBLIC one. The source was updated in the same commit as the rename. The installed copy was not, and a direct diff of the two files was the only thing that said so: two lines differed, both inside that table, where the installed side still named the vault by its pre-rename slug in the `private` row.
+
+**That diff is described rather than pasted, and the reason belongs in this item.** The stale-slug guard shipped in the same pull request refuses a verbatim quotation of the old line, correctly -- it cannot distinguish quoted evidence from a live reference. Its one standing exemption is pinned to a COUNT so that granting another is a deliberate act. `docs/BACKLOG.md` was not given one: it is 23,000 lines and grows daily, so a count here would be bumped reflexively rather than decided, which is the property the pin exists to buy. `docs/LEDGER-GATE.md` keeps its exemption because it is a stable page whose whole subject is one quoted artifact.
+
+**The drift found was comment-only, and that is not the point.** A body change would have hidden identically. The comment happens to be the part of this file that does the safety work -- it is what a human reads before choosing a remote -- so even the harmless-looking case was a live inaccuracy naming a path that no longer existed.
+
+`install-git-hooks.ps1 -Status` was run against exactly this state and reported:
+
+```
+post-commit: INSTALLED (durability hook)
+             ^ armed -> private (https://github.com/wshallwshall/MessageFoundry-vault.git)
+payload    : claim_check.py  installed b01bad5dc62e / source b01bad5dc62e
+             ^ IN SYNC -- identical CONTENT
+payload    : push_guard.py   installed c22ac41dd718 / source c22ac41dd718
+             ^ IN SYNC -- identical CONTENT
+```
+
+Two payloads got a hash pair. The drifted file got the word INSTALLED and a correct armed-remote line read from live git config, so the only green-looking row on the screen was the wrong one.
+
+### Why a marker cannot answer this question
+
+`install-git-hooks.ps1:162` sets `$durInstalled` by matching `$durabilityMarker` against the installed body, and `:164` prints the presence string off it. A marker answers *"is this ours"*. It cannot answer *"is this current"*, and it never goes false as the body drifts, because the installer's own `Copy-Item` at `:436` writes the marker in.
+
+That is the right instrument for the other two installed hooks and the wrong one here, and the difference is worth stating rather than assuming. `commit-msg` and `pre-push` are thin SHIMS that locate a `.py` payload; a marker plus a hashed payload covers them, which is what `tests/test_installed_coord_hooks.py:494-503` and `:552` do. `post-commit` has no payload to locate -- the file's own header says so, that it *"needs no shim, because unlike the claim and push gates it has no Python payload"* -- so behind its marker there is nothing hashed at all.
+
+### Where the scope was drawn, and it was drawn deliberately
+
+`install-git-hooks.ps1:82` describes `$payloads` as *"the .py PAYLOADS the install path below Copy-Items into `$hooksDir`, listed for -Status to audit"*, and `:86` is `$payloads = @("claim_check.py", "push_guard.py")`. The audit at `:205-217` walks that list.
+
+`tests/test_installed_coord_hooks.py:231` parses that same declaration and `:253` binds it to `PAYLOADS`; `:352` parametrizes `test_the_installed_coord_hook_matches_the_committed_source` over it. So the test's scope is the installer's scope by construction, which is the design that keeps the two from drifting -- and it inherits the gap exactly.
+
+`tests/test_durability_hook_provenance.py` does exercise a `.git/hooks/post-commit`, and it is not this one: its docstring at `:32` states the fixtures *"build throwaway repositories under `tmp_path` and never touch the real"* hooks. That is correct for a provenance test, and it means the file whose name most suggests coverage here provides none.
+
+### What would close it
+
+Both halves of the fold already exist -- `Get-HookPayloadHash` at `install-git-hooks.ps1:88` and `content_hash` in the test module -- so this is a declaration and a parametrize, not new machinery. The installer needs a second declared list mapping an installed name to its source path (`post-commit` -> `scripts/hooks/durability_push.sh`), `-Status` needs to print its hash pair beside the payloads', and the test needs to parse that declaration the way `payloads_declared_by` parses the first.
+
+Two properties the fix must keep. **An unrecognised declaration shape must report UNAUDITABLE, not clean**, which is the rule `payloads_declared_by`'s docstring already states for the payload list. And the parity check needs its own negative control, alongside `test_the_payload_parity_check_still_detects_a_content_difference` at `:418` -- appending a byte to the installed copy must change the hash, or the check is decoration.
+
+**One thing to settle before building.** The hooks directory is shared, so the parity question is asked once per CLONE and never once per worktree, and a red would tell every session at once about a single copy any one of them can fix. That is an argument for reporting rather than failing a commit, and it is a design call rather than an implementation detail.
+
+**How many worktrees share it is not a constant, and the first draft of this item recorded it as one.** Measured on this box on 2026-09-05, within a single session: 43 at the start, 38 an hour later, 18 after the reinstall. The instruments do not disagree -- `install-git-hooks.ps1:490` and `:300` both count `git worktree list` with the identical expression -- the population simply moves as sessions prune. Any figure here is an as-of reading, and the argument above needs only *"more than one"*, which is why it is stated without a number.
 
 ## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
 

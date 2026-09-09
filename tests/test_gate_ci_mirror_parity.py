@@ -105,6 +105,9 @@ _MIRRORS: dict[str, str] = {
     "gitleaks": r"\bgitleaks\s+detect\b",
     # the hook passes `-shellcheck=`; `--version` and `sudo install ... actionlint` must not satisfy it.
     "actionlint": r"\bactionlint\s+-shellcheck=",
+    # the hook shipped in PR 928 with no CI step; the mirror was added to ci.yml in the same
+    # pull request rather than exempting it, which is what this file's exhaustiveness arm asks for.
+    "stale-repo-slug": r"python\s+scripts/quality/stale_repo_slug_check\.py",
 }
 
 #: The file the three hooks below are pinned by. Kept as a PATH, not just named in prose, so the

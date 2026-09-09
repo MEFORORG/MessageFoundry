@@ -2,7 +2,7 @@ name: Required workflow state
 
 # Every REQUIRED status check must belong to a workflow GitHub will actually run.
 #
-# THE DEFECT THIS EXISTS FOR — measured on the sibling vault repo (wshallwshall/MessageFoundry),
+# THE DEFECT THIS EXISTS FOR — measured on the sibling vault repo (wshallwshall/MessageFoundry-vault),
 # 2026-07-30: 10 required contexts whose workflows were ALL `disabled_manually`. A disabled workflow
 # never dispatches, so those contexts never reported — NO pull request could merge, and every merge
 # there had silently been riding admin bypass. Nobody noticed, because the symptom presents as "CI is
