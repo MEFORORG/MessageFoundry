@@ -169,13 +169,14 @@ def test_check_json_payload_survives_a_log_record(
 ) -> None:
     """A record logged DURING ``check --json`` must not reach stdout.
 
-    The shape that evicted three merge-queue batches: a process that configured the engine's logging
-    keeps the guarded stdout sink on the root logger, and its stream object later goes stale (pytest's
-    capture teardown, an NSSM capture-file swap, a closed pipe). The next record fails to write, so
-    the guard rolls the sink onto the LIVE ``sys.stdout`` and records the rollover event there,
-    landing ahead of the payload; ``json.loads`` then raises ``Extra data: line 1 column 5`` on the
-    ISO timestamp. Forcing the record is what makes that deterministic. It is timing-dependent
-    otherwise, which is exactly why five real failures read as flakes.
+    The shape that evicted merge-queue entries (BACKLOG #1489 carries the census): a process that
+    configured the engine's logging keeps the guarded stdout sink on the root logger, and its stream
+    object later goes stale (pytest's capture teardown, an NSSM capture-file swap, a closed pipe).
+    The next record fails to write, so the guard rolls the sink onto the LIVE ``sys.stdout`` and
+    records the rollover event there, landing ahead of the payload; ``json.loads`` then raises
+    ``Extra data: line 1 column 5`` on the ISO timestamp. Forcing the record is what makes that
+    deterministic. It is timing-dependent otherwise, which is exactly why the real failures read as
+    flakes.
 
     The guard is doing the right thing and is not touched: writing the notice to the rolled sink is
     how stage 1 proves the replacement accepted a write. What changes is that a ``--json`` subcommand

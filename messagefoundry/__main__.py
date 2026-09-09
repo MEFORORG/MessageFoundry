@@ -881,8 +881,8 @@ def main(argv: list[str] | None = None) -> int:
     # (BACKLOG #1489). The engine's default log sink is stdout too, and one log line ahead of the
     # payload makes `json.loads` raise `Extra data: line 1 column 5`, because the text format opens
     # with the ISO timestamp: `2026` parses as a number and the payload becomes trailing garbage.
-    # Measured 2026-09-09 over ci.yml: five failures on five branches in a day, three of them
-    # evicting a healthy merge-queue batch.
+    # It cost real CI time before it was fixed; the census lives on the ledger item, with its
+    # provenance, rather than being restated here.
     #
     # DECIDED HERE, and not in `logging_guard`, which is where the symptom shows up. That module
     # writes its rollover notice to the ROLLED SINK on purpose: the notice landing is the proof that
