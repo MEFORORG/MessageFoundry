@@ -14,9 +14,17 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from messagefoundry.api.request_model import RequestModel
+from messagefoundry.api.validation import (
+    MAX_MAP_ENTRIES,
+    ConnectionName,
+    PermissionId,
+    RoleId,
+)
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
+# The ITEM rules for the id-shaped lists below live in `api/validation.py`, with the rest of the
+# operator API's input rules (BACKLOG #1108, docs/API-INPUT-VALIDATION.md).
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
@@ -40,7 +48,7 @@ class LoginResponse(BaseModel):
     token: str
     token_type: str = "bearer"
     must_change_password: bool = False
-    # The password was accepted but a second factor is still required before sensitive operations
+    # The password was accepted but a second factor is still required before ANY authorized route
     # (WP-14): the client should prompt for a TOTP / recovery code and POST /auth/mfa-verify.
     mfa_required: bool = False
     user: CurrentUser
@@ -99,7 +107,7 @@ class ChannelScope(RequestModel):
     client that sends null to widen a scope now narrows it to nothing. Administrators are
     all-channels by role, so a scope set on one has no effect either way."""
 
-    channels: list[str] | None = Field(default=None, max_length=512)
+    channels: list[ConnectionName] | None = Field(default=None, max_length=512)
 
 
 class UserCreateRequest(RequestModel):
@@ -107,7 +115,7 @@ class UserCreateRequest(RequestModel):
     password: str = Field(max_length=_PASSWORD_MAX)
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     email: str | None = Field(default=None, max_length=_NAME_MAX)
-    roles: list[str] = Field(default=[], max_length=64)
+    roles: list[RoleId] = Field(default=[], max_length=64)
 
 
 class UserUpdateRequest(RequestModel):
@@ -117,7 +125,7 @@ class UserUpdateRequest(RequestModel):
 
 
 class RolesUpdateRequest(RequestModel):
-    roles: list[str] = Field(max_length=64)
+    roles: list[RoleId] = Field(max_length=64)
 
 
 class PasswordChangeRequest(RequestModel):
@@ -205,7 +213,7 @@ class CustomRoleRequest(RequestModel):
 
     display_name: str = Field(max_length=_NAME_MAX)
     description: str | None = Field(default=None, max_length=_NAME_MAX)
-    permissions: list[str] = Field(max_length=64)
+    permissions: list[PermissionId] = Field(max_length=64)
 
 
 class CustomRoleInfo(BaseModel):
@@ -221,7 +229,7 @@ class AdGroupMapEntry(RequestModel):
 
 
 class AdGroupMap(RequestModel):
-    entries: list[AdGroupMapEntry]
+    entries: list[AdGroupMapEntry] = Field(max_length=MAX_MAP_ENTRIES)
 
 
 class AdGroupScopeEntry(RequestModel):
@@ -232,7 +240,7 @@ class AdGroupScopeEntry(RequestModel):
 
 
 class AdGroupScopeMap(RequestModel):
-    entries: list[AdGroupScopeEntry]
+    entries: list[AdGroupScopeEntry] = Field(max_length=MAX_MAP_ENTRIES)
 
 
 class AuditEntry(BaseModel):

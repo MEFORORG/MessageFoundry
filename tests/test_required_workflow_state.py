@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the required-context reachability check.
 
-THE DEFECT IT GUARDS — measured on the sibling vault repo (``wshallwshall/MessageFoundry``),
+THE DEFECT IT GUARDS — measured on the sibling vault repo (``wshallwshall/MessageFoundry-vault``),
 2026-07-30: 10 required contexts whose workflows were all ``disabled_manually``. A disabled workflow
 never dispatches, so NO pull request could merge and every merge had silently been riding admin
 bypass — invisible because the symptom reads as "CI is stuck", not "protection is misconfigured".

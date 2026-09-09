@@ -7,6 +7,45 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A startup preflight that reads the store principal's *effective* privileges, so the least-privilege
+  grant the runbooks prescribe stops being a claim the engine cannot check.**
+  [`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) told operators exactly which grant the engine's
+  database login needs, and the engine had no way to see what it had actually been given: no
+  fixed-server-role probe and no database-role probe existed anywhere, and
+  `[store].require_managed_identity` constrains the credential's *kind* rather than its privilege — a
+  `sysadmin` gMSA satisfies it clean. On a first deployment an over-granted store principal would
+  therefore have gone unobserved. `serve` now reads fixed **server**-role and **database**-role
+  membership plus `CONTROL SERVER` / database `CONTROL` on SQL Server, and role attributes
+  (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), assumable predefined roles and
+  database ownership on PostgreSQL — before any listener binds. The PostgreSQL attributes are read
+  across **every role the principal may assume**, not only its own row: attributes are never
+  inherited, but a member may `SET ROLE` to the holder and exercise them, so a wrapper role carrying
+  `CREATEROLE` is named (`CREATEROLE via role site_ops`) instead of reading clean.
+  **It observes and warns; it does not refuse by default** — refusing on an over-grant could block a
+  legitimate deployment mid-setup, and the engine does not own the grant. Every start logs what it saw,
+  writes a `store_privilege_preflight` audit row, and names each excess grant in
+  `security_loosenings()` and `GET /security/posture`. Set `[store].require_least_privilege = true` to
+  turn the warning into a refusal (refuse/warn splits on `[security].enforcement`, exactly like
+  `require_managed_identity`).
+  **It does not fail open, and that is the part to know before reading its output.** A probe that
+  cannot run — permission denied, a driver error, a store handle with no probe — reports
+  `unobservable`, which is a *different* result from "observed, and it is fine" in the log line, in the
+  audit row and in the posture response, and which a declared `require_least_privilege` also refuses.
+  SQLite reports `not_applicable` and says why: a local file has no server principal, and the control
+  there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
+  ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
+  ([BACKLOG #1008](docs/BACKLOG.md))
+
+### Changed
+- **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
+  additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
+  Additive with a default, so an older console ignores it; the seam still moves because the golden seam
+  contract introspects that model's field set.
+- **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
+  is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
+  records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
+  is still refused for a role holding only `USAGE` (the schema ACL is checked before the existence
+  skip, measured on 16.14). Bootstrap once with a DDL-capable principal, then hand over.
 - **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
   check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
   rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a
@@ -43,6 +82,32 @@ All notable changes to MessageFoundry are documented here. The format follows
   `ChannelScope`) travel in both directions; they carry the request rule because a dropped key on the
   RBAC writes is a mis-grant, so adding a field to one of them needs the client bump in the same
   release. ([BACKLOG #1109](docs/BACKLOG.md))
+
+- **A `fhir_lookup` search value now states its KIND, and a plain string carrying one of FHIR's
+  value-layer separators is refused rather than sent.** Percent-encoding is a URL-layer control: it
+  stops one value becoming two search parameters, and it cannot help at the FHIR value layer, where
+  `,` `|` and `$` are FHIR's own separators. The FHIR specification is explicit that a server
+  percent-decodes a parameter value first and reads FHIR's syntax second (R4 section 3.1.1.4.19, R5
+  section 3.2.1.5.7), so `%7C` arrives as a live token separator. A message-derived value carrying one
+  could therefore change what the search *means*.
+  **Three kinds, because one string cannot carry two provenances.** A plain `str` is data and raises a
+  PHI-safe error if it carries `,` `|` or `$` — the error names the parameter key and the character,
+  never the value. `FhirToken(system, code)` splits `"MRN|" + mrn` into its two halves: the system is
+  your literal and passes through, the code is data and screens. `FhirRaw("...")` is FHIR search syntax
+  **you** wrote — a composite, a quantity, a comma-separated OR or `_sort` list — percent-encoded only.
+  **Refusal rather than FHIR's backslash escape, deliberately:** the escape is correct only if the far
+  end implements the unescape, and server behaviour there varies, whereas a value that never leaves the
+  process cannot be misread by any server. Escaping stays available as an additive fourth kind for a
+  site that has a real FHIR server and can verify it.
+  **Migration:** `{"identifier": "MRN|" + mrn}` becomes `{"identifier": FhirToken("MRN", mrn)}`, which
+  puts identical bytes on the wire. Import `FhirToken` / `FhirRaw` from `messagefoundry`. A non-string
+  scalar also raises now — it was never in the declared type, but `urlencode` used to coerce it, so
+  `{"_count": 50}` has to become `{"_count": "50"}`.
+  **What is NOT screened:** the backslash. FHIR names it alongside these three because it introduces
+  the escape, so a server that implements the unescape reads a bare `\` as an introducer. Widening a
+  refusal is a behaviour change that should be ruled, so it is recorded on
+  `messagefoundry/fhirsearch.py` rather than folded in here.
+  ([BACKLOG #1243](docs/BACKLOG.md), [ADR 0043](docs/adr/0043-fhir-read-lookup.md))
 - **The authorization-grant audit trail now defaults ON, so a deployment records every authorization
   grant rather than only the state-changing ones.** `[security].audit_all_authorization_decisions` and
   the internal `[diagnostics].audit_all_authz` it desugars to both default `true`. Until now only a

@@ -54,6 +54,25 @@ on:
     # behavior unnecessary. Re-add `closed` if/when such PRs are accepted.
     types: [opened, synchronize]
 
+concurrency:
+  # security.yml's pattern, and its note there is the reasoning -- but keyed on `pull_request_target`,
+  # NOT `pull_request`, because that is the PR trigger this workflow actually declares. Copying the
+  # sibling expression verbatim would make this whole block a no-op: `github.event_name` is never
+  # `pull_request` here, so every run would take the `run_id` arm and nothing would ever group.
+  #
+  # ONLY THE PR ARM IS CANCELLABLE, AND THE OTHER TWO EVENTS ARE DELIBERATELY EXCLUDED:
+  #   * `merge_group` -- `cla` is a REQUIRED context and branch protection evaluates it on the
+  #     merge-group commit. A cancelled run reports a cancelled context, which is the same wedge the
+  #     `on:` note above records for an ABSENT one. It gets a unique group and cannot be cancelled.
+  #   * `issue_comment` -- this is the signing path: a contributor's sign comment is processed by
+  #     that run. Grouping those by ref would put EVERY comment in the repository into one group
+  #     (an issue_comment event's ref is the default branch), so a second comment anywhere would
+  #     cancel the run recording someone's signature. Unique group, never cancelled.
+  # The saving is the re-push path only: a rapid sequence of pushes to one PR now supersedes itself
+  # instead of leaving every earlier run alive competing for a runner slot.
+  group: cla-${{ github.event_name == 'pull_request_target' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
 permissions:
   actions: write
   contents: write
@@ -63,6 +82,7 @@ permissions:
 jobs:
   cla:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # REQUIRED BECAUSE THE ACTION BELOW IS LOCAL (BACKLOG #1381 vendored it from a remote one).
       # A remote `uses:` needs no working copy; a LOCAL `uses: ./...` resolves against

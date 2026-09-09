@@ -1,8 +1,9 @@
 # ADR 0042 — Embedded-document (base64 attachment) pruning
 
-- **Status:** Proposed (2026-06-27) — drafted for Multisession Plan 4 (Lane 0 coordinator); owner ratifies
-  the **design fork** (build increment (a) now, or defer) before Lane A builds. Number reserved here (next
-  free after [0041](0041-load-path-attestation-and-change-attribution.md)).
+- **Status:** Accepted — **increment (a) built in 0.2.9** (BACKLOG #47): the per-connection
+  `prune_documents_after` window strips OBX-5 ED and `mfb64:v1:` blobs in place to a tombstone, on all three
+  backends. The **ingest-time offload variant (b) stays deferred** to a future ADR. Drafted 2026-06-27 for
+  Multisession Plan 4 (Lane 0 coordinator); the owner ratified the design fork in favour of building (a).
 - **Decision in one line:** add a per-connection **`prune_documents_after`** window (with a size threshold)
   that, on a `RetentionRunner` pass, **rewrites the stored raw in place** to replace each base64 embedded
   document (the generic `mfb64:v1:` carriage marker and HL7 **OBX-5 ED** embeds) with a small

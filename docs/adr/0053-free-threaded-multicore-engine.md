@@ -1,9 +1,13 @@
 # 0053 — Free-threaded (cp314t) multi-core engine as the committed unified-store scale path (supersedes 0040)
 
-- **Status:** **Accepted** (2026-06-29) — the *commitment* is ratified; the cp314t feasibility + scaling
-  spike is **Phase 1 of execution** (see Acceptance Criteria), with ADR 0037 sharding + cross-shard
-  observability as the documented **fallback** if the spike fails. **Supersedes
-  [0040](0040-free-threaded-engine-support.md).**
+- **Status:** **COMMITMENT RETIRED — the spike ran and free-threading was declined.** The fallback named
+  below is now the path: **ADR 0037 engine sharding** over the [0063](0063-no-split-store-unified-store-for-sharding.md)
+  unified store. BACKLOG **#90** closed DECLINED 2026-07-09 (thread-hop fusion measured +6.5/+9.3/+10.0%,
+  below the 10% bar) and **#91** closed DECLINED 2026-07-20 (the engine is not CPU-bound: ~0.06–0.36 cores
+  per shard, so parallel CPU cannot pay for itself at the current wall). **Accepted 2026-06-29** — that
+  ratification, and everything below it, is kept as **history, not current direction**. It still
+  **supersedes [0040](0040-free-threaded-engine-support.md)**: 0040's *reasoning* was reversed here, and
+  the *outcome* landed back where 0040 stood, by measurement rather than by deferral.
 - **Date:** 2026-06-29
 - **Related:** **supersedes** [0040](0040-free-threaded-engine-support.md) (free-threading declined-by-design) ·
   **driven by** [0052](0052-enterprise-scale-target.md) (the committed enterprise target) · **refines**

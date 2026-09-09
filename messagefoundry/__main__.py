@@ -1833,6 +1833,10 @@ def _serve(args: argparse.Namespace) -> int:
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
+    # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
+    # None for the same reason and with the same discipline: it is reported moments later by the
+    # preflight's own log line + audit row once the lifespan opens the store, and completely by
+    # GET /security/posture. None here is "not yet observed", never "observed and clean".
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -1842,6 +1846,7 @@ def _serve(args: argparse.Namespace) -> int:
         (),
         (),
         (),
+        None,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -1851,7 +1856,8 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
             "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by the connector construction gate, `messagefoundry check` and "
-            "GET /security/posture.",
+            "GET /security/posture. Nor is the store-principal privilege observation (#1008) — the "
+            "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
         )
@@ -2413,16 +2419,16 @@ def _serve(args: argparse.Namespace) -> int:
                 # warn posture (permitted-but-audited, never silent).
                 logging.getLogger(__name__).warning(
                     "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
-                    "off, permitted because [security].allow_single_factor_admin_when_exposed=true — the "
-                    "Administrator role is single-factor over the network.",
+                    "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
+                    "account in [security].require_mfa_scope is single-factor over the network.",
                     exposure_desc,
                     "production " if production else "",
                     env_name,
                 )
             print(
                 f"warning: {exposure_desc} in a PHI-carrying "
-                f"environment ({env_name!r}) with [security].require_mfa off — the Administrator role is "
-                "single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
+                f"environment ({env_name!r}) with [security].require_mfa off — every account in "
+                "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
                 "before exposure.",
                 file=sys.stderr,
             )
@@ -2447,7 +2453,8 @@ def _serve(args: argparse.Namespace) -> int:
         print(
             "warning: [api].public_origin is set with no declared TLS terminator on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
-            "UNDECLARED reverse proxy, the Administrator role is single-factor over the network and "
+            "UNDECLARED reverse proxy, every account in [security].require_mfa_scope is single-factor over "
+            "the network and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",
@@ -5556,13 +5563,16 @@ def _security(args: argparse.Namespace) -> int:
             _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
-        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see ANY of
-        # the three per-connection declarations — it passes empty lists and declares the gap in
-        # `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
+        # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
+        # store — so it can see NEITHER the three per-connection declarations NOR the #1008
+        # store-principal privilege observation. It passes empty lists and None and declares BOTH gaps
+        # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, _rotation, (), (), ())
+            for s, r in security_loosenings(
+                sec, _store, _auth, _alerts, _rotation, (), (), (), None
+            )
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
@@ -5575,7 +5585,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included — see `messagefoundry check` or GET /security/posture"
+            "included, and neither is the store-principal privilege observation (#1008 — this command "
+            "opens no store) — see `messagefoundry check` or GET /security/posture"
         ),
     }
 

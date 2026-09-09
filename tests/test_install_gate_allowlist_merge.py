@@ -373,8 +373,52 @@ def test_the_installer_key_is_never_coarser_than_the_gates(tmp_path: Path) -> No
         "pair asks these two functions a question neither is ever asked in production."
     )
 
+    # `C:` IS DRIVE-RELATIVE, so Get-ComparablePath resolves it against the process's current
+    # directory ON DRIVE C. That leaves the pinned drive pair's meaning to ambient state no caller
+    # controls: when the current directory on C IS the drive root, both spellings resolve to the same
+    # place, the gate folds them, and the pair stops discriminating -- which the drive-pair assertion
+    # below then correctly reports as "a new counterexample is needed".
+    #
+    # MEASURED 2026-09-08, and that is why this is pinned rather than tolerated. The property held
+    # where the current directory on C was a real directory and failed where it was the root, with no
+    # change to either normalizer in between: three consecutive pushes to `main` failed this single
+    # assertion while every gate file went untouched. Left alone, the control's verdict is decided by
+    # whichever directory a runner happens to start in.
+    #
+    # So pin a known NON-ROOT directory on C for the comparison and restore it afterwards. This does
+    # not weaken the assertion; it removes the only reason it was reporting a property of the MACHINE
+    # rather than of the two normalizers. If no such directory exists the harness THROWS rather than
+    # skipping, because the pair then genuinely cannot be exercised and saying so is the whole point
+    # of the assertion it feeds.
+    pin = os.name == "nt"
+    prologue = (
+        (
+            "  $prevCwd = [System.IO.Directory]::GetCurrentDirectory()\n"
+            "  $pinDir = $null\n"
+            "  if ($env:SystemRoot -and $env:SystemRoot -imatch '^C:' -and "
+            "(Test-Path -LiteralPath $env:SystemRoot -PathType Container)) "
+            "{ $pinDir = $env:SystemRoot }\n"
+            # NAMED directories, not "the first one under C:/". That scan can return a directory the
+            # process cannot enter -- `System Volume Information` sorts early and is ACL-denied -- and
+            # SetCurrentDirectory would then throw an access error instead of the message below. Still
+            # loud, never a false green, but it names the wrong cause.
+            "  if (-not $pinDir) { $pinDir = @('C:/Windows','C:/Users','C:/ProgramData') | "
+            "Where-Object { Test-Path -LiteralPath $_ -PathType Container } | "
+            "Select-Object -First 1 }\n"
+            "  if (-not $pinDir) { throw 'no non-root directory on drive C, so the drive pair "
+            "cannot be exercised' }\n"
+            "  [System.IO.Directory]::SetCurrentDirectory($pinDir)\n"
+            "  try {\n"
+        )
+        if pin
+        else ""
+    )
+    epilogue = (
+        "\n  } finally { [System.IO.Directory]::SetCurrentDirectory($prevCwd) }" if pin else ""
+    )
+
     body = (
-        f"  $corpus = {_ps_array(corpus)}\n"
+        prologue + f"  $corpus = {_ps_array(corpus)}\n"
         "  $rows = foreach ($a in $corpus) { foreach ($b in $corpus) {\n"
         "    [pscustomobject]@{\n"
         "      a  = $a\n"
@@ -384,7 +428,7 @@ def test_the_installer_key_is_never_coarser_than_the_gates(tmp_path: Path) -> No
         "      gb = (Get-ComparablePath $b)\n"
         "    }\n"
         "  } }\n"
-        "  @($rows) | ConvertTo-Json -Depth 4 -Compress"
+        "  @($rows) | ConvertTo-Json -Depth 4 -Compress" + epilogue
     )
     out = _ok(
         _harness(

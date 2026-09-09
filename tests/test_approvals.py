@@ -179,7 +179,7 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
     await _add(service, "approver", Role.ADMINISTRATOR)
     # forge a pending request whose expiry is already in the past
     await engine.store.create_pending_approval(
-        approval_id="expired1",
+        approval_id="cafebabecafebabecafebabecafebabe",
         operation="dead_letter_replay",
         params="{}",
         requester="op",
@@ -188,9 +188,12 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
     )
     async with _client(engine, service, ON) as c:
         admin = await _token(c, "approver")
-        expired = await c.post("/approvals/expired1/approve", headers=admin)
+        expired = await c.post("/approvals/cafebabecafebabecafebabecafebabe/approve", headers=admin)
         assert expired.status_code == 409 and "expired" in expired.json()["detail"]
-        assert (await c.post("/approvals/nope/approve", headers=admin)).status_code == 404
+        # WELL-FORMED but absent -- a malformed id is a 422 at validation, before the route.
+        assert (
+            await c.post("/approvals/feedfacefeedfacefeedfacefeedface/approve", headers=admin)
+        ).status_code == 404
         # an expired request is also absent from the pending queue
         assert (await c.get("/approvals", headers=admin)).json()["approvals"] == []
 
