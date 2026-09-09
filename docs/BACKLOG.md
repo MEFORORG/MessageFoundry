@@ -28866,6 +28866,90 @@ drift into a named failure at commit time rather than a red a day later.
 
 ---
 
+## 1494. ADR 0056's planned-failover control plane is unbuilt, so a maintenance switchover means stopping the primary service
+
+> 🚧 **Filed 2026-09-09. Slice 1 -- the control plane -- ships with this item; the VIP mechanism does NOT.** Value **6/10** · Difficulty **4/10**. Value 6 -- it turns "reboot the primary and hope" into a first-class, audited operator action, and it is the piece of ADR 0056 that needs no privileged helper. Difficulty 4 -- the release logic already existed and was private; the work is the seam, the RBAC, and one race the ADR did not consider.
+
+**Cluster:** active-passive HA / operator control surface. **Priority:** P2. **Verdict:** build slice 1;
+leave the VIP mechanism gated on the owner's privileged-helper decision.
+**Severity:** no deployment axis (sec. 0). Zero deployments, so nothing is being drained today. This is
+a missing capability, not a defect in shipped behaviour.
+
+### What was missing
+
+An operator who wants to patch the active-passive primary has, on `main` before this item, exactly one
+way to move leadership: stop the engine service. That expires the lease and a standby promotes, but it
+also takes the node out of the cluster, and it is a service-control action rather than an audited,
+RBAC-gated one. ADR 0056 specified the alternative -- `POST /cluster/stepdown`, the leader voluntarily
+releasing its lease and staying up -- and nothing had been built.
+
+Measured on this worktree at `a2bfdb231`: no `CLUSTER_CONTROL`, no `cluster:control`, no `stepdown`
+anywhere under `messagefoundry/`, no `[cluster.vip]` settings block. The `vip` hits in `api/app.py`,
+`api/models.py`, `pipeline/dr.py`, `pipeline/engine.py` and `config/settings.py` belong to ADR 0048's
+disaster-recovery hook commands, which are a different mechanism.
+
+### What ships here
+
+- `ClusterCoordinator.step_down_leadership() -> tuple[bool, float | None]` on all three coordinators.
+  A visibility lift of `_release_leadership()`, which was already crash-correct and already demoted the
+  in-memory gate before touching the DB; `NullCoordinator` returns `(False, None)`.
+- `CLUSTER_CONTROL` (`cluster:control`), Administrator-only and in
+  `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so "Administrator only" is enforced on every minting path rather
+  than merely observed of the built-in roles -- the same treatment `dr:operate` gets.
+- `POST /cluster/stepdown` behind `require_step_up`, which supplies the ADR's whole decision-table row
+  in one wrapper: per-actor admin-write pacing, the TOTP MFA gate, the new-client-IP signal, and the
+  credential-recency window.
+- The audit row `cluster_stepdown`, carrying `{node_id, was_leader, released_at}` **as the coordinator
+  returned them**. No `is_leader()` pre-read exists in the handler at all, so there is no reading for a
+  fence or a lost-lease tick to invalidate. `tests/test_api_cluster_stepdown.py` proves this with a
+  coordinator whose two answers deliberately disagree, in both directions.
+
+Deferred on the ADR's own terms: the `force` flag, and `new_leader_eligible` in the result (at the
+instant of release no standby has acquired yet, so the caller re-polls `GET /cluster/nodes`).
+
+### The race the ADR did not consider, and why one line of new behaviour was unavoidable
+
+ADR 0056 says the stepdown differs from a clean stop only in that the node "keeps running and
+heartbeating afterward (demoted to standby)", and that the standby then "acquires the expired lease".
+That second half does not follow from the first.
+
+`_release_leadership()` sets `lease_expires_at = 0` but leaves `owner` naming the releasing node. The
+claim statement's renew branch is `WHERE leader_lease.owner = $2 OR <expired>` -- and the renew half
+carries **no expiry test**. So on a clean stop the ordering is safe (the maintenance loop is already
+cancelled), but on a stepdown the loop is still running: the drained node's very next tick matches its
+own renew branch and takes leadership straight back. Whether the drain works at all comes down to which
+node's heartbeat phase lands first. The endpoint would have answered `200` either way.
+
+The fix is a bounded post-stepdown claim pause, `2 * heartbeat_seconds`, checked in exactly the
+position ADR 0096's `promotable = false` short-circuit already occupies. It is a strictly stricter claim
+predicate on one node, so by ADR 0096's own argument it can only make that node claim later, never
+earlier, and cannot open a two-leader window. It touches neither the lease, nor the self-fence, nor the
+epoch token. `tests/test_cluster_lease.py` carries the regression **and its negative control** -- clear
+the pause and the same sequence hands leadership straight back, so the guard cannot silently stop
+measuring anything.
+
+**The cost is stated rather than hidden:** on a cluster with no other promotable node, that window is
+leaderless. That is the honest consequence of asking the only eligible node to step down.
+
+### What does NOT ship, and what gates it
+
+The VIP mechanism: `[cluster.vip]`, bind/release, the gratuitous ARP, the self-fence release path,
+`mefor-net-helper.exe`, and the `vip` field on `GET /cluster/status`. All of it depends on granting the
+engine network-configuration rights, which collides head-on with DEPLOY-1's least-privilege direction.
+ADR 0056 chose the privileged-helper option on paper; nobody has signed off on shipping a second
+privileged binary. **That decision is the gate, and it is the owner's.**
+
+### Also found while reading ADR 0056
+
+Its "Console -- High Availability page" section is stale. It names `console/shell.py`,
+`console/status.py` and `console/connections.py`, all of which went with the retired PySide6 desktop
+console; the operator UI is the web console at `/ui`. The topology reasoning in that section still holds
+(one page renders the whole cluster from any node, so Corepoint's "Viewing: Primary / Backup" toggle has
+no analogue) but its construction notes point at files that do not exist. The ADR's status block now
+says so; the section itself is kept for the reasoning.
+
+---
+
 ## 1497. ADR 0157 leaves increments 0, 2 and 3 unbuilt, says increment 2 is mis-specified, and no open item carries any of it
 
 > 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **6/10** · Difficulty **6/10** · _big bet_. Found by an ADR-to-backlog sweep. The ADR names three unbuilt increments in its own opening blockquote and warns that one of them must not be built as written. Its only backlog reference is a closed test-flake row about a wall-clock assertion, so the engine work has no home. Value 6: on a first deployment against SQL Server this is an absent in-flight recovery path plus two unfenced write paths on a demoted node. Difficulty 6: cross-backend store work under the fence invariant, and the specification has to be repaired before anyone can build it.

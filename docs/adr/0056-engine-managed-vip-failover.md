@@ -1,9 +1,22 @@
 # ADR 0056 — Engine-managed virtual IP (VIP) failover
 
-- **Status:** Proposed (2026-06-27) — drafted on the owner's go. **No code**; this is a **design**
-  decision to record the seam, the correctness argument, the privilege cost, and the operator surface
-  before any build. There is **no engine-managed-VIP code today** — every reference below to a bind/
-  release/`/cluster/stepdown`/VIP-owner field is **proposed**, not built.
+- **Status:** Partly accepted (2026-06-27; control plane built 2026-09-09, BACKLOG #1494). Read the two
+  halves separately, because they are at different build states and conflating them is how a reader ends
+  up designing for an address the engine does not move:
+  - **BUILT — the planned-failover control plane.** `POST /cluster/stepdown`, the `CLUSTER_CONTROL`
+    (`cluster:control`) permission, and the coordinator's public `step_down_leadership()` seam. That is
+    §"Control API — planned failover" below, minus the two things it defers on its own terms: the
+    `force` flag and `new_leader_eligible`.
+  - **STILL PROPOSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release, the
+    gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
+    `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
+    bind/release or a VIP-owner field is proposed, not built. The privileged-helper decision is the
+    gate.
+  - **STALE — §"Console — High Availability page".** It targets the PySide6 desktop console
+    (`console/shell.py`, `console/status.py`, `console/connections.py`), which was retired. The operator
+    UI is the web console at `/ui`. The section is kept for its topology reasoning — the "no Viewing
+    toggle" argument and the read-mostly layout still hold — but its construction notes name files that
+    no longer exist. Do not build from them.
   - **ADR number:** first drafted as `0047`; that slot was reassigned on `origin/main` (to the cloud/k8s
     HA deployment-packaging ADR), so this was renumbered to `0056` — the next free number on `main`, which
     now carries through 0055. Parallel worktrees can race the number, so confirm `0056` is still free

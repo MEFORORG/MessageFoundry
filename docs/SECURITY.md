@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **108** engine route objects, **90 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **109** engine route objects, **91 demand a
 specific permission** and 18 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -245,7 +245,7 @@ apply. What each **adds** over plain `require()`:
 | `require` | 43 | nothing — the ladder itself |
 | `require_paced` | 16 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 27 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 4 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -254,11 +254,11 @@ apply. What each **adds** over plain `require()`:
 validates the handshake `Origin` against `[api].ws_allowed_origins` **before** `accept()`, then the
 bearer token, the must-change lockout and the permission.
 
-### Permission catalogue (28)
+### Permission catalogue (29)
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 92, not 90, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 93, not 91, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -275,6 +275,7 @@ under `create_app()` (they sum to 92, not 90, because BOTH `/messages/export` ro
 | `CONNECTIONS_CONTROL` | `connections:control` | | 3 | `POST /connections/{name}/start`, `/stop`, `/restart` |
 | `CONNECTIONS_TEST` | `connections:test` | | 2 | `POST /connections/{name}/test`, `/test-credential` |
 | `DR_OPERATE` | `dr:operate` | | 2 | `POST /dr/activate`, `/dr/release` (ADR 0048). Never assignable to a custom role |
+| `CLUSTER_CONTROL` | `cluster:control` | | 1 | `POST /cluster/stepdown` (ADR 0056) — a planned active-passive failover: the leader releases its lease and a standby promotes. A dedicated capability, not a reuse of `monitoring:read` (a read) or `connections:control` (one connection). Never assignable to a custom role |
 | `CONFIG_DEPLOY` | `config:deploy` | | 2 | `POST /config/reload` **and** `POST /connections/{name}/flag` |
 | `CONFIG_VALIDATE` | `config:validate` | | 0 | no endpoint yet (see the note below) |
 | `CODE_EDIT` | `code:edit` | | 0 | no endpoint yet |
@@ -304,7 +305,7 @@ inheritance — where a permission came from is invisible downstream.
 
 | Role | Count | Permissions |
 |---|:--:|---|
-| **Administrator** | 28 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
+| **Administrator** | 29 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
 | **Operator** | 16 | `monitoring:read`, `monitoring:diagnose`, `messages:read`, `messages:view_summary`, `messages:view_raw`, `messages:replay`, `messages:resend`, `messages:edit`, `messages:export`, `messages:purge`, `connections:control`, `connections:test`, `logs:view`, `files:upload`, `files:browse`, `files:delete` |
 | **Deployment** | 4 | `monitoring:read`, `config:deploy`, `config:validate`, `connections:test` |
 | **Coding** | 4 | `monitoring:read`, `code:edit`, `config:validate`, `ai:assist` |
@@ -326,11 +327,12 @@ permission at all, so every gated property comes back `null` for them.
 The custom-role builder **is built** and is an *additive overlay* on the six built-ins, not a
 replacement:
 
-- A custom role is a named **subset of the existing 28-permission catalogue** — it can never define a
+- A custom role is a named **subset of the existing 29-permission catalogue** — it can never define a
   new permission kind.
 - Its id must carry the `custom:` prefix (`CUSTOM_ROLE_ID_PREFIX`), so it can never collide with a
   built-in role value or be mis-routed to the built-in resolver.
-- It may **never** grant `users:manage`, `approvals:approve`, `dr:operate` or `files:access_any`
+- It may **never** grant `users:manage`, `approvals:approve`, `dr:operate`, `cluster:control` or
+  `files:access_any`
   (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) — the escalation primitives stay admin-only.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
@@ -352,12 +354,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **108 route objects** — 67 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (66 HTTP + 1 WebSocket) and 38 declared in
+**Counting basis.** `create_app()` with no arguments builds **109 route objects** — 68 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (67 HTTP + 1 WebSocket) and 38 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 112 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 201
-(108 + the 97 console routes + the `/ui/static` mount). Of the 108: **90 are permission-gated**, 18 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 113 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 210
+(109 + the console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -474,6 +476,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/approvals` | `approvals:approve` | `require` |
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
+| `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_paced` |
 | `POST` | `/dr/release` | `dr:operate` | `require_paced` |
 
@@ -563,7 +566,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 108 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 109 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus

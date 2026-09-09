@@ -61,9 +61,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #1184 (ASVS 14.2.1) added three JSON routes -- POST /messages/search, POST /messages/export
 # and POST /uploads/{file_id}/messages/search -- and two /ui routes, POST /ui/messages/search/run and
 # POST /ui/uploaded-logs/file/{file_id}/filter, so the needle can travel in a body instead of a URL.
-_ROUTES_DEFAULT = 108
-_ROUTES_WITH_DOCS = 112
-_ROUTES_WITH_UI = 209
+# BACKLOG #1494 (ADR 0056 slice 1) added one JSON route -- POST /cluster/stepdown, the planned-failover
+# control plane -- so each basis moved by one.
+_ROUTES_DEFAULT = 109
+_ROUTES_WITH_DOCS = 113
+_ROUTES_WITH_UI = 210
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1074,8 +1076,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     gated = [r for r in rows if r[2]]
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
-    assert len(gated) == 90, (
-        f"{len(gated)} permission-gated routes, not 90 — update the doc's totals."
+    # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
+    assert len(gated) == 91, (
+        f"{len(gated)} permission-gated routes, not 91 — update the doc's totals."
     )
 
 

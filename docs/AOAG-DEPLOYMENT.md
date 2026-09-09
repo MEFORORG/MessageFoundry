@@ -574,9 +574,12 @@ cost of a slower crash-failover of the engine itself. Keep the load-enforced
 ### 5.4 Inbound MLLP VIP / LB
 
 MessageFoundry **designs for, but does not ship,** the floating VIP / L4 load balancer
-([`DEPLOYMENT.md`](DEPLOYMENT.md), [`CLUSTERING.md`](CLUSTERING.md)). An engine-managed VIP is
-**proposed only, with no code** ([ADR 0056](adr/0056-engine-managed-vip-failover.md)), so never
-design as if the engine moves an IP. Stand up keepalived, HAProxy, F5, or an NLB with:
+([`DEPLOYMENT.md`](DEPLOYMENT.md), [`CLUSTERING.md`](CLUSTERING.md)). The engine-managed **VIP
+mechanism** of [ADR 0056](adr/0056-engine-managed-vip-failover.md) is **proposed only, with no code**,
+so never design as if the engine moves an IP. What that ADR has actually shipped is only its control
+plane, `POST /cluster/stepdown`, which moves *leadership* on request; the address still follows because
+your health check stops passing on the node that released the lease. Stand up keepalived, HAProxy, F5,
+or an NLB with:
 
 - **One VIP per inbound MLLP port, with the health check a TCP connect to that port.** Only the
   leader binds it, so the check passes only on the active engine and the VIP follows engine

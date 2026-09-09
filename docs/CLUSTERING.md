@@ -297,6 +297,10 @@ fixed node — so a failover is transparent to senders (modulo a reconnect):
 > on **Linux/containerized** deployments, which it does **not** cover — use the external floating VIP / LB
 > described here, which stays the **cross-platform** default and the recommended posture for the strictest
 > split-brain guarantee.
+>
+> **What HAS shipped from that ADR is only the control plane** — `POST /cluster/stepdown` (below), which
+> moves *leadership*. It moves no address: with the external VIP / LB the address follows on its own,
+> because the health check stops passing on the node that just released the lease.
 
 - **MLLP / TCP inbound (per listener).** Use a VIP per inbound port whose health check is a **TCP
   connect to that port**. Because only the **primary** binds the port (the active-passive graph gating),
@@ -314,8 +318,9 @@ fixed node — so a failover is transparent to senders (modulo a reconnect):
 There is a promotion window, as in Rhapsody (minutes-class) — quantify it from the Workstream-D failover
 benchmark, don't assume zero-downtime:
 
-- **Clean stop** (graceful shutdown / planned switchover): the leaving primary **expires its lease**, so a
-  standby acquires on its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`).
+- **Clean stop** (graceful shutdown): the leaving primary **expires its lease**, so a standby acquires on
+  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A **planned switchover** that
+  leaves the node running takes the same path, without the shutdown — see `POST /cluster/stepdown` below.
 - **Crash / partition**: the primary's lease **ages out**, so a standby acquires after up to
   `leader_lease_ttl_seconds`. A partitioned old primary **self-fences** within
   `leader_fence_timeout_seconds` (< the TTL), so it stops *reporting itself* leader before the standby
@@ -327,6 +332,41 @@ benchmark, don't assume zero-downtime:
   dead primary's in-flight rows promptly (and the ordinary FIFO claim reclaims a stranded lane head, so
   order survives). At-least-once delivery + idempotent re-runs mean a row interrupted mid-delivery is
   re-delivered after its lease expires (so downstream connections must stay idempotent).
+
+### Planned failover — `POST /cluster/stepdown`
+
+Ask the current primary to hand over on purpose, before you patch or reboot it, instead of pulling the
+service out from under a live feed. The node **releases its leadership lease and keeps running**, demoted
+to standby: a standby acquires the expired lease on its next heartbeat and promotes its graph, and the
+node you drained stays up, heartbeating, ready to take leadership back later.
+
+```
+POST /cluster/stepdown        # body: {} — there are no options
+{ "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5 }
+```
+
+- **Permission:** `cluster:control`, a dedicated capability held by **Administrator only** and never
+  assignable to a custom role. Behind `require_step_up`, so the caller also passes the per-actor
+  admin-write pacing floor, the TOTP MFA gate and the credential-recency window.
+- **`was_leader` is what the release returned**, not a reading taken before it. A fence or a lost-lease
+  tick can move leadership in between, so a "was this node the leader?" check made first could report a
+  failover that released nothing. The same returned value is what the audit row records.
+- **Statuses:** `400` on a single node (no lease, no standby); `409` when this node is not the leader —
+  resolve the leader from `GET /cluster/nodes` and call it there, this is not a retry; `403` on a missing
+  permission, a stale step-up or an unsatisfied second factor; `503` when the engine is not started.
+- **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
+  `{node_id, was_leader, released_at}` — cluster metadata only, never message content.
+- **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
+  `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
+
+**In-flight work is not drained first.** Stepdown releases leadership; it does not quiesce the graph.
+Rows already claimed on the old primary are recovered by the new one through the ordinary lease/reclaim
+path, so plan the switchover the same way you plan a restart.
+
+**The drained node stands down briefly before it contends again.** For two `heartbeat_seconds` after a
+stepdown it declines to claim or renew, so a sibling wins the expired lease rather than the node you
+just drained renewing itself straight back. On a cluster with no other promotable node that window is
+leaderless, which is the honest consequence of asking the only eligible node to step down.
 
 ### Tune the lease timings to your network
 

@@ -44,6 +44,12 @@ class Permission(str, Enum):  # noqa: UP042
         "connections:test"  # probe a connection's reachability (POST /connections/{name}/test)
     )
     DR_OPERATE = "dr:operate"  # promote/release a third-tier DR standby (POST /dr/activate|release, ADR 0048)
+    # Planned active-passive failover: make the current leader release its leadership lease so a standby
+    # promotes (POST /cluster/stepdown, ADR 0056). A DEDICATED capability, not a reuse of monitoring:read
+    # (a read) or connections:control (one connection) — this moves the whole cluster's primary. Held by
+    # ADMINISTRATOR only at v1 and never assignable to a custom role, so "Administrator only" is enforced
+    # on every minting path rather than merely observed of the built-ins.
+    CLUSTER_CONTROL = "cluster:control"
     CONFIG_DEPLOY = "config:deploy"  # endpoint lands in a later effort
     CONFIG_VALIDATE = "config:validate"  # endpoint lands in a later effort
     CODE_EDIT = "code:edit"  # endpoint lands in a later effort
@@ -191,7 +197,8 @@ CUSTOM_ROLE_ID_PREFIX = "custom:"
 #: ``ADMINISTRATOR`` deliberately gates (ADR 0045 D1). ``USERS_MANAGE`` is the permission that mints
 #: roles (a custom role holding it could grant itself admin-equivalent power); ``APPROVALS_APPROVE`` is
 #: dual-control release; ``DR_OPERATE`` (ADR 0048) promotes/releases a whole third-tier DR standby box
-#: (a site-failover-grade action); ``FILES_ACCESS_ANY`` (ASVS 8.2.2) is the override that defeats
+#: (a site-failover-grade action); ``CLUSTER_CONTROL`` (ADR 0056) moves the active-passive primary, the
+#: same failover grade one tier down; ``FILES_ACCESS_ANY`` (ASVS 8.2.2) is the override that defeats
 #: owner-only on every uploaded file, so leaving it mintable would let a custom role read, re-inject
 #: and delete every operator's uploaded PHI while docs/SECURITY.md says it is Administrator-only.
 #: All stay admin-only.
@@ -200,6 +207,7 @@ CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.USERS_MANAGE,
         Permission.APPROVALS_APPROVE,
         Permission.DR_OPERATE,
+        Permission.CLUSTER_CONTROL,
         Permission.FILES_ACCESS_ANY,
     }
 )

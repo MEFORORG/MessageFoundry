@@ -102,6 +102,8 @@ from messagefoundry.api.models import (
     ClusterNode,
     ClusterNodeList,
     ClusterStatus,
+    ClusterStepdownRequest,
+    ClusterStepdownResult,
     ConfigProvenance,
     ConnectionEventInfo,
     ConnectionFlagRequest,
@@ -5442,6 +5444,71 @@ def create_app(
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
         )
+
+    # --- cluster control plane: planned failover (ADR 0056 slice 1) ----------
+
+    @app.post("/cluster/stepdown", response_model=ClusterStepdownResult)
+    async def cluster_stepdown(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.CLUSTER_CONTROL)),
+        _body: ClusterStepdownRequest | None = Body(default=None),
+    ) -> ClusterStepdownResult:
+        """**Planned failover**: make this node release its leadership lease so a standby promotes
+        (maintenance drain, ADR 0056). The node keeps running and heartbeating, demoted to standby —
+        this is not a shutdown.
+
+        Gated by the dedicated ``cluster:control`` permission (ADMINISTRATOR only, never assignable to
+        a custom role) behind ``require_step_up``, which is the composite the ADR's decision table asks
+        for: it charges the per-actor admin-write pacing floor, then the TOTP MFA gate, then the
+        new-client-IP signal and the credential-recency window. The three high-impact write neighbours
+        (``config:deploy``, ``messages:replay``, ``messages:purge``) sit behind the same wrapper.
+
+        Statuses: ``400`` single-node (refused BEFORE the coordinator is touched — there is no lease and
+        no standby); ``409`` this node is not the leader (the normative answer, not an idempotent
+        retry — the caller resolves the leader from ``GET /cluster/nodes`` first); ``403`` missing
+        permission / step-up / MFA; ``503`` engine not started or authentication not configured.
+
+        **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
+        already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
+        never runs on those, so a second denied row there would double-count. The ``409`` needs none
+        either — the ``cluster_stepdown`` row written from the coordinator's return already reads
+        ``was_leader: false``, which IS the refusal. That leaves the single-node ``400``, which nothing
+        else would record.
+        """
+        c = engine.coordinator
+        if not c.is_clustered():
+            # Single-node: no lease to release, no standby to take over. Gated here, before the
+            # coordinator, so the answer never depends on a NullCoordinator's no-op.
+            await engine.store.record_audit(
+                "cluster_stepdown_denied",
+                actor=identity.username,
+                channel_id=None,
+                detail=json.dumps({"node_id": c.node_id, "reason": "not-clustered"}),
+                client=client_ip(request),
+            )
+            raise HTTPException(
+                400, f"node {c.node_id} is not clustered; there is no lease to release"
+            )
+        # Deliberately NO is_leader() pre-read. The release itself reports whether this node held
+        # leadership, and that returned value is the only thing audited or reported: a fence or a
+        # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
+        # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
+        was_leader, released_at = await c.step_down_leadership()
+        result = ClusterStepdownResult(
+            node_id=c.node_id, was_leader=was_leader, released_at=released_at
+        )
+        # The audit detail IS the response body, so the two cannot drift apart field by field.
+        await engine.store.record_audit(
+            "cluster_stepdown",
+            actor=identity.username,
+            channel_id=None,
+            detail=json.dumps(result.model_dump()),
+            client=client_ip(request),
+        )
+        if not was_leader:
+            raise HTTPException(409, f"node {c.node_id} is not the current leader")
+        return result
 
     # --- third-tier DR standby (#61, ADR 0048) -------------------------------
 
