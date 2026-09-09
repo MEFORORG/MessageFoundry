@@ -26045,6 +26045,93 @@ A checker proven only against the two known rows is indistinguishable from one t
 
 I did not survey how the fence came to be written, or whether any dispatcher has actually spent a lane window on a fenced row. I measured the tool and the ledger, not an incident. The two fenced rows were read but not edited: they are fenced from this work by their own terms, and their words draw the line this row sits on -- a change to the WRITER or the VERIFIER is ordinary public engine work, and a change to what the RECORD SAYS is not. This changes the reader.
 
+## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
+> of **#1143**'s verification pass, where it was found to have been eliminated on a false premise and
+> to be the work at least seven citations across the repository are already waiting on.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P2. **Verdict:** build.
+**Severity:** on a first deployment, a site that recycles a `sAMAccountName` in its directory without
+also running a MessageFoundry `delete_user` would hand the new holder the departed operator's
+immutable `user_id`, and with it everything keyed on that id -- uploaded-file ownership, per-uploader
+quota, and saved search presets. Nothing would report it.
+
+**What ships today.** `_upsert_ad_user` (`messagefoundry/auth/service.py`) resolves an AD principal by
+`sAMAccountName` and mints a fresh `user_id` **only when no mirror row survives** -- that is, only
+after a `delete_user`. On the default path the surviving row is adopted and its `user_id` is re-bound
+to the new principal. `AdPrincipal` (`messagefoundry/auth/ldap.py`) carries `username`,
+`display_name`, `email`, `dn` and `groups`; `dn` is the only durable-looking attribute and it is the
+wrong one, because a DN changes on a rename or a move between organizational units.
+
+**Measured 2026-09-06:** `objectGUID` and `objectSid` occur in exactly one tracked engine file, as a
+docstring naming them as the future key. Positive control in the same run: `sAMAccountName` returns
+13 hits across 5 files, so the probe discriminates and the zero is real. **The LDAP layer reads no
+immutable directory identifier at all.**
+
+**Why this is not #1143, and must not be folded into it.** #1143 is scoped end to end to the
+OIDC-versus-directory limb of ASVS 6.8.1 and is blocked on an unresolved first-contact ceremony
+decision ([ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md),
+Proposed). This is the AD limb, it is not blocked on that decision, and #1143 could close honestly
+without touching it.
+
+**Why the option looked closed and is not.** #1143 struck directory-held immutable attributes twice,
+on the ground that a directory-readable attribute is not secret so an issuer willing to mint an
+arbitrary username claim will mint any claim. **That holds only where the attribute is an
+AUTHENTICATOR.** Here it is a re-resolution key for an account already identified by other means, and
+no assertion is being trusted. #1143 repairs the premise twice in its own body without ever
+re-opening the strike.
+
+**At least seven sites name #1143 as the fix for this**, and would resolve to a closed item that reads
+as done if #1143 closed as scoped: `messagefoundry/api/app.py` (`_may_access_upload` docstring),
+`messagefoundry/uploads.py` (`UploadedFileMeta`), `tests/test_upload_api.py`, ADR 0136,
+`docs/SECURITY.md`, and this ledger's **#1152** and **#1225**. Re-point them here. Enumerated with
+`git grep`; treat it as at least seven and re-run the grep rather than working the list.
+
+**Shape of the work.** One nullable column on `users` across the three backends, following the
+`reauth_at` convention already in each (`PRAGMA table_info` guard on SQLite, `information_schema`
+on Postgres, a `COL_LENGTH` guard in the SQL Server `_SCHEMA` list). **No index, so no SQL Server
+index-key width trap.** The real cost is upstream of the column: an added LDAP attribute read into
+`AdPrincipal`, and a lookup path, because `resolve_principal` takes only a username today. A
+first-contact rule is needed for accounts that predate the column -- but unlike #1143's, it is a
+backfill question and not a trust-ceremony one.
+
+**What would NOT be an honest close.** Adding the column and continuing to resolve by
+`sAMAccountName`, so the identifier is stored and never consulted. The acceptance test is a recycle:
+a directory-side name reuse with the MessageFoundry row left in place must NOT adopt that row.
+
+## 1472. two shipped comments assert a 0/0/0 uniqueness absence that the filtered unique index has closed
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **4/10** · Difficulty **1/10** · _fill-in_. Found while
+> verifying **#1143**; a comment correction with no behaviour change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / documentation accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect. The cost is to a reader: both comments state that the structural half
+of federated-subject exclusivity is unbuilt, and it shipped under **#1256**.
+
+**The two sites**, by symbol rather than line, because the anchors drift: the comment above the
+exclusivity veto in `messagefoundry/auth/service.py`, and the one on the federated-subject setter's
+declaration in `messagefoundry/store/base.py`. Both assert that no `UNIQUE` constraint names the OIDC
+columns on any backend, quoting a measurement of 0/0/0 against a positive control of 13/8/10.
+
+**Measured 2026-09-06:** a filtered unique index `ux_users_federated_subject` over
+`(oidc_issuer, oidc_subject)` exists on all three backends -- `store/store.py`, `store/postgres.py`
+and `store/sqlserver.py` -- each guarded for in-place upgrade. The `UNIQUE` positive control now reads
+10/6/8, so the original measurement was true when written and the code moved underneath it.
+
+**The service.py one contradicts code roughly twenty lines below it**, which explains that the index
+"refuses the loser on all three backends". A reader who trusts the first sentence concludes the
+structural half is missing -- which is the same error #1143's own ranked-table entry made and carried
+for weeks.
+
+**Do not simply delete the numbers.** They are evidence of a real prior state and the reason the veto
+is written the way it is. Rewrite them to say the index now exists and name what the veto adds on top
+of it (an ordered, audited refusal rather than an integrity error surfacing as a 500).
+
 ## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
 
 > 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
