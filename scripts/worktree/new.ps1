@@ -240,7 +240,7 @@ $venvPy = Join-Path $venv "Scripts\python.exe"
 # KEPT IN SYNC BY A TEST, NOT BY CARE: tests/test_worktree_venv_extras_parity.py fails if this line
 # and ci.yml's install line drift. Same remedy tests/test_lint_scope_parity.py already applies to
 # ruff and bandit, whose scopes were written twice and drifted until a test held them together.
-$extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,sqlserver" } else { "dev,harness,fhir,dicom,x12,xml,webauthn" }
+$extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sqlserver" } else { "dev,harness,fhir,dicom,x12,xml,webauthn,vault" }
 
 Write-Host "Creating virtualenv + installing .[$extras] (this can take a minute)..."
 & $Python -m venv $venv
