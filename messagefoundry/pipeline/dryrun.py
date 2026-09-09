@@ -729,6 +729,16 @@ def dry_run(
 
     ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
     default stays ``False`` (§8.1); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
+
+    **THIS FUNCTION TAKES NO ``sandbox`` ARGUMENT AND ALWAYS RUNS ROUTERS/HANDLERS IN-PROCESS.** It is
+    therefore blind to ``[sandbox].mode``. That matches ``serve`` on the shipped default (``off``),
+    and diverges from it at ``[sandbox].mode=subprocess``: ``messagefoundry check`` and
+    ``messagefoundry dryrun`` do not preview the isolation such a site's engine applies. A Handler
+    calling the live ``db_lookup``/``fhir_lookup`` bridges passes here and then **fails closed at**
+    ``serve``; ``[sandbox].wall_seconds`` is likewise unenforced here. Stated rather than fixed,
+    deliberately: the peer entry points :func:`route_only` / :func:`transform_one` below DO take
+    ``sandbox=`` and honour it, so the seam exists — teaching the gate to spawn a worker child per
+    inbound is its own change with its own cost.
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:

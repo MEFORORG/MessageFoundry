@@ -514,8 +514,12 @@ transform.
 - **The opt-in `[sandbox]` subprocess isolation** (ADR 0087) — `mode` defaults to **`off`**. Set to
   `subprocess` it gives an address-space boundary plus a forbidden-import guard, which is real
   blast-radius reduction, but it is **not a network-egress deny**: a worker can still connect sockets
-  from inside the child. It also **fails `db_lookup` / `fhir_lookup` closed**, so a feed needing live
-  enrichment cannot use it. A deny-by-default brokered sandbox is **proposed, not built** (ADR 0147).
+  from inside the child. **It does not stop your config Python executing in the engine process
+  either** — the loader runs every `*.py` in the config dir in-process regardless of `mode`. And it
+  **fails `db_lookup` / `fhir_lookup` closed**, so a feed needing live enrichment cannot use it —
+  and because `mode` is engine-wide rather than per connection, one such feed keeps the whole engine
+  process out of the sandbox. A deny-by-default brokered sandbox is **proposed, not built**
+  (ADR 0147).
 
 For an off-loopback deployment, populate the lists you use so a **misconfigured or hostile destination**
 cannot deliver to an unapproved address — **all eight of them**, not just the transports you happen to
