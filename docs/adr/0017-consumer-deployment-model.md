@@ -8,7 +8,25 @@
   stand-in for any adopter) consumes MessageFoundry: the engine as a **read-only installed dependency it
   never edits**, and HC's Connections/Routers/Handlers as its **own, separately-versioned config repo**
   that drives **multiple deployed instances** (at minimum Test + Production; optionally POC, Staging, …).
-- **Built:** Nothing in this ADR is built. It builds **on** mechanisms already shipped that must **not**
+- **Built (partial, re-verified 2026-09-09):** Both **Blocker** work-packages under "Engine work
+  required" are **BUILT**. Free-form environment names: `AiEnvironment` is gone from the Python source
+  and no `--env` argument carries `choices=`; `AiSettings.environment`
+  ([config/settings.py](../../messagefoundry/config/settings.py)) holds the free-form name. Explicit
+  posture tier, decoupled from that name: `DataClass` (`synthetic`/`phi`) and `SecurityEnforcement` in
+  [config/ai_policy.py](../../messagefoundry/config/ai_policy.py), read through
+  `AiSettings.require_posture()` in [config/settings.py](../../messagefoundry/config/settings.py).
+  Required active environment: `serve` in [__main__.py](../../messagefoundry/__main__.py) exits 2 when
+  no environment is set, so the silent PROD default is gone. One clause landed conditionally rather
+  than flatly. The `<name>.toml` existence check has two sites, both in
+  [__main__.py](../../messagefoundry/__main__.py): `_emit_anchor_diagnostics`, which `serve` runs at
+  startup, and `_check_env_file_present`, reached through `_resolve_offline_anchor` by the offline
+  `validate`, `graph`, `dryrun` and `check` subcommands. Both hard-fail with exit 2, and both fire only
+  when a project root is set and the loaded graph calls `env()`. Outside those conditions
+  `load_environment_values` in [config/environments.py](../../messagefoundry/config/environments.py)
+  still reads the value file only if it is present, and never fails. **Scope of this pass:** only the
+  two Blocker rows were re-verified, so this records that the Blockers shipped, **not** that the whole
+  ADR is built. *The sentence that stood here, "Nothing in this ADR is built", is now wrong. It is kept
+  as history, not as current state.* This ADR builds **on** mechanisms already shipped that must **not**
   be redesigned: the directory-level engine/config split via the loader
   ([config/wiring.py](../../messagefoundry/config/wiring.py) `load_config`, the `_SiblingHelperFinder`,
   and `codesets/` + `connections.toml` resolved relative to `--config`); the per-environment value layer

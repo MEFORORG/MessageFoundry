@@ -1300,6 +1300,12 @@ class PipelineSettings(_Section):
     # (never a lane outage). Reliability-core + read ONCE at engine construction (a /config/reload does
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
+    # ONE OTHER SETTING CAN CANCEL THIS ONE, and you must be told here rather than in that knob's
+    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is subprocess (it ships off, so
+    # this bites only a site that turned the sandbox on). Fusion runs Router/Handler/accepts= code
+    # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
+    # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
+    # get fusion you must also set [sandbox].mode=off, and that trade is yours to make on purpose.
     fuse_thread_hops: bool = Field(default=False)
     # Worker count for each per-stage fusing executor (ADR 0071 B5). Each fused stage (INGRESS/ROUTED)
     # gets its OWN ThreadPoolExecutor of this width plus a matching-width dedicated synchronous pyodbc
@@ -1343,20 +1349,54 @@ class PipelineSettings(_Section):
 class SandboxSettings(_Section):
     """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
-    Routers/Handlers are admin-authored pure Python the engine runs in its own address space (the
-    DEK, audit chain, and live sockets live there). ASVS 15.2.5 wants a hard isolation boundary; this
-    section turns one on. ``mode="off"`` (the default) runs them in-process, **byte-identically and
-    with zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
+    **THIS DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS, and that is the first thing
+    to know about it.** The loader executes every ``*.py`` in the config directory in-process, as the
+    service account, at every ``serve`` and every reload, ungated by ``mode``
+    (:func:`messagefoundry.config.wiring.load_config`). What ``mode`` governs is where a Router's or
+    Handler's *body* runs once the graph is built — module top level is out of its reach either way,
+    and the safe-source DACL gate is still what covers that.
+
+    Routers/Handlers are admin-authored pure Python. In the engine's own address space sit the DEK,
+    the audit chain, and every live socket. ASVS 15.2.5 wants a hard isolation boundary; this section
+    turns one on. ``mode="off"`` (**the default**) runs them in-process, **byte-identically and with
+    zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop — a subprocess
-    boundary breaks that; a Handler needing live enrichment runs with ``mode=off``). An isolation
-    denial routes the message to ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
+    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+
+    **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
+
+    * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
+      process boundary breaks, so they fail closed inside the child. **A Handler needing either must
+      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
+      single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
+      renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
+      sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
+      process in-process, not just that one.
+    * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
+      ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
+      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
+      to finish now dead-letters. ``startup_seconds`` and the POSIX ``cpu_seconds``/``mem_mb`` arm
+      with it.
+    * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
+      marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
+      per-interface bound. **One message is not one dispatch:** a message routed to one handler with
+      an ``accepts=`` predicate costs three (router, predicate, transform), and fan-out to K handlers
+      costs 1 + 2K, each re-marshalling the reference view.
+    * **Per inbound with traffic:** one child process, two parent daemon threads (frame reader +
+      stderr relay), three parent pipe fds, and on Windows a job-object handle.
+    * **The pre-deploy gate does not learn this setting.** ``messagefoundry check`` and ``dryrun``
+      always run in-process (:func:`messagefoundry.pipeline.dryrun.dry_run` takes no ``sandbox``
+      argument), so a Handler calling ``db_lookup``/``fhir_lookup`` passes the gate green and then
+      fails closed at ``serve``.
 
     Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
-    restart to change, exactly like ``claim_mode``)."""
+    **restart to change**, exactly like ``claim_mode``)."""
 
-    # off (default, byte-identical, no subprocess) | subprocess (persistent per-inbound worker child).
+    # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
+    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
+    # connection: one policy is rendered for the whole graph.
     mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
