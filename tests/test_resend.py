@@ -344,8 +344,12 @@ async def test_resend_endpoint_unknown_target_and_not_running(tmp_path: Path) ->
                 json={"to": "NOPE", "idempotency_key": "k2", "source": "OB1"},
             )
             assert unknown.status_code == 404
+            # WELL-FORMED but absent, which is what this arm is for. A malformed id is refused at
+            # validation with a 422 before the route runs (docs/API-INPUT-VALIDATION.md), so the old
+            # "nope" never reached the not-found path it was written to exercise.
             missing = await c.post(
-                "/messages/nope/resend", json={"to": "OB2", "idempotency_key": "k3"}
+                "/messages/deadbeefdeadbeefdeadbeefdeadbeef/resend",
+                json={"to": "OB2", "idempotency_key": "k3"},
             )
             assert missing.status_code == 404
     finally:

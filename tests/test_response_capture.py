@@ -654,9 +654,11 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
 
             # AUDITOR lacks messages:read → deny-by-default (403).
             assert (await c.get(f"/messages/{mid}/responses", headers=aud)).status_code == 403
-            # Unknown id → 404 (don't reveal existence).
+            # Unknown id → 404 (don't reveal existence). The id must be WELL-FORMED to reach that
+            # path: a malformed one is a 422 at validation and says nothing about existence either
+            # way, so it does not test the disclosure rule this line is here for.
             assert (
-                await c.get("/messages/does-not-exist/responses", headers=op)
+                await c.get("/messages/deadbeefdeadbeefdeadbeefdeadbeef/responses", headers=op)
             ).status_code == 404
 
         # Reading captured replies emits the response.read audit event.
