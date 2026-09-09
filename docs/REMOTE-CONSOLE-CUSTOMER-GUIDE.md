@@ -65,11 +65,14 @@ Place them somewhere the engine's service account can read, e.g. `C:\MessageFoun
 ## Step 2 — Configure the engine server
 
 Edit the engine's configuration file, **`messagefoundry.toml`**, on the server. Add or update the
-`[api]` section:
+`[security]` and `[api]` sections:
 
 ```toml
+[security]
+local_access_only = false                         # stop binding loopback-only
+listen_address = "0.0.0.0"                        # listen on the network (or a specific NIC IP)
+
 [api]
-host = "0.0.0.0"                                  # listen on the network (or a specific NIC IP)
 port = 8765                                       # the API port the console connects to
 tls_cert_file = "C:/MessageFoundry/tls/engine-cert.pem"
 tls_key_file  = "C:/MessageFoundry/tls/engine-key.pem"
@@ -77,8 +80,9 @@ tls_key_file  = "C:/MessageFoundry/tls/engine-key.pem"
 
 Notes:
 
-- `host = "0.0.0.0"` listens on all network interfaces; you can instead use a specific address (e.g.
-  `"10.0.0.12"`) to limit it to one network.
+- `listen_address = "0.0.0.0"` listens on all network interfaces; you can instead use a specific
+  address (e.g. `"10.0.0.12"`) to limit it to one network. It takes effect only once
+  `local_access_only = false`. The older `[api].host` spelling is **refused at config load**.
 - If your private key is **password-protected**, supply the passphrase via the environment variable
   `MEFOR_API_TLS_KEY_PASSWORD` — never put it in the file.
 - The engine **will refuse to start** if you open it to the network **without** a certificate (this

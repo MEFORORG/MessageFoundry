@@ -504,8 +504,9 @@ def _delimiters_only(line: str) -> str:
     GFM escapes a literal pipe in a table cell as ``\|``; it renders as ``|`` and does NOT split
     the cell. A raw ``line.count("|")`` cannot tell the two apart, so a CORRECT row that quotes a
     pipe reads as malformed -- which is not hypothetical: the 15.1.5 ``fhir_lookup`` row has to
-    name ``,`` ``|`` and ``$`` as FHIR *value* separators (BACKLOG #1243 limb B), and this
-    function's own docstring has always said "unescaped" while the code counted raw.
+    name ``,`` ``|`` and ``$`` as FHIR *value* separators (BACKLOG #1243 limb B, which now REFUSES
+    them in a plain ``str`` value rather than leaving them to the server), and this function's own
+    docstring has always said "unescaped" while the code counted raw.
     """
     return line.replace(r"\|", "")
 
@@ -813,10 +814,16 @@ def _checks() -> list[tuple[str, object, object]]:
         # '?'-query it gated, so its row is gone from here. This is a COUPLED edit —
         # `docs/security/THREAT-MODEL.md` lives in the vault (gitignored, absent from every checkout,
         # so these tests cannot enforce it here or in CI) and its 15.1.5 sentence at :256 must be
-        # rewritten to match: the structured `params=` form is now the ONLY search form, and the
-        # rewrite must also say what percent-encoding does NOT cover — it defeats structure injection,
-        # not FHIR value-layer injection (',' '|' '$' survive percent-decoding as separators, #1243
-        # limb B). Without that clause the threat model asserts a broader control than ships.
+        # rewritten to match: the structured `params=` form is now the ONLY search form.
+        # UPDATED 2026-09-03 — #1243 limb B landed, and the wording this note used to prescribe is now
+        # the WRONG one. It said the rewrite must add that percent-encoding does not cover the FHIR
+        # value layer; the value layer is now closed at run time, so that clause would make the threat
+        # model assert a NARROWER control than ships. What it should say instead: percent-encoding
+        # holds the URL layer, and above it a search value states its kind — a plain `str` carrying
+        # ',' '|' or '$' is REFUSED before dial-out, an author who means the separator writes
+        # `FhirToken` or `FhirRaw` (`messagefoundry/fhirsearch.py`). Refusal, not escaping, because an
+        # escape's correctness depends on the server implementing the unescape and a refused value
+        # never leaves the process. The residual to name is the BACKSLASH, which is not screened.
     ]
 
 

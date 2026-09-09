@@ -29,7 +29,10 @@ DIMSE failure (the sender was already told Success).
 **Security (§9):** the calling-AE allowlist (``require_calling_aet``, association-level) + a peer-IP
 allowlist (the per-connection ``source_ip_allowlist`` passed to ``inbound(...)`` — there is no
 ``[inbound].source_ip_allowlist`` service key — checked before any commit) + ``require_called_aet`` +
-a ``max_object_bytes`` cap (over-cap → DIMSE failure **before** commit) + DICOM-over-TLS. A non-loopback
+a ``max_object_bytes`` cap (over-cap → DIMSE failure **before** commit) + an **opt-in association-rate
+bound** (``max_associations_per_second``, ASVS 2.4.1 / BACKLOG #1114 — off by default, waits before the
+association request is read, and never drops or refuses; see :meth:`DicomScpSource._pace_association`
+for why the unit is an association and not a message) + DICOM-over-TLS. A non-loopback
 cleartext SCP is refused at startup by the generalized bind-guard (see
 :func:`messagefoundry.pipeline.wiring_runner.check_dimse_tls_exposure`). All log lines carry only
 **routing-safe identifiers** (SOP class/instance UID, calling AE, peer IP) — **never** the dataset or
@@ -51,6 +54,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+import threading
+import time
 from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
@@ -89,15 +94,27 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.mllp import InsecureHopGuard
+from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer
 
-__all__ = ["DicomScpSource", "DicomScuDestination", "DEFAULT_MAX_OBJECT_BYTES"]
+__all__ = [
+    "DicomScpSource",
+    "DicomScuDestination",
+    "DEFAULT_MAX_OBJECT_BYTES",
+    "DEFAULT_MAX_ASSOCIATIONS_PER_SECOND",
+]
 
 logger = logging.getLogger(__name__)
 
 #: Per-object size cap default (bounds what is persisted; pynetdicom buffers the object during receive,
 #: which max_associations + max_pdu_size bound). Overridable via DICOM(max_object_bytes=...).
 DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
+
+#: Association-rate pacing for the SCP ships OFF, for exactly the reason
+#: :data:`messagefoundry.transports.mllp.DEFAULT_MAX_MESSAGES_PER_SECOND` ships off (ruled 2026-08-11,
+#: ASVS 2.4.1 / 15.2.2): this control makes a real peer WAIT, and a number this project guessed would
+#: throttle a real modality — a worse failure than the unbounded intake it guards. The operator brings
+#: their own number. The cell stays `partial` on the shipped default and the record says why.
+DEFAULT_MAX_ASSOCIATIONS_PER_SECOND: float | None = None
 
 # DIMSE C-STORE response statuses (DICOM PS3.4 Annex B). Success commits; the failures below all mean
 # "not stored — the SCU should re-send / give up" and never a silent drop.
@@ -181,6 +198,27 @@ class DicomScpSource(SourceConnector):
         self._max_associations = int(s.get("max_associations", 10))
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
+        # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
+        # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
+        # the UNIT here is an association, not a message — see _pace_association for why a message-rate
+        # bound is the one thing this transport cannot honestly offer. The OFF-default semantics are
+        # still shared: _MessagePacer.for_rate is the single place "unset" is interpreted, so this
+        # connector cannot drift from the other four on what an absent key means.
+        mas = s.get("max_associations_per_second", DEFAULT_MAX_ASSOCIATIONS_PER_SECOND)
+        self.max_associations_per_second: float | None = float(mas) if mas else None
+        self.association_burst: float = float(
+            s.get("association_burst") or self.max_associations_per_second or 0.0
+        )
+        self._pacer = _MessagePacer.for_rate(
+            self.max_associations_per_second, self.association_burst
+        )
+        #: The pacer is driven from N concurrent pynetdicom association threads, so THIS consumer
+        #: supplies the mutual exclusion. Its read-modify-write of the token bucket is not atomic, and
+        #: the four intakes that came before all drive it from the single-threaded event loop, so it
+        #: never needed a lock of its own. Never held across the wait.
+        self._pacer_lock = threading.Lock()
+        #: Set by stop() so a paced connection's wait is cut short instead of holding up shutdown.
+        self._stopping = threading.Event()
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s)
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
@@ -231,6 +269,7 @@ class DicomScpSource(SourceConnector):
         # leader_gate is ignored: a listen source binds its own per-node endpoint, so there is no
         # shared-resource double-read to gate (accepted only so the runner's call is uniform).
         self._handler = handler
+        self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
         await asyncio.to_thread(self._start_server)
@@ -261,6 +300,11 @@ class DicomScpSource(SourceConnector):
             ae.supported_contexts = StoragePresentationContexts
             ae.add_supported_context(Verification)
         handlers: list[Any] = [(evt.EVT_C_STORE, self._on_c_store)]
+        if self._pacer is not None:
+            # Registered ONLY when a rate is configured, so an unpaced SCP — the shipped default —
+            # runs the same handler set it always did, with no new callback on the association path.
+            handlers.append((evt.EVT_CONN_OPEN, self._pace_association))
+            handlers.append((evt.EVT_ACCEPTED, self._charge_association))
         self._ae = ae
         self._server = ae.start_server(
             (self._host, self._port),
@@ -275,6 +319,63 @@ class DicomScpSource(SourceConnector):
         assert self._server is not None
         port: int = self._server.socket.getsockname()[1]
         return port
+
+    def _pace_association(self, event: Any) -> None:
+        """Wait off whatever the association budget owes, BEFORE this connection is read from.
+
+        ASVS 2.4.1 / 15.2.2, BACKLOG #1114. This is the one intake where the pace-before-decode
+        property does **not** transfer to a message-rate bound, and that is why the unit here is an
+        association. ``pynetdicom`` owns the read loop: by the time ``EVT_C_STORE`` fires, the object
+        has already been read off the wire and decoded, so a wait there would delay a message the
+        count-and-log invariant has already obliged us to account for — the same control with none of
+        the property that makes it honest. ``EVT_CONN_OPEN`` is before the A-ASSOCIATE-RQ is read, so
+        the excess is genuinely never taken in.
+
+        **Measured, because a limiter that serialises the acceptor IS the denial of service it
+        guards against** (pynetdicom 3.0.4, this connector's pinned version): ``EVT_CONN_OPEN`` runs
+        on a per-connection thread, not on the accept loop. Three concurrent connections each blocking
+        1.0 s here completed in 1.04 s total, at ``maximum_associations`` 10 and again at 1. So the
+        wait delays only its own peer, never the loop and never a sibling.
+
+        **Nothing is dropped, refused or answered differently.** The peer is back-pressured by TCP
+        while we decline to read, then its association proceeds in full. The delay is bounded by the
+        deficit (``associations / rate``) rather than being a hard stop, for the reason
+        :class:`~messagefoundry.transports.mllp._MessagePacer` gives: refusing to read at all would pin
+        capacity indefinitely.
+
+        **Residual, stated because a knob that hides one is worse than no knob.** The waiting
+        connection is already counted against ``max_associations``, so a rate low enough to make waits
+        long needs a ``max_associations`` high enough to hold the peers waiting behind it — and a wait
+        that outlasts the SCU's own ACSE timeout becomes an abort on the sender's side, which is a
+        refusal this control is otherwise careful never to make. That is the DIMSE form of the general
+        residual: a bound that demands a number cannot demand a sensible one.
+        """
+        pacer = self._pacer
+        if pacer is None:  # pragma: no cover - the handler is only registered when one exists
+            return
+        # Released BEFORE the wait below. Held across it, one peer sleeping off its own debt would
+        # block every other association's read of the bucket, which serialises the acceptor and turns
+        # this knob into the denial of service it guards against.
+        with self._pacer_lock:
+            wait = pacer.deficit(now=time.monotonic())
+        if wait > 0.0:
+            # Event.wait, not sleep: stop() sets it, so shutdown is not held up by an outstanding debt.
+            self._stopping.wait(wait)
+
+    def _charge_association(self, event: Any) -> None:
+        """Charge one token once an association is ACCEPTED — the debt is paid by the next arrival.
+
+        Charging at acceptance rather than at connection open is deliberate and mirrors the HTTP
+        listener: a connection that is rejected (an unlisted calling AE, no acceptable presentation
+        context) or that opens and never associates charges nothing. Charging earlier would let a peer
+        that submits no object spend a real modality's budget, which turns the limiter into the denial
+        of service it exists to prevent.
+        """
+        pacer = self._pacer
+        if pacer is None:  # pragma: no cover - the handler is only registered when one exists
+            return
+        with self._pacer_lock:
+            pacer.charge(1, now=time.monotonic())
 
     def _on_c_store(self, event: Any) -> int:
         """C-STORE callback — runs on a ``pynetdicom`` acceptor thread (NEVER the event loop). Returns a
@@ -414,6 +515,9 @@ class DicomScpSource(SourceConnector):
         return _STATUS_SUCCESS
 
     async def stop(self) -> None:
+        # Release any association thread parked on the pacing wait FIRST, so shutdown never waits out
+        # a rate debt (BACKLOG #1114). A no-op when pacing is off, and idempotent.
+        self._stopping.set()
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
         # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
         server = self._server
