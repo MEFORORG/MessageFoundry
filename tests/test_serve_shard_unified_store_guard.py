@@ -46,10 +46,20 @@ _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 # `[cluster]` is not involved here, but a server-DB backend needs its connection essentials to pass
 # settings validation. Nothing is dialed: create_managed_app is stubbed, so no store is ever opened.
-_SQLITE_TOML = "security.handles_real_patient_data = false\n"
+#
+# Both bodies carried `handles_real_patient_data = false` until BACKLOG #1279 retired it. These
+# fixtures need a `serve` that REACHES create_managed_app, so they now satisfy the PHI gates
+# per-gate instead. `tests/_phi_gate_provisions.py` documents what each line stands down.
+_PHI_GATES = (
+    "security.block_unlisted_outbound = true\n"
+    "security.allow_unencrypted_phi = true\n"
+    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+    "alerts.security_notifications_required = false\n"
+)
+_SQLITE_TOML = _PHI_GATES
 _POSTGRES_TOML = (
-    "security.handles_real_patient_data = false\n"
-    '[store]\nbackend = "postgres"\nserver = "127.0.0.1"\ndatabase = "mf"\nusername = "mf"\n'
+    _PHI_GATES
+    + '[store]\nbackend = "postgres"\nserver = "127.0.0.1"\ndatabase = "mf"\nusername = "mf"\n'
 )
 
 

@@ -390,10 +390,17 @@ def test_serve_ui_offloopback_requires_tls(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic — this reaches the stricter /ui
-    # exposure gate (the subject) instead of the PHI cleartext-bind clamp / egress refusals.
+    # The /ui exposure gate is the subject, so the gates AHEAD of it are stood down by name. This
+    # said `handles_real_patient_data = false` until BACKLOG #1279 retired it; the key is refused
+    # at load now, which made this test refuse for the wrong reason while still exiting 2.
+    #
+    # The four lines are inlined rather than imported from `tests/_phi_gate_provisions.py`: this is a
+    # SEPARATE distributable package and nothing here imports from the engine repo's test tree. That
+    # constant's docstring is the explanation of what each line gives up.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        'security.enforcement = "warn"\n'
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.serve_web_console = true\n",
         encoding="utf-8",
