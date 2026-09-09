@@ -33,6 +33,9 @@ jobs:
     # ONLY on this repo — public, so code scanning and the badge are free; skipped no-op on a fork.
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
+    # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
+    # reasoning. Above the floor because the analysis makes many API calls and is rate-limit-bound.
+    timeout-minutes: 15
     permissions:
       security-events: write # upload the SARIF results to code scanning
       id-token: write # publish results to the public OpenSSF Scorecard API (the badge)
