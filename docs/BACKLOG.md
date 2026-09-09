@@ -25810,6 +25810,63 @@ It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live play
 
 **NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
 
+## 1469. the dispatch gate does not read a row's DISPATCH FENCE, so the two fenced rows screen clean
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / dispatch gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis and no deployment axis (sec. 0). Nothing here reaches a running instance, and there are none. The cost is that a dispatcher who runs the gate on a fenced row gets a clean answer, so the fence holds only for as long as somebody reads the row by eye.
+
+### The measurement, 2026-09-06
+
+Engine checkout on branch `claude/dispatch-fence-gate`, ledger at **679 items** across the two files `parse_items` reads as one namespace.
+
+| what was asked | what came back |
+|---|---|
+| `grep -ciE 'fence' scripts/coord/dispatch_gate.py` | `0` |
+| `dispatch_gate.py 1007 1246 --explain --no-tree` | "items closing by the builder's own act: **2 of 2**", each row noted only as "closes by 'code', performed by the builder writes it; the LANDER flips the banner on merge" |
+| `dispatch_gate.py 1007 1246 --refuse --no-tree` | exit **0** -- the refusing mode refuses neither |
+
+The fence text is byte-identical in both rows. It opens a line with the marker words, a date and a colon, then states the bar and names the seat that owns the work.
+
+### This is not a broken gate, and the distinction is the point
+
+On the same run the gate raised MUST BE READ on two unrelated rows from landed-code citations in the tree. The warning channel exists, works, and populates from a real source. What it did not have was a fence among its inputs. Saying "the gate is broken" would send a reader looking for a defect in machinery that is doing its job.
+
+Nor is anyone unprotected today. The fence is prose in the row, and a dispatcher who reads the row sees it. What the gate adds is that the fence survives a screen -- so it does not depend on a reader who is skimming 679 rows for a lane window.
+
+### The needle, and why the bare word is not a candidate
+
+The marker is the words **DISPATCH FENCE**, a date, and a colon, opening a line of the item's own prose. Three properties do the work, and each was measured against a real row rather than argued:
+
+1. **The date and the colon.** They are what separates a filed act from a mention. A row narrating the convention writes the marker words followed by ordinary prose, which carries the words and not the shape.
+2. **The line anchor.** Only whitespace, blockquote markers and markdown emphasis may precede it. That is what keeps a fence quoted in a table cell from reading as the quoting row's own -- a documenting row lists the fenced population in a table, and those lines open with a pipe.
+3. **Prose, not the banner.** The banner is what a machine writes about a row, and the 2026-09-03 scoring pass already quoted one row's wording into another's. Both real fences are prose, so the narrower region costs no detection here.
+
+The bare word is not a candidate and the corpus settles it: **38 of 679 bodies contain "fenc"**, in at least four unrelated senses -- self-fencing leader election, a ciphertext prefix, a bold line-leading "Scope fence", and a fenced file. The needle fires on 2.
+
+### The fence is the one MUST BE READ that `--refuse` blocks on
+
+Every other level the gate returns is inferred: a token match in prose, or a citation in the tree. The gate argues at length against blocking on an inference, and it is right to -- the screen recorded under `#1394` discarded 46 percent of the live ledger on a "DO NOT" token match. **A fence is a different kind of sentence, not a stronger one.** A person wrote it deliberately about one row and named the seat the work belongs to, and two exist in 679 rows. Refusing on that cannot produce a sweep of that shape.
+
+The gate's printed guidance was corrected in the same change. It said, without qualification, that `--refuse` does not block on a MUST BE READ row. Left as written it would have been a false statement in the output of the tool whose exit code contradicted it.
+
+### The controls, both of them
+
+A checker proven only against the two known rows is indistinguishable from one that hardcodes them, so both arms are pinned:
+
+- **Must fire:** a constructed fixture carrying the fence verbatim with the subject replaced, so the test keeps working when those two rows close. Plus a live-ledger arm over the real pair.
+- **Must NOT fire:** the compared count is printed. Five rows are pinned by number, each a different sense of the word, and the ratio test fails if the fired set and the bare-word population converge -- which is when a bare-word detector would start passing the file.
+
+**This row is the only self-reference trap available.** Measured 2026-09-06: a needle for "dispatch" within 120 characters of "fenc" fires on the two fenced rows and on nothing else in 679. This row is the third, it describes the marker, and it did not exist when the needle was built. It is pinned in the must-not-fire set for that reason.
+
+### What is not claimed
+
+I did not survey how the fence came to be written, or whether any dispatcher has actually spent a lane window on a fenced row. I measured the tool and the ledger, not an incident. The two fenced rows were read but not edited: they are fenced from this work by their own terms, and their words draw the line this row sits on -- a change to the WRITER or the VERIFIER is ordinary public engine work, and a change to what the RECORD SAYS is not. This changes the reader.
+
 ## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
 
 > 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
