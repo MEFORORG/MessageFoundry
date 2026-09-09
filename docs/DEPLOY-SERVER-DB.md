@@ -130,6 +130,96 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 > moved: that start issues the DDL batch and **fails outright** without it. Pre-creating the schema
 > and never granting it is the other supported posture, and it takes the same upgrade discipline.
 
+### 1.2 PostgreSQL — the least-privilege role
+
+The SQL Server set in §1.1 does **not** transfer: Postgres has no fixed **database** roles, the schema
+uses `BIGSERIAL` sequences rather than `IDENTITY`, and there is no stored-procedure path
+(`fifo_claim_proc` is SQL Server only). The Postgres equivalent is a role with **no attributes**, plus
+object grants. Two supported postures — pick one:
+
+**Posture A — the engine role owns its own schema** (simplest; the engine bootstraps and upgrades
+itself, §2):
+
+```sql
+CREATE ROLE mefor LOGIN PASSWORD :'pw';          -- NOSUPERUSER NOCREATEDB NOCREATEROLE are the defaults
+GRANT CONNECT ON DATABASE messagefoundry TO mefor;
+CREATE SCHEMA mefor AUTHORIZATION mefor;         -- run by a DBA; the role owns only this schema
+-- then set [store].db_schema = "mefor" so the pool's search_path lands there
+```
+
+**Posture B — a DBA pre-creates the objects; the engine role holds only row CRUD** (the analogue of
+"pre-create the schema and never grant `db_ddladmin`"; it carries the same upgrade discipline — the
+first start of any build whose schema moved must be run by a principal that may issue DDL):
+
+```sql
+CREATE ROLE mefor LOGIN PASSWORD :'pw';
+GRANT CONNECT ON DATABASE messagefoundry TO mefor;
+GRANT USAGE ON SCHEMA mefor TO mefor;                                  -- USAGE, not CREATE
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA mefor TO mefor;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;         -- the BIGSERIAL sequences
+```
+
+> **Posture B has a prerequisite that "pre-create the objects" does not spell out: the `schema_meta`
+> marker must already record the current DDL batch.** The engine skips its batch only on that marker
+> (§2); with the marker absent or stale it runs `CREATE TABLE IF NOT EXISTS`, and on PostgreSQL that
+> is **refused for a role holding only `USAGE`** — measured on 16.14, `CREATE TABLE IF NOT EXISTS`
+> against an already-existing table fails with *permission denied for schema*, because the schema ACL
+> is checked **before** the existence skip. `IF NOT EXISTS` does not rescue it. So hand-creating the
+> tables is not enough: bootstrap by running the engine once as a DDL-capable principal (which writes
+> the marker), then hand over to the `USAGE`-only role — and re-grant for the first start of any build
+> whose schema moved, exactly as §2 says. If that sequencing is awkward, use posture A.
+
+> **Why nothing wider, derived from the store rather than asserted.** The Postgres store issues
+> `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` inside its own schema, then only
+> `SELECT` / `INSERT` / `UPDATE` / `DELETE`. Its concurrency primitives are `pg_advisory_xact_lock`
+> and `SET LOCAL statement_timeout`, both available to any role. It installs no extension, creates no
+> function, and never uses `LISTEN`/`NOTIFY` or `COPY`.
+>
+> **Never `SUPERUSER`**, and never `CREATEROLE` / `CREATEDB` / `REPLICATION` / `BYPASSRLS`. Do **not**
+> make the engine role the **owner of the database** — ownership carries `CREATE` on the database and
+> the right to drop it, neither of which the engine uses. Do not grant `pg_read_all_data`,
+> `pg_write_all_data`, `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program`,
+> `pg_signal_backend`, `pg_checkpoint`, `pg_maintain` or `pg_create_subscription`, nor a managed-cloud
+> umbrella role (`rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin`).
+>
+> **No managed identity.** Postgres has no managed-identity auth mode, so `[store].auth` is a static
+> role+password (supply it via `MEFOR_STORE_PASSWORD`, never the file) and
+> `[store].require_managed_identity` is unsatisfiable on this backend — see
+> [`CONFIGURATION.md`](CONFIGURATION.md). `[store].require_least_privilege` is the orthogonal control
+> and **does** apply here (§1.3).
+
+### 1.3 The startup privilege preflight (`[store].require_least_privilege`)
+
+The grants in §1.1 and §1.2 used to be prescriptions the engine could not check. They are now
+**observed at every start**, before any listener binds:
+
+| Backend | What the probe reads | On SQLite |
+|---|---|---|
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes | n/a |
+| PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database | n/a |
+| SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
+
+- **The WARN arm ships on and cannot block an install.** Every start logs what was observed, writes a
+  `store_privilege_preflight` audit row, and — when the principal holds more than the documented set —
+  names each extra grant in `security_loosenings()` and in `GET /security/posture`.
+- **Refusal is opt-in:** set `[store].require_least_privilege = true` to refuse to start on an
+  over-grant. Like `require_managed_identity`, the refuse/warn split reads `[security].enforcement`,
+  not the deployment tier.
+- **It does not fail open.** If the probe cannot run — permission denied, a driver error, a backend
+  with no probe — the status is `unobservable`, which is reported as its own loud condition and is
+  **never** rendered as a clean result. Under `require_least_privilege` an unobservable probe refuses,
+  because a declared refusal that passed a principal it could not read would be a control in name only.
+
+> **Two things it reports that a site may not expect, both by construction.** On SQL Server, a
+> **user-defined database role** is named as excess even when it wraps exactly the three prescribed
+> ones: the probe reads *membership*, not a role's contents, and it cannot expand a site role without
+> catalog permission it deliberately does not depend on. Grant the three fixed roles directly, or
+> accept the entry. On PostgreSQL, a role **attribute** is reported when it sits on any role the
+> principal may assume, not only on the principal itself — attributes are never inherited, but a
+> member may `SET ROLE` to the holder and exercise them, so the wrapper is named alongside the
+> attribute (`CREATEROLE via role site_ops`). Neither is a false positive; both are grants beyond what
+> §1.1/§1.2 prescribe.
+
 ---
 
 ## 2. Schema bootstrap & evolution
@@ -153,12 +243,12 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
   The engine login's grants are §1.1 — `db_datareader` + `db_datawriter` + `db_ddladmin`, and never
   `db_owner` or `sysadmin`.
 
-> _Filled by staging:_ the **PostgreSQL** bootstrap role grants + the pre-create DDL per backend. The
-> SQL Server set is settled in §1.1 and is **not** transferable: Postgres has no equivalent of SQL Server's fixed **database** roles
-> (`db_datareader`/`db_datawriter`/`db_ddladmin`),
-> the schema uses `BIGSERIAL` sequences rather than `IDENTITY`, and there is no stored-procedure path
-> (`fifo_claim_proc` is SQL Server only), so the Postgres grants are a role/schema-ownership question
-> this doc does not yet answer.
+> **The PostgreSQL role grants are now answered in §1.2** — the two supported postures, why nothing
+> wider, and posture B's marker prerequisite. The SQL Server set (§1.1) never transferred and does not
+> now: Postgres has no equivalent of SQL Server's fixed **database** roles
+> (`db_datareader`/`db_datawriter`/`db_ddladmin`), the schema uses `BIGSERIAL` sequences rather than
+> `IDENTITY`, and there is no stored-procedure path (`fifo_claim_proc` is SQL Server only), which is
+> why §1.2 answers it as a role-attribute / schema-ownership question instead.
 
 ---
 
