@@ -28817,3 +28817,40 @@ Zero non-test callers exist in the engine.
 **`set_segment` does not exist.** `parsing/message.py` has `field` and `add_segment`; there is no `def set_segment` anywhere.
 
 **Scope, stated so nobody over-corrects.** The README index row is **honest** -- it names only `msg.set` / `msg.field`-copy / `msg.delete_segments` and the actions `set_field` / `copy_field` / `delete_segment`. `tests/test_lens_native.py` covers exactly the shipped forms, consistent with there being no read row. The over-claim is internal to the ADR file.
+
+---
+
+## 1516. A declared ADR companion is declared in PROSE, so every number-keyed enumeration silently drops it and nothing asserts the file set is fully represented
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **4/10** · Difficulty **2/10** · _fill-in_. Found when two independent audits over all 172 ADR numbers each graded `0013-query-response-orchestration.md` and never opened its companion. Value 4: the failure is silent and self-confirming -- an audit reports full coverage of the corpus while one document has never been read. Difficulty 2: one enumeration plus one assertion, on a seam the ledger gate already models correctly.
+> Verdict: build
+> Research: none -- the measurement is in the body
+> Closing-act: code
+
+**Cluster:** repository gates / ADR ledger. **Priority:** P3. **Verdict:** build a corpus-wide file-to-index check.
+**Severity:** no deployment axis (sec. 0). Developer tooling. No engine behaviour, no shipped artifact, no PHI.
+
+**THE CONVENTION IS SOUND AND IS NOT WHAT THIS ROW ATTACKS.** A *declared companion* -- one ADR number carrying two files, the second named inside the first's index row -- is sanctioned by [`docs/adr/README.md`](adr/README.md), and ADR 0013 is a correct instance of it. Nothing here proposes renumbering 0013, retiring the convention, or splitting the row. Renumbering would break every existing citation for no gain.
+
+**THE EXISTING GATE IS ALSO CORRECT, and a fix must not duplicate it.** [`scripts/hooks/ledger_check.py`](../scripts/hooks/ledger_check.py) `check_adrs` already models companions and says so in its own comment -- *"A DECLARED COMPANION is legal: one number, one index row, two files -- the row itself names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse is a collision."* When a second file appears under an existing number, it requires that file's basename to appear in that number's row, or it fails the commit. That is the right check at the right moment.
+
+**THE GAP IS NARROWER THAN EITHER OF THOSE, AND IT IS A SCOPE GAP, NOT A LOGIC GAP.** The gate runs over `added_files()` at commit time. Nothing ever enumerates the *existing corpus* and asserts that every ADR file is reachable from the index. So the companion's declaration is real, but it lives as a **basename embedded in the prose of a table cell** -- discoverable only by substring-matching free text. Every tool that keys on the ADR *number* gets one file per number and drops the other, with no error.
+
+**Measured on this tree 2026-09-09:**
+
+```
+ls docs/adr/[0-9]*.md | wc -l          ->  173      (files)
+grep -c '^| \[0' docs/adr/README.md    ->  172      (index rows)
+```
+
+That difference of one **is** the companion, and no check anywhere reads it.
+
+**IT HAS ALREADY FIRED TWICE, AND THE SECOND TIME PROVES A README NOTE CANNOT FIX IT.** Two independent multi-agent audits swept all 172 ADR numbers for build-state truthfulness. Both graded `0013-query-response-orchestration.md`. Neither opened `0013-increment-2-reingress-design.md`. Both audits' agents had the README in front of them; the note did not help, because the loss happened *before* any agent read anything -- the batch list was built by taking the first four characters of each filename and deduplicating, which collapsed two files into one number. **The defect is in the shape of the enumeration, not in anybody's attention**, which is exactly why documenting it harder is not the fix.
+
+**What to build.** Enumerate `docs/adr/[0-9]*.md` and assert each file is reachable from `docs/adr/README.md` -- either as its own `| [NNNN](file)` row, or as a companion whose basename appears in the row for its number. Fail loudly on a file that is reachable by neither.
+
+**Three constraints for whoever takes it.**
+
+1. **Do not re-implement the collision check.** `ledger_check.py` owns "is this new file a legal companion or an undeclared reuse". This check answers a different question -- "is every file that exists represented" -- and must not become a second, silently divergent definition of companion legality. Import or defer to the existing one.
+2. **Check the legacy-debt premise before designing around it -- it is stale.** `ledger_check.py` explains its added-files-only scope by citing three ADRs that shipped without an index row (0077, 0079, 0080) and warning that *"failing every unrelated commit over old debt is how a gate gets uninstalled."* **Measured 2026-09-09: all three now have rows** (`grep -c '^| \[0077\]'` and its siblings each return 1, control 0078 also 1). [`LEDGER-GATE.md`](LEDGER-GATE.md) records why -- they were restored in the same change that added the gate. So the debt that motivated the narrow scope is already paid, and a corpus-wide check does **not** need an exemption list: the only file it would flag today is the companion. Do not port an exemption forward on the strength of that comment without re-measuring, and do not read this as a reason to widen `ledger_check.py` itself -- its added-files scope is still correct for a commit-time gate.
+3. **Give it a positive control.** A check of this shape returns "all reachable" both when the corpus is clean and when its enumeration is broken -- the same false-green that produced this row. Pin the known-good count, or assert the companion specifically, so a broken enumeration fails instead of passing quietly.
