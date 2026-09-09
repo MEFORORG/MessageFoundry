@@ -41,7 +41,15 @@ that one line, turned off **nineteen** start-up gates. Measured at `0ce6d95cf`, 
 | API PHI-read over an unproven serve hop | `tls_policy.api_phi_hop_disposition` | ALLOW |
 | Outbound TLS hop with no revocation check | `tls_policy.revocation_hop_disposition` | ALLOW |
 
-Eight of those are hard refusals a stock instance takes under the shipped `enforcement = enforce`.
+**Most of those are hard refusals rather than warnings under the shipped `enforcement = enforce`, and
+which ones a given instance meets depends on its exposure, not on its environment name.** An earlier
+draft of this line put a number on it. That number was not measured, and it understated: the refusing
+arms include the keyless at-rest gate (which refuses at any dial), open-egress, the
+`--allow-insecure-bind` clamp, proxy attestation, MFA-at-exposure, the terminator-without-an-external-
+origin gate, the ASVS 12.1.1 probe, PHI retention on a production tier, the notification channel and
+its deliverability check, the alert SMTP hop, the API PHI serve hop and the outbound revocation hop.
+The rest warn. Counting them precisely would need a per-topology matrix this ADR does not carry, so
+it says which arms refuse instead of asserting a total.
 
 **Three facts made this the right time.**
 
