@@ -53,6 +53,16 @@ on:
     - cron: "0 7 * * 1"
   workflow_dispatch:
 
+concurrency:
+  # security.yml's pattern, and its note there is the reasoning: per-ref for PR events so a rapid
+  # re-push supersedes its own in-flight analysis; every other event gets a unique group (run_id) and
+  # is never superseded, never cancelled. THE `merge_group` ARM IS WHY THE EXPRESSION IS SHAPED THIS
+  # WAY RATHER THAN `cancel-in-progress: true`: a cancelled queue-time run reports a cancelled
+  # context, and the `on:` note above records what an absent CodeQL context did to the queue's first
+  # entry. A unique group per non-PR run cannot collide, so it cannot be cancelled by this block.
+  group: codeql-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -69,8 +79,32 @@ jobs:
     # nothing here. ci.yml relies on exactly this reasoning for its required `test` contexts. So the
     # guard is not a fork problem and needs no change; see the Analyze step below for the measured
     # fork-upload finding.
-    if: github.repository == 'MEFORORG/MessageFoundry'
+    # AND NOT IN THE MERGE QUEUE, because the answer there is discarded. CodeQL is not a required
+    # context (see .github/required-contexts.txt), so nothing waits on this result and nothing is
+    # blocked by it, while the same tree is already analysed on the pull_request run and again on
+    # the push to main after the entry lands. The merge-group pass is a third analysis nobody reads.
+    #
+    # THE COMMENT ON THE TRIGGER ABOVE SAYS THIS COSTS NOTHING WHILE THEY ARE NOT REQUIRED. That was
+    # true about MINUTES and false about SLOTS. Measured 2026-09-07: MEFORORG is on the `free` plan,
+    # whose ceiling is 20 concurrent jobs for the whole account, and a probe caught 20 executing
+    # against 144 eligible-but-unstarted. This matrix takes 2 of the ~27 slots each queue entry asks
+    # for, 10 per wave at a build limit of 5, while the REQUIRED legs wait a median of 41 minutes for
+    # a runner. On a slot-bound account a discarded analysis is not free.
+    #
+    # THE `merge_group:` TRIGGER ABOVE STAYS, deliberately. It is the prerequisite that has to be in
+    # place BEFORE these contexts could ever be required, which is the whole point of the comment on
+    # it, and removing the trigger is the failure that comment records. This guard skips the WORK,
+    # not the trigger.
+    #
+    # COUPLED CHANGE, recorded in .github/required-contexts.txt beside the reason CodeQL is not
+    # required: promoting any CodeQL context to required means REMOVING this guard in the same
+    # change, or the context never reports in the queue and nothing merges.
+    if: github.repository == 'MEFORORG/MessageFoundry' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
+    # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
+    # reasoning and the sizing rule for every cap added in that change. Above the floor because a
+    # CodeQL database build is the variable part -- the pair currently runs about 3.3 minutes.
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write # upload the SARIF results to code scanning

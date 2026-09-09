@@ -14,13 +14,13 @@ from messagefoundry.tray.config import (
     ServiceRegistryInfo,
     build_engine_url,
     compose_config,
+    engine_serves_https,
     is_local_engine,
     is_tls_url,
     load_config,
     parse_serve_args,
     parse_service_config_arg,
     service_toml_path,
-    service_toml_uses_tls,
 )
 
 
@@ -174,18 +174,33 @@ def test_parse_service_config_arg(args: str, expected: str | None) -> None:
 @pytest.mark.parametrize(
     ("data", "tls"),
     [
+        # an operator chain always wins -- ensure_api_tls_material returns it unchanged
         ({"api": {"tls_cert_file": "C:\\certs\\engine.pem"}}, True),
-        ({"api": {"tls_cert_file": ""}}, False),
-        ({"api": {"tls_cert_file": "   "}}, False),
-        ({"api": {"tls_cert_file": None}}, False),
-        ({"api": {"host": "127.0.0.1"}}, False),
-        ({"api": "not-a-table"}, False),
-        ({}, False),
-        (None, False),
+        # THE SHIPPED DEFAULT: no chain and no declared proxy, so the engine MINTS and serves https.
+        # All four of these read as "no cert" and every one of them used to answer False. That is
+        # the BACKLOG #1126 defect, and ADR 0172 predicted it in writing: the tray composed an http
+        # URL against an https listener and would render a running engine as WEDGED.
+        ({"api": {"tls_cert_file": ""}}, True),
+        ({"api": {"tls_cert_file": "   "}}, True),
+        ({"api": {"tls_cert_file": None}}, True),
+        ({"api": {"host": "127.0.0.1"}}, True),
+        # a DECLARED upstream terminator is the ONE topology that mints nothing (api/tls.py)
+        ({"api": {"tls_terminated_upstream": True}}, False),
+        # ... and an operator cert set alongside it still serves https, because that branch returns
+        # first. Ordering here is not cosmetic: get it backwards and the declared-proxy arm swallows
+        # a configured chain.
+        ({"api": {"tls_terminated_upstream": True, "tls_cert_file": "C:\\c.pem"}}, True),
+        # only a literal True declares the topology; a string is not a TOML boolean
+        ({"api": {"tls_terminated_upstream": False}}, True),
+        ({"api": {"tls_terminated_upstream": "yes"}}, True),
+        # no readable settings at all -- the engine then runs on its own defaults, which mint
+        ({"api": "not-a-table"}, True),
+        ({}, True),
+        (None, True),
     ],
 )
-def test_service_toml_uses_tls(data: dict[str, object] | None, tls: bool) -> None:
-    assert service_toml_uses_tls(data) is tls
+def test_engine_serves_https(data: dict[str, object] | None, tls: bool) -> None:
+    assert engine_serves_https(data) is tls
 
 
 def test_service_toml_path_resolution(tmp_path: Path) -> None:
@@ -236,7 +251,9 @@ def test_load_config_reads_toml_and_registry(tmp_path: Path) -> None:
     assert reader.asked == ["MEFOR_Prod"]
     assert cfg.service_name == "MEFOR_Prod"
     assert cfg.poll_seconds == 7.0
-    assert cfg.engine_url == "http://127.0.0.1:9200"  # from the registry hint
+    # The host and port come from the registry hint; the SCHEME comes from the engine's own
+    # settings, and there are none here -- so the engine runs on its defaults, which mint (ADR 0172).
+    assert cfg.engine_url == "https://127.0.0.1:9200"
     assert cfg.repo_path == "C:\\repo"
 
 
@@ -261,10 +278,37 @@ def test_load_config_discovers_an_https_engine_from_the_service_toml(tmp_path: P
     assert cfg.monitor_only is False
 
 
-def test_load_config_plaintext_service_toml_stays_http(tmp_path: Path) -> None:
+def test_load_config_a_certless_service_toml_now_discovers_https(tmp_path: Path) -> None:
+    """The BACKLOG #1126 regression, at the load_config seam rather than the predicate.
+
+    This case used to assert http, under the retired premise that no ``[api].tls_cert_file`` means
+    a cleartext bind. Since ADR 0172 an engine with no chain and no declared proxy MINTS one and
+    serves https, so the old expectation composed a URL that would probe an https listener over
+    http and render a running engine as WEDGED.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
+    reader = _FakeReader(
+        ServiceRegistryInfo(
+            app_directory=str(repo), app_parameters="serve --host 127.0.0.1 --port 8765"
+        )
+    )
+    assert load_config(tmp_path, reader).engine_url == "https://127.0.0.1:8765"
+
+
+def test_load_config_a_declared_upstream_terminator_stays_http(tmp_path: Path) -> None:
+    """The NEGATIVE control for the test above, and the one topology that is genuinely cleartext.
+
+    Without it, the https assertions everywhere else would pass equally if the tray had simply been
+    hardcoded to https. ``tls_terminated_upstream`` is the single arm where
+    ``ensure_api_tls_material`` returns no material and the engine speaks plaintext to its proxy.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "messagefoundry.toml").write_text(
+        "[api]\ntls_terminated_upstream = true\n", encoding="utf-8"
+    )
     reader = _FakeReader(
         ServiceRegistryInfo(
             app_directory=str(repo), app_parameters="serve --host 127.0.0.1 --port 8765"
@@ -275,7 +319,12 @@ def test_load_config_plaintext_service_toml_stays_http(tmp_path: Path) -> None:
 
 def test_load_config_unreadable_service_toml_is_fail_soft(tmp_path: Path) -> None:
     """The service TOML is operator data reached via an untrusted registry hint: a missing or
-    malformed file must degrade to 'no TLS hint', never raise into the tray's startup."""
+    malformed file must never raise into the tray's startup.
+
+    Fail-soft is about not raising, and that is unchanged. What changed is the DEGRADED ANSWER: an
+    engine whose settings the tray cannot read is running on the engine's own defaults, and those
+    mint (ADR 0172), so the quiet fallback is https rather than http.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "messagefoundry.toml").write_text("this is = = not toml", encoding="utf-8")
@@ -284,10 +333,10 @@ def test_load_config_unreadable_service_toml_is_fail_soft(tmp_path: Path) -> Non
             app_directory=str(repo), app_parameters="serve --host 127.0.0.1 --port 8765"
         )
     )
-    assert load_config(tmp_path, reader).engine_url == "http://127.0.0.1:8765"
+    assert load_config(tmp_path, reader).engine_url == "https://127.0.0.1:8765"
     # Absent entirely (no AppDirectory to anchor on) is equally quiet.
     bare = _FakeReader(ServiceRegistryInfo(app_parameters="serve --host 127.0.0.1 --port 8765"))
-    assert load_config(tmp_path, bare).engine_url == "http://127.0.0.1:8765"
+    assert load_config(tmp_path, bare).engine_url == "https://127.0.0.1:8765"
 
 
 def test_load_config_tray_toml_engine_url_beats_the_tls_hint(tmp_path: Path) -> None:

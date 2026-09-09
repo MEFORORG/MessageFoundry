@@ -142,7 +142,7 @@ async def test_a_tls_probe_fails_against_a_plaintext_listener(tmp_path: Path) ->
     cert, _key = _localhost_cert(tmp_path)
     server, port = await _serve(ssl_context=None)
     try:
-        with pytest.raises(DeliveryError, match="connect to 127.0.0.1"):
+        with pytest.raises(DeliveryError, match=r"(connect|TLS handshake) to 127\.0\.0\.1"):
             await probe_tcp_reachable(
                 "127.0.0.1", port, 5.0, "TEST", ssl_context=_verifying_client_ctx(cert)
             )
@@ -160,7 +160,7 @@ async def test_a_verifying_probe_rejects_a_wrong_named_certificate(tmp_path: Pat
     wrong_cert, wrong_key = _wrong_name_cert(tmp_path)
     server, port = await _serve(ssl_context=_server_ctx(wrong_cert, wrong_key))
     try:
-        with pytest.raises(DeliveryError, match="connect to 127.0.0.1"):
+        with pytest.raises(DeliveryError, match=r"(connect|TLS handshake) to 127\.0\.0\.1"):
             await probe_tcp_reachable(
                 "127.0.0.1", port, 5.0, "TEST", ssl_context=_verifying_client_ctx(wrong_cert)
             )

@@ -65,6 +65,10 @@ jobs:
     # engine release built from `webconsole-v*` would ship the engine at the console's version.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     runs-on: ubuntu-latest
+    # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
+    # reasoning. The most generous cap in this file: it builds, signs and publishes, so it waits on
+    # Sigstore and PyPI, and a release that dies at a cap is far cheaper than one wedged for six hours.
+    timeout-minutes: 30
     permissions:
       contents: write       # create the release + upload its assets
       id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
@@ -505,6 +509,7 @@ jobs:
     # and fails if any tracked text drifts back to the pre-claim claim.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write   # gh release upload (attach the console wheel)
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token anywhere
@@ -632,6 +637,7 @@ jobs:
     if: github.repository == 'MEFORORG/MessageFoundry'
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write   # gh release upload (attach the harness wheel)
       id-token: write   # PyPI Trusted Publishing (OIDC) for the harness wheel

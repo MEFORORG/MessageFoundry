@@ -33,6 +33,24 @@ Two obstacles made a naive flip unsafe:
    `__Host-` cookie over `http://`, so simply engaging the whole bundle on loopback would set a cookie the
    browser drops — **breaking login** on Chrome/Safari.
 
+   > **Amendment 2026-09-06 (BACKLOG #1117): the second sentence is FALSE on the loopback origin it was
+   > written about, and the hybrid it justifies still stands on other ground.** Measured against Chrome
+   > 148.0.7778.280, with a server presenting the chain `make_self_signed` mints: an `http://127.0.0.1`
+   > origin, and again `http://localhost`, **STORED and returned** `__Host-`, `__Secure-` and a
+   > bare-`Secure` cookie alike. Two vacuity controls rode in the same run and both reported missing — a
+   > `Domain=example.invalid` cookie the browser must drop, and a `Path=/nowhere` cookie it must not send
+   > — and `curl` confirmed the server emitted all four before any browser touched it. A loopback origin
+   > is *potentially-trustworthy*, so a conforming browser applies its normal secure-origin cookie rules
+   > there. The claim is correct for a non-loopback `http://` origin, which is the case it was probably
+   > reasoned from.
+   >
+   > **This does not reopen the decision.** The hybrid keeps the plain cookie on two grounds that survive:
+   > Firefox and Safari are unmeasured, and since [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+   > no `messagefoundry serve` posture reaches the cleartext branch at all, so widening it would trade a
+   > measured-inert behaviour for an unmeasured one. It is amended rather than left because this sentence
+   > is the primary site — `_auth.security_headers_context`, `_security.py` and the console suite all
+   > inherited it, and three ASVS cells stand on it.
+
 A full fix — terminate TLS on the loopback bind so `effective_https` is true and *everything* (headers +
 secure cookie + HSTS) engages — is an **XL**: it means moving the whole API to https by default and migrating
 every client (harness, `apiclient`, tray, IDE) in lockstep. Out of scope here.
@@ -172,6 +190,15 @@ Posture-A ASVS re-score is owner-gated and handled separately.
 - [x] `security_loosenings()` untouched (the switch is not a loosening); `docs/SECURITY-LOOSENING.md` reframed + switch-table default flipped.
 - [x] Docs (`CONFIGURATION.md`, `SECURITY.md`, `PHI.md`, `OFF-LOOPBACK-DEPLOYMENT.md`) + `ide/src/securityEditor.ts` flip "off by default" → on by default.
 - [ ] Posture-A ASVS re-score (3.3.1/3.3.3 stay Partial on loopback; auto-TLS deferred) — **owner-gated, separate**.
+
+> **Note added 2026-09-04 (BACKLOG #1445). The checklist above is left as written.** Its
+> `app.state.loopback` row says the attribute was "curated into the webconsole seam snapshot", and
+> that was true on 2026-07-21. BACKLOG #1220 has since retired curation: `scripts/seam_discovery.py`
+> derives the surface, and `ENGINE_UI_SEAM` is a digest nobody picks, so the row's "(no
+> `ENGINE_UI_SEAM` bump)" names a decision that no longer exists either. Neither this ADR's decision
+> nor its analysis is affected. The live procedure is in
+> [`docs/WEBCONSOLE-PACKAGE.md`](../WEBCONSOLE-PACKAGE.md); this ADR is append-only history and is
+> dated rather than edited (`docs/adr/README.md`).
 
 ## Cross-reference (2026-08-04) — the in-place `serve_ui = False` flips feed no exposure predicate (BACKLOG #326)
 

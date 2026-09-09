@@ -7,13 +7,17 @@ here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 This package is **separately versioned** from the engine and pins itself to the engine's
-`api._ui_seam.ENGINE_UI_SEAM` via `SUPPORTED_ENGINE_SEAMS`; each entry notes the supported engine
-seam(s). See [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md) for the seam handshake and
-the engine compatibility range.
+`api._ui_seam.ENGINE_UI_SEAM` via `SUPPORTED_ENGINE_SEAMS`; each entry records the supported engine
+seam. Entries from before BACKLOG #1220 quote the integer that shipped at the time; a current one
+points at the constant instead, because nobody picks that value now. See
+[`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md) for the seam handshake and the
+engine compatibility range.
 
 ## [Unreleased]
 
-**Supported engine UI seam: `2`, `3`.**
+**Supported engine UI seam: the single value in `SUPPORTED_ENGINE_SEAMS` -- read it from
+[`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
+this line.**
 
 ### Added
 - **Engine-wide KPI headline on the status page** (BACKLOG #93). The status page now renders the
@@ -22,9 +26,10 @@ the engine compatibility range.
   PHI.
 
 ### Changed
-- **Engine UI seam bumped to `3`** (`SystemStatus` gained the additive `kpis` field). The console now
-  `SUPPORTED_ENGINE_SEAMS = {2, 3}`: seam `2` is retained because the new field has a default, so a
-  seam-`2` engine (whose `/status` omits `kpis`) still renders here with default (zeroed) KPI values.
+- **The engine UI seam moved** (`SystemStatus` gained the additive `kpis` field, so the contract
+  surface changed). `SUPPORTED_ENGINE_SEAMS` holds the one new value, so this console build refuses
+  any engine but the one it was built against -- including an engine one contract behind, whatever
+  defaults its DTOs carry (BACKLOG #279).
 
 ### Security
 - **The message editor now requires `messages:view_raw` alongside `messages:edit`** (BACKLOG #324).

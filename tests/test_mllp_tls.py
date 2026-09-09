@@ -500,7 +500,9 @@ async def test_test_connection_on_a_tls_destination_fails_against_a_cleartext_pe
             )
         )
         try:
-            with pytest.raises(DeliveryError, match="MLLP connect to 127.0.0.1"):
+            with pytest.raises(
+                DeliveryError, match=r"MLLP (connect|TLS handshake) to 127\.0\.0\.1"
+            ):
                 await dest.test_connection()
         finally:
             await dest.aclose()

@@ -34,6 +34,7 @@ from typing import Any
 from messagefoundry import __version__
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
+    LogFile,
     SyslogForward,
     configure_logging,
     query_sntp_offset,
@@ -804,6 +805,20 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--engine-host", default="127.0.0.1", help="live smoke: engine host")
     verify.add_argument("--mllp-port", type=int, default=2575, help="live smoke: inbound MLLP port")
     verify.add_argument(
+        "--smoke-tls",
+        action="store_true",
+        help="live smoke: send the frame over TLS, for an inbound configured tls = true. Declare "
+        "it: the smoke never probes in the clear and retries over TLS (ASVS 12.3.1 forbids that "
+        "fall-back), so without this the synthetic message crosses in cleartext",
+    )
+    verify.add_argument(
+        "--smoke-tls-ca",
+        default=None,
+        help="live smoke: CA/certificate file that anchors the engine's inbound certificate "
+        "(needed for the self-signed pair the engine mints on first run). No verify-off switch: a "
+        "smoke that accepts any certificate proves the port answers, not that it is the engine",
+    )
+    verify.add_argument(
         "--inbound",
         default=None,
         help="self smoke: inbound connection name (if config has several)",
@@ -1295,6 +1310,7 @@ def _serve(args: argparse.Namespace) -> int:
         platform_memory_encryption_readout,
     )
     from messagefoundry.config.settings import (
+        LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
         forward_hop_disposition,
@@ -1737,9 +1753,37 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.logging.forward_port,
                 _forward_why,
             )
-    forwarder_live = configure_logging(
-        settings.logging.level, fmt=settings.logging.format.value, forward=log_forward
+    # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
+    # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
+    # guard still wraps stdout, so the two-stage roll/stop applies either way.
+    _log_file = (
+        LogFile(
+            path=settings.logging.file,
+            max_bytes=settings.logging.file_max_bytes,
+            backup_count=settings.logging.file_backup_count,
+        )
+        if settings.logging.file is not None
+        else None
     )
+    try:
+        forwarder_live = configure_logging(
+            settings.logging.level,
+            fmt=settings.logging.format.value,
+            forward=log_forward,
+            log_file=_log_file,
+            stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
+        )
+    except OSError as exc:
+        # FAIL CLOSED at configuration time: the operator named an application-log path this process
+        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
+        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
+        print(
+            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
+            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
+            "the path/permissions, or unset [logging].file to run stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler — a TCP
         # collector that is down at startup is skipped (it warns), so this must not contradict it.
@@ -1790,7 +1834,14 @@ def _serve(args: argparse.Namespace) -> int:
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, (), (), ()
+        settings.security,
+        settings.store,
+        settings.auth,
+        settings.alerts,
+        settings.secret_rotation,
+        (),
+        (),
+        (),
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -2281,11 +2332,12 @@ def _serve(args: argparse.Namespace) -> int:
         if not browser_hardening_enabled():
             print(
                 f"warning: {BROWSER_HARDENING_OPT_OUT_ENV} is set — the /ui browser hardening is OFF "
-                "for this run. The session and OIDC flow cookies revert to their unprefixed names "
-                "(mf_session / mf_oidc_flow), losing the browser-enforced '__Host-' host binding, and "
+                "for this run. The session and OIDC flow cookies lose the browser-enforced '__Host-' "
+                "host binding and fall back to '__Secure-mf_session' / '__Secure-mf_oidc_flow', and "
                 "the per-response nonce CSP, COOP and CSP reporting are not emitted. Transport "
-                "security is NOT downgraded: Secure is still set over https. Unset this variable to "
-                "restore the secure-by-default posture.",
+                "security is NOT downgraded: Secure is still set over https, which is what keeps the "
+                "'__Secure-' prefix writable. Unset this variable to restore the secure-by-default "
+                "posture.",
                 file=sys.stderr,
             )
 
@@ -5320,6 +5372,8 @@ def _verify(args: argparse.Namespace) -> int:
         inbound=args.inbound,
         check_disposition=args.check_disposition,
         disposition_timeout=args.disposition_timeout,
+        smoke_tls=args.smoke_tls,
+        smoke_tls_ca=args.smoke_tls_ca,
         fed_id_token=args.fed_id_token,
         fed_jwks=args.fed_jwks,
         fed_nonce=args.fed_nonce,
@@ -5467,6 +5521,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         AlertsSettings,
         AuthSettings,
+        SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
         load_settings,
@@ -5482,6 +5537,9 @@ def _security(args: argparse.Namespace) -> int:
     # reporting a subset as if it were everything.
     _loosenings_partial = False
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
+    # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
+    # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
+    _rotation = SecretRotationSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -5489,6 +5547,7 @@ def _security(args: argparse.Namespace) -> int:
         try:
             _full = load_settings(config_path=path)
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
+            _rotation = _full.secret_rotation
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -5503,7 +5562,7 @@ def _security(args: argparse.Namespace) -> int:
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), ())
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, _rotation, (), (), ())
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a

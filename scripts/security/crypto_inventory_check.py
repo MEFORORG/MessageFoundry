@@ -396,19 +396,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK. store.crypto seam = the at-rest
     # cipher (MARKER_PREFIX/cell_aad/CipherError) it drives over the PHI columns.
     "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
-    # BACKLOG #1178: `probe_tcp_reachable`, the reachability probe the socket destinations share for
-    # `test_connection`, takes an optional `ssl_context` and dials with it. It BUILDS no context and
-    # imports `ssl` under TYPE_CHECKING only. Registered anyway, and NOT routed through the
-    # bare-local escape this module's docstring offers, because the escape is for a call site that
-    # CARRIES inputs to a builder that decides — and this one decides.
-    #
-    # THE DECIDING LINE IS `server_hostname=host if ssl_context else None`: that conditional sets
-    # whether SNI and the hostname check happen at all, so the module holds a verification-posture
-    # decision rather than passing one through. Hiding the `ssl` name would hide exactly that
-    # conditional. Before #1178 the probe was unconditionally cleartext, so a `tls=true` MLLP
-    # destination tested a transport the operator never configured; `None` (the default) stays the
-    # honest value for TCP and X12, which cannot speak TLS in any configuration.
-    #
+    # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's
+    # and hands it to asyncio.open_connection, so the connection test crosses the same hop the send
+    # path does instead of opening a plaintext socket to a tls=true partner. ssl is imported for the
+    # parameter's type and to tell an ssl.SSLError (handshake) from a plain OSError (connect) in the
+    # failure message. There is no plaintext retry: that downgrade is what 12.3.1 forbids.
     # THE TEST TO APPLY AT THE NEXT SITE, because "it only passes a context through" is the argument
     # that reaches for the escape: does this module DECIDE anything about the crypto, or only carry
     # inputs to something that does? The SMTP cells carry — `build_smtp_tls_context` decides for all
@@ -488,6 +480,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # bytes (integrity/dedup metadata). Body encryption at rest rides the store cipher — the
     # store.crypto seam (Cipher, cell_aad) it imports directly, now a first-class inventory token.
     "messagefoundry/uploads.py": frozenset({"hashlib", "secrets", "messagefoundry.store.crypto"}),
+    # BACKLOG #1178 (ASVS 12.3.1): live_smoke_ssl_context is the verifier's CLIENT context for a
+    # `messagefoundry verify --smoke live --smoke-tls` run against a tls = true MLLP inbound, so the
+    # smoke stops writing a synthetic message body onto a bare socket. It resolves its posture
+    # through the shared seam (harden_kex_groups / harden_cipher_suites / harden_verify_flags)
+    # rather than inheriting the interpreter's defaults, and offers NO verify-off escape -- a smoke
+    # that accepts any certificate proves the port answers, not that it is the engine.
+    "messagefoundry/verify/smoke.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # --- BACKLOG #282: modules the seam / library / non-messagefoundry-root widening newly surfaces ---
     # The CLI (gen-key / rotate-key / serve): mints the store DEK (store.crypto.generate_key),
     # gates a keyless PHI start, and surfaces KeyProviderError — all delegated through the store seams,
@@ -591,6 +590,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     # SHA-256 rather than BLAKE2 or a non-approved digest only because the engine renders a fips_mode
     # attestation, and a non-approved hash in the shipped surface invites a FIPS question for no gain.
     "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
+    # BACKLOG #1433, the SAME class as the three entries above: SHA-256 over the shipped
+    # common-password CORPUS FILE, recorded in the generated block of its .NOTICE so the notice's
+    # counts and the file they describe cannot drift apart unnoticed. A CHANGE DETECTOR, not a
+    # security control -- no secret, no key, no message authentication, and nothing user- or
+    # PHI-derived: the input is a published third-party wordlist committed beside the digest. It is
+    # taken over LF-NORMALIZED bytes so the recorded value does not depend on the platform a
+    # checkout was made on. SHA-256 rather than a cheaper non-cryptographic digest only because it
+    # is already this tree's convention for pinning a file, and a second convention buys nothing.
+    "scripts/security/build_password_corpus.py": frozenset({"hashlib"}),
     # BACKLOG #1323 -- ELEVEN SITES THE GATE COULD NOT SEE AT ALL until the TLS-policy seam was
     # added above. Each imports messagefoundry.config.tls_policy and NONE of the six stdlib crypto
     # modules, so before the seam widened there was no token that could match them and no row was
