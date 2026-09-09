@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
@@ -424,6 +425,10 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
             roles=[Role.VIEWER.value],
             actor="test",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
         u = await service.store.get_user(uid)
         assert u is not None and u.password_hash is not None
         await service.store.set_password(

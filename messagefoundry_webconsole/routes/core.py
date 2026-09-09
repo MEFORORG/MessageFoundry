@@ -360,7 +360,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
         rows = await core.list_connections(engine=engine, identity=identity)
-        return HTMLResponse(pages.dashboard(rows))
+        # BACKLOG #1152: the landing page is where a fresh operator forms the impression that RBAC
+        # is broken, so it is where the unprovisioned state gets a sentence. Read off the identity,
+        # never off `not rows` — an estate with no connections configured yet is a different empty.
+        return HTMLResponse(pages.dashboard(rows, unprovisioned=identity.has_no_channels))
 
     @app.get("/ui/connections", response_class=HTMLResponse)
     async def ui_connections(
