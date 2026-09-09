@@ -4,15 +4,21 @@
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import messagefoundry.checks as checks
 from messagefoundry.__main__ import main
-from messagefoundry.checks import run_checks
+from messagefoundry.checks import CheckReport, run_checks
+from messagefoundry.logging_guard import GuardedStreamHandler, active_guard, set_active_guard
+from messagefoundry.logging_setup import configure_logging
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 RESULTS_RELAY = Path(__file__).resolve().parents[1] / "samples" / "results_relay"
@@ -126,6 +132,76 @@ def test_check_dryrun_accepts_single_file(
     assert rc == 0
     dr = _check(_out_json(capsys), "dryrun")
     assert dr["required"] is True and dr["ok"] is True and dr["skipped"] is False
+
+
+# --- stdout belongs to the payload (BACKLOG #1489) ---------------------------
+# Every `_out_json` call above asserts that stdout is pure JSON. That assertion was OPTIMISTIC while
+# the default log sink wrote to stdout as well: it held only for as long as nothing happened to log.
+# The test below is the one that makes it SOUND, by forcing the thing that used to break it.
+
+#: Distinctive enough that finding it in a stream is evidence about THIS record, not a coincidence.
+_LOG_MARKER = "a log record fired during a --json subcommand"
+
+
+@pytest.fixture
+def _restore_root_logger() -> Iterator[None]:
+    """``configure_logging`` mutates the global root logger AND publishes a process-wide write guard;
+    restore both, or a handler bound to this test's capture stream outlives it (which is the very
+    failure this section is about)."""
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    saved_guard = active_guard()
+    try:
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
+        set_active_guard(saved_guard)
+
+
+@pytest.mark.usefixtures("_restore_root_logger")
+def test_check_json_payload_survives_a_log_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A record logged DURING ``check --json`` must not reach stdout.
+
+    The shape that evicted three merge-queue batches: a process that configured the engine's logging
+    keeps the guarded stdout sink on the root logger, and its stream object later goes stale (pytest's
+    capture teardown, an NSSM capture-file swap, a closed pipe). The next record fails to write, so
+    the guard rolls the sink onto the LIVE ``sys.stdout`` and records the rollover event there,
+    landing ahead of the payload; ``json.loads`` then raises ``Extra data: line 1 column 5`` on the
+    ISO timestamp. Forcing the record is what makes that deterministic. It is timing-dependent
+    otherwise, which is exactly why five real failures read as flakes.
+
+    The guard is doing the right thing and is not touched: writing the notice to the rolled sink is
+    how stage 1 proves the replacement accepted a write. What changes is that a ``--json`` subcommand
+    no longer leaves a log sink pointed at the stream its payload is going to.
+    """
+    configure_logging("INFO")
+    stdout_sink = logging.getLogger().handlers[0]
+    assert isinstance(stdout_sink, GuardedStreamHandler)
+    # A CLOSED stream, which is what a capture teardown or a supervisor file-swap leaves behind: the
+    # write raises, and the guard re-resolves to whatever `sys.stdout` is now.
+    stale = io.StringIO()
+    stale.close()
+    monkeypatch.setattr(stdout_sink, "stream", stale)
+
+    real_run_checks = checks.run_checks
+
+    def _run_checks_and_log(*args: Any, **kwargs: Any) -> CheckReport:
+        logging.getLogger("messagefoundry.test").warning(_LOG_MARKER)
+        return real_run_checks(*args, **kwargs)
+
+    monkeypatch.setattr(checks, "run_checks", _run_checks_and_log)
+
+    assert main(["check", "--config", str(SAMPLES_CONFIG), "--no-lint", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["ok"] is True  # stdout carries the payload and nothing else
+    assert _LOG_MARKER in captured.err  # and the record was re-routed, not dropped
 
 
 # --- per-feed fixture mapping (#11) ------------------------------------------
