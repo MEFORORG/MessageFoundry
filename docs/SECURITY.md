@@ -780,12 +780,28 @@ the same permission set on the same method reds CI until it is listed here.
 > fresh install from locking themselves out of their own console. A non-administrator with an empty
 > scope sees an empty console, and the landing page says so in a sentence rather than leaving it to
 > read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
-> make a fresh single-operator install unbootable for the same condition. Monitoring dashboards stay
-> global. A channel-scoped user **cannot purge** a shared outbound (purge spans every inbound feeding
-> it). **AD users** inherit their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`;
-> channel `*` = all): on login the group-derived scope is persisted — a wildcard row persists the
-> explicit `["*"]` grant — and stale sessions revoked. It's opt-in: with no matching mapped group the
-> user's existing scope is left untouched, which for a never-granted account means it stays denied.
+> make a fresh single-operator install unbootable for the same condition. A channel-scoped user
+> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
+> their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on
+> login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
+> and stale sessions revoked. It's opt-in: with no matching mapped group the user's existing scope
+> is left untouched, which for a never-granted account means it stays denied.
+>
+> **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
+> caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
+> return only their own inbound connections, and every **shared outbound** is suppressed outright
+> rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
+> an outbound spans channels and its state can reflect another channel's downstream.
+> `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
+> What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
+> `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
+> whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
+> `GET /metrics` is the exception in the other direction: the Prometheus exposition is keyed by
+> connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
+> holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
+> This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
+> route above against a scoped caller with an all-channels caller as the control, and reds if the
+> prose and the app disagree.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
