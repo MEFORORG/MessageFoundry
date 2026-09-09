@@ -1,6 +1,6 @@
 # ADR 0022 — FHIR resource codec + REST client
 
-- **Status:** **Accepted (2026-06-19)** — ratified on the owner's go. Design-only (no code yet); the Lane B
+- **Status:** **Accepted (2026-06-19)** — ratified on the owner's go. **Built** ([`parsing/fhir/`](../../messagefoundry/parsing/fhir) + [`transports/fhir.py`](../../messagefoundry/transports/fhir.py)); the ADR 0043 `fhir_lookup` read seam extends it. The original start-gate below is kept as history: the Lane B
   `fhir-codec` **build may start once `ci-py311-finalizer` (#17) has also merged** (the build start-gate is *ADR
   0022 Accepted AND #17 merged*). The "To resolve on acceptance" confirmations are ratified at their recommended
   positions — see **Resolved** below.

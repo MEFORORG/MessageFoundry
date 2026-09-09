@@ -1,6 +1,6 @@
 # ADR 0027 — Per-connection retention / pruning windows
 
-- **Status:** Proposed  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** Accepted — **built in 0.2.9** (per-connection `messages_days` / `dead_letter_days` retention windows). BACKLOG #34 carries the closing record.
 - **Date:** 2026-06-27
 - **Related:** BACKLOG #34 · [ADR 0001](0001-staged-pipeline-architecture.md) (staged queue + the
   count-and-log / at-least-once invariants this purge must preserve) · [ADR 0007](0007-gui-manageable-connections-toml.md)

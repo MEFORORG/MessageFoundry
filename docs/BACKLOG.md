@@ -28447,3 +28447,130 @@ its audit fires on cannot simply check that the line is non-blank -- that passes
 on other code, which is the common case. The design question is what to pin: the simplest honest form is
 to record the anchored line's TEXT beside the anchor and fail when the two disagree, which turns a silent
 drift into a named failure at commit time rather than a red a day later.
+
+---
+
+## 1497. ADR 0157 leaves increments 0, 2 and 3 unbuilt, says increment 2 is mis-specified, and no open item carries any of it
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **6/10** · Difficulty **6/10** · _big bet_. Found by an ADR-to-backlog sweep. The ADR names three unbuilt increments in its own opening blockquote and warns that one of them must not be built as written. Its only backlog reference is a closed test-flake row about a wall-clock assertion, so the engine work has no home. Value 6: on a first deployment against SQL Server this is an absent in-flight recovery path plus two unfenced write paths on a demoted node. Difficulty 6: cross-backend store work under the fence invariant, and the specification has to be repaired before anyone can build it.
+> Verdict: build
+> Research: none -- the ADR's own Increments section states the defect
+> Closing-act: code
+
+**Cluster:** HA correctness / store fences. **Priority:** P2. **Verdict:** re-specify Inc 2, then build 0, 2 and 3.
+**Severity:** conditional per CLAUDE.md sec. 0 -- **zero deployments**, so nothing is losing rows today. This is what a first deployment running SQL Server with a demoted node would hit.
+
+**What is built and what is not.** [ADR 0157](adr/0157-demotion-safety-fence-scope-on-post-claim-writes-and-a-bounded-graph-stop.md) says it in its own words: *"Increments 1, 4 and 5 are BUILT. C1 and C6 were decided by the owner. Inc 0, 2 and 3 are **not** built -- and Inc 2's premise is wrong as written."*
+
+| Increment | State | What it is |
+|---|---|---|
+| 0 | not built | clamp the lease renew's own statement timeout below the margin |
+| 2 | not built, **mis-specified** | SQL Server periodic in-flight recovery |
+| 3 | not built | the same fences on SQL Server's `claim_ready` and terminal resolves |
+
+**Inc 2 must be re-specified before it is built.** The ADR carries its own warning: the drafted version proposes an owner-blind, age-based sweep, but SQL Server has **no populated `owner` column** to discriminate with, so the sweep would re-pend rows a live leader is working. The ADR states the real defect is *the absence of recovery at graph re-start*, not the absence of a sweep.
+
+**The ordering constraint is already stated.** Inc 2 blocks Inc 3, and one of the ADR's acceptance criteria *cannot pass before Inc 2*. So this is one item, not three: taking Inc 3 alone would leave that criterion unprovable.
+
+**Why nothing caught it.** The ADR is cited by exactly one backlog row -- a closed item about `tests/test_adr0157_demote_teardown.py` asserting on a wall clock. A citation search for `0157` therefore returns a hit, and the hit is about a test, not the increments.
+
+---
+
+## 1498. ADR 0173's revocation remainder lost its tracking item when #1005 shipped and closed
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **6/10** · Difficulty **4/10** · _quick win_. Found by an ADR-to-backlog sweep. #1005 shipped CRL checking on the mTLS-terminating listeners and closed. ADR 0173 was written to cover the surfaces #1005 did **not** reach, is still `Proposed` with no code, and its only backlog citation is that now-closed row. Value 6 because a revoked peer certificate would keep verifying on the unguarded hops on a first deployment. Difficulty 4: the ADR already names the surfaces and carries one small build rider.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** TLS posture / ASVS 12.1.4. **Priority:** P2. **Verdict:** ratify the accept half, then build the sec. 4.3 rider.
+**Severity:** conditional per CLAUDE.md sec. 0 -- **zero deployments**. On a first deployment a revoked partner certificate would keep verifying on the hops this ADR names.
+
+**The gap is structural, not an oversight.** Three records share this subject and each closed a different slice:
+
+| Record | What it covers | State |
+|---|---|---|
+| ADR 0078 | the `[api]` in-process-TLS serve-time refusal + `MEFOR_TLS_REVOCATION_ATTESTED` | built; its own Status names the MLLP-over-TLS gate and the Postgres/REST/SOAP client paths as **documented residuals** |
+| ADR 0173 | revocation + OCSP stapling across terminating **and originating** surfaces | `Proposed`, **no code** |
+| BACKLOG #1005 | CRL on the mTLS-terminating listeners | SHIPPED 2026-08-22, `3c5cb988` |
+
+ADR 0078's stated residuals were meant to land under ADR 0173, and ADR 0173's only citation is #1005 -- which shipped a *different* slice and took the citation with it when it closed.
+
+**Two things this item must do.** First, the ADR's own Status says *"the accept half needs owner ratification"*, so it needs a decision before a build. Second, it names *"one build rider in sec. 4.3 [that] is a separate, small change that this ADR authorizes but does not perform."* Do not start the rider before the ratification: the ADR was deliberately written not to perform it.
+
+---
+
+## 1499. ADR 0085's deferred Direct S/MIME phases lost their home when BACKLOG #157 closed on PR1 alone
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **2/10** · _fill-in_. Found by an ADR-to-backlog sweep. The ADR shipped PR1 (outbound send only) and names four further phases as *"deferred (named, not built)"*. #157 closed, so the named phases are recorded only inside an ADR whose index row reads `Accepted`. Filing the deferral is the deliverable here; building the phases is demand-gated.
+> Verdict: demand-gate
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** connector parity / Direct Project. **Priority:** P3. **Verdict:** demand-gate -- record the deferral, build on a real feed.
+**Severity:** no deployment axis (sec. 0). The shipped outbound path is complete for what it claims.
+
+**What shipped and what did not.** [ADR 0085](adr/0085-direct-hisp-smime-connector.md) is `Accepted (2026-07-10) -- PR1 outbound-only; later phases deferred`. [`transports/direct.py`](../messagefoundry/transports/direct.py) is the built outbound connector. Deferred and named in the ADR:
+
+1. **Inbound Direct** and MDN processing.
+2. **DNS CERT / LDAP certificate discovery** (`dnspython` rejected for PR1 -- a dependency plus a network lookup on the send path).
+3. **Multi-level certificate path building** (PR1 does one level, `verify_directly_issued_by`).
+4. **CMS signed attributes** required by the Direct implementation guide.
+
+**Why this is a filing and not a build.** No adopter has asked for inbound Direct, and item 2 would add a dependency for a feed that does not exist. The point of this row is that the four phases are currently discoverable only by reading an ADR whose index row says `Accepted` -- which reads as done.
+
+---
+
+## 1500. ADR 0090's web console Resend UI is the last unbuilt piece of #123, and #123 closed without it
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **4/10** · Difficulty **3/10** · _fill-in_. Found by an ADR-to-backlog sweep. The API, the engine and all three store backends ship resend-to-alternate; the operator has no button. #123 closed on the API/engine deliverable, which the ADR says was the intent, so the UI residual has no item.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** web console / operator surface. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). A missing affordance over a shipped, audited API.
+
+**The residual, in the ADR's own words.** [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) documented residuals: *"(a) the **console/webconsole Resend UI** for #123 is a desired-if-clean follow-on; the API/engine capability is the deliverable of #123."* #123 closed on that deliverable, correctly, and residual (a) went with it.
+
+**Read residual (b) before scoping this.** The same list names a PySide6 desktop editor, and the ADR already annotates it: *"this residual can no longer be built, and is therefore not open work"* -- the desktop console was retired on 2026-07-13 (BACKLOG #103, [ADR 0032](adr/0032-console-desktop-launch.md) RETIRED). **Only residual (a), the web console, is open.** Do not repoint the desktop bullet at `/ui`; the ADR explicitly declines to.
+
+**The affordance has a stated requirement.** The ADR rules that a resend lands at the destination lane **tail** and may be delivered after newer same-partner messages, and that *"the console affordance (residual) will warn."* The warning is part of the deliverable, not polish.
+
+---
+
+## 1501. ADR 0084's declined-handler `message_events` mitigation was deferred behind a gate that has since shipped, and nothing tracks it
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **3/10** · _fill-in_. Found by an ADR-to-backlog sweep. The mitigation was deferred from v1 on the condition that it ride the `message_events` verbosity gate. That gate shipped in #899, so the stated precondition is met and the mitigation is the only part left -- with no open item naming it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** routing observability. **Priority:** P3. **Verdict:** build, default-off behind the existing gate.
+**Severity:** no deployment axis (sec. 0). Diagnostic detail, opt-in by design.
+
+**The deferral and its condition.** [ADR 0084](adr/0084-accepts-router-seam.md) ruling 2: *"The `message_events` declined-handler mitigation is DEFERRED from v1 -- and when it is built it must ride the **existing `message_events` verbosity gate** (BACKLOG #63, shipped in #899) rather than writing unconditionally."*
+
+**The condition is now met.** #63 closed BUILT 2026-07-10: `[diagnostics].message_events` is the operator verbosity dial, and the gate is applied at every emission path.
+
+**What it restores.** One metadata-only event per declined handler (`event = "accepts_declined"`, `detail = <handler name>`), written **inside the same router `route_handoff` transaction** so it is atomic with the disposition and re-derives identically on replay. Without it, the mixed case loses per-declined-handler granularity.
+
+**Why it must stay default-off.** The ADR does the arithmetic: on a 20-handler hub this writes up to 16 events per message on the default path, re-spending in `message_events` rows a meaningful share of the durable writes the `accepts=` seam exists to recover.
+
+---
+
+## 1502. ADR 0102 defers option (a) to an owner decision that was scheduled separately and never filed
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **1/10** · _fill-in_. Found by an ADR-to-backlog sweep. The ADR records a risk acceptance and builds the optional cross-check; option (a), the one thing that would close completeness, is deferred to the owner. #223 closed on the built half. No open item carries the decision, so it is waiting on nobody.
+> Verdict: owner-ruling
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** DR completeness / risk register. **Priority:** P3. **Verdict:** owner ruling -- schedule it, or accept the residual permanently.
+**Severity:** conditional per CLAUDE.md sec. 0 -- **zero deployments**. It bounds what a first deployment could attest about a restored server-DB store.
+
+**The deferral.** [ADR 0102](adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md) option (a): *"the full engine-driven server-DB store seed -- owner decision, scheduled separately; not started."* The ADR grades it *"strongest (engine-verifiable vintage end to end)"* and states plainly that **only (a) closes completeness**; (b) and (c) leave the residual *"documented, not closed."*
+
+**What did ship.** (b), the optional restore-token vintage cross-check, is built, and (c), the risk acceptance, is recorded. BACKLOG #223 closed on that, verified against `origin/main` 2026-07-28. That closure is correct for what it claims and is not what this row reopens.
+
+**What this row asks for.** One ruling: schedule (a), or accept the residual as permanent and say so in the ADR and the risk-acceptance register. Either answer closes this. What must not persist is a deferral pointed at an owner decision that no artifact ever surfaces.
