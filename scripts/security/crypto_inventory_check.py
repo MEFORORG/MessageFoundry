@@ -401,6 +401,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # path does instead of opening a plaintext socket to a tls=true partner. ssl is imported for the
     # parameter's type and to tell an ssl.SSLError (handshake) from a plain OSError (connect) in the
     # failure message. There is no plaintext retry: that downgrade is what 12.3.1 forbids.
+    # THE TEST TO APPLY AT THE NEXT SITE, because "it only passes a context through" is the argument
+    # that reaches for the escape: does this module DECIDE anything about the crypto, or only carry
+    # inputs to something that does? The SMTP cells carry — `build_smtp_tls_context` decides for all
+    # three, which is why exactly one file is registered for them and the `pipeline/` call sites stay
+    # `ssl`-free. A module holding a conditional that changes verification behaviour is the opposite
+    # case, and taking the escape there manufactures the #1164 state deliberately: not undocumented
+    # but UNSEEN, which is the one state a green cannot report.
     "messagefoundry/transports/base.py": frozenset({"ssl"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).

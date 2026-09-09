@@ -329,7 +329,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    **genuinely-synthetic** box (`data_class != phi`) stays **key-free** only when it declares
    `[security].handles_real_patient_data = false` **explicitly** (a loud, audited opt-out — it is no longer
    the `dev` default). Two further explicit overrides: `[store].require_encryption = true` forces the refusal
-   even for a synthetic instance; `[store].allow_unencrypted_phi = true` is the loud, **audited** opt-out that
+   even for a synthetic instance; `[security].allow_unencrypted_phi = true` is the loud, **audited** opt-out that
    lets a PHI instance start keyless anyway (it still emits the UNENCRYPTED-at-rest warning, and
    `require_encryption` wins over it) — and under **strict enforcement** (`[security].enforcement = enforce`,
    the default) keyless PHI additionally requires the second ack
