@@ -6,7 +6,31 @@
   §"To resolve" leans are taken as the answers: **DB-IN first**; `RawMessage` = `.raw`/`.text`/`.json()`
   (`.xml()` shipped #31); a **callable** summary hook; a small `content_type` **enum**. (Proposed → Accepted
   same day.)
-- **Built:** Nothing here yet. It builds on the **already-shipped** non-HL7 *destinations* (REST/DATABASE/
+- **Built:** BUILT, in the parts named here — §7.1's ingress contract shipped, and so did §7.2's first
+  non-HL7 sources. `ContentType` ([config/models.py](../../messagefoundry/config/models.py)) carries
+  `HL7V2`/`JSON`/`XML`/`TEXT`/`X12`/`FHIR`/`BINARY`/`DICOM`; `content_type` is a field on
+  `InboundConnection` and a parameter of the `inbound(...)` factory
+  ([config/wiring.py](../../messagefoundry/config/wiring.py), coerced by `_coerce_content_type`, with
+  §5's fail-loud `WiringError` when `strict` meets a non-HL7 type). §2's ingress branch and §4's generic
+  store fields are in [pipeline/wiring_runner.py](../../messagefoundry/pipeline/wiring_runner.py), at
+  both `_handle_inbound` and `_handle_inbound_http`. The `hl7v2` path keeps the HL7 peek and optional
+  strict-validate; any other type skips both and commits the body with no HL7 parse — decoded text for
+  the text types, base64-carried through `RawMessage.from_bytes` for the binary ones, per ADR 0028 —
+  with `message_type` = the `content_type` value and a null `control_id`/`summary`. §3's `RawMessage`
+  ([parsing/message.py](../../messagefoundry/parsing/message.py)) exposes
+  `.raw`/`.text`/`.json()`/`.xml()`/`.raw_bytes`/`.binary()`/`.encode()`/`.copy()`, and the 2026-07-17
+  amendment's magic-byte check was hoisted to [parsing/sniff.py](../../messagefoundry/parsing/sniff.py)
+  (`_content_matches_declared`) out of `transports/file.py`, where that amendment placed it;
+  `transports/file.py` re-imports and re-exports it, so the name still resolves there. Both first
+  sources are registered: `DatabaseSource`
+  ([transports/database.py](../../messagefoundry/transports/database.py)) and `HttpSource`
+  ([transports/http_listener.py](../../messagefoundry/transports/http_listener.py), ADR 0023).
+  **NOT BUILT:** §4's optional per-inbound id/summary extractor hook — `control_id` and `summary` stay
+  null on a non-HL7 inbound. *This bullet opened "Nothing here yet." until 2026-09-09. That was true at
+  acceptance (2026-06-12); nobody revised it as the build landed, so the record under-reported what
+  shipped, and the Status line above already contradicted it by recording `.xml()` as shipped. Only the
+  symbols named above were re-verified against the tree — read the rest of this bullet as written in
+  June.* It builds on the **already-shipped** non-HL7 *destinations* (REST/DATABASE/
   SOAP, ADR 0003) and on a reliability core that is **already format-agnostic**: the staged queue +
   ingress/routed/outbound stages and the disposition finalizer
   ([store/store.py](../../messagefoundry/store/store.py) `_maybe_finalize_message`) carry no HL7 coupling

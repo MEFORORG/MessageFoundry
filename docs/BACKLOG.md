@@ -28733,3 +28733,87 @@ ADR 0078's stated residuals were meant to land under ADR 0173, and ADR 0173's on
 **What did ship.** (b), the optional restore-token vintage cross-check, is built, and (c), the risk acceptance, is recorded. BACKLOG #223 closed on that, verified against `origin/main` 2026-07-28. That closure is correct for what it claims and is not what this row reopens.
 
 **What this row asks for.** One ruling: schedule (a), or accept the residual as permanent and say so in the ADR and the risk-acceptance register. Either answer closes this. What must not persist is a deferral pointed at an owner decision that no artifact ever surfaces.
+
+---
+
+## 1503. ADR 0075's AC-1 asserts a batched `mark_done` that does not exist, and cites a test name that does not exist
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **5/10** · Difficulty **3/10** · _fill-in_. Found by an adversarial over-claim hunt across 125 ADR build claims. The record is otherwise honest and the feature is real; the defect is that a counted acceptance criterion names a third hop that was never built, and anchors it to a test that does not exist. Value 5 because a cited-but-absent test reads as MORE verified than no citation at all. Difficulty 3: either build the third hop or correct the criterion, and the ADR's own open items already frame the choice.
+> Verdict: owner-ruling
+> Research: none -- the measurement is in the body
+> Closing-act: code
+
+**Cluster:** ADR record integrity / SQL Server store. **Priority:** P3. **Verdict:** decide batch-or-defer, then make AC-1 match.
+**Severity:** no deployment axis (sec. 0). The shipped batching is correct for the two hops it covers; nothing mis-executes. What is wrong is the record.
+
+**What AC-1 asserts.** [ADR 0075](adr/0075-per-hop-sql-statement-batching.md), inside its counted Acceptance Criteria block: *"WHEN `batch_handoff_statements=true` on a SQL Server store, THE SYSTEM SHALL emit, for each of `route_handoff` / `transform_handoff` / `mark_done`, the identical logical `(sql, params)` sequence as the unbatched path"* -- cited to `tests/test_adr0075_batch_golden_sql.py::test_batched_matches_unbatched_sequence`. The ADR is **Accepted** and the flag is **promoted default-ON**.
+
+**What the tree has.** Two of the three hops.
+
+| Hop | Batched method | Reads the flag |
+|---|---|---|
+| `route_handoff` | `_route_handoff_batched` | yes |
+| `transform_handoff` | `_transform_handoff_batched` | yes |
+| `mark_done` | **none** | **no** |
+
+`store/sqlserver.py` reads `_batch_handoff_statements` in exactly two places, both handoff dispatchers. `mark_done` never reads it, so the third hop is unreachable by construction rather than merely untested.
+
+**The cited test does not exist.** `tests/test_adr0075_batch_golden_sql.py` defines `test_route_batched_matches_unbatched_sequence` and `test_transform_batched_matches_unbatched_sequence`. Neither that file nor `tests/test_adr0075_rt_count_gate.py` contains the string `mark_done`.
+
+**The ADR already knows.** Its own open items carry an **unchecked** box: *"`mark_done` inclusion ... decide whether to batch it in v1 or defer it."* So a counted criterion asserts as delivered the exact thing the same document lists as undecided.
+
+**Scope, stated so nobody over-corrects.** The README index cell says only *"fold a multi-statement handoff BODY"*, which is accurate. The over-claim is in the ADR body, not the index row. The §Evidence round-trip table also prices `mark_done` at 11 to 7/8 round-trips, which the code does not do either.
+
+---
+
+## 1504. ADR 0133 D3 asserts content-triggered alerts are built, but a Handler cannot reach `content_match`
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **5/10** · Difficulty **4/10** · _fill-in_. Found by the same over-claim hunt. Two of the ADR's three capabilities are genuinely wired across all three backends; the third is a method with no reachable caller and no path from the authoring surface. `docs/BACKLOG.md:698` already records the capability as absent, so the ledger and the ADR disagree with each other. Value 5: an operator reading the ADR would plan a Handler they cannot write. Difficulty 4: either export an emitter onto the authoring surface or retract D3.
+> Verdict: owner-ruling
+> Research: none -- the measurement is in the body
+> Closing-act: code
+
+**Cluster:** alerting / ADR record integrity. **Priority:** P3. **Verdict:** build the seam or retract D3.
+**Severity:** no deployment axis (sec. 0). No mis-execution; a documented capability simply is not reachable.
+
+**What is genuinely built.** Do not let this row read as though ADR 0133 failed. D1 and D2 are complete:
+
+- **D1, escalation tiers** -- `EscalationTier` and `AlertRule.escalate` in `config/settings.py`, tier selection and occurrence counting in `pipeline/alert_sinks.py`, persisted monotonically on all three backends with each dialect's own idiom (`MAX` / `GREATEST` / `CASE`) and the DDL plus migration present in `store.py`, `postgres.py` and `sqlserver.py`.
+- **D2, schedule-aware thresholds** -- `AlertRule.schedule` plus the `is_active(now_dt)` gate in `alert_sinks.py`.
+
+**What D3 asserts.** [ADR 0133](adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md) status reads `Accepted (2026-07-18, built)`, and AC-3 is *"WHEN a Handler emits a `content_match`, THE SYSTEM SHALL emit a PHI-free event."* The README index row repeats that a Handler *"emits off the routing hot path"*.
+
+**Why a Handler cannot do that.** `content_match` exists only as `NotifierAlertSink.content_match` in `pipeline/alert_sinks.py`. It is:
+
+1. **absent from the `AlertSink` Protocol** in `pipeline/alerts.py` -- that protocol's methods do not include it;
+2. **absent from `LoggingAlertSink`**;
+3. **not exported** -- `messagefoundry/__init__.py`'s `__all__` carries no alert emitter;
+4. **unreachable from a `@handler`**, which receives only `msg` (`config/wiring.py`).
+
+Zero non-test callers exist in the engine.
+
+**The ledger already says so.** `docs/BACKLOG.md:698` records content-triggered alerting as not delivered. This row exists because the ADR does not, and the ADR is the document a reader trusts for build state.
+
+---
+
+## 1505. ADR 0089 claims a Phase A read-atom row that was never built, and names a `set_segment` the Message API lacks
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **3/10** · _fill-in_. Found by the same over-claim hunt, and one of only two findings in it that were not already written down somewhere in the repo. The bulk of Phase A shipped; the Status line claims the whole of it. Value 3: the affected rows render as opaque code in the Steps view rather than failing, so the cost is a wrong expectation, not a defect. Difficulty 3: either recognise the read atom or narrow the Status line and the Phase A table.
+> Verdict: build
+> Research: none -- the measurement is in the body, and it was measured by running the lens, not by grep
+> Closing-act: code
+
+**Cluster:** Steps view / lens. **Priority:** P3. **Verdict:** narrow the claim, or build the read row.
+**Severity:** no deployment axis (sec. 0). IDE authoring surface only, no engine path, no PHI.
+
+**What the Status line claims.** [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md): *"Phase A (native-idiom recognition) is built and adopted."* Phase A is titled *"native write/**read** atoms"*, and its table lists `x = msg.field("Y")` as a **Read Field to var** row (22 occurrences in its own estate scan) and names `set_segment`.
+
+**What the lens recognises.** `_recognize_native_method` in `messagefoundry/lens.py` handles `msg.set` (set_field), the `msg.set(dst, msg.field(src))` copy form, `msg.delete_segments` / `delete_segment`, plus `msg.add_segment` and `msg.add_repetition` (both tagged ADR 0106, so credited to a later ADR).
+
+**Why the read atom can never reach it.** The recogniser is invoked only inside an `isinstance(s, ast.Expr)` branch, and the comment there says so outright -- *"a mutating method call, so always a bare expression statement, never an assignment."* An assignment is structurally excluded. There is no `read_field` action anywhere in the product.
+
+**Measured, not inferred.** Running `messagefoundry.lens.parse_source` over a handler containing all four forms returns `{"kind": "code"}` for `x = msg.field("PID-5.1")`, while `msg.set`, `msg.delete_segments` and `msg.add_segment` in the same body return editable `action` rows with populated `literal_params`. So the 22 statements the ADR's own scan counted still render as opaque grey code rows.
+
+**`set_segment` does not exist.** `parsing/message.py` has `field` and `add_segment`; there is no `def set_segment` anywhere.
+
+**Scope, stated so nobody over-corrects.** The README index row is **honest** -- it names only `msg.set` / `msg.field`-copy / `msg.delete_segments` and the actions `set_field` / `copy_field` / `delete_segment`. `tests/test_lens_native.py` covers exactly the shipped forms, consistent with there being no read row. The over-claim is internal to the ADR file.
