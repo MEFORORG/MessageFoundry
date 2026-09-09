@@ -5474,6 +5474,14 @@ def create_app(
         successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
         authentication not configured, or one of the two drain conditions below.
 
+        **The ``503`` list above is "at least", not an enumeration, and the difference is load-bearing
+        for anyone reading a `503` off a real deployment.** ``RequestTimeoutMiddleware`` is registered
+        unconditionally on this app and answers ``503`` from OUTSIDE this handler at
+        ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, with a body naming no route. It writes neither a
+        ``cluster_stepdown`` nor a ``cluster_stepdown_denied`` row, so a ``503`` with no audit row of
+        either kind is that one and not either drain condition. Recorded on BACKLOG #1494; the two
+        below are the only ones this handler itself raises.
+
         **The two ``503``s are different answers and must not share a sentence.** An earlier build gave
         both raise sites one body ("could not release leadership; it is still the leader") and one audit
         reason, which was false of each in a different way.
