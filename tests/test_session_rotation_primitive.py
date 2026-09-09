@@ -7,15 +7,17 @@ above it: ``AuthService._rotate_session_token`` and the process-local state ``_r
 must carry with it.
 
 Why this file exists at all. The primitive landed ahead of its call sites — wiring rotation into the
-five in-place elevation sites is the remaining 7.2.4 work, researched under BACKLOG #1146 — so it had
-NO coverage and no caller, and its job is precisely the part that fails *silently*: three in-memory
-maps keyed on the session's token hash, each of which strands differently if it is missed. Untested
-code whose failure mode is silence is worse than absent code, so it is tested here rather than left
-to the wiring commit.
+five in-place elevation sites was the remaining 7.2.4 work, researched under BACKLOG #1146 — so it
+had NO coverage and no caller, and its job is precisely the part that fails *silently*: three
+in-memory maps keyed on the session's token hash, each of which strands differently if it is missed.
+Untested code whose failure mode is silence is worse than absent code, so it was tested here rather
+than left to the wiring commit.
 
-What those five sites do to the caller's token TODAY is measured in
+**That wiring has since landed**, so this file now pins the primitive BENEATH live callers rather
+than ahead of them. What the five sites do to the caller's token is measured in
 ``tests/test_session_token_at_elevation_sites.py``, at the ``identity_for_token`` seam rather than by
-grepping for this primitive's name.
+grepping for this primitive's name — and those assertions were written to invert exactly when the
+wiring arrived, which is what they now record.
 
 Each test names the mutation that must turn it RED.
 """

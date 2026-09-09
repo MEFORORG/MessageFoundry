@@ -41,6 +41,7 @@ from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
+    DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
@@ -50,6 +51,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
     register_source,
+    resolve_poll_ceiling,
 )
 
 __all__ = [
@@ -57,8 +59,8 @@ __all__ = [
     "FileSource",
     "render_filename",
     "DEFAULT_MAX_FILE_BYTES",
+    "DEFAULT_MAX_ITEMS_PER_POLL",
     "LEAVE_SEEN_CACHE_MAX",
-    "DEFAULT_MAX_FILES_PER_POLL",
     # Re-exported from parsing.sniff (ASVS 5.2.2) so remotefile.py + existing tests import them here.
     "_content_matches_declared",
     "_looks_like_hl7",
@@ -72,25 +74,6 @@ _T = TypeVar("_T")
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
 # falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
-
-#: Per-tick ceiling on how many candidate files ONE poll may process (ASVS 2.4.1, BACKLOG #1114).
-#: Before it, `_scan_once` iterated every candidate the glob returned, so one tick's work — memory in
-#: flight, latency to the next `stop()` check, and messages injected into the pipeline — was bounded
-#: only by how many files a partner happened to drop.
-#:
-#: THIS SHIPS ON, and that is not a different appetite for risk from the message-rate pacer that ships
-#: OFF (`mllp.DEFAULT_MAX_MESSAGES_PER_SECOND`, ruled 2026-08-11). It is a different DISPOSITION OF THE
-#: EXCESS. A rate bound on a listen intake makes a sender wait, so a guessed number throttles a real
-#: feed — the reason that one is off. A poll source has no sender to make wait: a partner writes to the
-#: directory and leaves. Over-ceiling files are LEFT WHERE THEY ARE and taken by the next tick, so the
-#: ceiling defers work rather than refusing, dropping or back-pressuring anything, and the
-#: count-and-log invariant is untouched (an unread file was never a received message).
-#:
-#: The number is an order of magnitude above what the pipeline itself drains end-to-end per interface,
-#: so on a healthy feed the pipeline, not this ceiling, is the binding constraint. What a too-low value
-#: costs is LATENCY, not loss: draining a backlog costs one extra poll interval per ceiling's worth of
-#: files. A falsy value (None/0) in settings disables it explicitly, like the byte caps above.
-DEFAULT_MAX_FILES_PER_POLL = 1000
 
 # Cap the leave-in-place (#142) in-memory dedup fast-path so it can't outgrow the durable
 # processed_files ledger's count cap (PROCESSED_FILE_LEDGER_KEEP_MAX in pipeline/wiring_runner.py). It
@@ -402,15 +385,15 @@ class FileSource(SourceConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self.max_file_bytes: int | None = int(mfb) if mfb else None
-        # Per-tick ceiling (ASVS 2.4.1, BACKLOG #1114). Absent -> the shipped default, this module's
-        # ordinary "key absent -> secure default" convention; see DEFAULT_MAX_FILES_PER_POLL for why
-        # this control follows it while the message-rate pacer deliberately does not.
-        mfp = s.get("max_files_per_poll", DEFAULT_MAX_FILES_PER_POLL)
-        self.max_files_per_poll: int | None = int(mfp) if mfp else None
-        #: Whether the LAST tick hit the ceiling — gates a single transition log, so a draining
-        #: backlog reports once at each edge instead of once per poll interval (the `_skipping`
-        #: pattern this class already uses for the leader gate).
-        self._deferring = False
+        # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
+        # poll source may default this on are stated once, in transports/base.py). Caps how many files
+        # ONE scan disposes of; the rest stay in the drop directory and the next scan takes them. A
+        # falsy value (None/0) disables the cap, matching max_file_bytes above.
+        self.poll_max_files: int | None = resolve_poll_ceiling(
+            s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
+            knob="poll_max_files",
+            transport="file source",
+        )
         # Optional inbound decompression (ADR 0123): "gzip" gunzips each file's bytes BEFORE the sniff /
         # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
@@ -558,9 +541,13 @@ class FileSource(SourceConnector):
         newly_recorded = (
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
-        for path in await self._run_fs(self._candidates):
+        candidates = await self._run_fs(self._candidates)
+        disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
+        for position, path in enumerate(candidates):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
+            if self._at_ceiling(disposed, len(candidates) - position):
+                break
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
             # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
@@ -582,6 +569,7 @@ class FileSource(SourceConnector):
                     self.max_file_bytes,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             try:
                 raw = await self._run_fs(path.read_bytes)
@@ -607,6 +595,7 @@ class FileSource(SourceConnector):
                         "file %s failed to gunzip (%s); routing to error dir", path.name, exc
                     )
                     await self._run_fs(self._move, path, self.error_dir)
+                    disposed += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
                 # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
@@ -626,6 +615,7 @@ class FileSource(SourceConnector):
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             try:
                 # The scan hook operates on already-read bytes (it may itself dial an AV/ICAP service),
@@ -642,6 +632,7 @@ class FileSource(SourceConnector):
                     exc,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
+                disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -674,6 +665,7 @@ class FileSource(SourceConnector):
                 logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
                 continue
             await self._run_fs(self._after_processing, path)
+            disposed += 1
             if self.after_read == "leave" and file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
                 # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
@@ -683,6 +675,39 @@ class FileSource(SourceConnector):
             # Bound the ledger's growth (age + count); only when this tick recorded something, so a stable
             # read-only share (nothing new) never churns the store.
             await self.processed_ledger.prune()
+
+    def _at_ceiling(self, disposed: int, remaining: int) -> bool:
+        """True when this scan has spent its per-tick budget (``poll_max_files``) and must stop, leaving
+        ``remaining`` candidates for the next scan.
+
+        **Nothing is dropped.** A file this scan does not reach is still in the drop directory, so the
+        next scan takes it — the same at-least-once deferral a transient read failure already produces.
+        No message was received, so there is no disposition to record and the count-and-log invariant is
+        untouched.
+
+        **What charges the budget, and why the exceptions are not an oversight.** Only a file this scan
+        FINISHED with charges: one handed to the pipeline, or one quarantined to ``.error`` (oversize,
+        a failed gunzip, a content-vs-type mismatch, a scanner rejection). Each of those leaves the
+        candidate set, so the next scan starts on new work. The arms that leave a file **in place** to be
+        retried — a locked/vanished file, a malfunctioning scan hook, a handler failure — deliberately do
+        NOT charge. If they did, a permanently stuck file that sorts early would eat the whole budget on
+        every scan and the healthy files behind it would never be ingested. A budget can only be charged
+        by something that makes progress.
+
+        This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
+        directory, because picking the first N in name/mtime order requires seeing all of them. The
+        per-file cost the ceiling removes is the read, the scan hook, the pipeline hand-off and the
+        durable commit — not the stat."""
+        if self.poll_max_files is None or disposed < self.poll_max_files:
+            return False
+        logger.info(
+            "file source %s reached poll_max_files (%s) this scan; %d candidate(s) left for the next "
+            "poll (deferred, not dropped)",
+            self.directory,
+            self.poll_max_files,
+            remaining,
+        )
+        return True
 
     def _file_key(self, path: Path) -> str:
         """A stable, HASHED identity for a source file, for the leave-in-place dedup ledger (#142).
@@ -803,7 +828,21 @@ class FileSource(SourceConnector):
             return False  # vanished/locked — let the read path handle it
 
     def _candidates(self) -> list[Path]:
-        """Files ready to process, honoring recursion, min-age, and sort order."""
+        """Files ready to process, honoring recursion, min-age, and sort order.
+
+        **The per-tick ceiling bounds the INGEST, not this listing, and the asymmetry is real rather
+        than an oversight.** Selecting the first N in name or mtime order requires knowing the whole
+        candidate set, so the glob and the per-candidate screens below are paid every tick regardless
+        of the ceiling. In steady state that is unchanged from before the ceiling existed. Draining a
+        LARGE backlog is where it bites: the ceiling turns one expensive tick into many, so this
+        listing is now paid once per tick over a shrinking set instead of once in total.
+
+        Bounding it properly is a separate change and a real one -- deferring ``is_file`` and
+        ``_within_root`` into the scan loop so they are paid only for candidates actually reached,
+        which is available under ``sort="name"`` because that key needs no syscall, and not under
+        ``sort="mtime"`` because the key IS the syscall. It also costs the accurate ``remaining``
+        count the ceiling's log line carries. Not folded in here: it changes what the screens mean
+        for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
         try:
             matched = list(globber(self.pattern))
@@ -822,48 +861,24 @@ class FileSource(SourceConnector):
             and self.error_dir not in p.parents
             and self._within_root(p)
         ]
-        if self.min_age_seconds > 0:
-            cutoff = time.time() - self.min_age_seconds
-            files = [p for p in files if _mtime(p) <= cutoff]  # skip files still being written
+        # Decorate-sort-undecorate under `sort="mtime"`: the min-age filter and the sort key are the
+        # SAME stat, and reading it twice per candidate doubled the syscalls on the one path that
+        # already pays the most. That cost is charged on every tick, and the per-tick ceiling means a
+        # backlog is now drained over many ticks rather than one, so a redundant stat is multiplied
+        # by the number of ticks it takes to drain. Under `sort="name"` the key is pure and no stat
+        # is needed at all.
         if self.sort == "mtime":
-            files.sort(key=_mtime)
-        else:
-            files.sort(key=lambda p: p.name)
-        return self._within_tick_ceiling(files)
-
-    def _within_tick_ceiling(self, files: list[Path]) -> list[Path]:
-        """Cut the candidate list to ``max_files_per_poll`` (ASVS 2.4.1, BACKLOG #1114).
-
-        SORT THEN CUT, which is why this runs at the end of :meth:`_candidates` and not earlier: the
-        ceiling must take the first N **in the configured order** (oldest-first under ``sort="mtime"``,
-        name order otherwise). Cutting before the sort would take an arbitrary subset of the glob and
-        silently reorder a feed that asked for oldest-first.
-
-        Deferral is not a drop. The remainder stays in the directory untouched and the next tick takes
-        it, so nothing is refused and no message goes unaccounted for — an unread file never became a
-        received message. Logged once at each edge, with COUNTS ONLY: a filename can carry an MRN, so
-        this source never logs one at INFO or above.
-        """
-        if self.max_files_per_poll is None or len(files) <= self.max_files_per_poll:
-            if self._deferring:
-                self._deferring = False
-                logger.info(
-                    "file source %s is no longer deferring: the backlog now fits one poll",
-                    self.directory,
-                )
-            return files
-        if not self._deferring:
-            self._deferring = True
-            logger.info(
-                "file source %s found %d ready files, over max_files_per_poll (%d); taking the "
-                "first %d in %s order and leaving the rest for the next poll (nothing is dropped)",
-                self.directory,
-                len(files),
-                self.max_files_per_poll,
-                self.max_files_per_poll,
-                self.sort,
-            )
-        return files[: self.max_files_per_poll]
+            cutoff = time.time() - self.min_age_seconds if self.min_age_seconds > 0 else None
+            dated = [(_mtime(p), p) for p in files]
+            if cutoff is not None:
+                dated = [pair for pair in dated if pair[0] <= cutoff]  # still being written
+            dated.sort(key=lambda pair: pair[0])
+            return [p for _, p in dated]
+        if self.min_age_seconds > 0:
+            cutoff_name = time.time() - self.min_age_seconds
+            files = [p for p in files if _mtime(p) <= cutoff_name]  # skip files still being written
+        files.sort(key=lambda p: p.name)
+        return files
 
     def _within_root(self, path: Path) -> bool:
         """True if ``path`` resolves inside the configured watch root.

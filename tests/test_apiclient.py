@@ -517,9 +517,10 @@ def test_the_plaintext_escape_refuses_every_credential(
 
 
 def test_a_token_copied_past_the_entry_points_still_cannot_cross() -> None:
-    """``for_polling`` assigns ``poll._token`` DIRECTLY, so a clamp that lived only on ``set_token``
-    would hold by accident rather than by construction. ``_request`` re-checks, so any future path
-    that sets the attribute without going through an entry point is covered too.
+    """A clamp that lived only on ``set_token`` would hold by accident rather than by construction.
+    ``_request`` re-checks, so any path that writes the token without going through an entry point is
+    covered too — ``_adopt_rotated`` (ASVS 7.2.4) is exactly such a path, and it writes through the
+    shared cell rather than the entry points.
 
     Mutation: delete the token branch in ``_request``. Red: the Authorization header goes out over
     plaintext http to a non-loopback host."""
@@ -565,3 +566,42 @@ def test_the_remote_plaintext_refusal_no_longer_advertises_the_escape_as_a_fix()
     assert "carries no credential" in message, (
         "the refusal must state what the escape now cannot do"
     )
+
+
+# --- ASVS 7.2.4: a rotation must reach the background poll clients -----------
+
+
+def test_a_rotation_reaches_a_poll_client_cloned_before_it() -> None:
+    """RED when: for_polling goes back to COPYING the token instead of sharing the cell.
+
+    The console clones a poll client once, at start-up, and then re-authenticates over the life of
+    the session. With a copied token every elevation would strand that clone on a retired bearer and
+    every background read on it would 401 -- silently, because the poll client has no handlers and
+    the main-thread client would carry on working.
+    """
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "before-rotation"
+        poll = client.for_polling()  # cloned BEFORE the rotation, as the console does
+        assert poll.token == "before-rotation"
+
+        client._token = "after-rotation"  # what _adopt_rotated does on an elevation response
+        assert poll.token == "after-rotation", "the rotation did not reach the poll clone"
+    finally:
+        client.close()
+
+
+def test_a_poll_client_never_writes_the_shared_token() -> None:
+    """RED when: a background read path starts assigning the token.
+
+    The cell is shared, so a writer on a worker thread would now reach the main-thread client too.
+    Sharing is only safe while the primary stays the sole writer -- this pins the direction, and is
+    the reason for_polling still installs no step-up/MFA handlers.
+    """
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "primary"
+        poll = client.for_polling()
+        assert poll._step_up_handler is None and poll._mfa_handler is None
+    finally:
+        client.close()

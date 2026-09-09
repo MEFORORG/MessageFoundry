@@ -93,12 +93,21 @@ async def _login(c: httpx.AsyncClient, username: str, password: str = PW, provid
 
 async def _reauth(
     c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
-) -> httpx.Response:
-    """POST /me/reauth; ``purpose`` mints the single-use per-action grant (ADR 0077)."""
+) -> tuple[httpx.Response, str]:
+    """POST /me/reauth; ``purpose`` mints the single-use per-action grant (ADR 0077).
+
+    Returns ``(response, the token to use next)``: a successful re-auth re-keys the session
+    (ASVS 7.2.4), so the caller must adopt the new bearer or every later request 401s. A refusal
+    rotates nothing and hands the incoming token back."""
     body: dict[str, str] = {"password": password}
     if purpose is not None:
         body["purpose"] = purpose
-    return await c.post("/me/reauth", json=body, headers=_auth(token))
+    r = await c.post("/me/reauth", json=body, headers=_auth(token))
+    if r.status_code != 200:
+        return r, token
+    fresh = r.json().get("token")
+    assert isinstance(fresh, str) and fresh, "an elevation route returned no rotated token"
+    return r, fresh
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -204,17 +213,16 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
 
         # The account is NOT bricked: enrollment rides require_reauth_only_action, which opts out of
         # the access gate, so the escape path is reachable from the pending session itself.
-        assert (
-            await _reauth(c, tok, purpose="mfa_enroll", password="a-rotated-passphrase-99")
-        ).status_code == 200
+        r, tok = await _reauth(c, tok, purpose="mfa_enroll", password="a-rotated-passphrase-99")
+        assert r.status_code == 200
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
-        assert (
-            await _reauth(c, tok, purpose="mfa_confirm", password="a-rotated-passphrase-99")
-        ).status_code == 200
+        r, tok = await _reauth(c, tok, purpose="mfa_confirm", password="a-rotated-passphrase-99")
+        assert r.status_code == 200
         confirmed = await c.post(
             "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
         )
         assert confirmed.status_code == 200
+        tok = str(confirmed.json()["token"])  # the confirm re-keyed the session (ASVS 7.2.4)
         # Confirming satisfies THIS session's factor, so the estate is reachable again.
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
 

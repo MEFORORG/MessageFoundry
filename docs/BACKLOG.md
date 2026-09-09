@@ -10059,6 +10059,43 @@ A recycled name inside one directory is **not** cross-IdP spoofing, so a 6.8.1 r
 
 **NOT built: the rotation wiring, and the reason is that no site is free.** Every elevation happens on an already-live session whose token the client is holding, so rotating anywhere requires the new token to reach that client in the same response -- which is the breaking token-delivery contract, the apiclient token-adoption work and the console cookie re-set, all of which this item already lists as separate proposed work. There is no cheapest-site increment that is honest on its own: the one arm that needs no delivery is `POST /me/password`, and it needs no rotation either because `change_password` revokes everything. So the residual is unchanged from the paragraph above, minus the citation repair and minus the behavioural suite. **The cell should not move on this commit** -- a suite that pins the gap is not the gap closed.
 
+**THE PARAGRAPH ABOVE IS SUPERSEDED AND ITS REASONING WAS SOUND WHEN WRITTEN.** It concluded that no site was free because rotating anywhere requires the new token to reach the client in the same response -- the token-delivery contract, the apiclient adoption and the console cookie re-set. That is correct, and it is why the build below did all of them together rather than looking for a cheapest site. The suite it left in current-state polarity is what the wiring inverted, exactly as its own docstring said it should.
+
+**BUILT 2026-09-06: rotation wired at ALL FIVE elevation sites. The item stays OPEN** -- the
+closing act is a scorecard re-score, which no builder performs.
+
+**Not the cheap subset, deliberately.** This row warns that the 2026-07-25 owner ruling names two JSON
+routes and that building precisely those would look like building to the owner's own words while
+leaving `confirm_mfa_enrollment`, `finish_webauthn_registration` and `finish_webauthn_assertion`
+un-rotated -- and that for `POST /ui/mfa` the passkey assertion is the ONLY leg. All five are wired.
+
+**The ordering invariant lives in ONE place.** A private `_elevated()` is the sole caller of
+`_rotate_session_token`, so the rule that every rowcount-blind stamp must land BEFORE the rotation is
+stated once rather than in nine route handlers. Both site-specific traps are handled: `reauth` decides
+`_factor_binding_is_blocked` before the rotation and mints its grant after, against the new hash;
+`verify_mfa`'s three-write group lands first. A rotation on a vanished session reports `session_lost`,
+which the routes map to 401 rather than the 403 a wrong proof gets -- a correct password must not be
+reported as incorrect because the session died mid-ceremony.
+
+**The pass rests on BEHAVIOUR, not on the marker**, exactly as this row requires: the cell's absence
+claim keys on the primitive's own call pattern, so wiring it for effect would flip the marker and
+change nothing. `tests/test_session_rotation_wiring.py` asserts a pre-elevation token stops
+authenticating at the moment of elevation, one case per site, with a mutation-checked negative control
+(making `reauth` rotate unconditionally reds it and nothing else).
+
+**The WebSocket question this row asks is answered and recorded in code.** A rotation would drop an
+open `/ws/stats` socket at the next revalidation tick, which is fail-closed and correct; `app.js`
+resumes the HTTP poll carrying the new cookie, so completing MFA would cost the live push for the rest
+of that page's life. A liveness regression, not correctness or data loss -- which is why the bounded
+reconnect is deferred rather than built.
+
+**Also repaired, as this row asks:** the test file's citation of a backlog number that cannot resolve
+from a public checkout now names the subject instead.
+
+**Still unbuilt, named by subject:** the IDE sign-in supersession; login supersession on the three
+console cookie-minting legs and written rationales for both bearer login legs; the console
+self-session revoke identifier; and the bounded console WebSocket reconnect.
+
 ## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. disable_mfa still offers and revokes nothing, and the post-disable redirect still lands on a page whose only relation to session termination is a link, so the option remains adjacent to the ceremony rather than part of it. The capability ships and is one click away, which caps value; difficulty 4 covers research plus a uniform ceremony across five factor-change paths without cutting the caller's own session mid-flow. _(was 5/10 · 4/10.)_

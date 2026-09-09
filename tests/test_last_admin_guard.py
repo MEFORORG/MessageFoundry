@@ -68,16 +68,20 @@ async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> tuple[di
     return h, my_id
 
 
-async def _reauth_update(c: httpx.AsyncClient, h: dict[str, str]) -> None:
+async def _reauth_update(c: httpx.AsyncClient, h: dict[str, str]) -> dict[str, str]:
     """7.5.1: PATCH /users/{id} is action-bound — mint a fresh single-use admin_user_update grant
     (single-use, so re-mint before each PATCH). The acting admin's password was rotated in
-    ``_admin_session``."""
+    ``_admin_session``.
+
+    Returns the REFRESHED header: the re-auth re-keys the session (ASVS 7.2.4), so the bearer the
+    caller passed in is dead on return and every later request has to carry the new one."""
     r = await c.post(
         "/me/reauth",
         headers=h,
         json={"password": "a-rotated-passphrase-99", "purpose": "admin_user_update"},
     )
     assert r.status_code == 200, r.text
+    return _auth(str(r.json()["token"]))
 
 
 async def _create_user(c: httpx.AsyncClient, h: dict[str, str], username: str, role: str) -> str:
@@ -97,12 +101,12 @@ async def test_non_last_admin_can_be_disabled_and_deleted(engine: Engine) -> Non
         h, _ = await _admin_session(c, service)
         root2 = await _create_user(c, h, "root2", "administrator")
         # disable one of two admins → allowed (one remains)
-        await _reauth_update(c, h)
+        h = await _reauth_update(c, h)
         assert (
             await c.patch(f"/users/{root2}", headers=h, json={"disabled": True})
         ).status_code == 200
         # re-enable and delete it → allowed (DELETE is window-gated, not action-bound)
-        await _reauth_update(c, h)
+        h = await _reauth_update(c, h)
         assert (
             await c.patch(f"/users/{root2}", headers=h, json={"disabled": False})
         ).status_code == 200
@@ -116,7 +120,7 @@ async def test_non_admin_can_always_be_disabled_and_deleted(engine: Engine) -> N
     async with _client(engine, service) as c:
         h, _ = await _admin_session(c, service)
         viewer = await _create_user(c, h, "viewer1", "viewer")
-        await _reauth_update(c, h)
+        h = await _reauth_update(c, h)
         assert (
             await c.patch(f"/users/{viewer}", headers=h, json={"disabled": True})
         ).status_code == 200
@@ -159,7 +163,7 @@ async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) 
         # Self-guard precedes the last-admin guard on both routes (acting admin == sole admin). PATCH
         # is action-bound (7.5.1), so mint the grant first — the self-guard 400 lives in the body,
         # behind the step-up dep the grant satisfies.
-        await _reauth_update(c, h)
+        h = await _reauth_update(c, h)
         r_disable = await c.patch(f"/users/{my_id}", headers=h, json={"disabled": True})
         assert r_disable.status_code == 400
         assert "your own account" in r_disable.json()["detail"]
@@ -170,7 +174,7 @@ async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) 
         # predicate the guard keys on returns True for it (and the second is no longer protected).
         root2 = await _create_user(c, h, "root2", "administrator")
         assert await service.is_last_enabled_admin(my_id) is False
-        await _reauth_update(c, h)
+        h = await _reauth_update(c, h)
         assert (
             await c.patch(f"/users/{root2}", headers=h, json={"disabled": True})
         ).status_code == 200

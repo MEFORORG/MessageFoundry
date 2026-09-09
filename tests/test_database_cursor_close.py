@@ -44,6 +44,11 @@ class _FakeCursor:
     async def fetchall(self) -> list[Any]:
         return []
 
+    async def fetchmany(self, _size: int) -> list[Any]:
+        # The poll path fetches through here whenever `poll_max_rows` is on, which is the shipped
+        # default; the close-before-release invariant has to hold on the path the engine takes.
+        return []
+
     async def close(self) -> None:
         self._log.append(f"close:{self._tag}")
 
@@ -95,6 +100,7 @@ async def test_source_select_closes_its_cursor_before_release() -> None:
     src._get_pool = lambda: _pool_coro(pool)  # type: ignore[method-assign,assignment]
     src._acquire_timeout = 5.0  # type: ignore[attr-defined]
     src._poll_sql = "SELECT 1"  # type: ignore[attr-defined]
+    src._poll_max_rows = db.DEFAULT_MAX_ITEMS_PER_POLL  # type: ignore[attr-defined]
 
     await src._select()
     assert "close:select" in log, f"the poll cursor was never closed; log={log}"

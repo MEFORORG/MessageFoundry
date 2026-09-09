@@ -1470,12 +1470,26 @@ session alive. `[auth].max_sessions_per_user` caps concurrent sessions (default 
 the cap revokes the user's oldest — ASVS 7.1.2; `0` = unlimited). Clients send the token as
 `Authorization: Bearer <token>` (the WebSocket prefers the header; the legacy `?token=` query param is
 deprecated because it leaks into proxy/access logs). The token is a **PHI-scoped** credential (the
-user's full RBAC for the session lifetime): the web console holds it in the browser session and the
-`apiclient` (test harness / automation) keeps it in memory, each re-validating it against `/auth/me`
-before use (discarding a stale/revoked one); `apiclient` also **refuses to send credentials over
-plaintext `http` to a non-loopback host** (no TLS yet) unless explicitly run with `--insecure` for
-trusted-network dev. (The retired PySide6 desktop console's OS-keyring token cache is an accepted
-retirement loss — BACKLOG #103.)
+user's full RBAC for the session lifetime), so where each client keeps it matters. **At least** these
+three shipped clients hold one:
+
+| Client | Where the token lives | Outlives the process that got it? |
+|---|---|---|
+| Web console | the browser session | no |
+| `apiclient` (test harness / automation) | process memory | no |
+| VS Code extension (`ide/src/auth.ts`) | VS Code **SecretStorage**, keyed by engine URL | **yes** |
+
+The console and `apiclient` each re-validate against `/auth/me` before use, discarding a stale or
+revoked token; `apiclient` also **refuses to send credentials over plaintext `http` to a non-loopback
+host** (no TLS yet) unless explicitly run with `--insecure` for trusted-network dev. The extension is
+the one holder that puts the credential in **durable, OS-managed** storage. It persists across VS Code
+restarts, so on a deploying site the token would outlive the editor window that acquired it and stay
+usable until the session's own idle or absolute timeout retires it server-side. The extension clears
+its copy on sign-out (revoking the session on the engine first, where the engine is reachable) and on
+a 401 from a request that carried the token; a background timer never clears it, because a request the
+session took no part in is not evidence about the session. (The retired PySide6 desktop console's
+OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
+durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
 
 ### Directory session reconciliation — propagating an AD disable (ADR 0079 mechanism 2)
 
@@ -1528,15 +1542,24 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   flagged). The session `id` is the session's `token_hash` (a one-way hash of the opaque token, safe to
   expose).
 - **`DELETE /me/sessions/{id}`** — revoke one of **your own** sessions (ownership-checked: another
-  user's id returns 404, never revealing or touching it).
+  user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
+  to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
+  already hold does not unlock a terminate, and the grant is single-use.
 - **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
+  Same `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
+The two self-service terminates are **password-only** step-ups deliberately: a second-factor gate
+would deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
-revoke + "sign out everywhere else" (the current session is shown but only revocable via *Sign out*),
-and the **Users** page has a **Revoke sessions** action for admin force-sign-out.
+revoke + "sign out everywhere else". The console renders **no Revoke button on the current session**,
+so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is
+a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks ownership only, so it
+accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
+sessions** action for admin force-sign-out.
 
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 

@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -92,7 +92,7 @@ from messagefoundry.store.store import (
     ResendOutcome,
 )
 
-__all__ = ["Engine", "ConfigReloadDenied"]
+__all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +103,46 @@ class ConfigReloadDenied(Exception):
     The API maps this to 403. Because the loader executes Python from the target directory, a
     reload may only load from the server's startup ``--config`` dir or an explicitly configured
     ``config_reload_roots`` entry — never an arbitrary client-supplied path."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReloadStepFailure:
+    """One named step of a config reload that did not complete, with a PHI-free reason.
+
+    ``step`` is a stable machine-readable label (``config_fingerprint``, ``reference_sync``,
+    ``cluster_propagate``); ``detail`` is a :func:`~messagefoundry.redaction.safe_exc` rendering, so
+    it carries the exception type and a redacted message and never a message body."""
+
+    step: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReloadOutcome:
+    """What a :meth:`Engine.reload_detail` call actually did, so the report matches the engine.
+
+    Three situations a caller must be able to tell apart, because they call for different operator
+    action:
+
+    * **The reload did not happen.** The call RAISES (``ConfigReloadDenied``, ``FileNotFoundError``,
+      ``WiringError``, or a connector build failure) and returns no outcome at all. The previously
+      live graph is untouched, so the operator fixes the config and retries.
+    * **The reload happened cleanly.** ``applied`` is True and ``failures`` is empty.
+    * **The reload happened and a follow-on step failed.** ``applied`` is True and ``failures``
+      names each step. The NEW graph is live. Reporting outright failure here would describe an
+      engine that does not exist, and reporting plain success would hide a step an operator has to
+      go finish by hand -- so the partial outcome is its own answer (ASVS 2.3.3, BACKLOG #1111).
+
+    A dry run applies nothing, so it reports ``applied`` False with no failures."""
+
+    registry: Registry
+    applied: bool
+    failures: tuple[ReloadStepFailure, ...] = ()
+
+    @property
+    def degraded(self) -> bool:
+        """True when the graph swapped but at least one follow-on step did not complete."""
+        return self.applied and bool(self.failures)
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -1508,7 +1548,28 @@ class Engine:
         dry_run: bool = False,
         propagate: bool = False,
     ) -> Registry:
+        """The graph now live -- or, for a dry run, the graph that *would* go live.
+
+        A thin projection of :meth:`reload_detail` for callers that only need the Registry. It
+        DISCARDS the partial-outcome report, so a clean apply and an apply whose follow-on step
+        failed both come back as a plain return here. A caller that has to tell those apart --
+        anything that reports the result to an operator -- calls :meth:`reload_detail` instead."""
+        outcome = await self.reload_detail(config_dir, dry_run=dry_run, propagate=propagate)
+        return outcome.registry
+
+    async def reload_detail(
+        self,
+        config_dir: str | Path | None = None,
+        *,
+        dry_run: bool = False,
+        propagate: bool = False,
+    ) -> ReloadOutcome:
         """Load the code-first graph from ``config_dir`` and apply it to the running engine.
+
+        Returns a :class:`ReloadOutcome` saying what actually happened: whether the graph swapped,
+        and which follow-on steps did not complete. Read that class for the three situations a
+        caller must tell apart; the short version is that a raise means nothing was applied and a
+        return with a non-empty ``failures`` means the new graph IS live.
 
         ``config_dir`` defaults to the server's startup ``--config`` dir. Any explicit value must
         resolve **within** an allowed reload root (the startup dir + ``config_reload_roots``);
@@ -1518,7 +1579,13 @@ class Engine:
 
         Validates first (a bad config raises before anything is swapped, so the running graph is
         left untouched), then atomically swaps via the runner's quiesce-and-swap reload. If the
-        engine was started without a graph, this loads and starts one. Returns the new Registry.
+        engine was started without a graph, this loads and starts one.
+
+        Everything that CAN be done before the swap is done before the swap, because a step that
+        raises there fails honestly: nothing was applied. Only two steps cannot move -- reference-set
+        reconciliation reads its specs off the LIVE registry, and the cluster version bump announces
+        a config this node has already taken -- so those two run after the swap and report as
+        ``failures`` rather than as a failed reload.
 
         ``dry_run`` performs the full validation **against this instance's environment** — it loads
         the graph and build-checks every connector, which resolves the graph's ``env()`` references
@@ -1536,8 +1603,10 @@ class Engine:
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
         (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value) — the
-        caller maps these to HTTP errors.
+        caller maps these to HTTP errors. Every one of them is raised BEFORE the swap, so a raise
+        from this method always means the live graph is the one that was already running.
         """
+        failures: list[ReloadStepFailure] = []
         path = self._resolve_reload_target(config_dir)
         self.last_reload_dir = path
         if not path.is_dir():
@@ -1608,7 +1677,26 @@ class Engine:
                 coordinator=self._coordinator,
             )
             checker.build_check(registry)
-            return registry
+            return ReloadOutcome(registry=registry, applied=False)
+        # ADR 0041 D1 (config provenance, item C): fingerprint the bundle BEFORE the swap. The digest
+        # is a pure, offline fold over the directory's file BYTES (config/fingerprint.py). It never
+        # reads the live graph, so computing it here is meaning-preserving, and it narrows the window
+        # between the bytes load_config just read and the bytes attributed to this reload. Doing it
+        # here also means a failure the OSError guard never covered (an ImportError on the local
+        # import, say) aborts the reload while the OLD graph is still live, instead of surfacing as a
+        # failed reload with the NEW graph already serving. The value is ASSIGNED only after the swap.
+        fingerprint: dict[str, object] | None
+        try:
+            from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+            fingerprint = await asyncio.to_thread(config_fingerprint_detail, path)
+        except OSError as exc:
+            # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing
+            # an otherwise-applicable config. Recorded as a step failure so the caller is not told the
+            # reload was clean when GET /config/provenance will report nothing.
+            log.warning("config fingerprint before reload failed for %s: %s", path, exc)
+            fingerprint = None
+            failures.append(ReloadStepFailure("config_fingerprint", safe_exc(exc)))
         if runner is None:
             runner = self.add_registry(registry)
             try:
@@ -1621,31 +1709,53 @@ class Engine:
                 raise
         else:
             await runner.reload(registry)
+        # ---- THE NEW GRAPH IS LIVE FROM HERE (BACKLOG #1111, ASVS 2.3.3) --------------------------
+        # Nothing below can put the old graph back: the runner owns the new registry and the old one
+        # is gone, and the swap is not a store transaction that could roll back. So a failure below is
+        # reported as a PARTIAL outcome, never as a failed reload. Telling the caller the reload
+        # failed while the new graph serves traffic would be a false report, and reporting plain
+        # success would hide a step an operator still has to finish by hand.
+        # Provenance is now the NEW bundle's (the digest was taken above, before the swap).
+        self.loaded_config_fingerprint = fingerprint
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
-        await self._reconcile_reference_sync(startup=False)
-        # ADR 0041 D1 (config provenance, item C): remember the fingerprint + git commit of the graph
-        # now live, so GET /config/provenance can report the running commit and detect on-disk DRIFT.
-        # Best-effort + off the event loop (like load_config); a failure leaves provenance unknown
-        # rather than failing an otherwise-successful reload.
+        # CANNOT move before the swap: the runner reads its specs LIVE off _registry_runner.registry
+        # (see _make_reference_runner), so pre-swap it would materialize the OLD graph's sets and a
+        # reload that ADDS a set would leave it unarmed.
         try:
-            from messagefoundry.config.fingerprint import config_fingerprint_detail
-
-            self.loaded_config_fingerprint = await asyncio.to_thread(
-                config_fingerprint_detail, path
-            )
-        except OSError as exc:
-            log.warning("config fingerprint after reload failed for %s: %s", path, exc)
-            self.loaded_config_fingerprint = None
+            await self._reconcile_reference_sync(startup=False)
+        except Exception as exc:
+            # Broad on purpose: this reaches a reference source (network/DB) and the coordinator, so
+            # the failure surface is open-ended. Logged and reported, never swallowed. Per-set source
+            # failures are already isolated inside sync_all (last-good kept); what lands here is the
+            # arm/converge machinery, which leaves the sets stale but the graph correct.
+            log.warning("reference sync after reload failed for %s: %s", path, safe_exc(exc))
+            failures.append(ReloadStepFailure("reference_sync", safe_exc(exc)))
         # Config-reload convergence (Track B Step 6): only the OPERATOR-initiated path propagates. Bump
         # the shared version so other nodes converge, and advance THIS node's applied version to the new
         # value so its own convergence loop sees no change (feedback-avoidance — the initiator does not
         # re-reload). A no-op on single-node (is_clustered() False). The per-node convergence reload
         # passes propagate=False and so never bumps (it would otherwise make nodes chase each other).
+        # CANNOT move before the swap either: the bump TELLS every other node to converge, so bumping
+        # first would announce a config this node had not applied, and a swap that then failed would
+        # leave the cluster converging on a graph the initiator never took.
         if propagate and self._coordinator.is_clustered():
-            self._applied_config_version = await self._coordinator.bump_config_version()
-        return registry
+            try:
+                self._applied_config_version = await self._coordinator.bump_config_version()
+            except Exception as exc:
+                # This node IS running the new graph; only the cluster-wide announcement is missing, so
+                # the other nodes stay on the old config until the next bump or an operator reload
+                # there. That is a partial apply across the cluster, not a failed one here.
+                log.warning("cluster config-version bump after reload failed: %s", safe_exc(exc))
+                failures.append(ReloadStepFailure("cluster_propagate", safe_exc(exc)))
+        if failures:
+            log.warning(
+                "config reload APPLIED with %d incomplete follow-on step(s): %s",
+                len(failures),
+                ", ".join(f.step for f in failures),
+            )
+        return ReloadOutcome(registry=registry, applied=True, failures=tuple(failures))
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
         """Resolve the reload target and enforce the allow-list (see :class:`ConfigReloadDenied`)."""

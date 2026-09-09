@@ -627,6 +627,7 @@ class _SrcCursor:
         self._rows = rows
         self._poll_exc = poll_exc
         self._mark_exc = mark_exc
+        self._position = 0  # DB-API cursor position, so fetchmany/fetchall consume the same set
         self.marks: list[tuple[str, tuple[Any, ...]]] = []
 
     async def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
@@ -639,7 +640,19 @@ class _SrcCursor:
                 raise self._mark_exc
 
     async def fetchall(self) -> list[tuple[Any, ...]]:
-        return list(self._rows)
+        rows = self._rows[self._position :]
+        self._position = len(self._rows)
+        return list(rows)
+
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        """DB-API 2.0 ``fetchmany``: at most ``size`` rows from the current position, advancing it.
+
+        The source's poll path fetches through here whenever ``poll_max_rows`` is on (the shipped
+        default), so a fake carrying only ``fetchall`` would model a cursor the connector no longer
+        uses."""
+        rows = self._rows[self._position : self._position + size]
+        self._position += len(rows)
+        return list(rows)
 
 
 class _SrcConn:

@@ -15,7 +15,18 @@ Submodules:
 
 from __future__ import annotations
 
-from messagefoundry.pipeline.engine import ConfigReloadDenied, Engine
+from messagefoundry.pipeline.engine import (
+    ConfigReloadDenied,
+    Engine,
+    ReloadOutcome,
+    ReloadStepFailure,
+)
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
-__all__ = ["Engine", "ConfigReloadDenied", "RegistryRunner"]
+__all__ = [
+    "Engine",
+    "ConfigReloadDenied",
+    "RegistryRunner",
+    "ReloadOutcome",
+    "ReloadStepFailure",
+]

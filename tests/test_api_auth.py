@@ -101,14 +101,30 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _rotated(response: httpx.Response, token: str) -> str:
+    """The bearer to use AFTER an elevation call (ASVS 7.2.4).
+
+    A successful elevation re-keys the session and returns the new token in the body, so every later
+    request has to carry it -- keeping the old one would 401 and quietly turn a real assertion into a
+    test of an expired token. A refusal rotates nothing and the incoming token is handed back."""
+    if response.status_code != 200:
+        return token
+    fresh = response.json().get("token")
+    assert isinstance(fresh, str) and fresh, "an elevation route returned no rotated token"
+    return fresh
+
+
 async def _reauth(
     c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
-) -> httpx.Response:
-    """POST /me/reauth. ADR 0077: pass ``purpose`` to mint a single-use grant bound to that action."""
+) -> tuple[httpx.Response, str]:
+    """POST /me/reauth. ADR 0077: pass ``purpose`` to mint a single-use grant bound to that action.
+
+    Returns ``(response, the token to use next)`` -- see :func:`_rotated`."""
     body: dict[str, str] = {"password": password}
     if purpose is not None:
         body["purpose"] = purpose
-    return await c.post("/me/reauth", json=body, headers=_auth(token))
+    r = await c.post("/me/reauth", json=body, headers=_auth(token))
+    return r, _rotated(r, token)
 
 
 async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) -> None:
@@ -174,7 +190,8 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
 
         # ADR 0077: enrollment binds to a fresh per-action proof, NOT the login window — a per-action
         # reauth unlocks each step (enroll, then confirm) exactly once (single-use).
-        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert _r.status_code == 200
         r = await c.post("/me/mfa/enroll", headers=_auth(tok))
         assert r.status_code == 200
         secret = r.json()["secret"]
@@ -183,13 +200,15 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
         # clock so the activating confirm code and the later /auth/mfa-verify code sit in distinct steps
         # (enrollment now consumes the activating step, BACKLOG #1021). The in-process ASGI server
         # shares this totp module, so the pin covers its server-side verify too.
-        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        assert _r.status_code == 200
         t0 = 1_000_000.0
         pin_totp_clock(monkeypatch, t0)
         r = await c.post(
             "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
         )
         assert r.status_code == 200 and len(r.json()["recovery_codes"]) == 10
+        tok = _rotated(r, tok)  # the confirm re-keyed the session (ASVS 7.2.4)
         st = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert st["enabled"] is True and st["required"] is True
 
@@ -208,6 +227,7 @@ async def test_mfa_enroll_confirm_and_step_up_gate(
             "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok2)
         )
         assert r.status_code == 200
+        tok2 = _rotated(r, tok2)  # the verify re-keyed the session (ASVS 7.2.4)
         # Now it passes (password step-up satisfied at login; MFA now satisfied).
         r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
         assert r.status_code == 200
@@ -220,13 +240,16 @@ async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
-        await _reauth(c, tok, purpose="mfa_enroll")  # ADR 0077: per-action step-up unlocks enroll
+        _r, tok = await _reauth(
+            c, tok, purpose="mfa_enroll"
+        )  # ADR 0077: per-action step-up unlocks enroll
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
-        await _reauth(c, tok, purpose="mfa_confirm")  # …and a fresh one unlocks confirm
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")  # …and a fresh one unlocks confirm
         confirm = await c.post(
             "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
         )
         recovery = confirm.json()["recovery_codes"]
+        tok = _rotated(confirm, tok)
 
         # Fresh login → satisfy the 2nd factor with a recovery code.
         tok2 = (await _login(c, "adm")).json()["token"]
@@ -259,10 +282,12 @@ async def test_mfa_enrollment_requires_explicit_reauth_for_require_mfa_admin(
         assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1"
         assert r.headers.get("X-Step-Up-Action") == "mfa_enroll"  # names the action to reauth for
         # A plain (unbound) password re-verify does NOT unlock enroll — the proof must be action-bound.
-        assert (await _reauth(c, tok)).status_code == 200
+        _r, tok = await _reauth(c, tok)
+        assert _r.status_code == 200
         assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 403
         # Re-prove the password BOUND to the enroll action → enrollment proceeds.
-        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert _r.status_code == 200
         r = await c.post("/me/mfa/enroll", headers=_auth(tok))
         assert r.status_code == 200
 
@@ -286,13 +311,16 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         )
         assert blocked.status_code == 403 and blocked.headers.get("X-MFA-Required") == "1"
         # ...yet the enroll path is reachable via an action-bound password reauth (no MFA gate there).
-        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert _r.status_code == 200
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
-        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        assert _r.status_code == 200
         confirmed = await c.post(
             "/me/mfa/confirm", headers=_auth(tok), json={"code": fresh_totp(secret)}
         )
         assert confirmed.status_code == 200 and confirmed.json()["recovery_codes"]
+        tok = _rotated(confirmed, tok)  # the confirm re-keyed the session (ASVS 7.2.4)
         # The admin has escaped the required-but-unenrolled state: MFA is active and — because confirming
         # marked the session second-factor-satisfied — the session is now usable. No lockout occurred.
         status = (await c.get("/me/mfa", headers=_auth(tok))).json()
@@ -721,7 +749,9 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
         token = (await _login(c, "adm")).json()["token"]
         h = _auth(token)
         body = {"entries": []}
-        assert (await _reauth(c, token)).status_code == 200  # uncounted (not a step-up route)
+        _r, token = await _reauth(c, token)
+        assert _r.status_code == 200  # uncounted (not a step-up route)
+        h = _auth(token)  # the re-auth re-keyed the session (ASVS 7.2.4)
         # Six sensitive writes back-to-back — twice the worst-case reauth-retry cost — all pass.
         for _ in range(6):
             assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
@@ -798,12 +828,16 @@ async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> Non
         assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
 
         # Enroll + confirm; confirming satisfies THIS session's factor (the escape path).
-        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert _r.status_code == 200
+        h = _auth(tok)  # every elevation re-keys the session (ASVS 7.2.4) — re-derive the header
         secret = (await c.post("/me/mfa/enroll", headers=h)).json()["secret"]
-        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
-        assert (
-            await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=h)
-        ).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        assert _r.status_code == 200
+        h = _auth(tok)
+        confirmed = await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=h)
+        assert confirmed.status_code == 200
+        h = _auth(_rotated(confirmed, tok))
 
         # Paced route: allowed again on the far side of the gate — require_paced adds throttling, not
         # a second-factor requirement of its own; it inherits exactly the one require() applies.
@@ -907,7 +941,8 @@ async def test_reauth_survives_an_exhausted_sign_in_budget(engine: Engine) -> No
         for _ in range(6):  # unauthenticated flood exhausts the SHARED sign-in budget
             await _login(c, "nobody", password="an-entirely-wrong-password")
         assert (await _login(c, "op")).status_code == 429  # sign-in is indeed throttled
-        assert (await _reauth(c, token)).status_code == 200  # ...but step-up still works
+        _r, token = await _reauth(c, token)
+        assert _r.status_code == 200  # ...but step-up still works
 
 
 async def test_reauth_budget_is_per_actor(engine: Engine) -> None:
@@ -920,9 +955,12 @@ async def test_reauth_budget_is_per_actor(engine: Engine) -> None:
         ta = (await _login(c, "a")).json()["token"]
         tb = (await _login(c, "b")).json()["token"]
         for _ in range(2):
-            assert (await _reauth(c, ta)).status_code == 200
-        assert (await _reauth(c, ta)).status_code == 429  # actor a spent its own budget
-        assert (await _reauth(c, tb)).status_code == 200  # actor b is unaffected
+            _r, ta = await _reauth(c, ta)
+            assert _r.status_code == 200
+        _r, ta = await _reauth(c, ta)
+        assert _r.status_code == 429  # actor a spent its own budget
+        _r, tb = await _reauth(c, tb)
+        assert _r.status_code == 200  # actor b is unaffected
 
 
 # --- WP-8: anti-automation on the PHI-read endpoints (ASVS 2.4.1) -------------
@@ -1002,7 +1040,9 @@ async def test_list_and_revoke_own_session(engine: Engine) -> None:
         assert fresh.status_code == 403
         assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # nothing revoked
-        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
+        h2 = _auth(t2)  # the re-auth re-keyed the session (ASVS 7.2.4)
         assert (await c.delete(f"/me/sessions/{other['id']}", headers=h2)).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # revoked
         assert (await c.get("/auth/me", headers=h2)).status_code == 200  # current still valid
@@ -1022,11 +1062,41 @@ async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:
         assert fresh.status_code == 403
         assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # untouched
-        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
         resp = await c.delete("/me/sessions", headers=_auth(t2))  # sign out everywhere else
         assert resp.status_code == 200 and "1" in resp.json()["detail"]
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200
+
+
+async def test_the_api_accepts_a_revoke_of_the_callers_own_current_session(engine: Engine) -> None:
+    """`DELETE /me/sessions/{id}` checks OWNERSHIP only, so the caller's CURRENT session id is a
+    valid target and revoking it ends the caller's own session.
+
+    RED when: a current-session guard is added to the route or to ``revoke_own_session`` without
+    the documentation changing with it. This test exists because `docs/SECURITY.md` and
+    `messagefoundry_webconsole/pages/account.py` both describe the console's missing Revoke button
+    on the current row, and a reader would reasonably carry that over to the API. It is a property
+    of the PAGE, not of the endpoint, and this pins which. Derived, not asserted.
+    """
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+        re, token = await _reauth(c, token, purpose="session_terminate")
+        assert re.status_code == 200
+        # The session id IS the token hash, so the re-auth's re-key (ASVS 7.2.4) gives the caller's
+        # own session a NEW id. Read the inventory AFTER the rotation or the id below is the retired
+        # one and the delete 404s -- which would look like the ownership rule failing.
+        sessions = (await c.get("/me/sessions", headers=_auth(token))).json()["sessions"]
+        current = next(s for s in sessions if s["current"])
+        assert (
+            await c.delete(f"/me/sessions/{current['id']}", headers=_auth(token))
+        ).status_code == 200
+        # The caller signed THEMSELVES out — the whole point, and the negative control for the
+        # ownership rule is the sibling test above, where another user's id answers 404.
+        assert (await c.get("/auth/me", headers=_auth(token))).status_code == 401
 
 
 async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
@@ -1042,7 +1112,8 @@ async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
         # leaking. Clear the gate first, so the 404 below still measures OWNERSHIP rather than the
         # step-up. Without this reauth the test would pass on the gate and prove nothing about it.
         assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 403
-        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
+        _r, ta = await _reauth(c, ta, purpose="session_terminate")
+        assert _r.status_code == 200
         # a tries to revoke b's session → 404 (ownership-checked, doesn't confirm/touch it)
         assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 404
         assert (await c.get("/auth/me", headers=_auth(tb))).status_code == 200  # b still signed in
@@ -1068,7 +1139,8 @@ async def test_revoke_session_requires_reauth_when_stale(engine: Engine) -> None
         assert (
             await c.get("/auth/me", headers=_auth(t1))
         ).status_code == 200  # nothing revoked yet
-        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
         assert (await c.delete(f"/me/sessions/{t1_sid}", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # now revoked
 
@@ -1083,7 +1155,8 @@ async def test_revoke_other_sessions_requires_reauth_when_stale(engine: Engine) 
         stale = await c.delete("/me/sessions", headers=_auth(t2))
         assert stale.status_code == 403 and stale.headers.get("X-Step-Up-Required") == "1"
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # t1 untouched
-        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
+        _r, t2 = await _reauth(c, t2, purpose="session_terminate")
+        assert _r.status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # t1 signed out
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200  # current kept
@@ -1101,7 +1174,8 @@ async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
         assert stale.status_code == 403
         assert stale.headers.get("X-Step-Up-Required") == "1"
         assert stale.headers.get("X-MFA-Required") is None  # NOT the MFA gate
-        assert (await _reauth(c, t, purpose="session_terminate")).status_code == 200
+        _r, t = await _reauth(c, t, purpose="session_terminate")
+        assert _r.status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 200
 
 
@@ -1119,7 +1193,8 @@ async def test_revoke_ownership_404_survives_reauth(engine: Engine) -> None:
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 403  # stale
-        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
+        _r, ta = await _reauth(c, ta, purpose="session_terminate")
+        assert _r.status_code == 200
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 404  # own
@@ -1233,7 +1308,9 @@ async def test_patch_user_preserves_omitted_fields(engine: Engine) -> None:
         token = (await _login(c, "root")).json()["token"]
         h = _auth(token)
         # 7.5.1: PATCH /users/{id} is now action-bound — mint the admin_user_update grant first.
-        assert (await _reauth(c, token, purpose="admin_user_update")).status_code == 200
+        _r, token = await _reauth(c, token, purpose="admin_user_update")
+        assert _r.status_code == 200
+        h = _auth(token)  # the re-auth re-keyed the session (ASVS 7.2.4)
         r = await c.patch(f"/users/{uid}", headers=h, json={"disabled": True})
         assert r.status_code == 200
     user = await engine.store.get_user(uid)
@@ -1291,7 +1368,9 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         assert fresh.status_code == 403
         assert fresh.headers.get("X-Step-Up-Action") == "admin_reset_password"
         # admin reset → a one-time temp returned once, after an action-bound re-proof
-        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
+        _r, admin_token = await _reauth(c, admin_token, purpose="admin_reset_password")
+        assert _r.status_code == 200
+        admin = _auth(admin_token)  # the re-auth re-keyed the session (ASVS 7.2.4)
         reset = await c.post(f"/users/{carol_id}/reset-password", headers=admin)
         assert reset.status_code == 200
         temp = reset.json()["temp_password"]
@@ -1308,19 +1387,25 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         # unknown → 404; AD user → 400; your own account → 400 (use change-password). Each needs its
         # own grant: the gate runs BEFORE the body, so without one these would all be 403 and the
         # test would stop measuring what it is named for.
-        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
+        _r, admin_token = await _reauth(c, admin_token, purpose="admin_reset_password")
+        assert _r.status_code == 200
+        admin = _auth(admin_token)  # the re-auth re-keyed the session (ASVS 7.2.4)
         assert (
             await c.post(f"/users/{ABSENT_USER_ID}/reset-password", headers=admin)
         ).status_code == 404
         # No malformed-id probe here on purpose. The step-up gate runs BEFORE the path is validated,
         # so on this route a malformed id gets 403 (no grant) rather than the 422 the id rule gives.
         # The rule is measured on the ungated routes and in tests/test_api_input_validation.py.
-        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
+        _r, admin_token = await _reauth(c, admin_token, purpose="admin_reset_password")
+        assert _r.status_code == 200
+        admin = _auth(admin_token)  # the re-auth re-keyed the session (ASVS 7.2.4)
         assert (
             await c.post(f"/users/{AD_USER_ID}/reset-password", headers=admin)
         ).status_code == 400
         me_id = (await c.get("/auth/me", headers=admin)).json()["user_id"]
-        assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
+        _r, admin_token = await _reauth(c, admin_token, purpose="admin_reset_password")
+        assert _r.status_code == 200
+        admin = _auth(admin_token)
         assert (await c.post(f"/users/{me_id}/reset-password", headers=admin)).status_code == 400
 
 
@@ -1536,15 +1621,16 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
-        await _reauth(c, tok, purpose="mfa_enroll")
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         t0 = 1_000_000.0
         pin_totp_clock(monkeypatch, t0)
-        await _reauth(c, tok, purpose="mfa_confirm")
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
         confirmed = await c.post(
             "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
         )
         assert confirmed.status_code == 200, confirmed.text
+        tok = _rotated(confirmed, tok)  # the confirm re-keyed the session (ASVS 7.2.4)
 
         # A LATER step deliberately: the activating code is single-use and cannot be replayed on
         # /auth/mfa-verify inside its own window (BACKLOG #1021), so reusing it here would 401 and
@@ -1555,9 +1641,10 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
             "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
         )
         assert verified.status_code == 200, verified.text
+        tok = _rotated(verified, tok)
 
         # TOTP is now the ONLY second factor and require_mfa defaults on, so the disable must refuse.
-        await _reauth(c, tok, purpose="mfa_disable")
+        _r, tok = await _reauth(c, tok, purpose="mfa_disable")
         r = await c.delete("/me/mfa", headers=_auth(tok))
         assert r.status_code == 400, r.text
         assert "enroll another factor first" in r.text
@@ -1655,7 +1742,9 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
         h = _auth(tok)
 
         # A grant bound to THIS action, so the request reaches the route body rather than the gate.
-        assert (await _reauth(c, tok, purpose="admin_reset_mfa")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="admin_reset_mfa")
+        assert _r.status_code == 200
+        h = _auth(tok)  # the re-auth re-keyed the session (ASVS 7.2.4)
         mine = await c.post(f"/users/{root_id}/reset-mfa", headers=h)
         assert mine.status_code == 400, (
             "the admin MFA reset accepted the caller's own id. That is a route to zero factors "
@@ -1665,7 +1754,9 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
 
         # THE OTHER HALF, and without it this test would pass just as well if the route were broken
         # outright: a DIFFERENT user is still resettable, so recovery is intact.
-        assert (await _reauth(c, tok, purpose="admin_reset_mfa")).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="admin_reset_mfa")
+        assert _r.status_code == 200
+        h = _auth(tok)
         other = await c.post(f"/users/{target}/reset-mfa", headers=h)
         assert other.status_code == 200, (
             "cross-user admin MFA reset broke. That is the always-available recovery for a "

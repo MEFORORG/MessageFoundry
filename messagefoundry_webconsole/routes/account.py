@@ -34,12 +34,14 @@ from .._auth import (
     allow_reauth_attempt,
     assert_same_origin,
     clear_session_cookie,
+    login_redirect_response,
     register_ui_action,
     require_ui,
     require_ui_reauth_only,
     require_ui_reauth_only_action,
     require_ui_step_up_action,
     session_token,
+    set_session_cookie,
     webauthn_rp,
 )
 from .._service import _service
@@ -275,16 +277,26 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         form = dict(await _form_pairs(request))
         code = form.get("code", "").strip()
         try:
-            codes = await service.confirm_mfa_enrollment(identity, code, token=token, client=client)
+            elevation = await service.confirm_mfa_enrollment(
+                identity, code, token=token, client=client
+            )
         except ValueError as exc:
             # No enrollment staged / not a local account — back to the account page.
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
-        if codes is None:
+        if elevation.session_lost:
+            # A correct code on a session revoked mid-enrolment: MFA IS now on, but this browser's
+            # cookie is dead, so the recovery codes cannot be shown here. Land on login.
+            return login_redirect_response()
+        if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
-        # Activated: the recovery codes render ONCE — never re-fetchable.
-        return HTMLResponse(pages.mfa_recovery_page(codes))
+        # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
+        # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
+        # out on the very page showing codes they have not written down yet.
+        resp = HTMLResponse(pages.mfa_recovery_page(list(elevation.recovery_codes)))
+        set_session_cookie(resp, elevation.token, request=request)
+        return resp
 
     @app.post("/ui/account/mfa/disable")
     async def ui_mfa_disable(
@@ -444,7 +456,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         try:
-            ok = await service.finish_webauthn_registration(
+            elevation = await service.finish_webauthn_registration(
                 identity,
                 response_json,
                 label=label,
@@ -457,11 +469,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Service-authored, safe messages only (expired ceremony / duplicate label or
             # credential / bad label / AD) — never reflected input.
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-        if not ok:
+        if elevation.session_lost:
+            return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
+        if elevation.token is None:
             return JSONResponse(
                 {"ok": False, "error": "passkey verification failed"}, status_code=400
             )
-        return JSONResponse({"ok": True, "redirect": "/ui/account?m=passkey_added"})
+        # Enrolling a passkey marks the session MFA-satisfied, so it re-keys (ASVS 7.2.4). The page
+        # follows `redirect` immediately, and that GET must carry the new cookie.
+        resp = JSONResponse({"ok": True, "redirect": "/ui/account?m=passkey_added"})
+        set_session_cookie(resp, elevation.token, request=request)
+        return resp
 
     @app.post("/ui/account/webauthn/{credential_id_hash}/delete")
     async def ui_webauthn_delete(

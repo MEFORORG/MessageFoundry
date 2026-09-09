@@ -17,7 +17,7 @@ import json
 import logging
 from collections.abc import Iterator
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 # The /ui admin pages moved to the messagefoundry_webconsole package (Option B, ADR 0065); this module
@@ -35,6 +35,7 @@ from messagefoundry.api.auth_models import (
     CurrentUser,
     CustomRoleInfo,
     CustomRoleRequest,
+    ElevatedResponse,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -167,6 +168,15 @@ def _client(request: Request) -> str | None:
     # rotation from a directly-reachable attacker (SEC-024) — the real brute-force bounds are the
     # global ceiling + per-account argon2 lockout (applied to both the password and MFA factors).
     return request.client.host if request.client else None
+
+
+def _no_store(response: Response) -> None:
+    """Forbid caching a response whose BODY carries a live session token (ASVS 7.2.4 delivery).
+
+    The rotated token has to reach the client somehow, and the body is the only channel a bearer
+    client has. That makes these three responses credential-bearing, so they must not sit in a proxy
+    or browser cache where a later reader could lift a working session out of one."""
+    response.headers["Cache-Control"] = "no-store"
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -354,22 +364,28 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         return SimpleMessage(detail="password changed; please sign in again")
 
-    @app.post("/me/reauth", response_model=SimpleMessage)
+    @app.post("/me/reauth", response_model=ElevatedResponse)
     async def reauth(
         body: ReauthRequest,
+        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
-    ) -> SimpleMessage:
+    ) -> ElevatedResponse:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
-        period. Rate-limited like the password change; a failure is a 403 and performs nothing."""
+        period. Rate-limited like the password change; a failure is a 403 and performs nothing.
+
+        On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
+        token — the one this request authenticated with is dead by the time the client reads it."""
         # Post-session ceremony: per-ACTOR budget. Sharing the sign-in global budget let an
         # unauthenticated flood deny step-up to every signed-in operator.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "reauth")
         token = bearer_token(request)
-        if token is None or not await service.reauth(
+        if token is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
+        elevation = await service.reauth(
             identity,
             body.password,
             token=token,
@@ -377,28 +393,46 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # ADR 0077: bind the fresh proof to the action the caller named (the value the 403 handed
             # back in X-Step-Up-Action). None => refresh only the session window, as before.
             purpose=body.purpose,
-        ):
+        )
+        if elevation.token is None:
+            # session_lost is a good password on a session revoked mid-ceremony: 401, not the 403 a
+            # wrong password gets, so the client re-authenticates instead of re-prompting for a
+            # password that was already correct.
+            if elevation.session_lost:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
-        return SimpleMessage(detail="re-verified")
+        _no_store(response)
+        return ElevatedResponse(detail="re-verified", token=elevation.token)
 
     # --- MFA: native TOTP second factor (WP-14, ASVS 6.3.3) ------------------
 
-    @app.post("/auth/mfa-verify", response_model=SimpleMessage)
+    @app.post("/auth/mfa-verify", response_model=ElevatedResponse)
     async def mfa_verify(
         body: MfaVerifyRequest,
+        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         _: Identity = Depends(require()),
-    ) -> SimpleMessage:
+    ) -> ElevatedResponse:
         """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
         Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
-        rate-limited like login. A wrong code is a 401 and changes nothing."""
+        rate-limited like login. A wrong code is a 401 and changes nothing.
+
+        The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
+        this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "mfa-verify")
         token = bearer_token(request)
-        if token is None or not await service.verify_mfa(token, body.code, client=_client(request)):
+        if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
-        return SimpleMessage(detail="verified")
+        elevation = await service.verify_mfa(token, body.code, client=_client(request))
+        if elevation.token is None:
+            # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
+            # /me/reauth there is no status to split — only the message differs.
+            detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail)
+        _no_store(response)
+        return ElevatedResponse(detail="verified", token=elevation.token)
 
     @app.get("/me/mfa", response_model=MfaStatusResponse)
     async def my_mfa(
@@ -435,6 +469,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/me/mfa/confirm", response_model=MfaConfirmResponse)
     async def confirm_mfa(
         body: MfaConfirmRequest,
+        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_CONFIRM)),
@@ -449,14 +484,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         if token is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         try:
-            codes = await service.confirm_mfa_enrollment(
+            elevation = await service.confirm_mfa_enrollment(
                 identity, body.code, token=token, client=_client(request)
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        if codes is None:
+        if elevation.token is None:
+            if elevation.session_lost:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
-        return MfaConfirmResponse(recovery_codes=codes)
+        # The body now carries BOTH the one-time recovery codes and a live session token.
+        _no_store(response)
+        return MfaConfirmResponse(
+            recovery_codes=list(elevation.recovery_codes), token=elevation.token
+        )
 
     @app.delete("/me/mfa", response_model=SimpleMessage)
     async def disable_my_mfa(

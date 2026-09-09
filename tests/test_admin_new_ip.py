@@ -141,8 +141,12 @@ async def test_reauth_reanchors_session_to_the_new_ip() -> None:
         await service.initialize()
         token, identity = await _enabled_admin(service, client="10.1.1.1")
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
-        # Re-verifying from the new address re-anchors the session, clearing the signal.
-        assert await service.reauth(identity, PW, token=token, client="10.2.2.2") is True
+        # Re-verifying from the new address re-anchors the session, clearing the signal. The
+        # re-auth also re-keys the session (ASVS 7.2.4), and `_rekey_token_state` carries the
+        # new-IP dedupe across — so the follow-up checks run on the ROTATED token.
+        reauthed = await service.reauth(identity, PW, token=token, client="10.2.2.2")
+        assert reauthed.ok is True and reauthed.token is not None
+        token = reauthed.token
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is False
         # The original address is now the unexpected one.
         assert await service.flag_new_client_ip(token, "10.1.1.1", path="/users") is True
@@ -226,9 +230,11 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
         # (enrollment now consumes the activating step, BACKLOG #1021).
         t0 = 1_000_000.0
         pin_totp_clock(monkeypatch, t0)
-        await service.confirm_mfa_enrollment(
+        enrolled = await service.confirm_mfa_enrollment(
             identity, totp.totp(enroll.secret, now=t0), token=token, client="10.1.1.1"
         )
+        assert enrolled.ok and enrolled.token is not None
+        token = enrolled.token  # the confirm re-keyed the session (ASVS 7.2.4)
         # Roam to a new address → flagged.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         # Completing MFA from the new address re-anchors the session (parity with reauth), using a code
@@ -236,7 +242,9 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
         code = totp.totp(enroll.secret, now=t1)
-        assert await service.verify_mfa(token, code, client="10.2.2.2") is True
+        verified = await service.verify_mfa(token, code, client="10.2.2.2")
+        assert verified.ok is True and verified.token is not None
+        token = verified.token
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is False
     finally:
         await store.close()
@@ -309,6 +317,7 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
         # Re-verifying from the new address re-anchors the session; the admin op then succeeds.
         ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
         assert ok.status_code == 200
+        token = str(ok.json()["token"])  # the re-auth re-keyed the session (ASVS 7.2.4)
         assert (await b.post("/users", headers=_auth(token), json=n2)).status_code == 201
 
 

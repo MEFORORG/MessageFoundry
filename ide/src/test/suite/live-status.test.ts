@@ -14,7 +14,12 @@ import {
   type RuntimeInfo,
   type VmNode,
 } from "../../graphModel";
-import { buildRuntimeMap, type ConnectionRowLite } from "../../liveStatusModel";
+import {
+  buildRuntimeMap,
+  CONNECTIONS_ROUTE,
+  LIVE_STATUS_PLAN,
+  type ConnectionRowLite,
+} from "../../liveStatusModel";
 
 // Live decorations for the CONNECTIONS view (ADR 0091 "live decorations"), exercised vscode-free:
 // the pure reduction of the engine's `GET /connections` rows into a RuntimeMap, and the
@@ -157,6 +162,93 @@ suite("graphModel — elements view runtime enrichment", () => {
     );
     assert.strictEqual(el(partial, "Inbound Connections", "IB_A").description, "mllp :6661 → route_x");
     assert.strictEqual(el(partial, "Outbound Connections", "OB_X").description, "mllp · running");
+  });
+});
+
+suite("liveStatus poll — the timer may not carry a bearer (AUTH-IDLE / CWE-613)", () => {
+  const LIVE_STATUS_TS = path.join(__dirname, "..", "..", "..", "src", "liveStatus.ts");
+
+  test("LIVE_STATUS_PLAN is tokenless, and names the one route this feature reads", () => {
+    // This is the control, not the file header above it. `GET /connections` is gated by plain
+    // `require(Permission.MONITORING_READ)`, and `require()` resolves the bearer with
+    // `identity_for_token(bearer_token(request))` — the default `activity=True`, which refreshes
+    // the session's idle clock. So a bearer on this 5-to-10-second
+    // timer would keep the session alive for as long as a VS Code window stays open and make the
+    // engine's 30-minute idle timeout unreachable, on the exact client the automatic-logoff control
+    // exists for. liveStatus.poll attaches the token IFF the plan entry says `authenticated`, so
+    // this assertion is what actually holds the line. Same rule, same shape, as POLL_PLAN.
+    assert.ok(LIVE_STATUS_PLAN.length > 0);
+    for (const entry of LIVE_STATUS_PLAN) {
+      assert.strictEqual(
+        entry.authenticated,
+        false,
+        `the live-status poll must not authenticate (${entry.route}) — it would defeat AUTH-IDLE`,
+      );
+    }
+    assert.deepStrictEqual(
+      LIVE_STATUS_PLAN.map((e) => e.route),
+      [CONNECTIONS_ROUTE],
+    );
+    assert.strictEqual(CONNECTIONS_ROUTE, "/connections");
+  });
+
+  test("the poll's call site reads the token ONLY through the plan", () => {
+    // The plan is a control only if the shell obeys it, so read the shell. A source scan that
+    // silently matches nothing is indistinguishable from a clean file, hence the guards below.
+    const text = fs.readFileSync(LIVE_STATUS_TS, "utf8");
+    assert.ok(
+      text.includes("getJson<ConnectionRowLite[]>("),
+      "the poll's call site moved — re-point this scan before trusting it",
+    );
+    const sites = text.split(/\r?\n/).filter((l) => l.includes("peekToken("));
+    assert.strictEqual(sites.length, 1, `expected one peekToken call site, found ${sites.length}`);
+    assert.ok(
+      /entry\.authenticated \?/.test(sites[0]),
+      `the poll must resolve its bearer through the plan, not unconditionally: ${sites[0].trim()}`,
+    );
+
+    // The check must be able to give a DIFFERENT answer. This is the line the file actually carried
+    // before the fix; if the predicate accepts it, the predicate is not testing anything.
+    const defect = "        const bearer = await peekToken(this.ctx, url);";
+    assert.ok(defect.includes("peekToken("), "the control line does not even reach the predicate");
+    assert.ok(
+      !/entry\.authenticated \?/.test(defect),
+      "the predicate passes the defect it exists to catch",
+    );
+  });
+
+  test("a tokenless 401 does not clear the cached session", () => {
+    // The poll sends no bearer, so a 401 means "this route needs auth" — never "your session died".
+    // Clearing on it would sign the user out from a timer, over a request their session had no part
+    // in. auth.withAuth still clears on a 401 from a request that DID carry the token.
+    const text = fs.readFileSync(LIVE_STATUS_TS, "utf8");
+    assert.ok(text.includes("peekToken"), "vacuity guard: this file should still name auth at all");
+    assert.ok(
+      !text.includes("clearToken"),
+      "liveStatus must not clear a token from a background timer",
+    );
+  });
+
+  test("a tokenless 401 STANDS THE TIMER DOWN rather than retrying for the life of the window", () => {
+    // Dropping the bearer made this failure DETERMINISTIC: LIVE_STATUS_PLAN is a compile-time
+    // constant with authenticated:false, so against an auth-enabled engine every tick 401s and no
+    // amount of waiting changes it. Left running that is one guaranteed-waste request every
+    // intervalMs, forever — 360-720/hour per open window. applySettings() re-arms, which is the only
+    // thing that can change the answer.
+    const text = fs.readFileSync(LIVE_STATUS_TS, "utf8");
+    assert.ok(
+      text.includes("standDown"),
+      "vacuity guard: the stand-down path must exist in the shell at all",
+    );
+    assert.ok(
+      /e\.status === 401 && !entry\.authenticated/.test(text),
+      "the stand-down must be gated on a TOKENLESS 401 — an authenticated 401 is a dead session, " +
+        "which is a different fact and must not silently stop the poller",
+    );
+    assert.ok(
+      /clearInterval/.test(text.slice(text.indexOf("private standDown"))),
+      "standDown must actually clear the interval, not merely mark a flag",
+    );
   });
 });
 

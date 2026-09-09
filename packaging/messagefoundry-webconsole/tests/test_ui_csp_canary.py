@@ -43,6 +43,7 @@ import pytest
 
 import messagefoundry
 import messagefoundry.api.app as engine_app
+import messagefoundry.api.auth_routes as engine_auth_routes
 import messagefoundry.api.client_networks as engine_client_networks
 import messagefoundry.api.header_floor as engine_header_floor
 import messagefoundry.api.request_timeout as engine_request_timeout
@@ -518,6 +519,7 @@ _PACKAGE_DIR = Path(messagefoundry_webconsole.__file__).parent
 #: cannot see. The console package itself is always read; these are the additions.
 _EMITTERS = (
     engine_app,
+    engine_auth_routes,
     engine_client_networks,
     engine_header_floor,
     engine_request_timeout,
