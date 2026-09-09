@@ -69,6 +69,18 @@ $script:UsageStatusLineMarker = "mefor-usage"
 $script:ClaudeAccountRootName = [regex]'\A\.claude-account-\d+\z'
 $script:ClaudeDefaultRootName = [regex]'\A\.claude\z'
 
+# The AVAILABILITY MARKER, named ONCE for the same reason the statusLine marker above is. It sits in
+# the root's publish directory rather than beside settings.json, because the publish directory is
+# already the per-account partition key (Get-UsageStateDir) -- so a marker cannot end up describing a
+# different account than the numbers it sits next to, and a reader pointed at an explicit -StateDir
+# finds the marker that belongs to the numbers it is about to read.
+#
+# THE FACT LIVES ON THE BOX, NOT IN THIS REPOSITORY. Nothing here may enumerate which roots exist or
+# which subscription was cancelled: the repository is public, an account root is one person's
+# credential set, and the whole file above is built on DISCOVERING roots rather than listing them.
+# So the repository carries the mechanism and the operator's own filesystem carries the fact.
+$script:UsageUnavailableMarker = 'unavailable.json'
+
 function Get-LaunchableConfigRoots {
     <#
     .SYNOPSIS
@@ -196,6 +208,111 @@ function Get-UsageStateDir {
     #>
     param([Parameter(Mandatory)][string]$ConfigRoot)
     return (Join-Path (ConvertTo-NormalRootPath $ConfigRoot) 'mefor-usage')
+}
+
+function ConvertTo-UtcDateTime {
+    <#
+    .SYNOPSIS
+        One reading of a timestamp that came out of JSON. $null when it is not a date.
+    .DESCRIPTION
+        DO NOT STRINGIFY A VALUE ConvertFrom-Json HAS ALREADY TOUCHED. It coerces an ISO-8601 field into
+        a [datetime] before any of our code sees it, and rendering that back to a string drops the 'Z';
+        re-parsing a Z-less string assumes LOCAL, which on this box added five hours and dated a reading
+        taken 90 seconds ago as 299 minutes in the FUTURE. usage.ps1's Get-AgeMinutes records the full
+        measurement and now subtracts from this function rather than restating its own copy of the rule.
+
+        A Kind of Unspecified is read as UTC because every timestamp this codebase writes is UTC. That
+        assumption is the reason this lives in one function: it is wrong for any other input, and one
+        place to change it is the difference between a fix and a hunt.
+    #>
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) {
+        switch ($Value.Kind) {
+            ([System.DateTimeKind]::Utc) { return $Value }
+            ([System.DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+            default { return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc) }
+        }
+    }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    try { return ([System.DateTimeOffset]::Parse([string]$Value)).UtcDateTime } catch { return $null }
+}
+
+function Get-RootUnavailability {
+    <#
+    .SYNOPSIS
+        Is this account still spendable? Reads the marker in a publish directory and reports one of
+        AVAILABLE / UNAVAILABLE / PENDING / MALFORMED.
+    .DESCRIPTION
+        WHY THE TRACKING NEEDS THIS AT ALL. A cancelled account is the one failure this reader could not
+        see, and it fails in the worst possible direction: a dead account never burns quota, so its last
+        reading freezes low and its publish directory goes quiet -- which is byte-identical to an IDLE
+        account with a full pool. A seat looking for "the account with the most headroom" is therefore
+        steered at the one account that has none, and the reader's own remedy for a quiet root ("start a
+        NEW session pinned to this root") points it at a subscription that no longer exists.
+
+        FAIL CLOSED ON A MARKER IT CANNOT READ. A malformed marker is UNAVAILABLE, not AVAILABLE. The
+        file exists because somebody put it there, so the reachable states are "cancelled" and
+        "cancelled, and the note about it is damaged" -- and reading a damaged note as an all-clear is
+        how a guard goes silent while still looking present. MALFORMED is returned separately from
+        UNAVAILABLE so the operator is told to fix the file rather than left wondering why an account
+        they never marked is refusing.
+
+        PENDING IS A REAL STATE AND NOT A CONVENIENCE. A cancellation normally takes effect at the end
+        of a billing period, so between the decision and that date the pool is still live and still
+        worth spending. A marker carrying a future `effective_from` therefore does NOT suppress the
+        numbers; it rides along beside them so a reader knows the account has an end date. Absent or
+        past `effective_from` means the marker is live now.
+
+        AN ABSENT MARKER IS AVAILABLE, and that is the only silent arm here -- correctly, because it is
+        the overwhelmingly normal case and the alternative (requiring every root to carry a marker) puts
+        a maintenance burden on five directories to describe a condition that applies to none of them.
+    #>
+    param([Parameter(Mandatory)][string]$StateDir)
+    $path = Join-Path $StateDir $script:UsageUnavailableMarker
+    $o = [ordered]@{
+        state          = 'AVAILABLE'
+        reason         = ''
+        marked_at      = $null
+        marked_by      = $null
+        effective_from = $null
+        marker_path    = $path
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $o }
+
+    $doc = $null
+    try { $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch {
+        $o.state = 'MALFORMED'
+        $o.reason = "the availability marker at $path is not readable JSON, so this account is treated as UNAVAILABLE rather than assumed spendable"
+        return $o
+    }
+    # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file. It is what -Clear could
+    # leave behind, and honouring it is what lets an operator record "checked, still live" explicitly.
+    if ($doc.PSObject.Properties.Name -contains 'unavailable' -and -not [bool]$doc.unavailable) { return $o }
+
+    $o.reason = [string]$doc.reason
+    if (-not $o.reason) { $o.reason = 'no reason recorded in the marker' }
+    # THROUGH THE CONVERTER, NOT [string]. ConvertFrom-Json has already turned this ISO field into a
+    # [datetime], and stringifying that yields the machine's LOCAL short format -- measured here as
+    # "09/08/2026 23:29:04": the 'Z' gone, and a day/month order that reads as 9 August to half the
+    # world. It is printed as the sole audit trail for why an account is being skipped, so an
+    # ambiguous date is the wrong kind of wrong. A value that is not a date is passed through as
+    # written rather than blanked, because a hand-edited marker saying "last Tuesday" should show what
+    # it says instead of vanishing.
+    $mk = ConvertTo-UtcDateTime $doc.marked_at
+    $o.marked_at = if ($mk) { $mk.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { [string]$doc.marked_at }
+    $o.marked_by = [string]$doc.marked_by
+    $eff = ConvertTo-UtcDateTime $doc.effective_from
+    if ($eff) {
+        $o.effective_from = $eff.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        if ($eff -gt (Get-Date).ToUniversalTime()) {
+            $o.state = 'PENDING'
+            return $o
+        }
+    }
+    $o.state = 'UNAVAILABLE'
+    return $o
 }
 
 function Resolve-CurrentConfigRoot {

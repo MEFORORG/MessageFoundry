@@ -155,6 +155,23 @@ function Write-Unknown([string]$Detail) {
         ) -join "`n")
 }
 
+# UNAVAILABLE IS NOT UNKNOWN, AND ROUTING IT THROUGH Write-Unknown WOULD BE A LIE IN THE SAFE-LOOKING
+# DIRECTION. The line above says UNKNOWN "is no measurement" and tells the session to use its own
+# judgment -- which is exactly the wrong instruction for an account that has no subscription, because
+# the honest reading is a hard zero and there is no judgment call left to make. The reader's own
+# distinction between exit 20 and 21 is preserved here rather than collapsed at the last hop.
+function Write-Unavailable([string]$Reason, [string]$Account) {
+    $lines = @($HEAD)
+    if ($Account) { $lines += "  account: $Account" }
+    $lines += @(
+        "  verdict: UNAVAILABLE -- this account has no subscription. There is no pool to spend."
+        "  reason: $Reason"
+        "  This is a MEASUREMENT, not a gap: it is zero spendable capacity, not an unread number."
+        "  Do not send work here, and do not read a quiet publish directory under it as spare capacity."
+    )
+    Write-Context ($lines -join "`n")
+}
+
 # --- which tool is this ---------------------------------------------------------------------------
 
 $raw = ""
@@ -214,6 +231,15 @@ if (-not $j) {
 
 $state = Get-Folded $j.state
 if (-not $state) { $state = "UNKNOWN" }
+
+# BEFORE THE WINDOW CHECK BELOW, because an UNAVAILABLE document deliberately carries NO five_hour key
+# -- so leaving this until after it would send every cancelled account down the "the reader returned no
+# window readings" path and report a known zero as an unread number.
+if ($state -eq "UNAVAILABLE") {
+    $why = Get-Folded $j.reason
+    if (-not $why) { $why = "no reason recorded" }
+    Write-Unavailable $why (Get-Folded $j.config_root)
+}
 
 # WHICH FILE WAS ACTUALLY LOOKED AT. The reader reports `path` when it found nothing and `state_dir`
 # when it found something; either way the session should be told where the number came from, because

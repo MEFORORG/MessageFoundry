@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -2021,3 +2022,307 @@ def test_rewired_says_which_thing_changed_not_always_the_publish_path(tmp_path: 
     )
     out2 = install("-ConfigDir", str(root2), pin=None).stdout
     assert "published somewhere else" in out2, out2
+
+
+# ------------------------------------------------------- a cancelled account has no headroom
+#
+# WHY THIS SECTION EXISTS. The four honesty rules above are all about a reading that is stale, thin, or
+# from the wrong account. None of them catches a CANCELLED account, and that case fails in the worst
+# possible direction: a dead account stops burning quota, so its last percentage freezes low and its
+# publish directory goes quiet -- which is byte-identical to an IDLE account with a full pool. A seat
+# comparing roots to find "the one with headroom" is therefore steered straight at the account that has
+# none, and the reader's own remedy for a quiet root ("start a NEW session pinned to this root") points
+# it at a subscription that no longer exists.
+#
+# The fix is a marker in the root's publish directory, and these tests pin the four things that would
+# make it worthless: that it BEATS a live-looking number, that a damaged marker fails CLOSED, that a
+# future-dated cancellation does NOT throw away a pool that is still spendable, and that the survey --
+# the one place accounts are compared -- honours it too.
+
+AVAIL = ROOT / "scripts" / "coord" / "account-availability.ps1"
+UNAVAILABLE = 21
+
+_PCT = re.compile(r"\d+(?:\.\d+)?\s*%")
+
+
+def avail(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
+    cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(AVAIL)]
+    if home is not None:
+        cmd += ["-HomeDir", str(home)]
+    cmd += list(args)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(None)
+    )
+
+
+def tempting(state: Path) -> None:
+    """A fresh, LOW reading -- what a cancelled account leaves behind, and the whole hazard.
+
+    Low rather than high on purpose. A frozen 3% is the shape that gets an account CHOSEN; a frozen
+    95% would be skipped for the right answer by accident, and a fixture that cannot fail the way the
+    defect fails proves nothing about the guard.
+    """
+    publish(state, five=3.0, seven=2.0)
+
+
+def test_a_cancelled_account_reports_unavailable_and_never_a_percentage(tmp_path: Path) -> None:
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+
+    # Positive control FIRST. Without the marker this root answers OK with a percentage, so the
+    # assertions below are measuring the marker rather than an inert fixture that could never say
+    # anything else.
+    code, doc = read(state)
+    assert code == OK, doc
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(3.0)
+
+    marked = avail("-Mark", "-ConfigDir", str(root), "-Reason", "subscription cancelled")
+    assert marked.returncode == 0, marked.stdout
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["state"] == "UNAVAILABLE"
+    assert doc["reason"] == "subscription cancelled"
+    # THE KEYS ARE ABSENT, NOT NULL. Emitting them as nulls would let a consumer that reaches straight
+    # for a percentage read this as a window that merely has not published yet.
+    assert "five_hour" not in doc, doc
+    assert "seven_day" not in doc, doc
+
+    _, _, human = reader("-StateDir", str(state))
+    assert _PCT.search(human) is None, f"a percentage survived under a cancelled account:\n{human}"
+    assert "NO SUBSCRIPTION" in human
+
+
+def test_a_damaged_marker_fails_closed_rather_than_reading_as_available(tmp_path: Path) -> None:
+    """The file exists because somebody put it there, so the reachable states are "cancelled" and
+    "cancelled, and the note about it is damaged". Reading a damaged note as an all-clear is how a
+    guard goes silent while still looking present -- and it would do so over the exact numbers the
+    marker was written to suppress.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+    (state / "unavailable.json").write_text("{ not json", encoding="utf-8")
+
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == "MALFORMED"
+    # Reported as a damaged marker, not as a recorded cancellation: the two need different fixes, and
+    # an operator told "cancelled" about an account they never marked has been sent the wrong way.
+    _, _, human = reader("-StateDir", str(state))
+    assert "damaged" in human
+    assert _PCT.search(human) is None, human
+
+
+def test_a_future_dated_cancellation_leaves_the_pool_readable_and_names_its_end(
+    tmp_path: Path,
+) -> None:
+    """A subscription normally runs to the end of its billing period, and until then the pool is real
+    and worth spending. Suppressing the numbers there would throw away a true reading; the END DATE is
+    the part the reader would otherwise have no way to know.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    publish(state, five=61.0, seven=44.0)
+
+    when = (datetime.now(UTC) + timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = avail(
+        "-Mark",
+        "-ConfigDir",
+        str(root),
+        "-Reason",
+        "subscription cancelled",
+        "-EffectiveFrom",
+        when,
+    )
+    assert out.returncode == 0, out.stdout
+
+    code, doc = read(state)
+    assert code == OK, doc
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(61.0)
+    assert doc["cancellation_pending_from"] == when
+
+    _, _, human = reader("-StateDir", str(state))
+    assert "still live until" in human and when in human
+
+
+def test_a_marker_timestamp_is_reported_in_iso_utc_not_the_boxs_local_format(
+    tmp_path: Path,
+) -> None:
+    """``ConvertFrom-Json`` coerces an ISO field into a [datetime] before our code sees it, and
+    stringifying that yields the machine's LOCAL short format -- measured while writing this as
+    "09/08/2026 23:29:04": the Z gone, and a day/month order that reads as 9 August to half the world.
+
+    It is the sole audit trail for why an account is being skipped, so an ambiguous date is the wrong
+    kind of wrong. Asserted on the RAW JSON TEXT: parsing it back in Python re-coerces the value and
+    would let a local-format string pass, which is the instrument answering a different question.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    assert out.returncode == 0, out.stdout
+
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(READ),
+            "-StateDir",
+            str(root / "mefor-usage"),
+            "-Json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+    m = re.search(r'"marked_at":"([^"]*)"', proc.stdout)
+    assert m, f"no marked_at in the reader's output: {proc.stdout}"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", m.group(1)), m.group(1)
+
+
+def test_the_survey_never_ranks_a_cancelled_root_as_headroom(fake_home: Path) -> None:
+    """The survey is the ONLY place accounts are compared, so it is where a cancelled one does its
+    damage -- it presents as the emptiest pool in the list.
+    """
+    live = fake_home / ".claude-account-1"
+    dead = fake_home / ".claude-account-2"
+    assert install("-ConfigDir", str(live), pin=None, home=fake_home).returncode == 0
+    publish(live / "mefor-usage", five=61.0, seven=44.0)
+    tempting(dead / "mefor-usage")
+
+    # Positive control: the tempting row really is visible as a percentage before it is marked, or the
+    # assertion below passes over a survey that was never printing it.
+    _, _, before = reader("-AllRoots", pin=live, home=fake_home)
+    assert "3%" in before, before
+
+    out = avail("-Mark", "-ConfigDir", str(dead), "-Reason", "subscription cancelled")
+    assert out.returncode == 0, out.stdout
+
+    _, _, after = reader("-AllRoots", pin=live, home=fake_home)
+    dead_row = next(x for x in after.splitlines() if str(dead) in x)
+    assert "UNAVAILABLE" in dead_row, dead_row
+    assert _PCT.search(dead_row) is None, dead_row
+    # The live account is untouched -- a guard that suppressed every row would pass the line above.
+    assert "61%" in after, after
+
+
+def test_the_collector_refuses_to_refresh_a_cancelled_roots_document(tmp_path: Path) -> None:
+    """Every publish rewrites captured_at, so a session running under a cancelled root would keep that
+    root's document looking freshly MEASURED -- disarming the staleness guard on the one account where
+    staleness is the truth.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "subscription cancelled")
+    assert out.returncode == 0, out.stdout
+
+    before = (state / "latest.json").read_text(encoding="utf-8")
+    line = collect(state, {"rate_limits": {"five_hour": window(88.0, 3600)}})
+    assert "unavailable" in line, line
+    assert (state / "latest.json").read_text(encoding="utf-8") == before
+
+    # CONTROL. A guard that suppressed every publish would pass the assertion above, so a live root
+    # has to still work in the same test.
+    ok = tmp_path / "live"
+    collect(ok, {"rate_limits": {"five_hour": window(88.0, 3600)}})
+    assert latest(ok)["five_hour"]["used_percentage"] == pytest.approx(88.0)
+
+
+def test_marking_refuses_a_config_root_that_does_not_exist(tmp_path: Path) -> None:
+    """``New-Item -Force`` builds every missing ancestor, so a typo'd path would have this command
+    MANUFACTURE a config root nothing can launch from and then declare it cancelled -- a wholly
+    fictional account, recorded as fact, with nothing reporting a problem. Same rule the installer
+    already enforces.
+    """
+    ghost = tmp_path / ".claude-account-99"
+    out = avail("-Mark", "-ConfigDir", str(ghost), "-Reason", "cancelled")
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout
+    assert not ghost.exists(), "the refusal created the root it refused"
+
+
+def test_an_unparseable_effective_from_is_refused_rather_than_treated_as_now(
+    tmp_path: Path,
+) -> None:
+    """Falling back to "now" would mark a still-live account dead -- the opposite of what was asked,
+    and indistinguishable from it having worked.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "x", "-EffectiveFrom", "next Tuesday")
+    assert out.returncode == 1, out.stdout
+    assert not (root / "mefor-usage" / "unavailable.json").exists()
+
+
+def test_marking_is_reversible_and_clearing_nothing_is_not_an_error(tmp_path: Path) -> None:
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+
+    assert avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled").returncode == 0
+    assert read(state)[0] == UNAVAILABLE
+    assert avail("-Clear", "-ConfigDir", str(root)).returncode == 0
+    assert read(state)[0] == OK, "clearing the marker did not restore a normal reading"
+
+    # The desired end state is "no marker here", and it already holds. A non-zero exit would make a
+    # correct no-op look like a failure to a caller that branches on the code.
+    again = avail("-Clear", "-ConfigDir", str(root))
+    assert again.returncode == 0, again.stdout
+    assert "NOTHING TO CLEAR" in again.stdout
+
+
+def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
+    """The absent-marker arm is the only silent one, and it is the overwhelmingly normal case. If it
+    ever stopped meaning AVAILABLE, every root on the box would go dark at once.
+    """
+    state = tmp_path / "plain"
+    publish(state, five=61.0, seven=44.0)
+    code, doc = read(state)
+    assert code == OK, doc
+    assert doc["five_hour"]["used_percentage"] == pytest.approx(61.0)
+    assert doc["cancellation_pending_from"] is None
+
+
+def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path) -> None:
+    """FAIL CLOSED IN THE READER, FAIL OPEN IN THE WRITER -- and the first version of the collector
+    guard got this backwards.
+
+    It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write or a half-flushed marker would
+    stop a LIVE account publishing at all, with one status-bar line as the only signal. That is exactly
+    what the collector's own comment forbids, and the try/catch around the call did not cover it: the
+    guard catches a THROW, not a MALFORMED verdict.
+
+    The asymmetry is deliberate and this test is the only thing pinning it. A damaged marker must still
+    REFUSE on the read -- asserted here in the same test, so a fix that simply stopped honouring
+    MALFORMED anywhere would fail rather than pass.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    (state / "unavailable.json").write_text("{ torn write", encoding="utf-8")
+
+    line = collect(state, {"rate_limits": {"five_hour": window(42.0, 3600)}})
+    assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
+    assert latest(state)["five_hour"]["used_percentage"] == pytest.approx(42.0)
+
+    # ... and the reader still refuses it, which is where fail-closed belongs.
+    code, doc = read(state)
+    assert code == UNAVAILABLE, doc
+    assert doc["marker_state"] == "MALFORMED"

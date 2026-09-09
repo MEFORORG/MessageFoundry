@@ -700,7 +700,8 @@ whole shape:
 | [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `<config root>/mefor-usage/latest.json` — one per account root |
 | [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets*. `-AllRoots` surveys every root |
 | [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal). Defaults to this session's pinned root; `-ConfigDir <dir>` names one, `-AllRoots` does every account root |
-| [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the other three share: what a config root is, which one am I in, where does its state live |
+| [`account-availability.ps1`](../scripts/coord/account-availability.ps1) | records that a root's account has no subscription, so the reader stops treating it as headroom. `-Mark` / `-Clear` / `-Status [-AllRoots]` |
+| [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the others share: what a config root is, which one am I in, where does its state live, is it still spendable |
 
 **One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
 draws down the same 5-hour and 7-day pools, so any one session's reading is the truth for all sessions
@@ -752,8 +753,29 @@ The bare invocation still works and now means **this session's account**, not th
 **survey, never a merge**: the roots are different accounts with different pools, so nothing is summed,
 averaged or worst-of'd across them, and the exit code stays this session's verdict.
 
+**A cancelled account is the one thing none of that catches, and it fails in the direction that gets it
+chosen.** A dead account stops burning quota, so its last percentage freezes low and its publish
+directory goes quiet — which is byte-identical to an *idle* account with a full pool. Anything comparing
+roots to find the one with headroom is steered straight at the account that has none, and the reader's
+own remedy for a quiet root ("start a new session pinned to this root") points at a subscription that no
+longer exists. `account-availability.ps1 -Mark` writes a marker into that root's publish directory, and
+from then on the reader, the survey, the spawn-point hook and the collector all report **UNAVAILABLE**
+and never a percentage. Cancel with `-EffectiveFrom <date>` and the pool stays readable until that date,
+with the end date printed beside it — the numbers are real until then and throwing them away would lose
+a true reading.
+
+**The fact lives on the box, not in this repository.** Everything in `config-roots.ps1` discovers roots
+by name shape rather than listing them, deliberately: a root is one person's credential set and this
+repository is public. So the repository carries the mechanism and the operator's filesystem carries which
+account was cancelled.
+
 Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
-**20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
+**20** unknown, **21** unavailable. **21 is deliberately not 20**: `UNKNOWN` means no measurement was
+obtained, and its advice is *treat headroom as unknown*; `UNAVAILABLE` means a measurement was obtained
+and it is zero-spendable-forever. Folding the second into the first understates a known fact and leaves a
+caller waiting for a reading that is never coming. It is not `CRITICAL` either — that says commit now
+because a live pool is running out, which is not an account that has none.
+`UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
 or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
 with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
 stamped with a config root other than the one it sits under is **refused** rather than reported as this
