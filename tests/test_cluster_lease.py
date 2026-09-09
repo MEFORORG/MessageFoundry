@@ -19,6 +19,8 @@ real Postgres lands with the failover suite (Increment 3).
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from messagefoundry.pipeline.cluster import DbCoordinator
@@ -102,12 +104,14 @@ def _coord(
     node: str = "A",
     ttl: float = 30.0,
     fence: float = 20.0,
+    heartbeat: float = 10.0,
     acquire_delay_seconds: float = 0.0,
     promotable: bool = True,
 ) -> DbCoordinator:
     return DbCoordinator(
         pool,
         node,
+        heartbeat_seconds=heartbeat,
         leader_lease_ttl_seconds=ttl,
         leader_fence_timeout_seconds=fence,
         acquire_delay_seconds=acquire_delay_seconds,
@@ -465,3 +469,127 @@ async def test_promotable_standby_takes_over_from_non_promotable_gap() -> None:
     await ha._maintain_leadership()  # HA acquires the empty lease
     assert ha.is_leader() is True
     assert db.row is not None and db.row["owner"] == "HA"
+
+
+# --- ADR 0056 slice 1: planned failover (step_down_leadership) ---------------
+
+
+async def test_step_down_returns_the_release_and_expires_the_lease() -> None:
+    # The public seam reports what it actually did — (was_leader, released_at) — and expires the lease
+    # row exactly as the clean-stop release does. released_at is wall-clock (the audit trail's units),
+    # not the injected monotonic clock, so it is only bracketed here.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    before = time.time()
+    was_leader, released_at = await a.step_down_leadership()
+    after = time.time()
+
+    assert was_leader is True
+    assert released_at is not None and before <= released_at <= after
+    assert a.is_leader() is False
+    assert a.current_epoch() is None  # released: no longer a fenced leader (H1)
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+
+
+async def test_step_down_on_a_non_leader_releases_nothing() -> None:
+    # The endpoint's 409 rests on this: a node that never held the lease reports (False, None) and
+    # leaves a live sibling's lease untouched. This is what makes the pre-read unnecessary.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await a._maintain_leadership()  # A leads
+
+    assert await b.step_down_leadership() == (False, None)
+    assert a.is_leader() is True
+    assert db.row is not None and db.row["owner"] == "A"
+    assert db.row["lease_expires_at"] == 30.0  # untouched
+
+
+async def test_step_down_pauses_this_node_so_a_standby_wins_the_expired_lease() -> None:
+    # THE REGRESSION THIS PAUSE EXISTS FOR. _release_leadership expires lease_expires_at but leaves
+    # `owner` naming us, and the claim statement's renew branch (owner = me) carries NO expiry test —
+    # so without the pause the drained node's very next maintenance tick renews and takes leadership
+    # straight back, whichever node happens to tick first. The negative control below proves the fake
+    # pool really would hand it back, so this is not a vacuous pass.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono_a = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono_a, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    await a.step_down_leadership()
+    assert a._no_claim_until == 20.0  # two heartbeats on the injected monotonic clock
+
+    # A's own next tick, inside the window: it declines rather than renewing itself back in.
+    db_clock.t = mono_a.t = 10.0
+    await a._maintain_leadership()
+    assert a.is_leader() is False
+    assert db.row is not None and db.row["owner"] == "A"  # row untouched, still expired
+    assert db.row["lease_expires_at"] == 0.0
+
+    # The standby's tick inside the same window wins the expired lease and bumps the epoch (H1).
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    assert db.row["owner"] == "B" and db.row["leader_epoch"] == 2
+
+    # And the pause is bounded: past it, A contends normally again (it just cannot beat a live lease).
+    mono_a.t = 21.0
+    await a._maintain_leadership()
+    assert a.is_leader() is False  # B's lease is live, so the ordinary predicate refuses A
+
+
+async def test_without_the_pause_the_drained_node_renews_itself_back_in() -> None:
+    # NEGATIVE CONTROL for the test above: clear the pause and the same sequence hands leadership
+    # straight back to the node that was just drained. If this ever stops reproducing, the pause is no
+    # longer measuring what it claims to.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono_a = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono_a, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+    await a.step_down_leadership()
+
+    a._no_claim_until = 0.0  # the pause removed
+    db_clock.t = mono_a.t = 10.0
+    await a._maintain_leadership()
+    assert a.is_leader() is True  # re-armed itself; the planned failover did nothing
+
+
+async def test_step_down_fires_the_demotion_edge_and_leaves_the_node_running() -> None:
+    # A stepdown is a demotion the node SURVIVES, so the engine must learn about it on the same edge
+    # every other True->False transition uses (ADR 0157 Inc 5) rather than waiting out a reconcile
+    # poll. And the coordinator's background tasks are untouched — this is not a stop().
+    db = _FakeLeaseDB(_Clock(0.0))
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    fired: list[int] = []
+    a.set_on_demote(lambda: fired.append(1))
+    await a._maintain_leadership()
+
+    await a.step_down_leadership()
+    assert fired == [1]
+    assert a._stop.is_set() is False  # still running; the maintenance loop keeps heartbeating
+
+    # A second stepdown on the now-demoted node releases nothing and fires nothing more.
+    assert await a.step_down_leadership() == (False, None)
+    assert fired == [1]
+
+
+async def test_step_down_survives_a_failed_release_write() -> None:
+    # The DB write is best-effort (the lease ages out on its own if it fails), and the in-memory
+    # demotion happens BEFORE it — so a partitioned node still reports the demotion it really made
+    # rather than raising into the API handler.
+    db = _FakeLeaseDB(_Clock(0.0))
+    pool = _FakeLeasePool(db)
+    a = _coord(pool, _Clock(0.0), node="A")
+    await a._maintain_leadership()
+
+    pool.fail = True
+    was_leader, released_at = await a.step_down_leadership()
+    assert was_leader is True and released_at is not None
+    assert a.is_leader() is False

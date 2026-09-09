@@ -52,7 +52,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.cluster import ClusterMember, default_node_id
+from messagefoundry.pipeline.cluster import (
+    ClusterMember,
+    default_node_id,
+    stepdown_pause_seconds,
+)
 from messagefoundry.redaction import safe_exc
 
 log = logging.getLogger(__name__)
@@ -122,6 +126,9 @@ class SqlServerCoordinator:
         # Default (0.0, True) = byte-identical. Mirrors DbCoordinator.
         self._acquire_delay = acquire_delay_seconds
         self._promotable = promotable
+        # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
+        # step_down_leadership(). Mirrors DbCoordinator._no_claim_until — read its comment there.
+        self._no_claim_until: float = 0.0
         self._monotonic = monotonic
         # Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two
         # deployments sharing one database via different schemas don't contend / co-elect.
@@ -460,6 +467,11 @@ class SqlServerCoordinator:
             # NON-PROMOTABLE: never acquire or renew, so this node can never become/remain leader. Touch no
             # DB row — _maintain_leadership demotes a somehow-already-leader node; the fence is the backstop.
             return False
+        if self._monotonic() < self._no_claim_until:
+            # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
+            # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
+            # branch. Mirrors DbCoordinator._claim_or_renew_lease — read its comment there.
+            return False
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
@@ -518,13 +530,30 @@ class SqlServerCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def _release_leadership(self) -> None:
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
+        :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its
+        docstring for why the demotion edge fires and why this node pauses its own claim."""
+        was_leader, released_at = await self._release_leadership()
+        if was_leader:
+            # The pause length is the SHARED module-level policy, not a copy: a per-class copy of a
+            # safety-relevant timing constant is two files that can be retuned independently.
+            self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
+                self._heartbeat_seconds
+            )
+            self._fire_on_demote()
+        return (was_leader, released_at)
+
+    async def _release_leadership(self) -> tuple[bool, float | None]:
+        """``(was_leader, released_at)`` — mirrors ``DbCoordinator._release_leadership``, including the
+        demote-the-cached-gate-before-the-DB ordering and the stamp taken at the in-memory demotion."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader (H1)
         if not was_leader:
-            return
+            return (False, None)
+        released_at = time.time()
         self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
             await self._store._execute(
@@ -538,6 +567,7 @@ class SqlServerCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
+        return (True, released_at)
 
     # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
 

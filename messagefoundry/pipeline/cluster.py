@@ -144,6 +144,21 @@ def fence_tick_seconds(fence_timeout_seconds: float) -> float:
     return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
 
 
+def stepdown_pause_seconds(heartbeat_seconds: float) -> float:
+    """How long a node declines to claim after a VOLUNTARY stepdown (ADR 0056 slice 1).
+
+    Module-level, and shared by both coordinators, for the reason :func:`fence_tick_seconds` is: it is
+    pure arithmetic on a constructor argument with no backend in it, and a per-class copy is a
+    safety-relevant timing constant that two files can retune independently with nothing failing.
+
+    Two heartbeats. A sibling's acquire runs once per ``heartbeat_seconds`` at an unrelated phase, so a
+    full interval can elapse before it even looks at the expired lease and a second guarantees it has.
+    Deliberately short rather than lease-length: the cost of the pause is that a cluster with no other
+    promotable node is leaderless for it, which is the operator's own request but should not linger.
+    """
+    return 2.0 * heartbeat_seconds
+
+
 def demote_stop_budget(
     *, lease_ttl_seconds: float, fence_timeout_seconds: float
 ) -> tuple[float, float]:
@@ -291,6 +306,26 @@ class ClusterCoordinator(Protocol):
         leader with no lease/expiry."""
         ...
 
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        """Voluntarily release this node's leadership lease and **keep running** as a standby — the
+        planned-failover / maintenance-drain control plane behind ``POST /cluster/stepdown``
+        (ADR 0056, slice 1).
+
+        Returns ``(was_leader, released_at)``: whether this node actually held leadership at the moment
+        the release ran, and the epoch-seconds instant it was demoted (``None`` when it held none). **The
+        caller audits this return value, never a prior** :meth:`is_leader` **read** — a fence or a
+        lost-lease tick can flip leadership between the read and the release, and auditing the pre-read
+        would record ``was_leader=true`` for an action that released nothing.
+
+        This is a **visibility lift** of the release the coordinators already run on a clean
+        :meth:`stop`, not a new election mechanism: the lease, the self-fence and the epoch token are
+        unchanged. The one difference from :meth:`stop` is that the node stays up and keeps
+        heartbeating, so it reports itself a standby rather than leaving. :class:`NullCoordinator`
+        returns ``(False, None)`` — single-node has no lease to release (and the endpoint refuses a
+        single-node caller before reaching here).
+        """
+        ...
+
 
 class NullCoordinator:
     """The single-node default (SQLite and single-node Postgres). Every gate is ``True``, there is no
@@ -362,6 +397,13 @@ class NullCoordinator:
         # Single-node: permanently leader, no lease row / expiry. Report self as the holder with no
         # expiry so /cluster/nodes is byte-identical in shape to a real cluster's.
         return (self.node_id, None)
+
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        # Single-node: there is no lease to release and no standby to promote, so this releases
+        # nothing and reports so. Unreachable through the API — POST /cluster/stepdown refuses a
+        # single-node caller with 400 before it touches the coordinator (ADR 0056) — but a truthful
+        # answer here keeps the Protocol honest for any direct caller.
+        return (False, None)
 
 
 # One-time-per-process info guard: the active-passive HA feature set is COMPLETE — election (Step 4),
@@ -465,6 +507,10 @@ class DbCoordinator:
         # this node never claim/hold the lease at all. Default (0.0, True) = byte-identical to before.
         self._acquire_delay = acquire_delay_seconds
         self._promotable = promotable
+        # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
+        # step_down_leadership() so a voluntarily-drained node does not immediately re-arm itself via the
+        # renew branch. 0.0 = no pause, which is every path but a stepdown.
+        self._no_claim_until: float = 0.0
         # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
         # the lease uses: the fence measures a node-local elapsed duration (free of INTER-NODE skew —
         # that is the property being bought), the lease compares against the DB's own clock_timestamp().
@@ -961,6 +1007,12 @@ class DbCoordinator:
             # demote a node that was somehow already leader (a clean step-down), and the fence watchdog is
             # the backstop. At least one promotable node must exist or the cluster elects no leader.
             return False
+        if self._monotonic() < self._no_claim_until:
+            # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
+            # expired lease instead of us renewing it straight back. Same shape as the check above —
+            # touch no DB row, report not-held — and strictly stricter than the base predicate, so it
+            # can only delay a claim, never advance one.
+            return False
         row = await self._pool.fetchrow(
             "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
             "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3, 1) "
@@ -1031,16 +1083,51 @@ class DbCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def _release_leadership(self) -> None:
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        """Release leadership and stay up as a standby (ADR 0056 slice 1). See the Protocol method.
+
+        Reuses :meth:`_release_leadership` verbatim, so the ordering that makes the release safe —
+        demote the cached gate BEFORE touching the DB — is the same one ``stop()`` runs. Two things
+        ``stop()`` does not need, because ``stop()`` has already cancelled the loops and is leaving:
+
+        * **Fire the demotion edge** so the graph tears down at once instead of waiting out a whole
+          ``_graph_reconcile_interval`` poll (ADR 0157 Inc 5). Every other True->False transition
+          (``_maintain_leadership``, ``_check_fence``) fires it; a stepdown the node SURVIVES would
+          otherwise be the one demotion the engine learns about late.
+        * **Pause our own claim** for :func:`stepdown_pause_seconds`. Without it the stepdown is a
+          coin flip: :meth:`_release_leadership` expires ``lease_expires_at`` but leaves ``owner``
+          naming us, so the renew branch (``owner = me``, which carries no expiry test) matches on our
+          very next maintenance tick and hands leadership straight back — a drained node re-arming
+          itself while the endpoint reported 200. The pause is a strictly STRICTER claim predicate on
+          this node only (the same shape as ADR 0096's ``acquire_delay``), so it can only make us claim
+          LATER, never earlier, and cannot open a two-leader window. It changes nothing about the lease,
+          the self-fence or the epoch token.
+        """
+        was_leader, released_at = await self._release_leadership()
+        if was_leader:
+            # Stand down long enough that every sibling has had a full tick at the expired lease.
+            self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
+                self._heartbeat_seconds
+            )
+            self._fire_on_demote()
+        return (was_leader, released_at)
+
+    async def _release_leadership(self) -> tuple[bool, float | None]:
         """Best-effort clean release: demote the cached gate first (so a concurrent is_leader() reader
         never sees a stale True), then expire our lease row so a standby can acquire immediately on a
-        clean shutdown. Safe to call when never elected (the UPDATE simply matches no owned row)."""
+        clean shutdown. Safe to call when never elected (the UPDATE simply matches no owned row).
+
+        Returns ``(was_leader, released_at)`` — whether this node held leadership when the release ran,
+        and the epoch-seconds instant it was demoted. ``released_at`` is stamped at the in-memory
+        demotion, not after the DB round trip: that instant is when this node stopped answering
+        :meth:`is_leader` ``True``, which is the fact the audit trail is recording."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader
         if not was_leader:
-            return
+            return (False, None)
+        released_at = time.time()
         self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
             # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
@@ -1057,6 +1144,7 @@ class DbCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
+        return (True, released_at)
 
     # --- #145 leadership-transition alerts (never-raise) ---------------------
 
