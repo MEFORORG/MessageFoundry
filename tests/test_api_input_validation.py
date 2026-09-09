@@ -178,6 +178,42 @@ def test_the_shipped_connection_names_all_pass_the_rule() -> None:
     assert not bad, f"connection names that the API rule would refuse: {bad}"
 
 
+# --- The per-channel RBAC scope ---------------------------------------------------------------------
+
+
+def test_the_channel_scope_entry_rule_admits_the_token_the_auth_package_mints() -> None:
+    """The scope list's extra member, pinned to the auth package's constant rather than a literal.
+
+    ``api/validation.py`` spells the token ``*`` inline because it may not import the auth package.
+    This is what stops the copy drifting: if ``ALL_CHANNELS`` is ever respelled, the grant stops
+    being expressible through the API and this fails here instead of as a 400 nobody expected.
+    """
+    from messagefoundry.auth.identity import ALL_CHANNELS
+
+    assert _accepts(v.ChannelScopeEntry, ALL_CHANNELS)
+    assert _accepts(v.ChannelScopeEntry, "IB_ACME_ADT")  # control: an ordinary member still passes
+
+
+def test_the_all_channels_token_stops_at_the_scope_list() -> None:
+    """The rule widened one field, not the connection-name rule every path and filter shares.
+
+    Both arms matter. Without the first, ``*`` reaches ``{name}`` on a path and every ``channel_id``
+    filter, where nothing reads it as a wildcard. Without the second, the widening never happened.
+    """
+    assert not _accepts(v.ConnectionName, "*")
+    assert _accepts(v.ChannelScopeEntry, "*")
+
+
+def test_the_scope_rule_admits_the_whole_token_and_nothing_shaped_like_it() -> None:
+    """A sentinel, not a glob. Anchored on its own, so no partial wildcard rides in behind it."""
+    for bad in ("*ADT", "IB_*", "**", "* ", "*\n", "IB_ACME_ADT*", ""):
+        assert not _accepts(v.ChannelScopeEntry, bad), bad
+    # Every non-token member is still exactly a connection name -- the rule reuses that one.
+    for bad in ("../../etc/passwd", "IB/ACME", "9_LEADING_DIGIT", "A" * 257):
+        assert not _accepts(v.ChannelScopeEntry, bad), bad
+    assert _accepts(v.ChannelScopeEntry, "FILE-OUT_Test_ADT")
+
+
 # --- Time bounds ----------------------------------------------------------------------------------
 
 
@@ -304,9 +340,14 @@ def test_the_auth_models_carry_the_same_rules() -> None:
         CustomRoleRequest,
         RolesUpdateRequest,
     )
+    from messagefoundry.auth.identity import ALL_CHANNELS
 
     assert ChannelScope(channels=["IB_A", "FILE-OUT_Test_ADT"]).channels is not None
-    assert ChannelScope().channels is None  # the all-channels scope survives
+    # The all-channels GRANT is the token, and it has to survive the model or the route cannot
+    # express it at all. An omitted list is the unset scope, which DENIES since BACKLOG #1152 --
+    # this line used to call that "the all-channels scope", which is now the inverse of what it does.
+    assert ChannelScope(channels=[ALL_CHANNELS]).channels == [ALL_CHANNELS]
+    assert ChannelScope().channels is None
     with pytest.raises(ValidationError):
         ChannelScope(channels=["IB_A", "../../etc"])
     assert RolesUpdateRequest(roles=["viewer"]).roles == ["viewer"]

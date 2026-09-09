@@ -24,6 +24,7 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Role id | A lowercase word, or a custom role id | Each entry of a `roles` list |
 | Permission id | `area:action`, lowercase letters and underscores | Each entry of a `permissions` list |
 | Connection name | A letter, then letters, digits, `_` and `-`, up to 256 characters | `{name}` in a path, and `channel_id`, `destination_name`, `to`, `source`, `connection` |
+| Channel-scope entry | A connection name, or the all-channels token `*` on its own | Each entry of the `channels` list on `PUT /users/{user_id}/channel-scope` |
 | Time bound | A finite number from 0 up to 4102444800 (2100-01-01 UTC) | `received_from`, `received_to`, `since`, `until` |
 | Free text | Printable text, no control characters, up to 512 characters | `content`, `field_value` |
 | Vocabulary token | Letters and underscores, up to 64 characters | `status`, and each `kind` on the event routes |
@@ -57,6 +58,15 @@ rejects a hyphen. Four connection names shipped in this repository contain one, 
 extension's narrower rule would make four connections unreachable through the API. The rule here
 admits them. What it still excludes earns its place: path characters, whitespace, control characters,
 and the quoting characters a value would need to carry meaning into a URL or a query.
+
+**One list holds a value that is not a connection name, and it stops there.** A user's `channels`
+scope may carry `*`, the all-channels grant. That grant used to be spelled by sending no list at all;
+BACKLOG #1152 made an absent scope deny, so `*` is now the only way to ask for the whole estate, and
+a rule that refused it would refuse the field's own purpose. The token is admitted in that one list
+and nowhere else. Widening the connection-name rule instead would let `*` through `{name}` on a path
+and through every `channel_id` filter, where nothing reads it as a wildcard. It is a whole value with
+its own anchors, so `IB_*` and `*ADT` are still refused, and every other member of the list is still
+exactly a connection name.
 
 **A time bound must be finite, and that was the gap.** A lower bound of zero does not exclude
 infinity. Before this rule, `?received_from=inf` was accepted and reached a database query, and the

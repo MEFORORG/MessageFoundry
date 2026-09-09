@@ -22,6 +22,7 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_RESET_MFA,
@@ -235,10 +236,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
         names = [ln.strip() for ln in form.get("channels", "").splitlines() if ln.strip()]
-        # The tri-state scope_mode keeps deny-all ([]) distinguishable from all-channels (None) —
-        # an empty textarea alone must never widen a stored deny-all scope (review PR2-M3).
-        # Absent (a pre-tri-state cached form) defaults to "list"; any OTHER value is a
-        # hand-crafted post — refused rather than guessed (deny-by-default).
+        # The tri-state scope_mode keeps deny-all distinguishable from all-channels — an empty
+        # textarea alone must never widen a stored deny-all scope (review PR2-M3). Absent (a
+        # pre-tri-state cached form) defaults to "list"; any OTHER value is a hand-crafted post —
+        # refused rather than guessed (deny-by-default).
         mode = form.get("scope_mode", "list")
         if mode not in ("all", "list", "none"):
             return await _user_detail(
@@ -255,7 +256,29 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
             )
-        channels = None if mode == "all" else ([] if mode == "none" else names)
+        # The token never rides in through the textarea. `set_channel_scope` stores the list as
+        # typed, but `auth.service._allowed_channels` returns None -- every channel -- for any
+        # stored list the token appears in, so "only these connections" with `*` in the box would
+        # grant the whole estate while the form said otherwise, and the saved list would still read
+        # as a narrow one. Measured: ["*", "IB_A"] resolves to None. That is the
+        # read-one-thing-do-another shape the tri-state mode exists to prevent (review PR2-M3), and
+        # the all-channels mode is right there for an operator who means it. Refused HERE and not in
+        # the request model, because the model serves the JSON route too, and there a list holding
+        # the token is the only spelling of that grant and means exactly what it says.
+        if mode == "list" and ALL_CHANNELS in names:
+            return await _user_detail(
+                user_id,
+                service,
+                identity,
+                error=(
+                    f"{ALL_CHANNELS!r} is the all-channels grant, not a connection name -- "
+                    "choose the all-channels scope instead of listing it"
+                ),
+                status_code=400,
+            )
+        # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
+        # and [] both deny, so posting null for "all" would have silently inverted this form.
+        channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         try:
             body = ChannelScope(channels=channels)
             await admin.set_channel_scope(user_id, body=body, service=service, identity=identity)

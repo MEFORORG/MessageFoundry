@@ -12,6 +12,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import AuthProvider, Identity, Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
@@ -79,8 +80,21 @@ async def _login(c: httpx.AsyncClient, username: str) -> dict[str, str]:
 
 
 def test_identity_can_access_channel() -> None:
-    allc = Identity.build(user_id="1", username="u", auth_provider=AuthProvider.LOCAL, roles=[])
+    # BACKLOG #1152: omitting allowed_channels DENIES. The wide scope is now spelled out.
+    unprovisioned = Identity.build(
+        user_id="0", username="fresh", auth_provider=AuthProvider.LOCAL, roles=[]
+    )
+    assert not unprovisioned.can_access_channel("anything")
+    assert unprovisioned.has_no_channels
+    allc = Identity.build(
+        user_id="1",
+        username="u",
+        auth_provider=AuthProvider.LOCAL,
+        roles=[],
+        allowed_channels=None,
+    )
     assert allc.can_access_channel("anything")  # None scope = all
+    assert not allc.has_no_channels
     scoped = Identity.build(
         user_id="2",
         username="s",
@@ -211,7 +225,10 @@ async def test_scoped_user_graph_edges_hides_shared_outbound(engine: Engine) -> 
     service = await _service(engine)
     scoped_uid = await _add(service, "op", Role.OPERATOR)
     await service.set_channel_scope(scoped_uid, ["IB_A"], actor="admin")
-    await _add(service, "boss", Role.OPERATOR)  # NO channel scope → unscoped
+    wide_uid = await _add(service, "boss", Role.OPERATOR)
+    # An explicit all-channels grant (BACKLOG #1152). Leaving the scope unset used to mean this and
+    # now denies, so the estate-wide arm of the comparison has to be granted rather than assumed.
+    await service.set_channel_scope(wide_uid, [ALL_CHANNELS], actor="admin")
 
     async with _client(engine, service) as c:
         scoped = (await c.get("/graph/edges", headers=await _login(c, "op"))).json()
@@ -293,16 +310,44 @@ async def test_credential_test_route_authorizes_before_disclosing_config(engine:
         assert (await c.post("/connections/IB_NOPE/test-credential", headers=h)).status_code == 404
 
 
-async def test_unscoped_user_and_admin_have_full_access(engine: Engine) -> None:
+async def test_unprovisioned_operator_reaches_nothing_until_granted(engine: Engine) -> None:
+    """BACKLOG #1152 (ASVS 8.2.2), the INVERSION of the test that used to pin the permissive default.
+
+    A freshly minted non-administrator has never had a scope written -- ``create_user``'s INSERT does
+    not list ``channel_scope``, so the column is SQL NULL. That used to resolve to "every channel",
+    which meant every per-channel check in the API narrowed nobody on a default install. It now
+    resolves to the empty set, so the same account reaches no message until somebody grants a
+    channel, and the grant is what changes the answer -- asserted here in the same test so a
+    regression that re-widens the default cannot pass by leaving both arms denied."""
     service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)  # no scope set → NULL → all channels
+    op_id = await _add(service, "op", Role.OPERATOR)
     admin_id = await _add(service, "boss", Role.ADMINISTRATOR)
     await service.set_channel_scope(admin_id, ["IB_A"], actor="admin")  # ignored for admins
     mid_b = await engine.store.enqueue_message(channel_id="IB_B", raw=ADT, deliveries=[("d", ADT)])
     async with _client(engine, service) as c:
-        for who in ("op", "boss"):
-            h = await _login(c, who)
-            assert (await c.get(f"/messages/{mid_b}", headers=h)).status_code == 200
+        # The unprovisioned operator: 404, the same answer another tenant's message gets.
+        assert (await c.get(f"/messages/{mid_b}", headers=await _login(c, "op"))).status_code == 404
+        # The administrator is all-channels by role, so the first operator of a fresh install is
+        # never locked out of their own console.
+        assert (
+            await c.get(f"/messages/{mid_b}", headers=await _login(c, "boss"))
+        ).status_code == 200
+        # Grant the channel and the SAME account now reaches it.
+        await service.set_channel_scope(op_id, ["IB_B"], actor="admin")
+        assert (await c.get(f"/messages/{mid_b}", headers=await _login(c, "op"))).status_code == 200
+
+
+async def test_explicit_all_channels_grant_reaches_the_estate(engine: Engine) -> None:
+    """BACKLOG #1152: all-channels survives as a grant somebody typed -- the ``*`` token in the
+    stored scope -- so an operator who genuinely needs the estate can still be given it without the
+    ADMINISTRATOR role. This is the arm that keeps the default flip from being a capability loss."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    mid_b = await engine.store.enqueue_message(channel_id="IB_B", raw=ADT, deliveries=[("d", ADT)])
+    async with _client(engine, service) as c:
+        assert (await c.get(f"/messages/{mid_b}", headers=await _login(c, "op"))).status_code == 404
+        await service.set_channel_scope(op_id, [ALL_CHANNELS], actor="admin")
+        assert (await c.get(f"/messages/{mid_b}", headers=await _login(c, "op"))).status_code == 200
 
 
 async def test_channel_scope_admin_endpoint_roundtrip(engine: Engine) -> None:

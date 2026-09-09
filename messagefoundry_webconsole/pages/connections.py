@@ -20,6 +20,7 @@ from .._html import Markup, el, page, rows_table, text
 from ._common import _num, _secs, _seg
 
 __all__ = [
+    "UNPROVISIONED_NOTICE",
     "bulk_control_result",
     "connection_details",
     "connections_fragment",
@@ -29,6 +30,7 @@ __all__ = [
     "purge_confirm",
     "purge_pending",
     "purge_result",
+    "unprovisioned_banner",
 ]
 
 
@@ -308,8 +310,35 @@ def _flagged_only_toggle() -> Markup:
     )
 
 
-def dashboard(rows: list[ConnectionRow]) -> Markup:
+#: Shown on the landing page to an operator whose per-channel scope is empty (BACKLOG #1152).
+#: A fresh non-administrator is granted no channel, so every list on this console is legitimately
+#: empty for them. Without this sentence that state is indistinguishable from a broken install, and
+#: an operator who reads it as broken RBAC files a bug or -- worse -- gets handed a wider grant to
+#: make the symptom go away. It says what happened, who fixes it, and nothing about the estate: it
+#: must not name a connection the reader is not authorized to know exists.
+UNPROVISIONED_NOTICE = (
+    "Your account is not granted access to any connection yet, so these lists are empty. "
+    "Ask an administrator to set your channel scope."
+)
+
+
+def unprovisioned_banner(unprovisioned: bool) -> Markup:
+    """The :data:`UNPROVISIONED_NOTICE` alert, or nothing.
+
+    ``role="alert"`` so it reaches a screen reader that never sees the empty table below it."""
+    if not unprovisioned:
+        return Markup("")
+    return el("p", UNPROVISIONED_NOTICE, class_="banner", role="alert")
+
+
+def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Markup:
     """The connections dashboard page; the table auto-refreshes via the first-party poll script.
+
+    ``unprovisioned`` raises :data:`UNPROVISIONED_NOTICE` above the table — the first-run affordance
+    for an operator with an empty channel scope (BACKLOG #1152). It is DELIBERATELY a page banner
+    and not a start-time refusal: refusing to start would make a fresh single-operator install
+    unbootable for the same condition, which is a worse answer to the same question. It defaults
+    False so every other caller renders byte-identically.
 
     ``data-poll`` names the same-origin fragment endpoint; ``app.js`` fetches it every ``data-poll-ms``
     and replaces this container's content with the server-rendered, already-escaped fragment. The
@@ -329,6 +358,10 @@ def dashboard(rows: list[ConnectionRow]) -> Markup:
         "Connections",
         # Header + the filter/bulk-action toolbar on one row.
         el("div", el("h1", "Connections"), _controls_toolbar(), class_="page-head"),
+        # Outside [data-poll]: the 5s fragment swap replaces the table only, and this notice must
+        # survive it — an operator who scrolls past the first refresh must still see why the page
+        # is empty.
+        unprovisioned_banner(unprovisioned),
         livestats,
         live,
         active="dashboard",
