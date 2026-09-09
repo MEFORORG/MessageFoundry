@@ -28413,24 +28413,6 @@ drift into a named failure at commit time rather than a red a day later.
 
 ---
 
-## 1496. ADR 0056 records an engine-managed VIP design that nothing tracks and nothing else in the repository mentions
-
-> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **2/10** · _fill-in_. Found by an ADR-to-backlog sweep over all 172 ADRs. The ADR says outright that there is no engine-managed-VIP code, and a search for `0056` across the tree returns exactly one hit outside the ADR file: its own index row. No backlog item, no code comment, no other document. It is the only ADR in the corpus with zero references anywhere.
-> Verdict: owner-ruling
-> Research: none -- the measurement is in the body
-> Closing-act: owner-ruling
-
-**Cluster:** HA/DR posture. **Priority:** P3. **Verdict:** rule on it, then either build or retire.
-**Severity:** no deployment axis (sec. 0). Design-only, and nothing shipped depends on it.
-
-**The measurement.** [ADR 0056](adr/0056-engine-managed-vip-failover.md) is `Proposed (2026-06-27, design-only)`. Its own Status says: *"There is **no engine-managed-VIP code today** -- every reference below to a bind/release/`/cluster/stepdown`/VIP-owner field is **proposed**, not built."* Searching the whole tree for the string `0056` finds the ADR file and `docs/adr/README.md:91`. Nothing else.
-
-**Why that matters and is not just tidiness.** The VIP references that *do* exist in the engine belong to a different decision. `api/app.py` and `config/settings.py` carry an **acquire-VIP-or-abort** fence around DR activation, and it calls an **operator-supplied takeover hook** ([ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)) -- the engine does not own the address. A reader who finds those hits and then finds ADR 0056 can easily conclude the engine manages the VIP itself. It does not.
-
-**The ruling needed.** Either (1) engine-managed VIP is wanted and this becomes a build item, or (2) the operator-hook model of ADR 0047/0048 is the answer and ADR 0056 is retired with a status that says so. Do not leave it Proposed: a design-only ADR with no tracking item is indistinguishable from work that was forgotten.
-
----
-
 ## 1497. ADR 0157 leaves increments 0, 2 and 3 unbuilt, says increment 2 is mis-specified, and no open item carries any of it
 
 > 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **6/10** · Difficulty **6/10** · _big bet_. Found by an ADR-to-backlog sweep. The ADR names three unbuilt increments in its own opening blockquote and warns that one of them must not be built as written. Its only backlog reference is a closed test-flake row about a wall-clock assertion, so the engine work has no home. Value 6: on a first deployment against SQL Server this is an absent in-flight recovery path plus two unfenced write paths on a demoted node. Difficulty 6: cross-backend store work under the fence invariant, and the specification has to be repaired before anyone can build it.
