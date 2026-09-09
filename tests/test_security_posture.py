@@ -371,6 +371,13 @@ def test_required_jobs_declare_no_skippable_job_level_if() -> None:
 # durable rule is the header's own: it defines no triggers at all. _HISTORICAL_DENIAL below is a LIVE
 # positive control, kept verbatim so the detector is re-proved able to fire on every run rather than
 # being trusted to.
+#
+# ONE THING TO EXPECT AND NOT MISREAD, since 2026-09-08: the push-to-main arm really was removed, so
+# _HISTORICAL_DENIAL's claim is now TRUE of the `on:` block and the detector would still red a header
+# that made it. That is not a bug in the tripwire. The rule being enforced is not "the header must be
+# accurate about the triggers", it is "the header must not describe them at all" -- an accurate second
+# definition is still a second definition, and it is free to go stale the next time the first one
+# moves. This exact arm moving twice is the argument, not a counterexample to it.
 _HEADER_DENIAL = re.compile(r"\bno\s+(pull_request|push|schedule|cron|workflow_dispatch)\b", re.I)
 _HISTORICAL_DENIAL = "# NO push-to-main trigger (dropped for CI cost): every push to main is an"
 
@@ -411,10 +418,20 @@ def test_the_security_header_does_not_contradict_its_own_triggers() -> None:
     against the historical text in the same run.
     """
     events = _declared_events(_SECURITY)
-    assert "push" in events, (
-        "security.yml no longer declares a `push` trigger. That may be correct (a merge-queue move "
-        "would remove it), but this test's positive control assumes it -- re-derive rather than "
-        "deleting the test, or the header is free to drift again in the other direction."
+    # POSITIVE CONTROL ON THE EVENT READ, re-derived 2026-09-08. It pinned `push` until the
+    # post-merge `push: branches: [main]` arm was removed as a re-scan of the tree its own
+    # merge_group run had just gated -- the merge-queue move the previous wording anticipated. It is
+    # re-pointed at `merge_group` and NOT deleted, because its job is to prove `_declared_events`
+    # returned a real parse of a real `on:` block: without it a locator or YAML-key failure would
+    # make the denial assertion below pass over an empty set. `merge_group` is the strongest anchor
+    # available now -- security.yml's own `on:` block marks it DO NOT REMOVE, since a required
+    # context that stops reporting in the queue stops all merging.
+    assert "merge_group" in events, (
+        "security.yml no longer declares a `merge_group` trigger. Read that as a merge-blocking "
+        "regression FIRST -- its jobs are required contexts, and a required context whose workflow "
+        "has no merge_group arm never reports on the queue commit. If the trigger set was moved "
+        "deliberately, re-derive this control against a trigger the file still declares rather than "
+        "deleting it, or the header is free to drift again in the other direction."
     )
 
     header = _header_block((WORKFLOWS / _SECURITY).read_text(encoding="utf-8"))

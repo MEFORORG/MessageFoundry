@@ -9,10 +9,11 @@ name: Branch leak scan
 # required context gates MERGING, which is not the event this watches.
 #
 # WHY IT EXISTS AT ALL, i.e. why the leak gate in security.yml is not enough. That workflow's
-# `forbidden-content` job triggers on pull_request, push to main, and a daily cron. A branch pushed
-# WITHOUT a pull request is scanned by none of them, and that is exactly the shape of the realistic
-# leak: a branch cut from a fetched private-lineage ref carries docs/security inside a commit TREE,
-# where .gitignore is never consulted because the files never went through the index.
+# `forbidden-content` job triggers on at least pull_request, merge_group and a daily cron; read that
+# workflow's `on:` block for the live set rather than this sentence. A branch pushed WITHOUT a pull
+# request is scanned by none of them, and that is exactly the shape of the realistic leak: a branch
+# cut from a fetched private-lineage ref carries docs/security inside a commit TREE, where
+# .gitignore is never consulted because the files never went through the index.
 #
 # WHY THIS IS NOT DONE SERVER-SIDE, which would be strictly better. It cannot be, and this was
 # measured on 2026-08-05 rather than assumed:
@@ -35,14 +36,18 @@ name: Branch leak scan
 # report green by not running. Paying for a small job on every branch push buys an answer that does
 # not depend on undocumented behaviour.
 #
-# COST, stated because CI cost is a live constraint here (see security.yml's header on why the
-# push-to-main arm was scoped): one ubuntu job, checkout plus setup-python plus a stdlib-only
-# scanner, no install step and no dependency resolution.
+# COST, stated because CI cost is a live constraint here -- live enough that security.yml dropped its
+# post-merge `push: branches: [main]` arm on 2026-09-08 as a re-scan of a tree its merge_group run had
+# just scanned: one ubuntu job, checkout plus setup-python plus a stdlib-only scanner, no install step
+# and no dependency resolution.
 
 on:
   push:
-    # `main` is already covered by security.yml's own push arm; scanning it here would duplicate that
-    # for no added signal.
+    # `main` is out of scope for a different reason than the rest of this file. This job watches a
+    # branch pushed WITHOUT a pull request; branch protection refuses that shape on `main`, so what
+    # reaches `main` arrives through the merge queue, where security.yml's `forbidden-content` has
+    # already run fully-loaded on the queue entry, with the daily cron behind it. This comment used to
+    # cite security.yml's own push-to-main arm, removed 2026-09-08.
     branches-ignore:
       - main
 
