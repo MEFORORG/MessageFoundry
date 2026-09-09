@@ -55,8 +55,10 @@ Replace the tick-counted trigger with two, and drop the tick unit rather than la
 
 1. **Front-load.** The first `_FRONTLOAD_WALKS = 4` ticks of a sampler's life each re-walk, however
    little time has passed.
-2. **Then amortise on time.** After that a walk runs only once `_RESOLVE_INTERVAL_S = 5.0` seconds
-   have elapsed since the last one.
+2. **Then amortise on time.** After that a walk runs only once `_RESOLVE_INTERVAL_S = 15.0` seconds
+   have elapsed since the last one. **This line read `_RESOLVE_INTERVAL_S = 5.0` as accepted on
+   2026-08-28. That value was superseded the same day under this same item, and the record was not
+   corrected until 2026-09-09** -- see *Amendment -- 2026-09-09* at the foot of this ADR.
 
 `FdSampler.__init__` now takes `frontload_walks` and `resolve_interval_s`; `resolve_every` is gone.
 Both call sites (`harness/load/connscale/runner.py`, `harness/load/estate/runner.py`) construct the
@@ -104,7 +106,8 @@ defect's case. Recorded here so it is not proposed naively later.
 The short profiles now re-walk on every tick they have, because their whole window sits inside the
 front-load. That is the cost of seeing a topology change in a two-tick window, and there is no cheaper
 way to see one. The long profile (`connscale.toml`, hold 60 / poll 1.0) keeps the amortisation: four
-front-loaded walks, then one per five seconds.
+front-loaded walks, then one per fifteen seconds. *This read "one per five seconds" as accepted;
+corrected 2026-09-09 with the constant in the Decision.*
 
 **The tick count per step narrows, and that is stated rather than glossed.** A walking tick costs more
 than a cached one, so fewer fit. Measured end to end on the CI cell before and after: `fd_probe_ticks`
@@ -134,3 +137,38 @@ hold ladder re-resolves. The amortisation control -- 30 ticks past the front-loa
 The 438-to-1016 pair above is a controlled stand-in tree, not an engine measurement, and must never be
 presented as the engine's per-worker footprint. The resource question stays open; #1357 is the reason
 it cannot yet be answered.
+
+## Amendment -- 2026-09-09: the interval this ADR decided at 5.0 seconds ships at 15.0
+
+**This supersedes the `_RESOLVE_INTERVAL_S = 5.0` in the Decision above and the same number in this
+ADR's index row in [README.md](README.md).** Both are corrected in place, with the superseded value
+kept and dated where it stood. Nothing else here moves. The two-trigger mechanism is BUILT and
+wired, `_FRONTLOAD_WALKS = 4` is exactly as decided, and this is a wrong number in a record rather
+than a defect in the instrument.
+
+**5.0 really shipped and was really raised, so do not read this as a typo.** Commit `227568a94`
+(2026-08-28) added this ADR and set `_RESOLVE_INTERVAL_S` to 5.0. Commit `51ead1399`, the same day
+and under this same BACKLOG #1357, raised it to 15.0, because 5.0 EQUALLED `_PROBE_TIMEOUT_S`.
+`FdSampler._resolve_pids` stamps `_last_walk_at` BEFORE the walk, so a walk that spent its whole 5.0
+second budget returned at exactly the interval, `FdSampler._due_for_rewalk` was already true, and the
+probe re-walked every tick. The amortisation this ADR exists to buy was worth zero on the one path it
+bounds. That second commit touched `harness/load/connscale/probe.py` and
+`tests/test_connscale_probe_degradation.py` and nothing else, which is where the record went stale.
+
+**The record reached `main` already disagreeing with the code beside it.** PR 669 squashed both
+commits into `f10867ce4`, so one commit added a Decision reading 5.0 and a `probe.py` reading 15.0.
+That disagreement then stood until #1357 recorded it by hand.
+
+**The margin is now a correctness coupling with a test on it.** `probe.py` states the reason at
+`_RESOLVE_INTERVAL_S`: the interval must be strictly greater than `_PROBE_TIMEOUT_S`, because
+charging a failed walk for its attempt buys nothing unless the interval outlives what the attempt may
+legally take. `tests/test_connscale_probe_degradation.py` asserts the inequality in
+`test_the_rewalk_interval_outlives_a_walk_that_spends_its_whole_budget`, and what it buys in
+`test_a_timed_out_walk_is_not_due_for_a_rewalk_the_instant_it_returns`. Anyone restoring 5.0 from the
+old text would reintroduce the every-tick re-walk and turn both red.
+
+**What this amendment does NOT revise.** The defect, the alternatives and the pre-fix measurements
+above stand as written. The post-fix figures under *Consequences* -- the PID set moving 6 to 14, the
+handle sum moving 438 to 1016, and the amortisation control that made 7 walks over 30 ticks -- were
+measured at 5.0, before the raise, and are left as recorded rather than re-run. A longer interval
+walks less often, so that control's conclusion still holds at 15.0; its count of 7 would not repeat.
