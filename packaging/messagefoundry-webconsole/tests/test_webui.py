@@ -2626,6 +2626,47 @@ async def test_channel_scope_roundtrip(engine: Engine) -> None:
         assert user is not None and json_.loads(user.channel_scope or "null") == [ALL_CHANNELS]
 
 
+async def test_the_all_channels_token_cannot_ride_in_through_the_textarea(engine: Engine) -> None:
+    """The "only these connections" mode must mean that. Any stored list the token appears in
+    resolves to every channel, so accepting one here would grant the whole estate while the form
+    said otherwise and the saved list still read as a narrow one -- the read-one-thing-do-another
+    shape the tri-state mode exists to prevent. The request model cannot be where this is refused:
+    the JSON route shares that model, and there a list holding the token IS the grant."""
+    import json as json_
+
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        r = await c.post(
+            f"/ui/users/{uid}/channel-scope",
+            data={"scope_mode": "list", "channels": "IB_ACME_ADT"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303  # control: an ordinary list still saves
+        for typed in (ALL_CHANNELS, f"{ALL_CHANNELS}\r\nIB_LAB_ORU"):
+            r = await c.post(
+                f"/ui/users/{uid}/channel-scope",
+                data={"scope_mode": "list", "channels": typed},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 400, typed
+            assert "all-channels grant" in r.text, typed
+            # Refused means unchanged, not partly applied.
+            user = await service.store.get_user(uid)
+            assert user is not None
+            assert json_.loads(user.channel_scope or "null") == ["IB_ACME_ADT"], typed
+        # ...and the mode that DOES mean it still works, so the guard did not just break the grant.
+        r = await c.post(
+            f"/ui/users/{uid}/channel-scope",
+            data={"scope_mode": "all", "channels": ""},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and json_.loads(user.channel_scope or "null") == [ALL_CHANNELS]
+
+
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)
