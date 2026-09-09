@@ -354,12 +354,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **109 route objects** — 68 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (67 HTTP + 1 WebSocket) and 38 declared in
+**Counting basis.** `create_app()` with no arguments builds **109 route objects** — 71 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket, `/ws/stats`) and 38 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 113 (`/openapi.json`,
 `/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 210
-(109 + the console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
+(109 + the 100 console routes + the `/ui/static` mount). Of the 109: **91 are permission-gated**, 18 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -588,13 +588,13 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **95 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **100 routes + one `/ui/static` mount** (federation off,
 the default — the two `/ui/oidc/*` routes are registered only when `[auth].oidc_enabled`). They are
-functions too, and they gate on the **same 28-permission catalogue** through parallel wrappers —
+functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
 cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 87 of the 95 are gated; the 8 that are not are the
+**Route → permission map (`/ui` plane).** 90 of the 100 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -720,7 +720,7 @@ re-implement the gate's checks by hand, in the gate's order (`must_change` befor
 factor), and neither is reachable without a live session cookie — "unauthenticated" here means
 "carries no `Depends` gate", not "open".
 
-The `/ui/static` **mount** is the ninth unauthenticated served path, and it is not a route at all:
+The `/ui/static` **mount** is the eleventh unauthenticated served path, and it is not a route at all:
 `StaticFiles` serves it with **no gate whatsoever** — no session, no permission, not even the 503
 fail-closed arm that `GET /ui` returns when no `AuthService` is attached. It carries only the console's
 own versioned CSS/JS — no PHI, no account state, no engine data — and it is still subject to the

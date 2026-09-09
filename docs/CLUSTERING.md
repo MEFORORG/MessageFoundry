@@ -351,11 +351,23 @@ POST /cluster/stepdown        # body: {} — there are no options
 - **`was_leader` is what the release returned**, not a reading taken before it. A fence or a lost-lease
   tick can move leadership in between, so a "was this node the leader?" check made first could report a
   failover that released nothing. The same returned value is what the audit row records.
-- **Statuses:** `400` on a single node (no lease, no standby); `409` when this node is not the leader —
-  resolve the leader from `GET /cluster/nodes` and call it there, this is not a retry; `403` on a missing
-  permission, a stale step-up or an unsatisfied second factor; `503` when the engine is not started.
+- **Statuses:** `400` when the deployment is **not clustered** — `[cluster]` disabled, or a store with no
+  cluster coordinator — so there is no lease to release; `409` when this node is not the leader — resolve
+  the leader from `GET /cluster/nodes` and call it there, this is not a retry; `403` on a missing
+  permission, a stale step-up or an unsatisfied second factor; `503` when the engine is not started, or
+  when the drain could not be achieved (see the next bullet).
+- **`400` does not mean "one node".** The gate reads whether clustering is *enabled*, not how many nodes
+  are live, so a clustered install that happens to be running one node accepts the call and goes
+  leaderless for the pause. Keying the refusal on whether a promotable sibling actually exists is
+  [BACKLOG #1509](BACKLOG.md); until then, read `GET /cluster/nodes` first.
+- **A `503` means the node was NOT drained.** The engine answers it when it could not write the lease
+  row, or when the maintenance tick did not yield inside `leader_fence_timeout_seconds`. In both cases
+  the lease stays live and owned by this node, so no standby can take it and the node takes leadership
+  back on its own — do not start maintenance. Retry, and if it repeats, look at the store connection.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
-  `{node_id, was_leader, released_at}` — cluster metadata only, never message content.
+  `{node_id, was_leader, released_at}` — cluster metadata only, never message content. The refusals the
+  handler itself reaches (`400`, `503`) write `cluster_stepdown_denied` with a reason instead, so a
+  failed drain is never recorded as a drain.
 - **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
   `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
 
@@ -367,6 +379,14 @@ path, so plan the switchover the same way you plan a restart.
 stepdown it declines to claim or renew, so a sibling wins the expired lease rather than the node you
 just drained renewing itself straight back. On a cluster with no other promotable node that window is
 leaderless, which is the honest consequence of asking the only eligible node to step down.
+
+**Two known limits, so you can plan around them rather than discover them.** A sibling whose
+`acquire_delay_seconds` is longer than two heartbeats is still handicapped out when the pause ends, and
+the node you drained then reclaims its own lease ([BACKLOG #1507](BACKLOG.md)). And a node that has
+already **self-fenced** cannot be drained at all: it holds no leadership to release, so the call answers
+`409` while `GET /cluster/nodes` still shows it as the lease owner until the lease ages out
+([BACKLOG #1508](BACKLOG.md)). In that state the node is already not doing leader work; wait out
+`leader_lease_ttl_seconds` rather than retrying the stepdown.
 
 ### Tune the lease timings to your network
 

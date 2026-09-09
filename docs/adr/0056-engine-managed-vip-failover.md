@@ -4,9 +4,22 @@
   halves separately, because they are at different build states and conflating them is how a reader ends
   up designing for an address the engine does not move:
   - **BUILT — the planned-failover control plane.** `POST /cluster/stepdown`, the `CLUSTER_CONTROL`
-    (`cluster:control`) permission, and the coordinator's public `step_down_leadership()` seam. That is
-    §"Control API — planned failover" below, minus the two things it defers on its own terms: the
-    `force` flag and `new_leader_eligible`.
+    (`cluster:control`) permission, and the coordinator's public `step_down_leadership()` seam — the
+    three subsections §"Proposed endpoint", §"Coordinator seam" and §"RBAC & audit" below, **less at
+    least** the `force` flag and `new_leader_eligible`, which that section defers on its own terms.
+    Read "at least" literally: this is a pointer to what shipped, not a closed enumeration of every
+    sentence in those subsections, and where a line there disagrees with the code the code is current.
+    Two known divergences, both introduced by the build and recorded rather than left for a reader to
+    trip over: `503` also covers a drain the engine could not achieve (a lease row it could not write,
+    or a maintenance tick that did not yield inside the fence timeout), and the `400` gate keys on
+    whether clustering is ENABLED rather than on whether a promotable sibling exists (BACKLOG #1509).
+  - **STALE AND UNBUILT — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API —
+    planned failover" and is therefore not covered by the bullet above. It names `client.stepdown_node`,
+    `poll_client`, the `_request` challenge path and an off-thread `AsyncRunner` — all PySide6 desktop
+    console symbols that went with that console — and it tells the confirm dialog to promise the
+    operator that "the VIP will move", which the paused-VIP bullet below denies. Nothing there is built.
+    Do not build from it; the web console page is BACKLOG #1495. Its one durable point survives the
+    move: render the leaderless window honestly rather than as "no live leader".
   - **PROPOSED AND PAUSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release,
     the gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
     `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
@@ -532,6 +545,13 @@ promotion; this API contract is unchanged by it.
   to node identifiers.
 
 ### Confirm / step-up posture (console)
+
+> **STALE — DO NOT BUILD FROM THIS SUBSECTION. Nothing here is built.** Every symbol it names
+> (`client.stepdown_node`, `poll_client`, `_request`, `AsyncRunner`) belonged to the retired PySide6
+> desktop console; the operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
+> below also has the dialog promise that "the VIP will move", which the engine does not do and is not
+> going to do until the paused VIP mechanism is decided. Kept for step 4's point, which does survive the
+> move to the web console: render the leaderless window honestly.
 
 The failover button follows the established **privileged-write** pattern, not the read pattern:
 

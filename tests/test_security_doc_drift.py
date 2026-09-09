@@ -727,7 +727,7 @@ def test_route_count_parity_with_the_console_mounted() -> None:
     pytest.importorskip("messagefoundry_webconsole")
     assert len(create_app(serve_ui=True).routes) == _ROUTES_WITH_UI, (
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
-        "'94 routes + one /ui/static mount' statement in the same change."
+        "'100 routes + one /ui/static mount' statement in the same change."
     )
 
 
@@ -877,8 +877,9 @@ def _ui_route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
 
 
 def test_every_ui_route_appears_in_the_ui_route_map() -> None:
-    """The console plane is 96 of the 201 served functions and the SOLE operator UI in the deployed
-    posture, so 8.1.1's "every function" includes it.
+    """The console plane is 100 of the 210 route objects a ``serve_ui=True`` app serves — 209 endpoint
+    functions plus the one ``/ui/static`` mount — and the SOLE operator UI in the deployed posture, so
+    8.1.1's "every function" includes it.
 
     RULE: a ``/ui`` route needs a row stating its permission and its wrapper, in both directions.
     ~20 of them have no JSON counterpart from which the authorization could be inferred.

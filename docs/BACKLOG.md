@@ -28904,6 +28904,28 @@ disaster-recovery hook commands, which are a different mechanism.
   fence or a lost-lease tick to invalidate. `tests/test_api_cluster_stepdown.py` proves this with a
   coordinator whose two answers deliberately disagree, in both directions.
 
+- **A release that did not happen is reported as a failure, not a drain.** The private release was
+  best-effort: it caught a pool error, logged a warning and returned `(was_leader=True, released_at)`,
+  so the endpoint answered `200` reading "drained". That is right for `stop()` -- the node is leaving
+  and a lease that ages out costs nothing -- and wrong for a stepdown, where the node stays up: the
+  lease row is untouched and still owned by it, no sibling can take it, and it renews itself back in
+  through the unfenced `owner = me` branch when the pause ends. On the shipped defaults (heartbeat 10,
+  fence 20, TTL 30) the pause ends at 20 while the lease lives to 30, and the settings validator pins
+  `heartbeat < fence < ttl` without ever comparing the pause to the TTL, so nothing prevents it. The
+  release now reports whether its write landed and `step_down_leadership()` raises
+  `StepdownUnavailable`, which the endpoint maps to `503` -- the status the neighbouring DR endpoints
+  and ADR 0056's contract already give environment conditions -- and audits `cluster_stepdown_denied`
+  rather than a `cluster_stepdown` row saying the node was drained.
+- **The lock's wait is bounded, and what the lock costs is written down.** Serializing against the tick
+  puts the SYNCHRONOUS in-memory demotion behind a tick's DB round trip, so a drained node keeps
+  answering `is_leader()` and keeps binding listeners while the call waits. Nothing bounded that wait:
+  `[store].command_timeout` is the only ceiling, `PostgresStore` passes `command_timeout or None` so
+  the documented zero-disables value removes even that, and the pool `acquire()` carries no timeout.
+  The wait is now bounded at `leader_fence_timeout_seconds` -- derived, not picked: past it the node's
+  own watchdog has concluded its DB access is not working -- and a timeout refuses with `503` without
+  touching leadership. The docstring that claimed the lock "adds no new stall to this method either"
+  was a compensating control resting on a false premise and now states the trade instead.
+
 Deferred on the ADR's own terms: the `force` flag, and `new_leader_eligible` in the result (at the
 instant of release no standby has acquired yet, so the caller re-polls `GET /cluster/nodes`).
 
@@ -28963,19 +28985,20 @@ depends on where the heartbeat phase falls.
 **The cost is stated rather than hidden:** on a cluster with no other promotable node, the pause window
 is leaderless. That is the honest consequence of asking the only eligible node to step down.
 
-**Two gaps found with the race and deliberately NOT fixed here, recorded so they are not re-derived:**
+**Three gaps found with the race and deliberately NOT fixed here. They are filed, so read them there:**
 
-- `stepdown_pause_seconds` returns `2 * heartbeat_seconds`, which can be SHORTER than a sibling's
-  configured ADR 0096 `acquire_delay_seconds`. That sibling is still handicapped out when the pause
-  ends, and the drained node reclaims its own lease. The function reads `heartbeat_seconds` alone, so it
-  cannot see the handicap it is being compared against; its docstring now says so.
-- a self-fenced node cannot be drained at all -- `step_down_leadership()` finds `_is_leader` already
-  false, releases nothing, and the endpoint answers `409` -- while the node goes on re-arming itself
-  through the ordinary claim path. And the endpoint's `400` gate keys on `is_clustered()`, a constant
-  `True` on a DB coordinator, rather than on whether a promotable sibling actually exists;
-  `cluster_members()` already exposes `promotable` and `last_seen`, so the check is available and unused.
+- **#1507** -- `stepdown_pause_seconds` cannot see a sibling's ADR 0096 `acquire_delay_seconds` and can
+  be shorter than it, letting the drained node reclaim.
+- **#1508** -- a self-fenced node cannot be drained at all: the endpoint answers `409` while the same
+  API's `lease_owner` still names that node.
+- **#1509** -- the endpoint's `400` gate keys on `is_clustered()`, a constant `True` on a DB
+  coordinator, rather than on whether a promotable sibling exists.
 
-They are named by subject rather than by number because no number has been allocated for them.
+An earlier revision of this section named these by subject with no number, on the reasoning that citing
+an unallocated `#N` is worse than citing nothing. That reasoning is right and the conclusion was not:
+the numbers were allocated and the items filed in the same change, which is the ordering
+[LEDGER-GATE.md](LEDGER-GATE.md) asks for -- allocate, then FILE, then cite. Prose that names a subject
+and no number is not tracked by anything, which is how a known gap gets re-derived by the next reader.
 
 ### What does NOT ship, and what gates it
 
@@ -28985,14 +29008,30 @@ engine network-configuration rights, which collides head-on with DEPLOY-1's leas
 ADR 0056 chose the privileged-helper option on paper.
 
 **CORRECTED 2026-09-09, same PR: this said "nobody has signed off ... that decision is the gate", and
-by then somebody had.** The owner ruled the VIP mechanism paused pending a code-signing decision on
-2026-09-09. The ruling, and the standard of evidence behind it, are recorded once in
+by then somebody had.** The ruling, and the standard of evidence behind it, are recorded once in
 [ADR 0056](adr/0056-engine-managed-vip-failover.md)'s status block; read it there rather than here.
-What made this worth correcting rather than deleting is that the ADR index row already asserted the
-ruling with no record behind it while this line denied it, so the two shipped records disagreed and a
-reader had no way to tell which was current.
+The correction is kept because the wrong claim was load-bearing for a reader deciding whether to build
+the VIP half, not because the disagreement it describes will be visible later.
+
+**And the disagreement it describes was never SHIPPED, which an earlier revision of this paragraph got
+wrong twice over.** It said "the two shipped records disagreed". Neither revision had reached `main`:
+both the ADR index assertion and this denial were drafts inside this same pull request. This repository
+also **squash-merges**, so the intermediate revisions carrying that disagreement collapse into one
+commit and the evidence for the sentence does not survive the merge at all. Two lessons, and the second
+is the general one: a record is not "shipped" until it is on `main`, and a correction that cites its own
+branch history as evidence is citing something the merge will delete.
 
 ### Also found while reading ADR 0056
+
+**TWO of its sections are stale, not one, and the second is the one that matters.** The first revision
+of this paragraph named only "Console -- High Availability page" and the ADR's status block scoped its
+STALE marker to that section alone. But `### Confirm / step-up posture (console)` sits INSIDE
+`## Control API -- planned failover`, the section the status block declares BUILT, so a reader arriving
+at it was told the surrounding prose was current. It names `client.stepdown_node`, `poll_client`,
+`_request` and `AsyncRunner` -- all retired PySide6 console symbols -- and it tells the confirm dialog
+to promise the operator that "the VIP will move", which the paused-VIP bullet three lines up denies.
+Both sections now carry their own do-not-build-from marker at the section itself, rather than relying on
+a reader having read the status block first.
 
 Its "Console -- High Availability page" section is stale. It names `console/shell.py`,
 `console/status.py` and `console/connections.py`, all of which went with the retired PySide6 desktop
@@ -29043,8 +29082,9 @@ Every endpoint already exists and is RBAC-gated:
 So the work is a page, not an API: render the membership table with a live/stale marker off `last_seen`,
 show who holds the lease and when it expires, and put the stepdown behind an explicit confirm that
 carries the step-up + MFA challenge the endpoint already demands. The endpoint answers `409` when the
-node addressed is not the leader and `400` when the deployment is single-node, so the page must resolve
-the leader from `GET /cluster/nodes` before it offers the control rather than offering it everywhere.
+node addressed is not the leader, and `400` when the deployment is not CLUSTERED -- which is not the
+same as single-node, see #1509 -- so the page must resolve the leader from `GET /cluster/nodes` before
+it offers the control rather than offering it everywhere.
 
 ### What NOT to build here
 
@@ -29262,6 +29302,154 @@ Zero non-test callers exist in the engine.
 **`set_segment` does not exist.** `parsing/message.py` has `field` and `add_segment`; there is no `def set_segment` anywhere.
 
 **Scope, stated so nobody over-corrects.** The README index row is **honest** -- it names only `msg.set` / `msg.field`-copy / `msg.delete_segments` and the actions `set_field` / `copy_field` / `delete_segment`. `tests/test_lens_native.py` covers exactly the shipped forms, consistent with there being no read row. The over-claim is internal to the ADR file.
+
+---
+
+## 1507. The post-stepdown claim pause cannot see a sibling's acquire_delay_seconds, so a drained node can win its own lease back
+
+> 🔢 **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there.** Value **4/10** · Difficulty **3/10**. Value 4 -- it turns a planned failover into a no-op on exactly the deployments that configured leader preference, which is a config an operator chose on purpose. Difficulty 3 -- the arithmetic is easy; deciding what the pause should read, and from where, is the work.
+
+**Cluster:** active-passive HA / planned failover. **Priority:** P3.
+**Severity:** no deployment axis (sec. 0). Zero deployments, so nothing is being drained today. A first
+deployment that combined `POST /cluster/stepdown` with a sibling carrying an ADR 0096 handicap would see
+the stepdown appear to succeed and leadership never move.
+
+### The gap
+
+`stepdown_pause_seconds(heartbeat_seconds)` returns `2 * heartbeat_seconds`: the drained node declines
+to claim or renew for that long, so a sibling has a full tick at the expired lease. That reasoning holds
+only for a sibling carrying **no** ADR 0096 `acquire_delay_seconds`.
+
+A sibling handicapped by more than the pause is still refused when the pause ends, because
+`acquire_delay` is added to the expiry side of the take-over predicate while the drained node's own
+renew branch (`owner = me`) carries no delay term at all. So the drained node reclaims its own lease and
+the operator who called the endpoint is still on the leader they asked to drain. The endpoint answered
+`200` and the audit row says `was_leader: true` -- both true of the release, neither true of the outcome.
+
+The function reads `heartbeat_seconds` alone. It is module-level, shared by both DB coordinators, and
+takes one scalar, so it cannot see the handicap it is being compared against. Its docstring says so
+today; nothing enforces it.
+
+### What a fix has to decide
+
+Not the arithmetic -- `max(2 * heartbeat, longest sibling acquire_delay + one heartbeat)` is the obvious
+shape -- but where the number comes from, and that is the real question:
+
+- The coordinator would have to READ the siblings' delays. `cluster_members()` already returns
+  `acquire_delay_seconds` and `promotable` per node, so the data exists, but it is a DB read and the
+  pause is currently pure arithmetic on a constructor argument with no I/O in it. Putting a round trip
+  inside the stepdown's critical section trades one defect for the stall #1494's lock already pays for.
+- Or the SETTINGS validator refuses the combination at load time. It already pins
+  `heartbeat < fence < ttl` (`config/settings.py`, `_fence_ordering`), but a cluster-wide comparison is
+  not available to it: each node loads only its own config and a sibling's delay lives in the sibling's
+  file. A local validator can only warn.
+- Or the pause stops being a duration: the drained node declines until it OBSERVES a different owner on
+  the lease row, with the current pause as a floor and the lease TTL as a ceiling. Correct, and it
+  reintroduces a DB read on the same path.
+
+Nothing here is cheap, which is why #1494 stopped rather than guessing. Pair this with #1508: both are
+the pause and the fence disagreeing with the lease row, and a fix that reads the lease row could answer
+both.
+
+## 1508. A self-fenced node cannot be drained at all: stepdown answers 409 while the same API still names it lease owner
+
+> 🔢 **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there. The reviewer isolated the cause -- do not re-derive it.** Value **5/10** · Difficulty **4/10**. Value 5 -- the window is up to `ttl - fence` wide on stock defaults, and it is exactly the window an operator reaches for the endpoint in, because a node that just self-fenced is a node something is wrong with. Difficulty 4 -- one early return, but changing it means deciding what a release means on a node that already believes it is not leader.
+
+**Cluster:** active-passive HA / planned failover. **Priority:** P2.
+**Severity:** no deployment axis (sec. 0). Zero deployments. A first deployment would see the endpoint
+refuse a drain it could have performed, and refuse it with a reason the rest of the same API contradicts.
+
+### The defect
+
+The self-fence watchdog demotes on the node's own MONOTONIC clock at `leader_fence_timeout_seconds`
+(20.0 by default) while the lease row stays live on the DB clock to `leader_lease_ttl_seconds` (30.0 by
+default). In that window the node is not leader in memory and still owns a live lease row.
+
+`POST /cluster/stepdown` in that window:
+
+1. `step_down_leadership()` reaches `_release_leadership()`, which reads `_is_leader` -- already
+   `False` -- and takes the `if not was_leader: return (False, None, True)` early return;
+2. so it issues **no** `UPDATE`, arms **no** claim pause, and fires no demotion edge;
+3. the endpoint answers `409 not the current leader`;
+4. and `GET /cluster/nodes` on the same API still reports `lease_owner` as that node, because the row is
+   untouched and does not expire for another ten seconds.
+
+An operator reading the two answers together cannot reconcile them, and the honest reading -- "this node
+holds the lease and refuses to release it" -- is the correct one.
+
+### The cause is the early return, not the SQL, and that was measured
+
+The reviewer issued the method's own `UPDATE` by hand against a coordinator in exactly that state
+(`_is_leader` false, row live and owned). It drained correctly: the row expired and a sibling took it. So
+the write is capable of doing the job in this state, and the `if not was_leader` guard is the only thing
+preventing it. That rules out the plausible alternative -- that the owner-scoped `WHERE` no longer
+matches -- without anyone having to re-test it.
+
+### What a fix has to decide
+
+`was_leader` currently answers two different questions with one boolean: *did this node hold the
+in-memory gate* (what the audit row should record) and *is there a lease row to expire* (what the
+release should act on). They diverge exactly in the self-fence window. Options, none free:
+
+- **Release on the ROW, report on the GATE.** Always issue the owner-scoped `UPDATE`; keep `was_leader`
+  reporting the in-memory gate. Then a self-fenced node drains and honestly reports `was_leader: false`
+  -- but the endpoint's `409` rests on `was_leader`, so the status table has to change too, and "we
+  released your lease and returned 409" is worse than what it replaces.
+- **Add a third answer.** `step_down_leadership()` reports whether it expired a row as well as whether
+  it held the gate, and the endpoint answers `200` when either is true. Truthful, and it widens a
+  Protocol return that three coordinators implement.
+- **Refuse honestly instead.** Keep the `409` and make `GET /cluster/nodes` stop naming a self-fenced
+  node as `lease_owner`. That fixes the contradiction rather than the drain, and it needs the
+  observability read to consult in-memory fence state it does not read today.
+
+Pair with #1507: both are the pause and the fence disagreeing with the lease row.
+
+## 1509. The stepdown 400 gate asks whether clustering is enabled, not whether anything can take over
+
+> 🔢 **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there.** Value **4/10** · Difficulty **2/10**. Value 4 -- the refusal it is meant to give exists to stop an operator making the cluster leaderless, and it does not give it. Difficulty 2 -- the data is already exposed; the work is one predicate plus deciding how stale a sibling may be.
+
+**Cluster:** active-passive HA / planned failover. **Priority:** P3.
+**Severity:** no deployment axis (sec. 0). Zero deployments. A first deployment running one clustered
+node could make itself leaderless for the stepdown pause by calling the endpoint.
+
+### The defect
+
+`POST /cluster/stepdown` refuses with `400` when `coordinator.is_clustered()` is false. That method is a
+literal `return True` on **both** DB coordinators, and a literal `return False` only on
+`NullCoordinator`: it is a property of the BACKEND, not of the deployment's size. Its own docstring says
+so -- "a plain backend property, not who-is-leader".
+
+So the gate answers "is this a clustered BUILD", while the refusal it is written to give is "is there
+anything here to take over". A `[cluster].enabled` install running one node -- the ordinary shape while a
+second node is being provisioned, and the shape a test bed sits in -- passes the gate, releases its
+lease, and is leaderless for `2 * heartbeat_seconds` with nothing able to promote. The same is true of a
+cluster whose only sibling is `promotable = false`, or has not heartbeated within a node timeout.
+
+`docs/CLUSTERING.md` described this as "`400` on a single node", which is what the gate was meant to do
+and not what it does; #1494's PR corrected that sentence to describe the code.
+
+### The check is available and unused
+
+`cluster_members()` already returns, per node: `node_id`, `last_seen`, `status`, `is_leader`,
+`promotable` and `acquire_delay_seconds`. A promotable-sibling predicate is a filter over that list --
+another node, `promotable`, and `last_seen` inside `node_timeout_seconds`.
+
+### What a fix has to decide
+
+- **How stale is too stale.** `cluster_members()` already derives liveness by AND-ing the flag with a
+  fresh `last_seen`, so reuse that rather than inventing a second freshness rule.
+- **Which status the refusal carries.** `400` says "your request was malformed", which a
+  single-node-clustered call is not -- the deployment state is what refuses it. `409` already means
+  "wrong node" here, so a third status or a distinct detail string is needed to keep the two apart.
+- **Whether it can be overridden.** An operator draining the last node on purpose, to stop all leader
+  work before a maintenance window, is a real request. That is what ADR 0056's deferred `force` flag was
+  for, so this and that flag should be decided together.
+- **The cost of the read.** This adds a DB round trip to a path #1494 already bounds at the fence
+  timeout. It runs before the coordinator is touched and before the leadership lock, so it does not
+  extend the critical section -- but an unreachable store then turns the refusal into a `503`, which is
+  the correct answer and should be written down rather than discovered.
+
+---
 
 ## 1513. the harness server fixture budgets 10 seconds for the whole engine bring-up and calls the expiry a lost port
 
