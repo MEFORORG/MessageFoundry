@@ -238,6 +238,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             (),
             (),
             (),
+            None,
         )
     )
     assert "enforce_store_key_expiry" in named
@@ -260,6 +261,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             (),
             (),
             (),
+            None,
         )
     ]
     assert named == []

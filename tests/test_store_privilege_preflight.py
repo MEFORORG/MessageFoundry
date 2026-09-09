@@ -50,6 +50,7 @@ from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    SecretRotationSettings,
     SecuritySettings,
     SqlAuth,
     StoreBackend,
@@ -532,6 +533,7 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             StoreSettings(),
             AuthSettings(),
             AlertsSettings(),
+            SecretRotationSettings(),
             (),
             (),
             (),
@@ -588,6 +590,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 StoreSettings(require_least_privilege=True),
                 AuthSettings(),
                 AlertsSettings(),
+                SecretRotationSettings(),
                 (),
                 (),
                 (),
