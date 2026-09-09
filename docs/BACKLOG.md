@@ -25747,6 +25747,69 @@ The stale `BUILDER.md:253` and `:148` citations became quotes of their claims; t
 
 It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live playbook sources". **That was wrong.** `.github/workflows/backlog-hygiene.yml` and CLAUDE.md section 5's Builder row AGREE -- both put the `docs/BACKLOG.md` edit in the same PR that carries the code, and that PR is the Builder's. The source that disagrees is the vault `roles/BUILDER.md` line 216, which is stale rather than live, because section 5 replaced the method those lines assume. The vault half is #1461. Left to #1460 either way, but for the right reason.
 
+## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
+
+> 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked, and CORRECTED the same day by a third that read the source.** Value **4/10** · Difficulty **3/10** · _quick win_. A session can end while its worktree survives. Its claims then have no live holder and no observable evidence of abandonment. `-Force` recovers them -- that is what it is for -- but the seat using it cannot distinguish an abandoned claim from a quiet one, and **74 of 76 live claims sit in exactly that ambiguity.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+
+**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+
+**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+
+**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+
+**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
+
+| | |
+|---|---|
+| claims held | **76** |
+| worktree still present | **74** |
+| worktree absent | **2** (`#1453`, `#1416`) |
+
+**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
+
+**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
+
+**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
+
+**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
+
+**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
+
+**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
+
+## 1468. the ledger gate has no path for RESTORING a number main lost, only for allocating or recovering one
+
+> 🔢 **Filed 2026-09-06 -- not started. Found because the gate REFUSED a repair it should accept, and the Lander first dismissed that refusal as noise.** Value **5/10** · Difficulty **3/10** · _quick win_. `ledger_check` refuses any `## N.` heading whose number this worktree did not allocate. That is right for a fresh allocation. It is wrong for a RESTORATION -- a number that is in `main`'s own history, fell out of the file, and is being put back -- because the two are indistinguishable to a diff and only one of them is a defect.
+
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a ledger that cannot be repaired by the seat that notices the damage.
+
+**THE INSTANCE, MEASURED 2026-09-06.** PR 855 (`642225f78`) stripped the `## 1147.` heading and concatenated that item's title onto the end of #1146's closing paragraph. Nothing else changed: the body survives, orphaned and unaddressable. **`origin/main` carries 442 live items where it should carry 443**, `parse_items` cannot see #1147, and six files still cite it. It is not in the archive either -- a positive control in the same run matched 237 headings there, so the instrument reached the corpus.
+
+**The repair is one line break and a restored marker, and it was verified before this item was filed:** applying it brings the count to 443 and `## 1147.` parses again. It is not a rewrite, a renumber, or a judgment call.
+
+**WHY IT CANNOT LAND.** The gate names two recoveries and neither reaches this case:
+
+1. **Commit from the owning worktree.** It **no longer exists** -- removed at some point without releasing the number.
+2. **Check out the owning branch.** It survives locally, is **369 commits behind main with 313 commits that exist in no remote**, and rebasing it onto main fails on an old history-reset commit. Forcing it would destroy unrecoverable local history to fix a formatting defect.
+3. The gate's third option -- allocate a new number -- **renumbers a live item**, which `ledger_check.py:58-61` argues against in terms: renumbering "would only make stale citations resolve uniquely and WRONGLY, which is worse than resolving ambiguously".
+
+**WHAT IS MISSING, STATED AS THE DISCRIMINATOR RATHER THAN AS A FEATURE.** A restoration is provably not a fresh allocation: **the number appears in this repository's own history, under the same heading text, before the commit that removed it.** That is a checkable fact -- `git log -S` over the ledger finds it -- and it is exactly what the gate cannot currently ask. Any widening must rest on that test and nothing weaker, because a rule that merely trusts the committer re-opens the hole the non-transferable design exists to close.
+
+**THE GATE WORKED. THE SEAT DID NOT.** `ledger_check` refused a commit with `BLOCKED: BACKLOG item #1147 was not allocated to this worktree` roughly an hour before this item was filed. **The Lander read that as a stale base, rebased the number away, and continued.** The corruption was then found independently by a packet session merging `main`. Recorded because it is the more useful half: the detector fired correctly and its signal was discarded, so a louder detector is not the fix -- the fix is a path that lets the person holding the repair commit it.
+
+**NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
+
 ## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
 
 > 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
