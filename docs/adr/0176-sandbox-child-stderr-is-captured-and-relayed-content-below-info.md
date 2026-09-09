@@ -1,14 +1,58 @@
 # ADR 0176 — Sandbox child stderr is captured and relayed, with content confined below INFO
 
-- **Status:** **Proposed (2026-08-14)** — records the design decision for BACKLOG #343. The engine
-  change is being built against it; this file is the *why*, which the diff cannot carry.
+- **Status:** **Accepted -- BUILT.** Recorded 2026-09-09 against the working tree: D1, D2 and D3 are
+  all in the tree, and BACKLOG #343 is banner-marked SHIPPED 2026-08-26. This file is still the *why*,
+  which the diff cannot carry.
+  **This line read *"Proposed (2026-08-14) — records the design decision for BACKLOG #343. The engine
+  change is being built against it"* until 2026-09-09.** That was true at drafting and is kept rather
+  than deleted, because it goes wrong in the direction a reader acts on: someone planning off it plans
+  to build code that already exists. The *body* of this ADR had already outrun its own header -- D2
+  below reads "Built with two independent mechanisms, and the redundancy was measured rather than
+  assumed", which only a shipped build can say.
   <!-- Proposed (no code yet) -> Accepted (build may start) -> Superseded by NNNN / Rejected -->
+- **Built:** **BUILT -- D1, D2 and D3, re-verified against the working tree on 2026-09-09 by symbol
+  rather than by line number.**
+  - **D1 -- capture and relay.** `SandboxSession._spawn` in
+    [`pipeline/sandbox.py`](../../messagefoundry/pipeline/sandbox.py) spawns with
+    `stderr=subprocess.PIPE` and starts a drain thread (`mf-sandbox-stderr-<inbound>-<generation>`)
+    beside the existing frame reader, in the same window and **before the boot frame write** the
+    *Consequences* section requires. The relay is the `_StderrRelay` class in the same module: it
+    carries the inbound name, the child pid and a per-session generation counter, and neutralises
+    control bytes through `scrub_control_chars` imported from
+    [`logging_setup.py`](../../messagefoundry/logging_setup.py) -- the one definition, called rather
+    than reimplemented beside it. `SandboxSession.__init__` takes `inbound` as a **required
+    keyword-only** parameter with no default, plumbed from `RegistryRunner._sandbox_for` in
+    [`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py), which is the widened
+    diff *Consequences* accepted.
+  - **D2 -- content below INFO, notice at WARNING.** `_StderrRelay._line` returns before it decodes
+    anything unless `log.isEnabledFor(logging.DEBUG)`, and the sole content call site beneath that
+    guard is `log.debug`. `_StderrRelay._notice` emits the identity-and-count record at `log.warning`,
+    throttled by `_STDERR_NOTICE_SECONDS`, and carries no content. Both of the independent mechanisms
+    the Decision names are present.
+  - **D3 -- the stdout rebind.** `_redirect_stdout_to_stderr` in
+    [`pipeline/_sandbox_worker.py`](../../messagefoundry/pipeline/_sandbox_worker.py) sets
+    `sys.stdout = sys.stderr` and keeps the original wrapper alive in `_ORIGINAL_STDOUT`. `main` calls
+    it **after** it captures `sys.stdout.buffer` for the frame writer and **before** the boot frame
+    read whose reply path runs `load_config()` -- the sequencing the Decision states. Its docstring
+    repeats the SDS-3.7 caveat verbatim: design intent, not an enforced invariant.
+  - **Tests.** `tests/test_sandbox.py`, `tests/test_sandbox_worker_logging.py` and
+    `tests/test_phi_logging_inventory.py` each carry a reference to this decision.
+  - **NOT claimed built.** The boot-frame log-level follow-up that the last *Consequences* paragraph
+    names by subject is still unbuilt and still unfiled, and no number is allocated for it. This
+    bullet changes nothing about that.
 - **Date:** 2026-08-14
 - **Supersedes nothing.** Extends the fd-discipline established for the sandbox IPC channel in
   [ADR 0087](0087-sandbox-subprocess-isolation.md) to the one file descriptor that decision left
   undisciplined.
 
 ## Context
+
+> **Note added 2026-09-09: this section is the problem as it stood on 2026-08-14, and the decision
+> against it is BUILT (see *Built* above), so read its present tense as of that date.** It is left
+> unedited on purpose. An ADR's Context is the record of what was true when the decision was taken,
+> and re-tensing it would erase the reason the decision exists. At least one sentence here is still
+> current: *"Both are conditional, not live"* stays true, because MessageFoundry still has zero
+> deployments, and that is a statement about the record rather than about the fix.
 
 **fd 1 is strictly framed. fd 2 has no discipline at all.** The sandbox worker was spawned in
 [`pipeline/sandbox.py`](../../messagefoundry/pipeline/sandbox.py) (`SandboxSession._spawn`) with
