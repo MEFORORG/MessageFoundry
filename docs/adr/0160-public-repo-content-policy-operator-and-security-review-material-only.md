@@ -107,7 +107,7 @@ merge conflict forced a re-read of the tree. If a future phase clears a director
 merge time rather than trusting the file list computed when the branch was cut.
 
 **Order of operations, and it is the load-bearing part.** Custody moved to the vault
-(`wshallwshall/MessageFoundry`) and was committed there **before** anything left the public tree.
+(`wshallwshall/MessageFoundry-vault`) and was committed there **before** anything left the public tree.
 Gitignoring alone would have left 103 files as single **unversioned** copies — no history, no
 backup, erased by `git clean -xdf`. "Move to the vault" and "gitignore" are not alternatives: the
 first provides durability, the second keeps the paths working in place. Both were done.
@@ -285,7 +285,7 @@ about the remedy space, not a decision, and the decision is not a session's to m
 What is recorded is that **D1's subject test is insufficient on its own.**
 
 **Custody first, as Phase 1 requires.** The 46 files were committed to the vault and pushed BEFORE
-leaving the tracked tree, at `wshallwshall/MessageFoundry` branch `lander/adr0160-custody`, verified
+leaving the tracked tree, at `wshallwshall/MessageFoundry-vault` branch `lander/adr0160-custody`, verified
 byte-identical. That ordering mattered more than Phase 1 knew: measured across both repositories,
 **1702 paths are shared and 760 of them DIVERGE**. The vault is a stale fork, not a mirror — the
 publish pipeline that synced them was retired at the 2026-07-27 cutover. 15 of these 46 already
@@ -452,7 +452,7 @@ The obvious next step after Phase 1 is `scripts/coord/` (9), `scripts/worktree/`
 by losing coverage, and the gain is cosmetic. The measurements that produced that decision follow —
 they are recorded because the *next* person to propose this move will re-derive them otherwise:
 
-⛔ **The vault's CI is off.** `gh workflow list --all` on `wshallwshall/MessageFoundry` reports every
+⛔ **The vault's CI is off.** `gh workflow list --all` on `wshallwshall/MessageFoundry-vault` reports every
 workflow except `ASVS scorecard` as `disabled_manually`; `ci.yml` last ran **2026-07-27** and failed.
 The last 50 runs are 42 `ASVS scorecard` plus 8 Dependabot. So "move the tooling to the vault, where
 its tests keep running" is **false**, and it is false in the most dangerous way: the vault *contains*

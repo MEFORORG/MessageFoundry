@@ -2419,16 +2419,16 @@ def _serve(args: argparse.Namespace) -> int:
                 # warn posture (permitted-but-audited, never silent).
                 logging.getLogger(__name__).warning(
                     "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
-                    "off, permitted because [security].allow_single_factor_admin_when_exposed=true — the "
-                    "Administrator role is single-factor over the network.",
+                    "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
+                    "account in [security].require_mfa_scope is single-factor over the network.",
                     exposure_desc,
                     "production " if production else "",
                     env_name,
                 )
             print(
                 f"warning: {exposure_desc} in a PHI-carrying "
-                f"environment ({env_name!r}) with [security].require_mfa off — the Administrator role is "
-                "single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
+                f"environment ({env_name!r}) with [security].require_mfa off — every account in "
+                "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
                 "before exposure.",
                 file=sys.stderr,
             )
@@ -2453,7 +2453,8 @@ def _serve(args: argparse.Namespace) -> int:
         print(
             "warning: [api].public_origin is set with no declared TLS terminator on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
-            "UNDECLARED reverse proxy, the Administrator role is single-factor over the network and "
+            "UNDECLARED reverse proxy, every account in [security].require_mfa_scope is single-factor over "
+            "the network and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",

@@ -24,9 +24,8 @@ from pathlib import Path
 #: ``messagefoundry-harness``); its own tag / changelog / PyPI cadence. Starts matched to the engine.
 __version__ = "0.2.15"
 
-#: The engine contract versions this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). A pair
-#: outside this set is refused at startup — the runtime backstop behind the PEP 508 compat range.
-# Seam 9 is the S8a console-dashboard lane (#76/#131/#136, ADR 0065 + ADR 0007 amendments): the
+#: The engine seam this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). Any other engine is
+#: refused at startup — the runtime backstop behind the PEP 508 compat range.
 # The console supports EXACTLY the engine seam it was built against — deliberately a single value,
 # not a range (BACKLOG #279, resolved 2026-07-21 in favour of option (b)).
 #

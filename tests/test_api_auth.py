@@ -24,6 +24,17 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
+
+# A well-formed user id no test creates, and a malformed one. Since BACKLOG #1108 the two get
+# DIFFERENT answers: an id the store has never seen is a 404, and a value that could not be a user id
+# at all is refused (422) before the lookup. Asserting both keeps the 404 arm honest — a single
+# "nope" probe would go on passing with the id rule removed.
+ABSENT_USER_ID = "0" * 32
+MALFORMED_USER_ID = "nope"
+
+#: The AD-provisioned fixture's id. Engine-minted ids are 32 hex, so a store row seeded by hand needs
+#: that shape too or its own routes refuse the id before the AD branch under test is reached.
+AD_USER_ID = "ad9" + "0" * 29
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
 
@@ -510,7 +521,13 @@ async def test_permission_inspector_unknown_user_404(engine: Engine) -> None:
     await _add(service, "root", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         admin = _auth((await _login(c, "root")).json()["token"])
-        assert (await c.get("/users/does-not-exist/permissions", headers=admin)).status_code == 404
+        assert (
+            await c.get(f"/users/{ABSENT_USER_ID}/permissions", headers=admin)
+        ).status_code == 404
+        # A value that could not be a user id never reaches the lookup at all (BACKLOG #1108).
+        assert (
+            await c.get(f"/users/{MALFORMED_USER_ID}/permissions", headers=admin)
+        ).status_code == 422
 
 
 async def test_audit_query_filters_by_actor_action_and_time(engine: Engine) -> None:
@@ -1113,7 +1130,12 @@ async def test_admin_revokes_a_users_sessions(engine: Engine) -> None:
         uid = (await c.get("/auth/me", headers=_auth(tu))).json()["user_id"]
         assert (await c.delete(f"/users/{uid}/sessions", headers=admin)).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(tu))).status_code == 401  # force-signed-out
-        assert (await c.delete("/users/nope/sessions", headers=admin)).status_code == 404
+        assert (
+            await c.delete(f"/users/{ABSENT_USER_ID}/sessions", headers=admin)
+        ).status_code == 404
+        assert (
+            await c.delete(f"/users/{MALFORMED_USER_ID}/sessions", headers=admin)
+        ).status_code == 422
 
 
 async def test_session_cap_evicts_oldest_on_login(engine: Engine) -> None:
@@ -1242,7 +1264,7 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         roles=["viewer"],
         actor="root",
     )
-    await engine.store.create_user(user_id="ad9", username="ad9", auth_provider="ad")
+    await engine.store.create_user(user_id=AD_USER_ID, username="ad9", auth_provider="ad")
     async with _client(engine, service) as c:
         admin_token = (await _login(c, "root")).json()["token"]
         admin = _auth(admin_token)
@@ -1277,9 +1299,16 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         # own grant: the gate runs BEFORE the body, so without one these would all be 403 and the
         # test would stop measuring what it is named for.
         assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
-        assert (await c.post("/users/nope/reset-password", headers=admin)).status_code == 404
+        assert (
+            await c.post(f"/users/{ABSENT_USER_ID}/reset-password", headers=admin)
+        ).status_code == 404
+        # No malformed-id probe here on purpose. The step-up gate runs BEFORE the path is validated,
+        # so on this route a malformed id gets 403 (no grant) rather than the 422 the id rule gives.
+        # The rule is measured on the ungated routes and in tests/test_api_input_validation.py.
         assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
-        assert (await c.post("/users/ad9/reset-password", headers=admin)).status_code == 400
+        assert (
+            await c.post(f"/users/{AD_USER_ID}/reset-password", headers=admin)
+        ).status_code == 400
         me_id = (await c.get("/auth/me", headers=admin)).json()["user_id"]
         assert (await _reauth(c, admin_token, purpose="admin_reset_password")).status_code == 200
         assert (await c.post(f"/users/{me_id}/reset-password", headers=admin)).status_code == 400

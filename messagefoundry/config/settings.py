@@ -2414,6 +2414,17 @@ class AuthSettings(_Section):
                 "oidc_enabled requires ad_enabled (federated logins resolve roles via AD)"
             )
 
+        # BLANK, not merely empty — the same test the client-secret guard below already applies, and
+        # for the same reason. `if not value` catches "" and lets "   " through, so a stray space in
+        # a config file or an NSSM environment entry produced a whitespace-only value that loaded
+        # clean. This validator disagreed with itself about what "missing" means: measured before the
+        # fix, `oidc_client_id=""` was refused while "   " and "\t" both loaded.
+        #
+        # It is not cosmetic for `oidc_client_id`, which is the expected `aud` — the ID Token
+        # audience check would have compared an incoming claim against whitespace. For the four
+        # pinned URLs it deferred the failure to the https check below, which then reports a SCHEME
+        # problem for what is really a missing value. Whitespace is stripped for the TEST only; the
+        # value itself is never rewritten (BACKLOG #1161, ASVS 10.5.4).
         missing = [
             name
             for name, value in (
@@ -2423,7 +2434,7 @@ class AuthSettings(_Section):
                 ("oidc_token_endpoint", self.oidc_token_endpoint),
                 ("oidc_jwks_uri", self.oidc_jwks_uri),
             )
-            if not value
+            if not (value or "").strip()
         ]
         if missing:
             raise ValueError(f"oidc_enabled requires: {', '.join(missing)}")

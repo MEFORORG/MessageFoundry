@@ -2,7 +2,7 @@ name: Required workflow state
 
 # Every REQUIRED status check must belong to a workflow GitHub will actually run.
 #
-# THE DEFECT THIS EXISTS FOR — measured on the sibling vault repo (wshallwshall/MessageFoundry),
+# THE DEFECT THIS EXISTS FOR — measured on the sibling vault repo (wshallwshall/MessageFoundry-vault),
 # 2026-07-30: 10 required contexts whose workflows were ALL `disabled_manually`. A disabled workflow
 # never dispatches, so those contexts never reported — NO pull request could merge, and every merge
 # there had silently been riding admin bypass. Nobody noticed, because the symptom presents as "CI is
@@ -38,6 +38,7 @@ jobs:
   reachable:
     name: required contexts belong to active workflows
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read # read workflow `state`; NOT the admin scope branch protection would need
@@ -67,6 +68,7 @@ jobs:
   accurate:
     name: the required-contexts file matches the server
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       # NO extra scope. The context list comes from `GET /repos/{owner}/{repo}/branches/{branch}`, which

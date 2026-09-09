@@ -247,4 +247,4 @@ rules:
       # Line-anchored on purpose, same as the two entries above: a file-level entry would swallow a
       # future local `uses:` added to this file, and that one might carry none of the four reasons.
       # Re-anchor if the line moves; do not broaden it to the file.
-      - cla.yml:102
+      - cla.yml:122
