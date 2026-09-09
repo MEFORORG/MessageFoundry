@@ -110,8 +110,8 @@ ConnectionName = Annotated[str, StringConstraints(pattern=CONNECTION_NAME_PATTER
 
 # --- The per-channel RBAC scope -------------------------------------------------------------------
 #
-# ``ChannelScope.channels`` is the one list on this surface whose members are not all connection
-# names. BACKLOG #1152 (ASVS 8.2.2) retired the encoding where an ABSENT scope meant every channel,
+# ``ChannelScope.channels`` holds connection names and one thing that is not a connection name.
+# BACKLOG #1152 (ASVS 8.2.2) retired the encoding where an ABSENT scope meant every channel,
 # and made all-channels a grant somebody typed: the token ``*``, stored as the one-element list
 # ``["*"]``. Saying nothing now DENIES, so that token is the only way left to ask for the whole
 # estate through ``PUT /users/{user_id}/channel-scope`` or its ``/ui`` twin. Typing that list as
