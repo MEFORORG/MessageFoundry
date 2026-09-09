@@ -28930,9 +28930,11 @@ disaster-recovery hook commands, which are a different mechanism.
   leader". On the committed branch that sentence sends an operator to fix a cluster that is already
   failing over correctly. A row count cannot earn the certainty back either: the driver reports one
   only on the path where it returned, and this refusal exists for the path where it raised. The body
-  now says the node cleared its leadership flag and STARTED tearing its graph down, that teardown is
-  NOT finished when the response is sent and its later phases are unbounded, that the lease MAY still
-  be live and ours, and what to do next. **An earlier cut of that body -- and of this line -- said the
+  now says the node has cleared its leadership flag, that the lease MAY still be live and ours, and
+  what to do next. *(Its teardown sentence was corrected twice more in this same PR -- see the two
+  CORRECTED paragraphs under "Corrections made while re-reading the shipped stepdown"; what it says
+  today is neither of the two versions this bullet has quoted.)* **An earlier cut of that body -- and
+  of this line -- said the
   node "stopped serving", which is false.** `Engine._on_demote_edge` (`pipeline/engine.py`) is
   `_graph_wake.set()` and its docstring says it deliberately does not set the runner's `_stop`; the
   teardown runs afterwards on the graph-supervisor task via `_stop_graph`, whose pinned comment keeps

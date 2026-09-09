@@ -367,10 +367,11 @@ POST /cluster/stepdown        # body: {} — there are no options
   leadership is where you left it either. Do not start maintenance. Retry, and if it repeats, look at
   the store connection.
 - **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
-  genuinely unknown.** It cleared its leadership flag, stopped claiming for two `heartbeat_seconds`,
-  and STARTED tearing its graph down. What it could not confirm is whether the write expiring its lease
-  row committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
-  `UPDATE` that never ran.
+  genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for two
+  `heartbeat_seconds`. What it could not confirm is whether the write expiring its lease row
+  committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
+  `UPDATE` that never ran. **It does not tell you a teardown just started**: a retry of an owed write
+  finds the node already demoted, and the demotion edge fires only on the call that demotes it.
   - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
     demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
     afterwards.
@@ -380,11 +381,10 @@ POST /cluster/stepdown        # body: {} — there are no options
     socket in the synchronous prologue of their own `stop()`, so they stop taking new connections
     before the unbounded phases (connector close, executor shutdown, sandbox close) are reached at
     all. **That buys less than it sounds like.** A source that overruns its share is abandoned rather
-    than cancelled; DICOM releases its port inside exactly the call that gets
-    abandoned, so a DICOM listener can still hold its port; established connections drain in the
-    background; and a message already inside a handler still finishes its commit and its ACK, which
-    count-and-log requires. Confirm quiescence with `GET /cluster/nodes` plus the connection view
-    before you touch the node.
+    than cancelled; DICOM releases its port inside exactly the call that gets abandoned, so a DICOM
+    listener can still hold its port; established connections drain in the background; and a message
+    already inside a handler still finishes its commit and its ACK, which count-and-log requires.
+    Confirm quiescence with `GET /cluster/nodes` plus the connection view before you touch the node.
   - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
     normally, whatever the error page says.
   - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
