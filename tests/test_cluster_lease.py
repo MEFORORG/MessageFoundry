@@ -31,7 +31,12 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.pipeline.cluster import DbCoordinator, StepdownUnavailable
+from messagefoundry.pipeline.cluster import (
+    DbCoordinator,
+    StepdownLockTimeout,
+    StepdownReleaseUnconfirmed,
+    StepdownUnavailable,
+)
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
 
@@ -113,6 +118,10 @@ class _FakeLeasePool:
         self.yield_in_fetchrow = False
         self.yield_in_execute = False
         self.on_execute: Callable[[], None] | None = None
+        # Records the ARGUMENTS of each release statement, which ``on_execute`` cannot: the
+        # release-retry tests ask "was a second UPDATE sent at all", and a row that already reads
+        # released cannot distinguish a re-sent write from a write that never happened twice.
+        self.on_execute_args: Callable[[tuple[object, ...]], None] | None = None
 
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         if self.yield_in_fetchrow:
@@ -132,6 +141,8 @@ class _FakeLeasePool:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
         if self.on_execute is not None:
             self.on_execute()  # a reader observing the coordinator DURING the release window
+        if self.on_execute_args is not None:
+            self.on_execute_args(args)  # a counter of the statements actually SENT
         if self.fail:
             raise RuntimeError("partitioned from db")
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at=0 WHERE lease_key AND owner.
@@ -709,7 +720,7 @@ async def test_a_failed_release_write_reports_failure_instead_of_a_drain() -> No
     await a._maintain_leadership()
 
     pool.fail = True
-    with pytest.raises(StepdownUnavailable):
+    with pytest.raises(StepdownReleaseUnconfirmed):
         await a.step_down_leadership()
 
     # The conservative half still holds: this node stops CALLING itself leader either way, and the
@@ -725,6 +736,86 @@ async def test_a_failed_release_write_reports_failure_instead_of_a_drain() -> No
     pool.fail = False
     mono.t = 21.0
     await a._maintain_leadership()
+    assert a.is_leader() is True
+
+
+async def test_a_retry_re_sends_the_write_the_first_stepdown_could_not_confirm() -> None:
+    # THE REFUSAL THE PREVIOUS TEST PINS IS ONLY HALF AN ANSWER: it tells the operator to retry, and
+    # the retry has to work. _release_leadership demotes the in-memory gate BEFORE the write, so on the
+    # second call `was_leader` reads False and its not-a-leader early return fired — the UPDATE was
+    # never re-sent, the caller got (False, None), and the endpoint turned that into a 409 "this node
+    # is not the current leader" over a lease row still live and still owned by that very node. The
+    # 409's own documented remedy (resolve the leader from GET /cluster/nodes) then pointed straight
+    # back here, because this node IS what that API still names as lease owner.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    pool.fail = True
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0  # live, and ours
+
+    # THE MEASUREMENT. Count the release statements the pool sees, so "the retry re-sent it" is read
+    # off the wire rather than inferred from the row. Reverting force_write leaves this at 1 and the
+    # row at 30.0 — the vacuity control for this test.
+    releases: list[tuple[object, ...]] = []
+    pool.fail = False
+    pool.on_execute_args = releases.append
+    assert await a.step_down_leadership() == (False, None)
+    assert len(releases) == 1, "the retry did not re-send the release write"
+    assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
+
+    # And the pause is re-armed on the retry, for the same reason it is armed on the first call: the
+    # release expires the lease but leaves `owner` naming us, so the unfenced `owner = me` renew branch
+    # would otherwise hand leadership straight back on this node's very next tick.
+    assert a._no_claim_until == 20.0
+    await a._maintain_leadership()
+    assert a.is_leader() is False
+
+    # A sibling can now take it, which is the whole point of retrying.
+    db_clock.t = 1.0  # the expired lease is only takeable once the DB clock is past it
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
+async def test_a_retry_that_fails_again_refuses_rather_than_answering_not_the_leader() -> None:
+    # The same early return also SWALLOWED a second failure. With the write forced but still failing,
+    # the retry must raise again — not return (False, None), which the endpoint renders as a 409
+    # meaning "you addressed the wrong node" for a node that may still hold a live lease.
+    db = _FakeLeaseDB(_Clock(0.0))
+    pool = _FakeLeasePool(db)
+    a = _coord(pool, _Clock(0.0), node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    pool.fail = True
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0
+
+
+async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pause() -> None:
+    # The counterweight to the two tests above: forcing the write is scoped to a release this node
+    # OWES, never to every stepdown. A caller who addresses a standby by mistake must not cost that
+    # standby a DB round trip or two heartbeats of declining to claim — that would delay the very
+    # failover they are trying to perform.
+    db = _FakeLeaseDB(_Clock(0.0))
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A", heartbeat=10.0)
+    b_pool = _FakeLeasePool(db)
+    b = _coord(b_pool, _Clock(0.0), node="B", heartbeat=10.0)
+    await a._maintain_leadership()  # A leads; B never has
+
+    releases: list[tuple[object, ...]] = []
+    b_pool.on_execute_args = releases.append
+    assert await b.step_down_leadership() == (False, None)
+    assert releases == [], "a stepdown on a node that owes no release still wrote to the lease row"
+    assert b._no_claim_until == 0.0, "an innocent standby was handicapped by someone else's mistake"
     assert a.is_leader() is True
 
 
@@ -785,7 +876,7 @@ async def test_the_lock_wait_is_bounded_and_refuses_rather_than_demoting() -> No
 
     await a._leadership_lock.acquire()  # stand in for a tick suspended mid-round-trip
     try:
-        with pytest.raises(StepdownUnavailable):
+        with pytest.raises(StepdownLockTimeout) as caught:
             await a.step_down_leadership()
     finally:
         a._leadership_lock.release()
@@ -793,6 +884,39 @@ async def test_the_lock_wait_is_bounded_and_refuses_rather_than_demoting() -> No
     assert a.is_leader() is True, "a refused stepdown must leave leadership exactly as it found it"
     assert a._no_claim_until == 0.0
     assert db.row is not None and db.row["lease_expires_at"] == 30.0
+    # ITS OWN TYPE, not the write-failure one. Both used to be StepdownUnavailable, so the endpoint's
+    # single `except` arm gave both the same body ("could not release leadership; it is still the
+    # leader") and the same audit reason — a sentence that is false here twice over: nothing was
+    # released, and this branch runs before any leader check, so it fires on a node that leads nothing.
+    assert not isinstance(caught.value, StepdownReleaseUnconfirmed)
+    assert isinstance(caught.value, StepdownUnavailable)  # still one family for a catch-all caller
+    text = str(caught.value)
+    assert "maintenance tick" not in text, (
+        "the message names a maintenance tick as the holder; both coordinators take this lock in "
+        "_maintain_leadership AND in step_down_leadership, so the holder is not knowable from here"
+    )
+    assert "leadership lock" in text and "still the leader" not in text
+
+
+async def test_a_stepdown_refused_by_the_lock_can_come_from_a_node_that_leads_nothing() -> None:
+    # WHY THE LOCK-TIMEOUT WORDING MAY NOT ASSERT LEADERSHIP. The endpoint deliberately takes no
+    # is_leader() pre-read, so this refusal reaches a caller who addressed a standby whose lock happens
+    # to be busy. Nothing in that path ever read who the leader is.
+    db = _FakeLeaseDB(_Clock(0.0))
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    await a._maintain_leadership()
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", fence=0.05)
+    assert b.is_leader() is False
+
+    await b._leadership_lock.acquire()
+    try:
+        with pytest.raises(StepdownLockTimeout) as caught:
+            await b.step_down_leadership()
+    finally:
+        b._leadership_lock.release()
+
+    assert "still the leader" not in str(caught.value)
+    assert a.is_leader() is True and b.is_leader() is False
 
 
 # --- ADR 0056 slice 1: the SQL Server twin ----------------------------------
@@ -930,6 +1054,15 @@ async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_w
     await a._maintain_leadership()  # take leadership back (the row is expired and owned by A)
     assert a.is_leader() is True
     store.fail = True
-    with pytest.raises(StepdownUnavailable):
+    with pytest.raises(StepdownReleaseUnconfirmed):
         await a.step_down_leadership()
     assert a.is_leader() is False
+
+    # And the twin's half of the retry: the forced re-send lands on this backend too, so the operator
+    # the refusal tells to retry gets the same outcome on SQL Server as on Postgres.
+    store.fail = False
+    assert db.row is not None and db.row["lease_expires_at"] != 0.0
+    assert await a.step_down_leadership() == (False, None)
+    assert db.row["lease_expires_at"] == 0.0, (
+        "the SQL Server retry did not re-send the release write"
+    )

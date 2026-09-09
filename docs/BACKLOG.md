@@ -28912,10 +28912,35 @@ disaster-recovery hook commands, which are a different mechanism.
   through the unfenced `owner = me` branch when the pause ends. On the shipped defaults (heartbeat 10,
   fence 20, TTL 30) the pause ends at 20 while the lease lives to 30, and the settings validator pins
   `heartbeat < fence < ttl` without ever comparing the pause to the TTL, so nothing prevents it. The
-  release now reports whether its write landed and `step_down_leadership()` raises
-  `StepdownUnavailable`, which the endpoint maps to `503` -- the status the neighbouring DR endpoints
-  and ADR 0056's contract already give environment conditions -- and audits `cluster_stepdown_denied`
-  rather than a `cluster_stepdown` row saying the node was drained.
+  release now reports whether its write returned and `step_down_leadership()` raises, which the
+  endpoint maps to `503` -- the status the neighbouring DR endpoints and ADR 0056's contract already
+  give environment conditions -- and audits `cluster_stepdown_denied` rather than a `cluster_stepdown`
+  row saying the node was drained.
+- **The two refusals are two exceptions, two bodies and two audit reasons.** The first cut of that fix
+  gave both raise sites one `except StepdownUnavailable` arm, one body ("could not release leadership;
+  it is still the leader") and one reason (`release-failed`) -- and that sentence is false of each in a
+  different way. The lock timeout fires BEFORE any release runs, on a node the handler never checked
+  for leadership, so it may lead nothing; it is now `StepdownLockTimeout` / `lock-timeout`, and its
+  message names the LOCK and the bound rather than a maintenance tick, since both coordinators take
+  that lock in `_maintain_leadership` AND in `step_down_leadership`. The write failure is now
+  `StepdownReleaseUnconfirmed` / `release-unconfirmed`.
+- **The write-failure refusal is worded conditionally, because the outcome is genuinely unknown.** A
+  lost response to a committed `UPDATE` is indistinguishable from an `UPDATE` that never ran -- the
+  exception's own docstring said so while the endpoint shipped the flat certainty "it is still the
+  leader". On the committed branch that sentence sends an operator to fix a cluster that is already
+  failing over correctly. A row count cannot earn the certainty back either: the driver reports one
+  only on the path where it returned, and this refusal exists for the path where it raised. The body
+  now says the node demoted itself and stopped serving, that the lease MAY still be live and ours, and
+  what to do next.
+- **A retry of an unconfirmed release re-sends the write.** `_release_leadership` demotes the in-memory
+  gate before the write, so the retry hit its not-a-leader early return, sent nothing, and the endpoint
+  answered `409` "is not the current leader" over a lease row still live and still owned by that node
+  -- with the `409`'s own documented remedy (resolve the leader from `GET /cluster/nodes`) pointing
+  back at the same node, since that API still names it lease owner. Both coordinators now carry
+  `_lease_release_owed` and force the write past that early return, and re-arm the claim pause on the
+  retry so the successful release is not undone by the unfenced `owner = me` renew branch on the next
+  tick. Scoped to a release this node OWES: a stepdown addressed to a standby by mistake still sends
+  nothing and arms no pause, so it cannot delay the failover the caller is trying to perform.
 - **The lock's wait is bounded, and what the lock costs is written down.** Serializing against the tick
   puts the SYNCHRONOUS in-memory demotion behind a tick's DB round trip, so a drained node keeps
   answering `is_leader()` and keeps binding listeners while the call waits. Nothing bounded that wait:
@@ -29425,8 +29450,9 @@ second node is being provisioned, and the shape a test bed sits in -- passes the
 lease, and is leaderless for `2 * heartbeat_seconds` with nothing able to promote. The same is true of a
 cluster whose only sibling is `promotable = false`, or has not heartbeated within a node timeout.
 
-`docs/CLUSTERING.md` described this as "`400` on a single node", which is what the gate was meant to do
-and not what it does; #1494's PR corrected that sentence to describe the code.
+The shipped docs are not what needs fixing. `docs/CLUSTERING.md` describes the refusal as the code
+gives it -- not clustered, and explicitly not "one node" -- so a reader is told the truth about a gate
+that is still the wrong gate. The predicate is the work.
 
 ### The check is available and unused
 

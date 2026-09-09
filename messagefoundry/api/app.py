@@ -301,7 +301,11 @@ from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.cluster import StepdownUnavailable, build_coordinator
+from messagefoundry.pipeline.cluster import (
+    StepdownLockTimeout,
+    StepdownReleaseUnconfirmed,
+    build_coordinator,
+)
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -5465,37 +5469,62 @@ def create_app(
         (``config:deploy``, ``messages:replay``, ``messages:purge``) sit behind the same wrapper.
 
         Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
-        and no standby); ``409`` this node is not the leader (the normative answer, not an idempotent
-        retry — the caller resolves the leader from ``GET /cluster/nodes`` first); ``403`` missing
-        permission / step-up / MFA; ``503`` engine not started, authentication not configured, or the
-        drain could not be achieved for an environment reason.
+        and no standby); ``409`` this node is not the leader — the caller resolves the leader from
+        ``GET /cluster/nodes`` first, and see the note below on the one case where a ``409`` IS the
+        successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
+        authentication not configured, or one of the two drain conditions below.
 
-        **The ``503`` on a failed drain is the one status that is not merely plumbing.** The
-        coordinator raises ``StepdownUnavailable`` when it could not write the lease row, or when the
-        maintenance tick holding the leadership lock did not yield inside the fence timeout. Both leave
-        the lease live and still owned by this node, so no standby can take it — and an operator who
-        read a ``200`` there would begin maintenance on a node that is still the leader. Mapping it to
-        ``503`` matches what the neighbouring DR endpoints and the ADR's own contract give environment
-        conditions, and the audit row says the drain failed rather than that the node was drained.
+        **The two ``503``s are different answers and must not share a sentence.** An earlier build gave
+        both raise sites one body ("could not release leadership; it is still the leader") and one audit
+        reason, which was false of each in a different way.
+
+        * ``StepdownLockTimeout`` → reason ``lock-timeout``. The coordinator's leadership lock was still
+          held at the fence timeout, so **nothing ran**: no lease row was read or written and nothing
+          was demoted. It fires before any leadership is consulted, so it can come back from a node that
+          leads nothing — this branch asserts nothing about who the leader is.
+        * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
+          itself, armed its claim pause and fired the demotion edge (so its graph is coming down); what
+          it could not confirm is whether the write expiring its lease row committed. A lost response to
+          a committed ``UPDATE`` is indistinguishable from an ``UPDATE`` that never ran, so the body is
+          conditional: saying "it is still the leader" is right on one branch and, on the other, sends
+          an operator to fix a cluster that is already failing over correctly.
+
+        Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
+        endpoints and the ADR's own contract give that status.
+
+        **A ``409`` after a ``release-unconfirmed`` ``503`` is the retry SUCCEEDING**, not a wrong-node
+        answer. The coordinator re-sends the owed write on the next stepdown; by then this node has
+        already demoted, so it truthfully reports ``was_leader=false``. The confirmation is the lease
+        moving in ``GET /cluster/nodes``, not the status code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400`` and the
-        failed-drain ``503``, which nothing else would record.
+        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400`` and the two
+        ``503``s, which nothing else would record.
         """
         c = engine.coordinator
-        if not c.is_clustered():
-            # Single-node: no lease to release, no standby to take over. Gated here, before the
-            # coordinator, so the answer never depends on a NullCoordinator's no-op.
+
+        async def _denied(reason: str, exc: Exception | None = None) -> None:
+            """One shape for every refusal this handler records, so the three cannot drift apart field
+            by field. The DISCRIMINATOR stays at the call site: each refusal supplies its own reason
+            and raises its own body, because that is exactly the distinction a shared arm lost once."""
+            detail = {"node_id": c.node_id, "reason": reason}
+            if exc is not None:
+                detail["error"] = safe_exc(exc)
             await engine.store.record_audit(
                 "cluster_stepdown_denied",
                 actor=identity.username,
                 channel_id=None,
-                detail=json.dumps({"node_id": c.node_id, "reason": "not-clustered"}),
+                detail=json.dumps(detail),
                 client=client_ip(request),
             )
+
+        if not c.is_clustered():
+            # Single-node: no lease to release, no standby to take over. Gated here, before the
+            # coordinator, so the answer never depends on a NullCoordinator's no-op.
+            await _denied("not-clustered")
             raise HTTPException(
                 400, f"node {c.node_id} is not clustered; there is no lease to release"
             )
@@ -5505,21 +5534,29 @@ def create_app(
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
         try:
             was_leader, released_at = await c.step_down_leadership()
-        except StepdownUnavailable as exc:
-            # The drain did not happen. Record THAT, not a stepdown: the lease is still live and owned
-            # by this node, so "was_leader" would be the wrong field to write here — the operator needs
-            # to read "this node was not drained".
-            await engine.store.record_audit(
-                "cluster_stepdown_denied",
-                actor=identity.username,
-                channel_id=None,
-                detail=json.dumps(
-                    {"node_id": c.node_id, "reason": "release-failed", "error": safe_exc(exc)}
-                ),
-                client=client_ip(request),
-            )
+        except StepdownLockTimeout as exc:
+            # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
+            # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm
+            # asserts no leadership: it names the lock and the bound, which is all that is known.
+            await _denied("lock-timeout", exc)
             raise HTTPException(
-                503, f"node {c.node_id} could not release leadership; it is still the leader"
+                503,
+                f"node {c.node_id} could not start a stepdown: its leadership lock was still held "
+                "when the fence timeout ran out, so nothing was read, written or demoted and this "
+                "call changed nothing. Retry, and if it repeats, look at the store connection.",
+            ) from exc
+        except StepdownReleaseUnconfirmed as exc:
+            # THE NODE HAS ALREADY STOOD DOWN; what is unknown is the write. Record that, not a
+            # stepdown — but do not claim the certainty the old body did ("it is still the leader"),
+            # because a lost response to a committed UPDATE reads identically here to an UPDATE that
+            # never ran, and on the committed branch a standby is promoting while this is read.
+            await _denied("release-unconfirmed", exc)
+            raise HTTPException(
+                503,
+                f"node {c.node_id} demoted itself and stopped serving, but could not confirm that its "
+                "leadership lease was expired; it may still own a live lease no standby can take. "
+                "Re-run the stepdown — a retry re-sends that write — then confirm the lease has moved "
+                "in GET /cluster/nodes before starting maintenance.",
             ) from exc
         result = ClusterStepdownResult(
             node_id=c.node_id, was_leader=was_leader, released_at=released_at

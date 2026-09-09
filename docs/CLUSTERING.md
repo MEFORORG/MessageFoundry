@@ -353,21 +353,37 @@ POST /cluster/stepdown        # body: {} — there are no options
   failover that released nothing. The same returned value is what the audit row records.
 - **Statuses:** `400` when the deployment is **not clustered** — `[cluster]` disabled, or a store with no
   cluster coordinator — so there is no lease to release; `409` when this node is not the leader — resolve
-  the leader from `GET /cluster/nodes` and call it there, this is not a retry; `403` on a missing
-  permission, a stale step-up or an unsatisfied second factor; `503` when the engine is not started, or
-  when the drain could not be achieved (see the next bullet).
+  the leader from `GET /cluster/nodes` and call it there; `403` on a missing permission, a stale step-up
+  or an unsatisfied second factor; `503` when the engine is not started, or when the drain could not be
+  achieved (see the two `503` bullets below).
 - **`400` does not mean "one node".** The gate reads whether clustering is *enabled*, not how many nodes
   are live, so a clustered install that happens to be running one node accepts the call and goes
   leaderless for the pause. Keying the refusal on whether a promotable sibling actually exists is
   [BACKLOG #1509](BACKLOG.md); until then, read `GET /cluster/nodes` first.
-- **A `503` means the node was NOT drained.** The engine answers it when it could not write the lease
-  row, or when the maintenance tick did not yield inside `leader_fence_timeout_seconds`. In both cases
-  the lease stays live and owned by this node, so no standby can take it and the node takes leadership
-  back on its own — do not start maintenance. Retry, and if it repeats, look at the store connection.
+- **A `503` reading `lock-timeout` means nothing happened at all.** The node's leadership lock was still
+  held when `leader_fence_timeout_seconds` ran out, so no lease row was read or written and nothing was
+  demoted. Leadership is exactly as you found it. This one says nothing about who leads: the endpoint
+  takes no leader check before the release, so it can come back from a node that leads nothing. Do not
+  start maintenance. Retry, and if it repeats, look at the store connection.
+- **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
+  genuinely unknown.** It demoted itself, stopped claiming for two `heartbeat_seconds`, and tore its
+  graph down: the demotion edge stops that node's listeners and workers at once, so it is serving
+  nothing. What it could not confirm is whether the write expiring its lease row committed, because a
+  lost response to a committed `UPDATE` is indistinguishable here from an `UPDATE` that never ran.
+  - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
+    normally, whatever the error page says.
+  - **If it did not**, the lease is still live and still owned by a node that has stopped serving, so
+    on a first deployment nothing carries the feeds until that node renews itself back in when its
+    pause ends — a partitioned pool during a stepdown is the way into that window.
+  - **Retry the stepdown; a retry re-sends that write.** Expect the retry to answer `409`, not `200`:
+    the node demoted on the first call, so the retry finds it already a standby. Then read
+    `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status code, is what tells
+    you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
   `{node_id, was_leader, released_at}` — cluster metadata only, never message content. The refusals the
-  handler itself reaches (`400`, `503`) write `cluster_stepdown_denied` with a reason instead, so a
-  failed drain is never recorded as a drain.
+  handler itself reaches (`400`, both `503`s) write `cluster_stepdown_denied` instead, carrying the
+  reason — `not-clustered`, `lock-timeout` or `release-unconfirmed` — so a failed drain is never
+  recorded as a drain and the two `503`s never read as one condition.
 - **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
   `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
 

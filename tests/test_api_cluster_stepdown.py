@@ -39,7 +39,8 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
     NullCoordinator,
-    StepdownUnavailable,
+    StepdownLockTimeout,
+    StepdownReleaseUnconfirmed,
 )
 from messagefoundry.store import MessageStore
 
@@ -305,23 +306,35 @@ async def test_default_single_node_engine_is_refused(tmp_path: Path) -> None:
         assert r.status_code == 400
 
 
-async def test_a_drain_that_did_not_happen_is_503_and_is_not_audited_as_a_stepdown(
+async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
     tmp_path: Path,
 ) -> None:
-    # The failure the coordinator can no longer hide. A partitioned pool leaves the lease row live and
-    # still owned by this node, so no standby can take it and the node renews itself back in when the
-    # pause ends. Reporting 200/was_leader=true there would send an operator into maintenance on the
-    # node that is still the leader, which is the whole point of asking.
+    # The failure the coordinator can no longer hide. If the write did not land, the lease row is live
+    # and still owned by a node that has already demoted and torn its graph down, so no standby can
+    # take it. Reporting 200/was_leader=true there would send an operator into maintenance on a node
+    # that may still hold the lease, which is the whole point of asking.
     #
     # 503, not 409 or 500: this is an ENVIRONMENT condition, the status the neighbouring DR endpoints
     # and ADR 0056's own contract already give those. 409 would be wrong in the other direction -- it
     # says "you addressed the wrong node", and the caller would go and address a different one.
-    coord = _StandinCoordinator(raises=StepdownUnavailable("lease row could not be expired"))
+    coord = _StandinCoordinator(
+        raises=StepdownReleaseUnconfirmed("the lease-expiring write did not return")
+    )
     async with _admin(tmp_path, coord) as (engine, c, boss):
         r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
         assert r.status_code == 503
-        assert "could not release leadership" in r.json()["detail"]
+        detail_text = r.json()["detail"]
         assert coord.step_down_calls == 1
+
+        # CONDITIONAL, because the outcome is genuinely unknown: a lost response to a committed UPDATE
+        # is indistinguishable here from an UPDATE that never ran. The retired body asserted "it is
+        # still the leader", which on the committed branch sends an operator to fix a cluster that is
+        # already failing over correctly.
+        assert "could not confirm" in detail_text and "may still own a live lease" in detail_text
+        assert "it is still the leader" not in detail_text
+        # ...and it says the two things an operator has to act on: the node has stopped serving, and a
+        # retry is what re-sends the write.
+        assert "stopped serving" in detail_text and "retry" in detail_text.lower()
 
         # No cluster_stepdown row: nothing was stepped down, and a row carrying was_leader would be
         # answering the wrong question. The denied row records what actually happened.
@@ -329,8 +342,38 @@ async def test_a_drain_that_did_not_happen_is_503_and_is_not_audited_as_a_stepdo
         denied = await _rows(engine, "cluster_stepdown_denied")
         assert len(denied) == 1
         detail = json.loads(str(denied[0]["detail"]))
-        assert detail["node_id"] == "node-a" and detail["reason"] == "release-failed"
+        assert detail["node_id"] == "node-a" and detail["reason"] == "release-unconfirmed"
         assert denied[0]["actor"] == "boss"
+
+
+async def test_a_lock_timeout_is_its_own_503_and_asserts_no_leadership(tmp_path: Path) -> None:
+    # THE SECOND RAISE SITE, which used to share the first one's body and audit reason. It fires BEFORE
+    # any release runs -- no lease row read, none written, nothing demoted -- and, because the handler
+    # deliberately takes no is_leader() pre-read, it can come back from a node that leads nothing. So
+    # every sentence the other branch owes the operator is wrong here, and one shared arm gave them
+    # both anyway.
+    coord = _StandinCoordinator(
+        leader=False,  # the node this refusal can reach: it leads nothing
+        raises=StepdownLockTimeout("the leadership lock was still held at the fence timeout"),
+    )
+    async with _admin(tmp_path, coord) as (engine, c, boss):
+        r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
+        assert r.status_code == 503
+        detail_text = r.json()["detail"]
+
+        # It names the lock and says nothing ran. It must NOT claim this node leads, must NOT claim it
+        # demoted, and must not borrow the release branch's language.
+        assert "leadership lock" in detail_text and "changed nothing" in detail_text
+        assert "still the leader" not in detail_text
+        assert "demoted itself" not in detail_text and "could not confirm" not in detail_text
+
+        assert not await _rows(engine, "cluster_stepdown")
+        denied = await _rows(engine, "cluster_stepdown_denied")
+        assert len(denied) == 1
+        detail = json.loads(str(denied[0]["detail"]))
+        # A DISTINCT reason, so the audit log can tell an operator which condition they hit. One reason
+        # for both would make "was this node drained?" unanswerable from the record.
+        assert detail["reason"] == "lock-timeout"
 
 
 async def test_stepdown_is_503_without_an_engine(tmp_path: Path) -> None:
