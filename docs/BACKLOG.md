@@ -17422,6 +17422,36 @@ remaining ask. **Closure is proposed by both amendments and taken by neither.** 
 row declared open is fully accounted for. A seat with the authority should rule on whether the
 allowlist scope survives as this row or as a new one.
 
+**AMENDMENT 2026-09-09 -- THE REFUSAL WAS TOO WIDE BY ONE ARGUMENT, AND MAIN IS WHERE THAT SHOWED.**
+The assertion above refused every `hvac.Client` argument outside `{url, token, allow_redirects}`.
+#1180 (ASVS 12.3.4) had meanwhile landed on `main` and resolves an operator-named internal CA into the
+**same** kwargs dict, on purpose, so that the assertion sees what the client is built with. Merged, the
+two produced a `ValueError` on every Vault hop with a CA configured -- three CI legs red, both
+providers, and the refusal message named `verify` while claiming the argument moved where the TLS
+context comes from, which it does not.
+
+**Narrowed rather than relocated, and the choice is the record.** The cheaper repair was to assert the
+base dict before splatting the CA in. That was declined: it gives up the ONE-dict property amendment 5
+of [ADR 0180](adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md) exists to
+state, and re-opens the drift the LDAPS site needed a second test to cover. Instead `verify` is
+admitted on the TYPE of its value -- a `str`/`os.PathLike` path, which chooses only WHICH roots verify
+the peer and leaves the suite list untouched (measured: `cert_reqs=CERT_NONE` yields the identical 17).
+`verify=False` stays refused, because that is the knob that turns peer verification off.
+
+**The bool arm is defence in depth and is labelled as such.** `vault_client_verify_kwargs` is typed
+`dict[str, str]` and returns a path or nothing, so no shipped caller can reach that refusal today. Six
+tests pin both sides -- the path admitted, and `False`/`True`/`""`/`0`/`1` each refused, the falsy
+non-bools included because `requests` reads every falsy value as "do not verify" and `bool` subclasses
+`int`, so the shorter spellings of the check all admit at least one of them.
+
+**Three repairs rode with it, all from the same hand-resolved merge, none of them a design question.**
+Two of the three Vault sites had kept BOTH the hoisted `_build_client` call and the original in-`try`
+one, so they constructed two clients where one is required; `scripts/security/crypto_inventory_check.py`
+had a duplicated comment line, an orphaned sentence fragment and a comment stranded inside a
+`frozenset()` call -- prose, so no gate reported it. And `scripts/worktree/new.ps1` gained the `vault`
+extra: the lane venv must install what the `test` leg installs, or a lane reads green over tests it
+never collected, which is the exact failure this row's own CI change was made to end (#1335).
+
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
 > 🔢 **Filed 2026-08-22 by the researcher, contributed jointly with the ASVS Tracker.** Value **6/10** -- Difficulty **5/10**. The security record and the #1107-#1199 research items together carry **3,543 bare `path:line` citations** (occurrences; 2,871 distinct) that assert nothing an independent reference could check. Against them the scorecard holds **2,090 evidence anchors** carrying an `expect` token the tree confirms -- roughly **1.7 uncheckable prose citations for every checkable anchor**. Ownership splits cleanly: the security-record half falls to the Lander, the only seat in the current roster holding vault authority (`CLAUDE.md` section 5, which retired the ASVS Tracker seat this line named); this seat wrote all 1,313 occurrences in #1107-#1199. One item, because both halves share one cause and one fix.

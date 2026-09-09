@@ -804,6 +804,48 @@ def test_the_vault_assertion_refuses_a_client_argument_it_cannot_replicate() -> 
 
 
 @_vault_extra
+def test_the_vault_assertion_admits_a_ca_bundle_path_as_verify() -> None:
+    """#1180 puts ``verify=<path>`` in the very dict this assertion is handed, and it must pass.
+
+    Both Vault providers resolve the operator's trust anchor INTO the kwargs dict, precisely so the
+    assertion sees what the client will be built with. A blanket refusal of ``verify`` therefore made
+    every CA-anchored Vault hop refuse to come up. A path chooses WHICH roots verify the peer and
+    leaves the suite list alone (measured: ``cert_reqs`` does not move it), so it is replicable.
+    """
+
+    tls_policy.assert_hvac_tls_suites(
+        {
+            "url": "https://vault.example.test:8200",
+            "token": "s.token",
+            "allow_redirects": False,
+            "verify": "/etc/mefor/vault-ca.pem",
+        },
+        connector="Vault KV secret provider",
+    )
+
+
+@_vault_extra
+@pytest.mark.parametrize("verify", [False, True, "", 0, 1])
+def test_the_vault_assertion_still_refuses_verify_as_an_on_off_switch(verify: object) -> None:
+    """DEFENCE IN DEPTH, not a live path, and worth saying which it is.
+
+    ``verify=False`` is the knob that turns peer verification off, and a replica that accepted it
+    would report a clean suite list for a hop that authenticates nobody. No shipped caller can reach
+    this today: ``vault_client_verify_kwargs`` is typed ``dict[str, str]`` and returns a path or
+    nothing. The arm exists so a future caller that starts passing a switch is refused rather than
+    quietly replicated. ``""`` and ``0`` are here because requests reads every falsy value as "do not
+    verify", and ``bool`` is a subclass of ``int`` -- the shorter spellings of this check all admit at
+    least one of them.
+    """
+
+    with pytest.raises(ValueError, match="not the path of a CA bundle"):
+        tls_policy.assert_hvac_tls_suites(
+            {"url": "https://vault.example.test:8200", "verify": verify},
+            connector="Vault KV secret provider",
+        )
+
+
+@_vault_extra
 def test_hvac_holds_no_ssl_context_of_its_own_at_any_layer() -> None:
     """The measurement the whole replica rests on — re-run rather than quoted.
 

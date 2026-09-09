@@ -270,7 +270,6 @@ class VaultKeyProvider:
         # both paths propagate out of open_store and serve refuses to start.
         client = _build_client(addr, token)
         try:
-            client = _build_client(addr, token)
             # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit
             # cipher, this path paid for NO metadata round trip -- measured zero read_key calls at
             # engine commit 2b8bccb43 -- so this ADDS one, to turn an operator-chosen key of an

@@ -209,9 +209,6 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
     client = _build_client(addr, token)  # lazy hvac import; fails closed naming the [vault] extra
     try:
-        client = _build_client(
-            addr, token
-        )  # lazy hvac import; fails closed naming the [vault] extra
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
         # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write
         # dead-letter. BACKLOG #1166, owner ruling 2026-08-22: the round trip was already being paid for

@@ -483,7 +483,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported). tls_policy since
     # ADR 0180: hvac exposes no SSLContext, so `_build_client` asserts the suite list urllib3 will
     # build for this hop (ASVS 12.1.2) before the client is constructed.
-    # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported).
+    # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy
     # seam, so an operator-named internal CA reaches hvac's single `verify=` bundle path.
     "messagefoundry/config/secretprovider_vault.py": frozenset(
         {"hvac", "messagefoundry.config.tls_policy"}
@@ -526,7 +526,6 @@ INVENTORY: dict[str, frozenset[str]] = {
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.keyprovider",
         }
-        # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy seam.
     ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
     # ASVS 3.4.7/3.4.8: mints the per-response CSP script nonce (secrets) stamped into <script> for the

@@ -864,15 +864,39 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
     harden_cipher_suites(ctx, connector=connector)
 
 
-#: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` can faithfully replicate.
+#: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` replicates UNCONDITIONALLY.
 #:
-#: These are the three the engine passes, and not one of them reaches the TLS context: ``url`` becomes
-#: the request URL, ``token`` an ``X-Vault-Token`` header, and ``allow_redirects`` is a requests-level
-#: policy the adapter applies after the handshake. Every OTHER ``Client`` argument is REFUSED rather
-#: than ignored — ``session``, ``adapter``, ``verify``, ``cert`` and ``proxies`` each redirect where
-#: the context comes from, and the function's docstring says why ``session=`` in particular must never
-#: be quietly accepted.
+#: Not one of them reaches the TLS context: ``url`` becomes the request URL, ``token`` an
+#: ``X-Vault-Token`` header, and ``allow_redirects`` is a requests-level policy the adapter applies
+#: after the handshake. ``verify`` is admitted separately, and only when its value is a CA bundle path
+#: — see :data:`_HVAC_CLIENT_CA_BUNDLE_KWARG`. Every OTHER ``Client`` argument is REFUSED rather
+#: than ignored — ``session``, ``adapter``, ``cert`` and ``proxies`` each redirect where the context
+#: comes from, and the function's docstring says why ``session=`` in particular must never be quietly
+#: accepted.
 _HVAC_CLIENT_REPLICABLE_KWARGS = frozenset({"url", "token", "allow_redirects"})
+
+#: The one ``hvac.Client`` argument admitted CONDITIONALLY, on the TYPE of the value it carries.
+#:
+#: ``verify=<path>`` names the CA bundle this hop trusts. That is what #1180 (ASVS 12.3.4) puts in the
+#: very dict this assertion is handed, when an operator anchors a Vault hop to their own PKI: it
+#: chooses WHICH roots verify the peer, and it is suite-neutral. ``verify=False`` is a different knob
+#: — it turns peer verification off — and stays refused.
+_HVAC_CLIENT_CA_BUNDLE_KWARG = "verify"
+
+
+def _is_ca_bundle_path(value: object) -> bool:
+    """Whether an hvac ``verify=`` value is a CA bundle PATH rather than an on/off switch.
+
+    ``bool`` is rejected first and on its own line, because ``bool`` is a subclass of ``int`` and
+    every shorter spelling of this check reads ``verify=True`` as "a bundle was named".
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str):
+        # An empty string is FALSY to requests, which reads it as "do not verify" rather than as a
+        # path, so it is an off switch wearing a path's type and it is refused with the bools.
+        return bool(value)
+    return isinstance(value, os.PathLike)
 
 
 def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: str) -> None:
@@ -908,17 +932,37 @@ def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: st
     whose HTTPS adapter carries an ``ssl_context`` — and it is exactly what would make this replica
     assert a context the hop does not use. A control that keeps reporting success after the thing it
     checks has moved is the false-premise shape SDS-3.7 forbids, so an argument outside
-    :data:`_HVAC_CLIENT_REPLICABLE_KWARGS` raises here instead.
+    :data:`_HVAC_CLIENT_REPLICABLE_KWARGS` raises here instead, except for the one argument the
+    next paragraph admits on the type of its value.
 
-    ``verify`` is refused for the same reason and NOT because it changes the suite list — measured, it
-    does not: ``cert_reqs=CERT_NONE`` yields the identical 17 suites. It is refused because it is the
-    knob that turns peer verification off, and a replica that quietly accepted it would report a clean
-    suite list for a hop that authenticates nobody. The engine passes it never, so the default
+    ``verify`` is the ONE argument admitted conditionally, and the type of its value decides. A PATH
+    (a ``str`` or an ``os.PathLike``, naming a CA bundle) is accepted: it chooses WHICH roots verify
+    the peer and does not move the suite list at all — measured, ``cert_reqs=CERT_NONE`` yields the
+    identical 17 suites — and #1180 (ASVS 12.3.4) puts exactly that value in this dict when an
+    operator anchors a Vault hop to their own PKI. A BOOL is still refused, because ``verify=False``
+    is the knob that turns peer verification off and a replica that quietly accepted it would report a
+    clean suite list for a hop that authenticates nobody. That bool arm is DEFENCE IN DEPTH rather
+    than a live path: :func:`vault_client_verify_kwargs` is typed ``dict[str, str]`` and returns a
+    path or nothing, so no shipped caller can produce one today. With ``verify`` absent, the default
     (``verify=True`` → ``CERT_REQUIRED``, measured on the shipped construction) is what this replicates.
 
     Raises :class:`ValueError` at construction, like every other assertion site.
     """
-    unreplicable = sorted(set(client_kwargs) - _HVAC_CLIENT_REPLICABLE_KWARGS)
+    admitted = set(_HVAC_CLIENT_REPLICABLE_KWARGS)
+    if _HVAC_CLIENT_CA_BUNDLE_KWARG in client_kwargs:
+        verify = client_kwargs[_HVAC_CLIENT_CA_BUNDLE_KWARG]
+        if not _is_ca_bundle_path(verify):
+            raise ValueError(
+                f"{connector}: cannot assert this hop's TLS suites — hvac.Client's `verify=` is "
+                f"{type(verify).__name__}, not the path of a CA bundle. A path only chooses WHICH "
+                f"roots verify the peer and leaves the suite list alone, so it is replicated; a bool "
+                f"is the knob that turns peer verification off, and a replica that accepted "
+                f"`verify=False` would report a clean suite list for a hop that authenticates "
+                f"nobody. Name the CA file that issued this hop's server certificate, or leave "
+                f"`verify` unset for the stock construction."
+            )
+        admitted.add(_HVAC_CLIENT_CA_BUNDLE_KWARG)
+    unreplicable = sorted(set(client_kwargs) - admitted)
     if unreplicable:
         raise ValueError(
             f"{connector}: cannot assert this hop's TLS suites — hvac.Client argument(s) "

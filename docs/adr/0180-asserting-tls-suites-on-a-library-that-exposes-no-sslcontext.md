@@ -183,11 +183,25 @@ that only the real function tracks urllib3 if urllib3 ever narrows its own defau
 "the look-alike is measurably wrong" would have been a satisfying and false argument.
 
 **3. It REFUSES any `hvac.Client` argument it cannot replicate** (`_HVAC_CLIENT_REPLICABLE_KWARGS =
-{url, token, allow_redirects}`). `session=` is the one that matters: it is the documented way to give
-this hop a different TLS context, and a replica that accepted it would keep reporting a clean suite
-list for a context the hop had stopped using. `verify=` is refused too, and **not** because it changes
-the suite list — measured, `cert_reqs=CERT_NONE` yields the identical 17 — but because it is the knob
-that turns peer verification off.
+{url, token, allow_redirects}`, plus `verify` on the condition below). `session=` is the one that
+matters: it is the documented way to give this hop a different TLS context, and a replica that accepted
+it would keep reporting a clean suite list for a context the hop had stopped using.
+
+`verify=` is admitted **conditionally, on the TYPE of its value**, and this paragraph first said it was
+refused outright. That reading did not survive contact with `main`. #1180 (ASVS 12.3.4) landed while
+this work was in flight and resolves an operator-named internal CA **into the very kwargs dict this
+assertion is handed**, so a blanket refusal turned every CA-anchored Vault hop into a refuse-to-start
+— which is what it did, on three CI legs, before this correction. The reconciliation: a **path**
+(`str` or `os.PathLike`) is accepted, because it only chooses WHICH roots verify the peer and —
+measured — `cert_reqs=CERT_NONE` yields the identical 17 suites. A **bool** is still refused, because
+`verify=False` is the knob that turns peer verification off and a replica that accepted it would report
+a clean suite list for a hop that authenticates nobody.
+
+**The bool arm is DEFENCE IN DEPTH, not a live path, and saying which it is costs nothing.**
+`vault_client_verify_kwargs` is typed `dict[str, str]` and returns a path or nothing, so under strict
+mypy no shipped caller can put a bool in that dict today. The arm exists so a future caller that starts
+passing a switch is refused rather than quietly replicated. Narrowing the refusal rather than moving
+the assertion off the CA dict is also what keeps point 5 below true.
 
 **4. Two construction points, three clients, and the sharing is now pinned by identity.**
 `config/secretprovider_vault._build_client` and `store/keyprovider_vault._build_client` both assert;
