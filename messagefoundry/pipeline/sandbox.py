@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197; default-on per #1278).
+"""Subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
 Routers and Handlers are admin-authored *pure* Python. In the engine's own address space sit the
 service account's DEK, the tamper-evident audit chain, and every live socket. ASVS 15.2.5 wants a
-hard isolation boundary between that trusted core and admin-supplied code; this module is that
-boundary, and since BACKLOG #1278 it is **on by default**.
+hard isolation boundary between that trusted core and admin-supplied code; this module is the
+**opt-in** boundary that closes the documented residual WP-L3-17.
 
 **IT DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS.** The loader runs every ``*.py``
 in the config directory in-process, as the service account, at every ``serve`` and every reload,
@@ -15,11 +15,15 @@ level is out of its reach in either mode; the safe-source DACL gate still covers
 
 **Modes (``[sandbox].mode``).**
 
-* ``off`` — :func:`run_sandboxed` calls the Router/Handler **in-process**, byte-identically and with
-  **zero** overhead (no subprocess, no marshalling, and no wall-clock cap either). The isolation seam
-  is invisible. This is the supported escape for a Handler that needs the live
-  ``db_lookup``/``fhir_lookup`` bridges, which fail closed in the child.
-* ``subprocess`` (**the default**) — the Router/Handler runs in a **persistent per-inbound
+* ``off`` (**the default**) — :func:`run_sandboxed` calls the Router/Handler **in-process**,
+  byte-identically and with **zero** overhead (no subprocess, no marshalling, and no wall-clock cap
+  either). The isolation seam is invisible. This is also the supported escape for a Handler that
+  needs the live ``db_lookup``/``fhir_lookup`` bridges, which fail closed in the child — and note
+  that ``[sandbox].mode`` is a single **engine-wide** setting
+  (:meth:`messagefoundry.pipeline.engine.Engine.add_registry` renders ONE :class:`SandboxPolicy` for
+  the whole graph, and a connection carries no per-connection sandbox field), so choosing ``off`` for
+  one such Handler runs **every** Router and Handler in the process in-process.
+* ``subprocess`` — the Router/Handler runs in a **persistent per-inbound
   worker subprocess** (:mod:`messagefoundry.pipeline._sandbox_worker`). The parent marshals
   ``(id, phase, name, payload, run_context)`` over a length-prefixed **non-executing** pipe codec
   (:mod:`messagefoundry.pipeline._sandbox_codec`); the worker looks the function up in **its own**
@@ -141,8 +145,10 @@ DEFAULT_FORBIDDEN_MODULES: tuple[str, ...] = (
 class SandboxMode(str, enum.Enum):  # noqa: UP042
     """How a Router/Handler is executed relative to the engine process."""
 
-    OFF = "off"  # in-process, byte-identical, zero overhead; the escape for live enrichment
-    SUBPROCESS = "subprocess"  # persistent per-inbound worker child (the [sandbox].mode default)
+    # OFF is the default and also the escape for a Handler needing live enrichment (see the module
+    # docstring's mode bullets; [sandbox].mode is engine-wide, so that escape is too).
+    OFF = "off"  # in-process, byte-identical, zero overhead (default)
+    SUBPROCESS = "subprocess"  # persistent per-inbound worker child
 
 
 @dataclass(frozen=True)
@@ -150,11 +156,12 @@ class SandboxPolicy:
     """Resolved ``[sandbox]`` policy. Pure data so the caps travel to the worker.
 
     ``mode`` carries **no default here on purpose.** The one default lives in
-    :class:`~messagefoundry.config.settings.SandboxSettings` (``"subprocess"`` since BACKLOG #1278);
-    a second one on this dataclass would be free to contradict it silently. Every construction site
-    already passes ``mode=`` explicitly.
+    :class:`~messagefoundry.config.settings.SandboxSettings` (``"off"``); a second one on this
+    dataclass would be free to contradict it silently. Every construction site already passes
+    ``mode=`` explicitly.
 
-    ``mode=off`` is the zero-overhead, byte-identical parity mode. ``wall_seconds`` is the
+    ``mode=off`` (the shipped default) is the zero-overhead, byte-identical parity mode.
+    ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
     pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
     ``mode=subprocess``: the in-process path has no timeout at all. ``cpu_seconds`` / ``mem_mb`` add

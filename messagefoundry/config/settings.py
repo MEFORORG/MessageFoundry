@@ -1251,9 +1251,9 @@ class PipelineSettings(_Section):
     # (never a lane outage). Reliability-core + read ONCE at engine construction (a /config/reload does
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
-    # SETTING THIS ALONE NOW DOES NOTHING ON THE SHIPPED DEFAULTS, and you must be told here rather
-    # than in the other knob's docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is
-    # subprocess, which is the default since BACKLOG #1278. Fusion runs Router/Handler/accepts= code
+    # ONE OTHER SETTING CAN CANCEL THIS ONE, and you must be told here rather than in that knob's
+    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is subprocess (it ships off, so
+    # this bites only a site that turned the sandbox on). Fusion runs Router/Handler/accepts= code
     # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
     # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
     # get fusion you must also set [sandbox].mode=off, and that trade is yours to make on purpose.
@@ -1298,7 +1298,7 @@ class PipelineSettings(_Section):
 
 
 class SandboxSettings(_Section):
-    """``[sandbox]`` — subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197/#1278).
+    """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
     **THIS DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS, and that is the first thing
     to know about it.** The loader executes every ``*.py`` in the config directory in-process, as the
@@ -1309,18 +1309,22 @@ class SandboxSettings(_Section):
 
     Routers/Handlers are admin-authored pure Python. In the engine's own address space sit the DEK,
     the audit chain, and every live socket. ASVS 15.2.5 wants a hard isolation boundary; this section
-    is one. ``mode="subprocess"`` (**the default since BACKLOG #1278**) runs each inbound's
+    turns one on. ``mode="off"`` (**the default**) runs them in-process, **byte-identically and with
+    zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges. ``mode="off"`` runs them in-process,
-    **byte-identically and with zero overhead** — the isolation seam is invisible. An isolation
-    denial routes the message to ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
+    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
 
-    **What the default costs, all of it measured in ADR 0087 (do not re-derive):**
+    **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
 
     * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
       process boundary breaks, so they fail closed inside the child. **A Handler needing either must
-      run ``mode="off"``** — that escape is supported and is not going away.
+      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
+      single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
+      renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
+      sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
+      process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
       ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
       post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
@@ -1341,9 +1345,10 @@ class SandboxSettings(_Section):
     Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
     **restart to change**, exactly like ``claim_mode``)."""
 
-    # subprocess (DEFAULT since #1278; persistent per-inbound worker child) | off (in-process,
-    # byte-identical, zero overhead — and the supported escape for a Handler needing live enrichment).
-    mode: Literal["off", "subprocess"] = Field(default="subprocess")
+    # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
+    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
+    # connection: one policy is rendered for the whole graph.
+    mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     wall_seconds: float = Field(default=5.0, gt=0)

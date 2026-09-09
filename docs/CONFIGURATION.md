@@ -821,8 +821,8 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `schedule_tick_seconds` | float (>0) | 30.0 | **Active-window scheduler tick** (#147, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). The reconcile granularity for a connection's per-connection `schedule` (a window boundary is honoured within one tick). Only affects connections that declare a `schedule`; connections with none are byte-identical always-on. |
 
 ### `[sandbox]`
-**Subprocess isolation for Routers/Handlers, ON by default** ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md),
-BACKLOG #197 built it, BACKLOG #1278 made it the default; ASVS 15.2.5).
+**Opt-in subprocess isolation for Routers/Handlers** ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md),
+BACKLOG #197, ASVS 15.2.5).
 
 **It does not stop config Python executing in the engine process — read that before anything else.**
 The loader executes every `*.py` in your config directory in-process, as the service account, at every
@@ -830,30 +830,38 @@ The loader executes every `*.py` in your config directory in-process, as the ser
 or Handler's **body** runs once the graph is built. Module top level is outside its reach either way.
 
 Routers/Handlers are admin-authored pure Python. The engine's own address space holds the DEK, the audit
-chain, and every live socket. `mode="subprocess"` (**the default**) runs each inbound's Router/Handler in
-a **persistent per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
-(socket/store/crypto) and the resource caps below. `mode="off"` runs them in-process, **byte-identically
-and with zero overhead**. An isolation denial (forbidden op, cap overrun, worker crash, a rejected frame)
-routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never dropped).
+chain, and every live socket. `mode="off"` (**the default**) runs them in-process, **byte-identically and
+with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
+per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
+(socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
+worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never
+dropped).
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
-**What the default costs you.** Four things change relative to `mode="off"`, and none of them is a
-reason to turn it off blindly:
+**`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
+whole graph, so whichever mode you pick governs **every** Router and Handler in the process. That
+matters most in the other direction: setting `mode="off"` because one Handler needs live enrichment
+takes every other Router and Handler out of the sandbox too. To isolate some feeds and not others you
+need separate engine processes.
 
-| | On the `subprocess` default |
+**What turning it on costs you.** Four things change relative to `mode="off"`:
+
+| | At `mode="subprocess"` |
 |---|---|
-| **Live enrichment** | `db_lookup` / `fhir_lookup` are **refused, fail-closed**. They re-enter the event loop and a process boundary breaks that. **A Handler needing either must run `mode="off"`** — that escape is supported and is not going away. |
-| **`wall_seconds`** | Now **enforced**. At `mode="off"` there is no timeout at all, so this is a cap the default posture gains: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `cpu_seconds`/`mem_mb` arm with it. |
+| **Live enrichment** | `db_lookup` / `fhir_lookup` are **refused, fail-closed**. They re-enter the event loop and a process boundary breaks that. **A Handler needing either must run `mode="off"`** — that escape is supported and is not going away, and per the note above it applies to the whole engine, not to that Handler alone. |
+| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `cpu_seconds`/`mem_mb` arm with it. |
 | **Throughput** | About **0.19 ms per dispatch** with no reference view; a 20k-entry crosswalk costs about **4.5 ms** marshalling and **6.2 ms** end-to-end, roughly 1.4x a pickle round-trip — inside the pipeline's existing per-interface bound. **One message is not one dispatch:** a message routed to one handler with an `accepts=` predicate costs **three** (router, predicate, transform), and fan-out to K handlers costs **1 + 2K**, each re-marshalling the reference view. |
 | **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter with its own re-loaded copy of your config dir), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
 
 **Two more things the setting does not reach.** `messagefoundry check` and `messagefoundry dryrun`
-always run Routers/Handlers **in-process** and never consult `mode`, so a Handler calling
-`db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then fails closed at `serve`, and
-`wall_seconds` is unenforced in the preview. And `[pipeline].fuse_thread_hops` is **hard-disabled**
-whenever `mode="subprocess"`: fusion runs Router/Handler code in-process on an executor hop, so honouring
-both would silently unsandbox the code you asked to isolate. The runner fails closed to the async
-sandboxed path and logs it. To get fusion you must also set `mode="off"`.
+always run Routers/Handlers **in-process** and never consult `mode`. On the default that costs nothing,
+because `serve` runs them in-process too; once you set `mode="subprocess"` the preview stops matching
+the engine, so a Handler calling `db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then
+fails closed at `serve`, and `wall_seconds` is unenforced in the preview. And
+`[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode="subprocess"`: fusion runs
+Router/Handler code in-process on an executor hop, so honouring both would silently unsandbox the code
+you asked to isolate. The runner fails closed to the async sandboxed path and logs it. To get fusion you
+must leave `mode="off"`.
 
 **The pipe itself is a control, and it is not configurable.** Both directions speak a **non-executing
 frame codec**: a closed tag set decoded with `json.loads` + `bytes.decode` and a literal tag match over a
