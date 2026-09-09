@@ -6,12 +6,27 @@
   router/store changes) is a **follow-up ADR** before any non-HL7 source is built, so §3 stays
   forward-looking. **First database backend: SQL Server** (reuses the store's existing `aioodbc` path —
   no new driver). (Proposed → Accepted same day.)
-- **Built:** Nothing yet. The extension *point* it uses is already built and is explicitly meant for
-  this: the connector **registry** (`register_source` / `register_destination` keyed by
-  `ConnectorType`, [transports/base.py](../../messagefoundry/transports/base.py)) and the
-  transport-agnostic `Source`/`Destination` models ([config/models.py](../../messagefoundry/config/models.py),
-  whose docstring says adding a transport "never requires touching this file"; the enum already carries
-  the placeholder comment `# Phase 2+: TCP, DATABASE, REST, FHIR`).
+- **Built:** BUILT, not pending — the §1 connectors shipped, and the §3 database source with them.
+  **AMENDED 2026-09-09.** This line previously read *"Nothing yet. The extension point it uses is
+  already built and is explicitly meant for this"*, which was true when written (2026-06-12, before
+  §2 was started) and is now wrong by the whole feature. It under-claimed, so a reader planning off
+  it would plan to build what already ships.
+  **Verified in the tree 2026-09-09, by symbol:** `ConnectorType.REST` / `.DATABASE` / `.SOAP` are
+  declared in [config/models.py](../../messagefoundry/config/models.py), each citing this ADR; and
+  `RestDestination` ([transports/rest.py](../../messagefoundry/transports/rest.py)),
+  `DatabaseDestination` + `DatabaseSource` ([transports/database.py](../../messagefoundry/transports/database.py))
+  and `SoapDestination` ([transports/soap.py](../../messagefoundry/transports/soap.py)) each register
+  themselves into the connector registry. §5's gate cleared: the follow-up landed as
+  [ADR 0004](0004-payload-agnostic-ingress.md), and `content_type` now reaches `store/` and `pipeline/`.
+  **Scope of that check:** symbols and registry registration only — not test coverage, and not every
+  §2/§4 sub-decision. There is no REST or SOAP *source* connector, and none is planned.
+  **The extension point named above is unchanged and is still the mechanism:** the connector
+  **registry** (`register_source` / `register_destination` keyed by `ConnectorType`,
+  [transports/base.py](../../messagefoundry/transports/base.py)) and the transport-agnostic
+  `Source`/`Destination` models ([config/models.py](../../messagefoundry/config/models.py)), whose
+  docstring still says adding a transport never requires touching that file. One detail of it went
+  stale: the enum's placeholder comment `# Phase 2+: TCP, DATABASE, REST, FHIR` is gone, replaced by
+  the real members.
 - **Related:** [ADR 0001](0001-staged-pipeline-architecture.md) (the staged pipeline these feed:
   sources → ingress, destinations ← outbound), [ADR 0002](0002-phase2-transport-security-and-strong-auth.md)
   (TLS/egress posture these inherit), the Corepoint-migration estate (185 MLLP but also database, REST,
