@@ -5509,8 +5509,10 @@ def create_app(
 
         **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
         — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
-        claim statement has exactly two arms: renew, ``WHERE leader_lease.owner = $2``, which carries
-        no expiry term; and take-over, which requires the lease to have expired. If the row still names
+        claim statement has exactly two arms: renew, gated on this node still OWNING the row
+        (``WHERE leader_lease.owner = $2`` on Postgres, ``t.owner = ?`` in the SQL Server ``MERGE``),
+        which carries no expiry term; and take-over, which requires the lease to have expired. Nothing
+        below turns on which backend it is — both spell the same two arms. If the row still names
         this node when the pause ends — the release write never committed, or it committed and no
         standby took the lease — the renew arm matches on the next tick, this node leads again, and a
         retry answers ``200``. If a standby acquired instead, the row names the standby and its lease
