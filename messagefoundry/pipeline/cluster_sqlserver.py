@@ -585,8 +585,9 @@ class SqlServerCoordinator:
     ) -> tuple[bool, float | None, bool]:
         """``(was_leader, released_at, wrote)`` — mirrors ``DbCoordinator._release_leadership``,
         including the demote-the-cached-gate-before-the-DB ordering, the stamp taken at the in-memory
-        demotion, the ``wrote`` flag its two callers read in opposite directions, and ``force_write``,
-        which re-sends an owed ``UPDATE`` past the not-a-leader early return."""
+        demotion, the ``wrote`` flag its two callers read in opposite directions, ``force_write``,
+        which re-sends an owed ``UPDATE`` past the not-a-leader early return, and the arm-before-the-
+        write ordering that keeps a CANCELLED write from unwinding with nothing owed."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
@@ -597,6 +598,10 @@ class SqlServerCoordinator:
         # #145: clean step-down (inverse -> auto-resolves), guarded exactly as DbCoordinator guards it.
         if was_leader:
             self._alert_leadership_lost("released")
+        # Armed before the write, cleared only on one that returned — `except Exception` cannot catch
+        # asyncio.CancelledError, so an owed flag set in the arm below would leak on cancellation.
+        # DbCoordinator._release_leadership carries the full reasoning; keep the two in lockstep.
+        self._lease_release_owed = True
         try:
             await self._store._execute(
                 "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
@@ -609,7 +614,6 @@ class SqlServerCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
-            self._lease_release_owed = True
             return (was_leader, released_at, False)
         self._lease_release_owed = False
         return (was_leader, released_at, True)

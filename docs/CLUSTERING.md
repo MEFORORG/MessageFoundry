@@ -366,17 +366,27 @@ POST /cluster/stepdown        # body: {} — there are no options
   takes no leader check before the release, so it can come back from a node that leads nothing. Do not
   start maintenance. Retry, and if it repeats, look at the store connection.
 - **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
-  genuinely unknown.** It demoted itself, stopped claiming for two `heartbeat_seconds`, and tore its
-  graph down: the demotion edge stops that node's listeners and workers at once, so it is serving
-  nothing. What it could not confirm is whether the write expiring its lease row committed, because a
-  lost response to a committed `UPDATE` is indistinguishable here from an `UPDATE` that never ran.
+  genuinely unknown.** It cleared its leadership flag, stopped claiming for two `heartbeat_seconds`,
+  and STARTED tearing its graph down. What it could not confirm is whether the write expiring its lease
+  row committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
+  `UPDATE` that never ran.
+  - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
+    demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
+    afterwards, and the phases after the source and dispatcher stop — connector close, executor
+    shutdown, sandbox close — are unbounded by design. Until the teardown reaches them, this node's
+    listen-type inbounds (MLLP, TCP, HTTP, DICOM, X12) are still bound to their own ports and still
+    accepting, because a listen source binds per node and ignores the leader gate. Confirm quiescence
+    with `GET /cluster/nodes` plus the connection view before you touch the node.
   - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
     normally, whatever the error page says.
-  - **If it did not**, the lease is still live and still owned by a node that has stopped serving, so
-    on a first deployment nothing carries the feeds until that node renews itself back in when its
+  - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
+    so on a first deployment nothing carries the feeds until that node renews itself back in when its
     pause ends — a partitioned pool during a stepdown is the way into that window.
-  - **Retry the stepdown; a retry re-sends that write.** Expect the retry to answer `409`, not `200`:
-    the node demoted on the first call, so the retry finds it already a standby. Then read
+  - **Retry the stepdown; a retry re-sends that write.** *Within the pause* — two `heartbeat_seconds`,
+    20s at the shipped default — expect the retry to answer `409`, not `200`: the node demoted on the
+    first call, so the retry finds it already a standby. Past the pause expect `200` instead, for the
+    reason the bullet above gives: the release leaves `owner` naming that node, its renew branch is
+    not gated on the expiry, so it takes leadership back on its own next tick. Either way, read
     `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status code, is what tells
     you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and

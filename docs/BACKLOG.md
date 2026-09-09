@@ -28930,8 +28930,18 @@ disaster-recovery hook commands, which are a different mechanism.
   leader". On the committed branch that sentence sends an operator to fix a cluster that is already
   failing over correctly. A row count cannot earn the certainty back either: the driver reports one
   only on the path where it returned, and this refusal exists for the path where it raised. The body
-  now says the node demoted itself and stopped serving, that the lease MAY still be live and ours, and
-  what to do next.
+  now says the node cleared its leadership flag and STARTED tearing its graph down, that teardown is
+  NOT finished when the response is sent and its later phases are unbounded, that the lease MAY still
+  be live and ours, and what to do next. **An earlier cut of that body -- and of this line -- said the
+  node "stopped serving", which is false.** `Engine._on_demote_edge` (`pipeline/engine.py`) is
+  `_graph_wake.set()` and its docstring says it deliberately does not set the runner's `_stop`; the
+  teardown runs afterwards on the graph-supervisor task via `_stop_graph`, whose pinned comment keeps
+  the connector-close phases unbounded; and every listen-type inbound (`transports/mllp.py`,
+  `tcp.py`, `http_listener.py`, `dicom.py`, `x12.py`) says in terms that `leader_gate` is ignored, so
+  those keep accepting on their own ports until teardown reaches them. On a first deployment an
+  operator reading "stopped serving" would begin maintenance on a node still bound to its port and
+  still ACKing. `docs/CLUSTERING.md` carried the same false claim and now says the same true one:
+  confirm quiescence with `GET /cluster/nodes` plus the connection view, never with the status code.
 - **A retry of an unconfirmed release re-sends the write.** `_release_leadership` demotes the in-memory
   gate before the write, so the retry hit its not-a-leader early return, sent nothing, and the endpoint
   answered `409` "is not the current leader" over a lease row still live and still owned by that node
@@ -29053,7 +29063,14 @@ of this paragraph named only "Console -- High Availability page" and the ADR's s
 STALE marker to that section alone. But `### Confirm / step-up posture (console)` sits INSIDE
 `## Control API -- planned failover`, the section the status block declares BUILT, so a reader arriving
 at it was told the surrounding prose was current. It names `client.stepdown_node`, `poll_client`,
-`_request` and `AsyncRunner` -- all retired PySide6 console symbols -- and it tells the confirm dialog
+`_request` and `AsyncRunner`. **An earlier revision of this line called all four retired PySide6
+console symbols, and that is wrong; ADR 0056 carries the correction and this record now matches it.**
+Three of the four are alive, REHOMED rather than retired: `_request` in
+`messagefoundry/apiclient/client.py`, `AsyncRunner` in `harness/_async.py`, and `poll_client` in
+`harness/_console_widgets.py`.
+Only `client.stepdown_node` is absent from the tree, and that absence is the control showing the
+check discriminates rather than matching everything. What is stale is the SEAT, not the machinery. It
+also tells the confirm dialog
 to promise the operator that "the VIP will move", which the paused-VIP bullet three lines up denies.
 Both sections now carry their own do-not-build-from marker at the section itself, rather than relying on
 a reader having read the status block first.
@@ -29064,6 +29081,44 @@ console; the operator UI is the web console at `/ui`. The topology reasoning in 
 (one page renders the whole cluster from any node, so Corepoint's "Viewing: Primary / Backup" toggle has
 no analogue) but its construction notes point at files that do not exist. The ADR's status block now
 says so; the section itself is kept for the reasoning.
+
+### Corrections made while re-reading the shipped stepdown, 2026-09-09
+
+**The `503` no longer claims the node stopped serving, in the body or in `docs/CLUSTERING.md`.**
+The trace is in the write-failure bullet above. Both now say what is true -- the node cleared its
+leadership flag and STARTED tearing its graph down, teardown is not finished when the response is
+sent, its later phases are unbounded, and listen-type inbounds keep accepting until it completes --
+and both send the operator to `GET /cluster/nodes` plus the connection view for quiescence rather
+than to a status code.
+
+**Cancellation escaped the owed-write contract, and both coordinators now arm the flag before the
+write.** `_release_leadership` caught `Exception`, which cannot catch `asyncio.CancelledError` (it
+derives from `BaseException`), so a cancelled lease-expiring write unwound with `_is_leader` already
+cleared and `_lease_release_owed` still False. The next stepdown then took the not-a-leader early
+return, sent no write, and answered `409` "not the current leader" over a lease that may still be
+live and owned -- with no audit row of either kind on that path. Reachable in the shipped
+configuration rather than only in theory: `RequestTimeoutMiddleware` is registered unconditionally
+and its `asyncio.timeout` cancels the handler at `DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0`, over a
+pool acquire the stepdown docstring documents as unbounded. Both coordinators now set the flag
+BEFORE the write and clear it only on one that returned, so neither a raise nor a cancellation can
+leave it clear.
+
+**"Expect the retry to answer `409`" is scoped to the claim pause.** It holds only for the two
+`heartbeat_seconds` a stepdown declines to claim. Past that, the `owner = me` renew branch -- which
+carries no expiry term, so it is not gated on the release -- puts the node back in on its own next
+tick and the retry answers `200`. The document contradicted itself: the bullet three lines above
+already described that re-arm. Now scoped in `docs/CLUSTERING.md` and in the endpoint docstring.
+
+### Found while making those corrections, recorded rather than fixed
+
+- The `cluster_stepdown` audit cannot tell a confirmed retry from a stepdown addressed to the wrong
+  node: both write `was_leader: false` with a null `released_at`.
+- A stale `_lease_release_owed` on a node that is no longer leader would make the next stepdown arm
+  the claim pause on an innocent follower.
+- `stop()`'s comment enumerating what it and `step_down_leadership` share still lists only `_is_leader`
+  and the owner-scoped `UPDATE`; it does not mention `_lease_release_owed`.
+- `docs/adr/README.md` says ADR 0056 has a stale "console section", singular, where the ADR now
+  carries two do-not-build-from markers.
 
 ---
 

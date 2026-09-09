@@ -643,11 +643,12 @@ class DbCoordinator:
         # step_down_leadership() so a voluntarily-drained node does not immediately re-arm itself via the
         # renew branch. 0.0 = no pause, which is every path but a stepdown.
         self._no_claim_until: float = 0.0
-        # ADR 0056 slice 1: a lease-expiring write raised, so this node may still own a live lease row
-        # it has already stopped claiming in memory. Set by _release_leadership when the write does not
-        # return, cleared when one does. Read by step_down_leadership ALONE, to force the retry's write
-        # past the not-a-leader early return — without it a retry sends nothing and answers "not the
-        # leader" over a lease row that is still live and still ours.
+        # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
+        # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
+        # write and clears it only when one returns, so neither a raise nor a cancellation can leave it
+        # clear. Read by step_down_leadership ALONE, to force the retry's write past the not-a-leader
+        # early return — without it a retry sends nothing and answers "not the leader" over a lease row
+        # that is still live and still ours.
         self._lease_release_owed = False
         # ADR 0056 slice 1: mutual exclusion between _maintain_leadership and the stepdown's release.
         # BOTH of them decide leadership across an await on the pool, and a stepdown runs from an API
@@ -1307,7 +1308,9 @@ class DbCoordinator:
         fired, the ``UPDATE`` was never re-attempted, and the caller was told "not the current leader"
         over a lease row still live and still owned by this node — with the endpoint's own remedy for
         that answer pointing back at this same node. :attr:`_lease_release_owed` records the owed write
-        so this method can force it past that early return.
+        so this method can force it past that early return. "Did not return" covers a CANCELLED write
+        as well as a raised one — the request deadline can cancel this call mid-write — which is why
+        :meth:`_release_leadership` arms that flag *before* the write rather than in its ``except``.
         """
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
         try:
@@ -1381,6 +1384,19 @@ class DbCoordinator:
         # its first pass: it is re-sending a write, not demoting a second time.
         if was_leader:
             self._alert_leadership_lost("released")
+        # OWED BEFORE THE WRITE, cleared only on a write that returned. The obvious placement — set it
+        # in the except arm — leaks on CANCELLATION: `asyncio.CancelledError` derives from
+        # BaseException, so `except Exception` below does not see it, and the method unwinds with the
+        # in-memory `self._is_leader = False` above already done and nothing owed. The next stepdown
+        # would then read owed=False, take the `not was_leader and not force_write` early return above,
+        # send no UPDATE, and answer "not the current leader" over a lease row that may still be live
+        # and still ours — with no audit row of either kind on that path.
+        #
+        # Reachable in the shipped configuration, not just in theory: `create_app` registers
+        # RequestTimeoutMiddleware unconditionally and its asyncio.timeout cancels the handler at
+        # api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS (120.0), over a pool acquire
+        # step_down_leadership's own docstring documents as unbounded.
+        self._lease_release_owed = True
         try:
             # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
             # acquire tick takes over at once instead of waiting out the full TTL.
@@ -1396,7 +1412,6 @@ class DbCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
-            self._lease_release_owed = True
             return (was_leader, released_at, False)
         self._lease_release_owed = False
         return (was_leader, released_at, True)

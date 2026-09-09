@@ -550,7 +550,9 @@ promotion; this API contract is unchanged by it.
 > going to do until the paused VIP mechanism is decided.
 >
 > **What is stale is the SEAT, not the machinery, and an earlier version of this marker got that
-> wrong.** It asserted that every symbol named below belonged to the retired PySide6 desktop console.
+> wrong.** It asserted that every symbol it named belonged to the retired PySide6 desktop console.
+> ("Named below" was also the wrong scope, and is corrected here: three of the four are named in step
+> 3 below, but `AsyncRunner` is named further up, in the High Availability page section.)
 > Three of the four are alive, REHOMED rather than retired: `_request` in
 > `messagefoundry/apiclient/client.py` (ADR 0088 extracted the Qt-free engine client), `AsyncRunner` in
 > `harness/_async.py`, and `poll_client` in `harness/_console_widgets.py` (the harness reuses view

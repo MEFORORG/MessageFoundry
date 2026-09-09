@@ -110,6 +110,10 @@ class _FakeLeasePool:
     ``on_execute`` is a synchronous probe called at the instant the release statement runs. It exists
     because every other test here reads ``is_leader()`` only after the whole call has returned, which is
     blind to WHEN inside the call the demotion happened.
+
+    ``hang_in_execute`` suspends the release statement on an event the test owns, BEFORE the row is
+    touched. ``fail`` cannot stand in for it: a raise is caught by the coordinator's ``except
+    Exception`` and a CANCELLATION is not, which is the whole distinction the cancellation tests pin.
     """
 
     def __init__(self, db: _FakeLeaseDB) -> None:
@@ -117,6 +121,7 @@ class _FakeLeasePool:
         self.fail = False
         self.yield_in_fetchrow = False
         self.yield_in_execute = False
+        self.hang_in_execute: asyncio.Event | None = None
         self.on_execute: Callable[[], None] | None = None
         # Records the ARGUMENTS of each release statement, which ``on_execute`` cannot: the
         # release-retry tests ask "was a second UPDATE sent at all", and a row that already reads
@@ -139,6 +144,10 @@ class _FakeLeasePool:
     async def execute(self, sql: str, *args: object) -> None:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
+        if self.hang_in_execute is not None:
+            # Suspended INSIDE the write and before the row moves, which is where a request deadline
+            # cancels a real one. Nothing sets this event; the test cancels the awaiting task instead.
+            await self.hang_in_execute.wait()
         if self.on_execute is not None:
             self.on_execute()  # a reader observing the coordinator DURING the release window
         if self.on_execute_args is not None:
@@ -149,6 +158,22 @@ class _FakeLeasePool:
         assert "leader_lease" in sql and "UPDATE" in sql
         _lease_key, owner = args
         self._db.release(owner)
+
+
+async def _cancel_once_suspended(task: asyncio.Task[object]) -> None:
+    """Let ``task`` reach its suspended write, then cancel it there and absorb the CancelledError.
+
+    The loop is why this is a helper rather than a bare ``cancel()``: cancelling after a single
+    scheduler pass would cancel a coroutine that had not yet reached the pool, which proves nothing
+    about a write cancelled mid-flight. The ``done()`` check is the control — without it a test that
+    cancelled too early, or too late, would still pass.
+    """
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done(), "the call never reached the suspended write, so nothing was cancelled"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def _coord(
@@ -800,6 +825,60 @@ async def test_a_retry_that_fails_again_refuses_rather_than_answering_not_the_le
     assert db.row is not None and db.row["lease_expires_at"] == 30.0
 
 
+async def test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it() -> None:
+    # THE HOLE THE TWO TESTS ABOVE DID NOT COVER. They partition the pool, so the write RAISES and the
+    # coordinator's `except Exception` arm records the owed write. A CANCELLATION takes neither arm:
+    # asyncio.CancelledError derives from BaseException, so `except Exception` never sees it and the
+    # method unwound with _is_leader already cleared and _lease_release_owed still False. The next
+    # stepdown then read owed=False, took the not-a-leader early return, sent NO write, and answered
+    # 409 "not the current leader" over a lease row still live and still ours — the exact defect the
+    # retry mechanism exists to prevent, reached by a different door and with no audit row either way.
+    #
+    # Not hypothetical in the shipped configuration: RequestTimeoutMiddleware is registered
+    # unconditionally and its asyncio.timeout cancels the handler at DEFAULT_REQUEST_TIMEOUT_SECONDS
+    # (120.0), over a pool acquire the stepdown docstring documents as unbounded.
+    #
+    # VACUITY CONTROL, both legs MEASURED rather than reasoned: move the `self._lease_release_owed =
+    # True` in _release_leadership back into its `except Exception` arm and this test fails at the
+    # owed assertion (`False is True`); silence that one line as well and it fails at the release
+    # count instead (`0 == 1`), which is the leg that proves the retry really did send nothing.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    pool.hang_in_execute = (
+        asyncio.Event()
+    )  # never set: the write suspends until the task is cancelled
+    await _cancel_once_suspended(asyncio.create_task(a.step_down_leadership()))
+
+    # The in-memory demotion happened (it precedes the write) and the row never moved, which is exactly
+    # the state the owed flag exists to record.
+    assert a.is_leader() is False
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0, "the cancelled write landed"
+    assert a._lease_release_owed is True, "a cancelled write left nothing owed"
+
+    # THE MEASUREMENT: the retry re-sends the write, counted off the wire rather than inferred.
+    releases: list[tuple[object, ...]] = []
+    pool.hang_in_execute = None
+    pool.on_execute_args = releases.append
+    assert await a.step_down_leadership() == (False, None)
+    assert len(releases) == 1, "the retry after a cancelled release sent no write"
+    assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
+    assert a._lease_release_owed is False, "a write that returned must clear the owed flag"
+
+    # And the pause is armed on that retry too, so the released lease is not re-taken by this node on
+    # its next tick — the same reason the raise-path retry arms it.
+    assert a._no_claim_until == 20.0
+    db_clock.t = 1.0
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
 async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pause() -> None:
     # The counterweight to the two tests above: forcing the write is scoped to a release this node
     # OWES, never to every stepdown. A caller who addresses a standby by mistake must not cost that
@@ -932,7 +1011,7 @@ class _FakeSqlLeaseStore:
     yields cannot exhibit an ordering defect, and a test that reads state only after the call cannot see
     where inside it the demotion landed.
 
-    **``_execute`` carries the same three hooks as its Postgres sibling on purpose.** Without them the
+    **``_execute`` carries the same hooks as its Postgres sibling on purpose.** Without them the
     release-window interleaving simply cannot be EXPRESSED against this backend, so a claim that both
     interleavings are pinned on both coordinators would have been half true with nothing failing.
     """
@@ -945,6 +1024,8 @@ class _FakeSqlLeaseStore:
         self.yield_in_fetchone = False
         self.yield_in_execute = False
         self.on_execute: Callable[[], None] | None = None
+        # Read _FakeLeasePool.hang_in_execute: a raise and a cancellation take different arms.
+        self.hang_in_execute: asyncio.Event | None = None
 
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object] | None:
         if self.yield_in_fetchone:
@@ -960,6 +1041,8 @@ class _FakeSqlLeaseStore:
     async def _execute(self, sql: str, params: tuple[object, ...]) -> None:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
+        if self.hang_in_execute is not None:
+            await self.hang_in_execute.wait()  # suspended inside the write, before the row moves
         if self.on_execute is not None:
             self.on_execute()  # a reader observing the coordinator DURING the release window
         if self.fail:
@@ -1066,3 +1149,32 @@ async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_w
     assert db.row["lease_expires_at"] == 0.0, (
         "the SQL Server retry did not re-send the release write"
     )
+
+
+async def test_sqlserver_cancelled_release_still_owes_the_write() -> None:
+    # The twin of test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it. It is here
+    # for the reason the module docstring gives for the other SQL Server tests: the defect is an
+    # asyncio one, not a T-SQL one — `except Exception` cannot catch CancelledError on either backend —
+    # so pinning it only on Postgres would leave the twin unguarded on every ordinary run.
+    #
+    # VACUITY CONTROL, both legs MEASURED: move `self._lease_release_owed = True` back into the
+    # `except Exception` arm of SqlServerCoordinator._release_leadership and this test fails at the
+    # owed assertion (`False is True`); silence that one line too and it fails at the row instead
+    # (`30.0 == 0.0`), the retry having sent nothing.
+    db = _FakeLeaseDB(_Clock(0.0))
+    store = _FakeSqlLeaseStore(db)
+    a = _sql_coord(store, "A", _Clock(0.0))
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    store.hang_in_execute = asyncio.Event()  # never set
+    await _cancel_once_suspended(asyncio.create_task(a.step_down_leadership()))
+
+    assert a.is_leader() is False
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0, "the cancelled write landed"
+    assert a._lease_release_owed is True, "a cancelled write left nothing owed"
+
+    store.hang_in_execute = None
+    assert await a.step_down_leadership() == (False, None)
+    assert db.row["lease_expires_at"] == 0.0, "the retry after a cancelled release sent no write"
+    assert a._lease_release_owed is False
