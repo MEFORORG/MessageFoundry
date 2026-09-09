@@ -354,7 +354,8 @@ async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
         # and the node is NOT quiescent yet.
         assert "retry" in detail_text.lower()
         assert "cleared its leadership flag" in detail_text
-        assert "bounded demotion budget" in detail_text and "unbounded phases" in detail_text
+        assert "bounded share of the demotion budget" in detail_text
+        assert "unbounded" in detail_text and "connector close" in detail_text
         assert "never means the node is quiescent" in detail_text
 
         # THREE RETIRED CLAIMS, pinned negatively because each shipped once and this test asserted two
@@ -365,9 +366,9 @@ async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
         #    ACKing. An operator who read it would begin maintenance on a live node.
         assert "stopped serving" not in detail_text
         # 2. "listeners keep accepting until it completes" — the ordering refutes it.
-        #    RegistryRunner._teardown_body runs _stop_sources_demote LAST of the three phases inside
-        #    the demotion budget and only THEN reaches the unbounded connector-close, executor-shutdown
-        #    and sandbox-close phases; MLLP/TCP/HTTP/X12 each call server.close() in their stop()'s
+        #    RegistryRunner._teardown_body runs _stop_sources_demote LAST of the three BOUNDED demote
+        #    phases and only THEN reaches the unbounded connector-close, executor-shutdown and
+        #    sandbox-close phases; MLLP/TCP/HTTP/X12 each call server.close() in their stop()'s
         #    synchronous prologue. Accept stops EARLIER than that sentence said, not later.
         assert "keep accepting until" not in detail_text
         # 3. "started tearing its graph down" — DbCoordinator.step_down_leadership fires the demotion

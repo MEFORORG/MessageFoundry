@@ -5582,8 +5582,9 @@ def create_app(
             #
             # NOR does it say the listeners keep accepting until teardown COMPLETES, which the
             # replacement body said and which the ordering refutes. RegistryRunner._teardown_body runs
-            # the source stop LAST of the three phases inside the demotion budget
-            # (_quiesce_workers_demote, _quiesce_dispatchers_demote, _stop_sources_demote), and only
+            # the source stop LAST of the three BOUNDED demote phases (_quiesce_workers_demote,
+            # _quiesce_dispatchers_demote, _stop_sources_demote — each taking its own share of the
+            # budget, 0.7/0.7/0.3, so the SHARES are bounded and their sum is not the budget), and only
             # then reaches the unbounded connector-close, executor-shutdown and sandbox-close phases.
             # MLLP, TCP, HTTP and X12 each call server.close() in their stop()'s SYNCHRONOUS prologue,
             # so accept stops on the first loop pass of that phase — earlier than "until it completes",
@@ -5600,10 +5601,11 @@ def create_app(
                 f"node {c.node_id} has cleared its leadership flag, but could not confirm that its "
                 "leadership lease was expired; it may still own a live lease no standby can take. "
                 "Demotion tears the graph down on another task, not in this call: the listener stop "
-                "runs inside the bounded demotion budget, ahead of the unbounded phases (connector "
-                "close, executor shutdown, sandbox close), and a listener that overruns that budget "
-                "is abandoned rather than cancelled while its established connections drain in the "
-                "background. Re-run the stepdown — a retry re-sends that write — then confirm the "
+                "runs under its own bounded share of the demotion budget, ahead of the unbounded "
+                "phases (connector close, executor shutdown, sandbox close), and a listener that "
+                "overruns that share is abandoned rather than cancelled while its established "
+                "connections drain in the background. Re-run the stepdown — a retry re-sends that "
+                "write — then confirm the "
                 "lease has moved in GET /cluster/nodes AND that this node's connections are quiet "
                 "before starting maintenance. This status code never means the node is quiescent.",
             ) from exc

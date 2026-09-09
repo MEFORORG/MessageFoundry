@@ -375,11 +375,12 @@ POST /cluster/stepdown        # body: {} — there are no options
     demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
     afterwards.
   - **The listeners stop early in that teardown, not at the end of it.** The source stop is the last of
-    the three phases inside the bounded demotion budget, and MLLP, TCP, HTTP and X12 each close their
-    accept socket in the synchronous prologue of their own `stop()` — so they stop taking new
-    connections before the unbounded phases (connector close, executor shutdown, sandbox close) are
-    reached at all. **That buys less than it sounds like.** A source that overruns the budget is
-    abandoned rather than cancelled; DICOM releases its port inside exactly the call that gets
+    the three BOUNDED demote phases — each takes its own share of the demotion budget, so the shares
+    are bounded and their sum is not the budget — and MLLP, TCP, HTTP and X12 each close their accept
+    socket in the synchronous prologue of their own `stop()`, so they stop taking new connections
+    before the unbounded phases (connector close, executor shutdown, sandbox close) are reached at
+    all. **That buys less than it sounds like.** A source that overruns its share is abandoned rather
+    than cancelled; DICOM releases its port inside exactly the call that gets
     abandoned, so a DICOM listener can still hold its port; established connections drain in the
     background; and a message already inside a handler still finishes its commit and its ACK, which
     count-and-log requires. Confirm quiescence with `GET /cluster/nodes` plus the connection view

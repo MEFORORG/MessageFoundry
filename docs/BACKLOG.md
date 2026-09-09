@@ -29096,8 +29096,9 @@ plus the connection view for quiescence rather than to a status code.
 **CORRECTED 2026-09-09, same PR: the replacement sentence was false too, and in a way the first fix
 made easy to miss.** It said teardown's "later phases are unbounded, so this node's listeners keep
 accepting until it completes". The unbounded half is true and the consequence does not follow.
-`RegistryRunner._teardown_body` runs the source stop as the LAST of the three phases inside the
-demotion budget -- after `_quiesce_workers_demote` and `_quiesce_dispatchers_demote` -- and only then
+`RegistryRunner._teardown_body` runs the source stop as the LAST of the three BOUNDED demote phases
+-- after `_quiesce_workers_demote` and `_quiesce_dispatchers_demote`, each taking its own share of
+the budget (0.7/0.7/0.3, so the shares are bounded and their sum is not the budget) -- and only then
 reaches the unbounded connector-close, executor-shutdown and sandbox-close phases. MLLP, TCP, HTTP
 and X12 each call `server.close()` in the synchronous prologue of their own `stop()`, so accept stops
 on the first loop pass of that phase, EARLIER than "until it completes" rather than later. The node
