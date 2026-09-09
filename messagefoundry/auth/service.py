@@ -57,7 +57,12 @@ from messagefoundry.auth.permissions import (
     is_custom_role_id,
     validate_custom_role_permissions,
 )
-from messagefoundry.auth.policy import PasswordPolicy, _operator_corpus
+from messagefoundry.auth.policy import (
+    BreachCorpusUnavailable,
+    PasswordPolicy,
+    _common_passwords,
+    _operator_corpus,
+)
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
@@ -96,6 +101,38 @@ def _warn_if_corpus_unreadable(path: str | None) -> None:
     )
 
 
+def _error_if_bundled_corpus_unusable(check_breached: bool) -> None:
+    """Eagerly load (and cache) the BUNDLED breach corpus at startup, so a truncated or missing file
+    surfaces in the log at boot rather than as a 500 on somebody's first password change (BACKLOG
+    #1438). The twin of ``_warn_if_corpus_unreadable`` above, at a higher level for a reason.
+
+    The OPERATOR corpus degrades to a warning because it is optional and the bundled list still screens
+    underneath it. Nothing screens underneath the BUNDLED list, so its loss is an ERROR: ``check_breached``
+    ships ``True``, and a corpus that cannot load means the shipped configuration asserts a check that is
+    not running. ``PasswordPolicy.violations`` refuses passwords in that state; this is only the loud
+    half. THIS FUNCTION deliberately does not stop the engine -- HL7 flow does not depend on password
+    screening, and bricking a message engine over an auth data asset would trade a contained failure for
+    an outage. Read that as scoped to this function and not to the change as a whole: on a FIRST run
+    ``initialize`` mints the bootstrap admin, whose generator screens its own candidate, so the raise
+    from ``violations`` escapes an unguarded lifespan call and startup fails. Tracked separately.
+
+    Skipped when the operator has turned screening off: a corpus nobody consults is not a defect.
+    """
+    if not check_breached:
+        return
+    try:
+        entries = _common_passwords()
+    except BreachCorpusUnavailable as exc:
+        _log.error(
+            "%s; local password creation and change will be REFUSED until it is repaired "
+            "(ASVS 6.2.4). Reinstall the messagefoundry wheel, or set [auth].password_check_breached "
+            "= false to accept unscreened passwords deliberately",
+            exc,
+        )
+        return
+    _log.debug("loaded the bundled breach corpus (%d entries)", len(entries))
+
+
 #: A fixed argon2 hash used to equalize login timing for unknown/disabled accounts (anti-enumeration).
 _DUMMY_PASSWORD_HASH = hash_password("mf-login-timing-equalizer")
 
@@ -106,6 +143,65 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
+
+#: ASVS 6.3.8 — the fixed budget every FAILED authentication response is held to, so the branch a
+#: challenge took cannot be read off its latency (BACKLOG #1140). Successes are never padded: a valid
+#: credential already tells the caller the account exists, and enumeration is about telling two
+#: FAILURES apart.
+#:
+#: 0.5 s is sized from measurement, not taste. Measured 2026-09-05 in-process against a real SQLite
+#: store, warmed and interleaved, 25 samples per branch: every local failure branch lands at 46-50 ms
+#: median with a p90 of 57 ms, dominated by the one argon2id verify (~40 ms at the pinned t=3, 64 MiB,
+#: p=4 parameters). 0.5 s is roughly 9x that p90, which leaves room for a slower CPU and for the
+#: `_argon2_sem` queue under a login flood. It is a MODULE constant rather than an operator setting on
+#: purpose: an operator who could lower it could silently disable the control, and no site-specific
+#: fact the right value depends on is left unfixed by the argon2 parameters.
+_FAILURE_BUDGET_SECONDS = 0.5
+
+#: Per-process, per-seam latch for the budget-overrun warning. Deliberately module-level and not
+#: per-instance: the warning reports that THIS DEPLOYMENT's budget is too small for its hardware,
+#: which is a fact about the process, not about one service object. One warning per seam per process
+#: — the login surface is unauthenticated, so warning on every overrun would be the same unbounded
+#: log amplifier the rate-limited audit paths already exist to avoid.
+_BUDGET_OVERRUN_WARNED: set[str] = set()
+
+
+def _failure_deadline(started: float, now: float, budget: float | None = None) -> float:
+    """The instant a failed challenge that began at ``started`` is allowed to answer.
+
+    Returns the first whole multiple of ``budget`` after ``started`` that is strictly later than
+    ``now`` — normally the first slot, since the budget is sized above every failure branch.
+
+    **The quantization is the fail-SAFE, and it is why this is not simply ``started + budget``.** A
+    pad that gives up once the work has outrun its budget fails open exactly when it matters: under
+    the load that made the work slow, the raw elapsed goes back on the wire. Rounding up to the next
+    slot instead means an overrun discloses only WHICH SLOT the work landed in, never the elapsed
+    itself, and it cannot fail open at all — the returned deadline is always strictly ahead of ``now``.
+
+    Quantizing does mean a pair of branches that straddle a slot boundary stay distinguishable, and
+    more visibly than their raw few-millisecond gap would be. That is not extra disclosure: a slot
+    index is a lossy function of the elapsed, so it cannot carry more than the elapsed already did,
+    and the budget is sized so that every branch lands in slot 1 with an order of magnitude to spare.
+
+    ``budget`` reads :data:`_FAILURE_BUDGET_SECONDS` at CALL time when omitted, so a test can lower
+    it; it must be > 0. ``now`` before ``started`` (a clock that ran backwards — ``time.monotonic``
+    does not, but a caller can still hand one in) collapses to slot 1 rather than to a past deadline.
+    """
+    span = _FAILURE_BUDGET_SECONDS if budget is None else budget
+    slots = max(1, int((now - started) // span) + 1)
+    return started + slots * span
+
+
+async def _sleep_until(deadline: float) -> None:
+    """Await until the monotonic instant ``deadline``, returning at once if it has already passed.
+
+    A named module-level function so the pad has exactly one sleep site to audit, and so a test can
+    replace it and read back the deadline a seam computed without paying a wall-clock wait.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
 
 # Global safety bound on outstanding single-use per-action step-up grants (ADR 0077). Each grant is
 # consumed on the next matching sensitive request (or expires with the step-up window), so the live set
@@ -295,20 +391,9 @@ class AuthService:
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
         # email push (the audited /me/security-events feed still records everything). Best-effort.
         self._security_notifier = security_notifier
-        self._policy = PasswordPolicy(
-            min_length=settings.password_min_length,
-            require_uppercase=settings.password_require_uppercase,
-            require_lowercase=settings.password_require_lowercase,
-            require_digit=settings.password_require_digit,
-            require_symbol=settings.password_require_symbol,
-            check_breached=settings.password_check_breached,
-            check_context=settings.password_check_context,
-            check_username=settings.password_check_username,
-            breach_corpus_file=settings.password_breach_corpus_file,
-            lockout_threshold=settings.lockout_threshold,
-            lockout_minutes=settings.lockout_minutes,
-        )
+        self._policy = PasswordPolicy.from_settings(settings)
         _warn_if_corpus_unreadable(settings.password_breach_corpus_file)
+        _error_if_bundled_corpus_unusable(settings.password_check_breached)
         if ldap is not None:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
@@ -899,7 +984,73 @@ class AuthService:
 
     # --- login ---------------------------------------------------------------
 
+    async def _equalize_failure(
+        self, outcome: LoginOutcome, started: float, *, seam: str
+    ) -> LoginOutcome:
+        """Hold a FAILED ``outcome`` until this challenge's deadline, then return it unchanged.
+
+        ASVS 6.3.8 asks that valid users not be deducible from failed challenges, *including by
+        different response times*. Messages and status codes on the challenge seams are already
+        collapsed; this closes the remaining channel by making every failure answer at an instant
+        fixed before dispatch, so the latency is a function of ``started`` and nothing else — not of
+        which branch ran, and so not of anything about the username.
+
+        **Successes return unpadded, deliberately.** A valid credential has already told the caller
+        the account exists; enumeration is about telling two FAILURES apart, and padding the success
+        path would only make every real sign-in slower.
+
+        **Exceptions propagate unpadded, also deliberately.** An unhandled store or directory error
+        becomes a 500, which is a far louder signal than any timing difference, so padding it would
+        buy nothing while delaying a genuine fault.
+
+        The pad is an ``asyncio.sleep``, so it holds a connection open but never the event loop; the
+        sign-in rate limiter bounds how many a caller can hold at once.
+        """
+        if outcome.ok:
+            return outcome
+        now = time.monotonic()
+        elapsed = now - started
+        if elapsed > _FAILURE_BUDGET_SECONDS and seam not in _BUDGET_OVERRUN_WARNED:
+            # The budget is too small for this hardware, so failures are landing in a later slot than
+            # the control assumes. It still cannot fail open (`_failure_deadline` always rounds up),
+            # but a pair of branches straddling the slot boundary would stay distinguishable.
+            _BUDGET_OVERRUN_WARNED.add(seam)
+            _log.warning(
+                "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
+                "responses are being padded to a later slot (further overruns are not logged)",
+                seam,
+                elapsed,
+                _FAILURE_BUDGET_SECONDS,
+            )
+        await _sleep_until(_failure_deadline(started, now))
+        return outcome
+
     async def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        provider: AuthProvider = AuthProvider.LOCAL,
+        client: str | None = None,
+    ) -> LoginOutcome:
+        """The credential sign-in seam, with every failed outcome held to a fixed deadline.
+
+        A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
+        added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
+
+        **The inner method is ``_dispatch_login`` and NOT ``_login``, which is load-bearing.**
+        ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine returning a
+        ``LoginOutcome`` as a per-provider authentication pathway owing a comparative-strength row in
+        ``docs/SECURITY.md`` (ASVS 6.1.3). Naming this one ``_login`` would have made a pure
+        refactoring look like a new pathway and forced that guard to be loosened to accommodate it —
+        which is how a guard stops catching the thing it was built for. Staying out of the namespace
+        keeps ``_login*`` meaning exactly what it meant.
+        """
+        started = time.monotonic()
+        outcome = await self._dispatch_login(username, password, provider=provider, client=client)
+        return await self._equalize_failure(outcome, started, seam="login")
+
+    async def _dispatch_login(
         self,
         username: str,
         password: str,
@@ -1092,6 +1243,34 @@ class AuthService:
         return attempts, locked_until is not None
 
     async def authenticate_kerberos(
+        self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
+    ) -> LoginOutcome:
+        """The browser/API Windows-SSO seam, with every failed outcome held to a fixed deadline.
+
+        **This is the SECOND challenge seam, and siting the pad here is what covers it** (BACKLOG
+        #1140). ``GET /ui/sso`` calls this method directly and never touches :meth:`login`, so a pad
+        on the sign-in seam alone would have left this one open; putting it on the service method
+        rather than in the route means every caller inherits it, the JSON API leg included.
+
+        **What the pad buys here.** The route already collapses every reject to one 303 to
+        ``/ui/login?e=sso_failed``, so latency was the last channel separating them: an unresolvable
+        principal costs a directory search, a like-named local account costs that search plus a store
+        lookup, a directory outage costs the full ``ad_connect_timeout``, and "SSO is not configured"
+        costs nothing. They now answer together.
+
+        **What it does NOT buy, and this is the honest limit.** The attacker does not choose the
+        username on this path — SPNEGO supplies it from a ticket the KDC issued — so equalizing these
+        branches is not username enumeration protection in 6.3.8's sense. What it removes is a caller
+        learning, about the one principal it can present, which of the reject branches it landed in.
+        It also does not cover ``kerberos_available == False``: the route redirects with a *different*
+        error code before reaching the service, and that is a server-wide configuration fact,
+        identical for every principal and already disclosed in the redirect.
+        """
+        started = time.monotonic()
+        outcome = await self._authenticate_kerberos(token, client=client, seed_reauth=seed_reauth)
+        return await self._equalize_failure(outcome, started, seam="kerberos")
+
+    async def _authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
     ) -> LoginOutcome:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a

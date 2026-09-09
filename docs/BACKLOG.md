@@ -69,6 +69,8 @@ from that same worktree and are ordinary items.
 
 `alloc.ps1` carries no transfer verb by design ("holes are free, collisions are not"), and the missing transfer path is itself filed as **#1414**.
 
+**#1422's own subject was re-filed at #1423**, with its text unchanged, from the worktree that would commit it.
+
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
 floor that could not see most of the namespace, so it is suspect **regardless of how low or high it
@@ -229,17 +231,15 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 5 | **#1421** | Record what the #1277 grant-trail default costs: unbounded audit_log growth, a standalone commit per authenticated read, and a decision record outside the ADR | 6 | 2 | _quick win_ | P1 | partly shipped | **Corrected 2026-09-03, after this row was scored:** costs 3 and 4 shipped -- the `_audit_all_authz` docstring and the ADR 0118 section 5 amendment -- so the last two sentences of the scoring measurement below no longer hold. Costs 1 and 2 stay open pending the owner ruling; see the item's Update note. The scoring measurement as taken, unchanged: All four costs stand at HEAD and none has been closed. Nothing bounds audit_log: [retention].audit_days defaults 0 and is documented reserved and unenforced at messagefoundry/config/settings.py:1675-1678, messagefoundry/store/base.py declares eight purge entry points between :1202 and :1849 with none for audit, and a grep of messagefoundry/ finds no reader of audit_days outside those two files, so an operator who sets a window gets no purge and no warning -- the accepted-but-inert knob is the gap, and the only workaround is flipping the #1277 default back off, which lowers the rate without bounding the table. The three records still disagree about why: messagefoundry/config/retention_classification.py:17-19 rests the rationale on the retention requirement "not on chain-breakage" while messagefoundry/config/settings.py:1675-1677 and docs/PHI.md:118 give both reasons, and that question decides whether in-place deletion is open at all. Cost 3's docstring is unchanged at messagefoundry/api/security.py:177-179, and ADR 0118's amendment at docs/adr/0118-secure-by-default-security-configuration-section.md:165 still records the outcome and the delegation without the two questions or the eight options. What this row ships is an owner ruling plus reconciled prose across five artifacts, so the cost is doc work held consistent rather than engine change. |
 | 6 | **#1341** | block-blanket-git-stage splits without quote state, so quoted prose reaches program position and denies | 6 | 3 | _quick win_ | P2 | partly shipped | The over-deny limb landed and I drove it: all six pinned prose and read-only payloads from this item now ALLOW against the live hook, and 21 real blanket stages still DENY (scripts/hooks/block-blanket-git-stage.ps1:130, tests/test_blanket_stage_guard.py:248-289). The #1229 limb this item made mandatory -- measure the fail-open axis, not only the false denies -- is unmet, and the repair bought the exact loss it warned about: driving the committed hook against its own parent at 786ac8b49^, six payloads flipped DENY to ALLOW, among them "echo it's fine && git add -A" and "echo isn't ready ; git add .", because Hide-QuotedSpans opens a quote span on any bare apostrophe and on a backslash-escaped quote, then blanks the real stage that follows (scripts/hooks/block-blanket-git-stage.ps1:74-88). The MUST_STILL_DENY corpus that exists to catch precisely this carries no unbalanced-quote or escaped-quote row, so the test arm reports success while missing the class (tests/test_blanket_stage_guard.py:392-424). Two smaller limbs are also open: the guard grew a third local scanner instead of consuming #1086's helper, by its own admission and with a stated deletion plan (scripts/hooks/block-blanket-git-stage.ps1:26-30), and the ledger row still reads "not started" (docs/BACKLOG.md:16424). Landing the remainder means making Hide-QuotedSpans honour backslash escapes and fall back to the unblanked view when the quote state is unbalanced at end of input, then re-driving both corpora so the prose fix does not regress -- a small additive change on one existing seam plus test rows, pwsh-gated. |
 | 7 | **#1346** | The vault claim gate reads a registry that does not exist there, so it can never pass | 6 | 3 | _quick win_ | P2 | not started | Not started on the engine side, and the engine side is all I verified. scripts/coord/claim.ps1:69 anchors $repo on $PSScriptRoot and :98 derives the claims directory from git -C $repo, while scripts/hooks/claim_check.py resolves the committing tree's own git-common-dir in _claims_dir() at :170, so the engine's claim tool writes the engine registry wherever it runs; scripts/coord/install-git-hooks.ps1:86 ships claim_check.py and push_guard.py as its only payloads and :58 anchors RepoRoot on its own script, so it cannot install a writer into a second repository. I did not open the MessageFoundry-vault checkout, because CLAUDE.md limits reading that tree to roles/, so whether the vault carries its own claim.ps1 is the one fact that would change this verdict. Value 6 for a gate that cannot be satisfied exactly where it bites, with the commit-body citation as a real but gate-defeating workaround that also manufactures #1347's invisible shape B. Difficulty lowered to 3: the two-repository control arms the row calls unachievable are already buildable from _coord_checkout at tests/test_script_root_anchoring.py:103, which git-inits two independent checkouts, so the remainder is one design ruling plus a scoped change in one small tool and two tests. |
-| 8 | **#1376** | the vault ships all three privileged installers and none of the three installed-vs-source parity instruments | 6 | 3 | _quick win_ | P2 | not started | Not started, and the vault-side state is worse than the filing shows. Measured today against the vault checked out beside this repo: it ships scripts/worktree/install-gate.ps1, scripts/worktree/install-selfheal.ps1 and scripts/coord/install-git-hooks.ps1 and none of tests/test_gate_installed_parity.py, tests/test_selfheal_installed_parity.py or tests/test_installed_coord_hooks.py, against a control of 526 entries in its tests/ tree. Value is above parity-with-a-clean-workaround because the vault's own copies are far adrift and nothing there reports it -- its scripts/hooks/worktree_gate.ps1 is 23,430 bytes dated 2026-07-29 against the engine's 208,171, so running the installer it ships would replace the one machine-wide gate with a July build, and its .git/hooks carries no push_guard.py and no pre-push hook at all. The engine-side workaround is real but one-sided and post-hoc: tests/test_gate_installed_parity.py:46 compares the SHARED installed gate under ~/.claude/hooks against the engine source and would go red after such an install, but tests/test_installed_coord_hooks.py:62 roots its git-hook half at the ENGINE repo, so the vault's per-repo hooks are covered by nothing. Landing it means porting about 1,960 lines into a repo that has pytest infra (pyproject.toml:221 testpaths, tests/conftest.py) but no such seam, and it is less mechanical than it looks, because the ported parity assertions would red on day one against the vault's older sources and so force a ruling on which copy is authoritative. |
-| 9 | **#1385** | three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it | 6 | 3 | _quick win_ | P2 | partly shipped | Partly shipped, and more has landed since filing than the first pass credited. The visibility half is in -- .github/workflows/failure-signal.yml:71 recovers the pull request number from a merge_group ref and :92 applies ci-red, so an ejection is recorded, though nothing in this tree reads that label (grep for ci-red returns the writing workflow plus prose at CLAUDE.md:302 and docs/METHOD.md:365). The windows-2025 hang limb is no longer undiagnosed either: .github/workflows/ci.yml:852 now passes --max-worker-restart=0, landed 2026-09-02 in 042ef7ff5, and the comment from :826 to :850 reads the mechanism out of the pinned pytest-xdist and records four hangs of 25 to 46 minutes with the inner watchdogs armed, which is this row's process-level deadlock below pytest. What is left is two tests -- tests/test_api_request_timeout.py:99 still runs a route against a 0.1 second deadline, and tests/test_sqlserver_store.py:4039 is unchanged and runs at ci.yml:1772 under a wrapper that retries only a native crash (ci.yml:1769), never exit 1; the hostile-disposition test the row names was already a ratio assertion before filing (tests/test_multipart.py:142). Difficulty falls to 3 because the hard limb landed and the seams exist -- pyproject.toml:195 already ships pytest-rerunfailures and tests/test_load_failover_sqlserver.py:71 marks a sibling flaky -- with the SQL Server arm provable only on the gated CI leg. |
+| 8 | **#1376** | the vault ships all three privileged installers and none of the three installed-vs-source parity instruments | 6 | 3 | _quick win_ | P2 | partly shipped | **Build state corrected 2026-09-03; the dated scoring text that follows is left as another seat wrote it, so read the item's banner notes for the current state.** Not started, and the vault-side state is worse than the filing shows. Measured today against the vault checked out beside this repo: it ships scripts/worktree/install-gate.ps1, scripts/worktree/install-selfheal.ps1 and scripts/coord/install-git-hooks.ps1 and none of tests/test_gate_installed_parity.py, tests/test_selfheal_installed_parity.py or tests/test_installed_coord_hooks.py, against a control of 526 entries in its tests/ tree. Value is above parity-with-a-clean-workaround because the vault's own copies are far adrift and nothing there reports it -- its scripts/hooks/worktree_gate.ps1 is 23,430 bytes dated 2026-07-29 against the engine's 208,171, so running the installer it ships would replace the one machine-wide gate with a July build, and its .git/hooks carries no push_guard.py and no pre-push hook at all. The engine-side workaround is real but one-sided and post-hoc: tests/test_gate_installed_parity.py:46 compares the SHARED installed gate under ~/.claude/hooks against the engine source and would go red after such an install, but tests/test_installed_coord_hooks.py:62 roots its git-hook half at the ENGINE repo, so the vault's per-repo hooks are covered by nothing. Landing it means porting about 1,960 lines into a repo that has pytest infra (pyproject.toml:221 testpaths, tests/conftest.py) but no such seam, and it is less mechanical than it looks, because the ported parity assertions would red on day one against the vault's older sources and so force a ruling on which copy is authoritative. **That last clause is the one the correction above is about:** the ruling has been given, each repository owns its own copy, and so there is no port to do. |
+| 9 | **#1385** | three merge-queue attempts on one PR failed three DIFFERENT unrelated tests, and the PR gate cannot see any of it | 6 | 3 | _quick win_ | P2 | partly shipped | Partly shipped, and more has landed since filing than the first pass credited. The visibility half is in -- .github/workflows/failure-signal.yml:71 recovers the pull request number from a merge_group ref and :92 applies ci-red, so an ejection is recorded. CORRECTED 2026-09-04: this sentence said nothing in the tree reads that label. True when written, FALSE now -- scripts/ci/report_ci_red.py landed in #789 the same day and reads it back, and it now names the failing job and step as well. The prose at CLAUDE.md:302 and docs/METHOD.md:365 still says nothing reads it and is stale on the same point. Still true: no workflow CALLS the reader, so the label is read only by someone who chooses to. The windows-2025 hang limb is no longer undiagnosed either: .github/workflows/ci.yml:852 now passes --max-worker-restart=0, landed 2026-09-02 in 042ef7ff5, and the comment from :826 to :850 reads the mechanism out of the pinned pytest-xdist and records four hangs of 25 to 46 minutes with the inner watchdogs armed, which is this row's process-level deadlock below pytest. What is left is two tests -- tests/test_api_request_timeout.py:99 still runs a route against a 0.1 second deadline, and tests/test_sqlserver_store.py:4039 is unchanged and runs at ci.yml:1772 under a wrapper that retries only a native crash (ci.yml:1769), never exit 1; the hostile-disposition test the row names was already a ratio assertion before filing (tests/test_multipart.py:142). Difficulty falls to 3 because the hard limb landed and the seams exist -- pyproject.toml:195 already ships pytest-rerunfailures and tests/test_load_failover_sqlserver.py:71 marks a sibling flaky -- with the SQL Server arm provable only on the gated CI leg. |
 | 10 | **#1393** | four open rows say their work ALREADY SHIPPED and must not be rebuilt, and every dispatch screen passes them as buildable because the verb is REBUILD not BUILD | 6 | 3 | _quick win_ | P2 | partly shipped | Partly shipped 2026-09-03: the body read, the needle and the MUST BE READ level landed on the dispatch gate, firing on 9 rows (7 open) against 35 open rows carrying the bare words; the mirror half, #1020's expired bar, is not built. The filed state was: not started, and I could find no body read anywhere on the dispatch path. judge() at scripts/coord/dispatch_gate.py:134 reads only item.fields at :152 to :154, the string MUST BE READ appears nowhere under scripts/, and the repo's only DO NOT REBUILD matcher is scripts/coord/claim-adjudicate.ps1:170, which adjudicates claim release rather than dispatch and so answers the opposite question. Re-running parse_items over docs/BACKLOG.md at HEAD, all four named rows (#1107, #1130, #1183, #1242) are still open, 36 open rows carry rebuild or already-shipped language on this row's own needle set, and #1020 still holds both its dead bar and the sentence retiring it. Value is a lane-window per occurrence with only the awkward workaround of reading every row, capped below 8 because this is fleet tooling with no product, PHI or deployment axis. The build is a body read, a needle set and a MUST BE READ level on one existing function plus must-fire and must-not-fire arms, and the unmerged #1334 retirement limb at eaf6d0940 already proves that seam. |
 | 11 | **#1398** | a row can be fully built with nothing in its text saying so, and no ledger-reading screen can detect it -- ask the tree, not the banner | 6 | 3 | _quick win_ | P2 | not started | Not started, and there is a live instance of the class. Nothing on the dispatch path asks the tree: scripts/coord/dispatch_gate.py:152 reads only banner fields, and a grep across scripts/ finds only scripts/hooks/claim_check.py:44, which matches a commit message rather than the tree, plus the citation checkers. The class is real -- #1328's remaining limb shipped at scripts/asvs/rescore_handoff_check.py:5 and both f6c96b3b1 and the f769316fa hardening are ancestors of main, while its banner still reads Filed 2026-08-22 - not started -- and I sized the population by grepping origin/main for the literal BACKLOG #N form across tests/, scripts/, messagefoundry/ and .github/: 118 of 275 open rows are cited by code that landed. Value is 6 rather than 7 because the row publishes and prices its own workaround, a per-candidate git grep costing four minutes for nine rows, which is awkward rather than absent, and because a 43 percent flag rate means the output has to be MUST BE READ rather than a verdict or it becomes the noise failure #1394 names. The build is that grep wired into the dispatch path with both controls, a known-unbuilt row returning zero and a known-built row returning nonzero. |
-| 12 | **#1417** | the review gate can report success on a head nobody reviewed: it reads the label from a snapshotted event payload | 6 | 3 | _quick win_ | P2 | not started | Not started, and the defect is intact at HEAD: .github/workflows/review-gate.yml:105 still reads LABELS out of the frozen webhook payload, and line 112 still hard-codes the remedy for the single synchronize action, so any other action can report SUCCESS from a payload snapshotted before the label moved. That gate is the repository's entire automated review requirement, since .github/required-contexts.txt:160 to :166 pins approvals at 0 and states that nothing else reports that a green pull request was never read. VALUE LOWERED 7 to 6, because a workaround exists and is already written down: CLAUDE.md:407 to :414 makes the reader compare the gate run's originating createdAt against the newest reviewed label event, and CLAUDE.md:287 forbids the Lander from merging a pull request carrying no reviewed label, so a seat that reads the label live is not fooled by the stale green. It is awkward rather than clean, because the documented join is this item's rule (4) alone and returns a false clean when the label predates the head. Difficulty 3 holds: the workflow edit is small, but tests/test_merge_gate_controls.py:1044 to :1069 welds the existing control suite to the $LABELS and $ACTION env contract, so reading labels live forces a gh stub into that harness on top of the new staleness assertion. |
 | 13 | **#1420** | the connscale final sample is taken after stop and drain while its docstrings call it in-hold | 6 | 3 | _quick win_ | P2 | part built | SUPERSEDED 2026-09-03 by the item's own MEASURED section: the measurement ran, fix (b) landed, and fix (a) is refused on evidence. The scoring text that follows is the pre-measurement read. Not started -- the ordering is unchanged at harness/load/connscale/runner.py:441 (sampler_stop.set), :450 (driver.stop), :451 (await_drain), :454 (sleep _SETTLE, defined at :92) and :474 (samples.append(final)), _empty_claim_rates still reads samples[0] and samples[-1] at runner.py:1153, and all five sites still call that window in-hold (report.py:119, runner.py:922, runner.py:1150, runner.py:1166, tests/test_connscale_empty_claims_per_msg.py:12). Value holds at 6 on stronger evidence than the harvest argument: the same window feeds a LIVE gate, empty_claims_base_reading at runner.py:1441, switched on at tests/test_connscale_smoke.py:110 and asserted at :539, and the post-drain tail adds empty claims with no reads, so a sign test built to fire on a dead in-hold counter can be satisfied by the tail instead. Left to build is the measurement the row refuses to pre-empt, one run per sweep cell with the final sample in and out, then either narrowing the rate window inside _build_record (runner.py:867) or correcting all five sentences. That is a measurement run plus a small additive change on an existing seam, with tests, so difficulty 3. |
 | 14 | **#1349** | a rescue ref can silently hold an ancestor instead of the tip, and the population where that matters is the population where it cannot be checked | 6 | 4 | _quick win_ | P2 | partly shipped | Partly shipped, and I re-ran the audit rather than trust the claim. The write-time control is real -- scripts/coord/rescue.ps1:166 writes an annotated tag recording branch, commit, was-tip and instant, scripts/coord/rescue.ps1:276 reads it back after the branch is gone, and tests/test_rescue_ref_provenance.py holds 12 tests over it. What is left is the population it grades: `rescue.ps1 -Check` run in this checkout reports EXAMINED 1671, UNVERIFIABLE 1671, because zero refs under refs/rescue or refs/tags/rescue carry the mefor-rescue-v1 marker defined at scripts/coord/rescue.ps1:83. Three writer surfaces still bypass it -- the post-commit hook force-pushes a bare lightweight tag at scripts/hooks/durability_push.sh:102, scripts/coord/unbacked_check.ps1:459 prints that same un-provenanced push as its remediation, and the audit reads only two namespaces at scripts/coord/rescue.ps1:111 while 1455 refs sit under refs/remotes/private/rescuetags. Landing the remainder means a provenance design for an sh hook that must never fail a commit, pointing the printed remedy at -Anchor, widening the audit, and Windows-gated tests for each. |
 | 15 | **#1359** | the worktree gate hands off branch-switch detection to rule 3b by verb, not by whether the command names a branch | 6 | 4 | _quick win_ | P2 | not started | Not started, and I re-located every limb by symbol rather than by the filed line. Test-WorktreeHijack at scripts/hooks/worktree_gate.ps1:1411 still opens with a return unless the verb is checkout or switch (:1412), while the gated verb list at :2282 carries twelve, and Test-Governed at :1360 exempts nested .claude/worktrees paths at :1365 -- so rule 3 declines a linked worktree and rule 3b declines the other ten verbs, leaving reset --hard, a fast-forward merge and rebase onto an existing branch unevaluated as branch changes on another session's checkout. The gate states the gap in its own words at :341, and the pinned safe form a naive patch would red is at tests/test_worktree_gate.py:580. Value 6 for a hole in a guard believed to govern every session, matching the table's own precedent for a worktree-gate hole, with no workaround beyond noticing afterwards. Difficulty 4 because the work is deciding per verb which ones actually move a governed worktree's HEAD, measuring the fail-open axis as #1229 requires and not only the false denies, in a 2840-line file with a regression history and live claims on it. |
 | 16 | **#1379** | the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either | 6 | 4 | _quick win_ | P2 | partly shipped | Partly shipped: class one is closed, class two is live, and I measured both by driving the committed gate. git -C <ungoverned> --git-dir=<governed>/.git config core.hooksPath now DENIES (worktree_gate.ps1:635-650, pinned at tests/test_worktree_gate_control_plane.py:1438), while all three PowerShell spellings of class two ALLOW, same line, same line through the Bash tool, and across a newline, against a POSIX-spelled control on the same command that DENIES. I then proved the consequence rather than the verdict: with $env:GIT_DIR set, git config wrote my probe key into the governed repo's shared config and not into the ungoverned repo I was standing in, so the rule that exists to stop a shared core.hooksPath disarm is reachable by the spelling this fleet's primary shell uses. No matcher can be widened into it, which is the value: worktree_gate.ps1:614 and :1730 both require whitespace or line start before GIT_DIR, Get-LiteralAssignments at :390 resolves only POSIX NAME=VALUE and cmd set, and the rule-3c window at :1720-1729 begins after the separator. Difficulty lowered from 5 to 4 because landing it means threading environment state across statements and lines in a 2840-line PowerShell file and re-measuring the corpus, with no dependency, no mypy-strict surface and no store backends, which sits one band above the single-function remainder in the same gate scored 3 at docs/BACKLOG.md:280. |
 | 17 | **#1395** | every pre-commit gate is silently bypassed by a rebase or cherry-pick, including the PHI leak guard and the secret detector, because git never invokes pre-commit for a replayed commit | 6 | 4 | _quick win_ | P2 | not started | Not started: .pre-commit-config.yaml declares exactly 11 hook ids (lines 84, 85, 148, 178, 193, 210, 225, 235, 250, 281, 296), a repository-wide search for post-rewrite, pre-merge-commit and pre-commit run --from-ref returns nothing outside the item's own text in docs/BACKLOG.md, and scripts/coord/install-git-hooks.ps1:123-129 installs the pre-commit type plus a separate commit-msg and pre-push, never a replay hook. Value lowered from 7 to 6 because the item's own amendment is right that all eleven have CI mirrors and I confirmed the content ones run: .github/workflows/branch-leak-scan.yml:98 and security.yml run scan_forbidden.py --path ., ci.yml:361 runs licence_header_check.py and ci.yml:379 the control-char check. So on a replayed commit the leak guard and the secret detector are late rather than absent, and the preferred CI-side re-run is late in the same way, since a push to this public repo publishes before any runner starts. What is genuinely unguarded is per-commit content that never reaches a tip tree, plus the ownership arm that ledger_check.py:333 and :422 skip under --ci for every commit and not only a replayed one. Difficulty raised from 3 to 4: the durable half is a parity module for the eight hand-maintained mirrors, in a file that already spends 14 tests and about a thousand lines on three (tests/test_lint_scope_parity.py:228, :992, :1001), plus a CI leg that must install every pinned hook environment and keep the ownership arm CI-skipped. |
-| 18 | **#1413** | nothing triggers a reviewer, so a required context waits on a label only a person applies | 6 | 4 | _quick win_ | P2 | not started | Not started, re-measured at HEAD: none of requested_reviewers, review_requested, pull_request_review, gh pr review or --reviewer appears in any of the 27 files under .github/workflows/, against a positive control of runs-on in 27 of 27. The nearest existing signal does not cover it either -- scripts/ci/check_stalled_prs.py:56 and :122 key the daily cron on mergeStateStatus BEHIND, and an unread pull request reads BLOCKED, so it falls outside that report. The gate itself is correct and must stay fail-closed: .github/workflows/review-gate.yml:30 records that nothing automated ever adds the label and :100 strips it on synchronize, so what is left to build is only the trigger that says a finished, green, unread pull request exists. The cost is throughput rather than product, and a seat polling gh pr list is an awkward but real workaround, which is what holds this out of the higher bands. Landing it is a small workflow or a mail drop on an existing seam, and the hard half is reaching a background session bound to another account, which the gate header records as blocked and which partly lives outside this repository. |
 | 19 | **#1414** | an allocation can be stranded in a worktree that EXISTS but cannot reach the branch its work is on | 6 | 4 | _quick win_ | P2 | not started | Not started, and the branch fallback shipped for #1282 does not close it: Checker.owns at scripts/hooks/ledger_check.py:246 tries the recorded worktree path and then the recorded branch (:281-295), and in instance A neither is the tree nor the branch the finished work sits on. scripts/coord/alloc.ps1:37-48 still exposes only -Kind, -Title, -List and -ShowFloor, and docs/LEDGER-GATE.md:221 records -Reassign as declined, so the cheap fix is closed off by an existing ruling. I measured one escape the item does not name: git refuses to check out a held branch in a second worktree but does allow git checkout -b <alias> <held branch> there, so the entitled worktree can reach the work's commits under another name and commit the row from the path owns accepts -- awkward, undocumented, and I did not measure the follow-on push. Landing a real fix means widening entitlement without reopening the two-sessions-one-number collision, since the single-checkout rule that makes the branch key safe is exactly what creates this deadlock, plus the population sweep the item says nobody has run. |
 | 20 | **#1391** | the respawn brief points relative commands at the PREDECESSOR checkout, so a replacement seat can declare into a dead box -- but it does not always fire, and the exception is the useful half | 6 | 5 | _quick win_ | P2 | not started | Not started -- nothing outside docs/BACKLOG.md cites it, and the mechanism is intact at HEAD. scripts/coord/seat.ps1:241 still takes (Get-Location).Path when no hint is passed, scripts/coord/seat.ps1:545 hashes that tree into the box key, and scripts/coord/lane.ps1:68 derives its key the same way, so the item's shared-root claim holds. The whole addressing scheme is path-derived at scripts/coord/mail-key.ps1:47 and dot-sourced by ten scripts and seven test files, and scripts/coord/mail.ps1:570 keys a sender's own box straight off cwd, so mail addressed by box really does follow the invoking directory. The small arm cannot be built here -- the generator is the respawn-fleet SKILL.md outside this repo, which now documents the split-mailbox hazard and tells seats to list both inboxes by hand, and that prose workaround is what caps the value at an awkward one. The remainder is the item's own first step, measuring what makes it fire, then re-keying on the session across those consumers and their Windows-gated tests. |
 | 21 | **#1400** | the 90 percent Workflow gate is a per-launch question, so its margin does not scale with concurrent launchers or with a fan-out's own later phases | 6 | 5 | _quick win_ | P2 | not started | Not started, and most of it cannot be built in this tree: watch.py and WORKFLOW_GATE_AT exist nowhere here, with grep returning only the backlog prose at docs/BACKLOG.md:18444 and :18458. I checked the census claim rather than inheriting it -- scripts/coord/lane.ps1:11 states there is deliberately no -Lane or -BoxKey parameter, its -Show branch at :92 prints only the record for the box derived from the current directory, and scripts/coord/fleet.ps1 projects live seats rather than fan-outs in flight or agents remaining. What is left is that missing denominator plus a way to price a launcher's own later phases, since the item measures counting agent( call sites as a 4.3x under-report. The cost falls on fleet spend and not on the engine, PHI or any deployment, and a launcher can read fleet.ps1 or occupancy.ps1 by hand first, which is the awkward workaround that caps this at 6. Difficulty stays 5: new shared coordination state with claim and release semantics, a rewrite of a gate that lives in another repository, and the design work the item deliberately leaves open. |
@@ -270,7 +270,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 46 | **#1357** | The connscale FD probe cannot see a multi-process engine: PID-set re-resolution never runs | 2 | 1 | _fill-in_ | P3 | partly shipped | The code and test limbs are met and I drove both: harness/load/connscale/probe.py:104-110 ships _FRONTLOAD_WALKS = 4 plus a SECONDS-unit _RESOLVE_INTERVAL_S, _due_for_rewalk at probe.py:277-287 sits on the live sample_proc path, both production call sites construct the sampler bare (harness/load/connscale/runner.py:413, harness/load/estate/runner.py:187), and tests/test_connscale_cpu_probe.py:901 passes at HEAD while going red against a simulated pre-fix sampler I built by rebinding FdSampler.__init__ kwdefaults to frontload_walks=1, where it named 6 of 7 live descendants missed. What is left is the record limb. Commit f10867ce4 raised _RESOLVE_INTERVAL_S from 5.0 to 15.0 under this same item number because 5.0 equalled _PROBE_TIMEOUT_S and made the amortisation worthless (probe.py:83-98), but ADR 0179 line 58 and its index row at docs/adr/README.md:202 both still record 5.0 as the decision with no amendment, so the decision record states a value the shipped code documents as a defect and a reader restoring it would reintroduce the every-tick re-walk. The ledger banner at docs/BACKLOG.md:16814 also still reads "not started" for work that shipped. Landing the remainder is an ADR amendment paragraph, one index-row edit and a banner flip, with no code and no test. |
 | 47 | **#1378** | rescue refs drift from the branch they were taken for, so a recovery reaches a commit strictly behind the work it was meant to protect | 2 | 1 | _fill-in_ | P3 | partly shipped | Substantially covered by its sibling #1349, whose shipped code rules against this item's premise: scripts/coord/rescue.ps1:259 calls a behind ref a snapshot older than its branch and NOT a defect, and scripts/coord/rescue.ps1:16 says the script must not be changed to chase staleness. The reader-cannot-tell half is answered by the provenance capture at scripts/coord/rescue.ps1:166, and its residual coverage gap is already priced under #1349, so charging it again here would double-count it. Nothing outside docs/BACKLOG.md cites #1378. The one distinct deliverable is the naming rule -- `git config --get-all remote.private.fetch` returns +refs/tags/rescue/*:refs/remotes/private/rescuetags/*, so one server-side tag carries two local names, and a grep of docs/, scripts/ and tests/ finds that stated only in a passing comment at scripts/coord/rescue.ps1:243. I lowered difficulty from 2 to 1 because a doc edit is the entire remainder. |
 | 48 | **#1388** | docs/SECURITY.md cites 9 config keys the loader now refuses, and two of the citations are instructions a reader cannot follow | 2 | 1 | _fill-in_ | P3 | partly shipped | Both INSTRUCTION lines shipped -- docs/SECURITY.md:821 now reads [security].require_mfa = false and names the retired [auth] spelling as refused at load, and docs/SECURITY.md:1388 names [security].max_session_hours and [security].sign_out_after_idle_minutes -- and the two already-correct lines were left alone as the row asked (docs/SECURITY.md:193 and :1191). My own census at HEAD over the 15 spellings in _RELOCATED_TO_SECURITY leaves 7 descriptive lines still naming an old spelling (docs/SECURITY.md:42, 866, 896, 1200, 1201, 1214, 1251), and several read correctly as written because [api].public_origin is the INTERNAL field, which messagefoundry/config/settings.py:3937 states did not move even though the operator-facing key did. Correcting the prior note: #1383's ratchet does NOT cover this remainder -- it scores assignment shapes only and treats a bare mention as harmless (tests/test_docs_cite_no_refused_config_keys.py:15-17), and SECURITY.md measures 0 there -- so these 7 lines are unguarded, which is why value stays 2 rather than 1. Difficulty stays 1, since the cost is prose edits in one file and the only real work is judging which lines are already right. |
-| 49 | **#1404** | the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it | 2 | 1 | _fill-in_ | P3 | partly shipped | Partly shipped -- four of the five steps landed and only prose is left. .github/required-contexts.txt names 14 contexts including a reviewer has read this at line 205, records enforce_admins = TRUE at line 30, and tests/test_required_contexts.py:119 pins 14; the PR 718 residue this item feared, _LIVE_CODEQL_CONTEXTS and the SIXTEEN claim, survives only inside the item's own text at docs/BACKLOG.md:19094 and :19095, not in any workflow or test. Step 4 is the whole remainder: three files still carry the OFF value at tests/test_push_guard.py:12, scripts/coord/install-git-hooks.ps1:361 and .github/workflows/branch-leak-scan.yml:24, plus the #1056 note at docs/BACKLOG.md:5855. It is worth little because the copy an operator actually reads is already correct at scripts/hooks/push_guard.py:20 and :79, no test asserts the value at all, and required-contexts.txt:49 to :51 already records the three stragglers as a deliberate scope choice that errs toward over-warning. Landing it is a doc edit across four files. |
+| 49 | **#1404** | the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it | 2 | 1 | _fill-in_ | P3 | partly shipped | Partly shipped -- four of the five steps landed and only prose is left. .github/required-contexts.txt names 14 contexts including a reviewer has read this at line 205, records enforce_admins = TRUE at line 30, and tests/test_required_contexts.py:119 pins 14; the PR 718 residue this item feared, _LIVE_CODEQL_CONTEXTS and the SIXTEEN claim, survives only inside the item's own text at docs/BACKLOG.md:19094 and :19095, not in any workflow or test. Step 4 is the whole remainder: three files still carry the OFF value at tests/test_push_guard.py:12, scripts/coord/install-git-hooks.ps1:361 and .github/workflows/branch-leak-scan.yml:24, plus the #1056 note at docs/BACKLOG.md:5855. It is worth little because the copy an operator actually reads is already correct at scripts/hooks/push_guard.py:20 and :79, no test asserts the value at all, and required-contexts.txt:49 to :51 already records the three stragglers as a deliberate scope choice that errs toward over-warning. Landing it is a doc edit across four files. RE-SCORE WITHDRAWN same day: the drift detector cited as the reason belongs to #1384, not here. Back to P3 / value 2. |
 | 50 | **#1419** | two records on main disagree about whether CI runs the connscale sweep, and the test docstring is the wrong one | 2 | 1 | _fill-in_ | P3 | not started | Not started, and the value band is one notch lower than scored. Both false clauses stand at HEAD: tests/test_connscale_smoke.py:42 says the Postgres leg forces pool_size to 1-2 while .github/workflows/ci.yml:2120 sets MEFOR_STORE_POOL_SIZE to 4 and the comment at :2114 records that 4 and not 1-2 was deliberate, and tests/test_connscale_smoke.py:45 says the shipped profile runs via the --connscale CLI in CI, while my own grep for --connscale under .github/ exits 1 with no output against a positive control that finds connscale on ten ci.yml lines. The remainder is two corrected sentences in one docstring, which ships nothing runnable, and the true answer is already on main in three places (harness/load/profiles/connscale-smoke.toml:11 and :26, tests/test_connscale_empty_claims_per_msg.py:84). That is the marginal-and-already-substantially-covered band rather than a niche interop knob, so value 2, with difficulty 1 for a doc edit. |
 | 51 | **#1333** | Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check | 2 | 2 | _fill-in_ | P3 | partly shipped | Partly shipped, and the half that froze the record is fixed -- the gate now counts what a payload INTRODUCES against what the record already carries (_introduced_banned at scripts/asvs/apply.py:42, called at :365), so a residual correction that carries the legacy characters forward is written rather than refused. Measured today against the live record using the shipped _BANNED class: 19 cells hold 181 banned occurrences in residual and zero in any of the other four _PROSE_FIELDS, so the strip has not run, but the reason to run it is now section 11 tidiness and not an unblocking. Also left: the scan reads residual alone at apply.py:364 while _PROSE_FIELDS at :86 names five fields, so a payload could introduce a glyph into reviewed_by or a decision field unrefused, and the anchor_repair skip is now backed by a byte-identity check over all five at :305-314. Landing both is a mechanical strip of 19 vaulted cells plus a one-field-to-five widening with a test. |
 | 52 | **#1361** | Operator-facing messages name config keys the loader REJECTS (ADR 0118 relocations) | 2 | 2 | _fill-in_ | P3 | partly shipped | Both broken remediations shipped: messagefoundry/scaffold.py:341 now names [security].handles_real_patient_data and [security].production_instance and says the [ai] spellings are refused, and the OIDC refusal at messagefoundry/config/settings.py:3944 now names [security].web_console_public_address. The census guard is live as a ceiling budget at tests/test_relocated_key_messages.py:32 with the growth check at :147. What is left is the 25 budgeted sites -- the _BUDGET sum across messagefoundry/__main__.py, messagefoundry/api/app.py, messagefoundry/config/settings.py, messagefoundry/pipeline/reference_sync.py and messagefoundry/pipeline/wiring_runner.py -- and I spot-checked them at HEAD: they describe state (messagefoundry/__main__.py:1910, :1923) or point at keys that did not move (messagefoundry/pipeline/wiring_runner.py:6615), so they are confusing rather than broken. Value stays 2 because the class defect is closed and the guard stops the population growing; difficulty stays 2 because landing the remainder is message-string editing across five files plus lowering each ceiling in the same commit, with no plumbing and no behaviour change for a config that already loads. |
@@ -399,7 +399,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 27 | **#122** | Corrupted application-log detection, rollover, and connection-stop | 7 | 6 | _big bet_ | P2 | No enforcement ships: the only log handlers on main are the stdout StreamHandler at logging_setup.py:427 and the syslog family, and nothing anywhere reacts to a write failure by stopping work. The owner ruling of 2026-08-11 binds this to the count-and-log invariant, which is enforcement rather than the visibility the 2/10 priced. Difficulty 6 prices a fail-closed halt across the listener and the internal routed/outbound stages plus a console-seam change, with the eight branch commits unverified and carrying a seam bump #1220 obsoleted. |
 | 28 | **#318** | DAST — authenticated dynamic security testing of the running engine | 7 | 6 | _big bet_ | P2 | Increment 1 is on disk and wired into the required pytest legs; the remainder is increment 2, whose highest-value piece is fuzzing the unauthenticated MLLP/raw-TCP/X12 ingress plane, and no mutator exists in the tree to extend. Value 7 for a real gap with no workaround (every other security test here is static or in-process); difficulty 6 for a mutator the project does not have plus an OpenAPI security overlay with a fifth DEP-1 lock, a TLS black-box target and the console plane, with only the nightly-notice widening cheap. |
 | 29 | **#1059** | Shell variable indirection defeats the worktree gate's path resolution, so the primary is reachable | 7 | 6 | _big bet_ | P2 | The gate moved forward two versions without touching this: the shared resolver still hands raw candidate strings through with no sigil handling, and a test at test_worktree_gate_control_plane.py:685 now pins the variable spelling as a deliberate ALLOW, so the bypass is documented rather than closed. Difficulty stays at 6 because the fix moves fail-closed semantics into the resolver that rules 3, 3b, 3c and 3d all depend on, under 4935 lines of pinned gate tests, and needs remedy text precise enough not to be routed around plus the negative control #1000 demands. |
-| 30 | **#1065** | Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it | 7 | 6 | _big bet_ | P2 | Rule 3c still takes the scalar $where[0] at worktree_gate.ps1:1031 from the set the resolver returns at :985, so neither banked fix is in the tree and the fail-open stands as filed. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. |
+| 30 | **#1065** | Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it | 7 | 6 | _big bet_ | P2 | CORRECTED 2026-09-04, re-measured: the scalar read is gone (rule 3c walks foreach ($cand in $where)) and all thirteen rows of this item's own acceptance corpus DENY on origin/main's gate blob 8d5c4d50, so the still-takes-the-scalar premise this rationale carried is stale; what actually stood were two live fail-opens of the same class, both closed in the amendment -- one no-op chdir between the decoy -C and the disarm reverted every one of those thirteen rows to ALLOW, and a neighbouring `git config --list` excused the disarm beside it in fifteen more. The numbers are left as the re-scoring pass set them rather than re-priced against a different remainder. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. |
 | 31 | **#1066** | Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one | 7 | 6 | _big bet_ | P2 | Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. |
 | 32 | **#1108** | research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them | 7 | 6 | _big bet_ | P2 | Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. |
 | 33 | **#1109** | research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect | 7 | 6 | _big bet_ | P2 | The API limb SHIPPED 2026-09-04 (see the item note): the 32 request-body models now carry extra=forbid via api/request_model.py, so the 84-models-with-no-model_config reading on this row is spent. The HL7 limb stands -- validation.strict still ships False at config/models.py:667 -- and the method ruling is still undecided, so the item stays open on the vault scorecard re-score, which is the Lander's act (owner ruling 2026-09-05, `CLAUDE.md` section 5). Scores NOT re-rated here; a builder does not re-score. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. |
@@ -2228,7 +2228,17 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 122. Corrupted application-log detection, rollover, and connection-stop
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. No enforcement ships: the only log handlers on main are the stdout StreamHandler at logging_setup.py:427 and the syslog family, and nothing anywhere reacts to a write failure by stopping work. The owner ruling of 2026-08-11 binds this to the count-and-log invariant, which is enforcement rather than the visibility the 2/10 priced. Difficulty 6 prices a fail-closed halt across the listener and the internal routed/outbound stages plus a console-seam change, with the eight branch commits unverified and carrying a seam bump #1220 obsoleted. _(was 2/10 · 6/10.)_
+> ✅ **SHIPPED 2026-09-04 — the enforcement is built, and the halt was VERIFIED BY EXECUTION rather than by reading the branch's commit subjects.** `messagefoundry/logging_guard.py` adds `LogWriteGuard` plus `GuardedStreamHandler` / `GuardedFileHandler`: detection is a `logging.Handler.handleError` override, so one seam covers every sink with no polling, and the response is two-stage — `_roll` renames the broken file aside, opens a fresh one, records the rollover in it and re-writes the failed record; only when the REPLACEMENT also refuses does `record_unwritable` escalate. Stage 1 is bounded (`_ROLL_FLAP_WINDOW_SECONDS` / `_MAX_ROLLS_PER_WINDOW`), because a sink needing rescue every few records is a failing log rather than a transient. `[logging].file` / `file_max_bytes` / `file_backup_count` / `on_write_failure` are real `LoggingSettings` fields, and the validator refuses a `file` inside `log_dir` so the engine and NSSM can never rotate one file. The stop reaches all three tiers, `SystemStatus.log_sinks` reports per-sink health from process memory, and a `log_write_failed` alert pages through the notifier rather than through the log that broke.
+>
+> **THE PARTIAL HALT WAS REAL, and the fix for it is load-bearing — measured, not argued.** Mutating `_halt_inbound_processing` to a no-op (the pre-fix shape: listener stop plus outbound pause only) put the committed ingress row on the **outbound stage** in BOTH claim modes, while the healthy-log negative control still delivered. Mutating `_log_recovery_ok` to always-true let `restart_inbound` + `start_outbound` disarm the halt in both modes. Both mutations were reverted and the tree verified clean.
+>
+> **A THIRD HOLE OF THE SAME CLASS WAS FOUND HERE, and it was NOT on the branch.** `RegistryRunner.start` cleared `_log_write_stopped` and `_log_halted` unconditionally, so it was the one re-arm path that never asked whether the log worked. Measured before the fix, both claim modes: with both sinks unwritable BEFORE the runner was built, a committed ingress row reached `PROCESSED` and was DELIVERED while `LogWriteGuard.can_log()` read False throughout. `Engine` starts a runner on leadership acquisition and on the reload that first builds one, so it is reachable plumbing. `start` now gates the clear on `revalidate`, `_start_pooled_dispatchers` replays the halt onto the fresh internal dispatchers before they seed lanes READY, and `_unbind_for_log_failure` takes the already-bound listeners back down.
+>
+> **ADR 0162's FILE IS NOT ON `main`, and that is a ledger-gate strand rather than an oversight — the number is NOT burned.** Its claim names a worktree that no longer exists, and the branch fallback names `w3-log-write-failure`, whose history shares **no root commit** with `main` (roots `5fa6db9f` and `72bfddfa`), so no commit made there can reach a mergeable pull request. Both documented recoveries — commit from the recorded tree, or check that branch out — are unreachable from an isolated worktree, and remedy 3 (allocate a fresh number) is not licensed while the branch still exists. Prose therefore cites `ADR 0162` with no relative link, so nothing dangles; the file and its index row are the one residual. The subject to file, unallocated: the ledger gate's branch fallback assumes the recorded branch can produce a mergeable commit, and an orphan-history branch cannot.
+>
+> **What the branch's own commits turned out to be worth, and the anchor below is stale.** The branch tip is `46b3a4437` on both `origin` and locally, not the `d26d66a6` recorded below -- it moved after that note was written, and it carries eight commits rather than five. The seam bump (`ENGINE_UI_SEAM: int = 19`) was obsoleted by #1220 and is replaced by the computed digest; the PHI-inventory anti-rot gates and the reload-recovery measurement both hold and their tests pass; the stdout hair-trigger fix holds. The `docs/testing/master-test-plan/` edit was dropped, that tree having been untracked under ADR 0160 D1.
+>
+> **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. No enforcement ships: the only log handlers on main are the stdout StreamHandler at logging_setup.py:427 and the syslog family, and nothing anywhere reacts to a write failure by stopping work. The owner ruling of 2026-08-11 binds this to the count-and-log invariant, which is enforcement rather than the visibility the 2/10 priced. Difficulty 6 prices a fail-closed halt across the listener and the internal routed/outbound stages plus a console-seam change, with the eight branch commits unverified and carrying a seam bump #1220 obsoleted. _(was 2/10 · 6/10.)_
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Value 2 stands — stdout + NSSM rotation, the RFC 5425 TLS syslog forwarder (`_TlsSysLogHandler`, logging_setup.py:281) and #50's disk metering already carry log durability and visibility, so this is marginal and substantially covered. But difficulty 5 prices the wrong shape of work. D5 is "a new connector/codec behind the transport registry" — this is not a connector. logging_setup.py's module docstring (lines 3-13) records that the engine "deliberately do[es] not add file handlers here" because NSSM owns rotation, and `grep FileHandler _(was 2/10 · 5/10.)_
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
@@ -2236,8 +2246,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **The 2/10 was arrived at by conflating VISIBILITY with ENFORCEMENT.** stdout, NSSM rotation, the TLS syslog forwarder and #50's disk metering make the log *visible*; none of them makes processing *stop* when the log cannot be written. The item is the enforcement, and that is what the owner ruled in. **A guard that logs a warning and lets processing continue does not satisfy this item** — that is the specific defect to check for at review.
 > **Work exists and is UNVERIFIED.** `w3-log-write-failure` (`d26d66a6`, pushed and anchored) carries five commits whose subjects claim: the halt let the backlog keep routing so the internal stages are stopped too; a reload-recovery claim that *"was a guess"* was measured and three docs corrected; two PHI-inventory anti-rot gates found red on the branch; and a console-contract seam bump. **The lane died mid-flight on a usage limit, so none of it is verified.** It carries **ADR 0162**, whose number was independently confirmed to come from `alloc.ps1` — a real allocation record exists and `main`'s highest is 0161 — so the number is sound, but the index row should be re-checked before landing since a rebase can drop it.
 > **The claim most worth verifying by execution is the partial halt:** a halt that stops intake while routed and outbound rows keep draining would still violate the invariant this item exists to protect.
-> Verdict: demand-gate
-> Closing-act: owner-ruling
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -3019,7 +3029,9 @@ def route_demo_oru(msg):
 
 ## 234. Steps view projection refreshes on save only
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Remainder is a UX latency fix on an authoring surface, which is the DX and console polish band, not a functional gap. The debounced channel and the deferral machinery already ship and the false stale-disk premise is already corrected in the code comment at :924-930, so the change is one subscription plus tests; the cost that keeps it above a trivial edit is the ADR 0076 section 5 amendment re-arguing a wholesale-adopted guardrail. _(was 4/10 · 3/10.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. PR 623 merged as commit f79370f09 (BACKLOG #234). Race half: ide/src/stepsView.ts:964 records the suppressed save, releaseEdit re-runs it at :545, :579, :608. Save-gate relaxation: ide/src/stepsView.ts:987 onDidChangeTextDocument; :994 skips zero-change; :996 loop guard first; :1000 returns while panel.active;
+>
+> **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Remainder is a UX latency fix on an authoring surface, which is the DX and console polish band, not a functional gap. The debounced channel and the deferral machinery already ship and the false stale-disk premise is already corrected in the code comment at :924-930, so the change is one subscription plus tests; the cost that keeps it above a trivial edit is the ADR 0076 section 5 amendment re-arguing a wholesale-adopted guardrail. _(was 4/10 · 3/10.)_
 >
 > **Filed 2026-07-30. PARTLY LANDED 2026-08-04 — the race half is fixed; the save-gate relaxation this item was filed for is STILL OPEN. Re-framed 2026-07-30 to match the instruction that filed it.** This was originally recorded as "revisit — do not treat as a bug", which contradicted the owner's actual words: *"Put that fix on the backlog too."* It is a **fix**, gated on an ADR amendment — not a question about whether to act. **Landed:** a user save arriving while a `lens rewrite` held the single edit slot was **discarded**, leaving the view on a pre-save projection with no signal until the next save; it is now deferred to slot release and re-projected exactly once ([ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment C — **ACCEPTED**; owner-ratified and landed with integration-c 2026-08-11). **Still open:** whether a *bounded relaxation* of the save gate is safe. Argue it against the corrected premise, not the old one: `render()` pipes `document.getText()` to `lens parse -` over stdin, so rows are projected from the **live buffer**, not from disk — the "stale disk content" justification the gate's own comment carried was false. The surviving reasons are re-shelling Python per keystroke and the fact that a re-projection replaces the entire webview HTML. `RERENDER_DEBOUNCE_MS` is at `stepsView.ts:93`; the stale `:89`/`:91` anchors below were corrected in this same commit, so the two no longer disagree. The engineering caveat that motivated the softer framing is preserved below and is unchanged.
 >
@@ -5333,7 +5345,9 @@ a file, which is the fact the whole finding rests on.
 
 ## 1026. The ASVS 12.1.1 TLS-floor probe silently does not run with the console off, and its own comment names three of its four conditions
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. I attacked the shipped claim on four fronts and it survived the first three. (a) The gate itself: messagefoundry/__main__.py:2130-2145 now refuses on `tls_terminated_upstream and data_class is DataClass.PHI and enforcing and not settings.api.public_origin` -- owner ruling (a), console-independent, sitting immediately above the probe gate at :2157-2161. (b) The comment limb: :2147-2156 now states the fourth condition explicitly and says why it is belt-and-braces rather than a hidden scope narrowing, so the "names three of its four conditions" complaint is discharged. (c) Test coverage that actually covers THIS: tests/test_api_tls.py:1437-1470 has the console-OFF arm, a console-ON arm, and a synthetic-data negative control; I ran them under .venv and got 3 passed. The console-OFF assertion is discriminating rather than coincidental -- it asserts "12.1.1" in stderr, and `grep -n "12\.1\.1" messagefoundry/__main__.py` returns 5 hits of which the only reachable one with `public_origin` unset is the new refusal at :2139 (the probe block at :2157 requires a truthy public_origin to enter). (d) A second inert copy of the gate: `grep -rn probe_tls_floor` over non-test Python returns exactly one call site, :2165, so there is no stale duplicate ladder. Where it does NOT hold up is actionability and documentation. The refusal message this fix added instructs the operator to set `[api].public_origin`, which settings.py:4096-4099 relocates and refuses at load -- the fix hands an operator a remediation that fails. And the landing commit changed no documentation while its own test comment flags the runbook as needing an update, leaving the published config docs describing the setting as console-scoped when it is no longer. That is one limb shipped and a second not, which under this pass's own rule is partly_shipped, not confirmed_shipped. Value 4 on the remainder: the ASVS 12.1.1 control is genuinely no longer inert, so the security gap is closed; what is left is an unactionable string in a hard refusal plus a doc line -- DX-grade, with a clean workaround (CONFIGURATION.md:188 records the relocation). Difficulty 2: a string edit on an existing seam, one assertion, one doc paragraph, no store or backend work. _(was 6/10 · 3/10.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. origin/main at ca4e85e5d. (a) Gate: messagefoundry/__main__.py:2518-2543 refuses on `tls_terminated_upstream and data_class is DataClass.PHI and enforcing and not settings.api.public_origin` -- console-independent (91a24061a, PR #392). (b) Comment: __main__.py:2545-2553 names the fourth condition and calls it belt-and-braces, not a scope narrowing.
+>
+> **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. I attacked the shipped claim on four fronts and it survived the first three. (a) The gate itself: messagefoundry/__main__.py:2130-2145 now refuses on `tls_terminated_upstream and data_class is DataClass.PHI and enforcing and not settings.api.public_origin` -- owner ruling (a), console-independent, sitting immediately above the probe gate at :2157-2161. (b) The comment limb: :2147-2156 now states the fourth condition explicitly and says why it is belt-and-braces rather than a hidden scope narrowing, so the "names three of its four conditions" complaint is discharged. (c) Test coverage that actually covers THIS: tests/test_api_tls.py:1437-1470 has the console-OFF arm, a console-ON arm, and a synthetic-data negative control; I ran them under .venv and got 3 passed. The console-OFF assertion is discriminating rather than coincidental -- it asserts "12.1.1" in stderr, and `grep -n "12\.1\.1" messagefoundry/__main__.py` returns 5 hits of which the only reachable one with `public_origin` unset is the new refusal at :2139 (the probe block at :2157 requires a truthy public_origin to enter). (d) A second inert copy of the gate: `grep -rn probe_tls_floor` over non-test Python returns exactly one call site, :2165, so there is no stale duplicate ladder. Where it does NOT hold up is actionability and documentation. The refusal message this fix added instructs the operator to set `[api].public_origin`, which settings.py:4096-4099 relocates and refuses at load -- the fix hands an operator a remediation that fails. And the landing commit changed no documentation while its own test comment flags the runbook as needing an update, leaving the published config docs describing the setting as console-scoped when it is no longer. That is one limb shipped and a second not, which under this pass's own rule is partly_shipped, not confirmed_shipped. Value 4 on the remainder: the ASVS 12.1.1 control is genuinely no longer inert, so the security gap is closed; what is left is an unactionable string in a hard refusal plus a doc line -- DX-grade, with a clean workaround (CONFIGURATION.md:188 records the relocation). Difficulty 2: a string edit on an existing seam, one assertion, one doc paragraph, no store or backend work. _(was 6/10 · 3/10.)_
 >
 > **Filed 2026-08-05 — not started.** The probe's gate requires **four** conditions; the comment directly above it names **three** and asserts that "every other posture never reaches here". The undocumented fourth is `public_origin` — and `public_origin` is only *mandatory* when `serve_ui` is also on. So with the console **off**, a PHI instance behind a declared terminator under `enforce` can start with it unset and the probe never runs.
 
@@ -5556,6 +5570,8 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 **Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
 
 ## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Shipped in PR #635 at 8b6f8a088. scripts/hooks/worktree_gate.ps1:2384 carries the "BACKLOG #1082" block; :2401 derives $scopeFlag from --global|--system; :2402-2409 emit the scoped opening (names the per-user/machine-wide file, then "Git falls back to that scope ... not knowable from the command alone"); :2410 keeps "SHARED git configuration" ONLY on the repository branch;
+>
 > **THE WORDING IS FIXED 2026-08-27; the banner stays open for the archive pass. THE VERDICT DID NOT
 > MOVE, which is the property this item most needed protecting.** Rule 3c had ZERO mentions of
 > `--global`/`--system`, so it emitted the shared-config sentence for every scope. It now branches: a
@@ -5579,7 +5595,7 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 > are split on lines and the first hit exits, so a multi-line command is judged by its first segment.
 >
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The wrong sentence is still the only one rule 3c emits, and the rule reaches it for a --global write because the only pre-deny exclusion at :981 is for reads, so a governed cwd resolves and denies with prose that names a mechanism the write does not use. The verdict must stay deny, so the work is a scope-aware wording plus a test that asserts the string rather than the verdict. _(was 4/10 · 3/10.)_
+> **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The wrong sentence is still the only one rule 3c emits, and the rule reaches it for a --global write because the only pre-deny exclusion at :981 is for reads, so a governed cwd resolves and denies with prose that names a mechanism the write does not use. The verdict must stay deny, so the work is a scope-aware wording plus a test that asserts the string rather than the verdict. _(was 4/10 · 3/10.)_
 >
 > **Filed 2026-08-07 — not started. ⛔ THE VERDICT IS CORRECT; ONLY THE WORDING IS WRONG. Do NOT "fix" this by allowing the write.** For `git config --global core.hooksPath <dir>` aimed at a governed repo, rule 3c denies and says *"would change the SHARED git configuration of <repo>"*. That sentence is false — the write lands in `~/.gitconfig`. But the DENY is right, because the write can still disarm the repo **by inheritance**.
 > Verdict: build
@@ -6365,6 +6381,8 @@ The literal spellings are all caught, including the newline form. Only the indir
 **Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
 
 ## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. origin/main ca4e85e5, verified by CONTENT (the row's :557/:1031/:1367 anchors are all drifted). scripts/hooks/worktree_gate.ps1: Get-FullPathRaw at :147, rejecting a non-fully-qualified base explicitly instead of swallowing a throw. Rule 3c roots the TARGET against the session cwd first at :2281 ($whereRaw = Get-FullPathRaw $where[0] $cwdRaw); fail-CLOSED deny at :2282-2283 (Write-Deny -Rule "3c" ...
+>
 > **HALF OF WHAT THIS ROW OWES IS NOW DISCHARGED, AND IT STILL MUST NOT CLOSE.** This banner records
 > that what remains is *"a ledger correction plus repairing #1071"*. The #1071 half is done as of
 > 2026-08-26: that row's title asserts `rev-parse --absolute-git-dir` as the mechanism and the shipped
@@ -6385,7 +6403,7 @@ The literal spellings are all caught, including the newline form. Only the indir
 > warning-vocabulary scan can catch.
 >
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. Nothing buildable remains under this item's own title: the relative-path fail-open denies on main in the two-step shape it prescribed (scripts/hooks/worktree_gate.ps1:1031 roots the target via Get-FullPathRaw at :147, :1032-1050 is the fail-closed deny, :1054 resolves the common dir against the rooted target), the fail-closed branch is tested at tests/test_worktree_gate_control_plane.py:332, and the installed hook is byte-identical to the repo copy at sha256 61a63c95, refuting the banner's still-commit-a67838d2 sentence. Value 2 and difficulty 1 because what is owed is a ledger correction plus repairing #1071, which asserts the gate asks rev-parse --absolute-git-dir when that string returns zero hits against a git-common-dir control of four. _(was 9/10 · 3/10.)_
+> **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. Nothing buildable remains under this item's own title: the relative-path fail-open denies on main in the two-step shape it prescribed (scripts/hooks/worktree_gate.ps1:1031 roots the target via Get-FullPathRaw at :147, :1032-1050 is the fail-closed deny, :1054 resolves the common dir against the rooted target), the fail-closed branch is tested at tests/test_worktree_gate_control_plane.py:332, and the installed hook is byte-identical to the repo copy at sha256 61a63c95, refuting the banner's still-commit-a67838d2 sentence. Value 2 and difficulty 1 because what is owed is a ledger correction plus repairing #1071, which asserts the gate asks rev-parse --absolute-git-dir when that string returns zero hits against a git-common-dir control of four. _(was 9/10 · 3/10.)_
 >
 > **Filed — a SECOND fix was WRITTEN and then REJECTED BY VERIFICATION (2026-08-06). ⛔ DO NOT SHIP IT EITHER. Four independent verifiers each returned a DIFFERENT blocker: at least FIVE new fail-opens and TWO new false-deny classes against the gate live on 57 worktrees, three proven end-to-end to disarm the commit hooks, two of those on keys the rule names explicitly (`includeif.`, `core.hooksPath`). Its 420/420 green suite could not see a single one of the four blockers. Same root cause as round 2, one layer down: structured parsing narrower than the regex it replaces. Patch banked, NOT COMMITTED, NOT INSTALLED (2026-08-06). ⛔ THE GATE GOVERNING THIS MACHINE IS UNCHANGED — still commit `a67838d2`, blob `3e7db362`, 57 worktrees — so this item is OPEN against what is actually running. The FIRST fix (round 2) was verified and REJECTED and its patch is banked, not in the tree; read nothing below as a closure claim, and re-measure before citing any of it.** **What the second fix is, and why it is a different object.** It is MINIMAL-FROM-COMMITTED, not a second parser: `+484/-74` against the committed gate versus the rejected patch's `+616/-96`. The rejected patch replaced this rule's broad regex matching with structured token parsing, and every place the parser turned out NARROWER than the regex became a hole — the git 2.46+ `git config set` form, a scope flag counted in any position, nine wrapper spellings (`(`, `$(`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`), and a `--file` compared as TEXT. The second fix keeps the regex base and carries across only three of that work's ideas (sub-command splitting, `rev-parse --absolute-git-dir`, and `--file` retargeting), none of which needs a tokeniser. **Verified in both directions, which is the part that was missing before:** the new deny cases were confirmed RED against the REJECTED PATCH — not against the committed gate, which already denies them, so recording them as red-first-against-HEAD would have been false and would have produced a suite blind to exactly that regression class. **Still open on the second fix, measured and named:** #1067, #1069's residual, #1070, #1071, #1072. **On THIS item specifically:** the second fix keeps the rooting this item filed and adds `rev-parse --absolute-git-dir`, so the relative spelling still denies and a junction spelling of the same repository now denies too — the latter was a residual of this item's own mechanism and was measured ALLOW on the committed gate. Its `-C`/`cd` composition is unchanged in direction, and the false deny this banner records below (`cd <ungoverned> && git -C . config …`) is still an ALLOW. The drafted assessment follows unedited: **THE FILED RELATIVE-PATH SPELLING, and the three defects this banner used to hold open against itself are now MEASURED CLOSED (#1065, #1066).** The target is resolved against the session's cwd before git is asked anything, and an unresolvable target no longer means "not governed". **What THIS item fixed is still only the spelling it filed** — everything wider was #1065/#1066's work, and their banners say what is and is not closed there. **The three follow-ups this banner previously recorded, re-measured against the current file with the hook subprocess cwd set equal to the payload cwd:** the surviving relative-path fail-open `cd ../../.. && git -C ../MessageFoundry config core.hooksPath /dev/null` now **DENIES**, because the resolver COMPOSES a `cd` with a following relative `-C` instead of preferring one (a real shell resolves the `-C` against the post-`cd` directory, measured); `git config --global alias.foo bar` now **ALLOWS** in every spelling, excluded before any path is resolved, so the deny text no longer contradicts its own closing bullet and no longer advises a remedy that also denies; and `cd <ungoverned> && git -C . config core.hooksPath /dev/null` now **ALLOWS** instead of denying while naming the primary. ⛔ **This still does not say rule 3c is unbypassable** — see #1066 for what remains open by construction. Rule 3c now roots the target token to an absolute path against `$cwdRaw` first, then resolves the common dir against **that**, so the relative spelling denies exactly like the absolute one. The rooted path is also what goes to `git -C`, via a new `Get-FullPathRaw` — `Get-ComparablePath` split in two so there is still exactly one definition of "resolve this path", with the lowercasing tail removed for the caller that shells out (a lowercased path passes on Windows and silently misses the real directory on a case-sensitive filesystem, which this file already warns about twice). **The two failure conditions are now different and are answered differently**, which was the substance of the fix rather than the arithmetic: a target that cannot be resolved at all **denies** — nothing has been asked of git, so nothing has said the repository is ungoverned, and treating that silence as "not governed" is precisely how this shipped — while git **answering** "not a repository" on a resolved target still **allows**, unchanged and still pinned by `test_a_non_repo_cwd_fails_open`. **A second fail-open closed with it**, found while fixing this one and not in the original filing: `& git -C <relative>` resolved against the **hook process's** cwd rather than the session's, so a relative path naming a **linked** worktree made git exit 128 and fall straight through the `$LASTEXITCODE -ne 0` allow — the verdict depended on where the hook process happened to be started, and the pytest harness does not set that cwd, so the coincidence did not even hold under test. **Fourteen new regression cases across eight tests**, every one confirmed against the pre-fix gate first: the five relative spellings (`-C` and the `cd <rel> &&` prefix), the relative-linked-worktree case and the fail-closed case FAIL there, while the absolute target, the linked-worktree target, the key-list narrowness controls, the ungoverned-repo control and the not-a-repo fail-open control all keep PASSING — which is what separates a correction from a widening. **Not fixed here, reported instead:** rule 3d (`:625`) carries the byte-similar construct and the filing's assumption that its target is always a linked worktree is false (the primary is itself a registered worktree, and `git worktree remove <relative-primary>` was measured ALLOW), and rule 3c reads only candidate `[0]`, so a `--git-dir=<primary>/.git` spelling from an ungoverned cwd is never inspected; both need their own item and their own asymmetry tests. Original filing follows. `git -C <primary-absolute> config core.hooksPath /dev/null` is DENIED. `git -C ../../.. config core.hooksPath /dev/null` is **ALLOWED** — same command, same target, relative spelling. That disarms `core.hooksPath` for the **shared clone**, i.e. the ledger, claim and secret-leak commit gates for every worktree at once, which is verbatim what rule 3c's own deny text says it exists to prevent. It requires no shell variable and no intent: `../../..` is the natural way to name the repo root from `<primary>/.claude/worktrees/<x>`.
 > **RESIDUAL SCOPE, written 2026-08-21 (dispatcher), measured on `origin/main` `75e20d43` and on the INSTALLED gate. THIS ITEM'S OWN BANNER MEASUREMENTS ARE STALE AND ONE IS LOAD-BEARING -- read this before re-deriving anything above.**
@@ -6503,7 +6521,9 @@ The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` r
 
 ## 1065. Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Rule 3c still takes the scalar $where[0] at worktree_gate.ps1:1031 from the set the resolver returns at :985, so neither banked fix is in the tree and the fail-open stands as filed. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. _(was 9/10 · 2/10.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. origin/main ca4e85e5d. scripts/hooks/worktree_gate.ps1 (3305 lines; the banner's ":1031/:985" anchors are dead). Scalar read gone -- rule 3c walks an ordered chain at :2328 `foreach ($cand in $where)`, chdir candidate appended :2325. Ownership window read off the QUOTE-BLANKED $seg.Scan: :2075 $ownWin, :2078 $ownDashC, :2105 $ownGitDir. -AllTargets gated on the disarming invocation's own -C at :2235.
+>
+> **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Rule 3c still takes the scalar $where[0] at worktree_gate.ps1:1031 from the set the resolver returns at :985, so neither banked fix is in the tree and the fail-open stands as filed. Value 7 is the rubric's real-gap-no-workaround rung: a gate that fails open admits no operator workaround, but the item's own Severity line records no product effect and no PHI effect, which forecloses rung 8's only applicable clause as well as rung 9's. Difficulty 6 because two written fixes were rejected by independent verification, the second with at least five new fail-opens and two false-deny classes that a 420-test green suite could not see, so the remainder is a correctness-gated rewrite of the matching rule. _(was 9/10 · 2/10.)_
 >
 > **Filed — a SECOND fix was WRITTEN and then REJECTED BY VERIFICATION (2026-08-06). ⛔ DO NOT SHIP IT EITHER. Four independent verifiers each returned a DIFFERENT blocker: at least FIVE new fail-opens and TWO new false-deny classes against the gate live on 57 worktrees, three proven end-to-end to disarm the commit hooks, two of those on keys the rule names explicitly (`includeif.`, `core.hooksPath`). Its 420/420 green suite could not see a single one of the four blockers. Same root cause as round 2, one layer down: structured parsing narrower than the regex it replaces. Patch banked, NOT COMMITTED, NOT INSTALLED (2026-08-06). ⛔ THE GATE GOVERNING THIS MACHINE IS UNCHANGED — still commit `a67838d2`, blob `3e7db362`, 57 worktrees — so this item is OPEN against what is actually running. The FIRST fix (round 2) was verified and REJECTED and its patch is banked, not in the tree; read nothing below as a closure claim, and re-measure before citing any of it.** **What the second fix is, and why it is a different object.** It is MINIMAL-FROM-COMMITTED, not a second parser: `+484/-74` against the committed gate versus the rejected patch's `+616/-96`. The rejected patch replaced this rule's broad regex matching with structured token parsing, and every place the parser turned out NARROWER than the regex became a hole — the git 2.46+ `git config set` form, a scope flag counted in any position, nine wrapper spellings (`(`, `$(`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`), and a `--file` compared as TEXT. The second fix keeps the regex base and carries across only three of that work's ideas (sub-command splitting, `rev-parse --absolute-git-dir`, and `--file` retargeting), none of which needs a tokeniser. **Verified in both directions, which is the part that was missing before:** the new deny cases were confirmed RED against the REJECTED PATCH — not against the committed gate, which already denies them, so recording them as red-first-against-HEAD would have been false and would have produced a suite blind to exactly that regression class. **Still open on the second fix, measured and named:** #1067, #1069's residual, #1070, #1071, #1072. **On THIS item specifically:** the re-opening this banner recorded is gone — `git config set core.hooksPath /dev/null` and four sibling `set` spellings DENY on the second fix, and they are now pinned by `test_the_git_2_46_SET_subcommand_is_still_a_write`, whose stated mutant is the rejected patch. The candidate set is still built with `git config` semantics, with ONE correction the rejected patch and the committed gate both got wrong: a `--git-dir` or `GIT_DIR=` retarget REPLACES the effective directory rather than adding to it, because git's own behaviour was measured — so `git --git-dir "<ungoverned>/.git" config core.hooksPath /x` issued from a governed checkout now ALLOWS instead of denying while printing the GOVERNED repository's name. The drafted assessment follows unedited: **the scalar read AND the segment-wide exclusions, measured. ⛔ THIS DOES NOT SAY RULE 3C IS UNBYPASSABLE; read the residuals in #1066.** **The fix is not the loop this item asked for, and that matters.** Iterating `Get-GitTargetCandidatesRaw` would have changed nothing here: for `git commit -C HEAD && git config core.hooksPath /nope` that resolver returns the ONE-element set `@("HEAD")`, so the contract at `:219` was already satisfied and the rule still allowed. The defect was the SET, not the read. Rule 3c now builds its own candidate set with `git config` semantics (`Get-ConfigTargetsRaw`-shaped inline block + `Get-EffectiveDirRaw`), because `git config` writes exactly ONE file and git picks it deterministically — measured: `--git-dir` and `GIT_DIR` retarget a config write, `--work-tree` and `GIT_WORK_TREE` do not, so rule 3's plural set both misses the real target and adds paths git never touches. **And the rule is now scoped per INVOCATION** (split at unquoted `&&` `||` `;` `|`), with git's global options read only BEFORE the subcommand — measured, `git config -C real --get x` fails with ``unknown switch `C'``, so a `-C` after the subcommand is never git's chdir. **Measured ALLOW → DENY** on the committed file: `git commit -C HEAD && git config core.hooksPath /nope`; `git config core.hooksPath "/nope -C HEAD"`; and a third of the same class that was NOT in this filing — `git config --list && git config core.hooksPath /nope`, where the segment-wide READ exclusion was armed by a neighbouring read. Two more unfiled fail-opens closed with them: `GIT_DIR=<primary>/.git git config core.hooksPath /x` from an ungoverned cwd, and `git --config-env=core.hooksPath=EVIL commit` (the exact `-c` class, absent from the old pattern — and both the `=`-attached and the space-separated spelling work, measured, so the space form is handled rather than assumed away). **The largest fail-open in this rule was NOT in this filing at all** and is recorded in #1066: the danger KEY was matched on the quote-blanked scan string, so every quoted key was erased before the disarm list ran. **Twenty-one new DENY cases and forty-four allow-side regression cases**, every deny confirmed RED against the committed gate first and every allow GREEN on both sides (38 failed / 89 passed there). **Not claimed:** `subst`ed drives, hard links to `.git/config`, an allowlist root spelled via a junction, more than one level of interpreter nesting, `--remove-section`, and a Windows drive-relative `C:foo` token all remain open by construction — see #1066 and #1067. Original filing follows. `git commit -C HEAD && git config core.hooksPath /nope` is **ALLOWED**. So is `git config core.hooksPath "/nope -C HEAD"`. Rule 3c is the only consumer that takes `$where[0]` from `Get-GitTargetCandidatesRaw` and stops — the resolver's own contract at `:219` reads *"It returns a SET, not a winner, and the caller denies if ANY member is governed."* **This is the highest-severity gate defect found to date and it supersedes #1061's severity**, because it needs no relative path, no variable and no unusual spelling.
 > Verdict: build
@@ -6565,6 +6585,49 @@ Fixed in the rule-3c follow-on work. **The rule-3 and rule-3d half is NOT this i
 
 **Two further classes found in the same pass are INHERITED rather than introduced and are filed as #1379**, both consequence-proven against the governed shared config: `-C` precedence composition, and the PowerShell environment-assignment spelling.
 
+
+**AMENDMENT 2026-09-04 (builder). THE SCORING ROW'S PREMISE IS STALE, THE CLOSURE IT DENIES IS REAL -- AND ONE NO-OP TOKEN REVERTED IT, WHICH IS WHAT THIS ACT FIXES.**
+
+**Re-measured, not argued.** Throwaway governed rig with a primary, a nested worktree under `.claude/worktrees/`, a linked sibling worktree and an independent clone; hook subprocess cwd set equal to the payload cwd. **All thirteen rows of the measured acceptance corpus above DENY** on `origin/main`'s gate, and the scalar read the scoring rationale still names is gone -- rule 3c walks `foreach ($cand in $where)`. The identical corpus run against the gate this item was FILED on (`a67838d2`, blob `3e7db362`) reproduces the filed ALLOWs, so the rig can produce a different answer rather than agreeing with itself.
+
+**THE CLOSURE WAS ONE ORDINARY TOKEN FROM BEING REVERTED.**
+
+```
+git commit -C HEAD && git config core.hooksPath /nope           DENY
+git commit -C HEAD && cd . && git config core.hooksPath /nope   ALLOW   <- the same write
+```
+
+Thirteen rows moved back to ALLOW on `origin/main`: seven chdir spellings (`cd`, `cd ./`, `pushd`, `chdir`, `sl`, `Set-Location`, `Push-Location`), three cwds (the primary, a nested worktree, a linked worktree), the `;` join as well as `&&`, and `alias.*` as well as `core.hooksPath`. **Consequence read back rather than inferred:** with `;` the command really runs, and `core.hooksPath` then reads `/nope` **from a different worktree of the same repository** -- which is what proves it reached the SHARED config rather than something local. `cd .` is a no-op, so the poison needs no intent, no relative path and no unusual spelling.
+
+**MECHANISM -- this item's own fix, one layer along.** The chdir guard covers `[first git token, disarm)` and answers a chdir by SUPPRESSING the base candidate. The resolver cannot follow that chdir either: its `$Prefix` is sliced at the FIRST git token and the chdir sits after it. So on a line that also carries a decoy `-C` the candidate set collapses to the decoy alone, git rejects it, the chain runs out, and the rule allows. **Suppressing the base is not the same as knowing where the write lands.**
+
+**THE FIX FOLLOWS THE CHDIR INSTEAD OF DECLINING TO.** `Get-ChdirTargetRaw` is extracted from the resolver -- one definition, two callers, no second spelling of "follow a cd" -- and rule 3c calls it on the guard window, composing a relative window chdir onto a prefix chdir and appending the result as the **LAST** candidate. Gated on the disarming invocation naming **no repository of its own**, so an explicit `-C`/`--git-dir` still decides and a governed chdir cannot manufacture a refusal for a write aimed elsewhere. `$where[0]` never moves, so the unresolvable-target refusal is still decided on exactly the token it was.
+
+**A SECOND LIVE FAIL-OPEN OF THE SAME CLASS, FOUND BY THE SAME SWEEP AND CLOSED IN THE SAME ACT.** The explicit READ flags were matched against the **whole segment**, so a read belonging to a NEIGHBOURING command excused the write beside it:
+
+```
+git config core.hooksPath /nope                        DENY
+git config --list && git config core.hooksPath /nope   ALLOW   <- the same write
+```
+
+**Fifteen rows on `origin/main`** -- every disarm key this rule names (`core.hooksPath`, `core.worktree`, `include.path`, `includeif.`, `alias.*`) by every cwd (primary, nested worktree, linked worktree). **Consequence read back:** run from the LINKED worktree, the PRIMARY then reads `/nope`. This banner already claims the shape was closed -- but by the **rejected** round-3 patch, which never shipped, so it has been live the whole time and had no number of its own. The exclusion is now tested against `$ownCmdWin` plus `$rest`, the same window `$ownGitDir` already uses, so `git config --get <key>` and `git --no-pager config --get <key>` are excluded exactly as before while the neighbour no longer reaches across the separator.
+
+**RESIDUALS -- READ THIS AS "AT LEAST THESE", and none of it says rule 3c is unbypassable.** More than one chdir in the window is not followed: the helper declines rather than guess a base, and that ALLOW is pinned as a negative control (#1000's shape) rather than left to be discovered. A prefix chdir the helper cannot follow suppresses the append entirely. A chdir target that is **quoted AND contains a space** is blanked on the scan string and is not followed -- measured on a rig whose governed root is literally `Pri mary`, where `cd "<spacey primary>"` stays ALLOW while the unquoted spelling, `cd "."` and `cd '.'` all DENY, because `Remove-QuotedSpans` unmasks a quoted span holding one bare word and blanks one containing whitespace. That is the same space family the file already records against the `-C` reader. Everything #1066, #1067 and #1069-#1072 record stays open.
+
+**NOT FIXED HERE, FILED AS #1446** (allocated on this branch, so the citation resolves only once both land): a RELATIVE `-C` on the disarming invocation still resolves against the SESSION cwd when a chdir in the guard window has already moved the shell. Measured in both directions and identical before and after this act. Closing it means composing that chdir into the `-C` branch of the resolver, which is the widening two rejected rounds died of.
+
+**THE BANNER'S HASHES ARE FALSE, AND THE SENTENCE IN #1061 THAT CORRECTS THEM IS NOW STALE TOO. Measured 2026-09-04:**
+
+| what | value |
+|---|---|
+| the banner's claim | commit `a67838d2`, blob `3e7db362` |
+| `origin/main`, immediately before this act | blob `8d5c4d50`, sha256 `59c896fc`, 3172 lines, `$GateVersion` `2026.09.03.1` |
+| INSTALLED at `~/.claude/hooks/worktree_gate.ps1` | sha256 `6d95811e`, 198887 bytes, 2712 lines, `$GateVersion` `2026.08.13.1` |
+
+The installed hook is **460 lines behind the repo copy** and carries the gate blob of `2b9f5b3c4` -- so it has this item's candidate chain and **not** #1379's `--git-dir` ranking, #1359's rule-3b verbs or #1229's encoding fix. #1061's correction (*"the installed hook hashes to `e7133498`, identical to `origin/main`'s blob ... byte-identical"*) was true when written and is not true now, so **a third re-measurement is owed before either sentence is cited again**. Nothing in this act installs anything: the drift is reported, not repaired.
+
+**The score is NOT moved here.** Its stated basis is corrected because it was factually wrong; the numbers are left where a re-scoring pass put them, because what remains open under this title (the residuals above, plus #1446) is a different quantity from what it was measured on and re-pricing it is not this act's work.
+
 ## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
 
 > ✅ **DECLINED-BY-DESIGN 2026-08-25, OWNER RULING extending the 2026-08-23 tokeniser ruling to the family (#1066/#1070/#1086/#1305/#1336).** Confirmed one-hop: the Liaison put it to the owner directly and read the answer, rather than relaying a third party's account. **#1336 already established this row cannot be fixed alone** -- it and `#1086` are "the same design error pulling in opposite directions," and closing this row's fail-open without widening `#1086`'s false-deny needs exactly the block-tracking shell tokeniser the ruling declines. The banked second fix below remains open evidence of why a narrower attempt still fails: it is MINIMAL-FROM-COMMITTED rather than a parser, and it was REJECTED by four independent verifiers finding at least five new fail-opens and two new false-deny classes -- the same failure shape #1336's own history shows four separate candidates hitting. **The gate governing this machine is unchanged and this row's bypass is real and remains live**; the ruling accepts that risk rather than building a fifth tokeniser-shaped candidate to close it. 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both halves are live on the repo blob and on the installed hook that actually governs this machine: the -C reader is the unchanged double-quote-only regex and the disarm-key match still reads the quote-blanked scan text, so a single-quoted absolute -C and every quoted -c alias override remain reachable by ordinary spellings. Value 7 because this governs agent behaviour in development with no product or PHI effect, which is above the rubric's parity rungs but below the production and ASVS rungs; difficulty 6 because two written fixes have been rejected by adversarial verification, the second yielding at least five new fail-opens with residuals filed as #1067, #1069, #1070, #1071 and #1072. _(was 9/10 · 3/10.)_
@@ -6621,7 +6684,9 @@ the two questions need different strings, and the segment object already provide
 the blanking here without measuring `#1086`'s false-deny rows in the same table.**
 ## 1067. Rule 3c governs by PATH PREFIX, so an independent repo vendored under a governed root inherits its governance
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Landed on origin/main (ca4e85e5d) in 1ef60ac7d, 2026-08-28, "rule 3c governs a repository by identity, not by path prefix (BACKLOG #1067)" (#653) -- after the 2026-08-20 re-score, which is why the banner is stale. scripts/hooks/worktree_gate.ps1:1640-1661 adds Get-RootCommonDirCmp (each root's OWN git common dir; empty unless the root is a repo top level).
+>
+> **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
 >
 > **Filed 2026-08-06 — not started, deliberately.** Rule 3c decides "is this a governed repository" with an equality-or-slash-prefix test against each governed root. Any repository living anywhere UNDER a governed root therefore inherits its governance, including one that shares nothing with it.
 > Verdict: build
@@ -7533,6 +7598,29 @@ The refusal names the scheme it found. A base URL with no scheme fails here too,
 **The live trap this item named is retired on the apiclient and still load-bearing on the console, which is a residual and not a defect.** `#488` encodes all 17 apiclient sites unconditionally, so nothing there rests on the trusted-identifier argument. The console encodes 6 of its 57 dynamic `/ui` interpolation sites; the other 51 carry engine-minted ids and rest on provenance. One is inconsistent inside its own file -- `pages/admin.py:306` interpolates `role.id` bare while `:364` and `:382` route the same value through `_seg`. It would not be reachable: `auth/service.py:2920` mints a custom role id as `custom:` plus `uuid4().hex`, so no path metacharacter can arrive there. Recorded with its provenance measured so a later reader does not mistake it for a live gap, and deliberately NOT swept -- this item disqualifies a blanket path-segment builder by name, and `#636` shipped a test proving one would break the re-auth redirect.
 
 **VERDICT: DO NOT CLOSE, AND THE REASON IS NOT THIS SEAT'S TO LIFT.** Three parts of four hold on measurement. The fourth is #1243 Limb B, blocked by owner ruling pending a real FHIR server. Even once that lifts, whoever performs the recorded scorecard-rescore closing act should read #1243's tail first: it warns that a builder can finish every line of Limb B and still not close 1.2.2, because the cell and the 15.1.5 threat-model row both live in the separate vault clone.
+
+**RE-MEASURED 2026-09-04 AT `a2eef0f3`. THE 2026-09-03 ANSWER HOLDS -- AND ITS PART 1 AND PART 2 REST ON A PREMISE THAT IS FALSE, WHICH THIS PASS MEASURED AND THE BUILD ABOVE CORRECTS.** Nothing was rebuilt. The four-part answer was verified rather than taken, and one new finding was added by execution.
+
+**The dead-anchor grep reproduces, with its scope corrected.** `fhir_require_structured_params` returns **0** under `messagefoundry/` against a positive control (`_encode_search_params`) of **6** in the same run. Repo-wide the target returns **2**, not zero -- both in `tests/test_threat_model_doc_drift.py` (`:642`, `:812`), which RECORDS the removal. The earlier "zero occurrences across the engine Python corpus" was measured under the engine package; stated repo-wide it is wrong, and a later reader re-running it repo-wide would think the setting had come back.
+
+**The peer report that this "was shipped in PR 488" is half right, and `--is-ancestor` is the wrong instrument for checking it.** `cf38e16aa` is NOT an ancestor of `origin/main`, and `git log origin/main --grep="(#488)"` returns nothing -- yet the code is on `main`. The question that answers it is whether the TREE carries the change: `git show origin/main:messagefoundry/apiclient/client.py` carries `_ALLOWED_URL_SCHEMES` at `:77` and `_seg` at `:120`. Parts 1 and 4 are on `main`. Part 2 is on `main` too but is NOT from `#488` (it is `#636`/#1370, as recorded above). `git log -S` is also useless here: it names `#713`, a docs-and-CI commit, for all three strings.
+
+**THE NEW FINDING: `_seg` DOES NOT CONTAIN `/`, AND THREE DOCSTRINGS SAID IT DID.** ASVS 1.2.2 asks that untrusted data be encoded *for its context*; the context here is a URL path segment, and the encoding is undone before the segment is read. ASGI defines `scope["path"]` as the **decoded** path and Starlette matches routes against it, so the `%2F` `_seg` emits is a separator again before any route is chosen. Measured on a **real uvicorn server**, not TestClient: a request line of `/ui/roles/custom%3Aabc%2Fevil/edit` was handled by the `{role_id}/{extra}/edit` route with `role_id="custom:abc"`. **`?` and `#` DO hold** (positive control, same run), so this narrows one limb and does not retract the encode.
+
+**Nothing in the tree could have caught this, because every assertion asked a different question (SDS-3.8).** All six shipped console assertions read the RENDERED HTML -- what the link says -- and none drove a request. `test_the_dead_letter_replay_forms_encode_a_name_carrying_a_slash` was written against the claim that the unencoded form "is a different route with an extra segment"; the encoded form reaches that same different route. Its assertions were true and its docstring was not.
+
+**The `/` limb is held by the ROUTE TABLE, which nothing asserted, so this pass pins it.** Six same-method console pairs exist where a sibling absorbs an extra segment; five carry an engine-minted id read back from a lookup that 404s on a miss. **One carries free text:** `POST /ui/dead-letters/{channel_id}/replay` against `POST /ui/dead-letters/{channel_id}/{destination_name}/replay`. On a first deployment, an operator replaying dead letters for a connection whose name contains a `/` would reach the destination-scoped handler with the name split across its two parameters. Both routes carry the same permission and step-up gate, so this is a **correctness defect, not an escalation**. The engine API has **13** such pairs (`/users/{user_id}` against its six sub-routes, `/messages/{message_id}` against its five, `/uploads/{file_id}` against its two), all carrying engine-minted ids.
+
+**Closing that limb is NOT this item's to buy.** The only fix that works at the routing layer is narrowing what a connection name may contain, and this item disqualifies a name gate by name -- *"it buys the verdict by narrowing what the product accepts"* -- and refers it to the owner on its own merits. So it is recorded, pinned by a test, and left. **This is the shape #1107 said was a valid outcome: a limb that cannot honestly reach pass.**
+
+**A site the 2026-09-03 enumeration missed, measured and found CONTAINED.** `routes/admin.py:414` builds `reauth_next=lambda r: f"/ui/roles/{r.path_params['role_id']}/edit"` -- a path interpolated bare from a client-supplied path parameter. It is contained at CONSUMPTION, not at construction: `_auth.py:463/479/504` reject any `next_path` containing `..`, and `lookup_ui_action` requires a `fullmatch` against a registered pattern, which for this route is `r"^/ui/roles/[^/?#]+/edit$"` (`routes/admin.py:66`) -- a positive allow-list that excludes the three metacharacters. That control does not rest on the trusted-identifier trap, so it stands.
+
+**SHIPPED ON THIS BRANCH.** The three overclaiming docstrings corrected (`apiclient/client.py` `_seg`, `webconsole/pages/_common.py` `_seg`, and the console test module); `test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer` pinning the measurement against a real server with `?`/`#` as the positive control and a benign name as the negative; `test_the_console_absorb_a_segment_route_pairs_are_the_six_that_were_read` pinning the route table the `/` limb now rests on. And `pages/admin.py:306` is now `_seg`-encoded -- the last bare path-segment site inside the partition, which `role_form_page` already encoded twice for the same value. Its recorded reason for exemption (`custom:` + `uuid4().hex`) was the trusted-identifier argument this item names as its live trap. Mutation-checked: reverting it reds the new test.
+
+**LIMB 3 WAS NOT TOUCHED, AND THE `safe=''` QUESTION THIS ITEM FLAGGED IS ANSWERED IN THE DIRECTION THAT LEAVES IT OPEN.** Percent-encoding at `safe=''` does leave FHIR's `|`, `,` and `:` **expressible** -- the URL layer encodes them and the server decodes them back with their separator meaning intact, which is exactly why they are not neutralised and why Limb B exists. So the confirmation the proposed-work note asked for lands on "the separators still work", not on "the escape is safe to ship". #1243 is `Closing-act: blocked` under an owner ruling pending a real FHIR server; a dispatch gate refuses it, and this seat did not touch it.
+
+**STILL DO NOT CLOSE, and the reason is unchanged.** The closing act is a scorecard re-score, and the cell lives in the separate `MessageFoundry-vault` clone. **`docs/security/` is gitignored here, so from an engine checkout that limb is UNREADABLE, not unstarted** -- `git ls-files docs/security` returns zero whether the record is perfect or absent. It is reassigned to the tracking seat rather than left looking undone. Whoever performs it should carry this finding in: the cell's 2026-09-03 verdict on Parts 1 and 2 was graded on encoding that does not hold the `/` limb.
+
 ## 1108. research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. _(was 7/10 · 6/10.)_
@@ -7932,6 +8020,14 @@ be broken, not a finding, and it found it present on both file sources.
 
 **One residual measured here and deliberately left unedited.** That same row concludes that "the code-first and the TOML surface both express them" across all four named factories. For `X12` the second half is false, for the reason the separate-subject paragraph above already gives: `_TRANSPORTS` carries no `x12` key, so the shipped sentence generalises past its own premise. The gap is already pinned with its own positive control in `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap`; what is new here is only that the security prose overstates it. Left for its own diff -- this pass touched no document outside this row, and a security sentence deserves a change a reviewer can see on its own.
 
+**BUILT 2026-09-05: two more subjects from the proposed-work list -- the poll-source per-tick ceilings and the DICOM association bound. THE ITEM STAYS OPEN AND THIS CHANGE DOES NOT MOVE THE CELL.** The 2026-09-04 re-measurement was re-run at HEAD `c57903c2` before any edit, by execution, with the control legs it names: `MLLP`, `Tcp`, `X12` and `Http` accept both pacing keys and carry them into the connection spec; `DICOM`, `File`, `Sftp` and `Ftp` each raised `TypeError` on each key after constructing normally WITHOUT them; `DEFAULT_MAX_MESSAGES_PER_SECOND` is still `None`; `_MessagePacer`/`_pacing_settings` still appear in `mllp.py`, `tcp.py`, `x12.py` and `http_listener.py` and nowhere else, against a `register_source` positive control returning 2 in every inbound transport module including the four the pacer scan calls zero. One correction to that pass's method, not its finding: the `DatabasePoll` leg reported here is **uninterpretable**, because the probe passed `connection=`/`statement=` and the real factory takes `server=`/`poll_statement=`, so the control leg failed. That row is untested by this pass and the 2026-09-04 reading of it stands unchallenged.
+
+**Why the two subjects needed OPPOSITE defaults, which is the design point to read before the diff.** The poll sources have **no sender to back-pressure** -- a partner writes to a directory and leaves -- so the excess is **deferred to the next tick, not refused**, and `max_files_per_poll` **ships ON at 1000** on `File`, `Sftp` and `Ftp` (a falsy value disables it, this module's ordinary convention for its byte caps). The DICOM SCP **does** have a peer to make wait, so `max_associations_per_second` / `association_burst` **ship OFF**, for the reason the 2026-08-11 ruling gives: a guessed rate throttles a real modality. **The residual runs both ways and neither direction is hypothetical.** A too-low tick ceiling costs latency -- one extra poll interval per ceiling's worth of backlog -- and a sustained arrival rate above `max_files_per_poll` per `poll_seconds` grows the directory without bound; a too-low association rate makes a modality wait behind a `max_associations` slot it is already holding, and a wait that outlasts the sender's ACSE timeout becomes an abort, which is the refusal this control is otherwise careful never to make.
+
+**The DICOM unit is an ASSOCIATION because pynetdicom owns the read loop, and the seam was measured rather than assumed.** By `EVT_C_STORE` the object is already read and decoded, so a wait there would delay a message the count-and-log invariant has already obliged us to account for -- the shape this row rejects by name. The wait sits on `EVT_CONN_OPEN`, before the A-ASSOCIATE-RQ is read, and the charge on `EVT_ACCEPTED`, so a rejected association and a connection that never associates charge nothing (the HTTP listener's rule). Measured on pynetdicom 3.0.4: `EVT_CONN_OPEN` runs on a **per-connection thread, not the accept loop** -- three concurrent connections each blocking 1.0 s there completed in 1.04 s total, at `maximum_associations` 10 and again at 1 -- so a pace delays only its own peer. A control leg with no block and the same limit of 1 refused all three associations too, so that refusal is pynetdicom's own concurrency behaviour and **not** an effect of pacing. `_MessagePacer` is reused, not re-implemented, but the four intakes before this one all drive it from the single-threaded event loop, so this consumer supplies its own lock and never holds it across the wait.
+
+**What did NOT move, and this is the part a reader should carry forward.** `DEFAULT_MAX_MESSAGES_PER_SECOND` is untouched, the DICOM bound ships off, and no gate reads any of these keys at startup, so **a default install still takes messages at an unbounded RATE on every listen intake** -- the fact that decides this cell. Walking `docs/ASVS-ASSESSMENT-METHOD.md` section 1 unchanged: rule 4 asks about the shipped default and still gets neither limb, so rule 5 still selects `partial`. What changed is reachability evidence only: a residual saying the DICOM SCP and the File/RemoteFile poll sources reach no rate control **in any configuration** is now stale, and `docs/SECURITY.md`'s ingest row is updated to say so with a guard that reads reachability from the factory signatures in both directions. **The two acts that could carry this cell to `pass` remain the owner's** -- flipping a default, or the refuse-to-start gate -- **and the closing act after that is the re-scoring seat's.** Still unbuilt from the list: that gate, the Database poll's row ceiling (`transports/database.py` was held by a peer builder), the egress pacing parameter, the console admin-write arm and the unpaced monitoring GETs.
+
 ## 1115. research an honest pass for ASVS 2.4.2 -- whether human-timing pacing is meaningful for an engine whose only human surface is the console
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The research half is delivered and the code it was written against is unchanged: the /ui surface charges nothing (zero allow_admin_write references in the web console) and the only pacing is a per-request per-actor budget at config/settings.py:2017-2021, never a flow timer. Value 4 because on a first deployment this is a coverage and calibration gap on an admin surface rather than a data-plane exposure; difficulty 6 because a flow timer spanning login, MFA enrolment and approve-then-decide is a new mechanism across auth service, API and console, and the floor has to come from a measurement the record does not have. _(was 3/10 · 5/10.)_
@@ -8099,7 +8195,21 @@ be broken, not a finding, and it found it present on both file sources.
 
 **The rewritten docstring did not make the asymmetry false, and re-measuring it was the point.** The `clear_session_cookie` docstring had been rewritten since the 2026-08-20 research to state that the `__Host-` deletion carries Secure. That was true, and it did not cover the reachable third state -- the bare name over https under the opt-out -- which is exactly where the loss happened. A docstring describing two of three branches reads to the next person as a completeness claim.
 
-**Scope corrections recorded here so they are not re-derived.** At least these four, established by the 2026-08-20 research and re-checked at `c2237d783`: the two deletion blocks are ungraded by the cell; a third session-minting route exists on the Kerberos SSO leg (`messagefoundry_webconsole/routes/sso.py:87`), beyond the two the record enumerates; the OIDC flow cookie fails both limbs on the same postures and is named by neither this item nor the cell; and `__Secure-` requires Secure exactly as `__Host-` does, so no reachable state has one available and not the other. The clear-path fix above closes one line of the proposed work and grades none of the rest -- the scorecard move stays an act on the record of record, not a consequence of this entry.
+**Scope corrections recorded here so they are not re-derived.** At least these four, established by the 2026-08-20 research and re-checked at `c2237d783`: the two deletion blocks are ungraded by the cell; a third session-minting route exists on the Kerberos SSO leg (`messagefoundry_webconsole/routes/sso.py:87`), beyond the two the record enumerates; the OIDC flow cookie fails both limbs on the same postures and is named by neither this item nor the cell; and `__Secure-` requires Secure exactly as `__Host-` does, so no reachable state has one available and not the other. **The fourth of those is FALSE and is struck -- see the 2026-09-05 ruling below.** It is left standing rather than deleted because it was acted on: it is the ground the 2026-08-20 pass gave for striking the `__Secure-` fallback from the cell's re-score triggers, so a reader who meets that strike needs to find its reason here and find it refuted. The clear-path fix above closes one line of the proposed work and grades none of the rest -- the scorecard move stays an act on the record of record, not a consequence of this entry.
+
+**OWNER RULING 2026-09-05, and it is now BUILT: the org browser-hardening opt-out drops `__Host-` ONLY, not every cookie-name prefix.** The question had never been written down, and the code took the wider reading, so both `/ui` cookies went bare on every opt-out posture. `__Secure-` is therefore the pinned verb's required fallback and it is implemented. `session_cookie_name` and `oidc_flow_cookie_name` (`messagefoundry_webconsole/_auth.py`, cited by symbol because this item records that these anchors have drifted twice) now answer in three branches rather than two: the transport decides first, and only then does the hatch choose between `__Host-` and `__Secure-`. The set sites reach both names through those same resolvers, so PR 868's single-resolver guarantee is unchanged and no second copy of the expression was introduced.
+
+**The fallback is taken only where Secure is genuinely set, and that is asserted rather than assumed.** A browser drops a `__Secure-` cookie without Secure exactly as it drops a `__Host-` one, so naming it over a cleartext origin would break login while a grep and a scorecard read as hardened -- this item's own disqualified move, in a new place. The name and the Secure attribute key on the same `effective_https` predicate, each through its own call, because this item forbids inferring either conjunct from the other; every new test asserts the Secure attribute in the same row as the name, so the two cannot be graded apart. Nothing widened `exposure_protected` and nothing emits Secure unconditionally.
+
+**Measured on a real socket, and each assertion was proved red before the code moved.** `packaging/messagefoundry-webconsole/tests/test_ui_cookie_prefix_wire.py` serves `/ui` under a real uvicorn on an ephemeral loopback port through the shipped TLS wiring (`ensure_api_tls_material` -> `build_api_ssl_context` -> uvicorn's `ssl_context_factory`), logs in, and reads the response's own `Set-Cookie`, so the scheme is a fact about the socket rather than a literal handed to an ASGI transport. The two opt-out arms measured a bare `mf_session` carrying Secure before the change and `__Secure-mf_session` after; the hardened default arm and a genuinely-cleartext arm are the controls, and both were green throughout, so the file was not vacuously red. The flow cookie and the `__Secure-`-is-not-`__Host-` half are pinned unit-level in `test_ui_hardening.py`, by `test_the_name_walks_three_rungs_and_the_set_agrees_with_the_read`, `test_the_flow_cookie_walks_the_same_rungs_as_the_session_cookie` and `test_a_prefixed_name_is_never_emitted_without_the_attribute_it_requires`. **The single test this paragraph first named, `test_the_opt_out_drops_host_only_and_keeps_the_secure_prefix`, no longer exists**: it was superseded on `main` by those three, which additionally pin that the set, read and clear sites agree on the name. The name is recorded here because a reader who met it in an earlier draft would otherwise search a tree that has never held it.
+
+**The startup report was stale the moment the ruling landed, so it moved in the same change.** The `serve_ui` arm in `messagefoundry/__main__.py` named `mf_session / mf_oidc_flow` as the names the opt-out reverts to; it now names the `__Secure-` twins and says that Secure is what keeps that prefix writable. A report naming a cookie the browser is not holding would send an operator hunting the wrong thing. It is still a report and not a control, and the 2026-08-17 ruling stands: nothing here re-scores the cell on a warning.
+
+**The re-score trigger the 2026-08-20 pass struck: already restored in text, not restored twice here.** The open PR on this item carries the restore instruction and the reasoning for it, so this pass does not repeat it. What this pass did add is upstream of that: the scope-corrections paragraph above still asserted the ground for the strike as current fact, and it is now marked struck in place, so a reader meeting either half finds the other.
+
+**Two annotations rather than deletions, on tests that describe a posture nothing ships.** `test_http_cookie_is_byte_identical` and `test_loopback_http_engages_headers_but_keeps_plain_cookie` grade the cleartext branch, which no `messagefoundry serve` posture has reached since ADR 0172. They are correct about the function and misleading about the deployment, so each now says so and points at the wire-level file for what actually ships. They are kept rather than deleted because they are the control that stops an unconditional rename.
+
+**Still not built, and unchanged as the closing act.** The re-score lives in the vault and this Builder did not touch it, so this item stays open. The one open measurement is still #1118's: whether a browser STORES a prefixed cookie over https served with an untrusted self-signed chain. That is now load-bearing for the opt-out fallback as well as the shipped default, since both are prefixed names over the same minted chain.
 
 **Measured 2026-09-05 at `a083cdb89`, driven rather than read: the lens contest is SETTLED, and it is settled by the premise dying rather than by either lens out-reasoning the other.** Both are restated here so nobody re-derives them. The *ceiling-is-partial* lens held that the cell cannot honestly reach pass, because the verb is conjunctive and its prefix half cannot hold on the stock install: Chrome rejects `__Host-` on an http-loopback origin while accepting `Secure` there, so shipping `__Host-mf_session; Secure` on the default would break the login silently while a grep and a scorecard read as satisfied. The *reachable-with-build* lens held the finding directionally right but under-scoped, and a pass reachable with build work. **They diverge on exactly one fact: whether the stock install's browser origin is http-loopback.** The first lens's entire argument is conditional on it; the second's is not. As posed, the settling evidence was a browser run observing the cookie as STORED on an http-loopback origin, with a positive control in the same run. **That run is no longer needed for this cell.** ADR 0172 removed the premise, so the first lens's ground is gone and its conclusion does not follow. The second lens is right by outcome and not by argument: the mechanism that landed is the transport one, under #1276, which neither lens picked.
 
@@ -9564,7 +9674,25 @@ That covers every startable topology, not just the loopback default. The one pos
 
 **Two engine follow-ups a reviewer raised and this pass declined, both small and neither required for the verb.** `_equalizing_bind` and `authenticate` each spell the bind-then-release sequence independently, so a shared helper would make the parity **structural** rather than test-enforced -- declined because the two call sites want different things from the result (one needs the bool and an early return, the other discards it and swallows `LDAPException`), so the helper would have to express both and the win shrinks. And the decoy CN is an inline f-string inside `_equalizing_bind`, where its own named sibling `_DUMMY_PASSWORD_HASH` (`messagefoundry/auth/service.py:99`) is module-level, as are `_MATCHING_RULE_IN_CHAIN` and `_LDAPS_CONNECTOR` in the same file. The test must keep asserting **invariance** rather than importing such a constant: an equality assertion against a shared symbol goes tautological exactly where the property is "does not depend on caller input".
 
-**No re-score, no banner flip, no vault write.** Closing act stays `scorecard-rescore`.
+**Progress 2026-09-05 (builder). (a) AND (c) ARE NOW BUILT: the fixed-deadline failure equaliser is sited at both challenge seams. THE ROW'S SEVERITY SENTENCE IS ALSO WRONG AT HEAD, AND SO IS THE RE-SCORE BANNER.** Re-measured by execution before building, in-process against a real SQLite store, warmed and interleaved, 25 samples per branch, on the worktree venv whose `argon2-cffi 25.1.0` / `ldap3 2.9.1` / `cryptography 50.0.1` match `requirements.lock` exactly.
+
+**THREE CLAIMS IN THIS ROW ARE STALE, AND ONE OF THEM INVERTS.** (1) The re-score banner still reads *"the asymmetry stands verbatim at HEAD"* and cites `auth/ldap.py:243-244`; the 2026-09-03 entry above already recorded that as false, and it remains false. (2) The **Severity** line says a first deployment *"would inherit a username-enumeration oracle on its directory namespace"* through the AD leg. **BACKLOG #1137 retired directory password sign-in on 2026-08-22** -- `login(provider=AD)` now refuses before any lookup, and `LdapAuthenticator.authenticate` (the `_equalizing_bind` path) has exactly ONE caller left, `_reauth_ad`, which is post-session and per-actor rate-limited. The directory-namespace oracle this row was filed for is no longer reachable from an unauthenticated seam at all. (3) The item names *"an extra awaited store write only on the valid-user-wrong-password branch"* as a live residual: **it is real in the code and NOT measurable on this store** -- unknown-username 45.99 ms vs wrong-password 45.68 ms, a 0.31 ms gap inside a 13 ms p10-p90 band. Both are dominated by the one argon2id verify (~40 ms at the pinned t=3, 64 MiB, p=4).
+
+**WHAT THE MEASUREMENT ACTUALLY FOUND, AND IT IS NOT WHAT THE ROW PREDICTED.** The loudest timing channel on the sign-in seam at HEAD is a branch this item has never named, because #1137 created it two days after the research was written: the retired-AD refusal answered in **0.61 ms** against **45.7-49.6 ms** for every local branch -- a **75x spread**, selectable by the caller through the request's own `provider` field. It is **not** a username oracle (it refuses before any store lookup, identically for every username), so it does not restore the severity the row claims; it is squarely what the verb grades, *different response times* on a challenge seam. Second finding: the bootstrap spelling is the one local branch measurably slower than its siblings, **49.58 ms against 45.7-46.2 ms**, from the extra lookup plus the supersession check #1268 added. Also not a username oracle -- `admin` is a fixed public constant -- but reproducible and above the noise, where the residuals this row does name are below it.
+
+**BUILT: a fixed-deadline failure equaliser, sited on the SERVICE methods.** `_failure_deadline` + `_sleep_until` + `AuthService._equalize_failure` in `messagefoundry/auth/service.py`, wrapping `login` and `authenticate_kerberos`. Every FAILED outcome is held to an instant fixed before dispatch, so latency is a function of the start time and nothing else. Successes return unpadded, deliberately: a valid credential has already disclosed that the account exists, and padding it would slow every real sign-in to conceal nothing. Measured after: the same five branches land at **511.04-512.04 ms, a 1.00 ms spread** -- against 48.97 ms before, a 49x reduction, with the residual being `asyncio.sleep` wake-up jitter (Windows timer granularity ~15.6 ms) that is uncorrelated with the branch.
+
+**(c) IS COVERED WITHOUT EDITING `routes/sso.py`, AND THAT IS THE DESIGN.** The pad sits on `authenticate_kerberos` rather than in the route, so `GET /ui/sso` and the JSON Kerberos leg both inherit it from one site; a route-local pad would have equalized one caller and left the other to be found later. Driven through the real route in the tests, not asserted from the call graph. **What the pad buys there:** the route already collapses every reject to one 303 to `/ui/login?e=sso_failed`, so latency was the last channel separating an unresolvable principal (a directory search) from a like-named local account (that search plus a store lookup) from a directory outage (the full `ad_connect_timeout`) from "SSO is not configured" (no work at all). **What it does NOT buy:** the attacker does not choose the username on that path -- SPNEGO supplies it from a KDC-issued ticket -- so this is not username-enumeration protection in 6.3.8's sense. It removes a caller learning *which reject branch* its one presentable principal landed in. It also does not cover `kerberos_available == False`, which the route answers with a different error code before reaching the service; that is a server-wide configuration fact, identical for every principal and already disclosed in the redirect. The two rejects the route answers itself -- malformed base64 and a non-navigation fetch -- are deliberately **not** padded and are pinned as such, so a later reading of "site it at every entry point" does not silently become "pad everything".
+
+**THE ITEM'S "HARD-BOUND THE DIRECTORY CALL AT THE SAME BUDGET" IS DECLINED, WITH A REASON.** Bounding the LDAP call at 0.5 s would refuse legitimate logins against any directory slower than that, and `ad_connect_timeout` / `ad_receive_timeout` default to 10 s each precisely because a real controller can be slow. The fail-open the item is right to fear is closed a different way: `_failure_deadline` **quantizes** an overrun up to the next whole multiple of the budget rather than giving up, so it can never return a deadline at or behind `now`. An overrun then discloses a slot index instead of the raw elapsed -- and on the directory leg an overrun discloses an availability fact identical for every principal. A per-seam, per-process warning says the budget is wrong for the hardware; it is latched because the login surface is unauthenticated and a warning per overrun would be the same unbounded log amplifier the rate-limited audit paths exist to avoid.
+
+**VERIFIED BY MUTATION, AND ALL SIX MUTATIONS WERE INVISIBLE TO THE PRE-EXISTING SUITE.** `tests/test_asvs_login_deadline.py` (31 tests, offline, no directory, on every CI leg). Six mutations of the shipped code, each run against the new file and against the 121 pre-existing tests in `test_auth_hardening` + `test_api_auth` + `test_auth_core` + `test_auth_session_lifecycle`: pad removed from the login seam, pad removed from the Kerberos seam, **deadline steered by the attempted username**, overrun made to fail open, successes padded too, and the warning un-latched. **Every one reds its intended guard in the new file; every one is GREEN across all 121 pre-existing tests.** The third is the one this row's own warning is about -- the test asserts INVARIANCE across branches, never equality against a shared symbol, so a deadline computed from caller input reds it where a tautological equality assertion would pass.
+
+**TWO EXISTING GUARDS INTERACTED WITH THE CHANGE, AND NEITHER WAS LOOSENED.** `tests/test_docs_security_pathways.py` treats every `_login*` coroutine returning a `LoginOutcome` as a per-provider pathway owing a `docs/SECURITY.md` row (ASVS 6.1.3), so the inner method is named **`_dispatch_login`, not `_login`** -- a pure refactoring must not have to weaken that guard to fit. Its sibling assertion AST-reads `mfa_verified=True` out of `authenticate_kerberos`; the grant moved one frame down into `_authenticate_kerberos`, so the anchor follows the fact, exactly as that test's own #1137 note did. Both still fail in the direction they were built to catch.
+
+**STILL DELIBERATELY NOT BUILT.** (b) the conflict branch and (d) the `LDAPException` asymmetry, both unchanged and both still recorded above as deliberate -- though (c)'s pad now equalizes (b)'s *timing* at the Kerberos seam, which was the part of it a branch-parity test inside the directory module could never see. The shared bind-then-release helper and the module-level decoy CN stay declined for the reasons above. **`authenticate_oidc` was considered and left unpadded:** its cost is dominated by an unbounded round trip to the IdP token endpoint, its branch set is configuration and flow state rather than anything the caller names, and padding it would be theatre over external latency.
+
+**No re-score, no banner flip, no vault write.** Closing act stays `scorecard-rescore`. A re-scorer should read the code and the paragraphs above, not this row's banner or its Severity line.
 
 ## 1141. research an honest pass for ASVS 6.4.5 -- a deadline and a reminder for a credential the engine cannot reach the holder of
 
@@ -10314,6 +10442,66 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **Anchor drift in the record, all resolving by token under the content-addressed resolver:** `messagefoundry/auth/service.py` recorded at `:848` resolves at `:938`; `messagefoundry/config/settings.py` recorded at `:1958` resolves at `:1966`.
 
+
+**RE-MEASURED 2026-09-06. This item's "crosses SILENTLY" claim about `tls_hop_attested` is WRONG at
+HEAD, and the correction narrows the finding without removing it.** `_enforce_shipped_hop`
+(`transports/rest.py:430`) logs at WARNING when an attestation suppresses an enforcing refusal, and
+`[security].enforcement` ships `ENFORCE`, so a first deployment lands on that branch and gets the line.
+**Two narrower claims are true and are the ones to write down.** First, the asymmetry is between
+LOUD-AND-AUDITED and LOUD-BUT-UNAUDITED, not between loud and silent: `cleartext_accepted` gets both a
+warning and an audit record, while `tls_hop_attested` produces a log line and no audit record, because
+the acceptance audit sink is passed only on the WARN-and-accepted arm. Second, the crossing IS fully
+silent -- quieter than the same hop with no attestation, which would at least WARN -- on an instance
+where the operator ALSO sets `[security].enforcement = warn`, because the attested arm returns ALLOW
+before the enforcing check is reached. The disqualifying configuration this item names is therefore
+real and independent of federated login, and it would put a minted OAuth bearer on a readable segment.
+**Two other measurements, both confirming.** The four-axis claim holds as four minting PATHS but only
+THREE enablement KEYS -- `FhirLookup` composed with `with_smart_backend` is switched by the same
+`smart_token_url` that enables the symmetric client-credentials path, though it remains a distinct
+spec, executor and opener table. And the other four cells in this family genuinely DO have federated
+login as their sole binding limb: zero `id_token` occurrences in `smart.py`, `http_auth.py` and
+`fhir.py`, against a firing control of 7, 9 and 4 `access_token` hits in the same run. So apply Owner
+Ruling 1's disposition to all six and inherit its PREMISE on five. **RETRACTED SAME DAY, and the retraction is worth more than the claim was.** This
+amendment first said the 2026-08-17 ruling was "not written anywhere in the engine tree ... a document
+nobody can read", and asked for its text to be copied into `docs/ASVS-ASSESSMENT-METHOD.md`. **The
+measurement was true and the conclusion was false.** The ruling is
+`docs/security/OWNER-RULINGS-2026-08-17.md` in the **`MessageFoundry-vault` repository**, on **that
+repository's** `origin/main`, added by vault commit `9b311054`; the federated-login ruling is
+**Ruling 1**, at lines 6-38. **Name the repository whenever you cite this path.** The identical
+string `docs/security/` also exists as a gitignored directory in the ENGINE repo, where it is
+genuinely unreachable -- `git ls-files docs/security` returns zero there against a positive control
+of 464 for `git ls-files docs/` -- so "the ruling is reachable" and "docs/security is unreachable
+from an engine checkout" are both true and about different repositories. Dropping the repository
+name is how one gets read as refuting the other. It is not in the engine tree
+BY DESIGN, because rulings live in the vault, so nothing needs copying anywhere and the six items
+defer to a document that reads fine. **The instrument could not have returned anything else:**
+`docs/security/` is gitignored from every engine checkout, which `CLAUDE.md` section 12 names as a
+trap in terms -- from an engine checkout the record "does not look misplaced, it looks like it does
+not exist, which is why sessions conclude there is nothing to read". A tree-wide engine search was
+the wrong question asked confidently.
+
+**WHAT READING THE ACTUAL RULING CHANGES, now that it has been read.** Two things, and the first
+strengthens this item's surviving finding rather than weakening it. **Ruling 1 scopes itself in its
+own words to "the six cells whose SOLE BINDING LIMB is that the federated-login feature ships off".**
+That is the premise this amendment measured as false for 10.1.1, and the ruling's own sentence is now
+the citation: this verb also ranges over outbound OAuth minting paths that ship independently of
+`[auth].oidc_enabled`, so 10.1.1 is not a cell whose sole binding limb is federated login. The
+ruling's DISPOSITION still applies -- the cell is permanently partial on the rubric gate either way,
+and the ruling says in terms that this is not a scope-out and the verdict does not move. Only its
+stated premise misses this one cell of the six.
+
+**Second, the ruling's own count has drifted by one and should be re-based when convenient.** It says
+enabling federated login "requires fifteen operator-supplied values" and rests that on execution.
+Measured again 2026-09-06 by REMOVAL rather than addition -- start from a configuration that loads,
+drop one key at a time, keep the ones whose absence refuses the load -- the answer is **fourteen**:
+thirteen in `[auth]` plus `[security].web_console_public_address`. Baseline-loads and
+drop-a-non-required-value controls both fired in the same run. **The ruling's argument is unaffected**
+-- at fourteen or fifteen, a gate demanding them would refuse to start for every site that does not
+federate -- so this is a figure to correct, not a conclusion to revisit. Note that
+`[api].public_origin` was renamed to `[security].web_console_public_address` under ADR 0118 and the
+old spelling is now REFUSED at load, which is the kind of change that moves a count like this. Anchor drift: `oidc_enabled` resolves at
+`config/settings.py:2003` and the `ad_enabled` precondition at `:2245`; enabling OIDC needs **14**
+further site-supplied values, measured by adding one at a time until the config loaded.
 ## 1156. research an honest pass for ASVS 10.1.2 when the flow-binding secrets are unconditional but the flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The enablement premise is unchanged (oidc_enabled ships False, now at settings.py:1942 rather than the cited :1880, and :2190-2210 refuses it without ad_enabled) and both live deltas the research must carry are present: the flow cookie's __Host- twin at _auth.py:783 and the hardening opt-out env at :77. Value 4 because the residual reads every binding on the acceptance path as unconditional, leaving a scorecard and method question with no product effect; difficulty 3 because the code half is one conditional in a single console auth module already covered at test_ui_hardening.py:322, and the cleartext branch is decided by the browser's own rule that a __Host- cookie requires Secure, not by engineering. _(was 4/10 · 6/10.)_
@@ -10433,6 +10621,57 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **Enumeration corrections from the lenses, none verdict-moving.** `OidcClaimPolicy` has two non-test construction sites, not one -- the second in `messagefoundry/verify/federation.py:292`, an in-scope engine module no matrix named. `/ui/sso` is a fourth federated console route (Kerberos, not OAuth, so this verb does not reach it) that a completeness claim has to name and exclude. And the two back-channel no-redirect citations quote one limb of a two-branch expression; both branches refuse a 3xx, so the property is stronger than recorded, but a second opener construction exists on the credential-bearing POST and one of this cell's own re-score triggers watches exactly that.
 
+
+**RE-MEASURED 2026-09-06 against RFC 9207 and RFC 9700 fetched from rfc-editor.org rather than
+paraphrased. THE FINDING HOLDS AND THE AFFIRMATIVE LIMB SHOULD BE RETRACTED: an `id_token` `iss`
+CLAIM is not a substitute for the RFC 9207 `iss` PARAMETER, and the reason is ORDERING.** The
+parameter is absent from the whole product: the callback route accepts `code`, `state` and `error`
+only, so an `iss` parameter from a conforming provider is discarded unread, and `complete_oidc_login`
+has no issuer argument to pass one to. The claim check is real and correct as an OIDC Core issuer
+check -- `_check_core_claims` compares `claims.get("iss")` against the pinned issuer -- but
+`_exchange_and_validate` runs `exchange_code` FIRST and `validate_id_token` second, and
+`exchange_code` POSTs the code, the PKCE verifier and, for a confidential client, the client secret
+before returning. So the check fires strictly downstream of the disclosure a mix-up defense exists to
+prevent. RFC 9207 section 4 permits omitting the parameter only where the AUTHORIZATION RESPONSE
+already carries the issuer identifier, naming the response types that return an ID Token from the
+AUTHORIZATION endpoint, or JARM; this client sends `response_type=code` with `response_mode=query`
+and refuses a token response with no ID Token, so its ID Token can only arrive from the TOKEN
+endpoint and the exemption does not reach it. RFC 9700 section 4.4.2, first subsection, lists both sanctioned
+transports for the identifier and both are in the authorization response.
+**WHAT ACTUALLY DEFENDS THE REDIRECT LEG is structural single-issuer pinning, not the claim check**,
+and the residual should be re-based on it: the four endpoint settings are scalar, the load-time
+validator requires all four and admits no selector, and RFC 9700 section 4.4.2 opens by stating that
+a client able to interact with only ONE authorization server needs no mix-up defense. So do not
+re-score downward either -- `fail` means no implementing control exists in any configuration, and on
+the only leg where the mix-up class is defined the antecedent is false.
+**A SEPARATE GAP THIS ITEM DOES NOT NAME, and RFC 9700 section 4.4.2 names it almost verbatim:**
+nothing requires `oidc_authorization_endpoint`, `oidc_token_endpoint` and `oidc_jwks_uri` to belong
+to the pinned `oidc_issuer`. The validator checks each URL independently for https and for membership
+in the operator's own `oidc_allowed_endpoints` list. The RFC warns that storing the authorization
+server URL alone is not sufficient, because an attacker can declare an honest server's authorization
+endpoint while declaring a token endpoint under their own control -- which is load-legal here. Stated
+conditionally: on a first deployment an operator whose allowlist named two hosts could configure a
+setup that authorizes the browser at host A and POSTs the code, the verifier and the client secret to
+host B, with the only issuer check firing after that POST. Not attacker-selected, so it is
+config-integrity hardening rather than a live attack path, and RFC 9207 support would NOT close it --
+the `iss` parameter attests who issued the authorization RESPONSE, not where the token POST goes. The
+**BUILT 2026-09-06, BUT NOT IN THE SHAPE THIS PARAGRAPH FIRST PROPOSED.** I scoped it here as a
+coherence REFUSAL in `_require_oidc_fields`. That is wrong, and the entry below settles it with
+evidence I did not have: four live discovery documents, of which Google alone advertises three hosts
+across two registrable domains, so a host-equality refusal rejects a conforming provider. What
+shipped instead is an ADVISORY arm on `_check_oidc_auth_params`, reporting the split so an operator
+confirms it against their provider's metadata. Read that entry rather than this proposal.
+**ONE THING A READER WILL GET WRONG, and it is the natural objection, so state it in terms.**
+**#1143** records that `auth/oidc/claims.py:227` pins the issuer before any continuity guard runs --
+it uses that fact to rule out grounding ITS cell on the (issuer, sub) pair -- so a reader arriving
+here from that row will assume the same pin closes the window above. It does not, and the reason is
+the one this item already turns on: the pin is on the TOKEN, which the engine does not hold until
+`exchange_code` has already returned. It is the same check, at the same point in the sequence, and
+the sequence is the finding. Cite #1143 rather than re-deriving the pin.
+Anchor drift, and it keeps drifting -- re-measured 2026-09-07 after nine further ledger commits
+reached `main`: `flow.py:307` resolves at `:306`; `flow.py:253-262` at `:252-260`; `settings.py:1943`
+at **`:2010`** (this row said `:2003` on 2026-09-06 and that was correct then, which is the point --
+locate by symbol, never by the number written here); `settings.py:2236-2248` at `:2296-2310`.
 **MEASURED 2026-09-06 AGAINST FOUR LIVE DISCOVERY DOCUMENTS: THE COHERENCE CHECK CANNOT BE BUILT AS A FAIL-CLOSED REFUSAL, SO THAT PROPOSED-WORK LIMB IS REFUTED RATHER THAN OUTSTANDING.** The paragraph above proposes "refusing at config load when a pinned endpoint does not belong to the pinned issuer". Two predicates can express "belong", and a provider this project expects to serve refutes each one. Each row below was fetched from that provider's own `.well-known/openid-configuration` with `curl`, so it is the provider's published metadata rather than a paraphrase.
 
 | Provider | `issuer` | authorization host | token host | JWKS host |
@@ -10448,11 +10687,15 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **RFC 9207 `iss` PARAMETER SUPPORT IS STILL GENUINELY UNBUILT, and that is now measured rather than assumed.** A search of `messagefoundry/`, `messagefoundry_webconsole/` and `tests/` returns exactly one `iss` hit, the ID Token claim compare at `auth/oidc/claims.py:227`, against a working control of three `oidc_issuer` hits in `config/settings.py`; no commit on any branch mentions 9207 except this row's own docs commit. It stays buildable on its own merits and stays Trap B for scoring. It was not taken here because a live session holds this row's claim.
 
+
+**LIMB TAKEN 2026-09-06: the OAuth2 client-credentials DESTINATION-BINDING limb, and only that one.** Not the issuer-to-endpoint coherence check, not RFC 9207, not the residual correction. **Outcome: the gap is confirmed and the remedy this row implies was REFUSED, because it does not close it.** **All three of the row's anchors for this limb are stale, in the direction the project already expects -- the code moved and the quoted lines did not.** `smart.py:160` is a missing-`client_id` error; the binding is `smart.py:169` (`self.audience = audience or token_url`) consumed at `:237` (`"aud": self.audience`). `http_auth.py:184` is a missing-`client_secret` error string and `:240-242` sits inside `access_token`'s cache write; the unbound credential is constructed at `http_auth.py:263-268`. **Row #1159 quotes `smart.py:160` for a DIFFERENT claim, so one stale anchor is now doing two jobs.** **The asymmetry itself reproduces exactly as described**, measured off the wire rather than the source: driving each provider against a recording opener, the SMART assertion carries `aud` equal to the pinned token endpoint plus `exp` and `jti`, while both `basic` and `post` transmit the reusable `client_secret` and assert no audience and no lifetime. **What was refused is `client_secret_jwt`, and the reason is that it is the WRONG PARITY.** The SMART leg's property comes from the key being ASYMMETRIC -- the server holds only a public key. A symmetric assertion is verified by a server that holds the same secret, so that server can mint one for any other audience: it would stop TRANSMITTING the secret without restoring the property the row's sentence is about, and landing it as the answer to that sentence is exactly the compensating-control-on-a-false-premise shape. Its cost is real too: `SignatureAlgorithm` carries no HMAC member and no `none`, and `transports/signing.py` names that absence as why an RS256-to-HS256 confusion is inexpressible on the attacker-reachable `verify_compact_jws` path, so reaching `client_secret_jwt` means either widening that enum or standing up a second JWT minter beside the audited one. **AND THE CORRECT CONTROL ALREADY SHIPS, MISNAMED.** `with_smart_backend` composes over a bare `Rest()` and puts a plain RFC 7523 section 2.2 `private_key_jwt` exchange on the wire -- form keys exactly `grant_type`, `client_assertion_type`, `client_assertion`, with nothing FHIR- or SMART-specific in it -- so the binding this limb calls absent is reachable today for any partner that registers a public key, under settings spelled `smart_*`. That is a discoverability defect, and it is what was fixed: the composer docstring and `docs/CONNECTIONS.md` now say so, and say what a shared secret does not buy. `tests/test_oauth2_destination_binding.py` pins four of the five facts the finding rests on and points at the owner of the fifth: `tests/test_compact_jws_verify.py::test_none_and_hs_are_absent_from_the_enum` already guards the enum for the same reason, and a second copy would be a silently different definition of one rule. Six mutation arms, all red, each hash-checked so a mutant that failed to apply could not score as survived. **A sixth measurement, outside the limb and worth carrying:** no per-connection auth mode reaches `connections.toml` at all -- `_build_spec` calls the transport factory with the `[settings]` table and `Rest` is keyword-only with a closed parameter list, so SMART, OAuth2-CC and Digest are each refused there, loudly and with a positive control. "Reachable from both surfaces" is therefore a bar none of the shipped modes clears. **NOT DONE, deliberately, and each is a real next step rather than a gesture:** a `messagefoundry check` advisory naming a symmetric-secret connection that has also declared `cleartext_accepted` or `tls_hop_attested`, which is the narrow discriminating condition (a blanket advisory would fire on every OAuth2-CC connection and grade as noise); widening `with_smart_backend` past its REST/FHIR gate to SOAP; and renaming or aliasing the `smart_*` settings for generic use. **No re-score and no closure -- the closing act is a scorecard re-score and is not a builder's.** **What would reverse the refusal:** a named partner authorization server that requires `client_secret_jwt`, or a ruling that a second, non-audited JWT minter is acceptable beside `signing.py`. [PR 969](https://github.com/MEFORORG/MessageFoundry/pull/969).
+
 ## 1159. research an honest pass for ASVS 10.2.3 -- least-privilege OAuth scopes the engine never validates
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands unchanged: both scope settings reach the wire through a bare str() at smart.py:305 and http_auth.py:305 with no cross-check against the connector's declared interaction, checks.py carries no scope rule, and the wildcard example survives in at least five artifacts including the shipped wiring sample at wiring.py:531 (value 6). The remainder prices at 4: a research call on whether required scope is derivable, then an additive advisory check on the established checks.py CheckResult seam (four such checks already at :219/:253/:292/:424) plus doc narrowing, with a refusing gate ruled out. _(was 6/10 · 5/10.)_
 > Research: done 2026-08-20
 > Partly built 2026-09-03: the SMART over-grant advisory and the artifact narrowing landed. Still open -- no re-score, and the rule-4 ruling plus the five other authorization parameters are untouched. See "WHAT LANDED" below.
+> Partly built 2026-09-06: the relying-party advisory landed as `oidc-auth-params`. Still open -- no re-score; the audience limb and the rule-4 ruling are untouched. See "THE SEVENTH PARAMETER" below.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.3** (L3) currently scores **partial**. The pinned verb asks that the OAuth client request only the scopes it requires. What holds it short is that `smart_scope` and `oauth2_scope` travel from operator config to the wire through one `str(...)` conversion and nothing else (`messagefoundry/transports/smart.py:305`, `messagefoundry/transports/http_auth.py:305`).
 > Verdict: research
@@ -10499,6 +10742,30 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **THE FIVE ARTIFACTS ARE NARROWED; THE TWO TEST ASSERTIONS WERE LEFT, AND THAT IS A CORRECTION TO THIS ITEM.** `transports/smart.py`, `docs/CONNECTIONS.md` (both the worked example and the settings-table row) and `docs/adr/0024` now show `system/Patient.c` against their `interaction="create"` connections, and the `FhirLookup` sample in `config/wiring.py` shows `system/Patient.rs`. `docs/CONNECTIONS.md` gains a *Least scope* section giving the letter alphabet, the per-shape table the check computes from, and the reason the check never blocks. `tests/test_smart_backend.py:131/:229/:279` still carry `system/*.rs` and did NOT move with the correction: they pin round-tripping of an ARBITRARY configured scope string through the token request, so the value is a fixture and not an example, and no code they exercise changed.
 
+
+**THE SEVENTH PARAMETER, and this item's count of six omits it. Built 2026-09-06: `oidc-auth-params`.**
+`[auth].oidc_scopes` is unvalidated. Its only validator, `_split_oidc_lists`, is a SHAPE normaliser --
+it comma-splits an env string into a list and screens no content -- so `["not-a-real-scope"]` with no
+`openid` at all loads clean, measured by execution against a settings object that otherwise loads.
+**The shipped DEFAULT is minimal and that is worth saying plainly:** `oidc_username_claim` defaults to
+`preferred_username`, which OIDC Core places in `profile`, so `["openid", "profile"]` is exactly what
+this configuration needs. The gap is the OVERRIDE, and it is a COUPLED one -- an operator may change
+the scopes and the username claim independently, with nothing relating them. **The line worth having
+is not a least-privilege report at all:** the login path reads exactly one scope-gated claim and
+raises `username_claim_missing` when the token lacks it, so pointing that setting at `email` without
+the `email` scope would, on a first deployment, produce a login that fails at its LAST HOP on a live
+user, reporting a missing claim rather than a missing scope. It is computable at config load and
+nothing computed it. The advisory reports that, the ACR request/require asymmetry in both directions,
+and a `prompt` value outside the OIDC Core set; it is advisory for `smart-scope`'s reason and stays
+silent on a custom username claim, whose carrying scope only the identity provider knows. **The cell
+does not move on it** -- the federated login ships off, so the shipped default builds no authorization
+request at all. **One correction for the next implementer: this item names TWO DIFFERENT four-check
+families and conflates them.** The re-score line's `:219/:253/:292/:424` are the config-dir advisories
+(now `checks.py:230/264/303/435`); the WHAT LANDED note names the posture family (now
+`:1546/:1592/:1638`). For `[auth]` settings the right template is neither -- it is
+`_check_alert_smtp_tls`, the only advisory that reads `messagefoundry.toml` rather than `load_config`.
+Anchor drift: `smart.py:305/306` resolves at `:395/:396`; `http_auth.py:305/307` at `:328/:330`;
+`wiring.py:531` at `:534`.
 ## 1160. research an honest pass for ASVS 10.5.1 when the ID Token nonce check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The control is complete and unguarded in the shipped code, so the cell is already substantially covered and only enablement holds it short. The item forbids both engine changes available to it, flipping oidc_enabled and adding a refuse-to-boot gate, and directs the shared optional-feature question to be answered once across all six siblings, so this item's own remainder is applying that ruling and recording the outcome, which ships nothing runnable and costs a record-grade edit. _(was 4/10 · 6/10.)_
@@ -10578,6 +10845,25 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **One unknown worth recording:** whether "equal to" in the pinned verb permits the containment reading the code implements. For a single-valued audience, membership in a one-element set IS equality, so the verb is met literally; for a multi-valued audience the code requires containment PLUS a matching authorized party, which is stricter than the OIDC Core recommendation. The cell records the alternative reading (reject any multi-audience token outright) as a re-score trigger and notes it lands on partial either way, so it cannot change this verdict -- but it is unsettled and a second assessor could legitimately raise it.
 
+
+**MEASURED 2026-09-06, and this item's own defect reproduces: A WHITESPACE-ONLY `oidc_client_id`
+LOADS.** `_require_oidc_fields` tests the five required fields with `if not value`, which catches the
+empty string and lets a run of spaces through, while the client-secret guard twenty lines below already
+STRIPS before testing -- the validator disagrees with itself. Executed against a settings object that
+otherwise loads: the empty string is refused, a three-space value and a lone tab both load, and a real
+value loads as the control. It is not cosmetic. `oidc_client_id` is the expected `aud`, so the ID Token
+audience check would compare an incoming claim against whitespace; and for the four pinned URLs the
+same test defers the failure to the https check, which then reports a SCHEME problem for what is really
+a missing value. The fix is one character class: strip before testing, exactly as the sibling guard
+does. **BUILT 2026-09-06** once the session holding `config/settings.py` committed and confirmed its
+own diff touches no OIDC validator. **The test's assertion matches the MISSING-VALUE message rather
+than the field name, and that is the whole discriminator** -- matching the field name alone was green
+for eight of its ten cases against the unfixed code, because the downstream https check refuses a
+whitespace URL too and names the same field. That was caught by sabotage before landing, not by
+review; with the pre-fix test restored all ten cases go red, and a padded-but-real value still loads
+with its padding intact, so the change cannot be confused with silently normalising operator values.
+**The cell does not move on it** -- a blank value also rides the authorization request and fails closed
+at the identity provider, so this is config hygiene on a fence the record calls load-bearing.
 ## 1162. research an honest pass for ASVS 11.1.1 -- a key-management policy covering all six keys, and an oversharing bound that does not fight escrow
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The one-of-six scope gap and the missing oversharing bound are both answered in the shipped document, and the answer took the honest route the item demanded rather than re-declaring the scope. What is left is re-verifying the cell against that text and rewriting its residual, which is a verifier run plus a vault edit rather than repo work. _(was 6/10 · 5/10.)_
@@ -10945,6 +11231,28 @@ Proof: nine mutations, each red, zero vacuous -- each of the three key-type chec
 **What I could not establish, stated as a gap rather than guessed.** The partner field data this item names as unknown (a) remains unknown, and it cannot be established from inside this repository. Three things would have to be known before any signature-padding flip: whether a given receiving HISP's CMS verifier accepts an `RSASSA-PSS` SignerInfo, where RFC 5751 makes PKCS#1 v1.5 mandatory-to-implement for S/MIME and PSS (RFC 4056) optional, so a fully conformant receiver may refuse it and be right; whether a given SMART token endpoint accepts ES384, which the Backend Services profile makes mandatory-to-support but which "mandatory in the specification" does not make implemented; and, for `OutboundSigning`, nothing at all, because `config/models.py` records that the receiver verifies out-of-band per partner contract, so there is no discoverable set even in principle. The repository holds no partner inventory, no interop corpus and no captured counterparty responses, and per section 0 there are zero deployments, so there is no field traffic to sample either -- the absence is structural, not an omission. A site would have to enumerate its own trading partners, obtain each verifier's capability statement, and run a signed test message through each partner's test environment before switching. I made no padding change: the prior "not reachable" ruling is the only ruling on the record, it authorizes nothing, and a shipped signing default is a security-posture decision with partner consequences that section 0's zero-deployment rule does not transfer to.
 
 **Handoff for the Lander, which performs the re-score (owner ruling 2026-09-05; `CLAUDE.md` section 5 retired the ASVS Tracker seat this line named); engine-side evidence by path.** The re-score needs no vault content to act on. Refresh the four cell anchors to `signing.py:246`, `signing.py:273`, `direct.py:363` and `direct.py:378`, and the three default anchors to `signing.py:507`, `config/models.py:517` and `smart.py:110`, adding the two SMART sites still missing from the record at `smart.py:394` and `smart.py:433`. Correct the recorded library version from 49.0.0 to 50.0.0; the residual that turns on it should be re-read, since it was written against a version that is not the one pinned. The key-transport limb at `direct.py:378` is measured unreachable within the pinned library, so a pass on this cell cannot be reached by configuration and the honest dispositions are the three this item already names -- fund a CMS writer emitting `id-RSAES-OAEP`, retire the connector, or record a signed relaxation, which under the method is a partial and never a pass. The two ruling questions stand unchanged and unanswered.
+
+**Researched 2026-09-05 at HEAD `a083cdb89`. The verdict does not move, and the reason it does not move is stronger than the record says: the key-transport limb is unreachable at EVERY version this repository has ever pinned. But the handoff written the day before is already stale, and the interpreter a session reaches for first measures the wrong version.** `requirements.lock:262` and `uv.lock:458` now pin `cryptography==50.0.1`; commit `ceb00f960` (2026-09-05, the dependabot group bump) moved it off the 50.0.0 the prior pass measured. So the handoff's "correct the recorded library version from 49.0.0 to 50.0.0" must be executed as **49.0.0 to 50.0.1**. A re-scorer applying that instruction verbatim writes a number that was true for one day.
+
+**The interpreter a venv-less worktree falls back to measures 49.0.0 -- which is exactly the stale number the scorecard already carries.** The primary checkout's `.venv` has `cryptography-49.0.0.dist-info` on disk and reports `49.0.0`, one major version behind the pin. A session re-introspecting the library there confirms the scorecard's recorded version by accident and learns nothing, because the instrument and the record are wrong in the same direction and agree. This is SDS-3.8: the question is what the ENGINE ships, and what that interpreter answers is what this box happens to have installed. `docs/WORKTREES.md` section "Why a venv per worktree" warns about the SOURCE half of this trap -- a shared venv silently importing the wrong checkout's code -- and is silent on the DEPENDENCY half, which is the half that decides this item. Read the pin from `requirements.lock`, then introspect an interpreter you have checked against it.
+
+**The version question was never load-bearing for this limb, which strikes one of the two things the difficulty-7 score rests on.** `cryptography/hazmat/primitives/serialization/pkcs7.py` is BYTE-IDENTICAL across 49.0.0, 50.0.0 and 50.0.1: `diff` returns empty for both pairs, against a positive control on `__about__.py` in the same run that prints the version line and exits 1. The score's justification reads "whether the CMS EnvelopedData surface can reach RSA-OAEP without leaving the pinned cryptography, which needs a version disagreement settled before it can even be introspected". The disagreement is settled, and it did not matter -- every version in dispute carries the same surface, so the introspection would have returned the same answer whichever side had been right.
+
+**Re-introspected at 50.0.1, the live pin: every library fact this item rests on holds verbatim.** `PKCS7EnvelopeBuilder`'s entire public surface is `add_recipient`, `encrypt`, `set_content_encryption_algorithm` and `set_data`; `add_recipient(certificate)` takes one positional certificate and there is no key-encryption seam anywhere on the type; `__init__` still calls `ossl.rsa_encryption_supported(padding=padding.PKCS1v15())` and raises `UnsupportedAlgorithm` when it is false. `PKCS7SignatureBuilder.add_signer` still exposes keyword-only `rsa_padding: PSS | PKCS1v15 | None = None`. The two DIRECT sites still differ in kind exactly as this item says.
+
+**One prior correction is itself wrong, and the error points a reader at a rollback that would not work.** The 2026-09-04 pass recorded "`ContentEncryptionAlgorithm` is no longer an enum at 50.0.0". Measured: it is the typing union at **49.0.0** as well, from the same byte-identical file, so nothing about it changed at 50.0.0. The practical consequence stands and is what #1169 and the proposed content-cipher upgrade need -- code written against a `.AES128` enum MEMBER will not run -- but the attribution does not, and as written it implies pinning back to 49 would restore an enum API. It would not.
+
+**All nine primary anchors still hold one day later**, at `signing.py:246` and `:273`, `direct.py:363` and `:378`, `signing.py:507`, `config/models.py:517`, and `smart.py:110`, `:394` and `:433`. The handoff's anchor list can be applied as written. Positive control on the census instrument: `PKCS1v15` returns two engine hits and four test hits tree-wide, reproducing the prior pass's counts exactly, against a deliberately absent token returning zero in the same run.
+
+**The three SECONDARY sites had never been re-verified. Two have moved and one has half-changed under the item.** The proposed-work list names them by 2026-08-20 anchors. Measured now: the WebAuthn site is still exactly `auth/webauthn.py:204`, where `generate_registration_options` passes no `supported_pub_key_algs` -- and the claim is now MEASURED rather than inferred from the missing parameter, because the resolved options object advertises `[-8, -7, -257]`, that is EdDSA, ES256 and `RSASSA_PKCS1_v1_5_SHA_256`, on webauthn 3.0.0. The SSH key load moved from `transports/remotefile.py:454` to `:619` and still loads `paramiko.RSAKey` only, so an operator has no key type available that avoids PKCS#1 v1.5 on SFTP client authentication.
+
+**The XML-DSig premise is stale in the product's favour, and a reader acting on the old wording would close the wrong subject.** The proposed work says `parsing/xml/signature.py:70` "passes no configuration". It does now: `verify()` passes `expect_config=_approved_signature_config(signxml)` at `:108`, because BACKLOG #1171's digest-strength limb landed. But `:59-65` records IN CODE that the PKCS#1 v1.5 limb was deliberately NOT applied -- `RSA_SHA256` and its siblings are the most common XML-DSig signature in use, and the appendix text could not be read from the checkout to confirm the restriction. So the accept-set remains a live PKCS#1 v1.5 acceptance surface for this requirement: half the proposal landed, the half this cell needs did not, and the anchor no longer points at the shape the proposal describes.
+
+**What was built, and what it is not.** `tests/test_direct_transport.py` gains two library-capability tripwires pinning this item's central distinction against silent upstream drift. One asserts `PKCS7EnvelopeBuilder` still exposes no key-encryption seam and that `add_recipient` still takes only a certificate; the other asserts `add_signer` still exposes `rsa_padding`, and doubles as the positive control proving the introspection CAN see a padding parameter when the library exposes one. The library limit is the whole reason this cell cannot pass, the only event that would change it is an upstream release growing an RSA-OAEP seam, and nothing in the repository watched for it. **This moves no cell and is not a fix.** DIRECT still wraps its content-encryption key with RSAES-PKCS1-v1_5, no default changed, and no assertion touches a settings field -- the mutation this item forbids as an acceptance test is absent because there is nothing there to mutate.
+
+**A neighbouring row watches the same library and did not know an executable check now exists.** `docs/ASVS-L2-PHASE0-CHANGES.md:356` carries the DIRECT S/MIME migration row, already cross-referenced to 11.3.1, whose trigger is "`cryptography` CMS `KEMRecipientInfo`/ML-KEM support + partner readiness" on a **review 2027-01** date. That is the PQC seam rather than the RSA-OAEP one, so the two are adjacent and not the same watch -- but they are the same library, the same type and the same maintainer, and the row is tracked by a calendar date where the tripwire fires on the event. `tests/test_crypto_inventory_doc.py` checks only that the row HAS a date and an owner, so nothing links them in either direction. This entry closes the half a reader of the tripwire needs; the row naming the test is unallocated proposed work, deliberately not taken here because that file is parsed by a regex test and edited by other lanes.
+
+**Verdict unchanged: an honest pass is still not reachable.** What changed is the confidence behind it -- the library axis is now measured across three versions rather than one, so "no lock bump reaches this" is a result and not an assumption. The two ruling questions stand unanswered, the partner field data at unknown (a) remains unobtainable from inside this repository, and the three honest dispositions are the ones already on the record. No padding change and no default flip was made.
 
 ## 1169. research an honest pass for ASVS 11.3.3 -- a strict-ciphertext read that refuses an unmarked cipher column
 
@@ -11352,6 +11660,77 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **OWNER RULING 2026-08-22 -- a strict positive allowlist. The re-scoping removed the cheap arm of this ruling before it was put.** The packet priced one reading as cheap because the operator cipher knob admitted CCM-8, a Disallowed but cryptographically strong mechanism, which is where candidate lists differ. Run end-to-end through the *shipped* context builder rather than through the validator alone, that same documented `[api].tls_ciphers` knob installs `ECDHE-RSA-NULL-SHA` (no confidentiality) and `ADH-AES256-GCM-SHA384` (no peer authentication) on a browser-facing listener, with every gate saying yes. Those fail every candidate list, so **the build is required under both readings** and the ruling decides only allowlist width. The ruling is: admit only suites appearing on every current candidate list, refuse everything unnamed, and refuse at config load. At zero deployments the compatibility cost of being strict is zero. The build is filed as **#1317**, which also records the trap: `_is_forward_secret` is not the defect -- both bad suites genuinely ARE forward-secret, and forward secrecy is simply the only property anything tests.
 
+
+**RE-READ 2026-09-06. WHICH LIST BINDS IS SETTLED, AND IT IS NOT APPENDIX C -- this item's
+binding-list claim is WRONG, and so is the Appendix C reading it rests on.** The ASVS 5.0.0 V12
+chapter that CARRIES 12.1.2 names its own references, verbatim: *Mozilla's Server Side TLS
+configuration guide* and *Mozilla's tool to generate known good TLS configurations*. Appendix C scopes
+itself in its own words to complementing the **Cryptography** chapter, which is V11, and 12.1.2's word
+is "recommended" rather than "approved". **So Mozilla Server Side TLS 5.7 binds**, and its Intermediate
+`openssl` list is nine TLS 1.2 suites, all AEAD, zero CBC. **Two further corrections.** This item says
+that dropping the six CBC suites leaves seven AES-128 suites *"also Legacy, one of them
+`TLS_AES_128_GCM_SHA256`"* -- false: Appendix C marks **GCM status A with an empty Restrictions cell**,
+and **CBC** is the row marked **L**. The item conflated a 128-bit key length with a Legacy status that
+belongs to CBC MODE, and its conclusion that the forbidden move *"pays the interop cost and still fails
+limb 1"* rests entirely on that. Corrected, the move succeeds under either candidate list. And
+`config/tls_probe.py` should not be graded as engine support for limb 3: `__main__.py` gates it on
+`tls_terminated_upstream` AND PHI AND enforcing AND a public origin, so it fires only in Posture B and
+it measures the OPERATOR'S proxy. **What is newly true and nobody wrote down: #1317 landed and
+`_APPROVED_TLS_SUITES` (`config/tls_policy.py:570`) already IS Mozilla Intermediate** -- the three TLS
+1.3 suites plus eight of Mozilla's nine, missing only `DHE-RSA-CHACHA20-POLY1305`. The operator knob is
+a strict positive allowlist, verified by execution with a passing control. **What holds the cell short
+is that the same list does not govern the SHIPPED DEFAULT**, which is CPython's inherited 17 suites,
+of which exactly six are the CBC-SHA2 family that lives in Mozilla **Old** and never in Intermediate.
+**The interop justification for keeping them DOES NOT EXIST, and BOTH repositories agree.** In the
+ENGINE tree a grep for the hospital-peer claim returns three hits, all inside `tls_policy.py` itself
+-- the docstring asserting it and the comment quoting it -- against a control of 93
+`harden_cipher_suites` hits in the same run. **That measurement alone would prove nothing about the
+world**, because `docs/security/` is gitignored here, so it was checked against the VAULT as well.
+The vault's own `docs/security/ASVS-HONEST-PASS-RESEARCH-SALVAGED-2026-08-20.json`, reached
+independently from the 11.3.5 side, states that what `harden_cipher_suites` records as measured is
+the SUITE-SET DELTA of a candidate `set_ciphers` string, that the clause about real MLLP and DICOM
+peers still speaking those suites is an assertion about the world with no cited census anywhere in
+the engine tree or the vault, and therefore that *"there is no interop measurement to RE-run; the
+honest form is to RUN one for the first time."* **Two passes from different cells, neither aiming at
+the other, on the same defect.**
+**"OWNER-RATIFIED" IS SPECIFICALLY UNSUPPORTED, and this is worth pinning because the phrase is
+already spreading.** The 2026-08-10 gate lane escalated the retention to *"a measured, owner-ratified
+interop decision"*; the vault entry above searched both `OWNER-RULINGS-2026-08-17.md` and
+`ASVS-GATE-RULINGS-2026-08-10.md` with a positive control of 19 `ruling` hits in each and found no
+owner ruling on the six suites, concluding *"'owner-ratified' is unsupported as well"*. A comment
+asserting an owner ratification that no rulings document carries is a compensating control resting
+on a false premise, which the standards forbid by name. The honest wording is that the retention is a
+recorded IN-CODE decision whose interop premise is unmeasured, and that retiring the six is an owner
+call **because** nobody has run the census -- which tells the next reader both why not to act alone
+and what would settle it. **Retracted in place by the packet B session in `af4a8a646` (PR 946)
+before it landed**, taking that framing; the comment now retracts rather than deletes, because a
+comment that silently loses a claim teaches nothing.
+
+**WHY THE PHRASE KEPT SPREADING, which is the part worth carrying forward: TWO GENUINE OWNER
+RULINGS SIT WITHIN ABOUT SIXTY LINES OF THE RETENTION COMMENT, AND NEITHER IS ABOUT IT.**
+`_APPROVED_TLS_SUITES` is a strict positive allow-list by owner ruling of 2026-08-22, which governs
+what an operator may CONFIGURE; the posture precedence gradient in the same module is owner-ratified
+under ADR 0153. Both are real. The defect was attaching their authority to a third subject in the
+same file that has none -- which is harder to catch than an invention, because every neighbouring
+citation checks out. A reader spot-checking "is there an owner ruling in this module" gets yes.
+
+**BOTH NEIGHBOURING CITATIONS WERE VERIFIED, and the verification is itself a warning.** ADR 0153
+resolves to a real file. The 2026-08-22 ruling on the allow-list is recorded in **BACKLOG #1317**
+(*"What to build, per the 2026-08-22 owner ruling"*) -- **not** in any rulings document, and not in
+the vault. Searching for it by DATE across both repositories, and by subject across the vault's
+`docs/security/` rulings files, returned nothing: the vault's only 2026-08-22 ruling artefact is
+`docs/security/ASVS-OWNER-RULING-PACKET-2026-08-22.md`, which **reads on its filename as a record of
+decisions and is the opposite** -- a ruling-REQUEST packet listing fourteen cells awaiting one. A
+searcher who stops at that filename concludes the ruling was made and cannot find its text. **So an owner ruling in this project may be recorded in the live ledger under an item
+number and nowhere else, and an instrument that looks only in rulings documents will report a
+sound citation as unsourced.** Check the ledger before calling any ruling citation unsupported. Removal is
+one file: pass the approved list to `set_ciphers` inside `harden_cipher_suites` before the four
+assertions, and invert the comment that currently argues the allowlist must never touch an inherited
+context. The peers that would lose interop are TLS-1.2-only ones offering ONLY ECDHE/DHE CBC-SHA2 with
+no GCM or ChaCha20 suite, which is Mozilla Old territory. Adjacent and confirmed:
+`ide/src/engineClient.ts` claims Node's default suite excludes the weak families, and Node 22.17.1's
+`defaultCoreCipherList` resolves to 52 suites of which 10 are NOT forward-secret; the code fix and the
+docstring correction must land together.
 ## 1176. research an honest pass for ASVS 12.1.5 -- whether ECH is reachable at all before CPython exposes an API
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Re-measured on the pinned runtime: an SSLContext exposes no ECH attribute, the routing half is unreachable from either authoring surface, and the Go sidecar the record leans on was retired from the tree, so the cannot-honestly-reach-pass finding is better supported now than when filed. Difficulty 2 because the deliverable is a recorded finding whose external blockers are confirmable in one probe and two greps. _(was 2/10 · 3/10.)_
@@ -11395,6 +11774,32 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **AND THE LANDED FIX DOES NOT MOVE THE CELL -- REPORTED BY THE RESEARCHING SEAT, 2026-08-22, AS ITS OWN FINDING.** In their words: `#488` carries this item's work and is *"fine as a defect fix, but do not read it as moving the cell... cannot honestly reach pass, verdict stays fail. A real defect closed, not a verdict change."*
 
 **So this item and its cell close on different evidence, and the item closing first is the normal case.** Whoever re-scores reads the researching seat's finding, not this item's status banner -- a shipped fix is a necessary and routinely insufficient condition for a verdict to move, and treating the two as one step is how a cell gets marked pass off a green board.
+
+**RE-MEASURED 2026-09-06. The blocker reproduces and BOTH of this item's proposed product fixes have
+SHIPPED, so its work list is stale rather than false.** Executed on the pinned interpreter: CPython
+**3.14.6** (satisfying the `>=3.14` floor), OpenSSL **3.5.7**, and `[a for a in dir(ssl) if 'ech' in
+a.lower()]` returns **zero**. The `cryptography` wheel reports a bundled OpenSSL 4.0.1, but it is
+statically linked into `_rust.pyd` and reachable by no `ssl` API, so this item's narrowing still holds.
+The ADR 0139 Go re-originator is **not in the tree** -- it was retired 2026-08-10 by owner ruling
+(#1011) and what ships is the engine-side routing plus a published contract for an operator-supplied
+sidecar; the hop it creates is cleartext LOOPBACK, refused outright if non-loopback, so it is not a
+network exposure. Shipped since this item was written: the non-REST closure is hoisted into
+`transports/base.py` at `build_source`/`build_destination` rather than copied per connector, and
+`transports/http_auth.py` threads `ech_sidecar` end to end, closing the token-endpoint SNI seam.
+**One residual reproduces and was reproduced by EXECUTION rather than inherited:**
+`tests/test_ech_egress.py` `test_both_refusal_sites_carry_the_same_message` does not witness the seam.
+Disarming ONLY the seam at runtime left the test green, because SOAP also routes through
+`egress_route_from_settings`, which raises the identical constant -- so the first `pytest.raises` block
+cannot tell which site fired. The repair is one test file and moves nothing: assert on a connector that
+reaches only the seam, and confirm it reds under the plant. **Grade it `fail`, not "the ceiling is
+partial":** nothing in the honest path conceals a single SNI byte, and a reader taking the softer
+phrase as licence to move the cell would record a posture-neutral movement. **DATED RE-CHECK, and the
+blocker is now one conjunct -- CPython must ship an `ssl`-module ECH API.** Re-run the probe above at
+**CPython 3.15.0 final, or 2027-05-01, whichever is sooner**; trigger early on a CPython release
+bundling OpenSSL 4.0 or later, or on the `ssl` ECH pull request merging. Pass condition: the `dir(ssl)`
+probe returns non-empty AND a client context has a `set_ech_config` attribute. Even then the cell stays
+short on the second wall, because ECH is not unilaterally satisfiable -- a re-measured DoH type-65
+probe of the EHR and FHIR hosts in scope must find at least one publishing an `ECHConfig`.
 ## 1177. research an honest pass for ASVS 12.2.1 -- refusing a cleartext outbound hop that carries a body rather than a credential
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The outbound refusal the item was filed against ships and fires on the DEFAULT posture, not only in production: enforcement defaults to ENFORCE at settings.py:3654 and feeds enforcing at :2471, so a cleartext non-loopback http destination is refused at construction unless the operator explicitly attests the hop, declares cleartext_accepted, or turns the dial to warn. The scored remainder is the honest-pass adjudication only, whether an audited operator declaration can carry an L1 pass and the unsettled narrow-versus-broad V12.2 reading, which is reading plus a scorecard re-read. _(was 8/10 · 5/10.)_
@@ -11428,6 +11833,35 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Still not an honest pass:** the item's named trap holds -- an owner ruling adopting the narrow reading moves the cell with no code change, and the record supplies its own tell, since the same exposure is carried by 12.3.1. But it is no longer the tempting move; the tempting move now is the opposite, re-scoring to pass on the newly-found outbound refusal alone, which grades the inbound and outbound limbs and silently drops the client limb -- "covers only part of the in-scope surface" verbatim. Nor declaring the IDE's tokenless probes out of scope because they carry no credential (the verb says all connectivity, not all credentialed connectivity, and the poll fires every fifteen seconds against whatever the setting names). Nor making `cleartext_accepted` refuse under enforcement and calling that the fix: defensible product work, but it touches neither the client limb nor the fallback limb, and it would remove raw TCP and X12 from off-loopback use on every enforcing instance until the unbuilt raw-transport TLS work lands -- buying the cell with the product's purpose. Nor citing `check_egress_allowed`, a host-and-port allowlist blind to scheme, which cannot express the requirement at all. Proposed work, unallocated and by subject: validating the IDE engine-URL setting at read; promoting the IDE target gate from a credential gate to a connectivity gate across the status-bar probe, its poll and read-environment callers and the AI-policy read, with a distinct rendered state so a refusal does not render as an outage; naming and overturning the browsable-URL gate's documented rationale so the two external-launch sites stop handing the OS browser a cleartext off-box origin; refusing rather than degrading a non-loopback cleartext tray engine URL, and explicitly NOT adding an https-then-http probe, which would create the fallback this cell forbids; deleting the apiclient non-loopback warn-and-cross escape (zero deployments, so the removal costs nothing) and updating the two load-harness call sites; adding a scheme gate to the two Vault client constructions, routed through the one authority AND its refusal floor rather than the bare authority, which only warns on a non-enforcing instance; a limb-A decision on the upstream-termination relaxation -- record it in the residual or close it by requiring a loopback bind when TLS terminates upstream; retiring the residual's false outbound sentence and re-anchoring onto the outbound refusal and its call sites; and correcting the off-loopback deployment note that tells operators the cleartext-egress refusal is PHI-posture gated, measured false at HEAD where it refuses on every posture.
 
+
+**RE-MEASURED 2026-09-06. THE OUTBOUND BODY LIMB DOES NOT REPRODUCE -- every body-carrying hop is
+gated, on every posture -- and this item's residual sentence asserting otherwise should be RETIRED.**
+The two functions are distinct and must not be conflated: `refuse_cleartext_egress` (`rest.py:578`)
+keys on the BODY, `refuse_cleartext_credential_hop` (`rest.py:510`) on a named CREDENTIAL. The body
+guard is called from `rest.py:1297`, `soap.py:381`, `fhir.py:373` and `:907`, and `dicomweb.py:246` --
+every HTTP-family destination plus the FHIR read path. Of the 14 registered outbound connectors, the
+seven socket and data-layer ones reach the same shared authority through `InsecureHopGuard.capture`,
+and `File` needs no guard. Executed across three postures with controls: a cleartext off-box REST or
+SOAP destination is REFUSED on production-PHI-enforcing, on enforcing-non-PHI AND on the NON-enforcing
+staging posture, via the decision-5 floor, while the loopback and https controls build. **A security
+record that under-claims a shipped fail-closed refusal is something operators configure around, which
+is why the retirement matters.** **What actually holds the cell short is the IDE client limb, and it
+reproduces:** `ide/src/engineTarget.ts` `assertTargetAllowed` is a real refusal whose message reads
+*"refusing to send credentials over plain http"* -- a CREDENTIAL gate, where this verb ranges over
+connectivity -- and its sibling `assertBrowsableUrl` deliberately DROPS the cleartext-off-box check on
+the documented ground that opening a console page sends no credentials, a rationale that does not hold
+for its own second caller, the sign-in path. Smallest honest change: validate
+`messagefoundry.engineUrl` at read in `ide/src/cli.ts`, which all five paths derive from, and promote
+`assertTargetAllowed` to a connectivity gate, correcting its message; overturning the
+`assertBrowsableUrl` rationale must land in the same change or the revert is invited. **One narrow
+finding that is NOT a 12.2.1 hole and should be filed as a consistency defect:**
+`transports/direct.py` is the single body-carrying destination whose cleartext decision does not route
+through the one shared authority, using the `is_phi`-keyed process-wide env escape where its
+`email.py` sibling was deliberately moved onto `InsecureHopGuard`. Measured: on an enforcing NON-PHI
+instance with the escape set, `direct.py` permits where the shared authority refuses. Two honest
+caveats -- the Direct payload is S/MIME signed and encrypted, so the exposure would be envelope
+metadata rather than the clinical body, and 12.2.1's verb names HTTP-based services, so SMTP falls to
+12.3.1. Anchor drift: `settings.py:3654` resolves at `:3715`, `:2471` at `:2532`.
 ## 1178. research an honest pass for ASVS 12.3.1 -- what a no-fallback claim means under the owner-ratified cleartext gradient
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Both limbs re-read at HEAD and both hold: transports/tcp.py:150-152 and transports/x12.py:124-125 declare cleartext_accepted a PERMANENT, STRUCTURAL declaration with no tls parameter to migrate to, and config/tls_policy.py:503-519 documents the loopback, hop_attested, cleartext_accepted and not-enforcing arms ahead of REFUSE. Value 7 because a first deployment would put a raw-TCP or X12 partner hop on the wire in the clear with no in-product configuration that changes it; difficulty 4 because this item's own remainder is the reading against the ADR 0153 gradient plus an owner ruling, with the connector TLS build tracked at #311. _(was 7/10 · 5/10.)_
@@ -11458,7 +11892,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **The inventory that ruling would range over is incomplete, and the missing artifact is one the verb's enumeration names in terms.** `messagefoundry/transports/database.py` -- simultaneously an outbound destination, an inbound `DatabasePoll` source and the hot-path `DatabaseLookupExecutor` behind the ADR 0010 carve-out -- appears nowhere in the analysis. On `dialect='generic'` it is not merely gated-with-an-escape but UNGATED: `_build_connection` returns `weakened=False` unconditionally at `database.py:403`, which disarms the byte-crossing tripwire `_assert_send_hop` (defined `:129`, called `:692`), and the only control is `_warn_generic_tls_unenforced`, whose own docstring at `:345-354` concedes "a generic PHI connection with no TLS keyword would cross in plaintext with no refusal and no trace" and states "This is advisory only; it never gates or changes the connection." Every reporting surface it feeds is non-blocking. That is the shipped-default limb, not a signed relaxation, and it is this item's own named trap -- a record that the hop is unencrypted rather than a control that encrypts it -- in a module nobody opened. Two more consequences: `database.py:108-109` places `if attested: return True` AHEAD of the posture clamp at `:110-113`, a second instance of the pattern the ruling-free fix corrects one file over; and the guarded condition at `:158` is `(trust or not encrypt)`, so `tls_hop_attested=true` there permits an outright plaintext ODBC session (`Encrypt=no` emitted at `:199`), not merely verify-off.
 
-**Still not an honest pass:** the item's two traps hold -- citing the acceptance audit trail as the compensating control fails because the shipped sink exists precisely to distinguish an accepted cleartext hop from one that merely warned, and re-verifying against the loopback default is MORE decisive now because the assessed posture is off-loopback on both planes. The most tempting move is not in the item: point at the shipped refusals -- every piece of which is true and re-confirmed -- and claim the startup-refusal limb is satisfied. It fails on the rubric's other sentence in the same row, that a signed relaxation is never a pass, and the per-feed escapes are authorable per connection. Two more: for the SMB and backup hops, arguing the payload is already encrypted is the paperwork trap in cryptographic clothing (encrypting the cargo removes exposure and does not turn an unencrypted protocol into an encrypted one); and for the reachability probe, "it sends zero bytes so nothing is disclosed" is the vacuity argument in miniature, bought purely to avoid a one-parameter change. Proposed work, unallocated and by subject: TLS on the four bare asyncio calls in the raw-socket connectors (already tracked -- do not re-file); the gradient amendment retiring the crossing arms and the standalone attestation, owner-gated; moving the attested early return behind the production-PHI clamp at BOTH sites, the inbound bind helper and the DATABASE weakened-TLS predicate; re-scoping the attestation retirement across every consumer of that flag rather than only the shared authority; refusing a generic-dialect DATABASE hop under an enforcing PHI posture when the advisory predicate returns a reason, and making the corresponding check required rather than advisory; replacing the off-box upstream-termination allow at `__main__.py:1646` with a verifiable requirement; a scheme gate on the three Vault hops and routing the insecure-LDAP escape through the posture clamp; passing the destination's SSL context into `probe_tcp_reachable` (`transports/base.py:557`) so a `tls=true` MLLP destination's connection test does not open a plaintext socket to the partner, and grading the second bare connection in `verify/smoke.py:126`; moving the IDE target gate into its client and dropping the payload-keyed exemption; wiring the four inbound exposure checks into the offline build-check path, measured NOT shipped; and a correction pass over the prior salvaged research entry striking its untracked-citation drift point.
+**Still not an honest pass:** the item's two traps hold -- citing the acceptance audit trail as the compensating control fails because the shipped sink exists precisely to distinguish an accepted cleartext hop from one that merely warned, and re-verifying against the loopback default is MORE decisive now because the assessed posture is off-loopback on both planes. The most tempting move is not in the item: point at the shipped refusals -- every piece of which is true and re-confirmed -- and claim the startup-refusal limb is satisfied. It fails on the rubric's other sentence in the same row, that a signed relaxation is never a pass, and the per-feed escapes are authorable per connection. Two more: for the SMB and backup hops, arguing the payload is already encrypted is the paperwork trap in cryptographic clothing (encrypting the cargo removes exposure and does not turn an unencrypted protocol into an encrypted one); and for the reachability probe, "it sends zero bytes so nothing is disclosed" is the vacuity argument in miniature, bought purely to avoid a one-parameter change. Proposed work, unallocated and by subject: TLS on the four bare asyncio calls in the raw-socket connectors (already tracked -- do not re-file); the gradient amendment retiring the crossing arms and the standalone attestation, owner-gated; moving the attested early return behind the production-PHI clamp at BOTH sites, the inbound bind helper and the DATABASE weakened-TLS predicate; re-scoping the attestation retirement across every consumer of that flag rather than only the shared authority; refusing a generic-dialect DATABASE hop under an enforcing PHI posture when the advisory predicate returns a reason, and making the corresponding check required rather than advisory; replacing the off-box upstream-termination allow at `__main__.py:1646` with a verifiable requirement; a scheme gate on the three Vault hops and routing the insecure-LDAP escape through the posture clamp; passing the destination's SSL context into `probe_tcp_reachable` (`transports/base.py:588`, corrected 2026-09-05 from a drifted `:557`) so a `tls=true` MLLP destination's connection test does not open a plaintext socket to the partner, and grading the second bare connection in `verify/smoke.py:126`; moving the IDE target gate into its client and dropping the payload-keyed exemption; wiring the four inbound exposure checks into the offline build-check path, measured NOT shipped; and a correction pass over the prior salvaged research entry striking its untracked-citation drift point.
 
 
 **OWNER RULING 2026-08-22 -- build the data-layer gate, and rule the partner-feed question separately.** The re-scoping found **14 data-layer hop sites across 11 shipped modules**, of which **8 reach no TLS gate of any family**; they are cleartext by default or by absence, not by a signed per-connection relaxation. So this cell stays partial on the data-layer limb *even if every clinical partner feed is ruled out of scope* -- the interop question the packet posed can no longer dispose of the cell. The ruling has a second half that is about the record rather than the build: recording a permanent partial and attributing it to clinical interop would be **a true sentence about the wrong cause**, which is the compensating-control-on-a-false-premise defect the standards forbid. The gate work is owed on its own merits; the partner-feed scope question is still open and is now genuinely separable.
@@ -11467,6 +11901,30 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Scope held deliberately narrow, and three things are measured-and-unclosed.** (1) The SQL Server preset keeps its own posture-keyed weakened-TLS refusal; moving that arm onto this gradient would ADD the loopback and `cleartext_accepted` relaxations to a path that refuses today, which is a loosening. (2) The `database.py` attested-before-the-clamp ordering stands: the clamp it precedes is the global `MEFOR_ALLOW_INSECURE_TLS` escape, so per-connection-attestation-then-clamped-escape is the ratified precedence, and moving it would retire the attestation arm on this cell -- which is the owner-gated question, not this build. (3) The `(trust or not encrypt)` condition still lets `tls_hop_attested=true` emit an outright plaintext `Encrypt=no` ODBC session rather than only verify-off. Narrowing it would make the module's two dialects disagree about what an attestation licenses, since the shared gradient's arm 2 lets an attestation ALLOW a cleartext hop everywhere else. It belongs to the item's own "re-scoping the attestation retirement across every consumer of that flag", which is owner-gated. The remaining data-layer sites and the partner-feed scope question are both untouched, so the cell does not rescore on this alone.
 
+**Built 2026-09-05: both bare connections in this item's probe residual can now cross the hop they are testing, and one of the item's two anchors had drifted.** Re-measured at `c57903c2c` by execution, with a positive control in the same run. `probe_tcp_reachable` sits at `transports/base.py:588`, not the `:557` this item recorded -- a 31-line drift, corrected above. `verify/smoke.py:126` still lands exactly. Both named defects held. `inspect.signature` showed the probe carried no `ssl` or `tls` parameter of any kind. A `tls=true` MLLP destination built a real `SSLContext` and its `test_connection()` returned OK having opened a bare TCP socket: a recording listener saw a connection carrying zero bytes and no ClientHello. The SAME destination's `send()` to the SAME listener in the SAME run sent a real ClientHello, so the instrument could see a handshake and the zero-byte reading was a finding rather than a blind probe. And `smoke_live` wrote a whole MLLP frame, `\x0bMSH|...`, onto a bare socket -- a synthetic body, but a body, and worse than the probe on this cell's own terms.
+
+**What changed.** `probe_tcp_reachable` now takes an optional `ssl_context` (plus `server_hostname`, defaulting to the host) and hands it to `asyncio.open_connection`, so a caller that speaks TLS gets a probe that speaks TLS. It stays a no-data probe: under TLS the handshake is all that crosses. A handshake failure is named as one instead of being reported as a failed connect, because a trust-anchor problem read as an unreachable partner sends the operator to the firewall. `None` keeps the plaintext probe byte-identical, which is the honest posture for raw TCP and X12 -- they have no `tls` parameter to migrate to, and their cleartext hop is gated separately at construction. `smoke_live` takes the same optional context and completes the handshake before any application byte, reachable as `messagefoundry verify --smoke live --smoke-tls [--smoke-tls-ca <file>]`. That context is built through the shared hardening seam rather than inheriting the interpreter's defaults, and carries NO verify-off switch: a smoke that accepts any certificate proves the port answers, not that it is the engine. Neither site ever probes one protocol and retries the other -- that fall-back is what the pinned verb forbids, so a mismatch fails and says so. The plaintext smoke's "0 bytes received" now names a TLS inbound as a possible cause, which is a diagnosis and deliberately not a retry. Both new call sites are registered in the crypto inventory; the gate was made to fail on purpose first, then satisfied.
+
+**What this does NOT do, so the cell does not move on it.** The MLLP destination's call site was still unwired when this was written, and it landed on 2026-09-06 in the note below; the two paragraphs together are the whole of this residual. The gradient amendment, the attested early return at both sites, the attestation re-scoping, the remaining data-layer hop sites, the upstream-termination allow, the Vault and IDE limbs and the partner-feed scope question are all untouched. **This item stays open.** Its closing act is a scorecard re-score, which no builder performs, and two named residual limbs remain either way.
+
+
+**Built 2026-09-06, and it is one call site rather than a data-layer hop: the shared reachability probe
+no longer opens a plaintext socket for a hop the configuration says is encrypted.**
+`probe_tcp_reachable` (`transports/base.py`) dialled plaintext unconditionally, so `test_connection` on
+a `tls=true` MLLP destination tested a transport the operator never configured. It now takes a
+keyword-only `ssl_context` and, when given one, dials with it and with `server_hostname` exactly as the
+delivery dial does. Two consequences on a first deployment, and the second is the one an operator
+feels: the engine would fall back to an unencrypted protocol on an encrypted hop, which is this cell's
+own verb; and a broken certificate, CA or hostname would pass a GREEN connection test and then fail
+every delivery, because the probe never performed the handshake. **MLLP is the only socket destination
+with the mismatch** -- `tcp.py` and `x12.py` carry zero `ssl` references, so their cleartext probe is
+honest, and the DICOM SCU already associates its C-ECHO through the same `tls_args` as a C-STORE.
+**Both halves are landed:** the shared helper first, then the MLLP call site once the other session
+holding that file committed. The discriminating test is the cleartext-peer case -- a `tls=true`
+destination probing a plaintext peer must now FAIL, where before it reported the peer reachable; the
+two positive tests pass either way, because a TCP connect to a TLS listener returns cleanly on the
+client side. **The cell does not move on this** -- the partner-feed scope question and the remaining
+ungated data-layer hop sites are both untouched.
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
@@ -11519,6 +11977,26 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **MEASURED AND DELIBERATELY LEFT, so nobody reads the clamp as more than it is.** The clamp is scoped to NON-loopback hops, so the shipped client default is untouched: `EngineClient`'s `base_url` still defaults to `http://127.0.0.1:8765`, and a loopback http request against a TLS listener returned the same `ReadError` after this change as before it. That is the *first-party client scheme migration*, a separate line in this item's proposed work, which moves `tray/` and `ide/` in lockstep and which ADR 0172 sizes as an XL. It is not this pass's, and on shipped defaults those bytes would stay on loopback. The `tls_terminated_upstream` hop, the IDE certificate-authority seam and the partner-feed scope question are all likewise untouched, so **nothing here shortens what holds this cell short.**
 
+
+**RE-VERIFIED 2026-09-06. Everything this item's own amendments claim landed HAS landed, and NO BUILD
+REMAINS ON THE ENCRYPTION LIMB.** Confirmed by symbol: `ensure_api_tls_material` mints when
+`[api].tls_cert_file` is unset and `uvicorn.run` receives the context (one occurrence in engine
+source); `docker/Dockerfile` is a single https probe arm with the cleartext fallback gone; the IP-SAN
+fix is live at both coupled sites in `pki.py`; and the apiclient clamp is live at three call sites.
+**Keep the two limb classes apart, because only one of them carries the cell.** The hops that CANNOT be
+encrypted number exactly ONE: the `tls_terminated_upstream` proxy hop, where `api/tls.py` returns None
+BY WRITTEN DECISION, with the reason in the code -- serving https underneath that proxy breaks the
+proxy's own hop. That is the deliberate exclusion `CLAUDE.md` section 2 names, no product change
+reaches it, and refusing to start over it would contradict the shipped decision. The hops that merely
+DEFAULT unencrypted are weaker: three first-party client defaults still spell `http`, but since ADR
+0172 the engine's end is https, so each writes plaintext into a TLS socket and the connection breaks --
+a broken client rather than a working cleartext channel, and on shipped defaults the bytes stay on
+loopback. `proxy_intra_service_auth` remains measurably inert, six tree-wide occurrences outside tests
+of which three are message strings. The IDE certificate-authority seam is still absent, re-measured
+with this item's own control: zero hits across 108 TypeScript files against a positive control firing
+five times in the same run. **The closing act here is a re-score and not a Builder's**, which is the
+honest outcome rather than a shortfall. Anchor drift: `uvicorn.run` moved from `:2868` to
+`__main__.py:3184`.
 ## 1180. research an honest pass for ASVS 12.3.4 -- narrowing internal TLS trust when the anchor is an artifact only the deployer holds
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both shortfalls confirmed at HEAD: the anchor ships off, and on the HTTP egress family it is inexpressible, since resolve_trust_anchor reaches only dicom, mllp and remotefile while rest.py and soap.py expose verify_tls alone and both hvac sites pass no CA. On a first deployment every internal REST, SOAP, FHIR, DICOMweb and Vault hop would verify against the whole OS store, including the hop that hands out the store data-encryption key. Difficulty 6 because this is a client-construction change across rest.py, soap.py and both hvac sites plus a refuse-versus-fall-back posture decision, not a default flip. _(was 7/10 · 6/10.)_
@@ -11563,6 +12041,48 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 
 **Neither trap was touched and the third one holds.** `trust_anchor_mode` still defaults to `"system"`; nothing was flipped, and the pinned-without-a-CA validator is untouched. The refuse-versus-fall-back posture decision is an owner ruling and is not built. **And this item's own sharpest warning applies to this commit by construction:** the cell's re-score trigger watches for the anchor resolver or a CA parameter appearing on these HTTP factories, and this work fires that trigger deliberately. **Expressibility is not a pass. Do not re-score 12.3.4 on this alone** -- every default is still permissive, and scoring it here would be wiring an existing toolkit into the pipeline so an absence claim stops firing, which is exactly what the record says not to do.
 
+
+**RE-MEASURED 2026-09-06. The two stated shortfalls reproduce; THREE of this item's supporting claims
+do not, and the third changes what a build must include.** **Correction 1, the resolver's reach is
+WIDER than stated.** `resolve_trust_anchor` (`config/tls_policy.py:1276`) reaches dicom, mllp and
+remotefile as recorded, and also **three SMTP hops** -- `transports/email.py`, `transports/direct.py`
+and `pipeline/alert_sinks.py` -- indirectly through `build_smtp_tls_context`. That is a fourth pattern
+and it is the one worth copying: the builder lives in `tls_policy.py`, so a transport imports one
+function and never touches the resolver. `rest.py` imports 13 names from `tls_policy` and none is the
+resolver; `soap.py` imports exactly two. **Correction 2, the factory count and the gap set.** There are
+**24** uppercase factories in `wiring.py`, not 25. Probed by signature with `Rest(verify_tls=True)`
+accepted as the positive control and `Tcp()`/`X12()` as TLS-incapable negative controls, the gap set is
+**FIVE**: `Rest()`, `FHIR()`, `DICOMweb()`, `FhirLookup()` and **`Ftp()`**, which this item does not
+name and which is the sharpest case -- `remotefile._ftps_ssl_context` READS six TLS settings that the
+factory writes none of, so `Ftp(tls_ca_file=...)` raises `TypeError`. Two qualifiers: `Http()`'s
+`tls_ca_file` is a SERVER-side client-cert CA and counting it as expressibility would be an error, and
+`Direct()`'s `trust_anchor` is the S/MIME message-layer CA, which the docstring already warns is easy
+to confuse. **Correction 3, and it refutes this item's answer to its own third unknown.** The
+attestation template's POLICY and VALIDATION halves ship as described, but a **fourth limb the item
+never checked is missing: `tls_hop_attested` has NO AUTHORING SURFACE.** `Rest(tls_hop_attested=True)`
+and `MLLP(tls_hop_attested=True)` both raise `TypeError`; it is in no factory signature and in neither
+`_INBOUND_KEYS` nor `_OUTBOUND_KEYS`, so `connections.toml` refuses it too -- and the repository
+already says so in `docs/CONNECTIONS.md` and `docs/CONFIGURATION.md`. So *"the answer is yes, and the
+pattern already ships"* is wrong as written: an anchor attestation copying it verbatim would be
+validated, read, honoured and unreachable. **The Vault correction this item already carries is right in
+direction and needs one refinement:** both `hvac.Client` sites pass no CA and `requests` defaults to
+the certifi PUBLIC bundle, read from the lock-pinned source rather than an installed copy, so an
+internal-CA Vault FAILS CLOSED -- but *"cannot reach one at all"* is too strong, because hvac reads
+`VAULT_CACERT` when `verify` is None, which is exactly what both sites produce. That is an environment
+workaround rather than product configuration, and `VAULT_CACERT` appears nowhere in this repository.
+There are also **three** consumers, not two: `store/crypto_transit.py` reuses
+`keyprovider_vault._build_client`, so one fix covers two. **Cost of the expressibility build is LOWER
+than this item prices it**, for a reason neither pass recorded: `Destination.trust_anchor_policy` is
+already a typed field threaded at the single `_dest_config` choke point and delivered to all four HTTP
+destinations, which simply never read it, and a per-connection `tls_ca_file` rides the existing
+settings mapping -- so `FhirLookupExecutor` needs no signature change and `connections.toml` inherits
+the fix free, because the factory is the schema. The one non-mechanical part is the opener: `pinned`
+mode cannot reuse urllib's context, and a fresh one must explicitly replicate the ALPN and
+post-handshake-auth settings urllib sets and `create_default_context` does not, or the pinned hop
+silently loses both. **BUILD IT AND DO NOT SCORE IT** -- expressibility trips this cell's own re-score
+trigger by construction, and landing it while every default stays permissive is the trap this item
+names. Anchor drift: `trust_anchor_mode` at `config/settings.py:1031`, `internal_ca_file` at `:1025`,
+the pinned validator at `:1033-1048`.
 ## 1181. research an honest pass for ASVS 12.3.5 -- intra-service endpoint authentication on an engine whose coordination is store-mediated
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **7/10** · _big bet_. The setting is still attestation-only: its sole consumer at settings.py:850 collapses four values to a boolean, so a declared "mtls" changes nothing. Value 6 rather than 7 because the hop the item's own severity names is genuinely closable today -- setting [api].tls_client_ca_file makes the API listener CERT_REQUIRED-verify the proxy's client cert (api/tls.py:58-62) -- so the gap is an unverified declaration beside a working control rather than an unavailable one; difficulty 7 because an honest pass must decide whether an attestation-only setting should exist at all, whether mutual PKI is reachable for the store and Vault hops given the drivers in use, and whether the IDE, tray and apiclient fall inside the requirement's scope. _(was 7/10 · 7/10.)_
@@ -11702,6 +12222,25 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **That makes FIVE of this wave's items with code on `main` and ZERO with a closed banner.** The gap is systematic, not per-item: a merge lands engine code and touches no ledger line, so every one of them reads as unstarted to the next lane.
 
 **The landing seat verified the allowlist in both directions and nearly filed a false alarm doing it** -- a slash-less `git show origin/main:.gitleaks.toml` is rewritten by MSYS path conversion into an invalid revision, and its empty output read as nine missing literals. **A pre-existing literal used as a positive control is what caught it**, because that too came back missing and a repo cannot lose a line nobody touched.
+
+**RE-MEASURED 2026-09-06. THE REDACTION LIMB NO LONGER REPRODUCES. The read-privilege limb does.**
+All five strings this item recorded as surviving VERBATIM are now redacted at HEAD, executed together
+with both of its original positive controls and a negative control that proves the instrument
+discriminates rather than blanket-scrubbing: `password=hunter2`, `Driver=x;PWD=hunter2;`,
+`secret=hunter2`, `postgres://mefor:hunter2@db.invalid:5432/mefor` and the exact cast-failure echo
+`setting 'password' (env 'MEFOR_VALUE_PW'='hunter2')` all lose the value while an ordinary log line
+carrying no secret passes through untouched. `support/redact.py` now carries `_CREDENTIAL_KV`,
+`_DSN_PASSWORD` and a quote-tolerant `_MEFOR_SECRET`, and its docstring records that every pattern is
+derived by AST in `tests/test_log_redaction_secret_domain.py` and must be claimed by a named secret
+family -- the machine-closed domain this item asked for. The bearer defect is fixed and the item
+already records it. **This item's `0o077|0o044|S_IROTH|S_IRGRP` absence measurement still holds**,
+re-run with the write-class mask as the positive control in the same pass: the read-class search
+returns a single hit and it is a display format string in an error message, not a policy test, while
+`0o022` fires three times across `auth/trust_anchors.py` and `config/wiring.py`. So the load-bearing
+limb is unchanged and the reusable pure evaluator is still where this item says it is. **Not built
+here, and the reason is scope rather than difficulty:** the preflight's own discovery source, the
+machine-closed file-borne asset registry, does not exist, so the mask swap this item prices at a
+re-derivation is gated behind building the registry first.
 ## 1184. research an honest pass for ASVS 14.2.1 -- getting the PHI search needle off the query string without breaking GET search
 
 > 🚧 **RE-VERIFIED 2026-09-06. THIS ITEM'S TITLED DEFECT NO LONGER REPRODUCES, and the scoring banner and "What holds it short today" paragraph below are STALE -- read this first.** Located by symbol at `744a7a434`, not by the line numbers below, which are stale by construction. No GET or HEAD route on either plane declares `content` or `field_value`: the three engine GETs (`search_messages_get`, `export_messages_get`, `browse_uploaded_file_get`) each have a POST twin taking a body model, both console routes pass the needle as `None` into the shared renderer, and both console forms POST for real rather than only in a docstring. `layered_search` stays a bookmarkable GET taking preset ids, with the term loaded server-side from the encrypted preset column. All five surfaces this item requires to be priced explicitly are paid: API three GETs cleaned plus POST twins and body models, console two routes and two page forms across four files, harness one call site moving for free through the apiclient, apiclient one method now POSTing a criteria body, and the IDE extension is not a consumer at all (its frozen probe allowlist deliberately excludes `/messages`; positive control fired on `/auth/login` and `/connections`). `tests/test_content_search.py::test_no_get_or_head_route_declares_a_phi_needle_parameter` is the durable half -- it walks both planes' route tables, resolves the WIRE name so an `alias=` re-add is caught, and passes at HEAD; executed here, 7 passed. **The three changes this row invites are each already built or already ruled against:** adding the needle names to `_CREDENTIAL_QUERY_KEYS` was ruled against 2026-09-05 and the ruling is pinned by `tests/test_logging.py`; the POST siblings shipped; the operator documentation is in `docs/PHI.md` section 7. **NO ENGINE WORK WAS MANUFACTURED HERE.** **STAYS OPEN** on what actually remains and is not this row's titled defect: the OIDC `code` parameter on a URL under `response_mode=query`, which is the pinned verb's own exemplar class and is a scorecard holder's call rather than a build; the two FHIR egress path sites that percent-encode a message-derived id, which need an owner ruling on whether "sent to the server" reaches the engine acting as an HTTP client; and a vault-side Referrer-Policy row no engine checkout can correct. Closing act is a scorecard re-score.
@@ -11882,6 +12421,20 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 **The incompleteness, and it is the reason this is not yet a scoped build.** The application-cache census was a substring search over dict-annotated attributes whose name contains "cache", which is structurally unable to match `self._cached_token: str | None` at `messagefoundry/transports/http_auth.py:203` and `messagefoundry/transports/smart.py:184`, and the transports tree was never walked. Those providers cache a bearer credential and return it without popping it; every invalidation call site -- `messagefoundry/transports/fhir.py:570`, `:628`, `:654`, `:952`, `:967`, `:1017`, `messagefoundry/transports/rest.py:1432`, `:1509`, `:1529` and `messagefoundry/transports/soap.py:819` -- is a 401 or error-retry path, measured against a positive control of three `def invalidate` definitions in the same run. There is no stop or close eviction, so eviction keys on age and on failure, never on use -- the shape this cell condemns elsewhere. Neither proposed build touches it. Re-run the census with an instrument that can fail: enumerate every in-process attribute holding a value derived from a PL-1, PL-2 or PL-3 source with a lifetime longer than one call, publish the command with a control that fires in the same run, and claim at least one ungraded family rather than a count.
 
 **Proposed work, all unallocated and named by subject:** the deny-by-default cache-directive inversion with the blind predicate deleted and a wire-asserted replacement; the ciphertext-resident transform-state and reference-snapshot caches with a window keyed on last read, which carries the store-key assumption and must say so; the application-cache census re-run plus a written ruling on whether "purged after use" is even applicable to a credential whose reuse is the design; the monitoring docstring reconciliation across engine and web console; and the reverse-proxy cache-off line in the off-loopback runbook, which must be named as a runbook step the engine cannot verify and never offered as the control.
+
+**Progress 2026-09-04 (builder). The guard's blindness is fixed and the three routes are covered. The cell is NOT closed: neither the decrypted-cache disjunct nor either open ruling was touched.** The item's own line numbers had moved again -- the tuple is at `messagefoundry/api/app.py:355`, not `:336` or the re-score's `:346` -- so everything below was re-measured at `2b8bccb43` by execution, with `/messages` as a positive control in the same run.
+
+**The blindness, measured rather than argued.** For all three routes the old permission-gate predicate returned `False`, none matched a prefix, and the wire carried **no `Cache-Control` at all** (`GET /events`, `GET /connections/x/events`, `GET /alerts/active` -> `cache-control=None`), while the control `/messages` was selected and served `no-store`. Re-running the old guard's own assertion over that app returned `uncovered == []` -- it **PASSED**, green, with three PL-2 responses uncovered. That is the item's thesis confirmed on real code: adding paths to the tuple would have left a check that cannot see its own failure class.
+
+**What shipped.** `_NO_STORE_ROUTE_PATHS` holds route path TEMPLATES (the middleware reads the matched template off `request.scope["route"]`) because `/connections/{name}/events` cannot be a prefix without blanketing the whole `/connections` dashboard. The prefix set stays, and the reason is not style: `GET /messages/{message_id}/attachments/{attachment_id}` streams raw bytes and declares **no `response_model`**, so no model walk can ever see it. The four alert-mutation POSTs are covered too -- same `AlertInstanceInfo`, same PL-2 `reason` -- which is part of the wider surface the 2026-08-20 research named.
+
+**The guard now selects on what a response CARRIES.** A route is sensitive when its response model, walked recursively, projects a store column `docs/PHI.md` section 2 rates PL-1/PL-2/PL-3. The rating is **read out of** section 2 (reusing the at-rest inventory guard's own row parser, with a test asserting the two readings never disagree about a level), so the guard cannot drift from the document it measures against. The one reviewed part is a 27-entry field-to-column register, needed because a bare column NAME is ambiguous across tables -- `detail` is PL-2 as `message_events.detail` and PL-4 as `audit_log.detail`, and matching on the name alone selected 34 uncovered routes, almost all of them `SimpleMessage.detail`. **An unresolved collision FAILS**, which is the deny-by-default hinge: the next classified monitoring route gets classified instead of shipping uncovered. The gate-shaped predicate is kept as a second disjunct for the no-response-model case.
+
+**Three mutations, all red, distinct failure sets** (a guard nobody has made fail is not evidence): emptying the covered set reds 4 tests and names all seven paths; deleting the `ConnectionEventInfo.reason` binding -- which simulates a NEW unclassified PL-2 field, the exact class the old guard could not see -- reds 4 including the hinge; pointing the parse at the wrong section of `PHI.md` reds 6, so a broken instrument cannot produce a vacuous green.
+
+**Two rulings deliberately NOT made, both still open for the owner.** (1) The docstring conflict: `GET /events` and `GET /alerts/active` say "metadata only, no PHI" while section 2 rates their `reason` column PL-2, and the 2026-08-20 research adds a third artifact, `messagefoundry_webconsole/routes/monitoring.py:22-23`. One side is wrong and the cell rests on which; this was built as though PL-2 is correct, because PL-2 is the shipped classification, and **PHI.md was not edited** -- that remains the disqualified move. (2) Whether "sensitive data" in the 14.2.2 verb tracks the PHI **permission** or the PHI **classification**. The guard makes the classification-shaped reading buildable and asserts nothing about the other.
+
+**Named and not built.** The second disjunct is untouched: `_state_cache` and `_reference_cache` still evict on abandonment plus age, never on use, so they hold PHI-derived values for the store object's lifetime -- and whether a decrypted cache with process-lifetime residency can satisfy "purged after use" **at all**, when keeping hot keys resident is what the design is for, is still open. Also unbuilt, and raised by review of this change: the field-to-column register is engine knowledge living in a test file, and `messagefoundry/config/retention_classification.py` is the precedent for carrying a PL rating in shipped code with a doc-drift test beside it -- moving it there is what would let `_NO_STORE_ROUTE_PATHS` be **derived** at app construction rather than hand-typed, which is the deny-by-default inversion this item's research already proposes. Two adjacent free-text fields are registered as projecting no store column and flagged in place: `ConnectionRow.error` and `ConnectionMetadata.error` carry a connector start-failure string (ADR 0031) whose persisted twin `connection_event.reason` IS rated PL-2, so whether the live string deserves the same rating is a classification ruling, not a build.
 
 ## 1186. research an honest pass for ASVS 14.2.4 -- doc-to-code fidelity when the measuring document is written as a mirror of the code
 
@@ -12620,6 +13173,73 @@ QT_QPA_PLATFORM=offscreen pytest packaging/messagefoundry-webconsole/tests/test_
 **Verdict: `partial` -- unchanged. Residual: replaced outright, because the current one is false in both halves and a later rescore reading it would repair a defect that no longer exists.** The current residual reads that `audit_all_authorization_decisions` ships False so a GET records no grant row; at HEAD it ships True and a GET does record one. The residual that fits the evidence is coverage, not the default: the switch ships **on** and the JSON-API surface is covered one row per authenticated request, while **at least** the following are not -- the console's own `require_ui` family, which records no grant in any configuration (zero grant-symbol occurrences tree-wide, positive control in the same walk); the nav-status inline `MONITORING_DIAGNOSE` branch, which records nothing on either side; per-property redaction, which records an aggregate exposure count and never a withhold; and, on the base failed-attempt limb rather than the L3 one, `authorize_ui_ws`'s silent return on an MFA-pending session. Write it as "at least", not as a list: this item's own proposed-work paragraph names further uncovered gates, and an enumeration here would be read as the full set. Anchor those by symbol -- `_grant_audit_permission`, `_audit_all_authz`, `require`, `require_ui`, `redact_unauthorized`, `summary_auditor.note` -- since this item has already been bitten by line-number anchors twice.
 
 **Two things a rescore must not take from this work.** The measurement does not lift the cell: ARM A's zero is evidence that the console's absence of grant rows is structural, which is the *reason* the coverage gap is real, not evidence against it. And the flooding cost is now measured rather than asserted, which removes the excuse for leaving the trail narrow -- it does not by itself authorise turning console parity on, because ARM C shows a first deployment would already be accumulating 172,800 rows a day per polling client with `audit_days` reserved and unenforced. **The drain is the precondition this item already named, and the measurement strengthens it rather than retiring it.**
+
+### Built 2026-09-05 -- the two DENIAL audits this item named, and nothing else
+
+**Two refusals that reached no audit row now reach one, and both were RE-MEASURED at HEAD before
+anything was written.** The item's proposed-work list names them; the rest of that list is untouched
+and **this item stays open**, because its closing act is a scorecard re-score in the vault that no
+build performs.
+
+**Re-measurement, executed, each arm carrying a control that must fire.** The console's
+`authorize_ui_ws` wrote **zero** audit rows for an MFA-pending session while the engine's header-path
+`authorize_ws` wrote `auth.mfa_denied` for the **same session, on the same store, through the same
+counter, in the same run** -- that contrast is the control, and without it a zero is a fact about the
+instrument rather than about the gate. `require_service_cert` wrote **zero** rows on a refused
+authorization while emitting its `log.warning`, against the same shape of control: `require`'s
+bearer-plane denial wrote `auth.permission_denied` for the same principal in the same run. Two further
+controls guard the console arm specifically -- `mfa_satisfied` was asserted False and the identity was
+asserted to resolve, so the gate demonstrably reached the MFA branch instead of returning at an
+earlier one and reporting a tidy, meaningless zero.
+
+**What shipped.** `authorize_ui_ws` now calls `audit_mfa_denied` before returning the empty pair on an
+MFA-pending session, matching what the engine's gates already do and for the same stated reason: the
+refusal sits ABOVE the permission loop, so the denial call inside that loop cannot reach it and the
+header-path fallback never sees a browser handshake. `require_service_cert`'s dependency now calls
+`audit_permission_denied` beside its existing log line. Both rows carry the permission (where there is
+one) and the PATH, never the full URL -- the no-payload limb this item calls load-bearing and fragile.
+Behaviour is otherwise unchanged: the console still returns `(None, None)` and still falls through,
+and the cert gate still raises the same 403.
+
+**The GRANT side was deliberately NOT built, on this item's own evidence.** A grant row is
+per-request and the chain has no drain, which part (a) measured rather than assumed. Console grant
+parity across the gate applications is the flood and stays gated on the drain and on a ruling. The
+cert plane's grant is left with it rather than taken as a cheap exception.
+
+**Four tests hold it, and the denial pair was DRIVEN.** With both source changes reverted,
+`test_ws_cookie_auth_mfa_pending_refusal_is_audited` and `test_service_cert_authz_denial_is_audited`
+fail and the rest of both files pass; with them restored all pass. The console test asserts `detail`
+equals exactly `{"path": "/ws/stats"}`, so widening the row to the full URL goes red, and it asserts a
+permission the actor does NOT hold while requiring that no `auth.permission_denied` row appears --
+an ordering guard, because refusing below the permission loop would tell an unverified caller whether
+it holds the permission. `test_ws_cookie_auth_mfa_satisfied_writes_no_mfa_row` and
+`test_service_cert_grant_writes_no_authorization_row` pass in BOTH states by design: they are the
+guards that a later mirror of the grant side cannot arrive unnoticed, and the second of them pins the
+measured fact that `[diagnostics].audit_all_authz` is True on that app and still does not reach that
+gate.
+
+**THREE CORRECTIONS THIS ITEM OWES, and the first one changes the residual drafted above.**
+
+1. **The drafted replacement residual names `authorize_ui_ws`'s silent return on an MFA-pending
+   session as uncovered. That is REPAIRED as of this change and must not be carried into a re-score** --
+   it is exactly the failure the same paragraph warns about, a rescore repairing a defect that no
+   longer exists. Part (b)'s "the cheap reading would not even work" argument rested on that same
+   silent return; the conclusion it supports is unaffected, because the L2 limb is still short by the
+   per-item list and graph withholds and by per-property redaction's unrecorded withhold, but the
+   sentence naming this gate is now historical. Read the rest of that residual as standing: the
+   console's `require_ui` family, the nav-status inline branch, and per-property redaction are
+   untouched, and the "at least" framing still binds.
+2. **The proposed-work line anchors the service-certificate work at `api/security.py:434-444`, which
+   is the DOCSTRING of `require_service_cert`, not the denial.** The denial lives in the closure that
+   factory returns. Anchor by symbol -- `require_service_cert`, `resolve_client_cert_identity` -- as
+   the re-score paragraph already requires of the others.
+3. **"and its grant path, which records nothing in any configuration" is right about the GATE and
+   incomplete about the surface.** The one shipped route on that gate, `GET /service/identity`, writes
+   its own `service_cert_auth` row **in the route body**, so the mTLS admission is not silent for that
+   route -- `docs/SECURITY.md` states this in two places and both remain true. What is genuinely
+   absent is any record of the authorization DECISION, and any record at all for a future route built
+   on the same factory, which is what the grant work would close.
+
 
 **Built 2026-09-06 -- the console MFA-denial audit, one item from this row's list.**
 `messagefoundry_webconsole/_auth.py`'s `require_ui` refused an MFA-pending session with a bare 303 and
@@ -14343,11 +14963,21 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **The carve-out this item makes IS sound, and I verified it:** `_encode_search_params` has exactly three references in the file (def `:697`, docstring `:721`, call `:756`) and is reached only from `_resolve_read_url`, so `conditional_query` travels a different path and the two tests this item promises to keep green are untouched by any change here.
 > **THE TAIL IS VAULTED AND NO BUILDER IN A PUBLIC CHECKOUT CAN PERFORM IT.** This item's title is to close ASVS 1.2.2 on the merits, and its re-score note makes the cell the terminal state -- but that cell lives in the separate vault clone, and `git ls-files docs/security` returns **0** here. A second vaulted artifact sits on the same tail: the 15.1.5 `fhir_lookup` row in the threat model. **A builder can finish every line of Limb B and still not close 1.2.2.**
 > Verdict: build
-> Closing-act: blocked
-> **BLOCKED 2026-08-22 BY OWNER RULING -- pending a real FHIR server. This is 1107 clause 3.**
-> *Recorded here because a reader cannot see it from anywhere else: the encoding question cannot be
+> Closing-act: code
+> ~~**BLOCKED 2026-08-22 BY OWNER RULING -- pending a real FHIR server. This is 1107 clause 3.**~~
+> ~~*Recorded here because a reader cannot see it from anywhere else: the encoding question cannot be
 > settled against our own suite, which pins `%7C` in five places and therefore cannot disagree with
-> itself.* **`Closing-act` is `blocked`, not `code`, so a dispatch gate refuses this to a builder.**
+> itself.* **`Closing-act` is `blocked`, not `code`, so a dispatch gate refuses this to a builder.**~~
+>
+> **BLOCK LIFTED 2026-09-03 BY OWNER RULING. `Closing-act` moved `blocked` -> `code`.** The reason
+> the block came off is that **the question the FHIR server was wanted for is answered normatively by
+> the FHIR specification itself**: R4 section 3.1.1.4.19 and R5 section 3.2.1.5.7 say, in the same two
+> sentences, that a server percent-decodes a parameter value *first* and reads FHIR's own syntax
+> *second*, and R5 then shows a character-exact pair in which a percent-encoded comma is still the OR
+> separator across three values. So no server was needed to settle it. **The struck paragraph above is
+> still right about our suite** -- a suite that pins `%7C` in five places cannot disagree with itself
+> -- which is why the citations go in the code and **not** into a test assertion. The owner chose the
+> refusal design over an ADR-first route. *(The status glyph is unchanged: that is the lander's act.)*
 >
 > ⚠️ **DO NOT READ THIS ITEM's `OWNER-RULED` BANNER AS COVERING IT.** *That marks a DIFFERENT ruling,
 > of 2026-08-13, on the two limbs.* **A grep for "owner rul" hits that one and returns a reader who
@@ -14394,6 +15024,44 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > end-to-end mutation-proved: re-inserting the retired sentence reds it while the behaviour test stays
 > green. **A future Limb B will legitimately red the behaviour arm; that is the intended signal, and
 > the docstring must move in the same commit.**
+>
+> **LIMB B BUILT 2026-09-03 (builder), on top of the note above -- branched from that PR's head, not
+> from `main`, so its docstring corrections are inherited rather than fought.** The sentence it wrote
+> saying the remainder is *"blocked pending a real FHIR server rather than merely unfinished"* is now
+> stale and was rewritten in the same commit; the block came off the same day.
+> **A SEARCH VALUE STATES ITS KIND.** A plain `str` is data, and one carrying `,` `|` or `$` is
+> **refused** with a PHI-safe `ValueError` naming the parameter key and the character, never the
+> value. `FhirToken(system, code)` splits the one string that carried two provenances: the system half
+> is an author literal and passes through, the code half is data and screens. `FhirRaw("...")` is
+> FHIR syntax the author wrote and rides through percent-encoded only. The vocabulary, the
+> specification citations and the rationale live once, on the new leaf module
+> `messagefoundry/fhirsearch.py` (a leaf so `config/` and `transports/` share it without either
+> importing the other, and so `import messagefoundry` still does not need the `[fhir]` extra).
+> **REFUSAL, NOT ESCAPING, AND THAT IS THE LOAD-BEARING CHOICE.** FHIR defines a backslash escape,
+> but it is correct only if the far end implements the unescape, and server behaviour there varies
+> (HAPI FHIR issue #192 reports an escaped comma coming back with the backslash still in it). A value
+> that never leaves the process cannot be misread by any server. Backslash escaping is deliberately
+> **not** built: it is an additive fourth kind for a site that has a server and can verify it, which
+> defers the one unknowable fact to the only party who can know it. **Unallocated and named by
+> subject rather than by a number, per the ledger rule.**
+> **`FhirRaw` IS REQUIRED, NOT OPTIONAL, AND IT DOES NOT REOPEN LIMB A.** FHIR puts separators inside
+> a single value -- a composite `code-value-quantity` carries `$`, three `|` and a `,`, all
+> structural; a quantity is `[prefix][number]|[system]|[code]`; `_sort`/`_elements` take
+> comma-separated lists. And there is an AND/OR trap this item never named: FHIR ANDs repeated
+> parameters, so a `list` value is an AND, and a comma inside one value is the only way to write OR.
+> Refusing commas with no `FhirRaw` would remove OR from the surface. Limb A rejected a sink reachable
+> **by default**; `FhirRaw` carries author-authored syntax, the same line `conditional_query` draws.
+> Operator strings reaching a sink stays **#1241**.
+> **THE AUTHORING SURFACE MOVED IN THE SAME COMMIT**, so the taught idiom never becomes a
+> transform-stage `ValueError` on a documented feature: the IDE snippet, `config/fhir_lookup.py`
+> (module example + `fhir_lookup()`), `config/wiring.py`'s `FhirLookup()`, `wiring_runner`'s
+> `_run_fhir_lookup`, ADR 0043 (two examples + a new 2026-09-03 amendment), and the five pinned `%7C`
+> assertions, which now read `FhirToken("MRN", "123")` and produce byte-identical wire output.
+> **THE NEGATIVE CONTROL IS THE POINT (SDS-3.8).** The refusal property is factored into one helper so
+> the same call runs against a mutated screen: `test_separator_refusal_negative_control` monkeypatches
+> the screen to a pass-through and asserts the property returns **nothing** where the real one returns
+> all three separators. Measured, not asserted. The citations are **not** a test assertion -- our suite
+> cannot arbitrate wire behaviour, and pretending it could is what this item found.
 
 **Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
 
@@ -15584,6 +16252,11 @@ such an instrument is the most misleading artifact available.***
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Re-censused at HEAD with the ledger counts as the positive control the item demands: 499 occurrences across 81 files, with docs/BACKLOG.md at 121 and BACKLOG-CLOSED.md at 93 both reproducing, so nothing has been swept and the population has drifted up from the filed 496 across 80. Value 4 because nothing is mis-parsed and no behaviour depends on it, leaving a real but consequence-free vocabulary defect; difficulty 4 because each site needs an editorial replacement word rather than a mechanical substitution, the two ledger files must be sliced last to protect the status alphabet backlog_status_check.py genuinely parses, and whether retired ADRs are rewritten at all is still an open decision. _(was 4/10 · 4/10.)_
 >
+> **AMENDED 2026-09-06 -- THE FIRST SLICE LANDED, AND TWO ROWS OF THE CENSUS TABLE BELOW ARE WRONG.** The five shipped operator docs are at **zero** and pinned there by `tests/test_operator_docs_no_warning_sign.py`. Seventeen sites now say the word the sentence meant: 5 WARNING, 5 CAUTION, 5 NOTE, and **2 cross-references that pointed at the glyph itself** (*"see the [glyph] above"*, *"the whole point of the [glyph] above"*) which now name what they point at -- the clearest instance of the scope defect section 11 describes, since a reader 60 lines away could not tell which mark was meant.
+> **Re-censused over git-tracked files at `172b1327c`, ledger counts held as the positive control: 496 occurrences across 75 files before the sweep, 479 across 70 after.** The control reported 127 and 93 on both passes, so the zeros are the files and not a dead pattern.
+> **THE TWO WRONG ROWS ARE LEFT STANDING RATHER THAN EDITED, because the wrong version is what a later reader would otherwise re-derive.** Both are SDS-3.8 instrument errors, an answer to a question adjacent to the one asked. First: the table reads the **web console at zero by counting `packaging/`**, but the console's source is `messagefoundry_webconsole/` (36 tracked files), which carries **2** -- `_external.py` and `routes/oidc.py`. So *"the web console has NONE"* in the distribution paragraph is false. Second: there is **no `harness/` row at all**, so **26 occurrences across 4 files** sat outside every bucket. The filed buckets do not sum to their own total (447 + 10 + 4 + 3 = 464, against a printed 496); the corrected ones do.
+> **The corrected per-bucket distribution is written ONCE, in CLAUDE.md section 11, and is not restated here (SDS-3.5).** It sums to its own total; the filed table's does not. **`scripts/` is still zero**, so the cp1252 finding below is untouched. The two ledger files and the ADR decision are untouched and still last.
+>
 > **Filed 2026-08-14 -- OWNER-RULED. The ruling is "not sanctioned; file a sweep", and "file it" is NOT "do it" -- nobody is authorised to start editing the 496 lines on the strength of this item.** U+26A0 is **not** a sixth holdout glyph and never was; it is decoration, which CLAUDE.md §11 forbids outright. This item exists because §11 already rules that changing a glyph population is *"a migration with its own item, not a doc edit"*, and the owner applied that same shape here.
 > **IT HAS NO MACHINE-PARSED DEFENCE, WHICH IS THE WHOLE ARGUMENT.** The five holdouts are tolerated for one reason: `scripts/docs/backlog_status_check.py` parses them as item status (`_CLOSED` three glyphs, `_OPEN` two). **U+26A0 is in neither list.** `parse_items` ignores it entirely, so it carries no status semantics anywhere in the repo and nothing would parse differently if every instance vanished. **Demonstrated rather than argued:** the #1241 and #1253 amendments filed 2026-08-14 carry no glyph at all, and the hygiene gate passed clean at 528 items each declaring exactly one status. It is provably optional in the file where it is densest.
 > **THE MEASURED POPULATION, positive-controlled at `origin/main` `ae76b9f9`.** The ledger counts are the control: an instrument that cannot find the 121 everyone agrees are in `docs/BACKLOG.md` proves nothing by returning zero elsewhere. **This is not pedantry -- the first attempt at this census returned a FALSE ZERO for engine source off a broken shell escape, and only the control caught it.** A false zero on this exact question has blocked it once before.
@@ -16117,7 +16790,9 @@ measurement from this row's subject and it is named here rather than performed.*
 
 ## 1277. record an audit entry for every authorization grant by default
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The defaults are unchanged and the item's counter-measurement holds -- exactly two grant sites (api/security.py:249, :773), so the named console flooder is not connected to the switch. Worth-if-built is the parity band rather than higher because PHI access is already audited unconditionally and the residual is non-PHI read authorizations, for which a documented one-line config switch is a clean workaround; the cell is level 2, so the ASVS band does not lift it. Difficulty is above a bare default flip because landing it reverses an owner-confirmed decision recorded at ADR 0118:156 and :235, rewrites the loosening classification at settings.py:4295-4296, and updates at least 5 test files and 7 documents. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. On origin/main (ca4e85e5d): config/settings.py:1386 `audit_all_authz: bool = True`; :3926 `audit_all_authorization_decisions: bool = True`. settings.py:1353-1385 replaces the false "console polling + /ws/stats" flooding comment with the measurement. settings.py:4499-4504 + :4640 reclassify `false` as a loosening. api/app.py:1169 factory default True, :1266 onto app.state; api/security.py:269, :825 read it.
+>
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The defaults are unchanged and the item's counter-measurement holds -- exactly two grant sites (api/security.py:249, :773), so the named console flooder is not connected to the switch. Worth-if-built is the parity band rather than higher because PHI access is already audited unconditionally and the residual is non-PHI read authorizations, for which a documented one-line config switch is a clean workaround; the cell is level 2, so the ASVS band does not lift it. Difficulty is above a bare default flip because landing it reverses an owner-confirmed decision recorded at ADR 0118:156 and :235, rewrites the loosening classification at settings.py:4295-4296, and updates at least 5 test files and 7 documents. _(previously unscored.)_
 >
 > **Filed 2026-08-16 - not started. THE FULL AUTHORIZATION TRAIL IS BUILT, CORRECT, AND SHIPS OFF.** `[diagnostics].audit_all_authz` and its friendly alias `[security].audit_all_authorization_decisions` both default `False` ([`config/settings.py:1340`](../messagefoundry/config/settings.py), `settings.py:3723`). On the shipped default only a fixed set of state-changing, configuration and user-management permissions writes an `auth.grant` row; **every authenticated read is authorized and not recorded.** **THE CHANGE: default both to `True`.**
 > **THE STATED REASON FOR THE OFF DEFAULT DOES NOT SURVIVE MEASUREMENT, and the comment asserting it must be rewritten with the flip.** `settings.py:3720-3722` reads *"Default false -- forcing it on risks flooding the audit log"*, and `settings.py:1333-1339` names the flooders as *"console polling + the /ws/stats feed"*. Measured at `origin/main`:
@@ -16596,7 +17271,9 @@ point, which are the parts that must survive it.**
 
 ## 1298. The archive dialog's permanently-discarded warning is not a loss test: a worktree behind main sees landed files as untracked
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. Neither half exists at HEAD: docs/WORKTREES.md carries no subsection stating the warning is an index test rather than a loss test, and scripts/coord/ holds no helper that answers the recoverability question. Value 4 because the cost is developer coordination only, but it is a high-frequency prompt that is wrong in the common case and trains the dismissal habit; difficulty 2 because the check is three git commands over a dirty set and the helper is a small additive script beside the existing coord tooling, with the one real design constraint being that anything it cannot read must count as unrecoverable rather than clean. _(previously unscored.)_
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Item names two deliverables in its "SCOPE, STATED PLAINLY" paragraph. Both landed at 642ed67a1 (PR #580). Doc: origin/main:docs/WORKTREES.md:126 -- a top-level heading calling the warning an INDEX test not a LOSS test, running to :185, with the reproduced measurement (:145-155), a verdict/reason table (:163-168), and the harness-not-our-code note citing #1298 (:184).
+>
+> **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. Neither half exists at HEAD: docs/WORKTREES.md carries no subsection stating the warning is an index test rather than a loss test, and scripts/coord/ holds no helper that answers the recoverability question. Value 4 because the cost is developer coordination only, but it is a high-frequency prompt that is wrong in the common case and trains the dismissal habit; difficulty 2 because the check is three git commands over a dirty set and the helper is a small additive script beside the existing coord tooling, with the one real design constraint being that anything it cannot read must count as unrecoverable rather than clean. _(previously unscored.)_
 >
 > **Filed 2026-08-20 -- not started. THE WARNING REASONS FROM "NOT IN THIS WORKTREE'S INDEX" STRAIGHT TO "WILL BE PERMANENTLY DISCARDED", SKIPPING THE ONLY QUESTION THAT DECIDES IT -- DOES THIS CONTENT EXIST ANYWHERE ELSE.** The session-archive dialog lists the worktree's dirty set and states the files "will be permanently discarded". For a `??` entry that is a statement about **this worktree's index**, not about the content. A worktree whose HEAD predates a commit sees every file that landed since as untracked, because they are absent from **its** index while being tracked on `main`. **THE CHANGE: document the three-command recoverability check as the thing a seat runs before believing the warning, and provide it as a helper so the answer is not re-derived by hand under time pressure.**
 > **MEASURED 2026-08-20, on a live instance of the dialog.** It warned that two files would be permanently discarded:
@@ -18426,6 +19103,7 @@ both needles stop being wording-sensitive.
 > 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Both limbs verified at HEAD, not read but driven: scripts/worktree/new.ps1:243 now installs dev,harness,fhir,dicom,x12,xml,webauthn (plus sqlserver on the switch) and scripts/worktree/new.ps1:273 adds -e packaging/messagefoundry-webconsole, matching all three ci.yml legs at .github/workflows/ci.yml:322, :987 and :1147. The parity arm the item named as the minimum exists and is collected -- tests/test_worktree_venv_extras_parity.py ran 9 passed in 0.19s, and I proved it discriminates by loading the module and repointing its _NEW_PS1 and _CI at mutated copies: reverting the extras to the pre-fix dev,harness fails the parity test, deleting the console install fails the second test, and deleting the console install from ci.yml fails the anti-vacuity arm at tests/test_worktree_venv_extras_parity.py:112. What is left is one stale sentence, not code: docs/WORKTREES.md:21 still tells a lane operator new.ps1 bootstraps its venv with pip install -e ".[dev,harness]", and the comment at tests/conftest.py:360 still asserts the same narrow list in the present tense. That is a two-line doc edit that ships nothing runnable -- value 1, difficulty 1.
+> 🚧 **The remainder is built and open in a pull request, 2026-09-06 (PR #955). Both stale sentences are corrected, and neither now cites something that can rot the same way.** `docs/WORKTREES.md` prints the real bootstrap line -- `--constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole` -- and says that `tests/test_worktree_venv_extras_parity.py` is what holds it against `ci.yml`, so a reader learns the mechanism and not just the list. The comment block in `tests/conftest.py` is rewritten in the PAST tense, as the reason the loud-omission machinery was built rather than a present-tense claim about the installer, and it cites that parity test instead of `new.ps1:232` and `ci.yml:273`. **Both of those line numbers had already moved** -- the extras assignment is at `:243` and the console install at `:273`, and CI's widest install line is at `.github/workflows/ci.yml:329` -- which is the argument for citing a test rather than a line: following a stale line citation lands somewhere plausible, so it reads as verified. **One thing added rather than assumed:** the loud-omission hooks are NOT made redundant by parity, and the comment now says so. Parity covers exactly one route to an incomplete run, the installer's; a venv built by hand, an installer skipped, or an extra CI gains before a lane is rebuilt all reach the same silence and are invisible to a two-file comparison. **No code and no new test:** the parity arm the score named already exists and was re-driven green here. ***Left open deliberately: the banner flip is the LANDER's on merge, not the builder's.***
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -18737,6 +19415,8 @@ read by someone searching for one thing, never front to back.*
 
 > 🔢 **Filed 2026-08-23 - not started.** Promoting `Verdict` into the banner block created a SECOND source of truth beside the re-score line that already carried it. **Three open items say `build` in the banner and `DEMAND-GATE` in their prose.** Every tool -- `parse_items`, the dispatch gate, a dispatcher's screens -- reads the banner, so all three read as freely dispatchable.
 >
+> **BUILT 2026-09-06 AND CARRIED BY PR 951. THE ROW STAYS OPEN AND ITS STATUS BANNER IS DELIBERATELY UNCHANGED.** The wiring limb is done and neither of this row's two open decisions is taken. `scripts/docs/verdict_divergence_check.py` gains an `--advisory` mode plus a refusal to report on an empty population, and an ADVISORY job in `.github/workflows/quality-advisory.yml` runs it on every pull request. **It reports; it cannot fail a merge.** The three divergent rows are still unreconciled, and promoting the job to a blocking gate is still an owner call. See **WHAT THE BUILD CONTAINS** below.
+>
 > **Scored 2026-09-03 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. Partly shipped -- the checker exists and nothing runs it. scripts/docs/verdict_divergence_check.py:63 matches the declaration form rather than a bare verdict word and scan() at :94 compares it against the banner field; run at HEAD it reports 275 open, 250 with a banner Verdict, 26 compared, 23 agree and 3 diverge (#340, #1003, #1266), and it exits 1 rather than warning, with the must-fire arm at tests/test_verdict_divergence_check.py:39 and the two measured false positives at :66 and :80. No hook or workflow calls it: grepping .pre-commit-config.yaml and .github/workflows finds only backlog_status_check.py, at .pre-commit-config.yaml:180 and .github/workflows/ci.yml:154, and every test in that file builds a tmp_path ledger rather than reading the real one. What is left is one hook entry, but wiring it as a blocking gate reds the tree on three rows this row deliberately refuses to reconcile, so the honest remainder is a config line plus an assessor ruling no builder can make.
 > Verdict: build
 > Research: none
@@ -18835,6 +19515,16 @@ rows from the three real ones.**
 
 **Reproduced independently from a separately written matcher: 237 open items carry a banner verdict, 26
 also carry a prose re-score, 23 agree, 3 diverge.** *Reconciles nothing, as scoped.*
+
+**WHAT THE BUILD CONTAINS, AND WHAT IT DELIBERATELY LEAVES ALONE.** The detector described above existed and ran nowhere. It now runs: an ADVISORY job in `.github/workflows/quality-advisory.yml` invokes `scripts/docs/verdict_divergence_check.py --advisory` on every pull request, reports the divergent rows in the log and the step summary, and **cannot fail a merge**. The checker keeps failing closed by default; `--advisory` is the opt-out the wiring passes.
+
+**WHY THAT FILE AND NOT ITS OBVIOUS SIBLING, WHICH IS THE BEST REASONING IN THE CHANGE.** `backlog-hygiene.yml` is the natural home for a ledger check and it is the wrong one: **its only job IS a required context**, so a step added there could block every merge. `quality-advisory.yml` is the repository's one place where a check can report without being able to gate, which is the property this check needs. Same reasoning as `#1431`, reached rather than copied -- that row's job sits in the same file for the same reason.
+
+**THE ADVISORY SHAPE IS PINNED, NOT ASSUMED.** `tests/test_verdict_divergence_advisory.py` asserts what a repository test can see: the workflow holds no claimed required context, the invocation LINE itself carries `--advisory` (the sibling guard learned the expensive way that the flag also appears in the step's prose), the step runs under `continue-on-error`, and the job is absent from the `liveness` meta-gate's `needs`. Branch protection lives on the server, so that first assertion reads the checked-in claim and not the server. The checker's exit status is re-raised rather than swallowed with `|| true`, so a scan that read NOTHING stays a red step inside the green job.
+
+**TWO THINGS ARE DELIBERATELY NOT DONE, AND BOTH WERE OUT OF SCOPE BEFORE THIS BUILD STARTED.** *Reconciling the three divergent rows* (`#340`, `#1003`, `#1266`) is an assessor decision, not a mechanical one; this row makes the divergence VISIBLE and resolves none of the three, unchanged from its original scope. *Promoting the job to a blocking gate* is an owner decision, available and untaken, on the `#1431` precedent: making a check RUN is a Builder's call, making one BLOCK is the owner's. A machine cannot answer the blocking form here, because the rows it would fail on are exactly the three nobody has ruled on -- that gate would be a merge freeze, not a gate.
+
+**THE COUNT AT THE COMMIT CARRYING THIS NOTE, WHICH HAS DRIFTED FROM EVERY EARLIER FIGURE IN THIS ROW.** `python scripts/docs/verdict_divergence_check.py` at this HEAD reports **278 open items; 251 carry a banner `Verdict`; 26 also carry a prose verdict declaration and were compared -- 23 agree, 3 DIVERGE** (`#340`, `#1003`, `#1266`), exit 1. The scoring line above recorded 275 / 250 / 26 / 23 / 3 on 2026-09-03, and the independent reproduction at the end of this row recorded 237 carrying a banner verdict. **The divergence set has not moved; the denominators have.** That is what a live figure does inside a durable record, and it is why the checker prints the denominator beside the count -- a reader who takes any of these three numbers as current is reading the day it was written.
 
 ## 1343. The claim gate has no handoff state, so a delegated commit has no honest expression
 
@@ -19506,6 +20196,32 @@ federation on, the authorization request would travel the browser-visible front 
 identity provider is the only party positioned to reject tampering. That is true, and it is not by
 itself a finding against this cell.
 
+
+**RESEARCHED 2026-09-06 against the ASVS 5.0.0 corpus at tag `v5.0.0`, fetched rather than paraphrased.
+THE APPLICABILITY QUESTION THIS ITEM SAYS WAS NEVER ASKED HAS NOW BEEN ASKED, AND IT DISPOSES OF THE
+CELL: `na` ON SCOPE.** The pinned text is *"Verify that grant type 'code' is always used together with
+pushed authorization requests (PAR)."* Its `section_id` is **V10.4**, `section_name` **"OAuth
+Authorization Server"**, and the chapter's own prose under that heading reads *"These requirements
+detail the responsibilities for OAuth authorization servers, including OpenID Providers."*
+**This engine hosts none.** Its 93 API paths include no `/authorize`, `/token`, `/par`, `/introspect`,
+`/revoke` or `/.well-known/openid-configuration`; an absence grep for the authorization-server
+vocabulary returns ZERO across the engine and web console against a live positive control of 61 hits
+for the CLIENT-side terms in the same file set; and `auth/tokens.py` `mint_token` mints the engine's
+own opaque session tokens, not OAuth tokens for third-party clients. **Four reasons the passive-voice
+counter-reading fails**, stated because it is the reading that moved this cell off `na` once already.
+ASVS 5.0 splits V10 BY ACTOR and assigns each section in its own intro prose. Every PAR mention in the
+chapter sits inside V10.4; V10.2 "OAuth Client" holds three requirements and names PAR in none of them,
+and V10.5 "OIDC Client" holds five and does the same, so ASVS placed no PAR obligation on a client
+anywhere. The sibling rows 10.4.10, 10.4.12 and 10.4.15 all say "the authorization server" outright, so
+10.4.13's passive voice is elision inside an already-scoped section. **And independently of all three:
+a PAR client could not satisfy this verb at all** -- the requirement is that grant type code is ALWAYS
+used with PAR, and only an authorization server can enforce "always", because only it can refuse a
+non-PAR request. **Do not scope PAR. No engine build is owed.** The narrow engineering statement this
+item already carries survives and is unaffected: on a first deployment with federation on, the
+authorization request would travel the browser-visible front channel. **One thing the record holder
+must check that a Builder cannot: if the sibling V10.4 cells are already `na` on scope, then this cell
+alone sitting at `needs-review` is an internal inconsistency, and it points at the move off `na` as the
+error rather than at any engine defect.**
 ## 1356. PR 487's five-file resolver conflict is a judgment merge whose obvious resolution re-arms a fixed defect
 
 > 🔢 **Filed 2026-08-22 by the lander, under a live 5-hour rung, because it cannot be finished in the remaining window.** Value **5/10** -- Difficulty **5/10**. PR **#487** (`lander/432-resolved`, draft, 45 ahead / 26 behind) conflicts with `origin/main` in FIVE files, all in the bash-interpreter resolver area that **#505** rewrote: `tests/_bash_resolver.py`'s consumers plus `tests/tooling_manifest.txt`.
@@ -19553,7 +20269,9 @@ A seat that runs its OWN copy is recorded correctly. A seat that runs another co
 
 ## 1359. the worktree gate hands off branch-switch detection to rule 3b by verb, not by whether the command names a branch
 
-> 🚧 **BUILT 2026-09-03 (builder), NOT closed -- the LANDER flips this banner on merge.** `Test-WorktreeHijack` now takes its hand-off from TWO verb sets
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. origin/main = ca4e85e5d; landed by b619551b5 (PR #807). Two verb sets: scripts/hooks/worktree_gate.ps1:1719 ($hijackSwitchVerbs) and :1720 ($hijackHeadMoveVerbs = reset, rebase, merge, cherry-pick, revert, am); Test-WorktreeHijack:1721 bails only if neither matches (:1722-1724). Per-verb ruling recorded in-file :1691-1703; exclusions and their non-coverage :1705-1710.
+>
+> **BUILT 2026-09-03 (builder), NOT closed -- the LANDER flips this banner on merge.** `Test-WorktreeHijack` now takes its hand-off from TWO verb sets
 > instead of one literal pair, and the per-verb ruling the filing left open is decided and recorded in
 > the file itself. The premise was re-measured before any edit rather than taken from this banner: the
 > two-verb bail was still the first line of the function at `46ea10a78`.
@@ -20116,7 +20834,9 @@ cpu_util_cores_mean      0
 
 ## 1368. the leak-gate detector floor is never checked against the real token list, so it can silently stop meaning anything
 
-> 🔢 **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Implements **SEC-04** from [`16-security-phi-and-supply-chain`](testing/master-test-plan/16-security-phi-and-supply-chain.md), which had no ledger row.
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. All on origin/main = ca4e85e5d; 7940d7bd7 is an ancestor. scripts/security/scan_forbidden.py:1214 floor_freshness_failure; the two shipped arms at :1239-1241 (absolute lag, small section) and :1242-1245 (ratio), both naming section, floor and loaded. mode marker emitted first at :1522.
+>
+> **Filed 2026-08-26 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Implements **SEC-04** from [`16-security-phi-and-supply-chain`](testing/master-test-plan/16-security-phi-and-supply-chain.md), which had no ledger row.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Claim holds on every code limb, and I drove each one rather than reading it. Both freshness arms fire and name both numbers: scripts/security/scan_forbidden.py:1129 returned None for the live 8/14/2 shape, "names floor 2 is 25% of 8 loaded (needs 80%)" on the ratio arm and "site_prefixes floor 1 lags 3 loaded by 2" on the absolute arm, and the terminal mode at scan_forbidden.py:1193 printed "mode=real" ahead of the counts, refused a bare total with exit 2, refused an unset floor with exit 2, and exited 1 end to end against a stale floor on this box's real token list. The guard is on the live path, called at .github/workflows/security.yml:723 inside the required forbidden-content context, and it is not vacuous at today's pinned floor: names 8 passes at 10 loaded and fires at 11, site_prefixes 2 passes at 3 and fires at 4. All 50 tests in tests/test_scan_forbidden.py pass under a real pytest run, including the nine #1368 arms at tests/test_scan_forbidden.py:527-627 that pin the count lines byte-identical between the synthetic and real modes. One limb is stale and it is bookkeeping only: parse_items still reads #1368 as OPEN at docs/BACKLOG.md:17250 under a banner saying "BUILT IN THIS COMMIT, not yet landed", while commit 7940d7bd7 is an ancestor of origin/main -- what is left is a banner flip and an archive move, no code.
 > Verdict: build
@@ -20237,6 +20957,15 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 > 🔢 **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
 >
 > **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Not started, and every mechanism claim holds at HEAD: scripts/worktree/install-gate.ps1:495 writes the allowlist with a bare Set-Content, the install branch defaults to exactly one root at :424, the only Get-Content of that file sits in the -Status branch at :300 which returns first, and the param block at :48-70 offers no -Add or -Merge. No backup exists, and two places assert one does -- install-gate.ps1:441 says the allowlist writer has done this since #1375 and tests/test_install_gate_records_the_install.py:16 repeats it, while the only Copy-Item backups cover settings.json at :164 and the gate script at :449. The precondition is live: the machine allowlist at ~/.claude/hooks/worktree-gate.repos.txt carries both MessageFoundry and MessageFoundry-vault, so a bare run from either drops the other. Correcting one anchor, since the silence has a different cause than filed -- a bare run writes ONE root, so the zero-root kill switch at scripts/hooks/worktree_gate.ps1:1259 never fires; the dropped root is simply absent from the roots list, matches no rule, and the gate exits 0 at :2447 and :2784 with no line printed. Left to build: read-and-merge, a .bak beside the allowlist, a warning naming any root the run is about to drop, and a deliberate way to still narrow scope; the workaround is awkward because -Repo is [string[]] at :50 so every governed root must be re-named on every run and docs/WORKTREE-GATE.md:157-158 reads additive, and the cost is a small additive change to one script plus a test on the region-extraction seam tests/test_install_gate_records_the_install.py already establishes.
+> 🚧 **Status 2026-09-03 -- BUILT AND PROPOSED, not landed.** The scoring line above read "not started" correctly against `main`, and separately against the work: this was built 2026-08-29 under a usage stop, never proposed to anyone, and sat on a local branch pushed only to a rescue remote, so `main` still carried the defect while the row was re-scored as unbuilt. The two #1375 commits are now cherry-picked onto a fresh branch off `main` (two unrelated commits on that branch were left behind) and are in a PR. **All four parts the row asks for are present:** read-and-merge, a `.bak` beside the allowlist, a warning naming every root a run is about to drop (`Show-AllowlistResult -Narrowed`, plus a louder one when the last root goes), and `-Uninstall -Repo "<path>"` to narrow scope on purpose. Landing it also makes `install-gate.ps1`'s own forward reference true -- the line the scoring note flags as asserting a backup that did not exist.
+>
+> **THE REVIEW THE BUILD COMMIT DISCLAIMED IS NOW DONE.** Its message said the work was "NOT YET REVIEWED BY ME", that "the review and test run are still owed", and "Do not land it on this basis". **The 634-line test file had never been run.** It was run: **46 passed** across `tests/test_install_gate_allowlist_merge.py` + `tests/test_install_gate_wiring.py`. **The anti-vacuity arm was re-measured rather than inherited**, each mutation on a scratch mirror against that same 46-passed control: feeding the install call site `@($resolved)` instead of `$result.Lines` gives **3 failed / 43 passed**; making the merge ignore `$Existing` gives **8 failed / 38 passed**; deleting the `.bak` gives **1 failed / 45 passed**. One mutant SURVIVED at 45 passed / 0 failed -- the **narrowing** call site (`-Uninstall -Repo`) had no coverage at all, so writing back the lines it just read left every test green while the named root stayed governed and the operator was told it had been removed. A test now kills it (**1 failed / 45 passed**), and the control moved 45 -> 46 to include it.
+>
+> **TWO THINGS CHANGED IN REVIEW, both of them wrong-prose rather than wrong-code.** First, the rebase onto current `main` red-lined the ordering test: it matched the literal `worktree_gate.ps1` in command text, and #1247 had hoisted that path into `$GateSrc`, so the predicate found ZERO gate copies. It follows the value now (the copy's `-Destination`), and it covers every write under the hooks directory rather than the gate alone. **Only the `== 1` count assertion beside it turned that into a failure instead of a silent pass.** Second, the refuted mechanism this row's own scoring line corrects was still stated as fact in **three** places -- the script's `.DESCRIPTION`, the allowlist section comment, and the test module docstring -- plus a fourth that conflated a *shortened* allowlist with the kill switch. All four now say what the gate does: a bare install writes ONE root, never zero, so `worktree_gate.ps1:1259` never fires; the dropped root is simply absent, matches no rule, and the hook exits 0 printing nothing. Re-verified independently here, and it agrees with the scoring line.
+>
+> **THE TWO OPEN QUESTIONS THE ROW NAMES ARE BOTH ANSWERED, measured not read.** `-Repo a,b` binds as `String[]` with two elements and the script iterates all of them, so it does govern two repos. And there is no second gate installer: `install-selfheal.ps1` writes `~/.claude-hooks/`, a different tool in a different directory, and only ever READS the gate's allowlist to seed its own. **STILL OWED, and not claimed:** nobody has executed the installer end to end. `install-gate.ps1:407` refuses inside Claude Code by design, keyed on the session rather than the target, so that run is the owner's from a plain terminal.
+>
+> **THE 46-PASSED CONTROL ABOVE IS A 2026-09-03 READING AND THE BRANCH HAS MOVED PAST IT TWICE.** Measured on Windows over the same two files: **47** at `52d04ad01`, the tip that reading was taken from, and **48** at `070bdccc6`. Why it was 46 rather than 47 on the day is not established here, and is not guessed at. The 47 -> 48 step is this: `test_the_writer_refuses_when_the_file_reads_back_wrong` produced its un-landed write by holding the target open with `FileShare.Read`, which obstructs a rename on Windows and **nothing at all on POSIX** -- a rename consults no open handle there -- so the write landed, the read-back agreed, and the ubuntu leg red on `NO THROW` while `Write-GovernedRoots` behaved correctly throughout. It is now two arms asserting one shared refusal: a portable one that shadows `Move-Item` in the scope the function is dot-sourced into, and the lock kept as a Windows-only second arm. **The mutation figures above were NOT re-measured against 48** -- each of 43, 38 and 45 is relative to the 46 control, and re-running that pass is what would refresh them.
 > Verdict: build
 > Closing-act: code
 >
@@ -20259,7 +20988,7 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 
 **CONFIRMED FROM SOURCE, quoted not inferred:** the `Set-Content` REPLACES, and nothing between the branch entry and that write reads the existing file; the only `Get-Content` sits inside the `-Status` branch, which returns before the install path; a bare run writes exactly ONE repo; and the installer never backs up the allowlist -- its `Copy-Item` calls cover `settings.json` and the gate script only.
 
-**LEAD WITH THIS: A DROPPED ROOT FAILS OPEN SILENTLY.** The gate exits zero when the root count is zero, and the comment beside it says why -- the allowlist doubles as the kill switch, so no file and no entries means nothing is governed. Zero protection, no warning, no log line.
+**LEAD WITH THIS: A DROPPED ROOT GOES UNGOVERNED SILENTLY.** *(Mechanism corrected 2026-09-03, twice and independently -- by the scoring pass above and again during the build review. The original sentence, kept here because it is the plausible-and-wrong one a reader will otherwise re-derive, said the gate exits zero when the root count is zero, so the allowlist doubling as the kill switch is what fails open.* **That never fires on this path:** *a bare install writes ONE root, never zero, so `scripts/hooks/worktree_gate.ps1:1259` is not reached and the surviving root stays governed exactly as before.)* The dropped root is simply **absent** from the list the gate loads: no rule matches a path inside it, the hook exits 0 with no output, and writes into that checkout stop being denied. Zero protection for that tree, no warning, no log line -- and **worse than the kill switch rather than milder**, because an emptied allowlist is at least visible and a silently shortened one reads like one somebody narrowed on purpose.
 
 **THE PRECONDITION IS LIVE ON THIS BOX, NOT HYPOTHETICAL.** The allowlist currently carries two roots, so a bare run would drop one. **And the two allowlists measurably disagree**, which is the state this defect produces and nothing reports.
 
@@ -20267,7 +20996,7 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 
 **TWO DECOYS, neither of which covers it:** #1247 covers the gate SCRIPT copy, not the allowlist write. #1367 covers the parity MESSAGE from the same incident and has already landed.
 
-**UNTESTED, AND THE ITEM MUST NOT READ OTHERWISE: nobody has executed the installer in any mode.** Every mechanism claim above is source-reading. Two questions are genuinely open: whether `-Repo a,b` actually governs two repos, and whether a second gate installer exists on this box that nobody has identified.
+**UNTESTED, AND THE ITEM MUST NOT READ OTHERWISE: nobody has executed the installer in any mode.** Every mechanism claim above is source-reading. *(Still true of the INSTALL RUN, which the script refuses inside a session by design. The two questions this paragraph called open are no longer open -- both were measured 2026-09-03; see the status banner.)* Two questions were genuinely open: whether `-Repo a,b` actually governs two repos, and whether a second gate installer exists on this box that nobody has identified.
 
 **A REFUTED FRAMING, KEPT SO IT IS NOT RE-DERIVED:** an earlier version claimed the engine was ungoverned for four days. **Refuted by 70 engine denial proof points across 2026-08-22 to 08-26** against an all-time control of 211. Real engine exposure was at most 72 minutes, both collapses were on 2026-08-26 ten minutes apart, and **the victim is inverted** -- the repository that was ungoverned, for about 24 days, was the vault.
 
@@ -20282,6 +21011,12 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 > 🚧 **Re-measured 2026-09-03 at engine `fd44b0f17` and vault `b2ca63d16`, with controls.** The three instruments are still ABSENT from the vault and the three installers still PRESENT there. Positive control: the same `git ls-tree -r --name-only origin/main -- tests` filter that returned none of the three returned four other `*_parity.py` files, so the search can see a present case; the vault `tests/` tree holds 527 entries. **Two figures in the scoring line above, and in its copy in the summary table, have moved and are deliberately left uncorrected there rather than edited into another seat's dated measurement:** the vault's `scripts/hooks/worktree_gate.ps1` is **23,042** bytes at its `origin/main`, last touched 2026-07-24, against the engine's **205,331**, last touched 2026-09-01 -- not 23,430 against 208,171. Only the byte counts moved, because both files moved; the finding is unchanged, and the vault still ships a July build of the gate. **New, and it is why the port is more than a copy:** the vault's `install-git-hooks.ps1` declares no `$payloads` list the engine's parser can read, so even the widened audit reports that root UNAUDITABLE instead of comparing anything. The repair is either an edit to that installer or a wider parser, and choosing between them is the same ruling.
 >
 > 🚧 **A separate, live host condition, recorded here so nobody mistakes it for this item's red.** On the reference box `test_the_installed_coord_hook_matches_the_committed_source` fails for both payloads and is correct to. The copies installed under the ENGINE's own shared `.git/hooks` are exact but older revisions of this repository's sources: `claim_check.py` matches commit `a729131dc` (2026-08-24) and so lacks the fail-closed fix from `68f7cd699`; `push_guard.py` matches `29eae2a2e` (2026-08-27). That is host state, not a repository defect, and it was not silenced to get a green. The repair is an operator running `scripts\coord\install-git-hooks.ps1` from a plain terminal in the primary checkout.
+>
+> 🚧 **OWNER RULING 2026-09-03, recorded by a builder. The port limb is CLOSED by ruling; this row stays open on a smaller, named remainder.** **WHAT WAS ASKED:** when the engine and the vault each ship a copy of a shared governance script, which copy is authoritative? This row and PR 787 both put it that way. It was filed as the named blocker on porting the three parity instruments into the vault. Every assertion in them compares an installed copy against a source. Ported into the vault, they would fire on day one against that repository's older sources. The one alternative this row recorded was to port anyway and let the reds settle it. That decides the question by landing rather than by ruling. **WHAT THE OWNER RULED:** *each repository owns its own copy of a shared governance script, and there is no cross-repo authority.* So the question does not arise. A parity instrument compares each governed root against that root's own committed source. It never compares one root against another. **THE INPUTS ARE RECORDED HERE ON PURPOSE, not only the outcome.** #1421's cost 4 states the rule: a decision written down as a result, with no question behind it, reads as inevitability. This note records the question and the alternative it displaced. It does not claim a formal option list went to the owner, because none did.
+>
+> **WHY THAT CLOSES THE PORT LIMB RATHER THAN OPENING IT.** PR 787 already built the per-root, self-referential shape. It uses each root's own installer to name that root's payloads. Under this ruling that shape is the complete answer. It is not a partial one waiting on a decision. The three instruments do not need porting into the vault, because the engine-side audit already covers every governed root on its own terms. **THIS SUPERSEDES ONE CLAUSE ABOVE, and both notes carry the same date, so read them in order.** The re-measurement note says that choosing between the two repairs for the unauditable root "is the same ruling". The ruling picks neither. Both repairs keep the audit self-referential, so the ruling blocks neither.
+>
+> **WHAT REMAINS, AND IT IS WHY THIS ROW IS NOT CLOSED.** One governed root still reports UNAUDITABLE. The vault's `scripts/coord/install-git-hooks.ps1` declares no `$payloads` list the engine's parser can read, so `audit_governed_root` compares nothing there and says so. **A root nothing can audit is not a root that passes.** The harm this row was filed for still stands there: the vault's installed copies drift and nothing reports it. The ruling does not make that moot; it renames the repair. Either that root's installer gains a `$payloads` declaration this parser can read, or `payloads_declared_by` learns that installer's shape. Choosing between them is an ordinary engineering call, not a second ruling. **NOBODY HAS READ THAT INSTALLER.** CLAUDE.md limits vault reads to `roles/`, so its shape is unknown from an engine checkout, and a guessed payload list would report confident parity over the wrong files. `Verdict: build` and `Closing-act: code` still hold, because the remainder is engine-side work in this repository.
 > Verdict: build
 > Closing-act: code
 
@@ -20332,6 +21067,7 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 > 🔢 **Filed 2026-08-28 (lander) - a visibility framing of this was refuted before filing; the surviving harm is VALUE drift.**
 >
 > **Scored 2026-09-03 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. Substantially covered by its sibling #1349, whose shipped code rules against this item's premise: scripts/coord/rescue.ps1:259 calls a behind ref a snapshot older than its branch and NOT a defect, and scripts/coord/rescue.ps1:16 says the script must not be changed to chase staleness. The reader-cannot-tell half is answered by the provenance capture at scripts/coord/rescue.ps1:166, and its residual coverage gap is already priced under #1349, so charging it again here would double-count it. Nothing outside docs/BACKLOG.md cites #1378. The one distinct deliverable is the naming rule -- `git config --get-all remote.private.fetch` returns +refs/tags/rescue/*:refs/remotes/private/rescuetags/*, so one server-side tag carries two local names, and a grep of docs/, scripts/ and tests/ finds that stated only in a passing comment at scripts/coord/rescue.ps1:243. I lowered difficulty from 2 to 1 because a doc edit is the entire remainder.
+> 🚧 **The one distinct deliverable is built and open in a pull request, 2026-09-06 (PR #955): the naming rule now has a prose home a reader will actually meet.** It went into `docs/SESSION-DRIFT-CONTROLS.md` under *Recovery and lifecycle*, where the recovery scripts are introduced. **The choice between that file and `docs/WORKTREES.md` had no winner on the stated test, because NEITHER discusses `scripts/coord/rescue.ps1`** -- the `rescue.ps1` that `SESSION-DRIFT-CONTROLS.md:178`, `WORKTREES.md` and `WORKTREE-GATE.md` all name is `scripts/worktree/rescue.ps1`, a DIFFERENT script that moves dirty primary work into a worktree. So the edit also spells the folder for both and says why, since a reader grepping the basename gets two answers and no warning. **What it states:** `remote.private.fetch` carries `+refs/tags/rescue/*:refs/remotes/private/rescuetags/*`, so one server-side tag sits under two local refnames in the same clone, `git tag -l 'rescue/*'` sees only one of them, and therefore **name the clone and the full refname every time you write one down**. **Two limits honoured in the text itself, not in a commit message:** it says outright that this is a naming rule and *not* a claim that any clone is missing a ref, so the refuted visibility story stays refuted; and it points at #1349's snapshot-versus-push-updated distinction rather than restating or re-litigating it. **One correction to the score:** the rule is stated in that script's docstring at `scripts/coord/rescue.ps1:60-70`, not in a passing comment at `:243` -- #1349's shipped work moved it, and the line citation went stale in between. ***Left open deliberately: the banner flip is the LANDER's on merge, not the builder's.***
 > Verdict: build
 > Closing-act: code
 
@@ -20349,6 +21085,46 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 **WHAT SURVIVES FROM THE REFUTED VERSION, and it is worth keeping:** one server-side tag can carry different local names per clone, because the engine rewrites `refs/tags/rescue/*` into a remote-tracking namespace. **Name the clone when you name a ref.** That is a naming lesson, not this defect.
 
 ## 1379. the -C precedence and PowerShell environment-assignment classes reach the governed shared config on both gates, and no rule models either
+
+> 🚧 **CLASS TWO BUILT 2026-09-03, NOT YET ON MAIN.** Branch `claude/gate-gitdir-1379`, commit
+> `b08260fad`. Deliberately NOT flipped to closed: a closure banner in this file asserts a verified
+> landing, and this has none. Whoever merges it should flip the banner with a real `main` sha.
+>
+> **WHAT SHIPPED, AND IT IS STATE RATHER THAN A PATTERN, exactly as the filing demands.** Each scan
+> segment now carries `Prior` -- the BLANKED text of everything that ran before it -- and a new
+> `Resolve-CarriedGitDir` folds that plus the current segment up to the write into one literal value.
+> The value becomes one more candidate, ranked where git ranks it: behind a repository token on the
+> disarming invocation itself, ahead of `-C` and the cwd. Reading the BLANKED scan rather than the raw
+> line is what keeps it honest -- an assignment inside a commit message or an alias value is data.
+>
+> **MEASURED BY DRIVING THE COMMITTED GATE, 32 rows, against the same rows on the pre-fix gate.** All
+> three PowerShell spellings now DENY on the same line, across a newline, and through the Bash tool;
+> the POSIX-spelled control still DENIES. Consequences were read back out of the target repository
+> rather than inferred from a verdict, in both directions.
+>
+> **IT CORRECTS A FALSE DENY TOO, and that is the only row that moves DENY to ALLOW.** A carried
+> variable naming an UNGOVERNED repository, from a GOVERNED cwd, was refused while the write really
+> landed in the ungoverned repo -- the #1085 shape. Same root cause as the fail-open, so this is a
+> reorder rather than a widening.
+>
+> **THE POSIX CARRYING SPELLING WENT WITH IT.** `export GIT_DIR=<governed>/.git; git config <key> v`
+> was open for the identical reason -- the rule's window starts after the separator -- and closing the
+> PowerShell spellings alone would have filed the same defect twice.
+>
+> **EVERY CONSTRAINT ROW WAS CONFIRMED ABLE TO FAIL, by mutating the code it constrains.** Ten
+> mutations; the ones that matter: gating the carried value on the existing ordering switch reddens 13
+> rows, folding raw text instead of blanked reddens the mention-in-a-message row, removing the bound at
+> the write reddens the assignment-after row, and leaking the value into rule 3 reddens the
+> `reset --hard` row. **Two rows are recorded as NOT independently falsifiable** rather than left
+> looking like coverage: the computed-value guard is defence in depth (the candidate chain already
+> falls through on a path git rejects), and the rule-3d row keys on the worktree being removed rather
+> than on the candidate list. Both say so in their own docstrings.
+>
+> **KNOWN RESIDUALS, pinned as known rather than asserted as correct:** a repository path CONTAINING A
+> SPACE stays masked by `Remove-QuotedSpans` and carries nothing (inherited from the #1069 carve-out);
+> a computed value carries nothing by design; `[Environment]::SetEnvironmentVariable` is not modelled;
+> and a variable set by a PREVIOUS TOOL CALL is unreachable, because each call is its own process and
+> the gate holds one command. No matcher closes that last one either.
 
 > 🔢 **Filed 2026-08-28 (lander) - INHERITED, not introduced; both are allowed on the pre-fix gate too.**
 >
@@ -20369,7 +21145,9 @@ AND IT SHIPS THE SUBJECT: install-selfheal.ps1 and worktree-selfheal.ps1 are bot
 
 ## 1380. the ASVS scorecard gate is path-gated to the one file it validates, so its green history is a history of not running -- and it carries at least two defects that only surface when it does
 
-> 🔢 **Filed 2026-08-29 (lander) - found while holding a scorecard PR; the gate is broken, the PR's content is not.**
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Vault origin/main .github/workflows/asvs-scorecard.yml (619 lines read, non-empty): :52 `pull_request:` with NO paths filter; :57-58 `schedule: cron '17 6 * * *'`; :106-111 the probe sets relevant=true for every non-PR event, so the cron leg always runs; :133/:138 verify and :356/:359 render-drift use a job-level `if: needs.changes.outputs.relevant != 'false'`, which reports SKIPPED, not absence.
+>
+> **Filed 2026-08-29 (lander) - found while holding a scorecard PR; the gate is broken, the PR's content is not.**
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Verified every limb of the in-row retraction rather than trusting it. The headline claim, that path-gating hides non-runs, is refuted by the workflow's own source: a job-level `if:` that reports SKIPPED plus an unconditional daily cron, read at the vault's `.github/workflows/asvs-scorecard.yml:65-130` on `origin/main`. The advisory claim is confirmed live -- `gh api repos/:owner/:repo/branches/main/protection` returns `["verified-at","every cited requirement identifier resolves"]`, so neither `verify` nor `render-drift` ever gated a merge. The one runnable remainder the row names, mirroring `scripts/asvs/scorecard.py`, already has its own daily fail-closed byte gate at `.github/workflows/asvs-verifier-drift.yml:110-168` and is not this row's work, though that mirror now sits 69 added and 13 removed lines behind the engine copy at `scripts/asvs/scorecard.py:1036`, including the shared `locate_anchor` refactor. All that is left here is the disposition: `parse_items` from `scripts/docs/backlog_status_check.py` reports #1380 still open at `docs/BACKLOG.md:17406` with an empty closed list, so closing it is a banner flip plus an archive move that ships nothing runnable.
 > Verdict: build
@@ -20585,6 +21363,10 @@ test-only asymmetry right now, which is what makes it worth recording rather tha
 
 ## 1384. two required contexts were never mirrored into required-contexts.txt, so they have no negative control and no test can notice
 
+> **THE HALF-BUILT DETECTOR WAS MEASURED MISSING AGAIN ON 2026-09-05, and this time it cost a session.** `.github/required-contexts.txt` claimed **14** contexts including `a reviewer has read this`; the live API returned **13** and did not include it. Four documents -- that file, `docs/CI.md`, `CLAUDE.md` and the vault's `roles/README.md` -- all still asserted the gate was armed, and `tests/test_required_contexts.py` pinned the wrong count. **Nothing anywhere noticed**, which is this item's option 1 in one sentence. The four documents were reconciled that day and the set is now 13 contexts over 11 jobs, but THAT IS THE SYMPTOM, NOT THE ITEM: the scheduled job that would have caught it is still the half that is not built, so the next divergence is equally invisible.
+>
+> **The count in this item's own filing banner is now stale, and it is left in place deliberately.** It records 15 enforced against 13 declared at 2026-08-29. The live set has since been 15, then 14, then 13. **Do not read a count out of this ledger** -- read branch protection, as CLAUDE.md section 5 requires. A number written into a document is exactly what this item exists to stop trusting.
+>
 > 🔢 **Filed 2026-08-29 -- OPEN.** Branch protection on `main` enforces **15** contexts.
 > [`.github/required-contexts.txt`](../.github/required-contexts.txt) declares **13**. The two it does
 > not name are `CodeQL (javascript-typescript)` and `CodeQL (python)`. Found while intersecting a PR's
@@ -20661,7 +21443,7 @@ today's instance and leaves the instrument exactly as blind.**
 > `CI` workflow in the **`merge_group`** context, which runs against the branch merged with `main` and
 > is a different set of runs the PR page does not surface.
 >
-> **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Partly shipped, and more has landed since filing than the first pass credited. The visibility half is in -- .github/workflows/failure-signal.yml:71 recovers the pull request number from a merge_group ref and :92 applies ci-red, so an ejection is recorded, though nothing in this tree reads that label (grep for ci-red returns the writing workflow plus prose at CLAUDE.md:302 and docs/METHOD.md:365). The windows-2025 hang limb is no longer undiagnosed either: .github/workflows/ci.yml:852 now passes --max-worker-restart=0, landed 2026-09-02 in 042ef7ff5, and the comment from :826 to :850 reads the mechanism out of the pinned pytest-xdist and records four hangs of 25 to 46 minutes with the inner watchdogs armed, which is this row's process-level deadlock below pytest. What is left is two tests -- tests/test_api_request_timeout.py:99 still runs a route against a 0.1 second deadline, and tests/test_sqlserver_store.py:4039 is unchanged and runs at ci.yml:1772 under a wrapper that retries only a native crash (ci.yml:1769), never exit 1; the hostile-disposition test the row names was already a ratio assertion before filing (tests/test_multipart.py:142). Difficulty falls to 3 because the hard limb landed and the seams exist -- pyproject.toml:195 already ships pytest-rerunfailures and tests/test_load_failover_sqlserver.py:71 marks a sibling flaky -- with the SQL Server arm provable only on the gated CI leg.
+> **Scored 2026-09-03 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Partly shipped, and more has landed since filing than the first pass credited. The visibility half is in -- .github/workflows/failure-signal.yml:71 recovers the pull request number from a merge_group ref and :92 applies ci-red, so an ejection is recorded. CORRECTED 2026-09-04: this sentence said nothing in the tree reads that label. True when written, FALSE now -- scripts/ci/report_ci_red.py landed in #789 the same day and reads it back, and it now names the failing job and step as well. The prose at CLAUDE.md:302 and docs/METHOD.md:365 still says nothing reads it and is stale on the same point. Still true: no workflow CALLS the reader, so the label is read only by someone who chooses to. The windows-2025 hang limb is no longer undiagnosed either: .github/workflows/ci.yml:852 now passes --max-worker-restart=0, landed 2026-09-02 in 042ef7ff5, and the comment from :826 to :850 reads the mechanism out of the pinned pytest-xdist and records four hangs of 25 to 46 minutes with the inner watchdogs armed, which is this row's process-level deadlock below pytest. What is left is two tests -- tests/test_api_request_timeout.py:99 still runs a route against a 0.1 second deadline, and tests/test_sqlserver_store.py:4039 is unchanged and runs at ci.yml:1772 under a wrapper that retries only a native crash (ci.yml:1769), never exit 1; the hostile-disposition test the row names was already a ratio assertion before filing (tests/test_multipart.py:142). Difficulty falls to 3 because the hard limb landed and the seams exist -- pyproject.toml:195 already ships pytest-rerunfailures and tests/test_load_failover_sqlserver.py:71 marks a sibling flaky -- with the SQL Server arm provable only on the gated CI leg.
 >
 > **WORKED 2026-09-03. Two limbs closed, one was already closed by somebody else, and the run
 > census in this item is wrong by one -- there were FOUR failing `merge_group` CI runs, not three.**
@@ -20700,6 +21482,83 @@ today's instance and leaves the instrument exactly as blind.**
 > of 8.0**, a 0.25 percent margin. The best-of-3 sampling it relies on landed 2026-07-28 in
 > `db53fd45d`, so the code that failed is the code in the tree today. Being a ratio rather than a
 > wall-clock budget did not save it, and this needs its own read.
+>
+> **WORKED 2026-09-04. This item is no longer about ONE pull request. Measured today, from the
+> Actions API: EIGHT failing `merge_group` CI runs across SEVEN pull requests, in one day.** PR 669
+> was not an unlucky change; it is the standing behaviour of the queue.
+>
+> | run | id | pull request | failing job |
+> |---|---|---|---|
+> | 10:18:36Z | 33862605516 | 769 | web console tests (windows-2025) |
+> | 10:18:37Z | 33862607354 | 770 | test (windows-2025) |
+> | 15:04:34Z | 33887390485 | 760 | sql server (store + connector) 2022 |
+> | 16:23:15Z | 33894838123 | 810 | test (windows-2025) |
+> | 16:56:20Z | 33897877945 | 810 | sql server (store + connector) 2025 |
+> | 17:12:36Z | 33899333774 | 780 | test (windows-2022) |
+> | 17:54:25Z | 33903044674 | 801 | web console tests (windows-2025) |
+> | 21:24:24Z | 33920943852 | 771 | test (windows-2022) |
+>
+> **PR 810 failed twice, with a different job each time**, which is 669's signature reproduced on
+> another pull request six days later. The 2026-09-03 pass corrected 669's census from three to four;
+> this is the same shape a scale up.
+>
+> **TWO OF THE EIGHT ARE NOT TEST FAILURES, AND THE ITEM HAD NO NAME FOR THAT KIND.** Both web
+> console legs failed the step `Step margin -- web console suite` while `Web console tests (pytest)`
+> concluded SUCCESS with `405 passed, 3 skipped, 2 warnings in 276.30s`. **A red with zero failing
+> assertions is a different defect from a flaky test and wants a different answer** -- re-queueing a
+> timing verdict cannot help, and every re-queue costs a full CI cycle, which is this row's severity
+> sentence. `step_margin.py` already says so, in its own step log, in words:
+>
+> ```
+> LOW: the 'Web console tests (pytest)' step CONCLUDED SUCCESS -- nothing it runs failed. This
+> check is a TIMING gate, and it is what reddened this leg: 4:46 of a 6:00 cap (79.3% of the
+> cap, margin 1.261x, floor 1.30x)
+> ```
+>
+> **The instrument was never the problem. Nothing carried its answer to a reader.** On a
+> `merge_group` run the PR page shows none of it, and the `ci-red` reader named the run and stopped,
+> so the one sentence that answers the question sat behind two clicks nobody knew to make.
+>
+> **Closed here.** `scripts/ci/report_ci_red.py` now names the failing JOB and STEP, marks a timing
+> gate as one, and refuses to name the `CI gate` roll-up as a cause -- it fails in all eight runs
+> above and its own failing step, `Fail -- a gated leg FAILED`, points at a leg it does not name.
+> Run live the same afternoon, it labelled PR #828 a TIMING GATE where the previous output was
+> `CI failed` and a URL.
+>
+> **The re-score above is STALE in one clause and it is worth saying which.** It reads "nothing in
+> this tree reads that label". True when written; `scripts/ci/report_ci_red.py` landed in **#789**
+> the same day and reads it. The other half of the re-score stands: the SQL Server arm is still
+> unchanged and still provable only on the gated CI leg.
+>
+> **A SECOND CLUSTER, verified rather than reported.** `tests/test_worktree_gate_control_plane.py`
+> failed on two unrelated pull requests today, in **two different tests**, both on
+> `repo harness tests (windows-2025) / Harness tests (pytest)`:
+>
+> | pull request | test | files it changed |
+> |---|---|---|
+> | 833 | `test_the_launch_timeout_diagnostic_does_not_fire_on_an_ordinary_denial` | `messagefoundry/redaction.py`, its test, `BACKLOG.md` |
+> | 783 | `test_a_repository_token_owned_by_an_EARLIER_command_is_not_the_disarm_s_target` | `review-gate.yml`, `CI.md`, two test files, `BACKLOG.md` |
+>
+> Neither touches `scripts/hooks/worktree_gate.ps1` or any `test_worktree_gate*` file, so neither
+> diff can reach what failed. **A third red on that same job was NOT this cluster and is excluded**:
+> PR 799's was `test_dangling_citation_check.py::test_no_docs_citation_names_a_number_that_can_still_be_issued`,
+> a real content check. Two verified beats three asserted. That file drives a real `pwsh` subprocess
+> per test and already carries a launch-timeout diagnostic for **#1304**; whether these two are that
+> mechanism is **not established here** -- the diagnostic fires only on `TimeoutExpired`, and neither
+> log was read far enough to say which arm failed. Unallocated, named by subject: the control-plane
+> subprocess flake read.
+>
+> **NOT FIXED, and stated rather than left implied.**
+> 1. **The web-console margin baseline has rotted.** `step_margin_baseline.toml` records a maximum of
+>    **3:59** for this leg, measured 2026-08-08, n=360, and marked right-censored. A run that PASSED
+>    today took **4:46**, so the recorded maximum is below observed reality and the 6:00 cap is sized
+>    against a smaller suite. `step_margin.py` says in the same breath that **raising the cap is not
+>    the fix** -- a cap sized against the work is -- and re-sizing needs a run population one Builder
+>    cannot gather in a turn.
+> 2. **The SQL Server arm.** Two of today's eight, on both OS legs again. Still unobservable off the
+>    gated CI leg, and nothing here claims otherwise.
+> 3. **Nothing consumes the reader.** `report_ci_red.py` is run by hand; no workflow calls it. The
+>    label is now read, but only by someone who chooses to.
 
 **Cluster:** CI / merge queue. **Priority:** P2. **Verdict:** build.
 **Severity:** a PR whose every required check is green cannot land, and nothing on the PR says why.
@@ -21961,7 +22820,9 @@ describing this defect spent thirteen days inside the population it describes.**
 
 ## 1370. operator-supplied names reach /ui URL paths unencoded or half-encoded, so a name carrying a slash addresses a different route
 
-> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 2 of the two the Lander scoped on **PR 530**, this seat's own abandoned lane, re-implemented against current `main` rather than cherry-picked.
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Verified by content at origin/main ca4e85e5d, MSYS2_ARG_CONV_EXCL set, every scan returned non-zero lines. Limb 1: messagefoundry_webconsole/pages/_common.py:26 def _seg, :58 return quote(str(value), safe=""). Limb 2: _seg( at connections.py:64, connections.py:200, admin.py:373, admin.py:391, messages.py:619, messages.py:629, plus a 7th at admin.py:315 (superset). Item's anchors 364/382 are stale; content matches.
+>
+> **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 2 of the two the Lander scoped on **PR 530**, this seat's own abandoned lane, re-implemented against current `main` rather than cherry-picked.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Every limb is on main and nothing runnable is left. Limb 1, the helper: messagefoundry_webconsole/pages/_common.py:43 returns quote(str(value), safe=""), and git show origin/main of that file carries it. Limb 2, the six sites: grep for _seg( in the console finds exactly connections.py:64, connections.py:200, admin.py:364, admin.py:382, messages.py:619 and messages.py:629, with the deliberate exclusions intact -- connections.py:59 and connections.py:384 keep a bare quote() for ?channel_id= query values, and _auth.py:519 keeps safe="/" for the re-auth next path. Limb 3, the tests: packaging/messagefoundry-webconsole/tests/test_ui_path_segment_encoding.py holds seven tests, sits under the pyproject.toml:335 testpaths so it is collected, and I ran it -- 7 passed in 0.93s; I also re-ran its structural scan against a mutated copy in memory and it reported connections.py: /ui/connections/{quote(name)}/flag as unencoded, so that guard is a live instrument and not a false-zero scan. The only residue is ledger hygiene: the item still carries the open banner and the words "BUILT IN THIS COMMIT, not yet landed" at docs/BACKLOG.md:18625 although commit 829ed98f8 (PR 636) landed it, which is a banner flip and an archive move, not a build.
 > Verdict: build
@@ -21994,7 +22855,9 @@ messages.py:618,628 {ch}/{dest}       RAW
 **Source:** dispatched by the Lander off PR 530 with a per-file measurement. Three searches in that scouting returned false zeros on SPELLING alone: `def test` missing 8 `async def test` functions, `def seg` matching `segment_ids` as a prefix, and `\bseg\(` unable to match `_seg(` because underscore is a word character.
 ## 1371. fetch-metadata never reaches the /ui/static mount, because a route dependency cannot run for a Mount
 
-> 🔢 **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 1 of the two the Lander scoped on **PR 530**, re-implemented against current `main` rather than cherry-picked.
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Landed in 829ed98f8, an ancestor of origin/main ca4e85e5d. Middleware: messagefoundry_webconsole/_security.py:304 class UiFetchMetadataMiddleware; :247 _is_ui_fetch_scope covers /ui and /ui/* and is wider than :242 _is_ui_html_path, which excludes /ui/static; :266 _is_safe_top_level_navigation.
+>
+> **Filed 2026-08-27 (builder 2) - BUILT IN THIS COMMIT, not yet landed.** Gap 1 of the two the Lander scoped on **PR 530**, re-implemented against current `main` rather than cherry-picked.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Nothing runnable is left: every limb is on origin/main and I drove each one rather than reading it. The middleware limb is real and wired -- messagefoundry_webconsole/_security.py:248 defines UiFetchMetadataMiddleware over the deliberately wider messagefoundry_webconsole/_security.py:226 _is_ui_fetch_scope, kept separate from _is_ui_html_path at messagefoundry_webconsole/_security.py:221, and messagefoundry_webconsole/mount.py:107 registers it idempotently on the real create_app path. The test limb is neither silent-green nor mis-directed: packaging/messagefoundry-webconsole/tests/test_ui_fetch_metadata_mount.py holds 8 async def tests in 180 lines, and I ran them (8 passed), including the one that gets 403 on GET /ui/static/app.css, a path no route dependency can reach, while the headerless request on the same path is not refused, so the 403 is header-driven and not an auth denial. I also ran the full console suite from this worktree and got 393 passed, 3 skipped, matching the item's own verification claim. All that remains is bookkeeping worth nothing runnable: the ledger banner at docs/BACKLOG.md:18658 still reads open although the code merged in commit 829ed98f8, and the test docstring cites BACKLOG #1122 (packaging/messagefoundry-webconsole/tests/test_ui_fetch_metadata_mount.py:3), a number that resolves to an unrelated open item at docs/BACKLOG.md:7683.
 > Verdict: build
@@ -22146,9 +23009,26 @@ Nothing writes the `reviewed` label, and that is held by a test rather than by p
 **Nearest existing mechanism:** the floor is already computed and recorded on every run, pass or fail, into the readings artifact and the step summary, and `harness/load/profiles/connscale-smoke.toml` already carries the `[slo]` table an armed check would key off. So the build is a threshold plus a negative control on an existing seam. **The harvest is the cost, and criterion 1 is most of it.**
 **Related:** [#1211](#1211-empty_claims_per_msg-is-not-contention-immune-the-ratio-form-excursions-past-its-own-slo-band-on-a-hosted-runner) is the single home for the harvest table, the five measured defects and the owner ruling -- read it there, and do not restate the table here. #1357 covers the FD arm of the test #1211 split. #1366's design premise that two metrics carry a band is now one, corrected in place there. #1414 is the allocation-transfer path this item's number history is an instance of.
 
+## 1416. review-gate reads a stale label payload, so a queued run can report success unread
+
+> ✅ **Allocated 2026-09-01 at 10:17:26, never filed. FILED AND CLOSED 2026-09-05 in one act -- the workflow it names was deleted, so the defect has no site.** It is written down rather than dropped because allocation here is one-way: `scripts/coord/alloc.ps1` has no release path, so an allocated number with no row reads to a later reader as lost work rather than as a duplicate that resolved.
+
+**Cluster:** CI gates / merge protection. **Priority:** closed. **Verdict:** moot.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- repository-side merge tooling; nothing here reaches shipped code.
+
+### It was the third allocation against one defect
+
+Three numbers were allocated against the same finding -- the review gate reading a snapshotted label payload -- by seats that could not see each other. Read from the allocation records: 1416 at 10:17:26 and 1417 at 10:18:37 on 2026-09-01, **seventy-one seconds apart**, from two different worktrees, and a third on 2026-09-03. #1417 was filed and carries the evidence; this one never was. #1413 records that collision, and names the missing waiting-pull-request signal as its cause.
+
+### Why it closes without a fix
+
+`review-gate.yml`, `unread-signal.yml`, `scripts/ci/check_unread_prs.py` and the required context `a reviewer has read this` were removed on 2026-09-05 at the owner's instruction. **The server had already dropped that context**: read from the API that day, branch protection carried 13 contexts and it was not among them, while `.github/required-contexts.txt` still claimed 14. So the removal made the repository's claim match the server rather than changing what the server enforces. What blocks a merge now is exactly the 13 required contexts, and review here is a human practice rather than a machine gate.
+
 ## 1409. diff-coverage (advisory) is killed by its 20-minute timeout on every pull request, so the coverage signal is never measured
 
-> 🔢 **Filed 2026-08-31 (ci-diagnostics) - BUILT IN THIS COMMIT, not yet landed.** Found while asking why `gate liveness (advisory)` reported healthy on a pull request whose coverage job had been cancelled. The defect that hid it is #1410, fixed in the same change.
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Three limbs, all on origin/main (ca4e85e5d), landed by 4107615cc (PR 724, via git log -S"not tooling"). Ledger anchors are ~10 lines stale, so cited by content: (1) .github/workflows/quality-advisory.yml:477 `pytest -q -m 'not tooling' --cov=messagefoundry ...`; (2) :348 `timeout-minutes: 30`, inside the `coverage:` job spanning :276-562, named `diff-coverage (advisory)` at :284;
+>
+> **Filed 2026-08-31 (ci-diagnostics) - BUILT IN THIS COMMIT, not yet landed.** Found while asking why `gate liveness (advisory)` reported healthy on a pull request whose coverage job had been cancelled. The defect that hid it is #1410, fixed in the same change.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. All three limbs the item names are on main and running. Verified by content: the `-m 'not tooling'` selection at .github/workflows/quality-advisory.yml:467, the cap re-sized to 30 at :338, and the sizing measurement recorded in the comment block at :277-337, all present in origin/main commit 4107615cc (PR 724). Verified by driving it: `pytest --collect-only -m 'not tooling'` from this worktree deselects 2879 of 15587 tests, while packaging/messagefoundry-webconsole/tests collects 396 with and without the flag, so the tier the item says must stay is retained and the pytest line carries no --ignore-glob. Verified live with `gh`: the four most recent pull_request runs finished `diff-coverage (advisory)` successfully in 13m19s to 15m21s, and job 100473803645's log shows the pytest step at 828s and diff-cover printing a real verdict. The only remainder is the ledger banner at docs/BACKLOG.md:18784, which still reads "BUILT IN THIS COMMIT, not yet landed" after that commit merged -- a doc edit that ships nothing runnable.
 > Verdict: build
@@ -22290,6 +23170,7 @@ The first draft said instead that a real cancel "stays green", and called that b
 > **DO NOT READ THAT AS THE ITEM SHRINKING, BECAUSE THE INSTRUMENT DID NOT IMPROVE.** The hole closed because the thing falling through it was removed, which is exactly the shape that leaves a guard looking healthy for a reason unrelated to the guard. The remainder the score identifies is untouched and is the part worth building: `tests/test_failure_signal.py` asserts only that each watched name exists, never that every required workflow is watched, so the next context armed on `main` is unwatched from the moment it arms and nothing goes red. **The value of that test just went UP, not down** -- it is what would have reported this coverage gap instead of a scoring pass finding it by hand. The watcher limb in `wshallwshall/claude-multisession#108` is unaffected either way, and this item's closing condition still rests on it.
 >
 > **Scored 2026-09-03 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. Half of this shipped and the score records none of it: .github/workflows/failure-signal.yml is in this branch's tree (landed 947df9dfe, PR #716) with a pinning suite at tests/test_failure_signal.py, so the state is partly_shipped, not not_started. What is genuinely left here is a coverage guard the shipped instrument lacks -- I drove tests/_workflow_contexts.py's resolver over .github/required-contexts.txt and the five workflows carrying a required context resolve to CI, Security, CLA Assistant, backlog-hygiene and review gate, while failure-signal.yml:34 watches CI, Security, CodeQL and backlog-hygiene. So `review gate`, armed a day later in 43849fe87 and carrying this repository's entire review requirement, is unwatched and its exclusion is unrecorded (CLA's is recorded, review gate's is not), and tests/test_failure_signal.py:147 asserts only that each watched name exists, never that each required workflow is watched, so it stays green over that hole. The watcher limb the item makes its closing condition lives in wshallwshall/claude-multisession#108, a repository this clone cannot read, so that limb is unverified and counts as unmet. Landing the in-repo half is one test plus a recorded exclusion on a seam that already exists, so the cost is small.
+> 🚧 **THE IN-REPO HALF IS BUILT AND OPEN IN A PULL REQUEST, 2026-09-06 (PR #955). THIS ITEM DOES NOT CLOSE ON THAT MERGE, and the banner must not be flipped for it** -- the closing condition is the watcher that reads the `ci-red` label, filed as `wshallwshall/claude-multisession#108`, in a repository no engine clone can read. That limb is unverified from here and therefore unmet. **What landed:** `tests/test_failure_signal.py` now asks coverage in the direction nothing asked before. For every context in `.github/required-contexts.txt` it resolves the reporting workflow through the existing `tests/_workflow_contexts.py` seam and requires that workflow to be either watched by `failure-signal.yml` or named in that file's OWN header as `# not-watched: <file> -- <reason>`, which the test parses. **The exclusion is recorded once, in the workflow, and read from there** -- a second copy in Python is free to drift, which is the defect #1335 turned out to be. A broken parser fails toward RED, because an unparsed exclusion leaves its workflow uncovered. **The anti-vacuity arm is the load-bearing half and it is built the way the item's own amendment argued:** `_unwatched` is pure over its arguments, so one test drives it with mutated COPIES of the real inputs -- untouched baseline empty, drop a watched name and it is non-empty, add a required context nobody watches and it is non-empty, and both directions of the exclusion mechanism -- without editing a file on disk. **THE PREDICTED RESULT HELD: the guard passes on the first run against the current tree**, because `review gate` was retired on 2026-09-04 and `cla` is the only unwatched required workflow left, its exclusion already written in the header prose. Measured here at 13 required contexts resolving to `ci.yml`, `security.yml`, `cla.yml` and `backlog-hygiene.yml`; dropping `CI` from the watch list turns up four uncovered contexts and dropping the exclusion turns up `cla`, so the green is a measurement and not a vacuum. ***The banner stays OPEN, for the watcher, exactly as this item's last paragraph already says.***
 > Verdict: build
 > Closing-act: code
 
@@ -22313,6 +23194,7 @@ So the only path from a red to somebody acting on it is a seat polling every ope
 > 🔢 **Filed 2026-08-31.** Sibling of #1402: same missing signal, harder to address.
 >
 > **Scored 2026-09-03 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The signal half is in this tree, so the state is partly_shipped rather than not_started: .github/workflows/failure-signal.yml:71-73 recovers the number from a merge-queue ref, and I drove that shell block directly against gh-readonly-queue/main/pr-716-9f2a1b3 (resolves 716) and against a spoofed pr-999-fake branch on a pull_request event (resolves empty, so the fork guard holds). Two limbs remain unmet. Nothing reads the label: grep for "add-label ci-red" returns only the writer at failure-signal.yml:91-92, no reader exists, CLAUDE.md:302 and docs/METHOD.md:365 both say so, and the watcher this item defers to sits in wshallwshall/claude-multisession#108, a repository I cannot read, so it counts as unlanded. Second, an ejection is recorded but not attributed: for a resolved pull request the workflow adds a bare label with no run name or URL (failure-signal.yml:83-92), because the run-URL path at failure-signal.yml:94-119 fires only when NO pull request resolves, so an ejection would leave a red label on a pull request whose own head is green and say nothing about which job ejected it, which is the blind spot this item's own second paragraph names. Closing that is one additive step in an existing workflow plus an assertion in tests/test_failure_signal.py, which I ran green at 6 passed using the primary checkout's venv.
+> 🚧 **THE ATTRIBUTION STEP IS BUILT AND OPEN IN A PULL REQUEST, 2026-09-06 (PR #955). THIS ITEM DOES NOT CLOSE ON THAT MERGE, and the banner must not be flipped for it** -- like #1402 its closing condition is the watcher in `wshallwshall/claude-multisession#108`, a repository no engine clone can read, so that limb stays unmet. **What landed:** one additive step in `failure-signal.yml`, exactly the shape the score priced. On a resolved pull request whose triggering `RUN_EVENT` was `merge_group`, it comments naming the failing run and linking its URL, and says in the comment that the pull request's own head can still be green because the queue revalidates the merge with the path gates off. **Scoped to `merge_group` on purpose:** a comment on every red pull request is noise a reader learns to skip, while on an ejection it is the only record there is -- on an ordinary red the author can reach the run from the checks tab. **Nothing existing was weakened.** The number recovery and its fork guard are untouched, no `uses:` was added, and the step needs NO new permission: `gh pr comment` posts an issue comment and the job already holds `issues: write` for the standing tracker. `RUN_NAME` and `RUN_URL` reach the script through `env:` like every other event value, never spliced into the body. **Three assertions were added** to `tests/test_failure_signal.py`: the step comments and names the run, its `if:` is gated on both `merge_group` and a resolved pull request, and its run values arrive from the environment. That last one is the positive half -- the file-wide `${{` scan alone cannot tell "hoisted to env" from "reads nothing". ***The banner stays OPEN, for the watcher, exactly as this item's last paragraph already says.***
 > Verdict: build
 > Closing-act: code
 
@@ -22333,6 +23215,8 @@ Identifying the ejected pull request therefore means recovering the number from 
 
 ## 1404. the checked-in record of what gates a merge disagrees with the server three ways, and no test can see it
 
+> **RE-SCORE WITHDRAWN 2026-09-05, SAME DAY IT WAS MADE.** This item was briefly raised to P2 (value 2 -> 6) on the grounds that "the drift detector this item asks for was never built". **That attributed another item's scope to this one.** The detector belongs to **#1384**, whose own option 1 -- a scheduled job that opens an issue on drift -- is recorded there as half built. This item's remaining work is step 4 alone: the `enforce_admins` value in `tests/test_push_guard.py`, `scripts/coord/install-git-hooks.ps1` and `.github/workflows/branch-leak-scan.yml`. That is a doc edit and P3 / value 2 / difficulty 1 was right. Today's drift incident is real evidence, and it is recorded on #1384 where it belongs.
+>
 > 🔢 **Filed 2026-08-31. REWRITTEN the same day, after review.** The first version said the review
 > gate "reports but does not gate". That was true when it was written and false a few hours later:
 > the context was armed the same day. The reviewer caught it before merge. Re-measuring to correct
@@ -22521,7 +23405,9 @@ So there is no writer anywhere in the merge path. An **anchor** -- a citation fr
 
 ## 1414. an allocation can be stranded in a worktree that EXISTS but cannot reach the branch its work is on
 
-> 🔢 **Filed 2026-09-01 (lander).** Two independent instances in one night, from two sessions
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. PR 825 landed as origin/main e2a73752f "fix(coord): count stranded allocations and stop a correct refusal burning a number (BACKLOG #1414)". Every limb the item's own BUILT paragraph names is present at origin/main HEAD (verified via git ls-tree + git show, not just the commit): the read-only census scripts/coord/alloc_strand_sweep.py (494 lines) with --detail:457 and --titles:459;
+>
+> **Filed 2026-09-01 (lander).** Two independent instances in one night, from two sessions
 > that reached it by different routes. Distinct from [#1282](#1282-an-allocation-whose-worktree-is-deleted-can-never-be-filed-and-allocps1-has-no-transfer-path)
 > and NOT closed by the fix open for it: verified by reading that fix's own mechanism, not by
 > assuming.
@@ -22637,7 +23523,9 @@ enough to warrant a documented manual recovery, is exactly what is missing.
 
 ## 1412. anchor_provenance's load_scorecard call is unguarded, so a malformed record prints a cell id to stderr
 
-> 🔢 **Filed 2026-08-31 - BUILT IN THIS COMMIT, not yet landed.** The same class **PR 719** closed in `anchor_report.py`, in the sibling tool that reads the same record. Found by reading that fix, not by a sweep.
+> ✅ **SHIPPED -- verified on `origin/main` at `f01b991d9`, 2026-09-08.** Closed as a banner flip: the work is on `main` and only this row still read open. Landed 9adb1a1b2 (PR 726), confirmed ancestor of origin/main (ca4e85e5d). Verified by content, not the ledger's stale anchors. Guard: scripts/asvs/anchor_provenance.py:672-681 -- record read plus the sole load_scorecard call (via _cells_from :333-344) in one try, "except Exception as exc" :673, prints only type(exc).__name__, returns 3. Rationale comment :602-666, incl.
+>
+> **Filed 2026-08-31 - BUILT IN THIS COMMIT, not yet landed.** The same class **PR 719** closed in `anchor_report.py`, in the sibling tool that reads the same record. Found by reading that fix, not by a sweep.
 >
 > **Scored 2026-09-03 -> P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Every limb verified at HEAD and on origin/main (commit 9adb1a1b2, PR 726). The guard sits on the live path -- scripts/asvs/anchor_provenance.py:369-377 wraps the sole load_scorecard call in except Exception, and driving the real CLI against two crafted records printed only the class name at exit 3, with no cell id and no grading vocabulary (ScorecardError for an unknown verdict, ValueError for a non-numeric line). The docstring third-stream amendment is present at scripts/asvs/anchor_provenance.py:53-60, and the 0/2/3 argument plus the two named-but-unfixed exit-1 paths sit in the comment at scripts/asvs/anchor_provenance.py:309-368. The test arms are collected and green -- 30 passed in tests/test_asvs_anchor_provenance.py, covering the nine-record fault table (:436), the class-discrimination arm (:523), the suite-declared _AnUnlistedFailure breadth arm (:579) and its KeyboardInterrupt-propagates twin (:625), all reading the shared BANNED_CONTENT constant at :75; ruff check and ruff format --check are clean on both files. All that is left is a ledger flip, since the banner at docs/BACKLOG.md:19203 still reads "not yet landed" while the fix is on main, so value 1 and difficulty 1 stand.
 > Verdict: build
@@ -23094,6 +23982,8 @@ The author identified this failure mode precisely, named its consequence exactly
 > **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. All four costs stand at HEAD and none has been closed. Nothing bounds audit_log: [retention].audit_days defaults 0 and is documented reserved and unenforced at messagefoundry/config/settings.py:1675-1678, messagefoundry/store/base.py declares eight purge entry points between :1202 and :1849 with none for audit, and a grep of messagefoundry/ finds no reader of audit_days outside those two files, so an operator who sets a window gets no purge and no warning -- the accepted-but-inert knob is the gap, and the only workaround is flipping the #1277 default back off, which lowers the rate without bounding the table. The three records still disagree about why: messagefoundry/config/retention_classification.py:17-19 rests the rationale on the retention requirement "not on chain-breakage" while messagefoundry/config/settings.py:1675-1677 and docs/PHI.md:118 give both reasons, and that question decides whether in-place deletion is open at all. Cost 3's docstring is unchanged at messagefoundry/api/security.py:177-179, and ADR 0118's amendment at docs/adr/0118-secure-by-default-security-configuration-section.md:165 still records the outcome and the delegation without the two questions or the eight options. What this row ships is an owner ruling plus reconciled prose across five artifacts, so the cost is doc work held consistent rather than engine change.
 >
 > **Update 2026-09-03 -- the two limbs that need no ruling shipped; this row STAYS OPEN on costs 1 and 2.** **Cost 4 is closed.** ADR 0118's section 5 amendment now carries both questions put to the owner, all eight options and both answers quoted, with [comment 5515263760 on PR 749](https://github.com/MEFORORG/MessageFoundry/pull/749#issuecomment-5515263760) kept as provenance, so the record sits in the artifact a reader consults rather than only in a pull-request comment. **Cost 3 is closed.** The `_audit_all_authz` docstring in [`api/security.py`](../messagefoundry/api/security.py) no longer argues that a wider fallback would invent a grant row -- both call sites read it only after authorization has already succeeded, which the change states -- and it now gives the real reason, that the fallback preserves prior behaviour for a hand-built `app.state`. The behaviour did not change and both sides stay pinned in [`tests/test_auth_hardening.py`](../tests/test_auth_hardening.py). **Costs 1 and 2 remain OPEN**, and so does this row: they wait on the owner ruling this row's verdict names -- whether deleting an `audit_log` row breaks the tamper-evident hash chain -- because that answer decides whether in-place deletion is available at all and therefore which lever can be sized. Nothing was chosen or built for them here: no retention bound, no rate or sampling bound, no audit purge entry point, no group-committer change, and `[retention].audit_days` is still accepted and unenforced.
+>
+> **Update 2026-09-05 -- the options memo the ruling needs now EXISTS. The ruling is still OUTSTANDING and this row STAYS OPEN.** [ADR 0185](adr/0185-retention-levers-for-the-tamper-evident-audit-log-what-each-deletion-shape-costs-verifiability.md) lays out the retention levers so the owner can choose, and deliberately chooses none of them. It re-establishes the mechanism from the code at HEAD rather than inheriting it: the line numbers this row cites are from `fd44b0f17` and have since drifted, so read the ADR's. `audit_row_hash` is at `store/store.py:1009` and its payload at `:1057`; the row `id` is not in it, and the walk chains from the STORED hash at `:7998`, which is the line that decides most of the question. A verifier exists and is reachable three ways, and `[integrity].audit_verify_on_start` still ships `False` (`config/settings.py:3370`). **Eight shapes were driven at `c57903c2c` with both controls firing**, alongside a second full walk beside the shipped one because the shipped verifier returns only the FIRST divergent row. That reproduces this row's cases A, B and D and adds **three findings this row does not carry**: a break is LOCAL and does not spread, so every row after the damaged one still verifies and keeps its evidentiary value; deleting an INTERIOR row leaves the anchor head byte-identical, so an anchor catches that shape by its COUNT and not by its hash; and a tombstone that preserves the stored `row_hash` still breaks the walk at the tombstoned row, so preserving the link bounds the damage without removing it. **The crux for the ruling:** a delete-then-reseal verifies clean, which is what an attacker who can write the table would produce, so a re-sealing purge would leave a held off-box anchor as the only working control. Six levers are costed against chain, build and operator, and the ADR carries a Builder recommendation marked as separable from the findings. **Nothing was chosen and no engine behaviour changed**: no purge, no new config field, no default moved, and `[retention].audit_days` is still accepted and unenforced. **Costs 1 and 2 remain OPEN.**
 > Verdict: owner-ruling
 > Research: none
 > Closing-act: owner-ruling
@@ -23223,9 +24113,117 @@ That is the same `self._lock` the staged-pipeline handoffs take. On a first depl
 
 **THE GENERAL PROBLEM, stated once so it is not re-derived per incident.** A decision recorded as an outcome plus a delegation is not reviewable. The inputs -- the question, the options, the answer -- are what let a later reader tell a considered call from an arbitrary one, and they are exactly the part that lives in the least durable place.
 
+## 1423. The review gate passes green with no reviewed label: a queued synchronize run strips the label after the reviewer applies it, and the labeled run then reads a stale payload
+
+> ✅ **Filed 2026-09-03. CLOSED 2026-09-08 as MOOT -- the gate this item grades was deleted from `main` on 2026-09-05 when the owner retired the review requirement, so the fix this row was filed with has nothing left to fix. Closed on the same ground and by the same reading as its sibling #1417. THE MEASUREMENT BELOW STANDS; only its subject is gone.**
+>
+> **THE FINDING SURVIVES THE RETIREMENT, because it was never about this one workflow.** A `pull_request` event payload is a SNAPSHOT taken when the run was queued, and a verdict read from it is a verdict about an older head. Two clocks, and the gate was reading the older one. That is true of any workflow that decides from `github.event` rather than re-reading live state, and it is the reason to state it here rather than delete the row with the gate. `a reviewer has read this` is a required status check on `main`, and with `required_approving_review_count` at 0 it is this repository's entire automated review requirement. **It reported SUCCESS on pull request 765 while that pull request carried zero labels.** The workflow now reads the label set live from the API instead of out of the frozen webhook payload, and BLOCKS when that read fails.
+>
+> **Scored 2026-09-03 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. Value 7 rather than #1417's 6, on one fact #1417 does not carry: the correction a reader would assume exists does not fire, so a false green stands until a person notices it. Difficulty 3, which is what #1417 predicted: the workflow edit is small and the cost was the control harness, welded to a `$LABELS` env contract and needing a `gh` stand-in on PATH.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / merge protection. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. What it reaches is this repository's own merge control, so the cost is an unreviewed change landing on `main`. **It does not mean past merges were unreviewed.** The race needs a specific ordering, and #1417's replay over the last 25 merged pull requests found every deciding run created after its last `reviewed` event.
+
+**RELATIONSHIP TO #1417, STATED FIRST so the two are not read as one finding counted twice.** #1417 filed this defect on pull request 724 and worked out the detection rule; its remedy list already names reading the labels live as one of two options. This row is a second, independent instance on pull request 765, it takes that option, and it adds one fact #1417 does not have. **Whether #1417 closes alongside this is the Lander's call, not this row's.**
+
+### The measurement, pull request 765, 2026-09-03
+
+Every timestamp below is a quoted API value from the runs, jobs and issue-timeline endpoints, on head `ee2e7ec2423a73fd385d2afa27733ca050058cba`.
+
+| time (UTC) | event |
+|---|---|
+| 20:40:58Z | run `33803677823` created by a Builder's `synchronize` push |
+| 20:43:19Z | `wshallwshall` applies `reviewed` |
+| 20:43:24Z | run `33803911587` created by that `labeled` event -- **its payload records the label as PRESENT** |
+| 20:45:10Z | the `synchronize` run's job finally starts, four minutes after creation |
+| 20:45:11-20:45:15Z | its step 3 removes the label; `github-actions[bot]` unlabels at 20:45:14Z |
+| 20:45:16Z | that run concludes FAILURE (check-run `100808902697`) |
+| 20:49:34Z | the `labeled` run's job starts, **six minutes** after creation |
+| 20:49:37Z | it reads its own 20:43:24 payload, finds `reviewed`, and concludes **SUCCESS** (check-run `100809679433`) |
+| 20:49:37-20:52:55Z | pull request 765 carries `a reviewer has read this` = success **with zero labels** |
+| 20:52:55Z | a person re-applies the label by hand, which creates a run whose payload is honest |
+
+The success is the newer check-run on the head, so it is the one branch protection reads.
+
+### The mechanism
+
+1. A push fires `synchronize`. That run is queued, here for four minutes.
+2. A reviewer, seeing a red gate, applies the label. That fires a `labeled` run whose payload captures the label as present.
+3. The queued `synchronize` run starts and deletes the label. Correct in isolation -- that removal is the whole re-review mechanism and must stay.
+4. The `labeled` run then evaluates its OWN payload, now stale by minutes, sees a label that no longer exists, and passes.
+
+**THE PAYLOAD IS A SNAPSHOT AND THE VERDICT IS NOT.** Those are two clocks, and the gate was reading the older one.
+
+### And nothing corrects it, which is why the payload read had to go
+
+The workflow header used to claim `unlabeled` was *"the opposite half"* that stops a withdrawn label leaving a green context. **That reasoning does not hold for this removal.** GitHub does not dispatch a workflow run from an event raised by the repository's own `GITHUB_TOKEN` -- `workflow_dispatch` and `repository_dispatch` are the documented exceptions, and a label event is neither. The removal runs `gh` under `github.token`, so its `unlabeled` event emits nothing.
+
+**Verified rather than inferred:** the workflow-runs API reports exactly **two** review-gate runs on that head, the two named above, and none for the 20:45:14Z removal. `unlabeled` therefore covers a **person** taking the label back, and nothing else. The header now says that.
+
+### What the fix does, and the three properties that constrain it
+
+The label-reading step now runs `gh pr view "$NUMBER" --json labels --jq '[.labels[].name] | join(",")'` and decides on the result. A gate must assert about the present.
+
+1. **It fails closed on a failed read.** `gh` absent, unauthenticated, rate-limited or answering with an error all BLOCK. A gate whose safe state depends on a network call succeeding is not a gate.
+2. **The `synchronize` removal stays.** Deleting the label on new commits is correct.
+3. **`synchronize` still fails by definition**, decided before any read rather than from a value it could race. Commits nobody has read are unread whatever a label says.
+
+The payload is still passed in, as a **diagnostic only**: when it and the live set disagree about `reviewed`, the log says so in words. Nothing branches on it. That line exists so the next reader is told the payload went stale instead of reconstructing it from three endpoints and two clocks.
+
+**THE OLD SHAPE WAS A ONE-ACTION SCREEN, and that is the generalisable lesson.** The workflow already knew the payload went stale -- its own comment said so -- and hard-coded a fix for the single action its author had an instance of, leaving every other action reading the same snapshot. A screen built from one case finds one shape.
+
+### What the fix does NOT do, said plainly
+
+**It narrows the window; it does not close it to zero.** A `labeled` run can still read a label that a `synchronize` run removes moments later, and its green then stands on a state that has just changed. The difference is the size: the payload read cost **minutes** of queue delay -- six, measured above -- while what remains is the gap between the API call and the job finishing, which is seconds. Claiming closure here would be the compensating control resting on a false premise that section 11 forbids.
+
+So the operational rule survives the fix rather than expiring with it. **For a BEHIND pull request: update-branch, WAIT for the resulting `synchronize` review-gate run to COMPLETE, then label, then merge.** Labelling while that run is still queued is what produced the false green above, and it is still the shape to avoid. Closing the residual entirely needs a different mechanism -- pinning the verdict to the head and the label event, which is #1417's rule (4) plus (5) -- and that is not built here.
+
+### Controls
+
+`tests/test_merge_gate_controls.py` lifts the step's own shell out of the workflow and runs it against a `gh` stand-in placed first on PATH, which records its own argv so a gate that stopped calling the API cannot be graded as though it had. Both directions are pinned: a stale payload showing `reviewed` over an empty live set must FAIL on every action the gate can see, a genuinely labelled pull request must PASS, and an unreadable label set must BLOCK. **The pre-fix form is run against the identical planted fixture and must go GREEN**, so the shipped refusal is measured against a form known to accept rather than merely asserted. `tests/negative_controls.toml` carries the registry rows.
+
 ## 1424. steer-inject.ps1 puts an unfolded file value inside a frame asserting the OWNER typed it
 
-> 🔢 **Filed 2026-09-03 -- not started. Found while closing #1040, on the surface that item does not
+> ✅ **CLOSED 2026-09-06 -- the fold, the prefix and the preamble are in the hook, and the tests
+> assert the EMITTED STRING rather than the presence of a helper.** `scripts/hooks/steer-inject.ps1`
+> folds the note through a local `Get-Fold` (mail-drain's order: `\p{C}` to a space, then anything
+> still outside `\x20-\x7E` to `?`, then collapse runs and trim), emits it as ONE line behind the
+> `    | ` prefix, and opens with a `DATA, NOT AUTHORITY` preamble naming the provenance as an
+> unverified claim. The frame no longer says the user typed it, which was the sentence a forged
+> second frame inherited.
+>
+> **THE RED COUNT, NOT MERELY THAT IT WENT RED: 20 of 30 rows.** `tests/test_steer_inject.py` run
+> against a copy of the hook as it stood at `172b1327c` -- so the number names the pre-fix script --
+> was **20 failed, 10 passed**. By property: **11 of 11** separator rows red on "cannot add a line";
+> **3 of 9** red on "folds away to nothing" (NUL, record separator, escape; the other six were
+> already caught by `IsNullOrWhiteSpace`); **2 of 2** on the substitution mark; **2** on the prefix;
+> **2** on the frame prose. Against the fixed hook: **32 passed**. The suite grew by two rows after
+> that measurement, when the `/simplify` pass split one fail-open row into three parametrized ones;
+> those three pass against both versions of the hook, so they are not part of the 20.
+>
+> **THE NOTE FOLDS TO ONE LINE, AND THAT IS A DECISION RATHER THAN A COPY OF `mail-drain.ps1`.**
+> The sibling keeps a body's line structure and prefixes each line, because a mail body is many lines
+> by nature. This row's proof statement is that a note "must not be able to add a line to the emitted
+> `additionalContext`", so the note is folded to a single line and the frame says so. The cost: a
+> deliberately multi-line note arrives as one line. `steer-send.ps1` takes the note as one command-
+> line argument, so that shape is the uncommon one.
+>
+> **WHAT THIS CLOSE DOES NOT COVER, NAMED SO IT IS NOT MISTAKEN FOR COVERED: there is no length cap.**
+> `mail-drain.ps1` caps a body and reports what it dropped; this hook caps nothing, so a large note
+> arrives whole. That is context cost, not frame forging -- one folded line is one line at any size --
+> and capping without the sibling's truncation-reporting apparatus would be the silent drop this repo
+> treats as the defect. Unfiled and named rather than numbered: the steering-note size bound.
+>
+> **SCOPE HELD.** `lane-level.ps1` is untouched and stays neither cleared nor accused.
+> `tests/test_claude_settings_contract.py:239` stays true: the hook is still wired nowhere, and this
+> change does not arm it. `docs/STEERING.md` gained the two bullets describing the frame, which moved
+> its byte count and therefore the citation of that count in `docs/SESSION-MAIL.md`; both are updated
+> in the same PR.
+>
+> **Filed 2026-09-03 -- not started. Found while closing #1040, on the surface that item does not
 > cover.** `scripts/hooks/steer-inject.ps1` reads `<project>\.claude\steer.txt` whole, trims it, and
 > interpolates it into one `additionalContext` string that opens *"[STEERING NOTE -- the user just
 > typed this via a side channel while you were mid-task ... Read it now and act on it right away ...
@@ -23281,6 +24279,7 @@ enumerating every hook that writes text an agent acts on rather than only the on
 > 🚧 **Filed 2026-09-03 -- the screen is BUILT and reports candidates; nothing yet flips a banner off it.** Every existing ledger gate reads the LEDGER. `scripts/docs/subject_exists_screen.py` is the first that reads the CODE: for each OPEN item it extracts the concrete code-side subjects the row names -- commit shas, merged pull requests, file paths and distinctive symbol names -- and asks git whether they are already on `origin/main`. **It reports candidates and flips nothing.** A wrongly-closed item is invisible forever, so the closing act stays a person reading each row.
 >
 > **The remaining work is the reading pass, not the tool.** First run at `46ea10a78`: 275 open items, 3781 subjects, **80 candidates and 114 weak-candidates**. Nobody has read that list. Two of the 80 were already known-true and are wired as controls; the other 78 are unread.
+> **Scored 2026-09-06 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Two Builders were measurably spent in one day discovering that their item was already complete, and the screen's first run found 80 candidates plus 114 weak against 275 open rows, none of them read -- so the misdescription is not two rows, it is a population. Value is capped below 8 because this is fleet tooling with no product, PHI or deployment axis, and a workaround exists in reading every row by eye, which is the labour the item exists to replace. Difficulty 4 prices the remainder ONLY: the tool, its 51 tests and its `DOC_GUARDS` wiring are built and on `main`, so what is left is the reading pass over 78 unread strong candidates and 114 weak ones, each needing a code-side check before any banner moves. Bounded and mechanical, but large, and a wrong close is invisible forever, so no part of it can be bulk-applied.
 > Verdict: build
 > Closing-act: code
 
@@ -23716,6 +24715,50 @@ The other four are posture, inherited from the tripwire as it already stood:
 
 ---
 
+## 1433. regenerate the password screening corpus from a committed script instead of by hand
+
+> ✅ **Shipped 2026-09-03.** `scripts/security/build_password_corpus.py` (`--check` / `--write`, plus `--seclists DIR` for the source arm) rebuilds or verifies `messagefoundry/auth/data/common_passwords.txt`, and writes a delimited generated block into `common_passwords.NOTICE` carrying the digest, the line and distinct counts, the two-run split and the whole by-floor table. `tests/test_auth_core.py` fails when the block stops describing the corpus, and a planted-mutation test proves that gate can move. **TWO PREMISES THIS ITEM WAS CUT FROM WERE FALSE AT HEAD AND ARE CORRECTED BELOW** -- neither changes what was built. **STILL OPEN:** the upstream member digests are recorded as `None`, because SecLists is not vendored here; `--check --seclists <checkout>` prints them for pasting. That is the last piece of #1134's honest path.
+> Verdict: build
+> Research: none
+> Closing-act: none
+
+**Cluster:** Security / offline password screening (from #1134). **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Zero instances run. The defect was a record that could drift from the file it described, which would first cost a reader on the way to a **first** deployment.
+
+### What was wrong
+
+`common_passwords.txt` was assembled by hand under #1134 and no regeneration script was committed with it. Every number in its `.NOTICE` was therefore a hand-copied measurement with nothing behind it, and the only remedy for a corpus change was to re-derive each count by hand. A count re-derived by hand is a count that eventually is not.
+
+### What shipped
+
+The tree's generator-plus-golden pattern (`scripts/webconsole_seam_snapshot.py --write` and its golden) applied to a data file. The golden here is a block **inside the notice**, between markers, so the hand-written prose and the generated numbers live in one file without the tool touching the prose.
+
+- **The filter is the shipped policy object, not a length test.** `selection_policy()` builds a real `PasswordPolicy` from `AuthSettings` defaults the way `AuthService` builds it, then turns off `check_breached` (every candidate would reject itself against the corpus it is being added to) and `check_username` (a corpus entry has no user context). That applies the length clause **and** the context deny-list, which is what makes the count "the top N which match the application's password policy" rather than "the top N that are long enough".
+- **The hygiene filter imports the gates' own definitions** rather than restating them: `ALLOWED` from `scripts/quality/control_char_check.py` for the C0 arm, and only the `routable IP address` reason out of `scan_forbidden.scan_text` for the IP arm. It reads that one reason deliberately -- the rest of that function's reasons come from a site-local, git-ignored token file, so consuming them would make the corpus a function of who ran the rebuild.
+- **The sub-minimum entries stay**, and a named test now says why. They are unreachable at the shipped floor, which makes them look like dead weight; `password_min_length` is an operator setting, so a site that lowers it makes every one of them operative again.
+
+### Correction 1: there were no per-number pytest gates to collapse
+
+The brief this item was cut from said `tests/test_auth_core.py` pinned eight numbers from the notice against live measurement -- a headline count and seven by-floor rows -- plus the corpus sha256. **Measured on `main` at `46ea10a78`: it pinned none of them, and the notice carried no by-floor table at all.** The two corpus tests there assert a floor (`>= 3000` clearing entries, the ASVS 6.2.4 bar) and three behavioural arms; both survive untouched, because a floor is not a hand-copied number. So the fixed-point gate is the **first** machine check on those counts, not a replacement for several. Recorded because the difference decides what a reader should expect to find in the diff.
+
+### Correction 2: the line-ending attribute was missing entirely, and my first spelling of it was wrong
+
+The brief listed keeping the corpus's `-text` pin in `.gitattributes` as a constraint. **`git check-attr text` reported `unspecified` at `46ea10a78`**, and under `core.autocrlf=true` the working tree held CRLF while the blob held LF -- two different sha256 values for one committed file (`fd9786f1` against `136e7bcf`). So there was no pin to keep; this item adds one.
+
+**IT ADDS `text=auto eol=lf`, NOT `-text`, AND THE FIRST DRAFT HAD IT WRONG.** `-text` disables the clean filter, so it FREEZES the current bytes and does nothing about the next write: a later CRLF edit lands CRLF in the blob permanently. For a file a generator rewrites, that is the wrong guarantee -- `eol=lf` normalizes on the way in, so the invariant the recorded digest depends on keeps holding. The `-text` precedent in that file belongs to the vendored CLA bundle, whose blob genuinely CONTAINS 1,297 CRLF pairs; this blob holds none, so `eol=lf` re-encodes nothing here. Caught by a peer lane measuring it rather than by me; I had reasoned from the precedent's wording instead of its subject.
+
+Two belts, because one fails on an existing checkout: the attribute keeps a **fresh** checkout equal to the blob on every platform, and the generator digests **LF-normalized** bytes so an **older** Windows checkout still verifies instead of failing with a hex mismatch that names nothing. Changing an attribute does not rewrite a working tree; `git checkout -- <path>` does.
+
+### What the gate does NOT verify, and why that is stated in its own output
+
+Without `--seclists` it does not verify that the corpus reproduces from upstream. SecLists is an 8 MB third-party checkout this repository deliberately does not vendor, so a bare run says so on stdout rather than reporting a green that means less than it looks like. The upstream member digests are recorded as `not recorded` until someone runs `--write --seclists <checkout>`, and a source-less `--write` carries forward whatever digests the notice already holds rather than destroying provenance while regenerating counts. **Recording those two digests is the one piece of #1134's honest path still open here.**
+
+### Re-score trigger for ASVS 6.2.4
+
+The selection depends on `password_min_length` **and** `password_check_context`. Both are printed in the generated block, and moving either shipped default changes the corpus the script produces and every count it records.
+
+
+
 ## 1435. docs/testing has no checkout-side marker, so a vaulted path reads as unstarted work
 
 > 🚧 **Filed 2026-09-03. The marker is built; the gate is researched and deliberately NOT built.** Value **5/10** · Difficulty **2/10** for what shipped, **6/10** for what is left. A documentation and process defect, not a product exposure: MessageFoundry has zero deployments, nothing here reaches an operator, and no impact claim below is present-tense about a running site.
@@ -23845,6 +24888,7 @@ So `test_the_script_prefers_its_own_repo_over_an_earlier_path_entry` supplies th
 
 **Adjacent and NOT fixed here, named rather than numbered.** `docs/WEBCONSOLE-PACKAGE.md`'s seam-refresh procedure is stale in three steps left behind by #1220: it says to bump `ENGINE_UI_SEAM` by hand (`1` to `2`) when the value is a derived digest, it says to update curated lists in this script that #1220 retired, and its step 5 prescribes `python scripts/webconsole_seam_snapshot.py > tests/golden/...`, the shell redirect this script's own docstring forbids because PowerShell's `>` writes UTF-16LE with a BOM into a file the test reads as UTF-8. That is doc drift with its own cause and it wants its own item; folding a documentation rewrite into a `sys.path` fix would make both harder to review.
 
+> **It got one: #1443**, filed and fixed 2026-09-04, in the commit that carries this line. Two of the three descriptions above were sharpened by measurement while it was built: the redirect is wrong in every shell rather than only under PowerShell (a redirect can write just one of the two files `--write` writes, so it leaves the constant stale even where the encoding survives), and the drift was not confined to the numbered steps -- the section heading two screens earlier called the seam an integer and typed it `int`. See #1443's LIMB 2 and LIMB 4.
 
 ## 1434. the tooling-partition gate names the file it rejects and not the remedy, so the Builder who trips it has already exited
 
@@ -24218,6 +25262,162 @@ The round-number rows are dead on an assumption worth naming: **that an estate c
 
 **No concrete six-digit value appears in this item, deliberately.** Writing one is the trap **#322** documents: a placeholder built from a loaded prefix is a real hit in tracked content, and nothing warns you before the hook fires.
 
+## 1437. redact() is quadratic on a delimiter-free run and its linear-scan test cannot see it
+
+> 🚧 **Filed 2026-09-03. FIXED IN THE SAME CHANGE, NOT YET ON MAIN.** Found while fixing the sibling defect under #1385. `tests/test_redaction.py`'s `test_redact_free_text_heuristic_is_linear` asserted that `redact` scans in linear time. **Two things were wrong and they compound.** The arm timed `"A " * 5000`, whose longest delimiter-free token is ONE character, against a bare `< 1.0` literal from a single sample -- an input on which every candidate pattern, guarded or not, is trivially linear. And the property it named is false: `_HL7_FIELD_RUN` is quadratic on a long delimiter-free run, so the arm passed green over the defect it existed to catch, from `2a6693f33` (2026-08-13) until this change.
+>
+> **Scored 2026-09-03 -> P1.** Value **7/10** · Difficulty **2/10** · _quick win_. Value 7: `redact` is the PHI chokepoint on the exception and logging path and runs synchronously on the asyncio event loop, its input is attacker-influenceable and is not length-bounded, and a 20,000-character run cost 1.05 s. Not higher, because section 0 applies -- zero instances run, so nothing is stalling today. Difficulty 2: the fix is one lookbehind, and the equivalence that makes it safe is machine-checkable.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI redaction / algorithmic denial of service. **Priority:** P1.
+**Severity:** no deployment axis (section 0). Zero instances run, so nothing is stalling an event loop today. Everything below is what a **first** deployment would meet.
+
+### Limb 1 -- the guard was real, the property it claimed was not
+
+[`redaction.py`](../messagefoundry/redaction.py)'s comment on `_HL7_FIELD_RUN` said the possessive quantifiers `*+` make the scan **linear**, naming `"a"*5000` as the input they protect against. Possessive quantifiers do remove backtracking inside one match attempt, and that is a real saving. **It is not where the cost was.**
+
+The leading `[^\s|^~&]*+` can match empty, so the engine restarts the pattern at **every offset**. Inside one long delimiter-free run each restart re-scans the rest of the run, which is quadratic whether or not the quantifier gives characters back. Possessive matching halved the constant and left the exponent alone.
+
+Measured 2026-09-03 on a dev box, through the shipping `redact` entry point:
+
+| input | pre-guard (greedy) | shipped before this change (possessive) | with the lookbehind |
+|---|---|---|---|
+| 5,000-char run | 0.116 s | 0.043 s | 0.00011 s |
+| 12,000-char run | 0.762 s | 0.419 s | 0.00049 s |
+| 20,000-char run | 2.36 s | **1.11 s** | **0.00053 s** |
+
+Four times the input, sixteen times the cost, in both of the first two columns. That is the signature the arm was written to detect.
+
+**The fix is a second guard, not a wider number.** `(?<![^\s|^~&])` admits a match only where the previous character is whitespace, a delimiter, or start-of-string, so a delimiter-free run gets ONE attempt instead of one per character and every other offset fails the lookbehind in constant time. It is the exact complement of the character class that follows it, so it cannot change what matches. Verified against the pre-guard pattern over **200,000 randomized delimiter-heavy strings with zero disagreements**, plus the HL7-shaped lines now parametrized into `test_the_linear_scan_guard_does_not_change_what_is_redacted`. A `\b` guard would have been the tempting spelling and is **not** equivalent: `-`, `.` and `:` are word boundaries but also live inside `[^\s|^~&]`, so `\b` would drop them from the front of a redacted span.
+
+### Limb 2 -- the input is not bounded, and the scan is on the event loop
+
+Two properties turn a slow regex into a whole-engine stall, and neither is obvious from the call site.
+
+1. **The truncation runs after the scan, not before it.** `safe_text` computes `redact(text)` and *then* applies `limit`, so the 200-character default bounds what reaches a stored `last_error`, not what the scan reads.
+2. **The logging filter has no bound at all.** `redact` is installed as a handler filter in [`logging_setup.py`](../messagefoundry/logging_setup.py) and rewrites whole rendered tracebacks, on whatever thread emitted the record -- for the engine, the asyncio event loop.
+
+The hostile shape is ordinary. The base64 alphabet contains none of `| ^ ~ &` and no whitespace, so an `mfb64:v1:` payload ([ADR 0028](adr/0028-base64-binary-carriage-codec.md)) quoted into an exception message or a traceback is one token to this scan. A Router or Handler raising with a message built from the received body produces exactly that.
+
+**One narrowing worth recording:** a base64 blob sitting *inside* an HL7 segment line is not the expensive case. `_HL7_SEGMENT` runs first and replaces the whole line, so the field-run scan never sees the blob. The expensive case is a bare run with no segment header, which is what a free-text exception message carries.
+
+### What the replacement test does
+
+`tests/test_redaction.py` now times the shipping `redact` on a 16,000-character delimiter-free run against one `_SCAN_BUDGET_SECONDS` line (0.05 s), with the **pre-fix** pattern swapped into that same path as a live positive control that must EXCEED the same line. Margins run in opposite directions across it: 93x above against the worst of 15 samples, 12.9x below against the best of 15.
+
+**The control is the possessive-without-lookbehind form, deliberately.** That is the half-fix. A control that only a fully unguarded pattern could fail would leave a band in which the half-fix cleared both arms -- which is the state this row found shipped.
+
+A third arm, `test_the_hostile_fixture_is_actually_hostile`, asserts the fixture's longest delimiter-free token directly, and pins the replaced arm's input at token length 1 for the record. Token length is the only property of an input that makes this scan expensive, so it is what a cost arm must assert about its fixture.
+
+### The mutation pair, one variable changed
+
+The mutation removes the `(?<![^\s|^~&])` lookbehind, restoring the pattern that shipped before this change:
+
+| test body | baseline (guarded) | under the SAME mutation |
+|---|---|---|
+| new | 35 passed in 2.18 s | **1 failed, 34 passed** in 5.47 s -- `cost 0.4643s ... against a 0.05s budget` |
+| old | 15 passed in 0.65 s | **15 passed** in 0.87 s -- completely invisible |
+
+### Still open
+
+- **Other single-sample wall-clock arms are not surveyed.** This row fixed the one it was pointed at and the sibling under #1385. Nobody has swept the suite for the same shape.
+- **`safe_text` redacts before it truncates, and that ordering is unchanged.** It is the safe ordering for PHI -- truncating first could cut a span mid-match -- and with the scan linear the cost argument for reversing it is gone. Recorded so the next reader does not re-derive the question.
+
+## 1438. Fail closed when the bundled breach corpus is unusable, instead of silently disabling password screening
+
+> 🚧 **Filed 2026-09-03. Implemented and committed on a feature branch, not merged.** `_common_passwords()` read `messagefoundry/auth/data/common_passwords.txt` and returned a `frozenset` of its lines. An empty or truncated file produced an **empty set**, `PasswordPolicy.violations` stopped emitting the `"not be a common or breached password"` clause, and breach screening became a no-op. Nothing logged. `password_check_breached` ships `true`, so the shipped configuration would assert a check that was not running.
+>
+> **Severity is conditional (sec. 0).** Zero instances run, so nothing is unscreened today. The defect is in the shipped code: a **first** deployment whose corpus file had been truncated, emptied or replaced would accept every weak password that cleared the length clause, and no log line, metric or audit row would say so.
+
+**Cluster:** Auth / password policy (ASVS 6.2.4). **Priority:** P2. **Verdict:** fix, shipped on the branch above.
+
+### The failure was silent in both directions, which is what made it worth a row
+
+A screen that rejects nothing looks exactly like a screen that found nothing to reject. `violations` returned `[]` either way, and `[]` is the success value. There was no runtime assertion anywhere: `tests/test_auth_core.py::test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar` pins the corpus at **build** time (BACKLOG #1134) and nothing checked it again after the wheel was installed.
+
+The decode is where the silence enters. `data.decode("utf-8", "ignore")` swallows a corrupt, truncated or mis-encoded file and yields a short-or-empty set with no exception, so there is no explicit early-out to find by reading: the empty set is **produced by the comprehension**, not returned by a guard clause. The fix therefore grades the parsed **result**, which covers every cause at once.
+
+The bundled corpus is the only screen underneath. `password_breach_corpus_file` is optional and unset by default, so on the shipped configuration the bundled file is the whole check.
+
+### What #1432 covers, and the four reasons it does not close this
+
+#1432 is the detection half, and it **shipped in 0.3.2** while this row was held on a branch. [`integrity.py`](../messagefoundry/integrity.py) now attests an explicit `_ATTESTED_ASSETS` set alongside the loaded engine modules, and `auth/data/common_passwords.txt` is in it. Its rationale comment names this row's exact defect. Four gaps stand anyway, and they are now **measured against the shipped code** rather than claimed against a branch nobody here could read:
+
+1. The tripwire is **alert-only by default**. `[integrity].fail_closed_on_drift` is opt-in, so on the shipped configuration the alert fires and screening still does nothing for the life of the process.
+2. It is a **no-op on editable installs and source-tree runs**, which is every developer checkout.
+3. It runs **once at startup**, while `_common_passwords()` is `lru_cache`d and read lazily on the first password check. There is a window between the two.
+4. It is **detection, not containment**. It never stops a weak password being accepted.
+
+Verified at this merge base: `fail_closed_on_drift` is `False` in `config/settings.py`; the editable-install early-out returns before any hashing; and `run_startup_attestation` is called once from the API lifespan.
+
+Detection and containment are different jobs, and this row is the containment one. **There is a case each one misses, which is the argument for having both.** A wheel BUILT with an already-truncated corpus passes attestation: `RECORD` carries the hash of whatever shipped, so a present-but-truncated file matches its own baseline and drifts from nothing. The tripwire is correct to stay silent there, and this guard still fires because it grades the parsed result rather than the bytes. The inverse also holds. Post-install tampering drifts the hash while possibly leaving enough entries to clear this floor, and there the alert is the only signal.
+
+### The fix
+
+Two halves, deliberately at different levels.
+
+**Contained, in `messagefoundry/auth/policy.py`.** `_common_passwords()` now raises `BreachCorpusUnavailable` when the file cannot be read, or when it holds fewer than `ASVS_6_2_4_MIN_CORPUS_ENTRIES` entries. `PasswordPolicy.violations` therefore refuses a password rather than accepting every password. On an ESTABLISHED instance only the password *create* and *change* paths screen a password, so this never touches login, never invalidates a session, and never stops message flow. A **first** run is the exception and is not narrow: see BACKLOG #1447.
+
+**Loud, in `messagefoundry/auth/service.py`.** `_error_if_bundled_corpus_unusable` loads the corpus eagerly in `AuthService.__init__`, beside the existing `_warn_if_corpus_unreadable`, and logs the defect at `ERROR`. That closes gap 3 above: the operator learns at boot instead of at somebody's first password change. That reporter does **not** stop the engine. HL7 flow does not depend on password screening, and bricking a message engine over an auth data asset trades a contained failure for an outage. **Read that as scoped to the reporter, not to this change as a whole.** On a first run the bootstrap generator screens its own candidate, so the raise from `violations` escapes an unguarded lifespan call and startup fails. BACKLOG #1447 carries that, with the chain measured and the options weighed.
+
+The two halves sit at different levels on purpose. The operator corpus degrades to a `WARNING` because the bundled list still screens underneath it. Nothing screens underneath the bundled list.
+
+### Why the floor is 3000 and not a non-empty check
+
+`ASVS_6_2_4_MIN_CORPUS_ENTRIES = 3000` is the ASVS 6.2.4 bar, re-used against a **different quantity** than the build-time test measures, and that difference is the reason it is safe.
+
+The build-time test counts entries that **clear the shipped policy**. The runtime guard counts the **whole corpus**. The clearing subset is a subset of the corpus, so a corpus holding fewer than 3000 entries in total cannot hold 3000 that clear the policy. The runtime check is therefore a **necessary condition** for the pinned bar, never a stricter one, and it cannot fail an install the build-time test would have passed.
+
+It costs one `len()` on an already-cached `frozenset`. A bare non-empty check would have caught truncation to zero and missed partial corruption.
+
+**Keying the guard on the clearing subset instead would be wrong, not merely more expensive, and this is the load-bearing reason for the choice.** The clearing count tracks `min_length` hard. Measured on the shipped corpus, independently by two sessions:
+
+| `min_length` | entries clearing the policy | against the 3000 bar |
+|---|---|---|
+| 8 | 9,135 | over |
+| 10 | 6,020 | over |
+| 12 | 5,367 | over |
+| 15 (shipped) | 5,274 | over |
+| 16 | 3,173 | over, by 173 |
+| 17 | 1,735 | **under** |
+| 20 | 512 | **under** |
+
+The margin at the shipped floor is one increment. A runtime guard keyed to clearing would start refusing every password on a site that raised its minimum to 17, with a corpus that is unchanged and sound, punishing an operator for making the policy stronger. The total is invariant to `min_length`; the clearing subset is not. Measured here: the total reads 15,045 at every floor in that table.
+
+**Read the table as measured-at-this-corpus, not as constants.** Every number in it moves together if the corpus is regenerated, and a regeneration script is in flight on another branch. The argument does not depend on the values: it needs only that the clearing subset shrinks with `min_length` while the total does not, which holds for any corpus. The invariance arm was measured; the rest of the table was produced in one worktree and reproduced in another before being written down.
+
+Measured 2026-09-03 on this branch: the shipped corpus is **15,256 lines** and parses to **15,045 unique entries** (the difference is case-duplicates, which lower-casing folds), **5,274** of which clear the shipped policy. The guard counts the parsed set, not the lines. Headroom over the floor is about 5x, so ordinary corpus curation cannot trip it.
+
+### An operator corpus does not excuse a broken bundled one
+
+Python's `or` evaluates `_common_passwords()` first, so the bundled floor is checked before any operator corpus is consulted. That is deliberate and it is the one judgment call in this row a reviewer should push on. An operator corpus is additive under 6.2.12 and has **no floor of its own**, and a bundled file that has been truncated or replaced is evidence about the **install**, not about the screen. The repair is to reinstall the wheel.
+
+### The tests, and the positive control
+
+A guard against a silent failure needs a reading that would have proved it absent, or it is untestable by construction. Seven cases land in a new `tests/test_password_corpus_guard.py` rather than in `tests/test_auth_core.py`, which concurrent work is restructuring; the build-time bar stays where it is and this file holds the runtime guard the same number implies. Measured on this branch by removing the guard and re-running: **four fail, and the two negative-control arms still pass.**
+
+| arm | what it pins | fails with the guard removed |
+|---|---|---|
+| truncated corpus refuses | the positive control: a five-entry corpus, and a passphrase the existing tests assert is ACCEPTED against the real corpus | yes |
+| empty corpus refuses | truncation to zero bytes, the cheapest way to disable the screen | yes |
+| missing corpus refuses | a distinct cause and a distinct message: the read failed rather than returning too little | yes |
+| startup reports it at ERROR | the loud half | yes |
+| shipped corpus clears the floor | keeps the three above honest: a guard wired to fire unconditionally would pass all of them | no, by design |
+| `check_breached=False` stays silent | the deliberate opt-out still works, and the guard did not become an import-time assertion | no, by design |
+| startup silent when screening is off | a corpus nobody consults is not a defect | no, by design |
+
+### Residual
+
+- **The API answer is a generic 500.** `app.py`'s catch-all handler logs the exception type and returns `{"detail": "internal error"}`. `BreachCorpusUnavailable` is a server fault, not a client one, so 500 is honest, but 503 with a specific message would be better. Mapping it means touching the API layer and both `/ui` twins, which is wider than this row.
+- **First-run bootstrap and admin password reset both raise.** `_generate_policy_password` screens its own output, so a broken corpus fails those too. That is fail-closed and correct, and both are recoverable by repairing the file, but it means a broken corpus blocks minting the first admin account. Worth an owner ruling if anyone disagrees.
+- **`lru_cache` does not cache exceptions**, so a broken install re-reads the file on each password attempt. That is one file read on an install already refusing them, and it means a repaired file recovers without a restart. Recorded as a deliberate trade, not an oversight.
+- **A regenerated corpus cannot trip the floor.** Concurrent work adds a build script that rewrites this file. The floor is 3000 TOTAL entries while the pre-existing build-time test pins 3000 POLICY-CLEARING entries, and clearing is a subset of total, so any corpus passing that test passes this guard. A corpus that did fall under 3000 total could not satisfy ASVS 6.2.4 on its own terms either.
+- **The floor is line-ending independent, so a `.gitattributes` pin cannot affect it.** Measured: the loader's `splitlines()` plus `strip()` return **15,045 entries under LF, CRLF and bare CR alike**, against a positive control (a five-line corpus) that correctly reports 5. Byte-level line-ending policy is a **wheel reproducibility** question, not an attestation one, and it changes nothing this guard reads. The startup attestation cannot be split by it on any host: [`integrity.py`](../messagefoundry/integrity.py) takes its baseline from `dist.read_text("RECORD")` and hashes the file in the same install root, and pip writes that RECORD from the bytes it unpacked, so baseline and file come from one install and move together. What the byte policy really costs is that two builds of one commit on different platforms produce different artifacts. An earlier draft of this row said the attestation was affected; that was wrong, and four sessions held that version before anyone read `integrity.py`.
+- **The number 3000 now has three independent homes** and no shared constant can join them: `ASVS_6_2_4_MIN_CORPUS_ENTRIES` here, the literal in the build-time test, and a third in the corpus-regeneration script under `scripts/`, which runtime code in `messagefoundry/auth/` must not import. Consolidating them is somebody's later cleanup, not a coupling worth inventing now.
+- **#1134's own banner is stale**, unrelated to this fix and not touched here. Its scoring note says the bundled corpus "supplies far fewer than 3000 policy-matching entries", which the 5,274 measured above contradicts. Its pinning test exists and passes. Someone should re-score it.
+
 ## 1444. a backlog item can be filed with no value or difficulty, so a scoring pass decays at the filing rate
 
 > 🔢 **Filed 2026-09-04 - not started. This is a DECISION, not a defect: the items are behaving correctly and the ledger has no gate.** Value **5/10** · Difficulty **3/10** · _fill-in_. Value 5 because the ranked tables silently stop being a complete view of the corpus, and a reader has no way to tell a ranked ledger from a partly-ranked one; a re-run is a real workaround, which is what holds it out of the higher bands. Difficulty 3 because either remedy is small on its own and the cost is the ruling above it, not the code.
@@ -24240,6 +25440,138 @@ The round-number rows are dead on an assumption worth naming: **that an estate c
 **What would NOT settle this:** scoring the five and calling it closed. That is another snapshot, and it decays the same way. The thing to fix is the absence of a gate or a cadence, not the current five.
 
 **Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
+
+## 1445. The web console package still speaks the retired integer-seam vocabulary in the sites #1443 deferred
+
+> 🔢 **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found by the audit #1443 ran while rewriting the seam-refresh procedure, which named these sites in its own closing paragraph and deliberately left them out so a documentation rewrite stayed separately reviewable. LIMB 3 is why one more site than that paragraph named is fixed here.
+> **Scored at filing 2026-09-04.** Value **2/10** · Difficulty **1/10** · _fill-in_. Value sits below #1443 on purpose: #1443 removed a procedure that manufactured a false green, and this removes the vocabulary left behind after it. No engine, PHI or deployment axis; the population is developers reading the console package. It is not a 1 because LIMB 1 is a comment that cannot be read to completion at all, which costs a reader more than a stale word. Difficulty 1 prices the remainder: five prose spans across four files, no code path, no test, no CI leg.
+
+**Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- every span here is a comment, a changelog line, a generator docstring or an ADR note. The shipped digest is unchanged: `python scripts/webconsole_seam_snapshot.py --digest` returns the same value before and after. The cost is a reader's session, and it is the same shape #1439 and #1443 record: prose that teaches a mechanism the code retired.
+
+**What:** BACKLOG #1220 turned `ENGINE_UI_SEAM` from a hand-picked incrementing integer into a 16-hex-character SHA-256 digest of a surface `scripts/seam_discovery.py` discovers. #1443 rewrote the procedure page onto that. The sites below still speak the retired vocabulary.
+
+| Site | Said | Shipped behaviour |
+|---|---|---|
+| `messagefoundry_webconsole/__init__.py:27-29` | "The engine contract **versions** this console build supports ... A pair **outside this set**", above a truncated fragment naming "Seam 9" | one seam, refused if it is not the one built against (#279) |
+| `packaging/messagefoundry-webconsole/CHANGELOG.md:16`, `:25` | `[Unreleased]` supports "engine UI seam `2`, `3`", `SUPPORTED_ENGINE_SEAMS = {2, 3}` | a `frozenset[str]` holding exactly ONE digest |
+| `packaging/messagefoundry-webconsole/CHANGELOG.md:10` | "each entry notes the supported engine seam(s)" | a value written into an entry cannot be kept current |
+| `scripts/webconsole_seam_snapshot.py:13` | "failing CI on any **unbumped** incompatible change" | nobody bumps a derived digest |
+| `docs/adr/0143:169` | `app.state.loopback` was "**curated** into the webconsole seam snapshot (no `ENGINE_UI_SEAM` bump)" | #1220 retired curation; true when written |
+
+**LIMB 1 -- THE COMMENT WAS NOT STALE, IT WAS AMPUTATED, AND GIT NAMES THE CUT.** `messagefoundry_webconsole/__init__.py:29` read `# Seam 9 is the S8a console-dashboard lane (#76/#131/#136, ADR 0065 + ADR 0007 amendments): the` and stopped, mid-sentence, on the article "the". Commit `e5992c10f` wrote it as the first line of a five-line sentence. Commit `c01cb8294` -- the #279 narrowing, landed as `3ca4e6bb0` -- deleted the four continuation lines and left the opener standing as unchanged diff context. A reader reaching line 30 does not find the rest of the sentence; they find a different sentence about #279 and read on.
+
+The fragment is **deleted rather than restored**, for three reasons. Its content survives in full and in better shape at `messagefoundry/api/_ui_seam.py:61-66`, so restoring it here would recreate the restatement SDS-3.5 forbids. It speaks the retired form: `_ui_seam.py:46-47` says the `vN` labels "are RETIRED as identifiers -- they no longer name the shipped value, they date the change", and the sanctioned shape is the framed `#: seam v9:` history entry, not a bare `Seam 9 is`. And it annotates a constant it now describes falsely: since #279 the console supports exactly one seam, and it is not 9.
+
+**LIMB 2 -- DELETING THE FRAGMENT ALONE WOULD HAVE LEFT THE CONTRADICTION IT WAS HIDING.** The two `#:` lines ABOVE it carry the same pre-#279 range framing: "The engine contract **versions** this console build supports ... A pair **outside this set** is refused." Two lines below, the `#` block says the opposite -- "EXACTLY the engine seam it was built against, deliberately a single value, not a range". Removing the fragment between them puts the contradiction on adjacent lines.
+
+An adversarial pass caught this, and it is the reason the fix is a three-line rewrite rather than a one-line deletion. The `#:` docstring now states what the constant IS, singular and without a set; the `#` block below keeps the WHY and the #279 citation, so the one-value rule is stated once (SDS-3.5).
+
+**LIMB 3 -- ONE SITE WAS ADDED BECAUSE #1443's OWN DIFF ORPHANS IT.** `scripts/webconsole_seam_snapshot.py:13` still says "failing CI on any unbumped incompatible change". #1443 rewrites that exact word in the doc twin at `docs/WEBCONSOLE-PACKAGE.md:134` into "an incompatible change the seam did not follow", and its two hunks in the generator (`@@ -38,8 +38,17 @@` and `@@ -300,8 +309,8 @@`) do not reach line 13. So #1443 would land a corrected page beside the uncorrected code it documents, and a defer would leave the line owned by nobody. It is taken here, at line granularity.
+
+**SO #1443's CARVE-OUT PARAGRAPH IS SHORT BY ONE, AND THAT IS RECORDED HERE BECAUSE IT WILL NOT BE CORRECTED THERE.** It opens "Three more, all in the #1220 class" and lists three; this line is the fourth. Its author verified that against their own branch on 2026-09-04 and decided against pushing a fix, on grounds that are about merge cost rather than about the record: #1443 is green, labelled and mergeable with the Lander waiting on it, and a push strips the label and restarts about forty checks to correct a list this item makes true anyway. That is a reasonable trade and it is why a reader who counts three in #1443 must find the fourth somewhere, so it is here.
+
+**The enumeration is the defect, not the miscount.** "Three more" is exactly the liability CLAUDE.md section 11 names under SDS-3.6, which prefers "at least" to a list: the same paragraph written as "at least three more" would have cost nothing, stayed true when a fourth appeared, and needed no correction now. The miss is also the instructive kind -- #1443's audit opened this file, flagged `:41` and `:303` in it, and walked past `:13`. A site missed inside a file you are editing is worse than one missed in a file you never opened, because the reader's fair assumption is that an edited file was read through.
+
+**THE TWO SPANS #1443 DOES REWRITE IN THAT FILE ARE DELIBERATELY NOT TOUCHED** -- the module docstring's redirect paragraph and its duplicate in `write_seam_and_golden`. Editing them from here would conflict on exactly the lines an open change is rewriting, which is the collision #1220 exists to prevent, arrived at by hand.
+
+**Merge safety was measured, not assumed.** `gh pr list --state open --limit 100` returned 24 open pull requests; two touch `messagefoundry_webconsole/__init__.py` and both edit only line 48, the constant. A three-way merge of this branch's `__init__.py` against each returned exit 0 with zero conflict markers, and the line-13 generator edit merges clean against #1443's head the same way.
+
+**LIMB 4 -- THE CHANGELOG'S CONVENTION IS THE DEFECT, NOT ONLY THE TWO WRONG LINES.** `[Unreleased]` claimed the console supports "engine UI seam `2`, `3`" and printed `SUPPORTED_ENGINE_SEAMS = {2, 3}`, retaining seam `2` "because the new field has a default, so a seam-`2` engine still renders here". That reasoning is precisely what #279 retired as untested -- CI installs ONE engine, so every accepted seam but that one was exercised by nothing. Both lines are PRESENT-state claims about an unreleased build, and the shipped constant is a `frozenset[str]` of one digest.
+
+The header three screens up is what would reproduce them: "each entry notes the supported engine **seam(s)**" instructs the next author to write a value into a changelog line, where it can never be updated. That is the rule `docs/WEBCONSOLE-PACKAGE.md` already states for its own heading, which said "currently 1" until seam 11. The banner now points at `SUPPORTED_ENGINE_SEAMS` instead of quoting it, and the header says why an older entry still quotes an integer.
+
+**No value is written into any of this prose, and the reasoning is not restated either.** A first draft of the banner explained what a digest is and why the set holds one. That is a third copy of a fact `_ui_seam.py:27-29` states and #1443 states again on the procedure page, so the SDS-3.5 rule this item applies to the code applies to it: the banner points, and the citations carry the rest. `[0.2.15]`'s "Supported engine UI seam: `1`" is left alone -- it records what that release actually shipped.
+
+**LIMB 5 -- THE ADR IS DATED, NOT EDITED, AND THE RULE IS WRITTEN DOWN.** `docs/adr/README.md:3-5`: ADRs "are append-only history -- supersede an ADR with a new one rather than rewriting it." `docs/adr/0143`'s acceptance checklist records that `app.state.loopback` was "curated into the webconsole seam snapshot (no `ENGINE_UI_SEAM` bump)". Both retired tokens sit on one line, and both were true on 2026-07-21. Editing the row would falsify the record of what was done at acceptance; leaving it bare would let a reader take a retired mechanism as live. A dated blockquote after the checklist does neither, and it matches how 0143's own Status line already carries its 2026-08-22 supersession by ADR 0172.
+
+**Verification:** the commands run and their results are recorded in the pull request body, together with the legs only a hosted runner reports. The load-bearing one is that no contract moved: `python scripts/webconsole_seam_snapshot.py --digest` returns the same digest as `ENGINE_UI_SEAM` and `SUPPORTED_ENGINE_SEAMS`, before and after this diff.
+
+**Adjacent and NOT fixed here, named rather than numbered, and at least these.** A sweep of the retired vocabulary across `messagefoundry_webconsole/`, `packaging/`, `scripts/`, `tests/`, `docs/` and `messagefoundry/api/` returned four more live sites this diff leaves alone. `tests/test_webconsole_seam_snapshot.py:11`, `:110` and `:125-127` carry "unbumped", "A seam bump has always required editing BOTH constants" and an assertion message opening "Bumping ENGINE_UI_SEAM requires updating..." -- #1443 examined that file, ruled it test prose rather than the procedure a developer follows, and left it "for whoever next edits that file"; nothing found here overturns that ruling, and a third hand on one gate's files in one week is how #1220's fault arrived. `messagefoundry_webconsole/_auth.py:297` and `docs/INSTALL-GUIDE.md:250` carry the same vocabulary in passing. And the root `CHANGELOG.md:302` says "A console wheel older than this engine refuses to mount, as designed" -- an ORDERING claim, where `assert_engine_seam` is a set-membership test (`messagefoundry_webconsole/__init__.py:62`), so a NEWER wheel is refused identically; that line was wrong when written and #1220's unordered digest only widens the gap. It sits inside a frozen `[0.3.1]` release block, which is why it is named rather than edited.
+
+## 1446. Rule 3c resolves a relative -C against the session cwd when a chdir in the guard window has already moved the shell
+
+> 🔢 **Filed 2026-09-04 (builder) -- MEASURED IN BOTH DIRECTIONS, INHERITED RATHER THAN INTRODUCED, AND DELIBERATELY NOT FIXED IN THE ACT THAT FOUND IT.** Found by the adversarial pass on #1065's chdir-window fix, measured against `origin/main`'s gate and against the branch that closes that one, and byte-identical on both.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build.
+
+**Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. *(Clause carried verbatim from #1065, because without it this row reads as a product-severity claim and it is not.)* It is a **fail-open in an enforcement control** whose mirror is a **false deny naming a repository the write never touches**, and both are reached by ordinary tokens.
+
+**What.** `Get-GitTargetCandidatesRaw` roots a relative `-C` against the session cwd, composing it with a chdir it can see in the PREFIX (#1085). It cannot see a chdir sitting BETWEEN the first git token and the disarm, because the prefix is sliced at the first git token. So when the disarming invocation carries its own relative `-C` and a chdir has already moved the shell, the gate measures that `-C` against the directory the session started in rather than the one git will stand in.
+
+**Measured 2026-09-04.** Throwaway governed rig -- a primary, a nested worktree, a linked worktree and an independent clone -- with the hook subprocess cwd set equal to the payload cwd. Identical verdicts on `origin/main` and on the #1065 chdir-window branch:
+
+```
+cwd = an UNGOVERNED clone
+  git commit -C HEAD && cd "<primary>" && git -C . config core.hooksPath /nope     ALLOW
+  reality: the write lands in the GOVERNED primary's shared config
+
+cwd = the GOVERNED primary
+  git commit -C HEAD && cd "<ungoverned>" && git -C . config core.hooksPath /nope  DENY
+  reality: the write lands in the ungoverned clone, and the refusal names the primary
+
+controls, the same `-C .` with no chdir on the line
+  from the primary            DENY
+  from the ungoverned clone   ALLOW
+```
+
+The controls are what make the two rows above readable: `-C .` alone is judged correctly in both directions, so the chdir is the only variable.
+
+**ONE ROOT CAUSE, SYMPTOMS IN BOTH DIRECTIONS**, which is a signature this file already records twice -- a base that is not the base. A fix aimed only at the ALLOW direction produces the DENY direction, and #1085 is this same defect one window earlier on the line.
+
+**WHY #1065's ACT STOPPED SHORT, stated so the gap is not read as an oversight.** That fix appends the followed chdir as a candidate ONLY when the disarming invocation names no repository of its own. The gate is deliberate: when an explicit `-C` or `--git-dir` IS present, that token decides where the write lands, and letting a governed chdir outrank it manufactures exactly the false deny above. Closing THIS row instead means composing the window chdir into the **`-C` branch** of the resolver -- widening the base every `-C` on every calling rule is measured against -- and that is the class of change two rejected rounds of #1065 died of, both times because the replacement turned out narrower or wider than the matching it displaced.
+
+**ANY FIX MUST PIN BOTH DIRECTIONS PLUS AN UNGOVERNED CONTROL**, red-first against the pre-fix gate in each direction. A suite carrying only the fail-open row passes against a rule that denies everything, and the false-deny row is the one that actively misinforms the session reading it.
+
+**Related:** #1065 (the pass that measured this, and whose fix deliberately stops at the gate described above), #1085 (the same COMPOSE-versus-PREFER defect in the prefix window, fixed and verified), #1066 (declined-by-design 2026-08-25, the residual family this joins), #1000 (a control green because it cannot see the class it covers).
+
+**Source:** the adversarial pass on #1065's own chdir-window fix, tasked with finding the shapes the new matching does not catch rather than confirming the ones it does.
+
+
+## 1447. an unusable breach corpus blocks minting the first admin account, because the bootstrap generator screens its own random token
+
+> 🔢 **Filed 2026-09-04. The heading understates it, and this line is the finding: on a FIRST run an unusable bundled corpus does not merely block the admin account, it stops the engine starting at all.** `AuthService.initialize` is awaited unguarded in the API lifespan, and on an empty store it mints the bootstrap admin through a generator that screens its own candidate. With BACKLOG #1438's guard in place that screen raises, the exception escapes the lifespan, and startup fails. On any later run `count_users() > 0` short-circuits the whole path and the engine starts normally.
+>
+> **Severity is conditional (sec. 0).** Zero instances run. Written as what a first deployment would meet: an operator whose wheel shipped or acquired a truncated corpus would get a process that refuses to come up, with the cause in the log from #1438's startup reporter but no admin account and no obvious link between the two.
+>
+> **Residual of #1438, which is not yet on `main`** as this is filed. The behaviour described here does not exist until that lands, so this row is filed ahead of its own subject deliberately rather than describing shipped code.
+
+**Cluster:** Auth / password policy (ASVS 6.2.4). **Priority:** P2. **Verdict:** needs an owner ruling, then a small fix.
+
+### The chain, measured
+
+Each link verified at this branch's merge base:
+
+1. [`api/app.py`](../messagefoundry/api/app.py) -- the lifespan awaits `auth.initialize()` with no `try`.
+2. [`auth/service.py`](../messagefoundry/auth/service.py) -- `initialize` calls `_ensure_bootstrap_admin`.
+3. Same file -- `_ensure_bootstrap_admin` returns early when `count_users() > 0`, so **only a first run continues**, then calls `_generate_policy_password`.
+4. Same file -- that generator loops 16 times over `secrets.token_urlsafe`, calling `self._policy.violations(candidate)` on each.
+5. [`auth/policy.py`](../messagefoundry/auth/policy.py) -- `violations` consults `_common_passwords()`, which raises `BreachCorpusUnavailable` when the corpus is unusable.
+
+The raise escapes on **iteration one**, so the generator's defensive `token_urlsafe(length) + "aA1!"` fallback is unreachable in this state. `admin_reset_password` reaches the same generator, so an admin-initiated password reset fails the same way, but that one is a 500 on a running engine rather than a failure to start.
+
+### Why the guard is arguably wrong HERE specifically, and right everywhere else
+
+The candidate is `secrets.token_urlsafe(max(24, min_length))` -- at least **192 bits** of entropy, rendered as roughly 32 URL-safe characters. It is not a human-chosen password and cannot appear in a corpus of human-chosen passwords. **The breach clause is inert on this input by construction.**
+
+So on this one path #1438's guard converts a check that can never fire into a check that always blocks. That is the precise shape of a false positive: the control is refusing an operation it was never able to evaluate in the first place, and the refusal is total.
+
+This does **not** generalise. On every other path `violations` screens an operator-supplied or user-supplied password, where the corpus is the whole point and failing closed is correct. Do not "fix" this by weakening the guard.
+
+### The options, not decided here
+
+| option | what it costs |
+|---|---|
+| screen the generated token with `check_breached=False` | one line and a comment; the screen it drops is provably inert on a 192-bit token. Keeps every other path failing closed. **Recommended.** |
+| catch `BreachCorpusUnavailable` inside the generator and fall through | keeps the screen wired but makes the generator quietly tolerate a broken corpus; a reader then has to reason about which failures it swallows |
+| guard `auth.initialize()` in the lifespan | wrong layer. It would let the engine start with no admin and no way to make one, trading a loud failure for a confusing one |
+| leave as is | defensible fail-closed reading: an install whose shipped security data is corrupt should not mint the highest-value credential in the system. Costs a first deployment a startup failure whose cause is two files away from its symptom |
+
+**The first option is the recommendation** because it removes a refusal that carries no security value while leaving every refusal that does. The fourth is a real position and the reason this is filed for a ruling rather than just fixed.
+
+### What would make this concrete
+
+A test that builds an `AuthService` against an empty store and an unusable corpus, and asserts `initialize()` does not raise once the chosen option lands. There is no such test today, which is why the interaction was found by reading the call graph rather than by a red leg.
 
 ## 1441. Non-serve CLI subcommands run with no root logging handler, so WARNING+ records bypass the PHI filter chain via logging.lastResort
 
@@ -24399,6 +25731,141 @@ Whether the tray needs the chain is unresolved and unclaimed. It is named as a s
 
 **Related:** #1054 and #1055 (the same class, both shipped), #1199 (the same premise, the opposite consequence) and its fix [PR 820](https://github.com/MEFORORG/MessageFoundry/pull/820), merged as `99887f5a4` and re-checked against this gap at `a2eef0f37`, which does not close it.
 
+## 1442. Pin shipped-artifact line endings so a Windows-built wheel matches the released one
+
+> 🔢 **Filed 2026-09-03 -- the `.gitattributes` stanza and its guard test are written, verified and open as a pull request.** Every blob in the repository stores pure LF, and under `core.autocrlf=true` every text file checks out CRLF, so a wheel built from a Windows tree is byte-different from the released Linux one and the two `*.dist-info/RECORD` rows disagree while the content is identical. **Nine shipped files drift, not one** -- the four non-`.py` files under `messagefoundry/`, plus `LICENSE`, `NOTICE`, `README.md`, `CHANGELOG.md` and `pyproject.toml`. Repo-wide the figure is **1,990 of 2,061 tracked files and 732,340 line endings**, but only the shipped set is in scope here; see the trap at the end before widening it.
+>
+> **Severity: no deployment axis (sec. 0), and no runtime axis either.** `messagefoundry/auth/policy.py` loads the corpus with `splitlines()` and `.strip()`, so CRLF never reaches the password comparison. Nothing published is affected: all three `release.yml` jobs run on `ubuntu-latest`, so every artifact on PyPI is the LF build. **What this costs is rebuild-to-verify**: the SLSA provenance binds an artifact's sha256 to this source commit, and an operator who rebuilds from that commit to check the binding reproduces the digest on Linux and cannot on Windows, with nothing telling them why.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** Release integrity / reproducible builds. **Scope:** the shipped set only.
+
+### The decision, and why the attribute is not a preference
+
+Owner chose the scope on 2026-09-03. The attribute was settled by measurement.
+
+```
+messagefoundry/** text=auto eol=lf
+/LICENSE text=auto eol=lf
+/NOTICE text=auto eol=lf
+/README.md text=auto eol=lf
+/CHANGELOG.md text=auto eol=lf
+/pyproject.toml text=auto eol=lf
+```
+
+**All three candidate spellings produce the same bytes on disk**, so a digest test cannot separate them. Fresh checkout, `core.autocrlf=true`, real corpus bytes, with a planted-byte control that matches neither:
+
+| attribute | on-disk size | sha256 | |
+|---|---|---|---|
+| none (today) | 188,636 | `fd9786f1` | the CRLF digest -- the defect |
+| `-text` | 173,380 | `136e7bcf` | |
+| `text eol=lf` | 173,380 | `136e7bcf` | |
+| `text=auto eol=lf` | 173,380 | `136e7bcf` | chosen |
+| control, planted byte | 173,381 | `3de9c816` | matches neither, so the test can fail |
+
+**What separates them is what happens on the NEXT write.** `-text` disables the clean filter, so it freezes rather than enforces: a Windows editor save commits CRLF into the blob permanently. `eol=lf` normalizes on the way in. Measured in a controlled repository -- the same CRLF edit lands `CRLF=4` in the blob under `-text` and `CRLF=0` under `eol=lf`. `-text` also shows the whole file as modified against the index (a 15,256-line diff on the corpus, which a careless `git add -A` would then commit), while `eol=lf` shows no content diff at all.
+
+**That equivalence is contingent, and must not be quoted as a general property.** The three agree only while the stored blob is already LF, so normalizing is a no-op. `-text` preserves whatever is committed; the `eol=lf` forms normalize on the way in. A census of all 2,061 tracked files is what makes it safe here: **exactly 4 blobs contain CRLF** -- the vendored CLA bundle (1,297 pairs) and 3 HL7 fixtures -- and none is in the shipped set. `messagefoundry/**` is a forward-looking glob, so this is a fact about today's files, not about the attributes.
+
+**Why the CLA-bundle precedent does not transfer.** That stanza uses `-text` because its blob genuinely holds CRLF and its recorded SHA256 would break on re-encoding, which is exactly what the census confirms. The corpus blob holds zero, so `eol=lf` re-encodes nothing.
+
+### Two traps, both measured
+
+**Never a bare `text` on a glob that can match a binary.** `text eol=lf` strips CRLF byte pairs from inside a binary blob -- a 17-byte fixture with NULs and CRLF pairs stored as 14 bytes. `text=auto` defers to git's binary detection and stores it intact. The 19 `messagefoundry/tray/assets/*.ico` files survive a bare `text` today only because none happens to contain a CRLF pair, which is agreement by luck.
+
+**Anchor the root patterns.** A pattern with no slash matches at any depth, so an unanchored `README.md` also matches `docs/README.md`, `ide/README.md` and 22 others. **Measured against the real path list: 24 files outside the shipped set, and zero once anchored.** An earlier draft of this row said 11; that was an undercount bounded by a probe covering only `tests/ samples/ scripts/ docs/ ide/`, and it omitted `.github/`, `docker/`, `harness/`, `packaging/` and `security/`. The same draft also blamed anchoring for downgrading `messagefoundry/generators/README.md` to `text=set` -- that was the bare-`text` spelling, a separate defect fixed by `text=auto`. Two fixes, not one.
+
+### The blob id is the anchor worth quoting
+
+Peers circulated "`git hash-object` returns `4482f231` under `autocrlf=true` and `7ca7ef4a` under `autocrlf=false`". Both values are real, but that framing buries the checkable half. Measured by varying whether the clean filter runs -- **not** by toggling `core.autocrlf`, which was not tested:
+
+```
+git hash-object --no-filters <corpus>     -> 7ca7ef4a   raw CRLF working tree
+git hash-object --path <corpus> <corpus>  -> 4482f231   clean filter applied, LF
+git rev-parse HEAD:<corpus>               -> 4482f231   the committed blob id
+```
+
+`4482f231` is not "the value under some setting"; it is the committed blob id, checkable in one command that needs no config change.
+
+### What is NOT affected, because four sessions believed otherwise before anyone read the file
+
+**The ADR 0041 D3 startup attestation is not downstream of this pin.** `messagefoundry/integrity.py` hashes on-disk bytes, but it sources the expected value from `dist.read_text("RECORD")` -- the installed distribution's own RECORD, which pip writes from the bytes it unpacked. Baseline and installed file therefore come from one install and cannot be split by a line-ending policy: a CRLF-built wheel carries CRLF bytes *and* a CRLF-derived RECORD, and attests clean. Reading the hash site without the baseline site is what produced the false dependency. This would change only if a digest were ever recorded **in the repository** rather than sourced from RECORD.
+
+### Follow-ups this row does not close
+
+1. **No test yet.** A test asserting `git check-attr` returns the pinned values for the shipped set would prevent regression. It was left out deliberately: a new test file needs a `tests/tooling_manifest.txt` entry unless it imports the engine, and the full suite could not be run before the session closed. Add it with the manifest line in the same commit.
+2. **The working tree materializes on the next checkout.** Changing an attribute does not rewrite an existing checkout. The blobs already store LF so nothing is re-encoded, but to materialize immediately, delete the nine affected files and `git checkout -- .` rather than `git reset --hard`.
+3. **The repo-wide question is separate and NOT decided here.** **The HL7 carve-out an earlier draft of this row called for ALREADY EXISTS** and was missed because the census read only the root `.gitattributes`, not the nested ones: `samples/messages/hapi-hl7v2/.gitattributes` pins `*.hl7 -text` and `*.txt -text`, on a better rationale than the one that draft gave -- the fixtures are vendored byte-verbatim and normalization would break the MPL-2.0 "unmodified" basis. Of the 7 vendored fixtures, 4 are bare-CR terminated and 3 are CRLF, which is what HL7 v2 segment termination looks like on disk. A repo-wide `* text=auto eol=lf` would still need that nested pin to keep winning, so anyone taking it up must verify precedence rather than assume it.
+4. **A record on an unmerged branch states a precondition that is false.** `reference/1134-corpus-provenance-do-not-merge` records `sha256 136e7bcf` in `common_passwords.NOTICE` over raw on-disk bytes and asserts the corpus "is pinned `-text` in `.gitattributes`". That is false on `main` -- `git check-attr text eol` returns unspecified, the measurement this row started from -- and it becomes wrong in its specifics under `text=auto eol=lf` while staying right in substance. The branch is marked do-not-merge, so a NOTICE-only cherry-pick is the likely path and the likely place to miss it. Whoever lands that provenance work owns the sentence.
+
+## 1443. WEBCONSOLE-PACKAGE.md's seam-refresh procedure teaches three steps #1220 retired, one of which corrupts the golden
+
+> 🔢 **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found 2026-09-03 while building #1439, which deliberately left it alone so a `sys.path` fix and a documentation rewrite stayed separately reviewable. The wider census in LIMB 4 is why the fix is not confined to the three steps the finding named.
+> **Scored at filing 2026-09-04.** Value **3/10** · Difficulty **2/10** · _fill-in_. Scored here rather than left for a later pass, because nothing in CI requires a score at filing and an item that enters unranked stays unranked until a pass reaches it -- five items filed since 2026-09-03 already carry none. Value is above the bottom of the table but not by much: there is no engine, PHI or deployment axis, and the whole population is developers changing the console contract, which is rare. It is not a 1 because the defect is not cosmetic staleness -- LIMB 2 measures the old procedure walking a reader into a state where the headline gate PASSES on a fabricated seam, and a procedure that manufactures a false green is worth more to remove than one that merely fails. Difficulty 2 prices the REMAINDER, which is what this table prices and nothing else: a section rewrite in one page, a docstring and its duplicate in the generator, one line in the package release checklist, and this row -- four small prose edits on existing seams, no code path, no test, no CI leg, which is where #1381 sits at the same digit for five citation rewrites plus an ADR amendment. **The measurement that made the prose honest is deliberately NOT priced here.** An earlier draft of this line did price it, and that was a rubric error worth recording rather than silently fixing: investigation already done is not remainder, and counting it would make a well-investigated item cost more than a careless one, inverting the scale. What the controls bought belongs in LIMB 2, which carries it. Correction raised by a peer session on 2026-09-04 and verified against the table's own rule at docs/BACKLOG.md:203, "the scores below price only the remainder".
+
+**Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine effect, no PHI axis, and **no deployment axis (sec. 0)** -- this is a developer procedure for a repository gate, and `docs/` and `scripts/` reach no wheel. The cost is bounded to a developer's session and it is the same shape #1439 recorded: **a corrupted golden, then debugging the gate that reported it.** Nothing is mis-shipped, because the seam the engine actually ships is derived by the tool and pinned by the tests either way.
+
+**What:** [`docs/WEBCONSOLE-PACKAGE.md`](WEBCONSOLE-PACKAGE.md)'s "Bumping the seam on an intentional contract change" still described the pre-#1220 world, in which `ENGINE_UI_SEAM` was a hand-picked incrementing integer over five hand-maintained tuples. #1220 made it a **16-hex-character SHA-256 digest of a DISCOVERED surface**. Three of the procedure's seven steps had no meaning left.
+
+| Step | Said | Shipped behaviour |
+|---|---|---|
+| 2 | bump `ENGINE_UI_SEAM` by hand, "e.g. `1` -> `2`" | the value is derived; `test_the_stored_seam_equals_the_derived_digest` fails any hand-written one |
+| 4 | if the change touched the *curated* surface, update the list in `webconsole_seam_snapshot.py` | #1220 retired all five tuples; `scripts/seam_discovery.py` discovers the surface and there is no list |
+| 5 | `python scripts/webconsole_seam_snapshot.py > tests/golden/webconsole_seam.snapshot` | the script's own docstring forbids exactly this; `--write` is the command, and it rewrites the constant AND the golden together |
+
+**LIMB 1 -- THE PROCEDURE IS UNFOLLOWABLE, NOT MERELY MISLABELLED, AND THAT IS THE STRONGEST THING AGAINST IT.** Under a derived seam the value does not exist until the change has been made and regenerated. Old step 2 asked the reader to write it, and old step 3 asked them to copy it into the console before old step 5 ever ran the generator. **There is no order in which the old steps can be executed**, so a reader who follows them faithfully cannot finish, and the first thing they will doubt is the gate rather than the page.
+
+**LIMB 2 -- STEP 5 FAILS IN THE WORST DIRECTION: FOLLOW THE OLD PROCEDURE AND THE HEADLINE GATE GOES GREEN ON A FABRICATED SEAM.** This is the finding that matters, and it is not the one the script's docstring names.
+
+`build_snapshot()` prints whatever `ENGINE_UI_SEAM` is imported, while `contract_digest()` never reads it. So old step 2 (hand-write the value) followed by old step 5 (regenerate the golden by redirect) produces a golden that AGREES with the hand-written value. Reproduced 2026-09-04 in an isolated copy of `messagefoundry/`, `messagefoundry_webconsole/`, `scripts/` and the golden, with the repository untouched and an assertion that the generator read the copy rather than the real tree:
+
+```
+hand-written seam in source   : deadbeefdeadbeef
+seam recorded in the golden   : deadbeefdeadbeef
+test_webconsole_seam_snapshot_matches_golden   : PASS
+test_the_stored_seam_equals_the_derived_digest : FAIL (derived=266cbfd342b22819 stored=deadbeefdeadbeef)
+```
+
+**The gate whose name says it compares the snapshot accepts `deadbeefdeadbeef`.** Exactly one test refuses it. A procedure that walks a developer into that state is worse than one that simply does not work.
+
+**THE ENCODING STORY IS REAL BUT NARROWER THAN THE DOCSTRING CLAIMS, AND I HAD IT WRONG ONCE BEFORE CORRECTING IT.** Measured on this box, one string redirected by each shell, then read back the way `tests/test_webconsole_seam_snapshot.py:94` reads the golden:
+
+| Shell | Bytes written | `read_text(encoding="utf-8")` |
+|---|---|---|
+| Windows PowerShell 5.1 | `ff fe 78 00 0d 00 0a 00` -- UTF-16LE with a BOM | `UnicodeDecodeError: invalid start byte` |
+| `pwsh` 7 | UTF-8, no BOM, CRLF | **decodes, and compares EQUAL** |
+| Git Bash | UTF-8, no BOM, LF | decodes clean |
+
+The `pwsh` 7 row is the correction: an earlier draft of this item and of the page claimed CRLF would diff every line. It does not. `read_text` performs universal-newline translation, so a CRLF golden and an LF golden compare equal, verified directly. The claim was plausible, wrong, and would have sent a reader hunting line endings; an adversarial verification pass caught it before it landed.
+
+So only the 5.1 arm damages the file, and that arm is still the nastiest: the golden is read as UTF-8 with no guard, so the developer gets a decode traceback instead of `_FAILURE_HINT` -- the gate's one mechanism for teaching the repair, bypassed exactly when it is needed. **But the encoding is not the common failure.** The common failure, in every shell including the `bash` the fence advertised, is that a redirect writes one of the two files `--write` writes.
+
+**LIMB 3 -- THE REMAINING BY-HAND EDIT IS STATED BY THE TOOL, SO THE PAGE LINKS TO IT RATHER THAN RESTATING IT (SDS-3.5).** `--write` deliberately does **not** touch `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS`; its own docstring gives the reason, that a tool writing both halves would turn the handshake into a self-consistent tautology and remove the one place a human states this console build matches this engine contract. So the console-side edit stays a step, but its **literal text is printed by `--write` with the new value already in it**, and the page now points at that output. The page keeps the *why* -- one value (#279), a test that reds CI on the same commit, and what widening the set would cost -- because none of that is in the tool's output.
+
+**LIMB 4 -- THE DRIFT WAS WIDER THAN THE THREE STEPS, AND THE REST OF IT WAS IN THE SECTION THAT DEFINES THE TERM.** Fixing only the numbered list would have left the page contradicting itself two screens earlier:
+
+- the heading read **"`ENGINE_UI_SEAM` -- the handshake integer"**, and the paragraph under it typed the constant `int` and the console's set `frozenset[int]`. Shipped: `ENGINE_UI_SEAM: str` (`api/_ui_seam.py`) and `SUPPORTED_ENGINE_SEAMS: frozenset[str]` (`messagefoundry_webconsole/__init__.py:48`). A reader who trusted the annotation would write an integer and be refused by mypy before the gate ever spoke.
+- the implementation list said **"Three files implement it"** and described the generator as emitting "a **curated** list" plus "**live-introspected**" DTO fields. `scripts/seam_discovery.py` is a fourth file and the whole surface is discovered. The description also predated two capture classes the generator has carried since #1220: enum member sets and `Literal` value sets. That omission is load-bearing rather than tidy -- the console indexes `_SCOPE_NOTES[data.scope]`, so a renamed literal `KeyError`s at runtime while a field-name-only snapshot stays byte-identical, which is precisely the failure the section claims to be the sole backstop against.
+- three further sites carried "unbumped" / "seam bump" / "seam-bumping", each implying a number somebody types.
+
+**ONE RULE WAS ADDED THAT NO VERSION OF THE PAGE EVER CARRIED: on a merge conflict over the seam, NEITHER SIDE IS CORRECT.** When two branches both move the contract surface, all three files holding the value conflict, and the merged surface derives a **third** digest matching neither. Taking either side ships a value describing a tree that does not exist, and it looks exactly like an ordinary conflict resolution. This is #1220's central property read from the other direction -- `api/_ui_seam.py` states it as the reason a digest cannot collide the way the old integer did, but nothing told a developer standing in the conflict what to do. The page now does: clear the markers to anything, rerun `--write`, then set the console side from its output. Reported by a peer session that hit it live on 2026-09-04 (branch `d4ae2ce03d5723a7`, main `266cbfd342b22819`, merged `767521d4399d1ef4`); the mechanism is deterministic from the digest's own construction, so it is recorded here as design rather than as one session's luck.
+
+**Two things were DELIBERATELY not added.** A `PYTHONPATH` pin before the generator runs, because #1439 anchored the script on `__file__` and that test's `_ANCHOR_HINT` forbids the call-site pin by name, citing this very by-hand procedure as the reason. And the new digest's value, anywhere in prose -- the section's own rule, older than this item, is that a value quoted in prose goes stale silently, which is how it came to say "currently 1" until seam 11.
+
+**Verification:** `python scripts/webconsole_seam_snapshot.py --digest` returns `266cbfd342b22819`, matching both `ENGINE_UI_SEAM` and `SUPPORTED_ENGINE_SEAMS`, so the tree is self-consistent and the rewritten page describes the state it is in. The redirect table above was measured rather than argued, in a scratch directory outside the repository, with the repository untouched.
+
+**ONE SIBLING WAS FIXED, BECAUSE IT IS THE TERMINUS OF THIS PROCEDURE.** The page's last step sends the reader to `packaging/messagefoundry-webconsole/RELEASE.md`, whose opening said to "keep the range and the seam **integers** honest". A reader who follows the corrected procedure to its end would have landed on the retired vocabulary one line after leaving it. That file now says digests, and names #1220. A repo-wide sweep found the shell redirect surviving in exactly ONE place -- the page this item fixes -- so there is no second copy of the procedure anywhere, `.github/` included (checked with a positive control, since a pattern that finds nothing is indistinguishable from a clean tree).
+
+**Adjacent and NOT fixed here, named rather than numbered.** `tests/test_webconsole_seam_snapshot.py:106-127` still says "A seam bump has always required editing BOTH constants" and "on the commit that bumps the engine", and its assertion message opens "Bumping ENGINE_UI_SEAM requires updating...". That prose is not false -- the constant does change -- but it carries the same chosen-number connotation this item removed from the page, and `_FAILURE_HINT` in the same file already teaches the correct repair. It is test prose rather than the procedure a developer follows, so it is left for whoever next edits that file.
+
+**ONE MORE SIBLING WAS TAKEN, ON A HANDOVER, AND THE ARGUMENT FOR IT IS SDS-3.4 RATHER THAN TIDINESS.** `scripts/webconsole_seam_snapshot.py:41` gave the redirect's reason as the PowerShell encoding alone. That is accurate and it is the wrong thing to publish: a reader on Git Bash consults it, correctly concludes it does not apply to their shell, runs the redirect and silently does half the job -- the exact case measured in LIMB 2, licensed by the warning meant to prevent it. Asking what a reader would DO with the sentence is the SDS-3.4 test, and it fails. The docstring now leads with the one-of-two-files failure and the false green, and demotes the encoding to a shell-specific second hazard; the duplicate at `:303` becomes a pointer rather than a second copy (SDS-3.5). Raised by the session that authored the line under #1439, which declined to open a competing branch for two comment lines and handed it over; taken because this diff is the one that cites the behaviour. It changes no code path -- the derived digest is `266cbfd342b22819` before and after.
+
+Three more, all in the #1220 class and all deliberately out of this diff so the procedure stays separately reviewable: `messagefoundry_webconsole/__init__.py:29` is a truncated leftover comment ending mid-sentence on the word "the" and naming an integer seam identity, sitting directly above the constant it purports to explain; `packaging/messagefoundry-webconsole/CHANGELOG.md:16` and `:25` make a PRESENT-state claim in `[Unreleased]` that the supported seam is `2, 3`, which is wrong on both the type and on #279's one-value rule; and `docs/adr/0143`'s "curated into the webconsole seam snapshot" names the retired mechanism, though an accepted ADR records what was true when written and is better left dated than edited. Also surfaced and entirely unrelated: `docs/LEDGER-GATE.md:132` credits `install-git-hooks.ps1` with installing the ledger gate, which its own synopsis says it no longer does, and `:164`'s two anchors into `ledger_check.py` have drifted to `:376` and `:465`.
+
+
 ## 1450. the live-API drift detector is invisible from the file it guards, so two readers in one night concluded the drift was undetectable
 
 > 🚧 **Filed 2026-09-04. Nothing is built here. This item is a measurement and a recommendation NOT to build the thing it was opened for.** Value **4/10** · Difficulty **2/10** for the documentation fix, **5/10** for routing the notice. A process and documentation defect, not a product exposure: MessageFoundry has zero deployments, and no claim below is present-tense about a running site.
@@ -24466,6 +25933,51 @@ This item was opened to assess exactly that. The assessment is negative, for rea
 ### The prose in the pin comment that is now half true
 
 `tests/test_required_contexts.py` lines 114 to 118 say the pin "GOES STALE IN THE DIRECTION THAT LOOKS FINE" and that "a count that only ever fails when someone edits the FILE cannot notice the server moving underneath it". **Both sentences are still literally true of that test** and should stay. What has changed is the implication a reader draws from them, which is that nothing notices. Something does. The paragraph needs one clause naming it, not a rewrite.
+
+## 1453. adopt the three hook patterns the orchestration survey found genuinely missing: a context-budget guard, a gh-run-watch denial, and a PreCompact re-prime
+
+> 🚧 **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
+
+**Cluster:** CI gates / development harness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). These are repository-side developer hooks. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
+
+### What was measured, and how the ranking was wrong
+
+The adoption ranking was written by reading `CLAUDE.md` and never reading `~/.claude-account-1/settings.json`. That is the method document, not the running configuration, and the two disagree.
+
+| Ranked item | Claimed gap | Measured state |
+|---|---|---|
+| Stop-hook mail injection | "nothing pushes a notice to a seat" | **Already built.** `scripts/hooks/mail-drain.ps1` is wired at `Stop` and emits `hookSpecificOutput.additionalContext`. |
+| UserPromptSubmit mail inject | "mail drains at SessionStart only" | **Already substantially covered** by the same `Stop` drain. |
+| Context-budget guard | no instrument for context-window fullness | **Absent.** Built here. |
+| `gh run watch` denial | no guard on shared API budget | **Absent.** Built here. |
+| PreCompact re-prime | context lost at compaction | **Absent.** Built here. |
+
+The claim `"every notice is polled, and nothing is pushed"` in section 5 is scoped to **workflows** by its own following sentences, and was over-read as covering session messaging. KORUS has the channel; what it lacked was an automatic trigger on the events below.
+
+### What is built
+
+1. **`scripts/hooks/context-budget.ps1`** (`UserPromptSubmit`). Reports how full THIS SESSION'S context window is, at 0.75 / 0.85 / 0.92. It measures a different quantity from `usage-headroom-inject.ps1`, which reads **account pool** headroom -- a seat with a fresh pool can still be one turn from a compaction, and both get called "usage". It **reports and never blocks**: gastown's original hard-gates by role, but a Builder blocked at its prompt has no next turn in which to be told, so blocking burns the brief rather than saving it. Fails open on every path.
+2. **`scripts/hooks/block-api-burn.ps1`** (`PreToolUse` on `Bash` and `PowerShell`). Denies `gh run watch`, any `gh ... --watch`, and hand-rolled `gh` poll loops. Every seat acts as one GitHub identity against one 5000/hr budget, and `gh run watch` polls every three seconds. The denial reason names the single-shot replacement. `gh` must sit in **command position**: the first draft denied `echo "gh run watch is banned"`, which would have blocked writing this very item.
+3. **`scripts/hooks/precompact-reprime.ps1`** (`PreCompact`). Restores the seat, the goal, the ledger numbers this worktree holds, and whether the branch is pushed. **It refuses to restore a declaration whose branch differs from the current one**, because worktrees are re-used and a stale goal reads as authoritative. Run live in the allocating worktree it correctly reported the declaration as a previous occupant's, on branch `ci/retire-review-gate`, 2.6 days old.
+
+### What is deliberately NOT in this change
+
+Three ranked items alter how every seat launches, and six sessions were live while this was written.
+
+1. **Separate autonomous and interactive settings profiles.** `scripts/worktree/spawn.ps1` has no profile or `--settings` logic today.
+2. **A base-to-role settings merge passed with `--settings`.** This is the real fix for tracked `.claude/settings.json` being per-worktree-per-branch, and it is a spawn-path change.
+3. **A contributor skill carrying an executable pre-commit self-check.** Additive and low risk, but it belongs with the two above so the checks it runs match the profile the seat launched under.
+
+**Where `--settings` could actually go, measured 2026-09-05. Read this before picking up item 2, because the sentence above points at the wrong file.** `scripts/worktree/spawn.ps1` is not the seam: it never invokes `claude` at all (`grep -c claude` returns 0), it calls `new.ps1` and opens a VS Code window for a person to start a chat in. Nor is `new.ps1`, which creates worktrees at `<repo-parent>/MessageFoundry-<name>` -- 18 of the 21 worktrees on this clone, including all eight live sessions, sit at `.claude/worktrees/<name>-<hash>`, the harness's own layout. Three do match `new.ps1`'s layout, so it is not dead code, but no live session is in one. **A `--settings` flag can only be passed by whoever runs `claude`, so it reaches a Console-spawned Builder and nothing else.**
+
+**The divergence item 2 is really about is confirmed.** Tracked `.claude/settings.json` is per-worktree-per-branch: 3352 bytes and 6 hook entries on this branch against 2267 bytes and 3 in the primary checkout at `main`. The three hooks above therefore bind only sessions running on this branch until it merges.
+
+**The layer that already binds every seat is the account file.** `~/.claude-account-1/settings.json` wires 16 hook scripts and applies regardless of worktree or branch, and this session shows both layers firing together. Whoever takes item 2 should first say why that file is not the answer.
+
+### Where the evidence lives
+
+The full ranked register, its corrections and its per-item evidence strength are a published artifact, not a repository document, so a repository search for it returns zero and **that zero is not evidence the work was not done**.
 
 ## 1457. zizmor 1.30.0 flags cla.yml self-repository, and the bump that introduced it merged with its own gate red
 
@@ -24804,6 +26316,649 @@ Vault `roles/BUILDER.md:213-217`, under the heading "Closing a ledger row makes 
 
 I read only `roles/` in the vault and ran no git history there, so I cannot date when any of these lines was written. Eleven of the fourteen playbooks were matched by the needle above but not read, so treat the population as **at least three files**, not a total. I did not check whether any workflow or CI job reads a playbook, and I confirmed no case in which a seat actually followed `BUILDER.md:216` and produced a red PR -- I measured the instruction and the gate, not an incident.
 
+
+
+## 1462. RETIRED -- folded into BACKLOG #1460, which is the primary row for this fix
+
+> 🔢 **Filed and retired in place 2026-09-05.** Value **5/10** · Difficulty **2/10** · _quick win_. The number is kept because commits, a PR title and a claim already cite it; the banner and fields stay exactly as filed, per the retire-in-place convention this ledger uses.
+
+**RETIRED IN PLACE.** Superseded by BACKLOG #1460, which was filed as the primary row for the same fix and carries the joint measurement set. This row SHOULD NOT BE BUILT.
+
+**Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Coordination prose read at dispatch time. No engine behaviour, no shipped artifact, no PHI.
+
+### Why it was retired rather than deleted
+
+Two rows describing one fix is the ledger decay this fleet spent 2026-09-05 correcting -- three rows read "not started" over shipped work and cost three sessions a wrong premise. #1460 was allocated first, as the primary, with the fuller scope. Adding a second row for the same sentence would have been a fresh instance of the defect being fixed.
+
+Deleting the number was not an option: `git log` carries it, PR 937's title cites it, and `claim.ps1` holds it. A deleted number turns those into citations that resolve to nothing, and the day someone re-allocates 1462 they start resolving to unrelated work.
+
+### The risk this retirement takes, stated plainly
+
+**BACKLOG #1460 is not on `main`.** It lives on `origin/builder-seat-name-filing` behind PR 936, open and unmerged; both its heading and #1461's were verified there. **If PR 936 is rejected outright, #1460 never exists and this retirement stranded the only surviving row for work that shipped.** That is the accepted trade, not an overlooked one. PR 936 should land before PR 937 so the citation resolves.
+
+### What shipped under this number, so the record is not empty
+
+PR 937 repaired both of the dispatch gate's seat maps: `CLOSING_SEAT` in `scripts/docs/backlog_status_check.py` (3 of 4 values named the ASVS Tracker, the Liaison or the Dispatcher) and `GATED_VERDICTS` in `scripts/coord/dispatch_gate.py` (the Liaison in both values, the Dispatcher in one). Reach, measured by calling `judge()` over each of `origin/main`'s 434 rows: ASVS Tracker 97, LIAISON 35, Dispatcher 33 -- 132 distinct rows, 130 open.
+
+The stale `BUILDER.md:253` and `:148` citations became quotes of their claims; the file lives in the vault, so no checkout of this repository could ever have resolved them, and `citation_line_check.py` refuses bare filenames besides. Two paired regression arms walk both maps, mutation-tested three ways.
+
+**Severity bound, so #1460 is not over-scored:** replacing every value in both maps changes the gate level on **0** rows, against 161 for the positive control of emptying `BUILDER_CLOSABLE_ACTS`. No workflow and no pre-commit hook invokes `dispatch_gate.py`. This was stale prose with a tool as its delivery channel.
+
+### A correction to this row's first version
+
+It said `CLOSING_SEAT["code"]` was "a routing disagreement between two live playbook sources". **That was wrong.** `.github/workflows/backlog-hygiene.yml` and CLAUDE.md section 5's Builder row AGREE -- both put the `docs/BACKLOG.md` edit in the same PR that carries the code, and that PR is the Builder's. The source that disagrees is the vault `roles/BUILDER.md` line 216, which is stale rather than live, because section 5 replaced the method those lines assume. The vault half is #1461. Left to #1460 either way, but for the right reason.
+
+## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
+
+> 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked, and CORRECTED the same day by a third that read the source.** Value **4/10** · Difficulty **3/10** · _quick win_. A session can end while its worktree survives. Its claims then have no live holder and no observable evidence of abandonment. `-Force` recovers them -- that is what it is for -- but the seat using it cannot distinguish an abandoned claim from a quiet one, and **74 of 76 live claims sit in exactly that ambiguity.**
+
+## 1467. the connscale intake-audit probe fails a full-suite run with a SQLite disk I/O error and passes in isolation
+
+> 🔢 **Filed 2026-09-06 -- not started. Reproduced twice, on two branches, by two sessions that were not looking for it.** Value **5/10** · Difficulty **4/10** · _fill-in_. `tests/test_connscale_smoke.py::test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` fails in a full-suite run and passes in isolation. The test is behaving CORRECTLY: its intake audit returns `PROBE_UNUSABLE` because the store sweep raised `OperationalError: disk I/O error`, and the assertion refuses to tolerate a probe that could not answer.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** Test suite / CI signal. **Priority:** P3. **Verdict:** research.
+**Severity:** no product defect established, and the engine is NOT implicated. The audit's
+`engine_suspect` arm did not trip -- only the `conclusive` arm did -- so nothing here is evidence
+that a deploying site would lose an acknowledged message. What it costs is a red leg whose cause is
+unattributed, which is exactly the state this check was built to replace.
+
+**What was measured, and by whom.** Two full-suite runs on two branches, neither session aiming at
+this and neither aware of the other until afterwards:
+
+| Run | Branch | Result |
+|---|---|---|
+| 1 | the ASVS packet C branch | 15,198 passed, this one failed |
+| 2 | the ASVS packet B branch | 15,612 passed, this one failed; 11 passed in isolation in 23s |
+
+Isolation on run 1's branch: **passed in 21s**, same interpreter and same worktree as the failing
+full run. **Two agreeing runs corroborate the OBSERVATION, not the cause.**
+
+**THE FAILURE TEXT NAMES A MECHANISM, so this is better than "an ordering flake" and the word
+should not be used for it.** Verbatim from run 1:
+
+> `INTAKE AUDIT COULD NOT ANSWER -- fixed_aggregate@N=12: intake audit [post_mortem]
+> PROBE_UNUSABLE: the store sweep failed: OperationalError: disk I/O error (sent=36 confirmed=36
+> unconfirmed=0 store_rows=0 missing_accepted=0 missing_rejected=0 late_unconfirmed=0 seqs=[]
+> codes=[])`
+
+So the sweep reached the stopped engine's store and SQLite refused the read. `store_rows=0` is a
+consequence of the failed read, not a finding about the store.
+
+**Test order is DETERMINISTIC here, which makes this reproducible rather than seeded.** Neither
+`pytest-randomly` nor `pytest-random-order` nor `xdist` is installed (each probed by
+`importlib.util.find_spec`, all absent), and `pyproject.toml` `addopts` is
+`--timeout=60 --timeout-method=thread` with no ordering flag. So "only under a full suite" is a
+stable property to bisect against, not a seed to chase.
+
+**WHAT WOULD NOT BE A FIX.** Tolerating `PROBE_UNUSABLE` so the leg goes green: the assertion's own
+message forecloses it in terms -- *"tolerating it restores exactly the unattributable red this check
+exists to replace"*. Nor retrying the sweep until it reads, which converts a resource problem into a
+slower resource problem and hides how often it happens. Nor marking the test `xfail` under a full
+suite, which is the same concession with a nicer name.
+
+**THE MOST LIKELY TRIGGER IS ENVIRONMENTAL, AND SAYING SO IS THE POINT -- otherwise the next reader
+hunts for a bug in the store and there may not be one.** Both runs happened while several full
+suites were executing concurrently on one machine, so **disk contention is the leading hypothesis**.
+Stated at its real strength: the packet B session reports seven concurrent sessions at the time;
+independently I can confirm only that at least four full-suite runs overlapped in that window (two
+of mine, one per packet). **The causal link is UNTESTED.** Nobody has run this suite alone on an
+idle box and shown the failure disappears, which is the cheap experiment and the one that would
+settle it. Until then "environmental" is the best-supported reading, not a finding.
+
+**Unknowns worth naming for whoever takes it.** Whether the disk I/O error is contention over the
+temp store path, file-handle exhaustion late in a long run, an antivirus or indexer touching the
+file on Windows, or the 60-second per-test timeout interacting with a slow read; whether it
+reproduces on the Linux leg or only on Windows; and which module immediately precedes it in
+collection order, which is the cheapest bisect handle and was not captured before this was filed.
+
+**A FIGURE FROM THIS FAILURE IS ALREADY CIRCULATING MIS-ATTRIBUTED, and it settles nothing.** A
+handoff credited the packet B session with a *"sent=36 confirmed=36 missing=0"*
+intake-audit reading they say they never ran and never reported. The figure is REAL -- it appears
+verbatim inside the assertion message quoted above, as part of the `PROBE_UNUSABLE` summary from
+run 1 -- so it is a mis-attribution rather than an invention. **It is not evidence of a clean
+intake:** it sits inside a verdict that says the audit could not answer, and `store_rows=0` beside
+it is the failed read, not a count. Do not cite it as a result.
+
+**A FOURTH SIGHTING, ON A HOSTED RUNNER -- AND IT BELONGS TO A CLOSED ITEM RATHER THAN TO THIS ONE.
+Recorded here only as a pointer, because two seats in one day nearly filed it against the wrong
+row, myself included.** Reported 2026-09-06 from a CI leg on `windows-2025, py3.14`: two tests in
+the SAME module failed and neither is this item's, which passed in that run.
+
+| | this item (#1467) | the fourth sighting |
+|---|---|---|
+| test | `test_no_accept_acked_message_is_absent_from_the_stopped_engines_store` | `test_no_loss_reconciles_at_every_step`, `test_the_run_reports_overall_success` |
+| symptom | the probe could not READ: `store sweep failed: OperationalError: disk I/O error` | the probe read fine; the intake FLOOR was missed: `engine_read 11 < intake floor 12 (half of 24 sent)` |
+| counts | `sent=36 confirmed=36 unconfirmed=0 store_rows=0` | `confirmed=11 unconfirmed=13 store_rows=11` |
+
+**THE FOURTH SIGHTING IS #1292's SUBJECT, AND #1292 IS CLOSED AS SHIPPED.** That row is *"connscale
+smoke reports a message acked but not observed at intake, and nothing discriminates harness race from
+real intake loss"*, and it already records this exact shape across four earlier runs on two operating
+systems, including `fixed_aggregate, count=12, sent=36, acked=13`. It is worth reading before anyone
+files a sibling here.
+
+**IT IS NOT A REGRESSION OF #1292, and the distinction is the useful part.** What #1292 shipped is the
+**discriminator** -- the thing that separates a harness reconciliation race from a real
+count-and-log violation -- not a fix for the shortfall. The fourth sighting's own output is that
+discriminator speaking and clearing the engine: `missing_accepted=0`, `missing_rejected=0`. So the
+post-#1292 state is exactly what #1292 bought: the shortfall can still occur, and now the harness
+tells you which kind it is. The assertion text differs from #1292's pre-fix example (`intake floor`
+rather than `confirmed sent`), which is consistent with the new discriminator code rather than with a
+revert.
+
+**WHAT THE TWO ITEMS GENUINELY SHARE, and it is why this pointer sits here rather than nowhere.** In
+both, the connscale harness fails a run in which its own audit reports NO message loss -- here
+because the audit could not answer at all, there because it answered and cleared the engine. Neither
+is evidence of a product defect, and this item's severity clause covers both.
+
+**WHAT IS NOT ESTABLISHED.** That the two share a cause. Resource contention on a loaded machine
+would explain a failed disk read and a throughput shortfall alike, but nothing has tested that. The
+reporter holds one CI observation with no isolation arm and says so; they also verified rather than
+assumed that their own branch could not be responsible -- of its seven changed files only
+`tests/conftest.py` could reach ordering, and every added line there is a comment, which I re-drove
+independently and confirmed empty.
+
+**DO NOT SPLIT THIS ITEM ON THE FOURTH SIGHTING.** Its title names a disk I/O error and that is still
+the right title for what it covers. The fourth sighting's home is #1292, reopened if anyone judges
+the shortfall worth pursuing past the discriminator that closed it.
+
+**Source:** filed 2026-09-06 from the ASVS packet C full-suite run, corroborated by the packet B
+run, at the request of the Console seat triaging the CI-signal rows, which confirmed no existing
+item covers it (`no_accept_acked_message_is_absent` returns zero across the ledger; the nearby
+ordering-flavoured rows are a PATH-order finding and #1304's windows-2025 pwsh launch timeout,
+neither of which is this).
+
+## 1470. a deleted item heading silently merges two ledger rows and every gate stays green
+
+> 🔢 **Filed 2026-09-06. AMENDED SAME DAY: the repair is NOT gate-blocked, and my first version of this row said it was.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+
+**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+
+**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+
+**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+
+**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
+
+| | |
+|---|---|
+| claims held | **76** |
+| worktree still present | **74** |
+| worktree absent | **2** (`#1453`, `#1416`) |
+
+**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
+
+**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
+
+**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
+
+**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
+
+**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
+
+**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
+
+## 1468. the ledger gate has no path for RESTORING a number main lost, only for allocating or recovering one
+
+> 🔢 **Filed 2026-09-06 -- not started. Found because the gate REFUSED a repair it should accept, and the Lander first dismissed that refusal as noise.** Value **5/10** · Difficulty **3/10** · _quick win_. `ledger_check` refuses any `## N.` heading whose number this worktree did not allocate. That is right for a fresh allocation. It is wrong for a RESTORATION -- a number that is in `main`'s own history, fell out of the file, and is being put back -- because the two are indistinguishable to a diff and only one of them is a defect.
+
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a ledger that cannot be repaired by the seat that notices the damage.
+
+**THE INSTANCE, MEASURED 2026-09-06.** PR 855 (`642225f78`) stripped the `## 1147.` heading and concatenated that item's title onto the end of #1146's closing paragraph. Nothing else changed: the body survives, orphaned and unaddressable. **`origin/main` carries 442 live items where it should carry 443**, `parse_items` cannot see #1147, and six files still cite it. It is not in the archive either -- a positive control in the same run matched 237 headings there, so the instrument reached the corpus.
+
+**The repair is one line break and a restored marker, and it was verified before this item was filed:** applying it brings the count to 443 and `## 1147.` parses again. It is not a rewrite, a renumber, or a judgment call.
+
+**WHY IT CANNOT LAND.** The gate names two recoveries and neither reaches this case:
+
+1. **Commit from the owning worktree.** It **no longer exists** -- removed at some point without releasing the number.
+2. **Check out the owning branch.** It survives locally, is **369 commits behind main with 313 commits that exist in no remote**, and rebasing it onto main fails on an old history-reset commit. Forcing it would destroy unrecoverable local history to fix a formatting defect.
+3. The gate's third option -- allocate a new number -- **renumbers a live item**, which `ledger_check.py:58-61` argues against in terms: renumbering "would only make stale citations resolve uniquely and WRONGLY, which is worse than resolving ambiguously".
+
+**WHAT IS MISSING, STATED AS THE DISCRIMINATOR RATHER THAN AS A FEATURE.** A restoration is provably not a fresh allocation: **the number appears in this repository's own history, under the same heading text, before the commit that removed it.** That is a checkable fact -- `git log -S` over the ledger finds it -- and it is exactly what the gate cannot currently ask. Any widening must rest on that test and nothing weaker, because a rule that merely trusts the committer re-opens the hole the non-transferable design exists to close.
+
+**THE GATE WORKED. THE SEAT DID NOT.** `ledger_check` refused a commit with `BLOCKED: BACKLOG item #1147 was not allocated to this worktree` roughly an hour before this item was filed. **The Lander read that as a stale base, rebased the number away, and continued.** The corruption was then found independently by a packet session merging `main`. Recorded because it is the more useful half: the detector fired correctly and its signal was discarded, so a louder detector is not the fix -- the fix is a path that lets the person holding the repair commit it.
+
+**NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
+
+## 1469. the dispatch gate does not read a row's DISPATCH FENCE, so the two fenced rows screen clean
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / dispatch gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis and no deployment axis (sec. 0). Nothing here reaches a running instance, and there are none. The cost is that a dispatcher who runs the gate on a fenced row gets a clean answer, so the fence holds only for as long as somebody reads the row by eye.
+
+### The measurement, 2026-09-06
+
+Engine checkout on branch `claude/dispatch-fence-gate`, ledger at **679 items** across the two files `parse_items` reads as one namespace.
+
+| what was asked | what came back |
+|---|---|
+| `grep -ciE 'fence' scripts/coord/dispatch_gate.py` | `0` |
+| `dispatch_gate.py 1007 1246 --explain --no-tree` | "items closing by the builder's own act: **2 of 2**", each row noted only as "closes by 'code', performed by the builder writes it; the LANDER flips the banner on merge" |
+| `dispatch_gate.py 1007 1246 --refuse --no-tree` | exit **0** -- the refusing mode refuses neither |
+
+The fence text is byte-identical in both rows. It opens a line with the marker words, a date and a colon, then states the bar and names the seat that owns the work.
+
+### This is not a broken gate, and the distinction is the point
+
+On the same run the gate raised MUST BE READ on two unrelated rows from landed-code citations in the tree. The warning channel exists, works, and populates from a real source. What it did not have was a fence among its inputs. Saying "the gate is broken" would send a reader looking for a defect in machinery that is doing its job.
+
+Nor is anyone unprotected today. The fence is prose in the row, and a dispatcher who reads the row sees it. What the gate adds is that the fence survives a screen -- so it does not depend on a reader who is skimming 679 rows for a lane window.
+
+### The needle, and why the bare word is not a candidate
+
+The marker is the words **DISPATCH FENCE**, a date, and a colon, opening a line of the item's own prose. Three properties do the work, and each was measured against a real row rather than argued:
+
+1. **The date and the colon.** They are what separates a filed act from a mention. A row narrating the convention writes the marker words followed by ordinary prose, which carries the words and not the shape.
+2. **The line anchor.** Only whitespace, blockquote markers and markdown emphasis may precede it. That is what keeps a fence quoted in a table cell from reading as the quoting row's own -- a documenting row lists the fenced population in a table, and those lines open with a pipe.
+3. **Prose, not the banner.** The banner is what a machine writes about a row, and the 2026-09-03 scoring pass already quoted one row's wording into another's. Both real fences are prose, so the narrower region costs no detection here.
+
+The bare word is not a candidate and the corpus settles it: **38 of 679 bodies contain "fenc"**, in at least four unrelated senses -- self-fencing leader election, a ciphertext prefix, a bold line-leading "Scope fence", and a fenced file. The needle fires on 2.
+
+### The fence is the one MUST BE READ that `--refuse` blocks on
+
+Every other level the gate returns is inferred: a token match in prose, or a citation in the tree. The gate argues at length against blocking on an inference, and it is right to -- the screen recorded under `#1394` discarded 46 percent of the live ledger on a "DO NOT" token match. **A fence is a different kind of sentence, not a stronger one.** A person wrote it deliberately about one row and named the seat the work belongs to, and two exist in 679 rows. Refusing on that cannot produce a sweep of that shape.
+
+The gate's printed guidance was corrected in the same change. It said, without qualification, that `--refuse` does not block on a MUST BE READ row. Left as written it would have been a false statement in the output of the tool whose exit code contradicted it.
+
+### The controls, both of them
+
+A checker proven only against the two known rows is indistinguishable from one that hardcodes them, so both arms are pinned:
+
+- **Must fire:** a constructed fixture carrying the fence verbatim with the subject replaced, so the test keeps working when those two rows close. Plus a live-ledger arm over the real pair.
+- **Must NOT fire:** the compared count is printed. Five rows are pinned by number, each a different sense of the word, and the ratio test fails if the fired set and the bare-word population converge -- which is when a bare-word detector would start passing the file.
+
+**This row is the only self-reference trap available.** Measured 2026-09-06: a needle for "dispatch" within 120 characters of "fenc" fires on the two fenced rows and on nothing else in 679. This row is the third, it describes the marker, and it did not exist when the needle was built. It is pinned in the must-not-fire set for that reason.
+
+### What is not claimed
+
+I did not survey how the fence came to be written, or whether any dispatcher has actually spent a lane window on a fenced row. I measured the tool and the ledger, not an incident. The two fenced rows were read but not edited: they are fenced from this work by their own terms, and their words draw the line this row sits on -- a change to the WRITER or the VERIFIER is ordinary public engine work, and a change to what the RECORD SAYS is not. This changes the reader.
+
+## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
+> of **#1143**'s verification pass, where it was found to have been eliminated on a false premise and
+> to be the work at least seven citations across the repository are already waiting on.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P2. **Verdict:** build.
+**Severity:** on a first deployment, a site that recycles a `sAMAccountName` in its directory without
+also running a MessageFoundry `delete_user` would hand the new holder the departed operator's
+immutable `user_id`, and with it everything keyed on that id -- uploaded-file ownership, per-uploader
+quota, and saved search presets. Nothing would report it.
+
+**What ships today.** `_upsert_ad_user` (`messagefoundry/auth/service.py`) resolves an AD principal by
+`sAMAccountName` and mints a fresh `user_id` **only when no mirror row survives** -- that is, only
+after a `delete_user`. On the default path the surviving row is adopted and its `user_id` is re-bound
+to the new principal. `AdPrincipal` (`messagefoundry/auth/ldap.py`) carries `username`,
+`display_name`, `email`, `dn` and `groups`; `dn` is the only durable-looking attribute and it is the
+wrong one, because a DN changes on a rename or a move between organizational units.
+
+**Measured 2026-09-06:** `objectGUID` and `objectSid` occur in exactly one tracked engine file, as a
+docstring naming them as the future key. Positive control in the same run: `sAMAccountName` returns
+13 hits across 5 files, so the probe discriminates and the zero is real. **The LDAP layer reads no
+immutable directory identifier at all.**
+
+**Why this is not #1143, and must not be folded into it.** #1143 is scoped end to end to the
+OIDC-versus-directory limb of ASVS 6.8.1 and is blocked on an unresolved first-contact ceremony
+decision ([ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md),
+Proposed). This is the AD limb, it is not blocked on that decision, and #1143 could close honestly
+without touching it.
+
+**Why the option looked closed and is not.** #1143 struck directory-held immutable attributes twice,
+on the ground that a directory-readable attribute is not secret so an issuer willing to mint an
+arbitrary username claim will mint any claim. **That holds only where the attribute is an
+AUTHENTICATOR.** Here it is a re-resolution key for an account already identified by other means, and
+no assertion is being trusted. #1143 repairs the premise twice in its own body without ever
+re-opening the strike.
+
+**At least seven sites name #1143 as the fix for this**, and would resolve to a closed item that reads
+as done if #1143 closed as scoped: `messagefoundry/api/app.py` (`_may_access_upload` docstring),
+`messagefoundry/uploads.py` (`UploadedFileMeta`), `tests/test_upload_api.py`, ADR 0136,
+`docs/SECURITY.md`, and this ledger's **#1152** and **#1225**. Re-point them here. Enumerated with
+`git grep`; treat it as at least seven and re-run the grep rather than working the list.
+
+**Shape of the work.** One nullable column on `users` across the three backends, following the
+`reauth_at` convention already in each (`PRAGMA table_info` guard on SQLite, `information_schema`
+on Postgres, a `COL_LENGTH` guard in the SQL Server `_SCHEMA` list). **No index, so no SQL Server
+index-key width trap.** The real cost is upstream of the column: an added LDAP attribute read into
+`AdPrincipal`, and a lookup path, because `resolve_principal` takes only a username today. A
+first-contact rule is needed for accounts that predate the column -- but unlike #1143's, it is a
+backfill question and not a trust-ceremony one.
+
+**What would NOT be an honest close.** Adding the column and continuing to resolve by
+`sAMAccountName`, so the identifier is stored and never consulted. The acceptance test is a recycle:
+a directory-side name reuse with the MessageFoundry row left in place must NOT adopt that row.
+
+## 1472. two shipped comments assert a 0/0/0 uniqueness absence that the filtered unique index has closed
+
+> 🔢 **Filed 2026-09-06 -- not started.** Value **4/10** · Difficulty **1/10** · _fill-in_. Found while
+> verifying **#1143**; a comment correction with no behaviour change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / documentation accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect. The cost is to a reader: both comments state that the structural half
+of federated-subject exclusivity is unbuilt, and it shipped under **#1256**.
+
+**The two sites**, by symbol rather than line, because the anchors drift: the comment above the
+exclusivity veto in `messagefoundry/auth/service.py`, and the one on the federated-subject setter's
+declaration in `messagefoundry/store/base.py`. Both assert that no `UNIQUE` constraint names the OIDC
+columns on any backend, quoting a measurement of 0/0/0 against a positive control of 13/8/10.
+
+**Measured 2026-09-06:** a filtered unique index `ux_users_federated_subject` over
+`(oidc_issuer, oidc_subject)` exists on all three backends -- `store/store.py`, `store/postgres.py`
+and `store/sqlserver.py` -- each guarded for in-place upgrade. The `UNIQUE` positive control now reads
+10/6/8, so the original measurement was true when written and the code moved underneath it.
+
+**The service.py one contradicts code roughly twenty lines below it**, which explains that the index
+"refuses the loser on all three backends". A reader who trusts the first sentence concludes the
+structural half is missing -- which is the same error #1143's own ranked-table entry made and carried
+for weeks.
+
+**Do not simply delete the numbers.** They are evidence of a real prior state and the reason the veto
+is written the way it is. Rewrite them to say the index now exists and name what the veto adds on top
+of it (an ordered, audited refusal rather than an integrity error surfacing as a 500).
+
+## 1473. the ASVS record's evidence has drifted from engine main -- 87 anchors do not locate and 16 absence claims are false -- and four different remedies hide behind that one symptom
+
+> 🔢 **Filed 2026-09-06 -- not started. Owner-requested filing.** Value **5/10** · Difficulty **6/10** · _money pit_. A full verify of the ASVS record against engine `main` at `ebdfa44a6` resolves 2,088 evidence anchors and leaves **87 that do not locate**, and checks 275 absence claims of which **16 are now false**. **The engine is not less secure.** The evidence went stale, usually because the code got better and the fix deleted the line the anchor quoted. Difficulty 6 because the remedy is one cell at a time in a separate repository and **a bulk re-anchor would silently convert closed gaps and removed controls into false green**; value 5 because nothing ships, no engine behaviour changes, and no operator reads the record.
+> Verdict: build
+> Research: none -- the measurement is in the body
+> Closing-act: scorecard-rescore
+
+**Cluster:** Security records. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine axis, no PHI axis, and **no deployment axis (sec. 0)**. Nothing ships in the wheel and no control moved. The cost is that a graded cell's evidence no longer points at the code it was graded from, so its verdict cannot be re-checked without redoing the reading from scratch.
+
+**Distinct from [#1405](#1405-nothing-writes-the-security-scorecard-so-its-anchors-go-stale-exactly-when-the-code-improves), which is the MECHANISM.** That row says nothing writes the scorecard, so anchors go stale exactly when the code improves, and it asks for a reporter. This row is a MEASUREMENT taken against that mechanism: what such a reporter would currently print, the two findings the run produced, and why the obvious response to its output is wrong. #1405 can close with a reporter; this row cannot, because the triage is the work.
+
+### How the measurement was taken, because the instrument is the interesting part
+
+One command, read-only:
+
+```
+python scripts/asvs/scorecard.py --scorecard <the record> --corpus <the ASVS 5.0.0 flat json> --root <an engine tree>
+```
+
+Engine tree at `main`, commit `ebdfa44a6`. The record read from the vault's `origin/main`.
+
+`--root` is required in verify mode, and the tool refuses a root that CONTAINS the scorecard: resolving anchors against the repository that stores the record produces a self-consistent, wrong answer.
+
+### What the run reports
+
+| reading | count |
+|---|---|
+| evidence anchors resolved | 2,088 |
+| anchors that DID NOT LOCATE | **87** |
+| absence claims checked | 275 |
+| absence claims now FALSE | **16** |
+
+**The graded content is deliberately not reproduced here, and the line is finer than it looks.** Cell IDS are public -- this ledger names them in the clear in hundreds of places. What stays in the vault is the GRADED CONTENT: coverage totals, gap counts and per-cell verdicts. [`CLAUDE.md`](../CLAUDE.md) section 12 lists ids first and separately from coverage and gaps, which is exactly why the two halves get swapped.
+
+So every number above is a property of the EVIDENCE LAYER -- how much of the record's own citation apparatus still resolves -- and none of it grades a cell. **A count of non-locating anchors is safe to publish; the same count paired with how many cells pass is not**, and paraphrasing the split (*"roughly half pass"*) discloses it just as effectively, with error bars.
+
+**This ledger already carries hard-coded ASVS verdict tallies of its own -- at least three, on two lines**, and the closed archive carries more. Measured with `scripts/docs/asvs_tally_lint.py`, which exists to find exactly these and whose own summary is the argument this row is making from the other end: *"Cite the rendered record instead of copying a number out of it: every copy goes stale on the next re-score, and of the roughly fifty that exist, approximately one is correct."* So the boundary is not currently held here. Recorded as an observation about this record's hygiene and deliberately not repaired: those are other items, and this row does not touch them.
+
+An anchor that does not locate means the cited token is no longer at that line, or now occurs more than once so the line number is not load-bearing. An absence claim that is false means the thing the record says is missing now exists.
+
+### Do not fix this with a bulk re-anchor
+
+The tool says so itself: *"Re-read the cell before touching the anchor: the token may have moved, been renamed, had the gap it certified CLOSED (retire it), or had its control removed (re-score). Do not re-anchor by default."*
+
+**Four different remedies hide behind one symptom**, and only the first two are mechanical:
+
+| what actually happened | remedy |
+|---|---|
+| the token moved | re-anchor |
+| the token was renamed | re-anchor to the new name |
+| the gap the anchor certified is CLOSED | retire the anchor |
+| the control it cited was REMOVED | re-score the cell |
+
+A sweep that re-anchors everything applies remedy one to all four. On the third and fourth rows that **converts a closed gap and a removed control into false green** -- a record asserting a control that is not there, which is exactly the compensating-control-resting-on-a-false-premise defect [`CLAUDE.md`](../CLAUDE.md) section 11 forbids. The 87 are a work queue, not a diff to apply.
+
+### The repair shape already has precedent, so this is not a new practice
+
+Two repairs on the vault's `origin/main` establish the convention: one repaired 15 stale evidence locators, the other a single documentation residual. **Both state in the commit subject whether the VERDICT moved and whether the STAMP moved**, and *"no verdict and no stamp moved"* is a normal and respected outcome rather than a weak result.
+
+That convention is the concrete answer to the caution above. Repairs land in **small, individually-justified batches that declare what did not move**, and the declaration is what makes the third and fourth remedies visible -- a batch that retires an anchor or re-scores a cell cannot claim no verdict moved. A sweep has no such field to fill in, which is precisely why it can convert a closed gap into false green without anybody being able to see it happen. Follow the existing shape; do not invent a bulk path beside it.
+
+### The remedy is a procedure, not an open design question -- the writer exists and its guards ARE the caution
+
+`scripts/asvs/apply.py` is the sanctioned writer for the record, and **the two guards this row argues for are already implemented in it.** Measured from its `--help` at `ebdfa44a6`:
+
+| flag | what it does |
+|---|---|
+| *(default)* | **dry run; the file is not touched.** `--apply` writes. |
+| `--allow-retirement` | permits an evidence or absence list to SHRINK, but **only where the payload DECLARES the retirement** via `retired_evidence` / `retired_absence`. Refused by default, because *"a silent cardinality drop is what this guard exists to stop, and the flag alone is not enough"*. |
+| `--allow-verdict-change` | permits a payload to move a verdict. Refused by default, because *"a verdict move is an assessor decision, and this writer's failure mode is making one during a pass whose stated purpose was mechanical"*. |
+
+So retiring one of the 16 false absence claims is not something to design. It is `apply.py --allow-retirement` with a declared `retired_absence`, and **the retirement itself must be re-confirmed with the owner rather than inherited from whoever first called it confirmed.** One of the 16 is being worked that way now, so the procedure has a live worked example and not just a specification.
+
+### The sharper finding: the tooling exists, and in THIS repository most of it runs only when a human runs it
+
+**The gap is NOT "no tooling exists".** Six tools sit in `scripts/asvs/`: `scorecard.py` verifies, `apply.py` writes under the guards above, `anchor_report.py` and `anchor_provenance.py` cover anchor work, `rescore_handoff_check.py` answers *"did a cell get re-scored AFTER its item's banner was last touched"*, and `prove_report.py` reports absence proofs.
+
+Measured at `ebdfa44a6`, counting workflow and `.pre-commit-config.yaml` references to each script path:
+
+| tool | wired into |
+|---|---|
+| `scorecard.py` | `asvs-anchor-report.yml`, `asvs-prove-absences.yml` |
+| `anchor_report.py` | `asvs-anchor-report.yml` |
+| `prove_report.py` | `asvs-prove-absences.yml` |
+| `apply.py` | **nothing** |
+| `anchor_provenance.py` | **nothing** |
+| `rescore_handoff_check.py` | **nothing** |
+
+**Three of the six are referenced by no workflow and no hook in this repository**, and the two that are wired run in jobs [#1405](#1405-nothing-writes-the-security-scorecard-so-its-anchors-go-stale-exactly-when-the-code-improves) already records as gated on a repository variable that deliberately does not exist, because a vault read credential held in the public repository would collapse the boundary the vault creates.
+
+### RESOLVED: a scorecard change opened as a vault pull request IS gated
+
+This row first flagged the vault side as unestablished, because two sources disagreed and neither had been measured. It has since been measured, and **the answer that made the remedy sound large was the wrong one.**
+
+**The generalisation that failed is worth keeping, because it is the kind that reads as safe.** The vault workflow literally named `CI` is disabled, and [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md) records it at `:336`: `ci.yml`, *"the only one that runs a test suite, is among the disabled"*. From there it is one short and false step to *"no CI runs in the vault"*. **The same line reports 8 workflows ACTIVE alongside the 17 disabled.** A workflow named `CI` being off is not the CI estate being off, and the sentence carrying the alarming half carries the correcting half one clause away.
+
+`asvs-scorecard.yml` is among the active ones. It fires on push to `main`, on pull request and on manual dispatch, path-filtered to a set that INCLUDES the record itself and the `verified_at` gate beside it. The estate was cut back at the 2026-07-27 cutover to avoid duplicating public CI, and that workflow was deliberately kept, because the doc-drift guards assert against documents that exist only in the vault.
+
+**So the gap is not the gate. It is the LOCAL commit-time net.** The `pre-commit` framework is not installed in that clone, so the fail-closed `asvs-scorecard` hook its `.pre-commit-config.yaml` declares never fires at commit. CI catches the change at pull-request time instead -- later, but not never.
+
+**This SHRINKS the item, which is why the question was worth asking before sizing it.** The remedy is not *"build a gate"*; a gate exists and runs. The drift accumulated anyway, so the live question is narrower and a reader can go and settle it: **does the gate not assert what we assumed, or does it assert it only on the paths it filters?** Answer that before estimating the rest.
+
+Not verified here: the daily cron #1405 describes. The trigger set measured is push, pull request and manual dispatch.
+
+### One false absence claim is substantive, and it corroborates a finding already on `main`
+
+The record says no unique index exists on the federated-subject columns. One does, and it ships on all three backends:
+
+- `messagefoundry/store/sqlserver.py:1439` -- `CREATE UNIQUE INDEX ux_users_federated_subject ON users(oidc_issuer, oidc_subject)`
+- `messagefoundry/store/postgres.py:566`
+- `messagefoundry/store/store.py:3376`
+
+The verifier reports three matches, one per backend.
+
+**This is corroboration, not a new defect.** It independently confirms, from a different instrument, the finding recorded on **#1143** and [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md), both merged: the claim that there is *"no uniqueness of any kind on the OIDC columns on any backend"* has been false since [#1256](#1256-the-federated-binding-guards-account-continuity-but-never-subject-exclusivity-so-two-accounts-can-bind-one-identity) built the partial unique index. The value is that a second instrument reached the same finding without being pointed at it.
+
+### One false absence claim is a false positive in the instrument, and no shipped cookie is affected
+
+The record's absence pattern for HttpOnly matches `httponly\s*=\s*False`. At `ebdfa44a6` that pattern hits two occurrences and **both are prose**:
+
+- `messagefoundry_webconsole/_auth.py:802` -- a comment explaining what Starlette's `delete_cookie` defaults are
+- `packaging/messagefoundry-webconsole/tests/test_ui_hardening.py:357` -- a test comment quoting the same defaults
+
+**No shipped cookie sets `httponly=False`.** Nothing here needs an alarm, and this row exists partly so nobody raises one.
+
+The generalisable part is a weakness of the method, worth recording on its own: **an absence pattern that scans prose as if it were code will keep producing this.** A comment that NAMES a banned pattern is indistinguishable from code that USES it, to a regex. The failure direction is the expensive one -- it manufactures a finding where the control is fine, so triage cost is spent on a cell that needed no work.
+
+### The two readings differ because the record MOVED, and the stale copy encoded superseded verdicts
+
+**Say which copy of the record you read, or the count means nothing.** The same command over the same engine tree gives **61** non-locating anchors from the vault clone's working tree and **87** from the vault's `origin/main`.
+
+**Those are not two copies of one record. They are the same record before and after at least five upstream changes landed on it**, and some of those changes moved verdicts rather than only anchors. So the stale copy did not merely lag: it encoded decisions that had already been reversed, and scoring against it would have graded the engine against superseded verdicts. Both runs are correct, both answer a different question, and neither output says which one it answered.
+
+**The clone holds no local scorecard edits, and the contrary claim is false.** Measured 2026-09-06: the clone is 4 commits ahead of `origin` and 54 behind, with 23 dirty files, but `git log origin/main..HEAD -- <the record>` is EMPTY. The record appears in a two-dot `git diff` only because the clone is BEHIND. The divergence is entirely inbound, which is why the fix is to read `origin/main` and not to reconcile anything.
+
+This is [`CLAUDE.md`](../CLAUDE.md) section 11's SDS-3.8 rule -- confirm your instrument answers the question you asked -- landing on the record rather than on the code. It cost a pass here before anyone noticed.
+
+### Not established
+
+I did not triage the 87. I read two absence claims by hand and confirmed that one merged wave did not cause the drift.
+
+**87 and 16 are counts from ONE run at ONE commit pair, and both sides move.** The engine advances and the record is edited independently, so each number is a reading and not a property. Re-run before acting, and record the engine commit and the record ref together the way this row does.
+
+Treat the findings as **at least** what is written here. The two hand-checked claims are the only ones whose classification I can defend, so the split between substantive and spurious across the other 14 false absence claims is unmeasured, and so is the split across the 87 among the four remedies above.
+
+## 1474. clearing a federated binding is unrepresentable: set_user_federated_subject requires both issuer and subject
+
+> 🔢 **Filed 2026-09-06.** Value **5/10** · Difficulty **6/10** · _fill-in_. Value 5 because nothing is
+> wrong in shipped behaviour today -- the gap only becomes reachable once #1143's administrative
+> binding surface exists, and that surface is now ruled rather than hypothetical. Difficulty 6 because
+> the fix is a Store protocol signature plus three backend implementations plus their tests, which is
+> the same shape as every other protocol widening in this repo and is mechanical rather than subtle.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P3. **Verdict:** build.
+**Severity:** none today. On a first deployment carrying #1143's binding surface, an operator who
+bound the wrong account would be able to RE-POINT the binding but never REMOVE it, so an account
+would remain federated-bindable with no way back to unbound.
+
+**What is missing.** `AuthStore.set_user_federated_subject` takes `issuer: str, subject: str`, both
+required and neither nullable. There is no `clear_user_federated_subject`, and no argument spelling
+that expresses "this account has no federated binding". So the operation the setter's own name
+implies a complement for -- unbind -- cannot be called, and a surface offering "set, unbind, rebind"
+can only offer two of the three.
+
+**Why it is filed now and not with #1143.** It was surfaced during that row's ceremony research and
+is genuinely separate: #1143 asks WHO may create a binding, this asks whether a created binding can
+be undone. The ceremony ruling of 2026-09-06 -- an administrative binding surface is the only thing
+that may create a federated binding, taken by the owner directly -- is what makes this reachable,
+because an operator-created binding is exactly the kind that gets created by mistake. ADR 0184's
+"Largest build" option did not price an unbind, so the cost is unrecorded anywhere.
+
+**The likely shape, stated as a starting point rather than a design.** Either a nullable pair on the
+existing setter, or a separate clear method on the protocol; three backends either way
+(`store/store.py`, `store/postgres.py`, `store/sqlserver.py`), plus whatever the filtered unique
+index `ux_users_federated_subject` requires of a row whose pair becomes NULL. The index is already
+filtered, which is why this is plausibly a fill-in rather than a schema change -- but that should be
+measured before it is believed.
+
+**What would NOT be an honest close.** Adding a clear path that leaves the account's `auth_provider`
+untouched, so an unbound account still reports as a directory identity and is still swept by
+`reconcile_directory_sessions`. Unbinding has to leave a coherent account, not just a NULL pair.
+
+**Source:** surfaced by the packet A builder while researching #1143's ceremony question, and handed
+over by that row's claim holder, who confirmed it is not in their record. Filed rather than left in
+mail because a gap recorded only in a message is one nobody can re-read.
+
+**Cluster:** Ledger integrity / tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect -- nothing here reaches the engine. The cost is to the record: an
+ASVS row's status and verdict disappear from every machine-parsed view, and its number becomes
+available for reallocation, which is the silent-corruption outcome the ledger gate exists to
+prevent, reached from a direction it does not watch.
+
+**WHAT HAPPENED, measured on `origin/main` rather than inferred.** Commit `642225f78` (PR 855) was
+appending a re-verification note to **#1146**. Its diff against `docs/BACKLOG.md` is **five
+insertions and one deletion**, and the single deleted line is:
+
+> `## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it`
+
+The amendment prose landed exactly where that heading had been. So **#1147's entire record stayed in
+the file and stopped being an item.** On `main` before this commit, `parse_items` returned 1146,
+1147 and 1148; after it, 1146 and 1148 only, with #1146's body grown from 38 lines to 68 and
+carrying #1147's banner, `Verdict: research` and `Closing-act: scorecard-rescore` as narrative.
+
+**WHY BOTH GATES PASSED, and this is the part to fix.** Neither is wrong; neither is asking this
+question.
+
+* `scripts/hooks/ledger_check.py` guards number REUSE and allocation ownership. It asks *"is this
+  `## N.` heading allocated to the committing worktree"*. A heading that DISAPPEARS is not a heading
+  it can see.
+* `scripts/docs/backlog_status_check.py` asserts each item declares exactly ONE status. `parse_items`
+  ends a banner block at the first line that is neither blank nor a blockquote, so #1147's banner --
+  now sitting mid-body inside #1146, well past that boundary -- is read as narrative and ignored.
+  The one-status invariant then holds **vacuously** for the merged row.
+
+So a change that loses a ledger row is invisible to the gate built to protect ledger numbers and to
+the gate built to protect item status, simultaneously.
+
+**HOW IT SURFACED, which is worth recording because nobody was looking for it.** It was found as a
+FALSE POSITIVE on an unrelated commit. A branch cut before `642225f78` still carried the #1147
+heading; when that branch tried to commit an unrelated ledger edit, `ledger_check.py` refused it --
+*"BACKLOG item #1147 was not allocated to this worktree"* -- because from its point of view the
+branch was INTRODUCING a number it did not own. The gate reported the stale branch and not the
+deletion. Nothing would have reported the deletion.
+
+**THE REPAIR IS ONE LINE, IT WAS PERFORMED AND VERIFIED, AND THE GATE THEN REFUSED THE COMMIT.**
+Re-inserting the heading immediately before #1147's own banner, taken verbatim from `744a7a434`
+rather than retyped, restores the ledger completely: `parse_items` returns 1146, 1147 and 1148;
+#1147 parses OPEN with its own score of 5; #1146 returns from 68 lines to 38 while #1147 holds 32;
+the live-ledger count goes 443 to 444; and `backlog_status_check` stays green. **That change cannot
+be committed by the session that found it.** `ledger_check.py` reads the restored `## 1147.` heading
+as a number being INTRODUCED by a worktree that does not own it, and refuses -- correctly, on its own
+terms, because it has no way to tell a restoration from an appropriation.
+
+**THE CORRECTION, AND IT MATTERS BECAUSE THIS ROW WOULD OTHERWISE ASSERT A LIMITATION THE TOOL DOES
+NOT HAVE.** This item first said the gate has no restore path. It does. `ledger_check.py` grandfathers
+every number carried by a **merge parent**, in terms: *"A MERGE COMMIT ALLOCATES NOTHING. It carries
+forward numbers another branch already committed."* So the working route is to restore #1147 by
+MERGING a branch that predates the deletion and still carries the heading, with a commit subject that
+does not cite `BACKLOG #1147` -- the CLAIM gate, a different control, fires on a code-touching subject
+naming a number the committer does not hold. No gate widening, no force, and no new number.
+
+**WHY I MEASURED A REFUSAL ANYWAY, since the two results are both real.** I re-inserted the heading
+BY HAND on a branch that had already merged the deletion. A hand-added heading is an ASSERTION, and
+the gate is right to refuse it -- its own note explains that grandfathered numbers *"are not asserted,
+they are READ OFF A COMMIT"*, which is precisely what makes the allowance safe. My case and the merge
+case are different inputs, and the gate answers each correctly.
+
+**THE GENERAL GAP SURVIVES, NARROWED.** Merge-parent grandfathering only helps while SOME branch still
+carries the number. Once every branch predating the deletion is pruned, the heading exists in no
+commit anyone can merge, and the restoration has no route at all. That is the case worth a companion
+guard: accept a heading byte-identical to one at a named ancestor commit, which is checkable without
+weakening the allocation rule. Not urgent while carrying branches survive; unfixable if it is left
+until they do not.
+
+**The damage and its fix are both a single line, which is why the guard matters** -- nothing about
+the size of the change signals the size of the consequence, in either direction.
+
+**WHAT TO BUILD.** A monotonicity check over the item-id SET, not the count. The union of ids in
+`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` may only grow; an id present in the
+parent commit and absent from both files in the child is a lost row and must red. Archival stays
+legal by construction, because it moves an id between the two files and the union is unchanged. Read
+the ids with `parse_items` -- never a hand-rolled scan, for the reason `ledger_check.py` already
+records about `PUBLIC_BACKLOG_FLOOR`: a second definition of what an item is drifts from the first.
+
+**WHAT WOULD NOT BE A FIX.** Restoring the heading and stopping. That repair is owed and should
+happen, but on its own it leaves the next slip just as silent. Asserting a FIXED item count, which goes stale on every filing
+and trains people to bump the number without reading why it moved. And widening `parse_items` to
+recover an orphaned banner from mid-body: that would make the merged state parse as two items and
+hide the defect rather than report it, which is the shape the standards call a compensating control
+resting on a false premise.
+
+**Source:** found 2026-09-06 from the ASVS packet C branch, as a gate refusal on an unrelated
+commit. The mechanism was then re-derived against `origin/main` with the commit diff, and both the
+loss and the repair verified through `parse_items` with the before and after counts recorded above.
+**#1147 IS STILL LOST ON `main` AS THIS IS FILED**, and the restoration is with the Lander, who
+identified the merge route and holds standing authority on the engine repo. The heading text is in
+`744a7a434` and in nine or more branches predating the deletion.
+
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
 
 > 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
@@ -24943,6 +27098,127 @@ The detector control stayed green in all four, which is the asymmetry: it flags 
 
 I did not read gitleaks' source, so "walks every ref when the flag is unset" rests on the commit counts above and not on the code. I did not test a fork pull request, where the checkout and the available refs differ. I did not check whether any other workflow in this repository scans with a whole-repository default; only `security.yml`'s secret job was examined.
 
+
+
+
+## 1480. an append that absorbs the next item heading deletes an item with every ledger gate green -- compare the ranked table's rows against the parsed items
+> 🔢 **Filed 2026-09-07 (youthful-stonebraker-883561) -- the detector is measured and ships with a positive control on both sides; whether to BUILD it is a separate owner decision and is NOT part of this filing.** Value **5/10** · Difficulty **2/10** · _quick win_. Value 5 because this class deletes a whole item while every wired gate stays green: it has fired once, on `#1147`, and neither CI nor `pre-commit` reported anything. It is ledger integrity only, with no engine, PHI or deployment axis (sec. 0). Difficulty 2 for roughly fifteen lines that reuse `parse_items`, against a fixture frozen in history and a control measured in both states.
+>
+> Verdict: owner-ruling
+> Research: done 2026-09-07 -- the detector, its control, and the dead end are all measured below
+> Closing-act: owner-ruling
+
+**Cluster:** Ledger integrity / repository gates. **Priority:** P2. **Verdict:** owner-ruling.
+**Severity:** no engine effect and **no deployment axis (sec. 0)** -- nothing here reaches shipped code. The cost falls on the record. An item's entire body, its status banner and its fields stay in the file, silently re-attributed to the item above it, while the ranked table still carries a row promising a section that no longer exists. A reader following that row finds nothing. A seat dispatching from the ledger cannot see the item at all, and no instrument says so.
+
+### What happened, and the diffstat is the part that should worry you
+
+Commit `642225f78` appended three `#1146` re-verification paragraphs to `docs/BACKLOG.md`. Its last appended line absorbed the `## 1147.` heading that followed it. The `## 1147. ` prefix was deleted outright and the title text was concatenated onto the tail of the `#1146` paragraph, where it still sits on `main`:
+
+```
+... **The cell should not move on this commit** -- a suite that pins the gap is not the gap
+closed. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the
+MFA-change ceremony rather than beside it
+```
+
+The diffstat read **5 insertions, 1 deletion**, and the commit message never mentioned `#1147`. The deletion is the heading; nothing in the diff names the item that was destroyed.
+
+**The general rule, because a reviewer will ask whether a diff would not have shown this.** No: **the summary of a change to a structured record does not describe what the change did.** Diffstat, subject line and line count are all summaries, and all three are blind in this family -- the negative control below deletes a heading prefix and moves the line count by exactly zero. This is not a one-off. A second instance was measured in the same week, in a different structured record in this project and by a different mechanism: a commit whose subject announced a single change while its blob carried several more (details are maintainer-internal; ask rather than assuming this file is the only record affected). So for any file whose **meaning is carried by structure rather than by lines**, verification has to parse the structure on both sides and compare the parsed results. Reading the subject, counting lines, and trusting a diffstat are the three ways this is usually done instead, and all three failed inside one week on two different files. `#1147`'s body, its `🔢` banner and its three fields all survived on `main`, re-attributed to `#1146`. PR 975 split the fused line back apart.
+
+### Why no wired gate sees it
+
+`parse_items` in [`scripts/docs/backlog_status_check.py`](../scripts/docs/backlog_status_check.py) reads only an item's **leading** blockquote block -- the block ends at the first line that is neither blank nor a blockquote. The orphaned banner sat *below* `#1146`'s own block, so it parsed as ordinary mid-item prose. The ledger stayed structurally valid with a whole item missing from it. `backlog_citation_check` and `ledger_check` were green as well. There is nothing to fix in any of the three: each answers the question it was built to answer, and none of them is asked whether the file still contains every item the file itself points at.
+
+### The detector, and it is one-directional by construction
+
+Compare the **ranked tables' row set** against the **parsed-item set**, taking items from BOTH ledger files (`docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`) into one namespace. Import `parse_items`; never hand-roll the scan (CLAUDE.md sec. 11). Rows extract with:
+
+```python
+ROW = re.compile(r"^\|\s*(?:\d+\s*\|\s*)?\*\*#(\d+)\*\*\s*\|")          # the rank cell is optional
+HDR = re.compile(r"^\|.*\|\s*V\s*\|\s*D\s*\|\s*Quadrant\s*\|\s*Tier\s*\|")   # ...but the TABLE must be ranked
+```
+
+Keep a row only when the header of **its own table block** matches `HDR` -- walk up from the row while the previous line still starts with `|`. The regex needs **widening and bounding, in opposite directions**, and the next two paragraphs are why each half is load-bearing.
+
+**Make the rank column optional, as above. The obvious regex requires it and is blind to a whole table.** Measured at `68693cfc2`: requiring a leading `| N |` rank cell sees **444** distinct numbers, and the optional form sees **459**. The 15 it adds are `#207`-`#222` less `#214`, whose only rows live in *Post-re-score additions -- #206-#222*, a table that carries no rank column at all -- its rows open `| **#219** |`. Nor is that the only one: `#1415` sits in a two-row continuation table introduced by a **bolded lead-in rather than a heading**. **State the consequence as a property of the guard, not as a past mistake.** It is not that the strict regex was wrong; it is that **the strict form can never report an absorbed heading for the 15 rows of the unranked table**, whatever the ledger does. That sentence survives a reader who thinks a small widening has fixed it; "the regex was wrong" does not. All 15 have parsed items today, so the blind spot holds no defect and the check would read correct forever -- **a gate that cannot fail, which is indistinguishable from a clean result.** That is the shape this repo keeps finding, and it is why the census above names its instrument. Both forms return the same `[1147]` on the control below, so a green run discriminates between them not at all.
+
+**The bound is the other half, and widening WITHOUT it trades a blind spot for a false-positive source.** `ROW` alone matches **any** markdown row whose first or second cell is a bolded item number, and two items carry exactly that shape in their own bodies. Every rank-less row on `origin/main`:
+
+| lines | numbers | the header of its table | verdict |
+|---|---|---|---|
+| 609 | `#1415` | `\| Item \| Title \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 983-998 | `#207`-`#222` | `\| # \| Item \| V \| D \| Quadrant \| Tier \| Why \|` | ranked, keep |
+| 3958-3961 | `#99 #98 #320 #351` | `\| Item \| The run \| What it needs \|` | prose in `## 1003.`, drop |
+| 22709-22710 | `#1040 #1229` | `\| item \| what had already landed \| ... \|` | prose in `## 1426.`, drop |
+
+Injecting one prose row citing an unfiled number into the `## 1426.` table gives `[1147, 99999]` unbounded against `[1147]` bounded. **A detector that fires on correct prose is worse than none**, because it sends a reader hunting a heading that was never meant to exist -- and prose citing a number with no section is a sanctioned pattern, not a defect.
+
+**Do not reach for a positional rule. It fails in both directions, and this was built and measured before being discarded.** "No `## N.` heading nearer than the last table heading" reports the `## 1426.` prose rows as unenclosed, because item bodies carry `###` subheadings and the walk stops at `### The defect, measured twice on one day`. In the other direction, `#1415`'s table has no heading of any level above it, only a bolded lead-in. **Position is the wrong key; the table's own header is the right one**, because it describes what the table *is* rather than where it sits.
+
+**Only rows-with-no-item is a defect. Items-with-no-row is the normal state and must never be reported.** 459 rows against 679 parsed items at the same ref, so most items legitimately carry no row. Every ranked table found is a *dated scoring-pass snapshot* (`re-scored 2026-08-20`, `re-scored 2026-08-03`, `re-scored 2026-07-10`, `first score 2026-09-03`, and the rank-less additions table), not a live index that every filing joins -- which is also why a new item does not get a row, and why the reverse comparison would report several hundred false positives on a clean file. That census was taken by walking every contiguous run of matching rows up to its nearest heading, so it covers **at least** those five; a table shaped unlike all of them would not be reached by the instrument that found these.
+
+### The positive control, on a fixture that cannot perish
+
+| state | ref | rows | parsed items | rows with no item |
+|---|---|--:|--:|---|
+| pre-fix | `68693cfc2` (`main` tip that day) | 459 | 679 | **`[1147]`** |
+| the causing commit | `642225f78` | 459 | 679 | **`[1147]`** |
+| post-fix | PR 975 head | 459 | 680 | none |
+
+Row counts are the optional-rank regex above; the strict form reads 444 in all three rows and returns the same verdict.
+
+It fires on the one real case and is silent otherwise. **Both pre-fix shas are ancestors of `origin/main`** (`git merge-base --is-ancestor` returns true for each, measured 2026-09-07), so PR 975 merging does not take the fixture away -- a merge adds a commit, it removes nothing from history. Anyone told to capture the pre-fix state before PR 975 lands has been told something false; cite the sha instead.
+
+### DEAD END: the mid-line heading probe. Do not build on it
+
+The obvious signature is a `## N.` heading appearing **mid-line**, and it is worthless here. The absorbed heading loses its `## ` prefix *and* its number entirely rather than losing its newline, so no heading-shaped remnant survives the fusion at all. Measured on `origin/main`: a mid-line `## N.` scan returns six hits -- `1022`, `1203`, `1204`, `1379` twice, and `1431` -- and **all six are prose**, items quoting a heading inside a sentence or in backticks. Zero are absorbed headings, in either state. **Write the probe loosely or it lies to you differently.** A first pass requiring whitespace after the period returned nothing at all, because every real occurrence is followed by a quote character or a backtick; that produced a true statement about one regex, published as a fact about the signature. A guard built on that signature reports a clean repository forever while producing a steady trickle of false positives, which is the worst pair of properties available. That negative result is the reason the row-versus-item comparison is the right instrument.
+
+### If you ever act on a hit, WHERE you re-insert the heading changes the outcome
+
+A restored heading has to go **above the banner that carries the status glyph**, which is not always the earliest banner. `#1147`'s block opens with `Re-scored 2026-08-20 -> P2`, carrying both the score and the `🔢`; its `Filed 2026-08-08` banner comes later and carries no glyph. Measured counterfactual on the two placements:
+
+| heading placed above | status banners | score | fields |
+|---|--:|---|---|
+| the `Re-scored` banner (what PR 975 did) | 1 (`🔢`) | 5 | 3 of 3 |
+| the `Filed` banner | **0** | **None** | 2 of 3 (`research` lost) |
+
+Zero banners is a hard error in `backlog_status_check` -- *"Every backlog item must declare exactly one status banner"* -- so the wrong placement trades a silent orphan for a broken gate, which is louder but not better. **Read `main`, not a branch.** Unmerged branches open their copy of the item with the `Filed` banner because they predate the re-score, so branch text actively misleads about placement.
+
+### Siblings, not duplicates. Closing one for the other loses a real guard
+
+A session working the ASVS scorecard has filed an item proposing two guards for the **vault scorecard**: refuse a write from a clone behind its remote, and compare the cells a payload NAMES against the cells the write actually CHANGES. That second guard and this row-versus-item comparison ask the same shape of question about **different files with different tools**, and neither covers the other. Both will read as "the out-of-scope-edit guard" to whoever picks either one up, and building one invites closing the other. **They are siblings. Do not close either for the other.** That item's number was allocated but was not on `main` as of 2026-09-07, so it is named here by subject rather than by number -- CLAUDE.md forbids citing a `#N` that cannot resolve.
+
+### Scope: this filing is the ask. Building it is a separate owner decision
+
+Nothing here assumes the check gets built. If the owner rules to build it, the natural home is **beside the existing advisory checks** -- the way `dangling backlog citations (advisory)` is wired in `.github/workflows/quality-advisory.yml`, which reports into the step summary, never gates a merge, and carries no paths filter (a defect of this class is introduced by editing prose, so a paths-filtered job would miss it). It should not be a new hard gate: the population it screens is a single number today, and a gate that has fired once has not yet earned the right to block anyone.
+
+### The WIRING is the load-bearing half, and this repo already holds the counter-example
+
+**A correct checker that nothing runs is not a weak guard, it is worse than none**, because it reads in the tree as though the class is covered. Do not accept a build of this that adds `scripts/docs/*.py` and stops there.
+
+Measured 2026-09-07: [`scripts/docs/citation_line_check.py`](../scripts/docs/citation_line_check.py) exists and is referenced **zero** times under `.github/workflows/` and **zero** times in `.pre-commit-config.yaml`. Tracked mentions are its own test, `tests/tooling_manifest.txt`, and this file. Nothing runs it, so nothing reports what it finds. `backlog_status_check.py` sits in `.pre-commit-config.yaml`, which is exactly why its failures get noticed at all. The two tools differ in wiring, not in quality.
+
+So the acceptance test for a build is a **wiring** entry plus a **negative control**, not a passing run:
+
+1. Add the workflow step or hook entry in the same change as the checker.
+2. **Deliberately break a row and confirm the guard reds.** A guard whose only true positive was repaired before the test existed has never been observed failing, and a green run proves nothing about it. This trick is how a builder established that `citation_line_check.py` does not cover `docs/BACKLOG.md` citations at all -- they corrupted one of their own citations, watched the checker pass, and reported the gap rather than claiming coverage.
+
+   **Already run, so the acceptance test is demonstrated rather than proposed.** Deleting the `## 3. ` prefix from item `#3` -- which carries a ranked row -- moved the verdict from `[1147]` to `[3, 1147]` on this branch. **The file's line count did not change at all**, which is the same measurement as check 2 above and the reason a diffstat cannot be trusted here: `642225f78` reported one deletion for an item it destroyed.
+
+### The guard's first real user is whoever lands it
+
+New items append at the ledger tail, so concurrent filings are scheduled conflicts against one boundary, and the resolution is keep-both. **That manoeuvre is how `#1147` died** -- `642225f78` was itself a tail append. So this detector is the post-rebase verification for its own merge, and for every ledger rebase after it. Three checks, in order:
+
+1. Count parsed items before and after. It must rise by **exactly** the number of item headings added -- not roughly, and not "the file got longer". **Compute that expected number at merge time from the diffs of the pull requests that actually landed; never carry a remembered constant.** Count headings, not pull requests: three queued PRs added four items here, because one of them filed two. The error is not symmetric -- expect one too few and a clean merge merely raises a phantom, but expect one too few while exactly one heading is absorbed and **the count matches, the check passes, and the absorption ships**. An off-by-one blinds this check to precisely one absorbed item, which is the modal case: `642225f78` absorbed exactly one.
+2. Inspect the boundary line itself. `#1147` died as a *prefix* deletion, so the heading text survived glued to the previous paragraph and the line count barely moved. **Length is not the signal.**
+
+   **A missing blank line before the heading is NOT this defect, and believing it is buys a false control.** Measured: with the blank line, without it, and with the `## ` prefix deleted, `parse_items` returns both items in the first two cases and loses one only in the third. An ATX heading interrupts a paragraph without a blank line, in CommonMark and in this parser alike. Restoring the separator at a merge boundary is good hygiene and worth doing -- it is simply **not** what stops an absorption, so a resolver who adds it and moves on has checked nothing. Only the count in check 1 catches the real shape.
+3. Run the row-versus-item comparison in its bounded form, and **read it differentially: compare the merged tree's orphan set against `main`'s at that same moment, not against empty.** A pre-existing orphan is not yours. Measured 2026-09-07: this branch's own merge reported `[1147]`, which is the defect this item documents, still on `main` because its fix had not landed -- a first-time runner sees a non-empty result and reasonably suspects their own resolve. **Do not write the expected value down either.** `[1147]` stops being the baseline the moment that fix merges, exactly as the item counts went stale at 442, then 443, then 444 inside two hours. Compute both sides at merge time; the check is `merged_orphans - main_orphans`, and only that difference is yours.
+
+### Two traps that cost measurement time
+
+1. **Set `PYTHONIOENCODING=utf-8` before printing anything derived from the banner alphabet.** A stock Windows console is cp1252 and raises `UnicodeEncodeError` on the status glyphs. It cost two separate runs here.
+2. **Deduplicate the row set.** At `68693cfc2` the regex above returns **570** raw matches against **459** distinct numbers (the strict rank-requiring form: **547** against **444**), because the dated scoring passes re-rank many of the same items. Comparing the raw list instead of the set inflates every count and makes the control unreproducible.
 
 ## 1475. Derive the log redactor's secret vocabulary from the settings registry, with a reasoned exclusion table
 
@@ -25112,6 +27388,169 @@ A PAR client on the relying-party side: POST the authorization parameters to the
 ### Not done here
 
 This row was **filed, not built**. Nobody has read the pinned requirement text against `flow.py` for this row's purposes, and no provider-support survey was run. The `na` ruling above is reported as the routing fact that makes this row necessary; this row does not re-derive it and does not depend on it being correct.
+## 1478. The write-time log handler filters carry no credential vocabulary, so a forwarded log line would leave the host unredacted
+
+> 🔢 **Filed 2026-09-06 -- built in the same pull request, banner left OPEN for the Lander.** Value **8/10** · Difficulty **4/10** · _no research_. The three filters `logging_setup._install_phi_filters` puts on every handler -- `RedactionFilter`, `CredentialQueryScrubFilter`, `ControlCharScrubFilter` -- carry no credential vocabulary between them. Seven credential shapes passed all three verbatim, with the OIDC `code`/`state` control scrubbing in the same run. Those filters sit on the stdout handler NSSM captures **and on the off-box syslog forwarder**, and there is no `FileHandler`, so they are the whole of what stands between a log call and the two sinks that leave the process.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / secret redaction. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Written in the conditional throughout: **a deploying site that set `[logging].forward_host` would ship credential-bearing log lines off the host to its collector**, with none of `support/redact.py`'s work in the path. Nothing is exposed today because nothing is running. That removes the urgency and none of the fix.
+
+### The defect, measured three times
+
+Measured at `ebdfa44a6` by a builder working #1475, re-measured at `redact-domain-e1`'s head by the seat that filed this row, and re-measured here at `68693cfc2` before any code was written. All three agree. The instrument drives `RedactionFilter()`, `CredentialQueryScrubFilter()` and `ControlCharScrubFilter()` in production order over one `LogRecord` and reads `getMessage()`.
+
+| shape | before |
+|---|---|
+| `store encryption_key=<secret>` | passes verbatim |
+| `vault_token=<secret>` | passes verbatim |
+| `client_secret=<secret>` | passes verbatim |
+| `ad_bind_password=<secret>` | passes verbatim |
+| `tls_key_password=<secret>` | passes verbatim |
+| `private_key=<secret>` | passes verbatim |
+| `Authorization: Bearer <secret>` | passes verbatim |
+| **control:** `code=<secret>&state=abc` | **scrubbed, both parameters** |
+
+The control fired in the same run, so the instrument discriminates and the seven zeros are measured rather than assumed.
+
+**`CredentialQueryScrubFilter` was the only credential-aware filter on the chain, and it is scoped to a URL query string.** Its six keys are `code`, `state`, `id_token`, `access_token`, `token`, `session_state` -- the OIDC callback shape ADR 0142 AC-10 names. It reaches no engine setting name.
+
+### Why `support/redact.py` does not cover this
+
+`support/redact.py` is a **second** pass, over the support archive (`support/bundle.py`) and `GET /logs/tail`. It reads a log that has already been written. The syslog forwarder ships each record at write time, so a record on its way to a collector never passes through that module. Two surfaces, two passes, and only one of them had a credential vocabulary.
+
+### The fix, and the design call it rests on
+
+The credential-label vocabulary moves to a new package-root neutral leaf, **`messagefoundry/secretscrub.py`** -- stdlib `re` only, no engine, config, FastAPI or Qt imports, sited beside `redaction.py`, `controlchars.py` and `credential.py` for the reason `credential.py`'s own docstring gives. `logging_setup` imports it for its DEFINITION, the way it already imports `controlchars`. A fourth filter, `CredentialScrubFilter`, applies it to the rendered message, `exc_text` and `stack_info`, installed **after** `RedactionFilter` (which is what renders `exc_info` into `exc_text`) and **before** `ControlCharScrubFilter` (which must stay last).
+
+**A second, unplanned hole closed with it.** Three filters had hand-copied the same record walk and the fourth, `CredentialQueryScrubFilter`, carried only the message half -- so an OIDC authorization `code` inside a **traceback** was scrubbed by nothing, which ADR 0142 AC-10 forbids outright. No reviewer comparing four separate `filter` methods would see a field missing from one of them. The walk is now `_rewrite_record`, shared by three of the four filters, and the omission cannot be written. `RedactionFilter` keeps its own body because it also renders and clears `exc_info`, which is a different act.
+
+**Built BESIDE PR 973, not on top of it.** That PR (#1475, #1477) rewrites `support/redact.py` and also carries all four commits of PR 965, and neither is on `main`. Refactoring `support/redact.py` to compose the new module would have guaranteed a conflict on an open pull request and made this change depend on two unlanded ones. So the six credential patterns are stated in the new module and `support/redact.py` is untouched. **The follow-up is unfiled and named rather than numbered: once #1475 lands, `support/redact.py` should compose `secretscrub` instead of holding its own copy of those six, keeping its `mfb64:`, long-base64 and leading-timestamp markers, which are properties of that surface rather than of the vocabulary.**
+
+**Three of `support/redact.py`'s markers are deliberately NOT here**, and the reason is the surface, not the vocabulary:
+
+| marker | why it stays on the read-time surface |
+|---|---|
+| `_MFB64` | a message body is PHI, owned by `redaction.py` and by the "never log full bodies at INFO+" rule |
+| `_LONG_B64` | over-redaction is right for a file that leaves the box, wrong for a live operator console -- it would eat an `idempotency_key`, the identifier an operator traces a message by |
+| `_LEADING_TS` | a `LogRecord` carries its timestamp in `record.created`, not in the message, so there is nothing to carve |
+
+**`CredentialQueryScrubFilter` is NOT folded in either.** `code` and `state` are ordinary operational vocabulary (`code=404`, `state=RUNNING`); they are safe only because that filter is scoped to a query string. Admitting them to a general `label=value` rule would redact operator diagnostics and buy nothing. That list also carries a ruling about two names deliberately absent from it (#1184). **Two vocabularies with a stated boundary, not one vocabulary stated twice.**
+
+**The registries are not read at runtime**, and that is a decision rather than a limitation. `config/settings.py` imports `LOG_LEVELS` from `logging_setup`, so a `logging_setup` importing the registries back would close a cycle. #1475 separately refused the runtime read on its own ground: `_SECRET_SETTING_KEYS` is `/metadata`'s redaction policy, so a name dropped from it for a display reason would silently stop being scrubbed. The vocabulary is literal; the **guard** is derived.
+
+### The guard is #1475's, pointed at the write-time surface
+
+`tests/test_logging_credential_scrub.py::test_every_engine_credential_setting_is_scrubbed_or_excluded` reads `config/wiring.py::_SECRET_SETTING_KEYS` and `config/settings.py::_FILE_SECRET_KEYS` and requires every name in the union to be scrubbed by the production filter chain or excused in `EXCLUDED_FROM_SCRUBBING` with a stated reason. The assertion is two-sided: an exclusion that has quietly become false reds as loudly as a hole. A credential setting added to the engine that the log filters cannot see reds the suite rather than shipping silently.
+
+**Six names are excluded, and they are the whole of the username class** -- `username`, `basic_user`, `credential_username`, `http_auth_user`, `proxy_user`, `ws_username`. They are out on grounds the engine already recorded two layers deep: `redaction.py` states its own residual as an adversarially-crafted single-token identifier, and a username is one; `docs/PHI.md` says the forwarded stream still carries usernames and gives that as its reason for gating the off-box hop. A `label=value` rule reaches the wrong shape anyway -- a username leaks as `Login failed for user 'svc'`, as `UID=svc;`, as `CN=svc,OU=` or as the engine's own `actor=` audit field.
+
+### Cost, measured before and after -- this is a per-record path
+
+Reported as the **minimum single-call time over interleaved samples**. This box runs a fleet, so a mean carries other sessions' load; a minimum is the one statistic a load spike cannot inflate. The before/after **subtraction on the 6 KB lines is not reportable** -- the pre-existing PHI pass swings from 33 ms to 53 ms between runs, which is more than the whole delta -- so the marginal column below is measured directly, on the new filter alone, and it is self-consistent with the subtraction on every line short enough for the subtraction to be stable.
+
+| line | chain before | chain after | added |
+|---|---|---|---|
+| plain 65-char operational line | 6.4 us | 7.2 us | **+0.9 us** |
+| a real credential line (`ad_bind_password=...`) | 5.6 us | 9.3 us | **+3.7 us** |
+| 6 KB hyphen-and-dot run, naming no credential word | 33.25 ms | 33.27 ms | +15 us |
+| 6 KB base64url, naming one credential word | 33.18 ms | 33.70 ms | +0.49 ms |
+| 6 KB hyphen-and-dot run naming EVERY family | 33.26 ms | 54.67 ms | **+21 ms** |
+
+The first two are the cost actually paid. **The last row is the adversarial ceiling and it is stated rather than hidden.** Log text is attacker-influenceable and `_LABEL_PREFIX`'s bounded repetition is O(6N) per word-boundary start position, so a long dotted-or-hyphenated run naming every family defeats every admission gate. It is not a new class of hazard: `redaction.redact` costs 33 ms on the same line before this module runs at all, and `support/redact.py` has the identical property on `GET /logs/tail` today.
+
+**Two gate decisions carry the small numbers, and both were measured rather than assumed.**
+
+1. **A casefolded substring test, not a compiled alternation.** A `(?i)` alternation defeats the regex engine's literal-prefix optimisation, so it trial-matches every branch at every start position. On the plain line the union alternation cost 5.07 us and was **100 percent** of what this module added; `casefold()` plus `in` costs 0.40 us. `casefold` and not `lower`: `(?i)s` matches U+017F and `(?i)k` matches U+212A, while `lower()` leaves both alone, so a `lower()`-folded gate would be NARROWER than the pattern behind it. That is pinned with the leaked credential as the control, and a mutant swapping it is killed.
+2. **One gate per pass, not one shared.** On a 6 KB hyphen-and-dot run carrying the word "token": **21.8 ms** shared against **1.3 ms** per-pass, because only the token family is admitted.
+
+A gate that can narrow is a hole, so `test_the_hint_gates_never_change_the_result` compares the gated and ungated passes over every fixture rather than trusting the argument.
+
+**One lever was rejected on purpose.** A bounded lookahead requiring a separator within N characters of the label would collapse the adversarial row, and it would silently stop scrubbing a credential whose label is longer than the bound. Trading a silent security narrowing for time on a synthetic input, against a cost this module does not dominate, is the wrong direction.
+
+### The tests were proved able to fail
+
+**19 mutants, each hash-verified applied and reverted byte-identical, every one killed**, scored against `test_logging_credential_scrub.py`, `test_logging.py` and `test_phi_logging_inventory.py` together. A mutant whose replacement string does not match the file is refused rather than scored, because a mutant that did not apply and a test that cannot fail print the same passing count. The planted changes: uninstall the filter; install it before `RedactionFilter`; make the shared record walk read `record.msg`, or stop covering `exc_text`, or stop covering `stack_info`; put the query filter back on a message-only walk; give the query filter a second spelling of the placeholder; empty each of the three word tuples; drop `_LABEL_PREFIX`; break `_AUTH_SCHEME`, `_MEFOR_SECRET` and `_DSN_PASSWORD`; **narrow one admission gate below its pattern**; fold the gate with `lower()` instead of `casefold()`; gate on raw rather than folded text; excuse a real credential as a username; and drop the filter from `docs/PHI.md`.
+
+**The gate mutants are the ones worth naming.** Narrowing a gate leaves every family passing and every diagnostic intact -- only the gated-versus-ungated comparison sees it. Without that assertion a narrowed gate would be a silent hole wearing a green suite.
+
+**And one survivor was informative rather than a gap.** A first run scored "fold the word tuples with `lower()`" as unkillable, which is correct: every word in every tuple is ASCII, so `lower` and `casefold` agree on all of them. The load-bearing fold is on the TEXT, not the words. The mutant was re-aimed at the text, where it is killed, and the module comment was corrected to say which of the two folds carries the property.
+
+### Residuals, stated because the fix does not close them
+
+1. **A comma-joined `encryption_keys_retired` written with a SPACE after each comma** leaves its later elements unmatched. Unlike the support-bundle surface there is no long-base64 sweep behind this pass to catch them.
+2. **A label with more than six underscore-joined prefix segments is not reached.** Six is 3x the longest real label in this tree and nothing comes close, but the failure is silent in the one direction that matters.
+3. **Usernames are out of scope by design** (above), so the stdout log and the forwarded stream can carry an operator username. `docs/PHI.md` already says so.
+
+### Not checked
+
+I did not enumerate the engine's actual logging call sites to ask which of these shapes a running engine emits -- the filter is a by-construction control precisely so that question does not have to be answered per call site. I did not measure on a hosted runner; every number here is from one Windows box under fleet load, which is why the minimum statistic was used. I did not touch `support/redact.py` or `docs/SECURITY.md`. `.gitleaks.toml` gained an allowlist block for the nine synthetic sentinels the new fixtures trip on entropy -- exact literals, only the nine that actually trip, inserted before the #1183 block rather than appended, because PR 973 appends its own at the tail. `docs/PHI.md` section 7 was updated because it is the record for Gate #1 and `tests/test_phi_logging_inventory.py` derives the filter list from `logging_setup.__all__` -- a fourth filter reds that suite until the doc names it.
+
+## 1481. A scoped secret scan can walk zero commits and pass; nothing asserts the range is non-empty
+
+> 🔢 **Filed 2026-09-07 -- not started. FILED ONLY: nothing here is fixed on this branch.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI merge gates / instrument honesty. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is a required secret gate that could report success having looked at nothing.
+
+**Measured 2026-09-07 on the pinned gitleaks 8.18.4 binary** -- the version `.github/workflows/security.yml` installs, downloaded from the release and version-checked, not a local build.
+
+### The hazard, demonstrated
+
+| invocation | reported | exit |
+|---|---|---|
+| `--log-opts HEAD` (what #1479 ships) | `2 commits scanned` | 1, planted secret caught |
+| `--log-opts HEAD..HEAD` (an empty range) | `0 commits scanned` | **0** |
+| no `--log-opts` (the pre-#1479 default) | `2 commits scanned` | 1 |
+
+**`0 commits scanned` and exit 0 is a green tick.** Nothing downstream distinguishes it from a clean scan, and a gate that cannot tell *found nothing* from *looked at nothing* is the same defect class the negative-control registry exists for.
+
+### The shipped range is safe, and that is why this is P3 rather than P1
+
+`--log-opts HEAD` is a **literal**, not built from a base SHA, a head ref or a pull-request number. Measured on a merge-commit HEAD shaped like a merge-queue commit (two parents): `2 commits scanned`, planted secret caught, exit 1. So it cannot resolve empty on any of the workflow's five triggers.
+
+**This row is about the NEXT edit.** The moment someone makes the range event-aware -- which #1479's own comment explains was declined only because three of five triggers carry no base SHA -- the range acquires the ability to be empty, and on the trigger where the base is unpopulated it silently will be.
+
+### The fix: read the scanner's own report, never recompute its subject
+
+**A check that recomputes its subject rather than reading the subject's own report is not a check.** That is the whole of this row, and it decides the implementation before any of the detail below.
+
+Assert the scan **walked something**, by reading the count the scanner itself printed:
+
+```
+grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
+```
+
+Verified against real 8.18.4 output on four cases -- clean+scoped, empty range, unscoped, and a run carrying a finding: it fires on exactly the empty-range case and passes the other three. The count line is present even when findings are reported, so the guard does not depend on a clean run.
+
+**Do NOT implement this with `git rev-list --count <range>`.** That is a second copy of the range, free to agree today and drift tomorrow, and to go on passing after the flag it guards has changed -- which is precisely the second-definition defect #1479 removed from this job's own header. A guard that drifts from the flag it guards keeps passing, which is the exact failure it was written to prevent. The scanner's own count cannot drift from what the scanner did.
+
+### The pipefail half, and the shortcut that must not be taken
+
+Capturing the count needs the scan piped through `tee`, and a pipe swallows the exit code that matters. GitHub's default `run:` shell is `bash -e {0}` -- **`-e` without `pipefail`** -- so a findings-exit of 1 would be discarded by the pipe and this required gate would report success. Same vacuous-pass class, one layer down, so `set -o pipefail` must land in the same change. Verified: the scan step declares no `shell:`, so it takes that default.
+
+**THE SHORTCUT IS `shell: bash`, AND IT IS THE WRONG FIX.** Naming the shell explicitly makes GitHub substitute `bash --noprofile --norc -eo pipefail {0}` instead of the bare default -- so the step would **silently acquire pipefail as a side effect of naming a shell it was already using**. Reject it. A reader seeing `shell: bash` cannot tell that error semantics changed, and a later edit removing it as redundant re-introduces the defect while looking like a cleanup. That is the same hidden-mechanism hazard this row is about, one layer further down again.
+
+The repository already agrees, measured 2026-09-07 over `.github/workflows/*.yml`: **12 workflows set `pipefail` explicitly; 3 files use `shell: bash` at all.** Explicit is both the local idiom and the legible one.
+
+### Add a control, or the guard is deletable in silence
+
+`tests/negative_controls.toml` registers two controls for this context under #1479. A third belongs here: the guard step must exist and must be asserted to fire, or it becomes decoration that a later edit removes without anything going red.
+
+### Provenance
+
+Raised by a peer session reviewing #1479, which asked what the range evaluates to on a `merge_group` run and named the failure mode as a silent pass rather than a red. The same session then supplied the `shell: bash` trap above and the generalisation that leads the fix section -- both are theirs, and the row is better for them. That was the right question: #1479's stated posture was "if the merge-group run fails, that is the finding", which covers the red case and not this one. The range turned out to be safe; the hazard it pointed at is real and is filed here rather than bolted onto a green pull request that was unblocking a frozen merge queue.
+
+### Not checked
+
+I did not test a fork pull request. I did not check whether any other scanner in `.github/workflows/` can be given an empty scope -- #1479's altitude pass established that gitleaks is the only ref-walking scanner, but "can its input be made empty" is a different question from "does it walk refs", and I did not ask it of the working-tree scanners.
+
+
 
 
 ## 1483. apply.py's module docstring enumerates the evidence fields and so denies the two it carries
@@ -25144,3 +27583,623 @@ The harm path is not "a reader is mildly misinformed". It is specific and it run
 ### Closing act
 
 One docstring edit in `scripts/asvs/apply.py`, stating that the listed keys are the ones the writer ORDERS and that any other key is carried verbatim. Deliberately **no count** of the carried fields: a tally in a docstring goes stale silently, which is the same defect wearing a number.
+
+
+## 1485. docs/SECURITY.md files the built gitleaks and SBOM jobs under Planned CI additions
+
+> 🚧 **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** documentation honesty / security prose. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, so no deploying site would meet it. The cost falls on a reader of the security record: they are told a built control is planned, told the wrong scope for a required gate, and told a local hook does not exist when it does.
+
+**Measured 2026-09-07** at engine `4c68c28eb`, which was `origin/main`'s tip in the same run.
+
+### Five claims, and what the tree says
+
+| the claim, as it stood | what the tree says |
+|---|---|
+| **SBOM** is a planned CI addition | `security.yml`'s `sbom` job builds CycloneDX bills of materials for the Python engine and the VS Code extension, scores them with `sbomqs`, and uploads them; the `trivy` job adds the container image. ADR 0149 and `docs/SUPPLY-CHAIN.md` document it. |
+| **Secret-history scan** is a planned CI addition | `security.yml` job `gitleaks`, `name: gitleaks (secret scan)`, and that exact string is listed in `.github/required-contexts.txt`. |
+| the scan is "Kept in CI rather than a per-author pre-commit hook" | `.pre-commit-config.yaml` pins `repo: https://github.com/gitleaks/gitleaks`, `rev: v8.18.4`, hook id `gitleaks`. Both exist. |
+| the scan runs "over the **full git history**" | BACKLOG #1479 scoped it with `--log-opts HEAD`. The reason lives once, on the scan step's own comment, and this ledger row does not restate it either. |
+| **pip-audit** and **bandit** are advisory | Both job comments read `BLOCKING`, neither declares `continue-on-error`, and both context strings are in `.github/required-contexts.txt`. |
+
+A sixth line was stale in a different direction: the section told the reader to turn **CodeQL** on through GitHub Advanced Security "on a private repo". `.github/workflows/codeql.yml` has run here for months and this repository is public, so no licence is involved. `security.yml`'s own header already records that correction.
+
+### The fix
+
+`docs/SECURITY.md` now carries one list of what CI runs, with `gitleaks` and the SBOM job in it, and no "Planned CI additions" block. It states the scan's scope **nowhere**: it names the step that holds it and stops, because a second copy of that fact is what went false last time. The section closes with a short paragraph naming what it used to say, so a reader who absorbed the old text can recognise the shape rather than be silently overwritten.
+
+### One dependent edit, and why it was not left to drift
+
+`tests/test_cutover_slug_rot.py`'s triage taxonomy cited the removed sentence by name, as a KEEP example ("a true statement about GitHub's pricing"). Removing the sentence without that edit would have left a docstring citing a line that no longer exists. The retirement is recorded in its place. The ratchet count falls 39 to 38 against a ceiling of 41; `test_the_ratchet_is_not_slack` allows up to 8 slack, so the ceiling is deliberately left alone.
+
+### Not taken here, and it is the same fact
+
+`docs/Secure_Build_Scorecard_MEFOR.md` says "gitleaks full-history" in three places (lines 31, 58 and 93), one of them the evidence for signal 5 graded **Built -- Strong**. That evidence is now overstated by exactly the scope BACKLOG #1479 removed. It is **not edited here**: that file is a dated scoring snapshot ("Scored 2026-07-14, against HEAD") whose own convention is that re-scoring is an owner act, and it already carries a precedent blockquote flagging a correction for the next re-sign rather than folding it silently. Naming the three lines is the handoff; whoever re-signs the scorecard folds them.
+
+---
+
+## 1486. Number allocation should land the item's section heading on main, so filing an item edits its own lines instead of inserting at a shared anchor
+
+> 🔢 **Filed 2026-09-07 (lander). Value **7/10** · difficulty 3/10 · _quick win_.** Twenty open pull requests block each other pairwise, and the cause is one line of file structure rather than anything about their content. Measured, not inferred; the discriminator below is exact at n=20.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Development harness / ledger mechanics. **Priority:** P2. **Verdict:** build (small).
+**Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). This costs seat time, nothing else.
+
+### What is wrong
+
+Every pull request that files a backlog item appends its section at the END of `docs/BACKLOG.md`. Git cannot merge two insertions made at the same anchor, so any two such branches conflict with each other, whatever they contain. The result is not a gradient of cost -- it is a clique.
+
+**Measured 2026-09-07 against main `43f0bad2f`, over the 45 mergeable pull requests then open.** Each candidate was merged into main in memory (`git merge-tree --write-tree`, then `commit-tree`), and every other clean pull request was merged against that simulated main:
+
+- **18 pull requests break nobody.** Not individually and not in sequence: simulating all eighteen landing back to back leaves every remaining pull request still clean.
+- **20 form a mutually blocking set**, each breaking 17 to 19 of the others. The pairwise graph over those twenty has density 0.93 -- 176 of 190 edges -- with a maximum independent set of 2 and a maximum matching of 2. **That is a floor of 18 resolution rounds**, and ordering buys exactly two of them back.
+
+**The discriminator is the insertion ANCHOR, and it is exact.** Of the twenty, eighteen place their last ledger hunk at the final line of their own base file; those break 17 to 19 others. The two that do not -- #943 at 0.988 of the file and #960 at 0.994 -- break 13 and 12.
+
+**Three plausible explanations were tested and refuted, and they are recorded so nobody re-derives them:**
+
+| Hypothesis | Refuted by |
+|---|---|
+| Any ledger-touching merge conflicts every other one | #969 changes 3 ledger lines and breaks 0, with 40 ledger-touching pull requests open |
+| Cost tracks the SIZE of the ledger edit | **#921 changes 67 lines and breaks 0**; #958 changes 84 and breaks 19 |
+| Cost tracks the region of the file | Both free and costly members sit in the last few percent; the free set contains edits of 95, 67 and 56 lines |
+
+**#921 is the whole argument in one row.** It changes 67 ledger lines, its last hunk sits at 0.499 of the file, and it collides with nothing. A pull request's page shows none of this: #969 and #943 both read MERGEABLE, and one is free while the other breaks thirteen.
+
+### What to build
+
+**Make allocation land the SECTION, not only the number.** `scripts/coord/alloc.ps1` already allocates a number atomically, and `pre-commit`'s ledger gate already refuses a number nobody allocated (`docs/LEDGER-GATE.md`). The missing half is that the allocated heading never reaches `main` until the work that fills it does -- confirmed while filing this item: `alloc.ps1 -Kind backlog` reserved #1486 and wrote no heading anywhere, so this very entry was appended at the shared anchor like every other.
+
+If allocation puts a stub heading on `main` -- the `## N.` line and a banner declaring the item unstarted -- then the branch that later fills it in **edits its own section at lines nobody else touches**. Two such branches no longer share an anchor, and the clique stops forming.
+
+**The cost is one extra round trip**: an allocation has to reach `main` before the work starts, rather than travelling with it. That is the trade, and it is worth stating plainly rather than discovering later.
+
+**What this does NOT fix.** The twenty already open still conflict and still need hand resolution; this stops the twenty-first. All eighteen conflicts among them are the same shape -- two appended sections at one anchor -- and resolve by keeping both in number order.
+
+### Rejected, with the reason
+
+**A merge driver for `docs/BACKLOG.md`** would end the class outright, and it changes the behaviour of every merge in the repository. That is a larger blast radius than the defect, and it wants its own item and a ruling.
+
+**One file per item with a generated index** dissolves the problem rather than avoiding it, and is the right long-term shape. It is a migration over 686 items and 12 referencing files, and the status banner alphabet is machine-parsed (`scripts/docs/backlog_status_check.py`), so it is not a doc edit. Its own item, if anyone wants it.
+
+**Reproducing the measurement.** Entirely offline against a static main, no CI and no waiting:
+
+    T=$(git merge-tree --write-tree "$MAIN" "$CAND" | head -1)
+    AFTER=$(git commit-tree "$T" -p "$MAIN" -p "$CAND" -m sim)
+    git merge-tree --write-tree "$AFTER" "$OTHER"   # non-zero exit means this one breaks
+
+About 45 calls per candidate, seconds each. The same shape stack-tests a merge-queue batch before enqueuing it, by merging each candidate onto the accumulated result rather than onto main.
+
+## 1488. test_connscale_smoke.py's probes assert a measurement was taken, so a contended runner fails them and evicts whatever is in the merge queue
+
+> 🔢 **Filed 2026-09-08 -- not started.** Two probes in `tests/test_connscale_smoke.py` fail on a loaded runner and take the merge-queue entry down with them. Measured 2026-09-08: **9 of 10 sampled failed `merge_group` CI runs** failed on this one file, out of **25 failed merge-group builds that day**. It evicted PR 879 three times and PRs 933, 955 and 833 once each.
+>
+> **Scored 2026-09-08 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. Value 7 -- it is the largest single consumer of merge-queue capacity measured so far, and every eviction also forces the entries behind it to rebuild. Difficulty 3 -- the change is confined to two test bodies and needs no product change.
+
+### What fails
+
+    FAILED tests/test_connscale_smoke.py::test_the_fd_probe_measured_or_named_why_it_could_not
+    FAILED tests/test_connscale_smoke.py::test_the_reload_probe_measured_at_least_one_step
+
+    Error: WALL #4 NEVER COMPARED -- no (sweep_mode, claim_mode) group
+
+Counts were 1, 1 and 2 failures against roughly 12,300 passes, and **a different assertion failed on each OS leg of the same run** -- the signature of a timing- or load-sensitive test rather than a consistent defect. The same file passes on the same commit when the runners are quiet.
+
+### RETRACTED 2026-09-08, SAME DAY, BY THE SEAT THAT FILED IT
+
+**The two sections that stood here were wrong, and the fix they prescribed would reintroduce a defect
+this repository has already measured and closed.** They are removed rather than left with a correction
+appended, because a reader who acts on a prescription does not always read to the end of the item.
+
+**What they said.** That the probes "assert a measurement was taken" where their own names promise
+"measured or named why it could not", that this is a test defect rather than a product one, and that
+the fix is to record an unavailable measurement and pass.
+
+**Why that is wrong.** `_assert_fd_probe` in `tests/test_connscale_smoke.py` already tolerates a gap
+per record. What it refuses is a whole run in which no `(sweep_mode, claim_mode)` group ever got two
+readings to compare, and its comment records the measurement that bound exists for: forcing every step
+after the first to time out left one group with a single reading, **zero pairs actually compared**, and
+`fd_count_monotonic` still reported monotonic -- so a 1000-handle FD collapse passed green. The
+tolerance this item asked for is the exact tolerance that made a real collapse invisible. Assertion 4
+in that helper's docstring states the same bound in words, and this item did not engage it.
+
+**What is actually true.** The probes fail when the runner cannot take the measurement, and on
+2026-09-08 the runner could not because the merge queue and a large push wave were competing for it --
+a wave this seat generated. The failure is a true report about the machine, which is what the helper
+was rewritten to make it. **A test that goes red when its instrument cannot measure is not obviously
+broken; the alternative is a green that means nothing.**
+
+**What a real remedy would have to address**, none of it inside the assertion: the probe's timeout
+budget against a loaded runner, whether this smoke belongs in a contended lane at all, or the load
+itself. Whoever takes that up should start from `_assert_fd_probe`'s docstring and the
+`WALL #4 NEVER COMPARED` comment, not from this item's original text.
+
+**How this happened, since the shape recurs.** The seat read the test NAMES, matched them against a
+symptom, and proposed a change to code whose reasoning it had not read. The names were a genuine clue
+and the conclusion still did not follow. The item was filed, scored a quick win, merged, and was
+carrying a prescription to weaken a guard for about two hours.
+
+### Not taken here
+
+Quarantining the two probes was considered and refused by the owner on 2026-09-08. That decision
+stands and is unaffected by this retraction: skipping them would stop the evictions and remove a
+connection-scaling guard.
+
+## 1489. the log write guard prints its roll notice to stdout, so it lands inside captured CLI output and breaks --json readers
+
+> 🔢 **Filed 2026-09-08 -- not started.** `messagefoundry/logging_guard.py` (shipped by PR #883 at 07:24Z, commit `995fc2790`) writes `application log sink stdout was rolled after a write` to the **stdout sink**. A CLI command invoked with `--json` writes its payload to that same stream, so a reader doing `json.loads(...)` sees the notice first and raises `Extra data: line 1 column 5`. Six tests in `tests/test_checks.py` fail this way, and it has already failed one merge-queue build.
+>
+> **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Value 6 -- it makes `--json` output unreliable for any consumer, and it evicts merge-queue entries at random. Difficulty 3 -- the notice needs a stream that is not the machine-readable one.
+
+### What fails
+
+    FAILED tests/test_checks.py::test_check_clean_sample_passes
+    FAILED tests/test_checks.py::test_check_dryrun_accepts_single_file
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_bad_message
+    FAILED tests/test_checks.py::test_check_dryrun_fails_on_missing_messages_path
+    FAILED tests/test_checks.py::test_check_dryrun_gates_when_fixtures_present
+    FAILED tests/test_checks.py::test_check_dryrun_skipped_without_fixtures
+
+All six raise the same `json.JSONDecodeError: Extra data: line 1 column 5` from `json.loads(capsys.readouterr().out)`.
+
+### Why this is the guard and not the PR that fails
+
+It surfaced on PR 976, whose **entire diff is `docs/BACKLOG.md`** -- that change cannot reach the code path. Sampled failed CI runs mentioning `tests/test_checks.py`:
+
+| Window | Sampled | Mentioning the file |
+|---|---|---|
+| 09-07 12:00Z to 09-08 07:23Z, before the guard merged | 12 | **0** |
+| 09-08 07:24Z onward, after it merged | 12 | **2** |
+
+**Both numbers are samples of twelve, not a census.** They are consistent with the mechanism rather than proof of it; the mechanism is the load-bearing part, and it is not in doubt -- the module did not exist before `995fc2790`, and the failure text is the notice that module writes.
+
+### Why it looks like a flake
+
+`main`'s own CI has been green on every commit since the guard landed, and the failure has only been seen on `windows-2025`. The roll only happens sometimes, so the notice only sometimes precedes the payload. **That is the shape that gets a real defect filed as bad luck**, which is why the before/after split is recorded here rather than left to a later reader to re-derive.
+
+### The fix is NOT what this item first said -- corrected before merge
+
+**The original text prescribed sending the roll notice to stderr. That would break the control.**
+It is recorded rather than quietly replaced, because the reasoning is the useful part.
+
+`_GuardedSinkMixin.handleError` writes the notice to the **replacement stream on purpose**, and says
+why: *"STAGE 1 is only complete once the REPLACEMENT has actually accepted a write. Both writes below
+go to the fresh stream; either raising means the replacement is no better than the file it replaced,
+which is precisely the Stage 2 condition."* The notice **is the proof that the rolled sink recovered**.
+Move it to stderr and stage 1 can no longer tell a healed stdout sink from a dead one, so the
+fail-closed halt loses its trigger. `_last_resort` already writes to stderr for the case where there is
+no working sink at all; that is a different channel for a different fact.
+
+### What the defect actually is
+
+Two streams with different contracts share one file descriptor. `messagefoundry check --json` writes a
+machine-readable payload to stdout, and the default log sink writes to stdout as well. Under pytest's
+capture the guard's re-resolve fires -- **the scenario `GuardedStreamHandler`'s docstring was written
+for**, naming "pytest's capture teardown" by name -- and the notice lands in the captured buffer ahead
+of the payload, so `json.loads` reports `Extra data: line 1 column 5`.
+
+So the question is not which stream the notice takes. It is one of:
+
+1. **A `--json` payload should not share a stream with logging.** A parser contract and a
+   human-readable log on one descriptor is the collision, and the CLI is where that is decided.
+2. **The tests should not assert stdout is pure JSON while logging is live.** `test_checks.py` reads
+   `json.loads(capsys.readouterr().out)`, which is only sound if nothing else may write there.
+
+Both are real and neither is inside `logging_guard.py`. **Whoever takes this up should start from the
+guard's docstrings and choose between those two, not from a prescription in this item.**
+
+### How this item went wrong, since it is the second time in one day
+
+The seat matched a symptom to a mechanism and proposed changing code it had not read. BACKLOG #1488
+failed the same way and had to be retracted after it merged. The tell in both cases is the same: the
+proposed change made a guard weaker, and the guard's own comments already recorded the measurement that
+put it there. **A prescription that weakens a control is the one that most needs the code read first.**
+
+### Not taken here
+
+No revert of #883 is proposed. The guard is wanted and its re-resolve design is deliberate.
+
+## 1448. a dispatched brief is frozen at spawn: the chip cannot be corrected and nothing tells the receiver it has drifted
+
+> 🔢 **FILED 2026-09-04 by the session that read the stale brief.** Not started. A **fleet-process** defect with no engine, PHI or deployment axis (sec. 0) -- nothing here reaches a running instance, because there are none. What it would cost is duplicated Builder turns and a prose merge conflict a human then resolves by hand.
+
+**The defect in one sentence: a chip is a snapshot of the tree at spawn, and once the receiver has started it there is no path to correct it and no signal that it needs correcting.**
+
+`CLAUDE.md` sec. 5 already says *"The brief is disposable. The BACKLOG item is the record."* That covers a brief being **thrown away**. It does not cover a brief being **wrong** by the time it is read, and those are different failures with opposite remedies: a disposable brief you may ignore, a stale one you must first detect.
+
+### The measured incident, 2026-09-04
+
+**#1443 and #1445 are allocated and open in PRs 837 and 859; neither is on `main` yet**, so `dangling_citation_check.py` reports both unresolved until they land. #1439 is on main. Cited anyway, per the rule in `CLAUDE.md` sec. 5 that an allocated-but-unlanded number is cited and said so.
+
+A session working **#1443** raised a task chip naming three drift sites. Item 3 was a docstring in `scripts/webconsole_seam_snapshot.py`.
+
+Minutes later the author of that line -- working **#1439**, and declining to open a competing branch over two comment blocks -- handed the same fix to the spawning session directly. It took it and pushed `c2f549f42` on **PR 837**. **That was the correct call**: the session already in the file is the cheapest place for the change.
+
+**The chip was already dispatched, and the spawner then had nowhere to put that fact.** `dismiss_task` withdraws only a chip the user has **not** yet acted on; this one had been started, so it stayed live, frozen, and wrong.
+
+***THE SHARPEST PART OF THIS ROW IS THAT THE RECORD WAS UPDATED AND ONLY THE CHIP WAS NOT.*** #1443's own body carries the handover in the same change, under the heading *"ONE MORE SIBLING WAS TAKEN, ON A HANDOVER"*. So the spawner did exactly what sec. 5 prescribes -- the BACKLOG item is the record, and it corrected the record -- **and the receiver was reading the other artifact, the one with no update path.**
+
+**The receiver -- PR 859, working #1445 -- avoided the duplicate for a reason that does not generalise.** It read PR 837's diff at hunk granularity before touching anything and saw both comment blocks already rewritten. Had it trusted the brief, two PRs would have rewritten the same two hunks and met at merge, with the Lander resolving prose by hand.
+
+### Two more of the same brief's items failed to survive a read of their sources, and they are three different faults
+
+**A brief that drifts once has usually drifted more than once**, because the tree moves and the brief does not, so the count of bad items tracks elapsed time rather than the author's care. But the three faults below have three different causes, and a fix aimed at one will not touch the others.
+
+| item | what the brief said | what the source says | fault |
+|---|---|---|---|
+| 3 | fix the docstring in `scripts/webconsole_seam_snapshot.py` | already fixed and pushed as `c2f549f42` | **stale** -- correct at spawn, overtaken |
+| 1 | delete one line, `messagefoundry_webconsole/__init__.py:29` | the deletion makes the file **worse**. Verified by reading: `:29` is a truncated fragment ending on the word "the"; removing it alone puts the pre-#279 range framing on `:27-28` (*"A pair outside this set"*, *"PEP 508 compat range"*) directly against its contradiction on `:30-31` (*"EXACTLY the engine seam it was built against -- deliberately a single value, not a range"*). The correct fix is a three-line rewrite. | **wrong when written** -- never true, not stale |
+| adjacency | `docs/adr/0143-...md` is "adjacent, probably leave alone" | #1443's carve-out **does** list it, among *"Three more, all in the #1220 class and all deliberately out of this diff"* -- **and the same sentence argues against fixing it**, that *"an accepted ADR records what was true when written and is better left dated than edited"* | **a compression of a source that says two things.** The brief is defensible here; what it is not is a substitute for reading the carve-out |
+
+***THE THIRD ROW IS RECORDED AGAINST THIS ITEM'S OWN INTEREST, AND DELIBERATELY.*** It was reported to this session as a plain staleness -- the brief deferring a site the carve-out wanted fixed -- and the source does not support that reading. A row asserting the brief was wrong there would be a stale citation of exactly the kind this item exists to describe. **It still supports the rule**, because the receiver's recovery is the same in all three cases: go read the source, not the brief's one-line summary of it.
+
+### THE DEFECT IS THE MECHANISM, NOT THE AUTHOR
+
+Handing item 3 to the session already in that file was right, and re-cutting the chip is not an option anyone declined -- **it does not exist**. Read this row as an argument about the channel: **a dispatch artifact with no update path and no staleness signal will eventually be acted on stale, and the only thing standing between that and a hand-resolved merge conflict is a receiver who happens to verify.**
+
+### Family, and why this is NOT folded into #1391
+
+**#1391 is the same family and is cited rather than extended** -- both are a dispatch artifact that is wrong by the time it is used. The mechanisms and the fixes are disjoint:
+
+| | #1391 | this row |
+|---|---|---|
+| when it goes wrong | **at generation.** `respawn.ps1:1339`/`:1426` emit a relative command rooted at the predecessor's checkout, so the brief is wrong the instant it is written | **after dispatch.** The brief was correct at spawn and the tree moved underneath it |
+| candidate fixes | an absolute path in the brief, or `seat.ps1` keying on the session rather than the invoking tree | a chip that cites the record instead of restating it, or a head-SHA stamp the receiver can diff from |
+
+Neither fix does anything for the other row. **#1391's own body warns that "a fix aimed at the wrong half will look like it worked on the seats that were never affected"** -- folding these together would build that trap on purpose.
+
+### AMENDED SAME DAY: THE WINDOW THIS ROW FIRST NAMED IS THE SMALLER HALF
+
+**This item was filed scoped to spawn-to-read, and two Manager seats answered within the hour that
+the dominant window is filed-to-dispatch.** Both reports are attributed, not verified here; the
+correction is recorded because **the original scoping was the defect this row exists to describe.**
+A rule reading *"a brief can go stale between spawn and read"* invites a reader to check how fresh
+the brief is and skip -- which is the SDS-3.4 shape the incident's own `c2f549f42` commit was fixing,
+a warning whose stated reason licenses the failure it exists to prevent. `CLAUDE.md` sec. 5 item 6
+was widened accordingly.
+
+**The reported population, from a seat that dispatched fourteen Builders that day: six of eleven
+briefed items were already answered at spawn.** Each by a different mechanism, and none of them a
+race:
+
+| item | how it was already answered |
+|---|---|
+| #1117 | founding premise died when ADR 0172 shipped the change **under a different item number** |
+| #1317 | its open half decided by ADR 0180, **accepted five days before the brief**; the item never recorded it |
+| #1139 | one of three named targets already built under #1248 |
+| #1085 | marked fixed 2026-08-26, banner deliberately left open; the item said so, the ranking table did not |
+| #1107 | shipped in PR 488, and the item's own body says **"DO NOT REBUILD IT"** |
+| #1172 | both brief items shipped, in PR 603 and a 2026-09-03 gate change |
+
+***THE STRUCTURAL CAUSE, AND IT IS BIGGER THAN THE CHIP.*** **An item records its own research, and
+nothing records the work that ANSWERS it.** A ruling or a PR that settles a question never touches
+the row that asked it, so the row keeps pointing at a settled question and every dispatch screen
+reads it as current. The frozen chip is one instance; a row that outlives its own answer is the
+general case, and it is measured in weeks rather than minutes.
+
+**Anchor drift is the second half and is reported worse than the first.** Four anchors adrift by
+**50, 86, 581 and 593 lines** in one day, one item with both of its anchors dead. Hence the flat
+rule now in sec. 5: **line numbers are navigation aids and never evidence.**
+
+### THE CORRECTION PATH EXISTS FOR ONE WORKER TYPE AND NOT THE OTHER
+
+**This row's title says "cannot be corrected", and that is true of a chip and of a `claude -p`
+session. It is NOT true of a subagent.** `MANAGER.md:30` carries the table: a Console's workers are
+separate `claude -p` sessions, a Manager's are **subagents in the Manager's own process**. A Manager
+reported sending mid-flight corrections to four running subagents on 2026-09-04; each landed at the
+worker's next tool round and all four acted on it.
+
+**So "what to do about a stale brief" has two answers by seat, and a single rule that ignores that is
+wrong for one of them.** A fix aimed only at the frozen-chip case would leave the Manager path
+untouched, and a fix assuming corrections are deliverable would not reach a Console Builder at all.
+
+***AND THE OBVIOUS FIX PUSHES IN A DIRECTION ANOTHER RULE ALREADY WARNS ABOUT.*** "Send more
+corrections" collides with `MANAGER.md` sec. 5, which says to hand down **readings, not
+conclusions**, because a worker told your conclusion will apply it and its own correct evidence will
+lose. **A correction must therefore carry the new MEASUREMENT and let the worker re-decide** -- never
+the sender's new conclusion.
+
+### The mitigation that has evidence behind it, and it is two lines
+
+The same seat put two lines at the top of every brief, and reports **six Builders hitting a stale
+item with none wasting its turn**; two produced better findings than the original item asked for:
+
+1. *Check it is not already answered. If it is, record that with evidence and STOP -- that is a good
+   outcome, not a failure.*
+2. *Re-measure every line number this item cites.*
+
+**Line 1 is the load-bearing half**, and it is a permission rather than an instruction: a Builder
+that believes finding-it-done is a failed turn will build it again rather than report it.
+
+### Where the authoritative text lives is itself unresolved, and this row does not settle it
+
+`CLAUDE.md` sec. 5 is no longer the only place seat rules live. The vault's `roles/` folder carries
+`COMMON.md`, `MANAGER.md`, `BUILDER.md` and others, and `MANAGER.md`'s standing rules say a conflict
+between a playbook and `COMMON` goes to the **owner** rather than being resolved by any seat.
+
+**Checked before amending sec. 5, and reported as a null result rather than skipped:** `BUILDER.md`
+carries no rule about verifying a brief against the tree, and `MANAGER.md` carries none the new
+bullets contradict. **So there is no conflict to escalate today** -- but sec. 5's roster does not
+list a Manager seat at all, while `MANAGER.md` exists and is being followed, and **that gap is a
+question for the owner, not for this row.**
+
+### What a fix looks like, smallest first
+
+1. **Prose, and it is already written.** `CLAUDE.md` sec. 5 now tells the receiver to verify a brief against the tree before acting, and tells whichever seat dispatched to mail the receiver when it takes an item back. **That is a workaround, not a mechanism.** It costs the receiver a diff read per named PR, and it fails silently the first time somebody skips it.
+2. **A chip that cites the record rather than restating it.** Sec. 5 already names the BACKLOG item as the record, and the incident above shows the record staying accurate while the chip did not. A chip reduced to a citation would let the spawner correct the item and have the receiver read the correction. **Unmeasured:** nobody has checked whether a citation alone carries enough for a cold receiver, which is the whole reason briefs restate.
+3. **A staleness signal.** Stamp the chip with the head SHA of every branch it names, so the receiver can diff from a known point rather than guessing what moved.
+
+**Do not start at 3.** The receiver already recovers by reading diffs, so a signal telling it to do what it already does buys the least of the three. **Measure first how often a chip outlives its own accuracy** -- this row is a population of one, and one incident cannot tell a rare race from a routine one.
+
+**Cluster:** Fleet coordination. **Priority:** unscored -- filed after the 2026-09-03 scoring pass, so it carries no row in the ranking table above. **Verdict:** build (small), pending that measurement. **Severity:** no engine effect, no PHI axis, no deployment axis (sec. 0). It costs duplicated Builder turns and prose conflicts resolved by hand.
+
+
+## 1476. a whole-file scorecard re-render from a stale clone silently reverts every cell landed since that clone's base, and nothing compares stated scope against cells touched
+
+> 🔢 **Filed 2026-09-06 -- not started. Scored at filing.** Value **6/10** · Difficulty **3/10** · _quick win_. A vault commit whose subject names one cell re-rendered the whole scorecard and reverted an owner-approved repair to an unrelated cell. The reverted bytes are identical to the pre-repair state, so the write came from a base predating the repair rather than from any edit to it. It stood three days undetected. The recurrence vector is loaded rather than theoretical: the vault clone checked out beside the engine is 54 commits behind `origin/main`, and a re-render from it would revert every cell landed since its base. The remainder is two additive guards on the existing tool -- refuse to write from a clone behind its remote, and compare the cells a payload NAMES against the cells the write actually changes. Difficulty 3 for two guards plus must-fire and must-not-fire arms.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ASVS record integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is the security **record**, not engine behaviour -- no shipped artifact, no PHI, no runtime path. What it corrupts is the evidence an assessor would read, and the decisions an owner already made.
+
+**The defect, in one sentence:** a targeted scorecard edit is written as a whole-file re-render, so it carries the writer's stale base over every cell it never meant to touch, and nothing compares what the commit says it did against what it did.
+
+### It has already fired once, and the proof is a hash rather than a diff read
+
+Vault commit `0d4df75c` (2026-08-28) re-patterned one cell's absence claim. Its own body records the authority: *"Owner-approved 2026-08-28, as drafted, via the Liaison"*, and it states that the change was carried to the owner as **not** a like-for-like repair.
+
+Vault commit `c117e0a2` (2026-09-03), whose subject names a different cell and a different item, reverted it.
+
+Hashing that cell's absence block across four revisions settles the mechanism without anyone reading a 1,483-line diff:
+
+| revision | absence block |
+|---|---|
+| `0d4df75c^` (before the repair) | `a68537c3d858` |
+| `0d4df75c` (the owner-approved repair) | `90851aadcb04` |
+| `c117e0a2^` (still repaired) | `90851aadcb04` |
+| `c117e0a2` (the sweep) | `a68537c3d858` |
+| `origin/main` today | `a68537c3d858` |
+
+The sweep's output is **byte-identical to the pre-repair state**. That is the discriminating fact: a deliberate re-edit would land on some third hash, and a merge would conflict. Reproducing the old bytes exactly means the writer rendered from a base that predated the repair.
+
+The blast radius was not one cell. The overwhelming majority of cells in the file changed real content under that one-cell subject, and the change was not cosmetic -- normalising each cell to its sorted set of stripped lines leaves the count unchanged, so key reordering and re-indentation explain none of it. Most of it is a legitimate re-verify: anchor `line` values drift as engine code moves, and `verified_at` moves with them. The reverted claim is not, and it rode in under the same commit with nothing separating the two.
+
+### Why the existing guard does not catch it
+
+The preservation guard compares **key sets**. Here no key was added or removed -- the same three fields carry different values -- so it passes by construction. That is the value-corruption blindness `#1242` already records, reached from a new direction: `#1242` is about a writer mangling a value it was handed, and this is about a writer faithfully rendering a value it should never have been holding.
+
+Neither row should be closed on the strength of the other, and a fix to either leaves this open.
+
+### The instrument trap, recorded because it cost this session a wrong answer
+
+`git log -S"<needle>" -- docs/security/asvs-scorecard.toml`, run with no explicit ref in the vault clone beside the engine, **does not list `c117e0a2` at all**. That clone is 4 ahead and 54 behind, `c117e0a2` is not an ancestor of its `HEAD`, and `git log` defaults to `HEAD`. The query returns a short, plausible, wrong list, and nothing about the output says a ref was assumed.
+
+Worse for a reader trying to check the record: that clone's working file still carries the **repaired** form. Anyone who opens it concludes the fix is in place and nothing is wrong.
+
+Name the ref (`git log ... origin/main --`) and confirm ancestry with `git merge-base --is-ancestor` before concluding a commit did not touch a file. This is **SDS-3.8** in its purest form -- the instrument answered "what happened on this branch", and the question was "what happened to the record".
+
+### What would prove a fix
+
+1. A write attempted from a clone behind its remote is **refused**, and the refusal names the gap. The check must run against a clone that is genuinely behind, not a fresh one, or it passes on the only state that was never the problem.
+2. A payload naming one cell that produces changes to cells it does not name is **refused or reported**, with the out-of-scope ids listed. A legitimate whole-file re-verify must have an explicit way to say so, or the guard gets disabled the first time it is inconvenient.
+3. A regression arm replaying this exact pair: apply `c117e0a2`'s shape over a tree carrying `0d4df75c`, and assert the repair survives.
+
+**Related:** `#1242` (the sibling blindness in the same guard -- value corruption rather than key loss, and latent where this one has fired). `#1187` (the ledger row for the reverted cell; its own re-score is a separate act and is not this).
+
+**Source:** measured 2026-09-06 while putting the cell's retirement question to adversarial review. Two of three independent readers found the revert; the hash comparison and the ancestry trap above were confirmed directly afterwards.
+
+---
+
+## 1490. unread-signal.yml takes a runner SLOT on every workflow completion, reporting on a review gate that no longer exists, and it is DISABLED MANUALLY right now
+
+> 🔢 **Filed 2026-09-08 -- the workflow is already off; the tree does not say so.** Owner
+> ruling 2026-09-08: turn it off. Done the same hour with `gh workflow disable unread-signal.yml`,
+> so the live state is `disabled_manually` while `.github/workflows/unread-signal.yml` is still in
+> the tree and still reads as a live workflow. **That gap is the reason this row exists** -- it is
+> the exact shape of the 2026-07-30 incident `tests/test_required_workflow_state.py` was built for,
+> where ten required contexts sat on `disabled_manually` workflows that kept their files and job
+> names. This one is not required, so nothing is ungated, but the invisible state must not stand
+> undocumented.
+>
+> **Scored 2026-09-08 -> P2.** Value **5/10** · Difficulty **4/10**. Value 5 -- the runner
+> saving is already banked by the disable, so what is left is removing dead machinery and
+> closing the gap between a disabled workflow and a tree that still shows it live. Difficulty
+> 4 -- twelve coupled files, two of them test manifests that fail loudly if a name is missed.
+
+### THE FIRST FILING OF THIS ROW CITED 440 RUNNER-MINUTES A DAY. THAT NUMBER WAS WRONG.
+
+It came from `updated_at - run_started_at` at the RUN level, which is wall-clock **occupancy**, not
+work. Under runner starvation occupancy is mostly the starvation itself, so the figure was largely
+measuring the queue this workflow was waiting in. Corrected the same day, after a peer session
+pulled job-level data and inverted the conclusion; re-measured here independently before amending.
+
+**The old metric is self-refuting, and this is the cheapest way to see it.** Twelve completed runs
+per workflow, run-level occupancy against the sum of `completed_at - started_at` over each run's
+jobs:
+
+| workflow | run-min (occupancy) | job-min (work) | jobs | wait |
+|---|---|---|---|---|
+| CI | 568.0 | 635.2 | 142 | **-11.8%** |
+| unread signal | 308.1 | **2.8** | 10 | 99.1% |
+| failure signal | 10.8 | 0.1 | 1 | 99.2% |
+| Security | 318.9 | 52.3 | 84 | 83.6% |
+| quality-advisory | 439.0 | 234.8 | 84 | 46.5% |
+| CLA Assistant | 107.1 | 1.7 | 12 | 98.5% |
+
+**CI's job-minutes EXCEED its wall-clock**, because its jobs run in parallel. A metric that can be
+exceeded by the work it claims to measure was never measuring work. That row is the control, and
+nothing about it needed a second opinion.
+
+**What `unread signal` actually costs: 2.8 job-minutes across 12 runs, about 17 seconds of work
+each.** Cutting every signal and notice workflow saves well under 1% of runner time, not the 25%
+the first filing implied.
+
+### The real cost is SLOTS, and that argument is unchanged
+
+A job holds a runner slot whatever its duration, and slots are what the merge queue competes for.
+`unread signal` fires on `workflow_run: completed`, so every CI, Security, CodeQL or
+backlog-hygiene run that finishes starts one: a single push costs about seven CI runs **and about
+seven signal runs**, and the signal half scales with the CI half forever. Ten pushes in forty
+minutes on 2026-09-08 put 73 runs in the queue against 3 running.
+
+**So the decision to disable it stands on the SLOT argument, not on the minutes argument.** State
+it that way in anything citing this row. Relieving the merge queue and saving compute are two
+different rankings and they disagree; this row is the first.
+
+**A larger win sits next door and is NOT this row's to take.** `Security` runs ten near-trivial
+jobs, roughly 4.3 job-minutes against 126 queue-minutes per run, and is about a fifth of every slot
+contended for. Consolidating those ten into two or three composite jobs would cut that pressure
+**without removing a single scan** -- same coverage, same seven required contexts, fewer slots.
+Attributed to a peer session's 7-day job-level census, not re-measured here.
+
+### The gate it was built for is gone, confirmed three ways
+
+Its header states the purpose (BACKLOG #1413): `a reviewer has read this` became a required context
+on 2026-08-31, and nothing reported that a green pull request was sitting unread. That gate is now
+absent:
+
+1. branch protection lists **13** required contexts and **none** names review or read;
+2. `.github/workflows/review-gate.yml` is **not in the tree**;
+3. `required_approving_review_count` is **0**.
+
+Nothing reads its label either. `gh pr list --label unread` is a convenience for a seat, not a gate,
+and no workflow keys on it -- consistent with CLAUDE.md, which records that no label any signal
+workflow applies gates a merge.
+
+### What it cost, concretely
+
+PR 859 entered the merge queue at 18:07:11Z fully green and was removed at 18:29:06Z having failed
+nothing. Its merge_group batch (`95734a3c`) had `CI` still `queued` and never started, while the
+sibling batch (`e215f25d`) got a runner and survived. The queue drops an entry whose checks do not
+start; the starvation was 58 queued runs against 9 in progress.
+
+### What is left to do, and why it was not done in this pull request
+
+The disable stops the cost. The tree still carries the machinery, and removing it touches at least:
+
+    .github/workflows/unread-signal.yml      scripts/ci/check_unread_prs.py
+    tests/test_unread_signal.py              tests/test_unread_prs.py
+    tests/test_merge_gate_controls.py        tests/negative_controls.toml
+    tests/tooling_manifest.txt               .github/zizmor.yml
+    .github/required-contexts.txt (comment)  CLAUDE.md, docs/CI.md, docs/METHOD.md
+
+That is a coupled change with real breakage risk in the manifest and negative-control tests, and it
+is a Builder's change, not a merge repair. **Whoever takes it must re-run
+`scripts/ci/check_required_workflow_state.py --states-json <live>` afterwards**; it passed at the
+time of the disable, reporting all 13 required contexts on active workflows.
+
+**Do not simply re-enable it to make the tree agree.** The measurement above is the reason it is
+off; if it is re-enabled, this row is the thing to argue with.
+
+**Source:** measured 2026-09-08 by the Lander while draining the merge queue, after the queue
+dropped a green pull request for want of a runner.
+---
+
+## 1491. the web console step's cap rests on a CENSORED anchor, and the whole cost lands on the merge queue as evicted, healthy pull requests
+
+> 🔢 **Filed 2026-09-08 -- measured, not built. Owner ruled: file it, change nothing.**
+>
+> **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10**. Value 6 -- it removes a
+> failure that costs a healthy pull request a full extra CI cycle, about an hour, at roughly one
+> queue batch in twenty, and it does so without touching a single test. Difficulty 3 -- two numbers
+> in two files, both with a stated derivation rule to follow; the work is the MEASUREMENT, and most
+> of it is below.
+
+### The chain, and every link is in the tree already
+
+`scripts/ci/step_margin.py` reports **LOW** and exits 1 when `cap / elapsed < 1.30`
+(`DEFAULT_MIN_MARGIN`). For `Web console tests (pytest)` on `windows-2025` the cap is
+`matrix.webconsole_step_timeout = 6` in `.github/workflows/ci.yml`, so the step fails above **4:36**.
+
+`ci.yml` states the sizing rule: `step_timeout = ceil_minute(1.35 x that leg's anchor)`. Six minutes
+is `ceil(1.35 x 3:59)`. That **3:59** is the `windows-2025` web-console row in
+`scripts/ci/step_margin_baseline.toml`, and the row says of itself:
+
+    max_passing = "3:59"
+    censored    = true
+    censored_by = "the JOB cap of the `test` job -- ... equally retired by the move to a separate
+                   `webconsole` job"
+    source      = "measured 2026-08-08; ... Predates the job split (2026-08-16)."
+
+**So the cap was sized from a number the file marks as a LOWER BOUND, taken before the job split
+that retired the mechanism which censored it.** The file already prescribes the remedy, in the
+ubuntu row's `censored_by`: *"the first row measured under the new topology supersedes it."*
+
+### What it actually takes now, measured 2026-09-08
+
+Pool: the 300 most recent of 3,055 CI runs created since 2026-08-16. Step duration is
+`completed_at - started_at` on the step named `Web console tests (pytest)`, over steps that
+CONCLUDED SUCCESS.
+
+| leg | n | p50 | p95 | max | cap | LOW above | over |
+|---|---|---|---|---|---|---|---|
+| ubuntu-latest | 237 | 2:26 | 2:42 | 2:56 | 5:00 | 3:50 | 0 (0.0%) |
+| windows-2022 | 240 | 3:09 | 3:30 | 4:28 | 6:00 | 4:36 | 0 (0.0%) |
+| **windows-2025** | 240 | 3:28 | 4:27 | 5:09 | 6:00 | 4:36 | **6 (2.5%)** |
+
+**THE POOL WAS PROVED WHOLE BEFORE ANY NUMBER WAS READ FROM IT.** The five-way partition by event
+sums EXACTLY to the total the API reports for the same window -- `push 463 + pull_request 1872 +
+merge_group 696 + schedule 23 + workflow_dispatch 1 = 3055`, against a `total_count` of 3055. A page
+that came back silently short breaks that identity and cannot break it in a compensating way. Credit
+for the control: a peer session, same day.
+
+### The finding that matters: it is a MERGE-QUEUE-ONLY failure
+
+Same step, same leg, split by the event that started the run (120 most recent runs of each):
+
+| event | n | p50 | p95 | max | over 4:36 |
+|---|---|---|---|---|---|
+| `pull_request` | 72 | 3:28 | 4:25 | 4:33 | **0 (0.0%)** |
+| `merge_group` | 116 | 3:29 | 4:46 | 5:38 | **6 (5.2%)** |
+
+**The medians differ by one second. The entire difference is in the tail.** Every observed failure is
+a `merge_group` run and not one is a pull request's own check. That is why the symptom is so
+confusing from the outside: a pull request passes all 13 required contexts, is silently removed from
+the queue, and still passes all 13 afterwards. The check that removed it never ran as part of its own
+tests.
+
+Seven evictions on 2026-09-08 across four pull requests -- 859 (x2), 976 (x2), 974 (x2), 993 (x1) --
+none caused by the pull request. 859 and 976 both merged on a later attempt, so the cost is roughly
+**one extra CI cycle, about an hour, per eviction**, not correctness.
+
+### What a fix would be, and why it is NOT in this pull request
+
+Re-deriving the anchor to the measured **5:38** gives `ceil_minute(1.35 x 5:38)` = **8:00**, and a LOW
+point of `8:00 / 1.30` = **6:09**, which no run in either pool reaches. That is two numbers:
+the `windows-2025` web-console row in `step_margin_baseline.toml`, and `webconsole_step_timeout` for
+`W25` (and `W22`, if its 2:51 row gets the same treatment) in `ci.yml`.
+
+**Owner ruling 2026-09-08: file the measurement, change nothing.** A gate's sensitivity is not the
+Lander's to move on its own measurement.
+
+**WHAT IS STILL OWED BEFORE THE NUMBER IS WRITTEN IN, and this is the real work of the item.** The
+5:38 above is from a BOUNDED pool -- the most recent 120 `merge_group` runs -- so it is itself a
+lower bound, and swapping one lower bound for another is how this row got wrong the first time.
+Walking all 3,055 runs since the split costs about 3,055 API calls against a budget SHARED by every
+session on this machine; exhausting it on 2026-09-08 is what stopped the first attempt at this
+measurement. Whoever takes this should either walk the full pool deliberately with that cost
+budgeted, or state the bound in the row exactly as the file's contract requires -- pool AND count --
+and set `censored` honestly rather than asserting an uncensored maximum it did not observe.
+
+The nesting invariant in `ci.yml` must also still hold after any cap change:
+`setup(max) + webconsole_step_timeout < webconsole_job_timeout`, currently 20.
+
+**Related:** `#1304` (the sibling contention failure -- a pwsh launch that never returns, which
+evicts by a different mechanism on the same runners), `#344` (the item the baseline file and the
+sizing rule both come from).
+
+**Source:** measured 2026-09-08 by the Lander while draining the merge queue, after four pull
+requests were evicted while fully green and the cause was twice misdiagnosed -- first as runner
+starvation, then as an exceedance of the recorded maximum. It is neither: it is the margin against
+the cap, and the cap's anchor is censored.
+---

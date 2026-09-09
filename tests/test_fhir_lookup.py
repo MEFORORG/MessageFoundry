@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import fhir_lookup
+from messagefoundry import FhirRaw, FhirToken, fhir_lookup, fhirsearch
 from messagefoundry.config.fhir_lookup import FhirLookupError, activated
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -130,11 +130,13 @@ def test_fhir_lookup_delegates_to_active_runner() -> None:
     with activated(runner):
         res = fhir_lookup("epic", "Patient/123")
         # The structured params= form threads through the accessor → runner unchanged (BACKLOG #204).
-        fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})
+        # The accessor does not screen: a value's KIND is resolved at encode time (#1243), so the
+        # runner receives exactly the FhirToken the author wrote.
+        fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", "123")})
     assert res == {"resourceType": "Patient", "id": "123"}
     assert calls == [
         ("epic", "Patient/123", None),
-        ("epic", "Patient", {"identifier": "MRN|123"}),
+        ("epic", "Patient", {"identifier": FhirToken("MRN", "123")}),
     ]
     # The runner is reset on exit — calling again raises.
     with pytest.raises(FhirLookupError):
@@ -160,7 +162,7 @@ async def test_search_returns_bundle() -> None:  # AC-2 as amended 2026-08-13 (#
     # ADR 0043's AC-2 originally specified the flat "Patient?identifier=MRN|123" form and named this
     # test as its evidence. #1243 removed that form; the ADR amendment supersedes AC-2 accordingly.
     ex, opener = _executor(body=SEARCHSET.encode())
-    res = await ex.read("epic", "Patient", {"identifier": "MRN|123"})
+    res = await ex.read("epic", "Patient", {"identifier": FhirToken("MRN", "123")})
     assert res["resourceType"] == "Bundle" and res["type"] == "searchset"
     req = opener.requests[0]
     assert req.get_method() == "GET"
@@ -285,13 +287,19 @@ async def test_read_rejects_bad_query_phi_safe() -> None:
 
 def test_resolve_read_url_params_percent_encodes_each_value() -> None:  # #204 (a)
     # The safe structured form: each value is percent-encoded, structure (key=value) preserved.
-    url = _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"})
+    url = _resolve_read_url(BASE, "Patient", {"identifier": FhirToken("MRN", "123")})
     assert url == f"{BASE}/Patient?identifier=MRN%7C123"
 
 
 def test_resolve_read_url_params_multi_and_list() -> None:  # #204 (a)
-    # Multiple params keep order/structure; a list value expands to repeated params (doseq).
-    url = _resolve_read_url(BASE, "Patient", {"family": "O'Hara", "identifier": ["a|1", "b|2"]})
+    # Multiple params keep order/structure; a list value expands to repeated params, which FHIR
+    # reads as an AND. A comma inside ONE value is the OR, and that is what FhirRaw exists for
+    # (#1243) -- a plain str carrying one is refused, so a list can never be mistaken for an OR.
+    url = _resolve_read_url(
+        BASE,
+        "Patient",
+        {"family": "O'Hara", "identifier": [FhirToken("a", "1"), FhirToken("b", "2")]},
+    )
     assert url == f"{BASE}/Patient?family=O%27Hara&identifier=a%7C1&identifier=b%7C2"
 
 
@@ -300,47 +308,107 @@ def test_resolve_read_url_empty_params_is_bare_search() -> None:  # #204 (a)
     assert _resolve_read_url(BASE, "Patient", {}) == f"{BASE}/Patient"
 
 
-def test_encode_search_params_holds_the_url_layer_not_the_value_layer() -> None:  # #1243
-    """Pin BOTH halves of _encode_search_params' BEHAVIOUR; the mechanism is on that function.
+def _separators_refused_in_a_plain_str() -> list[str]:
+    """Which of FHIR's value-layer separators the encoder refuses inside a plain ``str`` value.
 
-    Asserting the value-layer survival alone would prove nothing (a no-op encoder passes it too), so
-    the URL-layer guarantee is the positive control in the same function: it must PASS while the
-    value-layer arm shows the gap. Mutation-proved both ways -- a Limb-B-style escaping encoder reds
-    the value-layer arm ONLY, a no-op encoder reds the control ONLY.
+    THE PROPERTY, factored out so the same call can be run against a MUTATED screen -- that is the
+    negative control below, and without it a green here could come from a check that cannot see the
+    failure class at all (SDS-3.8)."""
+    refused: list[str] = []
+    for separator in fhirsearch.FHIR_VALUE_SEPARATORS:
+        try:
+            _encode_search_params({"identifier": f"MRN{separator}123"})
+        except ValueError:
+            refused.append(separator)
+    return refused
 
-    **Whoever builds BACKLOG #1243 Limb B will red the value-layer arm, and that is the intended
-    signal, not an obstacle.** This pins the DOCUMENTED behaviour, so that arm and the docstring it
-    guards must move in the same commit. The docstring TEXT is pinned separately, by
-    ``test_encode_search_params_docstring_states_the_value_layer_gap``.
-    """
-    # CONTROL -- the guarantee that DOES hold: a value cannot inject an extra search PARAMETER.
-    # The exact-list equality pins the count too, so there is no separate len() assertion.
+
+def test_encode_search_params_holds_the_url_layer_and_refuses_at_the_value_layer() -> None:  # #1243
+    """Pin BOTH layers of _encode_search_params' BEHAVIOUR; the mechanism is on that function.
+
+    The URL-layer guarantee is the positive control in the same function: it must keep PASSING while
+    the value-layer arm changes, so a value-layer refusal can never be mistaken for the encoder
+    having been broken wholesale.
+
+    This arm REPLACES the one that pinned the separators surviving to the value layer. That was the
+    documented behaviour until BACKLOG #1243 limb B; it is not any more, and rewriting it is the
+    intended act rather than a regression."""
+    # CONTROL -- the guarantee that has always held: a value cannot inject an extra search PARAMETER.
+    # The exact-list equality pins the count too, so there is no separate len() assertion. Note this
+    # value carries NO FHIR value-layer separator, so it is still accepted; only the layers differ.
     hostile = _encode_search_params({"code": "abc&_count=999&identifier=evil"})
     assert hostile == "code=abc%26_count%3D999%26identifier%3Devil"
     assert urllib.parse.parse_qsl(hostile) == [("code", "abc&_count=999&identifier=evil")], (
         "CWE-88 control: one value must stay one parameter"
     )
 
-    # UNDER TEST -- the FHIR value-layer separators the encoding does NOT neutralise. Each row is
-    # (wire form, what the server has after percent-decoding), so one assertion pins BOTH that the
-    # separator is encoded on the wire and that the decode hands it back with separator meaning.
-    # Collected rather than asserted per row: a Limb B build regresses all three at once, and a
-    # bare `assert` in the loop would report only the first and hide the shape of the change.
-    wire_then_value_layer = {
-        value: (enc, urllib.parse.parse_qsl(enc)[0][1])
-        for value, enc in (
-            (v, _encode_search_params({"code": v})) for v in ("sys|val", "a,b", "$everything")
-        )
-    }
-    assert wire_then_value_layer == {
-        "sys|val": ("code=sys%7Cval", "sys|val"),
-        "a,b": ("code=a%2Cb", "a,b"),
-        "$everything": ("code=%24everything", "$everything"),
-    }, (
-        "the separator is percent-encoded ON THE WIRE but reaches the FHIR value layer intact; "
-        "_encode_search_params' docstring must not claim otherwise. If you are building BACKLOG "
-        "#1243 Limb B, this failure is expected -- update this arm and that docstring in the "
-        "same commit."
+    # UNDER TEST -- a plain str is DATA, so every FHIR value-layer separator in one is refused. The
+    # value never reaches the wire, so no server's escaping behaviour can be wrong about it.
+    assert _separators_refused_in_a_plain_str() == list(fhirsearch.FHIR_VALUE_SEPARATORS)
+
+
+def test_plain_str_refusal_names_the_key_and_withholds_the_value() -> None:  # #1243
+    """A refusal must be actionable AND PHI-safe: the key and the character, never the value.
+
+    A search value is the most message-derived string the engine builds, so leaking it into an error
+    would put PHI on a path the store does not control (CLAUDE.md section 9)."""
+    with pytest.raises(ValueError) as ei:
+        _encode_search_params({"identifier": "MRN|8675309"})
+    message = str(ei.value)
+    assert "identifier" in message, "the author cannot act on a refusal that hides which param"
+    assert "8675309" not in message and "MRN|8675309" not in message, (
+        "the refused value must NOT appear in the error -- it may carry PHI"
+    )
+    assert "'|'" in message, (
+        "naming the offending separator is routing-safe and makes the fix clear"
+    )
+
+
+def test_fhir_token_passes_the_system_half_and_screens_the_code_half() -> None:  # #1243
+    """The token pair is the answer to 'one string, two provenances' -- by not having one string."""
+    # The system half is an author literal: it rides through and re-forms the '|' on purpose.
+    assert _encode_search_params({"identifier": FhirToken("MRN", "123")}) == "identifier=MRN%7C123"
+    # The code half is where message data goes, so it screens exactly as a plain str does.
+    for separator in fhirsearch.FHIR_VALUE_SEPARATORS:
+        with pytest.raises(ValueError, match="code half"):
+            _encode_search_params({"identifier": FhirToken("MRN", f"1{separator}2")})
+
+
+def test_fhir_raw_carries_author_syntax_through_percent_encoding_only() -> None:  # #1243
+    """FHIR's own grammar puts separators INSIDE one value, so the author must be able to say so.
+
+    A composite is one value carrying '$', three '|' and a ',', all structural; repeated params are
+    ANDed, so a comma inside one value is the only way to write an OR. Refusing commas with no
+    FhirRaw would remove OR from the surface entirely."""
+    composite = "code$loinc|12907-2,value$ge150|http://unitsofmeasure.org|mmol/L"
+    encoded = _encode_search_params({"code-value-quantity": FhirRaw(composite)})
+    # Percent-encoded (the URL layer still holds) and byte-identical after the server decodes it.
+    assert urllib.parse.parse_qsl(encoded) == [("code-value-quantity", composite)]
+    assert _encode_search_params({"_sort": FhirRaw("status,-date")}) == "_sort=status%2C-date"
+
+
+def test_an_unsupported_value_kind_is_refused_phi_safely() -> None:  # #1243
+    """Config is dynamically loaded Python, so a wrong kind is a runtime question, not just mypy's."""
+    with pytest.raises(ValueError) as ei:
+        _encode_search_params({"identifier": 8675309})  # type: ignore[dict-item]
+    assert "identifier" in str(ei.value) and "8675309" not in str(ei.value)
+
+
+def test_separator_refusal_negative_control(monkeypatch: pytest.MonkeyPatch) -> None:  # #1243
+    """SDS-3.8 non-vacuity: mutate the screen to a pass-through and the property MUST go red.
+
+    A green from a check that cannot see its own failure class is worth nothing, and that is the
+    defect BACKLOG #1243 found in the first place -- a suite pinning %7C in five places could not
+    disagree with itself. So the control runs the SAME property function as the test above against a
+    screen that refuses nothing: it must return an empty list where the real one returns all three."""
+
+    def _passthrough(key: str, value: str, *, half: str) -> str:
+        return value  # the mutant: no screen at all
+
+    monkeypatch.setattr(fhirsearch, "_screen", _passthrough)
+    assert _separators_refused_in_a_plain_str() == [], (
+        "the mutated screen must refuse nothing -- if this still reports refusals, the property is "
+        "measuring something other than the screen and proves nothing about it"
     )
 
 
@@ -356,12 +424,14 @@ def _encode_docstring_lie(doc: str) -> str | None:
     return next((lie for lie in _RETIRED_ENCODE_CLAIMS if lie in collapsed), None)
 
 
-def test_encode_search_params_docstring_states_the_value_layer_gap() -> None:  # #1243
+def test_encode_search_params_docstring_states_the_value_layer_rule() -> None:  # #1243
     """The docstring is a security contract, so pin its TEXT, not just the behaviour behind it.
 
     It used to tell an author that a '|' in a value "stays a literal, never a separator", which is
     false at the FHIR value layer and is the SDS-3.7 defect BACKLOG #1243 records. The behaviour test
-    above cannot see that sentence return; this one can."""
+    above cannot see that sentence return; this one can. Since limb B it must also state the rule
+    that replaced the gap -- refusal by value kind -- because a docstring that merely stops lying
+    still leaves an author guessing what to write."""
     doc = _encode_search_params.__doc__ or ""
     assert doc, "_encode_search_params must keep its docstring -- it is the contract under test"
 
@@ -376,11 +446,18 @@ def test_encode_search_params_docstring_states_the_value_layer_gap() -> None:  #
     assert "does not neutralise" in collapsed, (
         "the docstring must positively state the limit, not merely omit the false claim"
     )
-    for separator in (",", "|", "$"):
+    assert "refuses" in collapsed or "refuse" in collapsed, (
+        "the docstring must state what happens now, not only what percent-encoding cannot do"
+    )
+    # Read the alphabet from the engine, not a literal: a fourth separator added there must widen
+    # this guard too, rather than leaving it silently passing on three.
+    for separator in fhirsearch.FHIR_VALUE_SEPARATORS:
         assert f"``{separator}``" in collapsed, (
             f"the docstring must name {separator!r} as a value-layer separator it does not neutralise"
         )
-    assert "#1243" in collapsed, "the docstring must cite the open item"
+    for kind in ("FhirToken", "FhirRaw"):
+        assert kind in collapsed, f"the docstring must name {kind}, the way out of a refusal"
+    assert "#1243" in collapsed, "the docstring must cite the item"
 
 
 def test_encode_docstring_guard_self_test() -> None:  # #1243
@@ -397,7 +474,7 @@ def test_resolve_read_url_rejects_params_with_query_string() -> None:  # #204, #
     # Was "ambiguous, pick one form"; since #1243 removed the flat form a '?' is refused outright,
     # so this case is subsumed rather than special.
     with pytest.raises(ValueError, match="not supported"):
-        _resolve_read_url(BASE, "Patient?active=true", {"identifier": "MRN|123"})
+        _resolve_read_url(BASE, "Patient?active=true", {"identifier": FhirToken("MRN", "123")})
 
 
 async def test_read_params_injection_value_is_encoded() -> None:  # #204 (b)
@@ -443,7 +520,7 @@ def test_read_by_id_unaffected_by_the_removal() -> None:  # #1243 limb A
 def test_structured_params_are_the_only_search_form() -> None:  # #1243 limb A
     # The safe form is untouched by the removal: values stay percent-encoded, structure preserved.
     assert (
-        _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"})
+        _resolve_read_url(BASE, "Patient", {"identifier": FhirToken("MRN", "123")})
         == f"{BASE}/Patient?identifier=MRN%7C123"
     )
 
@@ -457,9 +534,23 @@ async def test_executor_refuses_flat_read_before_dialling_out() -> None:  # #124
 
 async def test_executor_params_read_still_works() -> None:  # #1243 limb A
     ex, opener = _executor(body=SEARCHSET.encode())
-    await ex.read("epic", "Patient", {"identifier": "MRN|123"})
+    await ex.read("epic", "Patient", {"identifier": FhirToken("MRN", "123")})
     assert len(opener.requests) == 1
     assert opener.requests[0].full_url == f"{BASE}/Patient?identifier=MRN%7C123"
+
+
+async def test_executor_refuses_a_separator_value_before_dialling_out() -> None:  # #1243 limb B
+    """The refusal surfaces as a PHI-safe FhirLookupError and no byte leaves the process.
+
+    That last clause is the whole reason limb B refuses rather than backslash-escapes: an escape is
+    correct only if the far end implements the unescape, and server behaviour there varies. A value
+    that never goes on the wire cannot be misread by any server."""
+    ex, opener = _executor(body=SEARCHSET.encode())
+    with pytest.raises(FhirLookupError) as ei:
+        await ex.read("epic", "Patient", {"identifier": "MRN|8675309"})
+    assert "epic" in str(ei.value) and "identifier" in str(ei.value)
+    assert "8675309" not in str(ei.value)  # PHI-safe: the value is withheld
+    assert len(opener.requests) == 0  # refused before any dial-out
 
 
 # --- error path is PHI- and secret-safe (AC-6) -------------------------------
@@ -467,9 +558,12 @@ async def test_executor_params_read_still_works() -> None:  # #1243 limb A
 
 async def test_error_is_phi_and_secret_safe_on_http_error() -> None:  # AC-6
     # A 404/500 names only the connection + redacted host + status — never the query values or a body.
+    # The value is a FhirToken so the search reaches the HTTP round trip at all: since #1243 a plain
+    # str carrying the '|' is refused before dial-out, which would have this test proving the wrong
+    # thing (it asserts the error names no parameter, and a refusal names one by design).
     ex, _ = _executor(exc=_http_error(404, body=b'{"resourceType":"OperationOutcome"}'))
     with pytest.raises(FhirLookupError) as ei:
-        await ex.read("epic", "Patient", {"identifier": "SSN|000-00-0000"})
+        await ex.read("epic", "Patient", {"identifier": FhirToken("SSN", "000-00-0000")})
     msg = str(ei.value)
     assert "epic" in msg and "404" in msg
     assert "000-00-0000" not in msg  # the query value never reaches the error
@@ -690,7 +784,7 @@ def _reg_with_fhir_handler(fn: Any) -> Registry:
 
 def test_dry_run_raises_when_handler_calls_fhir_lookup() -> None:  # AC-3 (dry-run)
     def handler(msg: Any) -> None:
-        fhir_lookup("epic", "Patient", {"identifier": f"MRN|{msg['PID-3.1']}"})
+        fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", msg["PID-3.1"])})
         return None
 
     reg = _reg_with_fhir_handler(handler)

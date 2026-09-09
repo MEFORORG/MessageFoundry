@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.03.1"
+$GateVersion = "2026.09.04.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -404,6 +404,126 @@ function Get-LiteralAssignments([string]$Prefix) {
     $map
 }
 
+# --- BACKLOG #1379 class two: the environment carried across statements and lines ----------------
+#
+# `Get-LiteralAssignments` above answers a DIFFERENT question and cannot be widened into this one. It
+# maps a SHELL VARIABLE so a `"$p"` token can be substituted, it reads POSIX `NAME=VALUE` and cmd `set`
+# only, and it is handed a PREFIX that stops at the first git token on ONE line. The question here is
+# what value an ENVIRONMENT variable holds at the moment a later git invocation reads it, and in
+# PowerShell the assignment that sets it is a separate STATEMENT -- frequently on a separate LINE.
+#
+# NO MATCHER REACHES THAT, AND THAT WAS PROVEN BY ATTEMPTING IT. A regex was written for the PowerShell
+# spelling, it parsed, it emitted correctly, and three rows were still wrong; it was reverted rather
+# than shipped. The reason is structural: a segment is a LINE (see Get-ScannableSegments), rule 3c's
+# own repository-token window begins AFTER the separator before the owning git token, and both GIT_DIR
+# patterns require whitespace or line start before the name. A PowerShell assignment lands outside all
+# three, so widening any of them moves the boundary without crossing it.
+#
+# SO THE CHANGE IS STATE, NOT A PATTERN. Each segment now carries `Prior` -- the BLANKED text of
+# everything that ran before it -- and this function folds that text plus the current segment up to the
+# write into a single value. The value is then ONE MORE CANDIDATE, ranked exactly where git ranks it.
+#
+# READ OFF THE BLANKED SCAN, NEVER THE RAW LINE, and the carve-out at Remove-QuotedSpans is what makes
+# that work: a quoted span holding ONE BARE WORD is unmasked (BACKLOG #1069), so an ordinary
+# `$env:GIT_DIR="C:/x/.git"` arrives here with its value intact while an assignment sitting inside a
+# commit message or an alias VALUE is gone entirely. Reading raw instead would let
+# `git config alias.zz "!pwsh -c '$env:GIT_DIR=<ungoverned>/.git; git log'"` name the ungoverned repo
+# and turn a live disarm of the governed one into an ALLOW -- the same hole the flag spelling already
+# had and closed.
+#
+# MEASURED, by reading the value back out of the target repository rather than trusting a verdict.
+# From an ungoverned cwd, each of these really writes into the repository GIT_DIR names:
+#     $env:GIT_DIR='<gov>/.git'; git config <key> v        same line
+#     ${env:GIT_DIR}="<gov>/.git" <newline> git config ..  across a line
+#     Set-Item env:GIT_DIR '<gov>/.git' <newline> git ...  across a line
+#     export GIT_DIR=<gov>/.git; git config <key> v        the POSIX carrying spelling
+# and the CLEAR really restores the cwd: `$env:GIT_DIR='<gov>/.git'; Remove-Item env:GIT_DIR; git
+# config <key> v` lands in the cwd, not in <gov>. That is why the removal spellings are modelled at
+# all -- without them this function would report a value git is no longer reading, and a refusal
+# naming a repository the write never touches is the BACKLOG #1085 defect over again.
+#
+# WHAT IT DELIBERATELY DOES NOT REACH -- read this as "AT LEAST the following", never as complete:
+#   * A COMPUTED value -- `$env:GIT_DIR = Join-Path $r '.git'`, `"$root/.git"`, `%X%`, `+=`. The value
+#     is a runtime fact, "" is the honest answer, and the caller keeps today's behaviour.
+#   * A quoted value CONTAINING A SPACE. Remove-QuotedSpans masks a multi-word span, so it arrives here
+#     as an empty pair and reads as no value. That is the residual the #1069 carve-out already records
+#     for `-c 'alias.ci=commit --no-verify'`, inherited rather than introduced.
+#   * `[Environment]::SetEnvironmentVariable('GIT_DIR', ...)` and any other API spelling.
+#   * A value set by a PREVIOUS TOOL CALL. Each Bash/PowerShell call is its own process and the gate
+#     holds one command, so there is nothing to read. No matcher closes that one either.
+#   * CONTROL FLOW. The LAST textual event wins, which is what a straight-line script does; an
+#     assignment inside an `if` or a loop is read as though it ran.
+function Resolve-CarriedGitDir([string]$ScanPrefix) {
+    <#
+    The literal ``GIT_DIR`` in force at the end of ``$ScanPrefix``, or ``""`` when there is none and
+    when it cannot be resolved WITHOUT GUESSING.
+
+    ``$ScanPrefix`` is BLANKED scan text -- every statement and line that ran before the write under
+    judgement, in textual order. ``""`` is a result and not a failure: it means the caller keeps the
+    behaviour it had before this function existed.
+    #>
+    # No mention of the name at all is the overwhelmingly common case, so the ordinary path pays one
+    # substring search rather than a regex.
+    if ($ScanPrefix -notmatch 'GIT_DIR') { return "" }
+
+    # A `#` COMMENT DOES NOT RUN, SO IT CANNOT SET ANYTHING. PowerShell and a POSIX shell agree that a
+    # `#` at the start of a token opens one, which is what the lookbehind says; a `#` INSIDE a token
+    # (`C:/repo#1/.git`) is an ordinary character in both and is left alone.
+    #
+    # THIS IS THE ONLY PLACE THE GATE MODELS COMMENTS, and it is safe HERE for a reason that does not
+    # generalise to the rest of the file: everything this resolver does is new, so removing text from
+    # its input can only withhold a denial that did not exist before. It can never reopen one that did.
+    #
+    # Without it a session that merely NOTES the variable in a comment and then configures an
+    # unrelated repository gets refused, and the refusal names a repository the write never touches --
+    # the BACKLOG #1085 shape, which is exactly what teaches people to route around a gate.
+    $ScanPrefix = [regex]::Replace($ScanPrefix, '(?m)(?<=^|\s)#.*$', '')
+
+    # A VALUE AS IT SURVIVES BLANKING: a bare token. It stops at whitespace, at a statement separator,
+    # and at a closing brace or paren so `& { $env:GIT_DIR=x }` does not swallow the brace.
+    $val = '(?<v>[^\s;&|)}]*)'
+    # \x24 = $. Written as hex for the same reason Get-LiteralAssignments gives: a `$` inside a
+    # PowerShell string is a live wire and the next edit to this line must not be able to arm it.
+    $psName = "\x24\{?env:GIT_DIR\}?"
+    $drive = 'env:\\?GIT_DIR'
+    $sep = '(?:^|[\s;&|(){}])'
+    # ORDERED ALTERNATION, SCANNED FOR EVERY MATCH, LAST ONE WINS -- because that is what the shell
+    # does. A removal alternative captures no value, so its match clears.
+    $events = @(
+        "(?:$psName\s*\+?=\s*$val)"
+        "(?:$sep(?:set-item|si|new-item|ni)\s+(?:-\w+\s+)*$drive\s*(?:(?:-\w+\s+)*$val)?)"
+        "(?:$sep(?:remove-item|ri|rm|del|clear-item|cli)\s+(?:-\w+\s+)*$drive)"
+        "(?:${sep}export\s+GIT_DIR\s*=\s*$val)"
+        "(?:${sep}unset\s+(?:-v\s+)?GIT_DIR)"
+    ) -join '|'
+    # IGNORECASE IS REQUIRED. PowerShell writes `$Env:GIT_DIR` and `Set-Item` in mixed case by
+    # convention, and [regex]::Matches is case-SENSITIVE by default -- so omitting it would silently
+    # match the lowercase spellings alone, which is the failure mode this file has hit twice before.
+    $hits = @([regex]::Matches($ScanPrefix, $events,
+                               [System.Text.RegularExpressions.RegexOptions]::IgnoreCase))
+    if ($hits.Count -eq 0) { return "" }
+
+    $last = $hits[$hits.Count - 1]
+    # `+=` APPENDS TO A VALUE THIS FUNCTION MAY NEVER HAVE SEEN, so the result is computed even when
+    # the right-hand side is a literal. Checked on the whole match rather than on the value.
+    if ($last.Value -match '\+=') { return "" }
+    # A masked multi-word span arrives as a bare quote pair; trimming it leaves nothing, which is the
+    # same answer as "no value" and clears.
+    $v = $last.Groups['v'].Value.Trim('"', "'")
+    if (-not $v) { return "" }
+    # \x24 = $, \x25 = %, \x60 = backtick. Same class, same reason, as Get-LiteralAssignments.
+    #
+    # DEFENCE IN DEPTH, NOT A LOAD-BEARING GUARD, and the difference is measured rather than assumed:
+    # deleting this line leaves the whole corpus green. Without it the unresolved literal (`$root/.git`)
+    # becomes a candidate, git is asked about it, no such directory exists, and the candidate chain
+    # falls through to the same answer. It is kept because "" is the HONEST answer -- a half-resolved
+    # value looks decided -- and because a literal that happens to name a real directory would
+    # otherwise decide on text the shell never meant literally. Do not read its presence as the reason
+    # any current ALLOW is an ALLOW.
+    if ($v -match '[\x24\x25\x60]') { return "" }
+    $v
+}
+
 function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
     <#
     ``$Token`` with every variable reference replaced by a literal assigned in ``$Prefix``, or
@@ -434,9 +554,55 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
     $out
 }
 
+# ONE DEFINITION OF "FOLLOW A CHDIR", AND IT IS EXTRACTED RATHER THAN COPIED (BACKLOG #1065).
+#
+# This body used to live inline in Get-GitTargetCandidatesRaw and had exactly one caller. Rule 3c now
+# needs the same answer for a DIFFERENT span of the same command line -- the region between the first
+# git token and the disarm, which the resolver's own $Prefix is sliced short of and can never see. A
+# second copy beside the first is how the two drift apart silently, and this file already records that
+# happening: #1229's third round was a measured fail-open caused by two places spelling one fact
+# differently, and the resolver's own residual list says the fix for a resolution defect belongs in the
+# shared helper "rather than to this rule".
+#
+# RETURNS "" FOR EVERY CASE IT CANNOT ANSWER, and the callers treat "" and $null alike because both are
+# falsy in PowerShell -- so the resolver's behaviour is byte-identical to the inline version it replaces.
+# The four unanswerable cases are unchanged and are all "this text cannot be composed":
+#   * `popd` or `cd -`  -- restores a directory this scan never saw;
+#   * a `(` or `{`      -- a subshell whose chdir does not affect the parent;
+#   * more than one     -- the fold is not a single token and this is not a shell;
+#   * a target that is blank after trimming. Answering "" there costs an unclosed shape and never a
+#     wrong one; inventing a target from the residue would be the second kind.
+#
+# WHAT QUOTING DOES TO A CALLER READING THE SCAN STRING, MEASURED RATHER THAN ASSUMED -- because the
+# obvious guess is wrong in one direction and right in the other. Remove-QuotedSpans UNMASKS a quoted
+# span holding one bare word, so `cd "."`, `cd '.'` and a quoted path with no space are all followed
+# exactly like the unquoted spelling. It blanks a span containing whitespace to an empty pair, so a
+# QUOTED target CONTAINING A SPACE (`cd "C:/Pri mary"`) is not followed at all -- and that is a stated
+# residual, not a hazard: the pair defeats the regex, nothing is returned, and the caller keeps the
+# behaviour it had. The UNQUOTED spacey spelling IS followed, because the capture class here admits
+# spaces and stops at the separator -- unlike the `-C` reader's `[^"\s]+`, which is a different
+# residual this file already records. A caller reading RAW text is unaffected by any of it.
+function Get-ChdirTargetRaw([string]$Text) {
+    if (-not $Text) { return "" }
+    if ($Text -match '(?:^|\s)(?:popd|cd\s+-(?:\s|$))') { return "" }
+    if ($Text -match '[({]') { return "" }
+    # THE VERB LIST AND THE IGNORECASE OPTION ARE BOTH LOAD-BEARING and are carried over verbatim.
+    # [regex]::Matches is case-SENSITIVE by default and PowerShell verbs are conventionally written
+    # `Set-Location`, so a case-sensitive alternation of lowercase spellings would match none of them
+    # and this helper would silently do nothing. The shells being matched are themselves
+    # case-insensitive, so this widens nothing that was not already reachable.
+    $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
+    $cds = [regex]::Matches(
+        $Text,
+        "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($cds.Count -ne 1) { return "" }
+    $cds[0].Groups[1].Value.Trim()
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
                                    [switch]$AllTargets, [switch]$BaseFallback,
-                                   [switch]$ExplicitFirst) {
+                                   [switch]$ExplicitFirst, [string]$CarriedGitDir = "") {
     <#
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
@@ -463,6 +629,18 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     ``-BaseFallback`` -- append the cd-or-cwd base LAST, so a `-C` that git rejects does not end the
     question. The append sits INSIDE the `-C` branch, so on a line with no `-C` the candidate list is
     byte-identical with the switch on or off.
+
+    ``-CarriedGitDir`` -- the GIT_DIR an EARLIER STATEMENT OR LINE put in the environment, already
+    resolved to a literal by Resolve-CarriedGitDir (BACKLOG #1379 class two). EMPTY IS THE DEFAULT AND
+    ITS OFF STATE IS BYTE-IDENTICAL, so rules 3 and 3d see the list they have always seen; only rule 3c
+    passes it, the same blast-radius control the three switches above use.
+
+    IT IS AN ORDERING PARAMETER, NOT AN ADDITIVE ONE, and this file's own standing rule says to label it
+    as such: a parameter is additive only if its OFF state is byte-identical AND its ON state APPENDS.
+    This one INSERTS, ahead of `-C` and the base, because that is where git ranks it -- so it can turn a
+    current DENY into an ALLOW, deliberately and in one measured shape (a governed cwd whose write the
+    environment sends to an UNGOVERNED repository). Ranking it any lower would leave that refusal naming
+    a repository the write never touches.
     #>
     $out = @()
 
@@ -480,38 +658,29 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # The bail-outs are unchanged and still guard both branches: `popd` and `cd -` restore an unknown
     # directory, and `(`/`{` mean a subshell whose `cd` does not affect the parent -- in all three the
     # prefix cannot be composed and $cd stays null, which falls back to exactly the old behaviour.
-    $cd = $null
-    if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-        # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until now. This composer knew
-        # only `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command
-        # after it was judged against the SESSION cwd instead. Measured on the shipped gate, with the
-        # consequence read back from the governed working tree rather than inferred from a verdict:
-        #
-        #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
-        #
-        # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
-        # spelling one verb differently.
-        #
-        # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is here rather than at
-        # a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied -- caught
-        # downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
-        # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
-        #
-        # IGNORECASE IS REQUIRED AND IS THE ONE RISKY CHARACTER HERE. [regex]::Matches is case-SENSITIVE
-        # by default, and PowerShell verbs are conventionally written `Set-Location`, so a case-sensitive
-        # alternation of lowercase spellings would match none of them and this fix would silently do
-        # nothing. The shells being matched are themselves case-insensitive, so this widens nothing that
-        # was not already reachable.
-        #
-        # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously
-        # did not, so every verdict it changes moves ALLOW to DENY.
-        $chdirComposeVerbs = 'cd|chdir|pushd|sl|set-location|push-location'
-        $cds = [regex]::Matches(
-            $Prefix,
-            "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
-            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
-    }
+    # THE VERB LIST MATCHES RULE 3c's CHDIR GUARD, and it did not until #1304. The composer knew only
+    # `cd` and `pushd`, so a PowerShell chdir verb never resolved its target and the command after it
+    # was judged against the SESSION cwd instead. Measured on the shipped gate, with the consequence
+    # read back from the governed working tree rather than inferred from a verdict:
+    #
+    #     Push-Location <governed>; git reset --hard      ALLOWED, and it DESTROYED uncommitted work
+    #
+    # run from an ungoverned cwd. That is precisely the hijack rule 3 exists to prevent, reached by
+    # spelling one verb differently.
+    #
+    # THE ABSOLUTE AND RELATIVE CASES FAILED DIFFERENTLY, which is why the fix is in the composer rather
+    # than at a call site. With an ABSOLUTE governed path `sl` and `Set-Location` already denied --
+    # caught downstream by the path itself -- while `Push-Location` did not. With a RELATIVE target every
+    # uncomposed verb failed open, because nothing resolved `../../..` against the chdir at all.
+    #
+    # ADDITIVE BY CONSTRUCTION: composing a chdir can only make a target RESOLVE where it previously did
+    # not, so every verdict it changes moves ALLOW to DENY.
+    #
+    # THE BODY MOVED TO Get-ChdirTargetRaw (BACKLOG #1065) and is byte-identical in behaviour: the two
+    # bail-outs, the verb list, the IgnoreCase option and the exactly-one rule are all carried across,
+    # and "" is falsy exactly where $null was. It moved because rule 3c needs the same answer for a span
+    # this $Prefix is sliced short of, and a second copy is how two spellings of one fact drift apart.
+    $cd = Get-ChdirTargetRaw $Prefix
 
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
@@ -622,6 +791,25 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
             $promoted += (Join-Path $rooted "..")
         }
     }
+    # THE CARRIED ENVIRONMENT VALUE, GIVEN EVERY TREATMENT THE PROMOTED TOKENS ABOVE GET (BACKLOG #1379
+    # class two). It is a separate list rather than an append to $promoted for one reason, and it is the
+    # reason that keeps this from being a hole: $promoted is emitted ONLY under -ExplicitFirst, which
+    # rule 3c gates on the disarming invocation carrying its OWN repository token. A carried value is by
+    # construction NOT on that invocation, so reusing that switch would promote, alongside it, every
+    # `--git-dir` on the line -- including one belonging to an EARLIER command, which the window test
+    # exists to exclude. `git --git-dir=<ungoverned> log && $env:GIT_DIR=<governed>; git config <key> v`
+    # would then be decided by the earlier command's token and ALLOW a live disarm.
+    #
+    # COMPOSE, NEVER REPLACE, and against $postC rather than $cd for the same reason the block above
+    # gives: git reads a relative GIT_DIR against the directory it is standing in, which is the fold of
+    # every `-C` over the `cd` base.
+    $carried = @()
+    if ($CarriedGitDir) {
+        $rooted = $(if ($postC -and -not [System.IO.Path]::IsPathRooted($CarriedGitDir)) { Join-Path $postC $CarriedGitDir } else { $CarriedGitDir })
+        $carried += $rooted
+        $carried += (Join-Path $rooted "..")
+    }
+
     $explicit = @()
     if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
     if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
@@ -646,7 +834,13 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         #               first and deepen the second.
         # `-C` STILL EMITS, behind the promoted tokens, because with no `--git-dir` on the line it is
         # the right answer and $promoted is empty -- so such a line is byte-identical to before.
+        #
+        # THE CARRIED VALUE SITS BEHIND $promoted, and that order is git's: a `--git-dir` written on the
+        # command line OVERRIDES the environment, and so does the `GIT_DIR=<x> git ...` prefix form.
+        # Putting it first would let a stale earlier `export` outrank the token the operator typed on
+        # the invocation itself.
         $out += $promoted
+        $out += $carried
         $out += $dashCOut
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
@@ -657,6 +851,12 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         # DENY. Byte-identical to the pre-change list is the only safe meaning of opt-in.
         # The `-C` candidates lead here exactly as they always did -- #1379's reorder is opt-in too,
         # for the same blast-radius reason, so rules 3 and 3d see the list they saw before.
+        #
+        # $carried STILL LEADS, and it has to. The environment configures THIS invocation no matter what
+        # the invocation itself carries, so gating it on -ExplicitFirst would make the fix apply only
+        # where a redundant on-line token was already present. It is EMPTY for every caller that does
+        # not pass it, so rules 3 and 3d are still byte-identical here.
+        $out += $carried
         $out += $dashCOut
         if ($emitBase) { $out += $(if ($cd) { $cd } else { $CwdRaw }) }
         $out += $explicit
@@ -1314,6 +1514,23 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers
     # unnamed groups before named ones) -- but only by an ordering rule no reader should have to know,
     # now that $sigil contributes a named group of its own.
+    # EVERY LINE'S BLANKED FORM, COMPUTED ONCE (BACKLOG #1379 class two). This used to be computed
+    # inline in the emit loop below; it is hoisted because each segment now also carries the blanked
+    # text of the lines BEFORE it, and recomputing that per segment would run Remove-QuotedSpans a
+    # quadratic number of times on a long command. Same function, same argument, same result.
+    #
+    # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
+    # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. That collapse
+    # happens INSIDE Remove-QuotedSpans, on a span the scan already owns.
+    #
+    # IT USED TO BE TWO ORDERED REGEXES AT THE EMIT SITE, DOUBLE QUOTES FIRST, AND THAT WAS A LIVE
+    # FAIL-OPEN OF THE EXACT SHAPE THIS SCAN EXISTS TO CLOSE. Running before the scan, they could pair
+    # a quote with a distant `/git"` ACROSS a gated command and replace the whole middle with a bare
+    # token -- verb and arguments gone, nothing left for any rule to match. Ownership cannot be decided
+    # by a regex that has no idea which quote opened first, which is the same sentence this file
+    # already wrote about the blanking order.
+    $scans = @($lines | ForEach-Object { Remove-QuotedSpans $_ $Convention })
+
     # THE EXTRACTION MUST AGREE WITH THE BLANKING ABOUT WHERE THE ARGUMENT ENDS
     # (BACKLOG #1229 residual, third round). `[^"]*` is escape-BLIND: it stops at the first
     # quote, INCLUDING an escaped one. Once Remove-QuotedSpans became escape-AWARE, the two
@@ -1353,7 +1570,13 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
     }
 
     $inner = @()
-    foreach ($ln in $lines) {
+    # THE PRIOR ACCUMULATOR. `Prior` is the BLANKED text of everything that RAN BEFORE this segment, in
+    # textual order -- the state rule 3c reads a carried environment variable out of. It is blanked
+    # rather than raw for exactly the reason $ownGitDir is read off the scan: an assignment inside a
+    # commit message or an alias VALUE is data, not code, and must not configure anything.
+    $priorForLine = ""
+    for ($li = 0; $li -lt $lines.Count; $li++) {
+        $ln = $lines[$li]
         # WHICH ARM MATCHED IS RECORDED, because only the double-quoted one can carry an outer escape.
         # A single-quoted word is fully literal on BOTH hosts, so its payload already IS what the
         # interpreter receives and re-decoding it would corrupt a legitimate backslash or backtick.
@@ -1395,38 +1618,39 @@ function Get-ScannableSegments([string]$Cmd, [string]$Convention = 'none') {
                 #
                 # The EXTRACTION regex above keeps the OUTER convention on purpose: it is parsing the
                 # OUTER command line's quoting, and that line really is the outer host's.
+                #
+                # A PAYLOAD INHERITS THE PARENT'S ENVIRONMENT, so its Prior is the outer text that ran
+                # before it: every earlier line, plus this line up to the flag. Blanked here for the
+                # same reason the lines are, and `$m.Index` is an index into `$ln` -- both RAW -- so no
+                # index crosses between a raw string and a blanked one.
                 $inner += [pscustomobject]@{
                     Text    = $m.Groups['code'].Value
                     Conv    = $owner
                     Escaped = [bool]$spec.Escaped
+                    Prior   = $priorForLine + (Remove-QuotedSpans $ln.Substring(0, $m.Index) $Convention)
                 }
             }
         }
+        # APPENDED AFTER the line is processed, so `Prior` never includes the line it belongs to.
+        $priorForLine += $scans[$li] + "`n"
     }
 
     # RAW LINES FIRST, then payloads -- the order is not cosmetic. Rule 3 records the FIRST
     # verb-bearing segment it sees, so putting extracted payloads last keeps a recursed line from
     # outranking a gated command written plainly on a raw line.
-    foreach ($line in $lines) {
-        # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
-        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. That collapse now
-        # happens INSIDE Remove-QuotedSpans, on a span the scan already owns.
-        #
-        # IT USED TO BE TWO ORDERED REGEXES RIGHT HERE, DOUBLE QUOTES FIRST, AND THAT WAS A SECOND LIVE
-        # FAIL-OPEN OF THE EXACT SHAPE THE SCAN BELOW EXISTS TO CLOSE. Running before the scan, they
-        # could pair a quote with a distant `/git"` ACROSS a gated command and replace the whole middle
-        # with a bare token -- verb and arguments gone, nothing left for any rule to match. Ownership
-        # cannot be decided by a regex that has no idea which quote opened first, which is the same
-        # sentence this file already wrote about the blanking order.
-        $s = Remove-QuotedSpans $line $Convention
-        [pscustomobject]@{ Raw = $line; Scan = $s }
+    $prior = ""
+    for ($li = 0; $li -lt $lines.Count; $li++) {
+        # The blanking itself is hoisted to $scans above; the note on WHY it is a single ordered pass
+        # lives there with the call.
+        [pscustomobject]@{ Raw = $lines[$li]; Scan = $scans[$li]; Prior = $prior }
+        $prior += $scans[$li] + "`n"
     }
 
     # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
     # rather than from the tool name at the call site. See the note at the extraction above.
     foreach ($item in $inner) {
         $s = Remove-QuotedSpans $item.Text $item.Conv
-        [pscustomobject]@{ Raw = $item.Text; Scan = $s }
+        [pscustomobject]@{ Raw = $item.Text; Scan = $s; Prior = $item.Prior }
     }
 
     # =================================================================================================
@@ -1980,8 +2204,8 @@ if ($tool -in @("Bash", "PowerShell")) {
         $rest = $dis.Groups['rest'].Value
         $via = $dis.Groups['via'].Value
         $viaConfig = $via -match '\bconfig\b'
-        # A read is not a write -- the EXPLICIT read flags.
-        if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        # THE EXPLICIT READ FLAGS ARE TESTED BELOW, AGAINST THE DISARMING INVOCATION'S OWN WINDOW, and
+        # they used to be tested here against the WHOLE SEGMENT. See the block after $ownCmdWin.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
         # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
         # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
@@ -2067,6 +2291,50 @@ if ($tool -in @("Bash", "PowerShell")) {
         $ownCmdWin = $seg.Scan.Substring($ownStart, $dis.Index - $ownStart)
         $ownGitDir = ($ownCmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
 
+        # ===============================================================================================
+        # A READ IS NOT A WRITE -- BUT IT HAS TO BE *THIS* INVOCATION'S READ (BACKLOG #1065).
+        #
+        # THE DEFECT, MEASURED, AND IT IS THIS ITEM'S CLASS WITH A DIFFERENT TOKEN. The explicit read
+        # flags were matched against the WHOLE SEGMENT, so a read belonging to a NEIGHBOURING command
+        # excused the write beside it:
+        #
+        #     git config <key> /nope                        DENY
+        #     git config --list && git config <key> /nope   ALLOW   <- the same write
+        #
+        # Fifteen rows on `origin/main`, every disarm key this rule names by every cwd -- primary,
+        # nested worktree, linked worktree. `git config --list` is an ordinary thing to run, so the
+        # excusing token needs no more intent than the `-C HEAD` this item was filed about, and the
+        # mechanism is identical: a token that belongs to a different command on the line decides the
+        # rule. The banner records a REJECTED patch closing this shape; nothing shipped, so it was live.
+        #
+        # $ownCmdWin IS THE SAME WINDOW $ownGitDir ALREADY USES, deliberately, so there is one answer to
+        # "what did the disarming invocation itself say" rather than two. It runs from the separator
+        # before the owning git token to the disarm, which is where a read flag is actually written, and
+        # `$rest` is appended for the trailing spelling. `git config --get <key>` is therefore excluded
+        # exactly as before -- the flag is inside its own window -- and so is `git --no-pager config
+        # --get <key>`, while the neighbouring read no longer reaches across the separator.
+        # ===============================================================================================
+        if ("$ownCmdWin $rest" -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+
+        # ===============================================================================================
+        # AND WHAT DID AN EARLIER STATEMENT OR LINE PUT IN THE ENVIRONMENT? (BACKLOG #1379 class two)
+        #
+        # THE WINDOW ABOVE CANNOT ANSWER THIS AND WIDENING IT WOULD NOT EITHER. It starts at the
+        # separator before the owning git token, which is exactly where a PowerShell assignment STOPS
+        # being visible: `$env:GIT_DIR=<x>; git config <key> v` puts the assignment in the previous
+        # STATEMENT, and the across-a-newline spelling puts it in a previous SEGMENT. Measured on the
+        # committed gate, all three PowerShell spellings ALLOWED -- same line, across a newline, and
+        # through the Bash tool -- while the POSIX-spelled control on the same command DENIED.
+        #
+        # THE INPUT IS SCAN TEXT ONLY, and both halves are indices into a blanked string: `$seg.Prior`
+        # is built from blanked lines, and `$dis.Index` is an offset into `$seg.Scan`. No index crosses
+        # between Raw and Scan, which is the invariant the window above states.
+        #
+        # BOUNDED AT THE DISARM, so an assignment written AFTER the write cannot configure it. Without
+        # that bound `git config <key> v; $env:GIT_DIR=<governed>/.git` would refuse and name a
+        # repository the write had already missed.
+        $carriedGitDir = Resolve-CarriedGitDir ($seg.Prior + $seg.Scan.Substring(0, $dis.Index))
+
         # THE CHDIR GUARD, AND ITS POSITION BOUND IS THE LOAD-BEARING HALF. $pfx is sliced at the FIRST git
         # token, so the resolver's own `cd` composer cannot see a chdir that appears AFTER it. Without this
         # guard `git commit -C HEAD && cd <ungoverned> && git config <key> v` denied and NAMED THE GOVERNED
@@ -2096,6 +2364,63 @@ if ($tool -in @("Bash", "PowerShell")) {
         # THE FALLBACK IS THE ONLY SUBTRACTIVE PIECE IN THIS CHANGE, and it subtracts from something that
         # did not exist before, so getting either guard wrong leaves a shape unclosed and cannot open one.
         $fallbackOk = (-not $ownDashC) -and (-not $chdirBefore)
+
+        # ===============================================================================================
+        # SUPPRESSING THE BASE IS NOT THE SAME AS KNOWING WHERE THE WRITE LANDS (BACKLOG #1065).
+        #
+        # THE DEFECT, MEASURED, AND IT REVERTS THIS RULE'S OWN HEADLINE CLOSURE WITH ONE ORDINARY TOKEN.
+        # The guard above answers "a chdir happened, so the session cwd is no longer the answer" by
+        # dropping the base candidate. But the resolver cannot follow that chdir either -- $pfx is sliced
+        # at the FIRST git token and the chdir sits after it -- so on a line that also carries a decoy
+        # `-C` the candidate set collapses to the decoy alone, git rejects it, and the rule allows:
+        #
+        #     git commit -C HEAD && git config <key> /nope              DENY   (the closure)
+        #     git commit -C HEAD && cd . && git config <key> /nope      ALLOW  (the same write)
+        #
+        # Measured on this file before this change from the primary, a nested worktree and a linked
+        # worktree, and with every chdir verb the guard above enumerates -- `cd`, `cd ./`, `pushd`,
+        # `chdir`, `sl`, `Set-Location`, `Push-Location` -- plus the `;` spelling and the alias key:
+        # THIRTEEN rows, every one ALLOW, every one landing in the shared config. `cd .` is a no-op, so
+        # the poison token needs no intent and changes nothing about what the command does.
+        #
+        # THE FIX IS TO ANSWER THE QUESTION RATHER THAN TO DECLINE IT. When the disarming invocation
+        # names no repository of its own, the directory the shell is standing in IS the target, and that
+        # directory is the chdir this guard just found. Follow it with the SAME helper the resolver uses
+        # and append it as a candidate.
+        #
+        # GATED ON THE INVOCATION NAMING NO REPOSITORY ITSELF, and that gate is what keeps this from
+        # manufacturing a deny. If the disarming invocation carries its own `-C` or `--git-dir`, THAT
+        # token decides where the write lands and the surrounding chdir does not -- appending it there
+        # would let a governed chdir refuse a write aimed by an explicit token at an ungoverned repo,
+        # which is the #1085 shape this rule has already been fixed for twice.
+        #
+        # APPENDED LAST, NEVER FIRST. $where[0] is unchanged, so the unresolvable-target refusal below is
+        # still decided on exactly the token it is decided on today, and a candidate that ANSWERS still
+        # decides before this one is ever tried. The only reachable change is where the chain used to run
+        # out and allow.
+        #
+        # COMPOSE, NEVER REPLACE -- the rule the resolver states for the same reason. A relative chdir in
+        # the window resolves against a chdir in the PREFIX, so the two are joined. If the prefix carries
+        # a chdir the helper cannot follow, nothing is appended at all: a base that is wrong is worse than
+        # no base, because it produces a confident answer about the wrong repository.
+        #
+        # THE WINDOW IS READ OFF SCAN AND THE PREFIX OFF RAW, and the split is deliberate rather than an
+        # oversight. A chdir inside a quoted VALUE is not a chdir, which is why the window uses the same
+        # blanked string the guard above tests; $pfx is the resolver's own argument and stays RAW so this
+        # rule and the resolver compose the identical prefix. See Get-ChdirTargetRaw for exactly what
+        # quoting costs on the scan side -- one bare word survives, a spacey quoted target does not.
+        $chdirTarget = ""
+        if ($chdirBefore -and -not $ownDashC -and -not $ownGitDir) {
+            $winCd = Get-ChdirTargetRaw $chdirWin
+            $pfxCd = Get-ChdirTargetRaw $pfx
+            $pfxFollowable = $pfxCd -or ($pfx -notmatch "(?:^|\s)(?:$chdirVerbs)(?:\s|$)")
+            if ($winCd -and $pfxFollowable) {
+                $chdirTarget = $(
+                    if ($pfxCd -and -not [System.IO.Path]::IsPathRooted($winCd)) { Join-Path $pfxCd $winCd }
+                    else { $winCd })
+            }
+        }
+        # ===============================================================================================
         # -AllTargets IS GATED ON $ownDashC, and the gate is the whole point (BACKLOG #1065).
         #
         # Sweeping EVERY `-C` on the line was too wide, and adversarial measurement caught it: from an
@@ -2113,7 +2438,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         # token must not end the question. The residual is stated rather than hidden: two `-C` tokens
         # inside one owning span are decided by whichever ANSWERS first, so a governed one can still win
         # over an ungoverned one. That errs CLOSED and is narrower than before this change.
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir)
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw -AllTargets:$ownDashC -BaseFallback:$fallbackOk -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir)
         if ($where.Count -eq 0) { continue }
 
         # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
@@ -2201,6 +2526,10 @@ What to do instead:
         # the primary's own root -- the exact spelling #1061 was filed about. "Unresolvable means not
         # governed" is how this whole defect shipped; it is not reinstated here in any form.
         # ===============================================================================================
+        # The followed chdir joins the chain HERE and nowhere earlier, so both properties above hold of
+        # it unchanged: $where[0] never moves, and the refusal above has already been decided.
+        if ($chdirTarget) { $where = @($where) + @($chdirTarget) }
+
         $govCfg = $null
         foreach ($cand in $where) {
             $candRaw = Get-FullPathRaw $cand $cwdRaw

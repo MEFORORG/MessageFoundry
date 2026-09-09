@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "The seat roster, the alias map, and the retired seats with the reason each was retired.",
+    "CLAUDE.md's seat table (section 5) GOVERNS. This file must agree with it, and",
+    "tests/test_role_cards.py fails if the two drift apart.",
+    "FIVE SEATS, NOT KORUS'S SEVEN. korus adds a Manager and a Reviewer; this table has",
+    "neither, so neither resolves to a card here. An unmapped label resolves to NOTHING.",
+    "The hook never guesses."
+  ],
+  "live": [
+    "console",
+    "builder",
+    "regulator",
+    "steward",
+    "lander"
+  ],
+  "_aliases_comment": [
+    "Observed and near-miss spellings, collapsed onto the canonical seat. A canonical name is",
+    "never a key here: it resolves to itself. Numbered spellings exist because several",
+    "sessions hold the same seat at once and the number was appended to tell them apart."
+  ],
+  "aliases": {
+    "builder1": "builder",
+    "builder2": "builder",
+    "builder3": "builder",
+    "builder-1": "builder",
+    "builder-2": "builder",
+    "builder-3": "builder",
+    "build": "builder",
+    "console1": "console",
+    "console-1": "console",
+    "consul": "console",
+    "lander1": "lander",
+    "lander-1": "lander",
+    "land": "lander",
+    "landing": "lander",
+    "regulator1": "regulator",
+    "regulator-1": "regulator",
+    "reg": "regulator",
+    "steward1": "steward",
+    "steward-1": "steward",
+    "stewart": "steward"
+  },
+  "_retired_comment": [
+    "A retired label resolves to NO CARD, and the hook says it was retired rather than",
+    "staying silent. Silence would send the reader looking for a card that was removed.",
+    "CLAUDE.md records seven seats retired 2026-09-01. Manager and Reviewer are NOT retired",
+    "here -- they were never seats in this repository, and they are live in korus."
+  ],
+  "retired": {
+    "dispatcher": "Retired 2026-09-01. The Console replaces it: it reads the record, picks the work and spawns a Builder.",
+    "liaison": "Retired 2026-09-01. The Console replaces it and is the only seat the owner talks to.",
+    "pm": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
+    "project-manager": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
+    "cleaner": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
+    "role-manager": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
+    "process-improvement": "Retired 2026-09-01 by owner decision. Nothing replaced it."
+  },
+  "_elsewhere_comment": [
+    "Live in korus, absent from this repository's table, and therefore resolving to nothing",
+    "here. Named so a session that holds one of these seats in korus and opens a worktree",
+    "here learns why no card arrived, rather than reading silence as a missing file."
+  ],
+  "elsewhere": {
+    "manager": "A korus seat, not one here. CLAUDE.md section 5 runs the Console instead.",
+    "reviewer": "A korus seat, not one here. No seat in this table reviews as its own job."
+  }
+}

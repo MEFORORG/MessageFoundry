@@ -48,7 +48,7 @@ class LoginResponse(BaseModel):
     token: str
     token_type: str = "bearer"
     must_change_password: bool = False
-    # The password was accepted but a second factor is still required before sensitive operations
+    # The password was accepted but a second factor is still required before ANY authorized route
     # (WP-14): the client should prompt for a TOTP / recovery code and POST /auth/mfa-verify.
     mfa_required: bool = False
     user: CurrentUser

@@ -86,6 +86,7 @@ tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
+tests/test_install_gate_allowlist_merge.py
 tests/test_install_gate_records_the_install.py
 tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
@@ -119,6 +120,7 @@ tests/test_merge_gate_controls.py
 tests/test_negative_controls.py
 tests/test_new_dependency_check.py
 tests/test_nightly_notice.py
+tests/test_operator_docs_no_warning_sign.py
 tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
@@ -127,6 +129,7 @@ tests/test_required_contexts.py
 tests/test_required_contexts_drift.py
 tests/test_required_workflow_state.py
 tests/test_rescue_ref_provenance.py
+tests/test_role_cards.py
 tests/test_scan_forbidden_loaded_set.py
 tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
@@ -138,11 +141,14 @@ tests/test_session_mail_held.py
 tests/test_session_mail.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
+tests/test_shipped_line_endings_pinned.py
 tests/test_stalled_prs.py
+tests/test_steer_inject.py
 tests/test_subject_exists_screen.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_unread_prs.py
 tests/test_unread_signal.py
+tests/test_verdict_divergence_advisory.py
 tests/test_verdict_divergence_check.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_shell_syntax.py
