@@ -54,7 +54,10 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import (
     ClusterMember,
+    StepdownUnavailable,
+    acquire_leadership_lock,
     default_node_id,
+    lease_write_refusal,
     stepdown_pause_seconds,
 )
 from messagefoundry.redaction import safe_exc
@@ -185,7 +188,7 @@ class SqlServerCoordinator:
             await asyncio.gather(*tasks, return_exceptions=True)
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
-        # NOT under _leadership_lock — see DbCoordinator.stop().
+        # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
         await self._release_leadership()
         try:
             await self._store._execute(
@@ -548,27 +551,38 @@ class SqlServerCoordinator:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
         :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its
         docstring for why the release is serialized against the maintenance tick, why the demotion
-        edge fires, and why this node pauses its own claim (and why the pause is not the exclusion)."""
-        async with self._leadership_lock:
-            was_leader, released_at = await self._release_leadership()
-            if was_leader:
-                # The pause length is the SHARED module-level policy, not a copy: a per-class copy of a
-                # safety-relevant timing constant is two files that can be retuned independently.
+        edge fires, why this node pauses its own claim (and why the pause is not the exclusion), why the
+        pause is armed BEFORE the release, what the lock costs, and why a failed lease write raises
+        :class:`~messagefoundry.pipeline.cluster.StepdownUnavailable` here but not on :meth:`stop`."""
+        await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
+        try:
+            # Armed before the release's await so a cancellation inside the pool write cannot skip it.
+            # The pause length, the lock's bound and the refusal text are all the SHARED module-level
+            # policy, not copies: a per-class copy of a safety-relevant timing constant (or of the
+            # sentence an operator acts on) is two files that can be retuned independently.
+            if self._is_leader:
                 self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
                     self._heartbeat_seconds
                 )
+            was_leader, released_at, wrote = await self._release_leadership()
+            if was_leader:
                 self._fire_on_demote()
+                if not wrote:
+                    raise StepdownUnavailable(lease_write_refusal(self.node_id))
+        finally:
+            self._leadership_lock.release()
         return (was_leader, released_at)
 
-    async def _release_leadership(self) -> tuple[bool, float | None]:
-        """``(was_leader, released_at)`` — mirrors ``DbCoordinator._release_leadership``, including the
-        demote-the-cached-gate-before-the-DB ordering and the stamp taken at the in-memory demotion."""
+    async def _release_leadership(self) -> tuple[bool, float | None, bool]:
+        """``(was_leader, released_at, wrote)`` — mirrors ``DbCoordinator._release_leadership``,
+        including the demote-the-cached-gate-before-the-DB ordering, the stamp taken at the in-memory
+        demotion, and the ``wrote`` flag its two callers read in opposite directions."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader (H1)
         if not was_leader:
-            return (False, None)
+            return (False, None, True)
         released_at = time.time()
         self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
@@ -583,7 +597,8 @@ class SqlServerCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
-        return (True, released_at)
+            return (True, released_at, False)
+        return (True, released_at, True)
 
     # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
 

@@ -79,6 +79,7 @@ __all__ = [
     "ClusterMember",
     "NullCoordinator",
     "DbCoordinator",
+    "StepdownUnavailable",
     "build_coordinator",
     "default_node_id",
 ]
@@ -136,6 +137,62 @@ class ClusterMember:
 _DEMOTE_BUDGET_FRACTION = 0.5
 _DEMOTE_BUDGET_FLOOR = 1.0
 _DEMOTE_BUDGET_CEILING = 10.0
+
+
+class StepdownUnavailable(RuntimeError):
+    """A planned failover (ADR 0056 slice 1) could not be completed because of an ENVIRONMENT
+    condition — the shared lease row could not be written, or the maintenance tick that owns the
+    leadership lock did not yield in time. Raised only by :meth:`ClusterCoordinator.step_down_leadership`
+    and mapped to ``503`` by ``POST /cluster/stepdown``, the status the ADR's contract and the
+    neighbouring DR endpoints already give environment conditions.
+
+    **Why this exists rather than a best-effort success.** The release write is best-effort on
+    :meth:`stop`, where the node is leaving anyway and a lease that ages out costs nothing. It is not
+    best-effort on a stepdown, where an operator reads the answer and then starts maintenance: a
+    partitioned pool leaves the lease row live and still owned by this node, so no sibling can take it
+    and this node renews itself back in when the pause ends. Reporting ``200``/``was_leader=true`` there
+    would tell an operator the node was drained when it was not.
+
+    The in-memory demotion and the claim pause are already done by the time this raises — those are the
+    conservative direction (this node stops calling itself leader either way), and the write outcome is
+    genuinely unknown, since a lost response to a committed ``UPDATE`` is indistinguishable here from an
+    ``UPDATE`` that never ran. What the caller must NOT conclude is that leadership moved.
+    """
+
+
+async def acquire_leadership_lock(
+    lock: asyncio.Lock, fence_timeout_seconds: float, node_id: str
+) -> None:
+    """Take a coordinator's ``_leadership_lock`` for a stepdown, or raise :class:`StepdownUnavailable`.
+
+    Module-level and shared by both coordinators for the reason :func:`stepdown_pause_seconds` is: the
+    BOUND is a safety-relevant timing policy, and a per-class copy is two files that can be retuned
+    independently with nothing failing.
+
+    The bound is ``leader_fence_timeout_seconds``, derived rather than picked. That is exactly the
+    interval after which the node's own watchdog concludes its DB access is not working and demotes on
+    the node-local clock, so a stepdown still queued past it is racing a self-fence and can no longer
+    report a drain the operator can act on. Refusing leaves leadership exactly as it was found.
+
+    Not an ``async with``: the acquire has to be wrapped in :func:`asyncio.wait_for` and the caller holds
+    the lock across work this function does not see, so it releases in its own ``finally``.
+    """
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=fence_timeout_seconds)
+    except TimeoutError:
+        raise StepdownUnavailable(
+            f"node {node_id}: the leadership maintenance tick did not yield within the "
+            f"{fence_timeout_seconds:.1f}s fence timeout; leadership is unchanged"
+        ) from None
+
+
+def lease_write_refusal(node_id: str) -> str:
+    """The message for a stepdown whose lease-row write did not land. Shared for the reason above: both
+    coordinators run the same owner-scoped expiring ``UPDATE`` and owe the operator the same sentence."""
+    return (
+        f"node {node_id}: the leadership lease row could not be expired, so the lease is still held "
+        "by this node and no standby can take it"
+    )
 
 
 def fence_tick_seconds(fence_timeout_seconds: float) -> float:
@@ -334,6 +391,12 @@ class ClusterCoordinator(Protocol):
         heartbeating, so it reports itself a standby rather than leaving. :class:`NullCoordinator`
         returns ``(False, None)`` — single-node has no lease to release (and the endpoint refuses a
         single-node caller before reaching here).
+
+        **Raises** :class:`StepdownUnavailable` when the drain could not be achieved for an environment
+        reason — the shared lease row could not be written, or the maintenance tick holding the
+        leadership lock did not yield within the fence timeout. A returned tuple therefore always means
+        the release ran; it is never a best-effort answer. The DB coordinators raise it;
+        :class:`NullCoordinator` never does.
         """
         ...
 
@@ -606,9 +669,14 @@ class DbCoordinator:
         # Drop leadership: demote the cached gate FIRST so any concurrent is_leader() reader sees "not
         # leader" the instant we begin releasing, then expire the lease row so a standby can take over
         # immediately on a clean shutdown (best-effort — a failed release just lets the lease age out).
-        # Deliberately NOT under _leadership_lock: the gather above already retired the only coroutine
-        # that competes for leadership here, and taking it would queue a shutdown behind an in-flight
-        # stepdown that is itself stalled on a hung pool.
+        # Deliberately NOT under _leadership_lock. The gather above retired the maintenance loop, but
+        # NOT step_down_leadership(), which runs from an API handler this method never sees — so a
+        # shutdown concurrent with a stepdown is genuinely unserialized here. That is the trade taken
+        # on purpose: taking the lock would queue a shutdown behind a stepdown stalled on a hung pool,
+        # and the unserialized case is benign because both coroutines only ever DEMOTE (each sets
+        # _is_leader False and issues the same owner-scoped expiring UPDATE, which is idempotent), so
+        # no interleaving of the two can leave this node reporting leader. The maintenance tick was the
+        # dangerous competitor precisely because it can promote.
         await self._release_leadership()
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
@@ -1145,39 +1213,79 @@ class DbCoordinator:
           this node only (the same shape as ADR 0096's ``acquire_delay``), so it can only make us claim
           LATER, never earlier. It changes nothing about the lease, the self-fence or the epoch token.
           **It is a claim predicate, not mutual exclusion**: it is evaluated before the claim's await,
-          so it says nothing about a claim already in flight — that is the lock's job, above.
+          so it says nothing about a claim already in flight — that is the lock's job, above. It is
+          armed BEFORE the release rather than after it, so a cancellation landing inside the pool
+          write cannot skip it; that ordering buys nothing against either interleaving above and is
+          not credited with doing so.
 
         Deadlock, since the lock is new: it is taken in exactly two coroutines, neither of which calls
         the other, so there is no ordering to invert. A cancelled tick releases it on the way out
         (``async with`` unwinds), and ``stop()`` deliberately does not take it, so a shutdown never
-        queues behind a stepdown stalled on a hung pool. Waiting for an in-flight tick adds no new
-        stall to this method either — it already awaits the same pool inside the release.
+        queues behind a stepdown stalled on a hung pool.
+
+        **What the lock COSTS, stated because a control resting on a false premise is worse than no
+        control.** An earlier draft of this docstring said waiting for an in-flight tick "adds no new
+        stall to this method either — it already awaits the same pool inside the release". That is
+        false, and in the one direction that matters: the first line of :meth:`_release_leadership` is
+        the SYNCHRONOUS in-memory demotion, so before this lock that demotion happened immediately and
+        now it happens behind a tick's DB round trip. A tick suspended in ``fetchrow`` holds the lock,
+        and while this call waits, the node an operator is draining still answers :meth:`is_leader`
+        ``True`` and still binds listeners. Nothing bounds that round trip from here either:
+        ``[store].command_timeout`` is the only ceiling, ``PostgresStore`` passes ``command_timeout or
+        None`` so the documented zero-disables value makes it unbounded, and the pool ``acquire()``
+        carries no timeout at all.
+
+        So the wait is bounded, and a timeout refuses with ``503`` rather than demoting anything —
+        :func:`acquire_leadership_lock` holds that bound and the reasoning behind it.
         """
-        async with self._leadership_lock:
-            was_leader, released_at = await self._release_leadership()
-            if was_leader:
+        await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
+        try:
+            # Arm the claim pause BEFORE the release's await, not after it. Cancelling the request task
+            # while the release is suspended in the pool write unwinds this method correctly but would
+            # skip an assignment placed after the await, leaving _no_claim_until at 0.0 on a node whose
+            # lease row may already be expired — the very re-arm the pause exists to prevent. Reading
+            # _is_leader here is exact rather than a "pre-read" of the kind the endpoint refuses to
+            # make: nothing suspends between this read and _release_leadership's own read of the same
+            # attribute (awaiting a coroutine does not yield to the loop), and the only other writers
+            # are _maintain_leadership, which is holding-lock-excluded, and _check_fence, which is
+            # synchronous and therefore cannot run in that gap.
+            if self._is_leader:
                 # Stand down long enough that every sibling has had a full tick at the expired lease.
                 self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
                     self._heartbeat_seconds
                 )
+            was_leader, released_at, wrote = await self._release_leadership()
+            if was_leader:
                 self._fire_on_demote()
+                if not wrote:
+                    raise StepdownUnavailable(lease_write_refusal(self.node_id))
+        finally:
+            self._leadership_lock.release()
         return (was_leader, released_at)
 
-    async def _release_leadership(self) -> tuple[bool, float | None]:
-        """Best-effort clean release: demote the cached gate first (so a concurrent is_leader() reader
-        never sees a stale True), then expire our lease row so a standby can acquire immediately on a
-        clean shutdown. Safe to call when never elected (the UPDATE simply matches no owned row).
+    async def _release_leadership(self) -> tuple[bool, float | None, bool]:
+        """Clean release: demote the cached gate first (so a concurrent is_leader() reader never sees a
+        stale True), then expire our lease row so a standby can acquire immediately. Safe to call when
+        never elected (the UPDATE simply matches no owned row).
 
-        Returns ``(was_leader, released_at)`` — whether this node held leadership when the release ran,
-        and the epoch-seconds instant it was demoted. ``released_at`` is stamped at the in-memory
-        demotion, not after the DB round trip: that instant is when this node stopped answering
-        :meth:`is_leader` ``True``, which is the fact the audit trail is recording."""
+        Returns ``(was_leader, released_at, wrote)`` — whether this node held leadership when the
+        release ran, the epoch-seconds instant it was demoted, and whether the lease row's ``UPDATE``
+        completed without raising. ``released_at`` is stamped at the in-memory demotion, not after the
+        DB round trip: that instant is when this node stopped answering :meth:`is_leader` ``True``,
+        which is the fact the audit trail is recording.
+
+        **``wrote`` exists because the two callers want opposite things from a failed write.**
+        :meth:`stop` is best-effort — the node is leaving, so a lease that ages out at its TTL costs
+        nothing and a raise would break shutdown. :meth:`step_down_leadership` is not: the node stays
+        up holding a live lease no sibling can take, so it turns ``wrote=False`` into
+        :class:`StepdownUnavailable`. The exception is raised there rather than here so this method
+        keeps exactly one behaviour for both callers."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader
         if not was_leader:
-            return (False, None)
+            return (False, None, True)
         released_at = time.time()
         self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
@@ -1195,7 +1303,8 @@ class DbCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
-        return (True, released_at)
+            return (True, released_at, False)
+        return (True, released_at, True)
 
     # --- #145 leadership-transition alerts (never-raise) ---------------------
 

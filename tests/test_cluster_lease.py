@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.pipeline.cluster import DbCoordinator
+from messagefoundry.pipeline.cluster import DbCoordinator, StepdownUnavailable
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
 
@@ -100,6 +101,10 @@ class _FakeLeasePool:
     under test: without one of these set, an ``await`` on these methods returns without ever handing
     control back to the loop, so two coroutines that genuinely interleave in production run to
     completion one after the other here and every concurrency test passes by construction.
+
+    ``on_execute`` is a synchronous probe called at the instant the release statement runs. It exists
+    because every other test here reads ``is_leader()`` only after the whole call has returned, which is
+    blind to WHEN inside the call the demotion happened.
     """
 
     def __init__(self, db: _FakeLeaseDB) -> None:
@@ -107,6 +112,7 @@ class _FakeLeasePool:
         self.fail = False
         self.yield_in_fetchrow = False
         self.yield_in_execute = False
+        self.on_execute: Callable[[], None] | None = None
 
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         if self.yield_in_fetchrow:
@@ -124,6 +130,8 @@ class _FakeLeasePool:
     async def execute(self, sql: str, *args: object) -> None:
         if self.yield_in_execute:
             await asyncio.sleep(0)  # the release round trip is in flight; let another task run
+        if self.on_execute is not None:
+            self.on_execute()  # a reader observing the coordinator DURING the release window
         if self.fail:
             raise RuntimeError("partitioned from db")
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at=0 WHERE lease_key AND owner.
@@ -623,8 +631,13 @@ async def test_a_tick_inside_the_release_window_cannot_re_promote_the_drained_no
     # reports leader while a sibling can take the expired lease, so BOTH consider themselves leader,
     # and the endpoint answered 200.
     #
-    # The lock is what closes it. Arming the claim pause before the release would not: this test would
-    # pass on that alone, which is exactly why the second test below exists.
+    # THIS TEST DOES NOT ISOLATE THE LOCK, and an earlier comment here claiming "the lock is what
+    # closes it" read a conjunction as one term. Measured by reverting one mechanism at a time:
+    # removing the claim pause kills this test, removing the mutual exclusion does NOT. The pause is
+    # armed before the release, and it is the first thing the tick checks, so a tick that STARTS in the
+    # release window is turned away by the pause and never reaches the lock at all.
+    # The test below is the one that isolates the lock: it puts the claim in flight BEFORE the pause is
+    # armed, so the pause cannot close it and only mutual exclusion can.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
     mono_a = _Clock(0.0)
@@ -650,9 +663,10 @@ async def test_a_tick_inside_the_release_window_cannot_re_promote_the_drained_no
 async def test_a_claim_already_in_flight_cannot_re_promote_after_the_release() -> None:
     # The OTHER interleaving, and the one that decides the fix. Here the maintenance tick is already
     # suspended inside its claim round trip when the stepdown begins, so it has ALREADY passed the
-    # _no_claim_until check. Arming the pause earlier therefore changes nothing: the claim returns
-    # "held" afterwards and _maintain_leadership promotes on that stale result, leaving the node leader
-    # with a LIVE lease no sibling can take for a full TTL. Only mutual exclusion orders these two.
+    # _no_claim_until check. The pause IS now armed before the release, and it still changes nothing
+    # here: the claim returns "held" afterwards and _maintain_leadership promotes on that stale result,
+    # leaving the node leader with a LIVE lease no sibling can take for a full TTL. Only mutual
+    # exclusion orders these two, and removing it is measured to kill this test and no other.
     db_clock = _Clock(0.0)
     db = _FakeLeaseDB(db_clock)
     mono_a = _Clock(0.0)
@@ -676,19 +690,109 @@ async def test_a_claim_already_in_flight_cannot_re_promote_after_the_release() -
     assert a.is_leader() is False, "two leaders at once"
 
 
-async def test_step_down_survives_a_failed_release_write() -> None:
-    # The DB write is best-effort (the lease ages out on its own if it fails), and the in-memory
-    # demotion happens BEFORE it — so a partitioned node still reports the demotion it really made
-    # rather than raising into the API handler.
+async def test_a_failed_release_write_reports_failure_instead_of_a_drain() -> None:
+    # REPLACES test_step_down_survives_a_failed_release_write, which asserted the DEFECT as correct.
+    # That test read the release write as "best-effort — the lease ages out on its own", which is true
+    # of stop() (the node is leaving) and false of a stepdown (the node stays up). With the pool
+    # partitioned the UPDATE never lands, so the lease row stays LIVE and still owned by this node: no
+    # sibling can take it, and when the pause ends this node renews itself back in through the unfenced
+    # `owner = me` branch. The old test asserted (True, released_at), which the endpoint turned into a
+    # 200 reading "drained" — telling an operator to start maintenance on the node that is still leader.
+    #
+    # Arithmetic on the shipped defaults, which is why the pause does not save it: heartbeat 10, fence
+    # 20, ttl 30, so the pause ends at 20 while the lease lives to 30. The settings validator pins
+    # heartbeat < fence < ttl and never compares the pause to the ttl.
+    db = _FakeLeaseDB(_Clock(0.0))
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    pool.fail = True
+    with pytest.raises(StepdownUnavailable):
+        await a.step_down_leadership()
+
+    # The conservative half still holds: this node stops CALLING itself leader either way, and the
+    # pause is armed, because a lost response to a committed UPDATE is indistinguishable from an
+    # UPDATE that never ran and the possibly-released reading is the safe one.
+    assert a.is_leader() is False
+    assert a._no_claim_until == 20.0
+    # ...and the fact the caller must be told: the lease row was NOT expired.
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0
+
+    # The consequence a 200 would have hidden. The lease outlives the pause, so past it this node takes
+    # its own leadership back and the "drained" node is the leader again.
+    pool.fail = False
+    mono.t = 21.0
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+
+async def test_the_release_demotes_before_it_writes() -> None:
+    # ORDERING GUARD. _release_leadership's first line is the SYNCHRONOUS `self._is_leader = False`,
+    # ahead of the awaited lease write, so no reader can see a stale True while the release is in
+    # flight — is_leader() gates listener binding and the whole graph. Moving that assignment after the
+    # await passes every other test in this file and on both backends, because they all read
+    # is_leader() only once the call has returned; only a probe INSIDE the release window sees it.
     db = _FakeLeaseDB(_Clock(0.0))
     pool = _FakeLeasePool(db)
     a = _coord(pool, _Clock(0.0), node="A")
     await a._maintain_leadership()
+    assert a.is_leader() is True
 
-    pool.fail = True
-    was_leader, released_at = await a.step_down_leadership()
-    assert was_leader is True and released_at is not None
+    seen: list[bool] = []
+    pool.on_execute = lambda: seen.append(a.is_leader())
+    await a.step_down_leadership()
+    assert seen == [False], "a reader inside the release window saw the node still reporting leader"
+
+
+async def test_a_cancelled_stepdown_still_arms_the_claim_pause() -> None:
+    # The pause is armed BEFORE the release's await, not after it. Cancel the request task while the
+    # release is suspended in the pool write and `async with` unwinds correctly — but an assignment
+    # placed after that await never runs, leaving _no_claim_until at 0.0 on a node whose lease row may
+    # already be expired. The endpoint's handler is a bare await with no shield and no timeout, so any
+    # client disconnect or server shutdown lands exactly there.
+    db = _FakeLeaseDB(_Clock(0.0))
+    pool = _FakeLeasePool(db)
+    a = _coord(pool, _Clock(0.0), node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    pool.yield_in_execute = True  # suspend inside the release, then cancel there
+    task = asyncio.ensure_future(a.step_down_leadership())
+    await asyncio.sleep(0)  # let the task reach the suspension point
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert a._no_claim_until == 20.0, "a cancelled stepdown skipped the pause"
     assert a.is_leader() is False
+    # And the pause does its job: this node's own next tick declines rather than renewing itself in.
+    await a._maintain_leadership()
+    assert a.is_leader() is False
+
+
+async def test_the_lock_wait_is_bounded_and_refuses_rather_than_demoting() -> None:
+    # The lock puts the in-memory demote behind a DB round trip: a maintenance tick suspended in
+    # fetchrow holds it, and step_down_leadership blocks BEFORE _release_leadership's first line. That
+    # wait was unbounded — [store].command_timeout is the only ceiling and PostgresStore passes
+    # `command_timeout or None`, so the documented zero-disables value removes even that, while the raw
+    # pool acquire() carries no timeout at all. It is bounded here at the fence timeout, and a timeout
+    # REFUSES: it must not demote a node whose release it never ran.
+    db = _FakeLeaseDB(_Clock(0.0))
+    pool = _FakeLeasePool(db)
+    a = _coord(pool, _Clock(0.0), node="A", fence=0.05)
+    await a._maintain_leadership()
+
+    await a._leadership_lock.acquire()  # stand in for a tick suspended mid-round-trip
+    try:
+        with pytest.raises(StepdownUnavailable):
+            await a.step_down_leadership()
+    finally:
+        a._leadership_lock.release()
+
+    assert a.is_leader() is True, "a refused stepdown must leave leadership exactly as it found it"
+    assert a._no_claim_until == 0.0
+    assert db.row is not None and db.row["lease_expires_at"] == 30.0
 
 
 # --- ADR 0056 slice 1: the SQL Server twin ----------------------------------
@@ -699,20 +803,30 @@ class _FakeSqlLeaseStore:
 
     Emulates only the two statements ``SqlServerCoordinator`` issues for the lease: the
     ``MERGE ... WHEN MATCHED AND (t.owner = ? OR t.lease_expires_at + ? < @now)`` acquire/renew
-    (``_fetchone``) and the release ``UPDATE`` (``_execute``), with the same opt-in suspension the
-    Postgres stand-in carries and for the same reason — a stand-in that never yields cannot exhibit an
-    ordering defect.
+    (``_fetchone``) and the release ``UPDATE`` (``_execute``), with the same opt-in suspension and
+    release-window probe the Postgres stand-in carries and for the same reasons — a stand-in that never
+    yields cannot exhibit an ordering defect, and a test that reads state only after the call cannot see
+    where inside it the demotion landed.
+
+    **``_execute`` carries the same three hooks as its Postgres sibling on purpose.** Without them the
+    release-window interleaving simply cannot be EXPRESSED against this backend, so a claim that both
+    interleavings are pinned on both coordinators would have been half true with nothing failing.
     """
 
     _settings = None
 
     def __init__(self, db: _FakeLeaseDB) -> None:
         self._db = db
+        self.fail = False
         self.yield_in_fetchone = False
+        self.yield_in_execute = False
+        self.on_execute: Callable[[], None] | None = None
 
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object] | None:
         if self.yield_in_fetchone:
             await asyncio.sleep(0)  # the MERGE round trip is in flight; let another task run
+        if self.fail:
+            raise RuntimeError("partitioned from db")
         assert "MERGE leader_lease" in sql, "not the claim statement"
         assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
         # Positional params of the MERGE: (lease_key, owner, delay, owner, ttl, owner, ...).
@@ -720,20 +834,29 @@ class _FakeSqlLeaseStore:
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
     async def _execute(self, sql: str, params: tuple[object, ...]) -> None:
+        if self.yield_in_execute:
+            await asyncio.sleep(0)  # the release round trip is in flight; let another task run
+        if self.on_execute is not None:
+            self.on_execute()  # a reader observing the coordinator DURING the release window
+        if self.fail:
+            raise RuntimeError("partitioned from db")
         assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
         _lease_key, owner = params
         self._db.release(owner)
 
 
-def _sql_coord(store: _FakeSqlLeaseStore, node: str) -> SqlServerCoordinator:
-    # Same timings as _coord above, so the two backends' tests are comparable at a glance.
+def _sql_coord(
+    store: _FakeSqlLeaseStore, node: str, mono: _Clock | None = None
+) -> SqlServerCoordinator:
+    # Same timings as _coord above, so the two backends' tests are comparable at a glance. `mono` is
+    # passed in when a test needs to move this node's monotonic clock past its own stepdown pause.
     return SqlServerCoordinator(
         store,  # type: ignore[arg-type]
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=30.0,
         leader_fence_timeout_seconds=20.0,
-        monotonic=_Clock(0.0),
+        monotonic=mono or _Clock(0.0),
     )
 
 
@@ -760,3 +883,53 @@ async def test_sqlserver_step_down_is_serialized_against_an_in_flight_claim() ->
     await b._maintain_leadership()
     assert b.is_leader() is True
     assert a.is_leader() is False, "two leaders at once"
+
+
+async def test_sqlserver_a_tick_inside_the_release_window_cannot_re_promote() -> None:
+    # The OTHER interleaving on the twin, which the committed suite could not express: its stand-in had
+    # a hook on the MERGE only, so a tick STARTING inside the release's await window had nowhere to
+    # start. Now that _execute suspends too, the Postgres half's release-window case has its sibling
+    # here, and "both interleavings are pinned on both backends" is a claim the suite actually carries.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    store = _FakeSqlLeaseStore(db)
+    a = _sql_coord(store, "A")
+    b = _sql_coord(_FakeSqlLeaseStore(db), "B")
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    store.yield_in_execute = True  # the release suspends mid-UPDATE, as a real driver does
+    await asyncio.gather(a.step_down_leadership(), a._maintain_leadership())
+
+    assert a.is_leader() is False, "a tick in the release window re-promoted the drained node"
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+
+    db_clock.t = 1.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    assert a.is_leader() is False, "two leaders at once"
+
+
+async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_write() -> None:
+    # The twin's half of the two defects the Postgres tests above pin: the demotion is synchronous and
+    # lands before the awaited write, and a write that raises is reported rather than dressed up as a
+    # drain. Same reasoning, same consequences — the T-SQL release carries the same owner-scoped UPDATE.
+    db = _FakeLeaseDB(_Clock(0.0))
+    store = _FakeSqlLeaseStore(db)
+    mono = _Clock(0.0)
+    a = _sql_coord(store, "A", mono)
+    await a._maintain_leadership()
+
+    seen: list[bool] = []
+    store.on_execute = lambda: seen.append(a.is_leader())
+    await a.step_down_leadership()
+    assert seen == [False], "a reader inside the release window saw the node still reporting leader"
+
+    # And a partitioned release refuses instead of reporting the drain it did not achieve.
+    mono.t = 21.0  # past this node's own stepdown pause, so it may claim again
+    await a._maintain_leadership()  # take leadership back (the row is expired and owned by A)
+    assert a.is_leader() is True
+    store.fail = True
+    with pytest.raises(StepdownUnavailable):
+        await a.step_down_leadership()
+    assert a.is_leader() is False

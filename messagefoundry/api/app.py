@@ -301,7 +301,7 @@ from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.cluster import build_coordinator
+from messagefoundry.pipeline.cluster import StepdownUnavailable, build_coordinator
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
@@ -5464,17 +5464,26 @@ def create_app(
         new-client-IP signal and the credential-recency window. The three high-impact write neighbours
         (``config:deploy``, ``messages:replay``, ``messages:purge``) sit behind the same wrapper.
 
-        Statuses: ``400`` single-node (refused BEFORE the coordinator is touched — there is no lease and
-        no standby); ``409`` this node is not the leader (the normative answer, not an idempotent
+        Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
+        and no standby); ``409`` this node is not the leader (the normative answer, not an idempotent
         retry — the caller resolves the leader from ``GET /cluster/nodes`` first); ``403`` missing
-        permission / step-up / MFA; ``503`` engine not started or authentication not configured.
+        permission / step-up / MFA; ``503`` engine not started, authentication not configured, or the
+        drain could not be achieved for an environment reason.
+
+        **The ``503`` on a failed drain is the one status that is not merely plumbing.** The
+        coordinator raises ``StepdownUnavailable`` when it could not write the lease row, or when the
+        maintenance tick holding the leadership lock did not yield inside the fence timeout. Both leave
+        the lease live and still owned by this node, so no standby can take it — and an operator who
+        read a ``200`` there would begin maintenance on a node that is still the leader. Mapping it to
+        ``503`` matches what the neighbouring DR endpoints and the ADR's own contract give environment
+        conditions, and the audit row says the drain failed rather than that the node was drained.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the single-node ``400``, which nothing
-        else would record.
+        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400`` and the
+        failed-drain ``503``, which nothing else would record.
         """
         c = engine.coordinator
         if not c.is_clustered():
@@ -5494,7 +5503,24 @@ def create_app(
         # leadership, and that returned value is the only thing audited or reported: a fence or a
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
-        was_leader, released_at = await c.step_down_leadership()
+        try:
+            was_leader, released_at = await c.step_down_leadership()
+        except StepdownUnavailable as exc:
+            # The drain did not happen. Record THAT, not a stepdown: the lease is still live and owned
+            # by this node, so "was_leader" would be the wrong field to write here — the operator needs
+            # to read "this node was not drained".
+            await engine.store.record_audit(
+                "cluster_stepdown_denied",
+                actor=identity.username,
+                channel_id=None,
+                detail=json.dumps(
+                    {"node_id": c.node_id, "reason": "release-failed", "error": safe_exc(exc)}
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(
+                503, f"node {c.node_id} could not release leadership; it is still the leader"
+            ) from exc
         result = ClusterStepdownResult(
             node_id=c.node_id, was_leader=was_leader, released_at=released_at
         )

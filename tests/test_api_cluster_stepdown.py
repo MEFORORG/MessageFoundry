@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """``POST /cluster/stepdown`` — the planned-failover control plane (ADR 0056 slice 1, BACKLOG #1494).
 
-ADR 0056 AC-9 names this file. It covers the whole status table (200 / 400 / 403 / 409 / 503), the
+ADR 0056 AC-9 names this file. It covers the whole status table (200 / 400 / 403 / 409 / 422 / 503),
+both shapes of the ``503`` (no engine, and a drain the coordinator could not achieve), the
 content of the audit row, and — the load-bearing one — that the audited ``was_leader`` comes from what
 ``step_down_leadership()`` RETURNED and never from a prior ``is_leader()`` read. A fence or a
 lost-lease tick can flip leadership between a pre-read and the release, so a pre-read would record a
@@ -35,7 +36,11 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
+    NullCoordinator,
+    StepdownUnavailable,
+)
 from messagefoundry.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # >=15 chars, no vendor terms — satisfies the ASVS password policy
@@ -59,11 +64,13 @@ class _StandinCoordinator(NullCoordinator):
         clustered: bool = True,
         leader: bool = True,
         step_down: tuple[bool, float | None] = (True, 1_700_000_000.5),
+        raises: Exception | None = None,
     ) -> None:
         super().__init__("node-a")
         self._clustered = clustered
         self._leader = leader
         self._step_down = step_down
+        self._raises = raises
         self.step_down_calls = 0
 
     def is_leader(self) -> bool:
@@ -74,6 +81,8 @@ class _StandinCoordinator(NullCoordinator):
 
     async def step_down_leadership(self) -> tuple[bool, float | None]:
         self.step_down_calls += 1
+        if self._raises is not None:
+            raise self._raises
         return self._step_down
 
 
@@ -294,6 +303,34 @@ async def test_default_single_node_engine_is_refused(tmp_path: Path) -> None:
     async with _admin(tmp_path) as (_eng, c, boss):
         r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
         assert r.status_code == 400
+
+
+async def test_a_drain_that_did_not_happen_is_503_and_is_not_audited_as_a_stepdown(
+    tmp_path: Path,
+) -> None:
+    # The failure the coordinator can no longer hide. A partitioned pool leaves the lease row live and
+    # still owned by this node, so no standby can take it and the node renews itself back in when the
+    # pause ends. Reporting 200/was_leader=true there would send an operator into maintenance on the
+    # node that is still the leader, which is the whole point of asking.
+    #
+    # 503, not 409 or 500: this is an ENVIRONMENT condition, the status the neighbouring DR endpoints
+    # and ADR 0056's own contract already give those. 409 would be wrong in the other direction -- it
+    # says "you addressed the wrong node", and the caller would go and address a different one.
+    coord = _StandinCoordinator(raises=StepdownUnavailable("lease row could not be expired"))
+    async with _admin(tmp_path, coord) as (engine, c, boss):
+        r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
+        assert r.status_code == 503
+        assert "could not release leadership" in r.json()["detail"]
+        assert coord.step_down_calls == 1
+
+        # No cluster_stepdown row: nothing was stepped down, and a row carrying was_leader would be
+        # answering the wrong question. The denied row records what actually happened.
+        assert not await _rows(engine, "cluster_stepdown")
+        denied = await _rows(engine, "cluster_stepdown_denied")
+        assert len(denied) == 1
+        detail = json.loads(str(denied[0]["detail"]))
+        assert detail["node_id"] == "node-a" and detail["reason"] == "release-failed"
+        assert denied[0]["actor"] == "boss"
 
 
 async def test_stepdown_is_503_without_an_engine(tmp_path: Path) -> None:
