@@ -15,15 +15,23 @@ shared table. Both clocks are injectable:
 The split-brain guarantee — a partitioned old leader self-fences BEFORE a standby can acquire — is
 proven directly in :func:`test_fence_fires_before_standby_can_acquire`. The live behaviour against a
 real Postgres lands with the failover suite (Increment 3).
+
+The last section covers the SQL Server twin, against its own stand-in over the same shared lease row.
+It is here rather than in the gated SQL Server failover suite because the defect it pins is an asyncio
+ordering one, not a T-SQL one: the ``MERGE`` carries the identical unfenced ``t.owner = ?`` renew
+branch, so the same interleaving re-promotes a drained node there, and a test that only runs when
+``MEFOR_TEST_SQLSERVER`` is set would leave the twin unguarded on every ordinary run.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
 
 from messagefoundry.pipeline.cluster import DbCoordinator
+from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
 
 class _Clock:
@@ -38,63 +46,90 @@ class _Clock:
 
 
 class _FakeLeaseDB:
-    """The shared single-row ``leader_lease`` table + the DB clock the lease arithmetic uses."""
+    """The shared single-row ``leader_lease`` table, the DB clock the lease arithmetic uses, and the
+    two row mutations both backends' claim/release statements perform.
+
+    The mutations live HERE rather than in each stand-in because the two backends run the same lease
+    semantics through different SQL — PG's ``INSERT ... ON CONFLICT``, T-SQL's ``MERGE ... HOLDLOCK`` —
+    and a per-stand-in copy is two models of one lease that can drift apart while both keep passing.
+    Each stand-in still asserts its OWN statement's shape; only the row arithmetic is shared.
+    """
 
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
         # {"owner": str, "lease_expires_at": float, "leader_epoch": int}
         self.row: dict[str, object] | None = None
 
+    def claim(self, owner: object, ttl: float, delay: float) -> dict[str, object] | None:
+        """Acquire-or-renew, returning the ``(owner, leader_epoch)`` the statement would OUTPUT, or
+        ``None`` when another node holds a live lease.
+
+        The H1 epoch: 1 on a fresh insert, +1 on a take-over of an expired/foreign lease, UNCHANGED on
+        a renew (``owner == me``). The ADR 0096 ``delay`` handicaps the take-over predicate only — it is
+        added to the expiry side, so a renew is never delayed.
+        """
+        now = self._db_clock()
+        row = self.row
+        if row is None:
+            self.row = {"owner": owner, "lease_expires_at": now + ttl, "leader_epoch": 1}
+            return {"owner": owner, "leader_epoch": 1}
+        expired = float(row["lease_expires_at"]) + delay < now  # type: ignore[arg-type]
+        if row["owner"] == owner or expired:
+            if row["owner"] != owner:
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
+            row["owner"] = owner
+            row["lease_expires_at"] = now + ttl
+            return {"owner": owner, "leader_epoch": row["leader_epoch"]}
+        return None  # another node holds a live lease
+
+    def release(self, owner: object) -> None:
+        """Expire our own lease row (the release ``UPDATE ... WHERE lease_key AND owner``)."""
+        row = self.row
+        if row is not None and row["owner"] == owner:
+            row["lease_expires_at"] = 0.0
+
 
 class _FakeLeasePool:
     """One node's view of the pool over a shared :class:`_FakeLeaseDB`. Emulates the two statements the
     coordinator issues for the lease; ``fail=True`` makes every call raise to simulate this node being
-    partitioned from (or the DB hung for) THIS node only — the other node's pool keeps working."""
+    partitioned from (or the DB hung for) THIS node only — the other node's pool keeps working.
+
+    ``yield_in_fetchrow`` / ``yield_in_execute`` make the named statement SUSPEND before it touches the
+    row, which a real pool does at every round trip and this stand-in otherwise never does. They are
+    opt-in per test because a stand-in that never yields quietly hides every ordering defect in the code
+    under test: without one of these set, an ``await`` on these methods returns without ever handing
+    control back to the loop, so two coroutines that genuinely interleave in production run to
+    completion one after the other here and every concurrency test passes by construction.
+    """
 
     def __init__(self, db: _FakeLeaseDB) -> None:
         self._db = db
         self.fail = False
+        self.yield_in_fetchrow = False
+        self.yield_in_execute = False
 
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
+        if self.yield_in_fetchrow:
+            await asyncio.sleep(0)  # the claim round trip is in flight; let another task run
         if self.fail:
             raise RuntimeError("partitioned from db")
-        # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING,
-        # INCLUDING the H1 leader_epoch maintenance: epoch 1 on a fresh INSERT, +1 on a take-over of an
-        # expired/foreign lease, UNCHANGED on a renew (owner == me). RETURNS owner + leader_epoch.
-        # The 4th arg is the ADR-0096 acquire_delay: a take-over requires the lease to have been expired
-        # for `delay` seconds (added to the expiry side); a renew (owner == me) is never delayed.
+        # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING.
+        # The 4th arg is the ADR-0096 acquire_delay.
         assert "leader_lease" in sql and "INSERT" in sql
         assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
         assert "$4" in sql, "claim SQL must carry the acquire_delay handicap param"
         _lease_key, owner, ttl, delay = args
-        now = self._db._db_clock()
-        row = self._db.row
-        if row is None:
-            self._db.row = {
-                "owner": owner,
-                "lease_expires_at": now + float(ttl),  # type: ignore[arg-type]
-                "leader_epoch": 1,  # fresh acquire on an empty table
-            }
-            return {"owner": owner, "leader_epoch": 1}
-        expired = float(row["lease_expires_at"]) + float(delay) < now  # type: ignore[arg-type]
-        if row["owner"] == owner or expired:
-            # Renew (owner == me) keeps the epoch; a take-over of an expired/foreign lease bumps it.
-            if row["owner"] != owner:
-                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
-            row["owner"] = owner
-            row["lease_expires_at"] = now + float(ttl)  # type: ignore[arg-type]
-            return {"owner": owner, "leader_epoch": row["leader_epoch"]}
-        return None  # another node holds a live lease
+        return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
     async def execute(self, sql: str, *args: object) -> None:
+        if self.yield_in_execute:
+            await asyncio.sleep(0)  # the release round trip is in flight; let another task run
         if self.fail:
             raise RuntimeError("partitioned from db")
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at=0 WHERE lease_key AND owner.
         assert "leader_lease" in sql and "UPDATE" in sql
         _lease_key, owner = args
-        row = self._db.row
-        if row is not None and row["owner"] == owner:
-            row["lease_expires_at"] = 0.0
+        self._db.release(owner)
 
 
 def _coord(
@@ -580,6 +615,67 @@ async def test_step_down_fires_the_demotion_edge_and_leaves_the_node_running() -
     assert fired == [1]
 
 
+async def test_a_tick_inside_the_release_window_cannot_re_promote_the_drained_node() -> None:
+    # THE TWO-LEADER WINDOW. A stepdown runs from an API handler with the maintenance loop LIVE, and
+    # _release_leadership() SUSPENDS at its UPDATE. A tick that starts in that window matches the claim
+    # statement's unfenced `owner = me` renew branch, takes the lease back, and flips _is_leader on
+    # again — after which the release's own UPDATE expires the row it just renewed. The node then
+    # reports leader while a sibling can take the expired lease, so BOTH consider themselves leader,
+    # and the endpoint answered 200.
+    #
+    # The lock is what closes it. Arming the claim pause before the release would not: this test would
+    # pass on that alone, which is exactly why the second test below exists.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono_a = _Clock(0.0)
+    pool_a = _FakeLeasePool(db)
+    a = _coord(pool_a, mono_a, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    pool_a.yield_in_execute = True  # the release suspends mid-UPDATE, as a real pool does
+    await asyncio.gather(a.step_down_leadership(), a._maintain_leadership())
+
+    assert a.is_leader() is False, "a tick in the release window re-promoted the drained node"
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0  # the release still won the row
+
+    # And the drain actually transfers: the standby takes the expired lease and is the ONLY leader.
+    db_clock.t = 1.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    assert a.is_leader() is False, "two leaders at once"
+
+
+async def test_a_claim_already_in_flight_cannot_re_promote_after_the_release() -> None:
+    # The OTHER interleaving, and the one that decides the fix. Here the maintenance tick is already
+    # suspended inside its claim round trip when the stepdown begins, so it has ALREADY passed the
+    # _no_claim_until check. Arming the pause earlier therefore changes nothing: the claim returns
+    # "held" afterwards and _maintain_leadership promotes on that stale result, leaving the node leader
+    # with a LIVE lease no sibling can take for a full TTL. Only mutual exclusion orders these two.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono_a = _Clock(0.0)
+    pool_a = _FakeLeasePool(db)
+    a = _coord(pool_a, mono_a, node="A", heartbeat=10.0)
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    pool_a.yield_in_fetchrow = True  # the claim is in flight when the stepdown arrives
+    await asyncio.gather(a._maintain_leadership(), a.step_down_leadership())
+
+    assert a.is_leader() is False, "an in-flight claim re-promoted the drained node"
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0, (
+        "the release must win the row; a renew landing after it leaves the lease live for a full TTL"
+    )
+
+    db_clock.t = 1.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    assert a.is_leader() is False, "two leaders at once"
+
+
 async def test_step_down_survives_a_failed_release_write() -> None:
     # The DB write is best-effort (the lease ages out on its own if it fails), and the in-memory
     # demotion happens BEFORE it — so a partitioned node still reports the demotion it really made
@@ -593,3 +689,74 @@ async def test_step_down_survives_a_failed_release_write() -> None:
     was_leader, released_at = await a.step_down_leadership()
     assert was_leader is True and released_at is not None
     assert a.is_leader() is False
+
+
+# --- ADR 0056 slice 1: the SQL Server twin ----------------------------------
+
+
+class _FakeSqlLeaseStore:
+    """The SQL Server sibling of :class:`_FakeLeasePool` over the SAME :class:`_FakeLeaseDB`.
+
+    Emulates only the two statements ``SqlServerCoordinator`` issues for the lease: the
+    ``MERGE ... WHEN MATCHED AND (t.owner = ? OR t.lease_expires_at + ? < @now)`` acquire/renew
+    (``_fetchone``) and the release ``UPDATE`` (``_execute``), with the same opt-in suspension the
+    Postgres stand-in carries and for the same reason — a stand-in that never yields cannot exhibit an
+    ordering defect.
+    """
+
+    _settings = None
+
+    def __init__(self, db: _FakeLeaseDB) -> None:
+        self._db = db
+        self.yield_in_fetchone = False
+
+    async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object] | None:
+        if self.yield_in_fetchone:
+            await asyncio.sleep(0)  # the MERGE round trip is in flight; let another task run
+        assert "MERGE leader_lease" in sql, "not the claim statement"
+        assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
+        # Positional params of the MERGE: (lease_key, owner, delay, owner, ttl, owner, ...).
+        owner, delay, ttl = params[1], params[2], params[4]
+        return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
+
+    async def _execute(self, sql: str, params: tuple[object, ...]) -> None:
+        assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
+        _lease_key, owner = params
+        self._db.release(owner)
+
+
+def _sql_coord(store: _FakeSqlLeaseStore, node: str) -> SqlServerCoordinator:
+    # Same timings as _coord above, so the two backends' tests are comparable at a glance.
+    return SqlServerCoordinator(
+        store,  # type: ignore[arg-type]
+        node,
+        heartbeat_seconds=10.0,
+        leader_lease_ttl_seconds=30.0,
+        leader_fence_timeout_seconds=20.0,
+        monotonic=_Clock(0.0),
+    )
+
+
+async def test_sqlserver_step_down_is_serialized_against_an_in_flight_claim() -> None:
+    # The twin carries the identical unfenced `t.owner = ?` renew branch, so the same interleaving
+    # re-promotes the drained node — and the consequence is worse here than on Postgres: only the three
+    # FIFO claim paths are epoch-fenced on SQL Server, so claim_ready and every terminal resolve would
+    # still accept writes from the ex-leader this endpoint just drained.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    store = _FakeSqlLeaseStore(db)
+    a = _sql_coord(store, "A")
+    b = _sql_coord(_FakeSqlLeaseStore(db), "B")
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+
+    store.yield_in_fetchone = True  # the claim is in flight when the stepdown arrives
+    await asyncio.gather(a._maintain_leadership(), a.step_down_leadership())
+
+    assert a.is_leader() is False, "an in-flight claim re-promoted the drained node"
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+
+    db_clock.t = 1.0
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    assert a.is_leader() is False, "two leaders at once"

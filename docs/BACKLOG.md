@@ -28920,24 +28920,77 @@ cancelled), but on a stepdown the loop is still running: the drained node's very
 own renew branch and takes leadership straight back. Whether the drain works at all comes down to which
 node's heartbeat phase lands first. The endpoint would have answered `200` either way.
 
-The fix is a bounded post-stepdown claim pause, `2 * heartbeat_seconds`, checked in exactly the
+Half the fix is a bounded post-stepdown claim pause, `2 * heartbeat_seconds`, checked in exactly the
 position ADR 0096's `promotable = false` short-circuit already occupies. It is a strictly stricter claim
 predicate on one node, so by ADR 0096's own argument it can only make that node claim later, never
-earlier, and cannot open a two-leader window. It touches neither the lease, nor the self-fence, nor the
-epoch token. `tests/test_cluster_lease.py` carries the regression **and its negative control** -- clear
-the pause and the same sequence hands leadership straight back, so the guard cannot silently stop
-measuring anything.
+earlier. It touches neither the lease, nor the self-fence, nor the epoch token.
+`tests/test_cluster_lease.py` carries the regression **and its negative control** -- clear the pause and
+the same sequence hands leadership straight back, so the guard cannot silently stop measuring anything.
 
-**The cost is stated rather than hidden:** on a cluster with no other promotable node, that window is
-leaderless. That is the honest consequence of asking the only eligible node to step down.
+**CORRECTION, 2026-09-09, same PR. This section first said the pause "cannot open a two-leader window".
+That was wrong, and the way it was wrong is worth more than the sentence it replaces.** ADR 0096's
+argument is about a claim PREDICATE, and it transfers intact: a stricter predicate cannot make a node
+claim earlier. The pause is a stricter predicate, so the argument was correctly applied -- to a question
+it does not answer. A predicate is evaluated at one instant; the window here is an INTERVAL, opened by
+the fact that `_release_leadership()` suspends at its `await`, and a predicate that is true when read
+says nothing about what a coroutine already past it will do when it resumes. Borrowing a neighbouring
+safety argument whose subject is not the same is the defect, not the arithmetic.
+
+Two interleavings were reproduced against the repository's own stand-in, one `asyncio.sleep(0)` in the
+fake pool, both with the pause armed:
+
+- a maintenance tick that STARTS inside the release's await window renews the lease the release is
+  expiring, and `_is_leader` goes back to true while the release then expires that same row. The node
+  reports leader and a sibling takes the expired lease: **both consider themselves leader**;
+- a claim ALREADY IN FLIGHT when the stepdown arrives has passed the pause check before the pause was
+  armed, so it returns held afterwards and `_maintain_leadership` promotes on that stale result --
+  leaving the node leader with a live lease no sibling can take for a full TTL. Arming the pause earlier
+  is measured NOT to close this one, which is what decides the fix.
+
+The other half of the fix is therefore mutual exclusion: `_leadership_lock`, an `asyncio.Lock` held
+across the release and across the whole maintenance tick, on both DB coordinators. `pipeline/dr.py`
+already holds one for its analogous promote/release pair. `stop()` deliberately does not take it -- it
+cancels and gathers both loops first, so nothing competes, and taking it would queue a shutdown behind a
+stepdown stalled on a hung pool. Both interleavings are pinned by regression tests carrying their
+fails-without readings, and the SQL Server twin has its own (its `MERGE` carries the identical unfenced
+`t.owner = ?` renew branch, and only its three FIFO claim paths are epoch-fenced, so a re-promoted
+ex-leader there is not fenced out of `claim_ready` or any terminal resolve).
+
+**Severity, in the conditional (sec. 0): zero deployments, so nothing is drained today.** A first
+deployment that used this endpoint would have hit it -- not a certainty per call, a race whose outcome
+depends on where the heartbeat phase falls.
+
+**The cost is stated rather than hidden:** on a cluster with no other promotable node, the pause window
+is leaderless. That is the honest consequence of asking the only eligible node to step down.
+
+**Two gaps found with the race and deliberately NOT fixed here, recorded so they are not re-derived:**
+
+- `stepdown_pause_seconds` returns `2 * heartbeat_seconds`, which can be SHORTER than a sibling's
+  configured ADR 0096 `acquire_delay_seconds`. That sibling is still handicapped out when the pause
+  ends, and the drained node reclaims its own lease. The function reads `heartbeat_seconds` alone, so it
+  cannot see the handicap it is being compared against; its docstring now says so.
+- a self-fenced node cannot be drained at all -- `step_down_leadership()` finds `_is_leader` already
+  false, releases nothing, and the endpoint answers `409` -- while the node goes on re-arming itself
+  through the ordinary claim path. And the endpoint's `400` gate keys on `is_clustered()`, a constant
+  `True` on a DB coordinator, rather than on whether a promotable sibling actually exists;
+  `cluster_members()` already exposes `promotable` and `last_seen`, so the check is available and unused.
+
+They are named by subject rather than by number because no number has been allocated for them.
 
 ### What does NOT ship, and what gates it
 
 The VIP mechanism: `[cluster.vip]`, bind/release, the gratuitous ARP, the self-fence release path,
 `mefor-net-helper.exe`, and the `vip` field on `GET /cluster/status`. All of it depends on granting the
 engine network-configuration rights, which collides head-on with DEPLOY-1's least-privilege direction.
-ADR 0056 chose the privileged-helper option on paper; nobody has signed off on shipping a second
-privileged binary. **That decision is the gate, and it is the owner's.**
+ADR 0056 chose the privileged-helper option on paper.
+
+**CORRECTED 2026-09-09, same PR: this said "nobody has signed off ... that decision is the gate", and
+by then somebody had.** The owner ruled the VIP mechanism paused pending a code-signing decision on
+2026-09-09. The ruling, and the standard of evidence behind it, are recorded once in
+[ADR 0056](adr/0056-engine-managed-vip-failover.md)'s status block; read it there rather than here.
+What made this worth correcting rather than deleting is that the ADR index row already asserted the
+ruling with no record behind it while this line denied it, so the two shipped records disagreed and a
+reader had no way to tell which was current.
 
 ### Also found while reading ADR 0056
 
@@ -28947,6 +29000,57 @@ console; the operator UI is the web console at `/ui`. The topology reasoning in 
 (one page renders the whole cluster from any node, so Corepoint's "Viewing: Primary / Backup" toggle has
 no analogue) but its construction notes point at files that do not exist. The ADR's status block now
 says so; the section itself is kept for the reasoning.
+
+---
+
+## 1495. ADR 0056's High Availability page is specified against the retired PySide6 console, so the web console has no cluster page at all
+
+> 🔢 **Filed 2026-09-09, found while building #1494's control plane. The number was allocated then and cited from the ADR index before this item existed, which is the defect the item below records first.** Value **4/10** · Difficulty **4/10**. Value 4 -- an operator can already read `GET /cluster/nodes` and `GET /cluster/status` and can already drive `POST /cluster/stepdown` over the API, so the gap is that nothing renders them, not that the data is missing. Difficulty 4 -- one read-mostly page over three endpoints that already exist, plus the step-up confirm flow the stepdown control needs.
+
+**Cluster:** web console / active-passive HA operator surface. **Priority:** P3.
+**Severity:** no deployment axis (sec. 0). A missing view over shipped endpoints, not a defect in
+shipped behaviour.
+
+### The citation came before the item, and that is recorded first on purpose
+
+`1495` was allocated atomically on 2026-09-09 and cited from `docs/adr/README.md`'s ADR 0056 row in the
+same session -- before any `## 1495.` heading existed. The allocation record satisfied the ledger gate,
+so nothing failed. But the allocation store lives under the primary checkout's git directory and is not
+in git: removing the claiming worktree would have released the number while the published citation
+stayed in a merged file, and the day someone legitimately re-allocated `1495` that citation would have
+started resolving to unrelated work with nothing reporting a problem. Filing the item is what closes
+that, and the ordering is the lesson: allocate, then FILE, then cite.
+
+### What is missing
+
+ADR 0056 specifies a read-mostly "High Availability" page -- the Corepoint A2 equivalent -- and names
+`console/shell.py`, `console/status.py` and `console/connections.py` for its construction. All three
+went with the retired PySide6 desktop console (BACKLOG #103); the operator UI is the web console at
+`/ui`. The ADR's status block now marks that section do-not-build-from and keeps it for its topology
+reasoning, which does survive the move: one page renders the whole cluster from any node, because every
+node reads the same shared `nodes` and `leader_lease` rows, so Corepoint's "Viewing: Primary / Backup"
+toggle has no analogue here.
+
+### What it would take
+
+Every endpoint already exists and is RBAC-gated:
+
+- `GET /cluster/status` and `GET /cluster/nodes` (ADR 0008) -- membership, per-node `last_seen`,
+  derived leadership, the lease owner and its expiry, plus each node's ADR 0096 `acquire_delay_seconds`
+  and `promotable`. Both read-only under `monitoring:read`.
+- `POST /cluster/stepdown` (#1494) -- planned failover, `cluster:control` behind `require_step_up`.
+
+So the work is a page, not an API: render the membership table with a live/stale marker off `last_seen`,
+show who holds the lease and when it expires, and put the stepdown behind an explicit confirm that
+carries the step-up + MFA challenge the endpoint already demands. The endpoint answers `409` when the
+node addressed is not the leader and `400` when the deployment is single-node, so the page must resolve
+the leader from `GET /cluster/nodes` before it offers the control rather than offering it everywhere.
+
+### What NOT to build here
+
+The VIP fields. `GET /cluster/status` has no `vip` member and the engine binds no address -- that half
+of ADR 0056 is unbuilt and paused (see #1494). A page that renders a VIP owner would be rendering a
+field that does not exist.
 
 ---
 

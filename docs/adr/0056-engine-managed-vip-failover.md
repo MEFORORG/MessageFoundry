@@ -7,11 +7,21 @@
     (`cluster:control`) permission, and the coordinator's public `step_down_leadership()` seam. That is
     §"Control API — planned failover" below, minus the two things it defers on its own terms: the
     `force` flag and `new_leader_eligible`.
-  - **STILL PROPOSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release, the
-    gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
+  - **PROPOSED AND PAUSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release,
+    the gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
     `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
-    bind/release or a VIP-owner field is proposed, not built. The privileged-helper decision is the
-    gate.
+    bind/release or a VIP-owner field is proposed, not built.
+
+    **The ruling and what backs it, recorded here because this page is the decision record.** On
+    **2026-09-09** the owner ruled the VIP mechanism **paused, pending a code-signing decision**: it
+    needs a `requireAdministrator` helper binary (`mefor-net-helper.exe`) and this repository has no
+    code-signing infrastructure to ship one with. **Read it at the standard it was given:** in session,
+    to the session that built the control plane, with **no git ref or other artifact anchoring it** —
+    these lines are the record, so a reader who needs it independently verified should ask the owner
+    rather than treat this page as the proof. It is written down because the alternative measured
+    worse: `docs/adr/README.md` asserted the ruling in its Status column with nothing behind it, while
+    BACKLOG #1494 said in the opposite direction that nobody had signed off, and no reader could tell
+    which was current. Stated once here; the index row and that item point at it rather than repeat it.
   - **STALE — §"Console — High Availability page".** It targets the PySide6 desktop console
     (`console/shell.py`, `console/status.py`, `console/connections.py`), which was retired. The operator
     UI is the web console at `/ui`. The section is kept for its topology reasoning — the "no Viewing
