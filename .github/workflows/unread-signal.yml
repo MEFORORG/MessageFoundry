@@ -151,6 +151,7 @@ jobs:
     # silently re-map an existing REQUIRED context onto this job.
     name: announce an unread pull request
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write # add/remove one label and post one comment; no other write scope

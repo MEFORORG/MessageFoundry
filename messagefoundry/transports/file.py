@@ -58,6 +58,7 @@ __all__ = [
     "render_filename",
     "DEFAULT_MAX_FILE_BYTES",
     "LEAVE_SEEN_CACHE_MAX",
+    "DEFAULT_MAX_FILES_PER_POLL",
     # Re-exported from parsing.sniff (ASVS 5.2.2) so remotefile.py + existing tests import them here.
     "_content_matches_declared",
     "_looks_like_hl7",
@@ -71,6 +72,25 @@ _T = TypeVar("_T")
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
 # falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
+
+#: Per-tick ceiling on how many candidate files ONE poll may process (ASVS 2.4.1, BACKLOG #1114).
+#: Before it, `_scan_once` iterated every candidate the glob returned, so one tick's work — memory in
+#: flight, latency to the next `stop()` check, and messages injected into the pipeline — was bounded
+#: only by how many files a partner happened to drop.
+#:
+#: THIS SHIPS ON, and that is not a different appetite for risk from the message-rate pacer that ships
+#: OFF (`mllp.DEFAULT_MAX_MESSAGES_PER_SECOND`, ruled 2026-08-11). It is a different DISPOSITION OF THE
+#: EXCESS. A rate bound on a listen intake makes a sender wait, so a guessed number throttles a real
+#: feed — the reason that one is off. A poll source has no sender to make wait: a partner writes to the
+#: directory and leaves. Over-ceiling files are LEFT WHERE THEY ARE and taken by the next tick, so the
+#: ceiling defers work rather than refusing, dropping or back-pressuring anything, and the
+#: count-and-log invariant is untouched (an unread file was never a received message).
+#:
+#: The number is an order of magnitude above what the pipeline itself drains end-to-end per interface,
+#: so on a healthy feed the pipeline, not this ceiling, is the binding constraint. What a too-low value
+#: costs is LATENCY, not loss: draining a backlog costs one extra poll interval per ceiling's worth of
+#: files. A falsy value (None/0) in settings disables it explicitly, like the byte caps above.
+DEFAULT_MAX_FILES_PER_POLL = 1000
 
 # Cap the leave-in-place (#142) in-memory dedup fast-path so it can't outgrow the durable
 # processed_files ledger's count cap (PROCESSED_FILE_LEDGER_KEEP_MAX in pipeline/wiring_runner.py). It
@@ -382,6 +402,15 @@ class FileSource(SourceConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self.max_file_bytes: int | None = int(mfb) if mfb else None
+        # Per-tick ceiling (ASVS 2.4.1, BACKLOG #1114). Absent -> the shipped default, this module's
+        # ordinary "key absent -> secure default" convention; see DEFAULT_MAX_FILES_PER_POLL for why
+        # this control follows it while the message-rate pacer deliberately does not.
+        mfp = s.get("max_files_per_poll", DEFAULT_MAX_FILES_PER_POLL)
+        self.max_files_per_poll: int | None = int(mfp) if mfp else None
+        #: Whether the LAST tick hit the ceiling — gates a single transition log, so a draining
+        #: backlog reports once at each edge instead of once per poll interval (the `_skipping`
+        #: pattern this class already uses for the leader gate).
+        self._deferring = False
         # Optional inbound decompression (ADR 0123): "gzip" gunzips each file's bytes BEFORE the sniff /
         # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
         self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
@@ -530,6 +559,8 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         for path in await self._run_fs(self._candidates):
+            if self._stop.is_set():
+                break  # shutting down — leave the rest for the next start (at-least-once)
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
             # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
@@ -798,7 +829,41 @@ class FileSource(SourceConnector):
             files.sort(key=_mtime)
         else:
             files.sort(key=lambda p: p.name)
-        return files
+        return self._within_tick_ceiling(files)
+
+    def _within_tick_ceiling(self, files: list[Path]) -> list[Path]:
+        """Cut the candidate list to ``max_files_per_poll`` (ASVS 2.4.1, BACKLOG #1114).
+
+        SORT THEN CUT, which is why this runs at the end of :meth:`_candidates` and not earlier: the
+        ceiling must take the first N **in the configured order** (oldest-first under ``sort="mtime"``,
+        name order otherwise). Cutting before the sort would take an arbitrary subset of the glob and
+        silently reorder a feed that asked for oldest-first.
+
+        Deferral is not a drop. The remainder stays in the directory untouched and the next tick takes
+        it, so nothing is refused and no message goes unaccounted for — an unread file never became a
+        received message. Logged once at each edge, with COUNTS ONLY: a filename can carry an MRN, so
+        this source never logs one at INFO or above.
+        """
+        if self.max_files_per_poll is None or len(files) <= self.max_files_per_poll:
+            if self._deferring:
+                self._deferring = False
+                logger.info(
+                    "file source %s is no longer deferring: the backlog now fits one poll",
+                    self.directory,
+                )
+            return files
+        if not self._deferring:
+            self._deferring = True
+            logger.info(
+                "file source %s found %d ready files, over max_files_per_poll (%d); taking the "
+                "first %d in %s order and leaving the rest for the next poll (nothing is dropped)",
+                self.directory,
+                len(files),
+                self.max_files_per_poll,
+                self.max_files_per_poll,
+                self.sort,
+            )
+        return files[: self.max_files_per_poll]
 
     def _within_root(self, path: Path) -> bool:
         """True if ``path`` resolves inside the configured watch root.

@@ -53,6 +53,16 @@ on:
     - cron: "0 7 * * 1"
   workflow_dispatch:
 
+concurrency:
+  # security.yml's pattern, and its note there is the reasoning: per-ref for PR events so a rapid
+  # re-push supersedes its own in-flight analysis; every other event gets a unique group (run_id) and
+  # is never superseded, never cancelled. THE `merge_group` ARM IS WHY THE EXPRESSION IS SHAPED THIS
+  # WAY RATHER THAN `cancel-in-progress: true`: a cancelled queue-time run reports a cancelled
+  # context, and the `on:` note above records what an absent CodeQL context did to the queue's first
+  # entry. A unique group per non-PR run cannot collide, so it cannot be cancelled by this block.
+  group: codeql-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -91,6 +101,10 @@ jobs:
     # change, or the context never reports in the queue and nothing merges.
     if: github.repository == 'MEFORORG/MessageFoundry' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
+    # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
+    # reasoning and the sizing rule for every cap added in that change. Above the floor because a
+    # CodeQL database build is the variable part -- the pair currently runs about 3.3 minutes.
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write # upload the SARIF results to code scanning
