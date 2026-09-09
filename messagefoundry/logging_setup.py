@@ -1095,13 +1095,17 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     """Install a **stderr-only** root handler carrying the same PHI-redaction + control-char-scrub
     filter chain :func:`configure_logging` puts on stdout, and return it.
 
-    For a MessageFoundry child process whose **stdout is a binary channel**: today the ADR 0087 sandbox
-    worker, whose stdout carries the MFW2 IPC frames, so a stray log byte written there would corrupt a
-    frame. The obvious way to express that — ``logging.basicConfig(stream=sys.stderr)`` — gets the
-    stream right and the *filters* wrong: it installs a handler with **no filters at all**, so a
-    child's records would reach the stderr the parent captures and relays (ADR 0176) with neither PHI
-    redaction nor CR/LF neutralization (BACKLOG #1054). :func:`build_stderr_handler` is what supplies
-    the chain and the shared text formatter here, and says why that has to be asked for.
+    For a MessageFoundry process whose **stdout is not a log channel**. Two shapes reach here, and the
+    second is why this is not sandbox-specific machinery. (1) A child whose stdout is a **binary
+    channel**: the ADR 0087 sandbox worker, whose stdout carries the MFW2 IPC frames, so a stray log
+    byte written there would corrupt a frame. (2) A **CLI subcommand invoked with ``--json``**, whose
+    stdout carries one machine-parsed document; ``__main__.main`` calls this before dispatch and
+    carries the measurement (BACKLOG #1489). The obvious way to express either,
+    ``logging.basicConfig(stream=sys.stderr)``, gets the stream right and the *filters* wrong: it
+    installs a handler with **no filters at all**, so a child's records would reach the stderr the
+    parent captures and relays (ADR 0176) with neither PHI redaction nor CR/LF neutralization
+    (BACKLOG #1054). :func:`build_stderr_handler` is what supplies the chain and the shared text
+    formatter here, and says why that has to be asked for.
 
     Replaces any handlers already on the root logger, exactly as :func:`configure_logging` does, so it
     is idempotent and safe to call from a test.

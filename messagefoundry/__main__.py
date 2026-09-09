@@ -37,6 +37,7 @@ from messagefoundry.logging_setup import (
     LogFile,
     SyslogForward,
     configure_logging,
+    configure_stderr_logging,
     query_sntp_offset,
 )
 
@@ -876,6 +877,26 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    # A `--json` subcommand's stdout is a machine-parsed document, so NOTHING else may write there
+    # (BACKLOG #1489). The engine's default log sink is stdout too, and one log line ahead of the
+    # payload makes `json.loads` raise `Extra data: line 1 column 5`, because the text format opens
+    # with the ISO timestamp: `2026` parses as a number and the payload becomes trailing garbage.
+    # It cost real CI time before it was fixed; the census lives on the ledger item, with its
+    # provenance, rather than being restated here.
+    #
+    # DECIDED HERE, and not in `logging_guard`, which is where the symptom shows up. That module
+    # writes its rollover notice to the ROLLED SINK on purpose: the notice landing is the proof that
+    # the replacement stream accepted a write, which is precisely what separates stage 1 (healed)
+    # from stage 2 (unwritable). Move the notice and the fail-closed halt loses its trigger. The
+    # collision is two contracts on one file descriptor, and the CLI is what owns that choice.
+    #
+    # `configure_stderr_logging` is the shipped answer to "this process's stdout is not a log
+    # channel" (the ADR 0087 sandbox worker, whose stdout carries IPC frames), and it carries the
+    # PHI-redaction + control-char-scrub filter chain, which is strictly more than the UNFILTERED
+    # `logging.lastResort` a handler-less subcommand degrades to today. `serve` and `supervise` take
+    # no `--json`, print no payload and are untouched: they still log to the stdout NSSM captures.
+    if getattr(args, "json", False):
+        configure_stderr_logging()
     return _DISPATCH[args.command](args)
 
 
