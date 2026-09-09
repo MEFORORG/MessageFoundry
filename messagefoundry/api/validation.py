@@ -108,6 +108,39 @@ CONNECTION_NAME_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{0,255}$"
 ConnectionName = Annotated[str, StringConstraints(pattern=CONNECTION_NAME_PATTERN)]
 
 
+# --- The per-channel RBAC scope -------------------------------------------------------------------
+#
+# ``ChannelScope.channels`` is the one list on this surface whose members are not all connection
+# names. BACKLOG #1152 (ASVS 8.2.2) retired the encoding where an ABSENT scope meant every channel,
+# and made all-channels a grant somebody typed: the token ``*``, stored as the one-element list
+# ``["*"]``. Saying nothing now DENIES, so that token is the only way left to ask for the whole
+# estate through ``PUT /users/{user_id}/channel-scope`` or its ``/ui`` twin. Typing that list as
+# ``ConnectionName`` therefore stopped being a description of its contents and became a refusal of
+# the one value the field exists to carry.
+#
+# The token belongs HERE and not in ``CONNECTION_NAME_PATTERN``, and that split is the point.
+# Widening the connection-name rule would admit ``*`` at ``{name}`` on a path and in every
+# ``channel_id`` / ``destination_name`` filter, where nothing reads it as a wildcard and it could
+# only ever be a name no connection has. This rule admits it in the single field whose vocabulary
+# includes it, and the connection-name rule is reused unchanged for every other member.
+#
+# What this does NOT relax: the token is a whole value with its own anchors, so ``*ADT``, ``IB_*``
+# and ``**`` are all still refused, and each of the list's other members still has to pass the
+# connection-name rule. Nor is it a new capability -- before #1152 the same all-channels grant was
+# reachable by sending ``null``, which this route still accepts and which now means the opposite.
+#
+# The token is spelled as a literal rather than imported because this module depends on nothing but
+# pydantic and the standard library (see the header). ``tests/test_api_input_validation.py`` pins it
+# equal to :data:`messagefoundry.auth.identity.ALL_CHANNELS`, so the two cannot drift apart quietly.
+# ``AdGroupScopeEntry.channel`` carries the same wildcard for an AD group's estate-wide row and is
+# length-bounded only; narrowing it to this rule is a separate, unfiled tightening.
+
+#: One member of a stored per-channel scope: the all-channels token ``*``, or a connection name.
+CHANNEL_SCOPE_ENTRY_PATTERN = r"^\*$|" + CONNECTION_NAME_PATTERN
+
+ChannelScopeEntry = Annotated[str, StringConstraints(pattern=CHANNEL_SCOPE_ENTRY_PATTERN)]
+
+
 # --- Time ranges ---------------------------------------------------------------------------------
 #
 # The API's time bounds (``received_from``/``received_to``, ``since``/``until``) are epoch seconds as

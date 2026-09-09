@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    ConnectionName,
+    ChannelScopeEntry,
     PermissionId,
     RoleId,
 )
@@ -105,9 +105,13 @@ class ChannelScope(RequestModel):
     ``["*"]`` is the explicit all-channels grant. ``None`` clears the scope back to unset, and unset
     DENIES every channel (BACKLOG #1152, ASVS 8.2.2) — it is not the wide value it used to be, so a
     client that sends null to widen a scope now narrows it to nothing. Administrators are
-    all-channels by role, so a scope set on one has no effect either way."""
+    all-channels by role, so a scope set on one has no effect either way.
 
-    channels: list[ConnectionName] | None = Field(default=None, max_length=512)
+    A member is a connection name or that one token, which is why this list is typed
+    ``ChannelScopeEntry`` and not ``ConnectionName``; ``api/validation.py`` states the rule and why
+    the token stops here rather than widening the connection-name rule everything else uses."""
+
+    channels: list[ChannelScopeEntry] | None = Field(default=None, max_length=512)
 
 
 class UserCreateRequest(RequestModel):

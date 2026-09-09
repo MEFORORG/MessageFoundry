@@ -4,8 +4,12 @@
 
 BACKLOG #1109, the API limb of ASVS 2.2.1. Pydantic's default is ``extra="ignore"``, so every API
 request body used to accept a misspelled key, drop it, and answer 200. The worst instance is
-``PUT /users/{id}/channel-scope``: ``channels`` is optional and ``None`` means *all channels*, so
-``{"chanels": ["IB_ACME_ADT"]}`` asked for one connection and granted every one of them.
+``PUT /users/{id}/channel-scope``: ``channels`` is optional, so ``{"chanels": ["IB_ACME_ADT"]}``
+asked for one connection and silently applied the default instead, answering 200 either way. It was
+worst when that default was *all channels* -- the typo widened the grant. BACKLOG #1152 flipped the
+default to deny, which inverts the damage without removing it: the same typo now takes every channel
+away. Which direction it fails in is not the point, and neither is the flip -- an unread key is a
+request nobody made.
 
 The posture is deliberately DIRECTIONAL, and these tests pin both halves of it, because a blanket
 ``extra="forbid"`` across the module would be a different and worse defect:
