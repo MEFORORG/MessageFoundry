@@ -720,7 +720,6 @@ _EXPOSED = (
     "alerts.security_notifications_required = false\n"
     "security.local_access_only = false\n"
     'security.listen_address = "0.0.0.0"\n'
-    "security.block_unlisted_outbound = true\n"
     "security.delete_message_bodies_after_days = 30\n"
     '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
 )
@@ -758,7 +757,6 @@ def test_default_loopback_serve_emits_nothing_new(
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
         "alerts.security_notifications_required = false\n"
-        "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
     )
     assert _serve(tmp_path, monkeypatch, toml, env="dev") == 0

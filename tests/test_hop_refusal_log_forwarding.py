@@ -42,7 +42,8 @@ SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 PROD_PHI = HopPosture(enforcing=True)
 STAGING_PHI = HopPosture(enforcing=False)  # PHI, dial at warn
-SYNTHETIC = HopPosture(enforcing=True)  # not is_phi → always ALLOW
+# Pre-#1279 this was the blanket carve-out ("not is_phi → ALLOW"). It is enforcing, so it REFUSES.
+SYNTHETIC = HopPosture(enforcing=True)
 
 REMOTE = "10.0.0.5"  # RFC 1918, non-loopback (never resolves; treated as off-box)
 LOOPBACK = "127.0.0.1"
@@ -105,8 +106,16 @@ def test_loopback_collector_allowed_so_the_local_agent_deployment_survives() -> 
     assert forward_hop_disposition(_log(forward_host=LOOPBACK), PROD_PHI) is HopDisposition.ALLOW
 
 
-def test_synthetic_instance_plaintext_collector_allowed_silently() -> None:
-    assert forward_hop_disposition(_log(), SYNTHETIC) is HopDisposition.ALLOW
+def test_the_synthetic_allow_arm_is_gone_and_the_hop_now_refuses() -> None:
+    # ADR 0153 left this cell keyed on the data label because the forwarder is not a connection and
+    # so cannot carry a per-hop `cleartext_accepted`. BACKLOG #1279 removed the label, so the arm it
+    # bought has no instance left to fire on: an enforcing box with a plaintext collector REFUSES.
+    #
+    # THIS IS THE RESIDUAL ADR 0186 RECORDS, made executable. Under `enforce` this cell now has NO
+    # per-hop way to accept the risk -- only `forward_hop_attested` (below), which is an assertion
+    # that the hop is secure by other means, not an acceptance that it is not. The `[logging]`
+    # sibling of `cleartext_accepted` is the recorded follow-up and is unbuilt.
+    assert forward_hop_disposition(_log(), SYNTHETIC) is HopDisposition.REFUSE
 
 
 def test_non_enforcing_phi_plaintext_collector_warns_and_crosses() -> None:

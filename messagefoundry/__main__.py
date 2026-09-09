@@ -1538,8 +1538,8 @@ def _serve(args: argparse.Namespace) -> int:
             # the H3 tightening — previously prod refused and non-prod only warned (fail-open), but
             # dev/staging routinely hold near-real PHI.
             print(
-                f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set "
-                f"(environment {env_name!r}); refusing to start "
+                f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
+                f"PHI instance (environment {env_name!r}); refusing to start "
                 "— PHI bodies and the summary/metadata (MRN + patient name) and "
                 "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
                 "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
@@ -1572,7 +1572,7 @@ def _serve(args: argparse.Namespace) -> int:
         # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
         # was verified above, so the AUDIT line names both flags; the warn posture names just the one.
         logging.getLogger(__name__).warning(
-            "AUDIT: starting keyless on a %sinstance (environment %r) because "
+            "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
             "[security].allow_unencrypted_phi=true%s — PHI is stored UNENCRYPTED at rest "
             "(at-rest encryption opt-out override).",
             "production " if production else "",

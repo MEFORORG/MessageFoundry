@@ -475,8 +475,12 @@ def test_the_per_connection_attestation_passes() -> None:
     check_inbound_revocation(_mtls(attested=True), "IB", posture=_PHI_ENFORCING)
 
 
-def test_a_non_phi_instance_warns_rather_than_refusing() -> None:
-    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=True))
+def test_an_enforcing_instance_refuses_where_a_non_phi_one_used_to_warn() -> None:
+    # This asserted that a NON-PHI instance warned and crossed. BACKLOG #1279 removed the data
+    # label from the predicate, so the same input is now judged on the enforcement dial alone --
+    # and at `enforce` an mTLS listener that checks no revocation is refused.
+    with pytest.raises(WiringError, match="revocation"):
+        check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=True))
 
 
 def test_a_non_enforcing_instance_warns_rather_than_refusing() -> None:

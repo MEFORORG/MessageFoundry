@@ -545,23 +545,22 @@ def test_a_positive_readout_does_not_discharge_the_declaration(
     assert "amd-sev-snp" in err
 
 
-def test_exposed_synthetic_instance_is_silent(
+def test_exposed_instance_is_no_longer_silenced_by_a_declaration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # THE INVERSE OF THE TEST THIS REPLACES. It asserted silence on the strength of a synthetic
+    # declaration; BACKLOG #1279 retired it, so an exposed instance with no in-use data-protection
+    # declaration gets the ASVS 11.7.1 warning. Still a WARNING, not a refusal -- that needs
+    # [security].require_memory_encryption_declaration, which the sibling test above covers.
     _readout(monkeypatch, capability=False, active=False, source="test:negative")
     rc = _serve(
         tmp_path,
         monkeypatch,
-        exposed_prod_phi(
-            "security.block_unlisted_outbound = true\n"
-            "security.allow_unencrypted_phi = true\n"
-            "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-            "alerts.security_notifications_required = false\n"
-        ),
+        exposed_prod_phi(),
         env="prod",
     )
     assert rc == 0
-    assert "11.7.1" not in capsys.readouterr().err
+    assert "11.7.1" in capsys.readouterr().err
 
 
 # --- rung 2: the contradiction case -------------------------------------------------------------

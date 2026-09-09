@@ -93,10 +93,34 @@ def test_phi_read_disposition_prod_phi_secure_hop_allows() -> None:
     )
 
 
-def test_phi_read_disposition_synthetic_insecure_hop_allows() -> None:
-    # A synthetic instance carries no PHI, so an insecure serve hop is not refused (no false-close).
+def test_the_synthetic_allow_arm_is_gone_from_the_api_serve_hop() -> None:
+    # ADR 0153 restated the `not is_phi -> ALLOW` arm HERE rather than inheriting it, because the
+    # API serve hop is not a connection and cannot carry a per-hop `cleartext_accepted`. BACKLOG
+    # #1279 removed the label, so the arm has no instance left to fire on.
+    #
+    # SYNTHETIC is a NON-enforcing posture here, so it WARNS rather than refusing -- which is the
+    # useful half of this test: the removal did not turn every previously-quiet hop into a hard
+    # stop, it moved each one to whatever the enforcement dial says.
     assert (
         phi_read_hop_disposition(SYNTHETIC, serve_hop_secure=False, audited_opt_out=False)
+        is HopDisposition.WARN
+    )
+
+
+def test_the_api_serve_hop_refuses_when_enforcing_with_no_per_cell_escape() -> None:
+    # The other half, and the residual ADR 0186 records: under `enforce` this cell has NO per-hop
+    # acceptance mechanism at all. `audited_opt_out` arrives already clamped by the caller, so the
+    # only ways across are a proven-secure serve hop or an unstamped posture.
+    assert (
+        phi_read_hop_disposition(PROD_PHI, serve_hop_secure=False, audited_opt_out=False)
+        is HopDisposition.REFUSE
+    )
+    assert (
+        phi_read_hop_disposition(PROD_PHI, serve_hop_secure=True, audited_opt_out=False)
+        is HopDisposition.ALLOW
+    )
+    assert (
+        phi_read_hop_disposition(None, serve_hop_secure=False, audited_opt_out=False)
         is HopDisposition.ALLOW
     )
 
@@ -170,12 +194,27 @@ async def test_api_prod_phi_secure_hop_serves_raw_view(engine: Engine) -> None:
         assert r.json()["raw"] == ADT
 
 
-async def test_api_synthetic_insecure_hop_is_byte_identical(engine: Engine) -> None:
+async def test_api_dev_insecure_hop_refuses_exactly_as_prod_does(engine: Engine) -> None:
     mid = await _seed(engine)
-    # A synthetic (dev) instance over an insecure hop is UNAFFECTED — no PHI to protect, byte-identical.
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so the synthetic posture is declared explicitly.
+    # THE INVERSE OF THE TEST THIS REPLACES (BACKLOG #1279). A dev instance over an unproven serve
+    # hop used to be byte-identical to no gate at all, because it declared itself synthetic. There
+    # is no such declaration now, so `dev` takes the same 403 `prod` takes three tests above -- and
+    # the PHI body still never leaves.
     async with _client(engine, ai=AiSettings(environment="dev"), secure=False) as c:
-        assert (await c.get(f"/messages/{mid}")).status_code == 200
+        r = await c.get(f"/messages/{mid}")
+        assert r.status_code == 403
+        assert "PHI read refused" in r.json()["detail"]
+        assert ADT not in r.text
+
+
+async def test_api_dev_secure_hop_still_serves(engine: Engine) -> None:
+    mid = await _seed(engine)
+    # ...and the loopback default every developer actually runs is untouched, which is what keeps
+    # the refusal above a gate on EXPOSURE rather than a gate on the environment name.
+    async with _client(engine, ai=AiSettings(environment="dev"), secure=True) as c:
+        r = await c.get(f"/messages/{mid}")
+        assert r.status_code == 200
+        assert r.json()["raw"] == ADT
 
 
 async def test_api_no_ai_posture_is_byte_identical(engine: Engine) -> None:
