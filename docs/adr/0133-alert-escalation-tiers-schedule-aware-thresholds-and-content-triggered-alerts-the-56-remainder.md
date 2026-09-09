@@ -1,6 +1,48 @@
 # ADR 0133 — Alert escalation tiers, schedule-aware thresholds, and content-triggered alerts (the #56 remainder)
 
-- **Status:** Accepted (2026-07-18, built) — DEMAND-GATE-BACKLOG Wave 4 (lane `dg-s1b`).  <!-- Proposed → Accepted → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-07-18) — DEMAND-GATE-BACKLOG Wave 4 (lane `dg-s1b`) — **PARTIALLY BUILT; corrected 2026-09-09**, see **Built** below.  <!-- Proposed → Accepted → Superseded by NNNN / Rejected -->
+- **Built (re-verified against the tree 2026-09-09):** **D1, D2 and D4 are BUILT. D3 is NOT BUILT as a
+  reachable capability** — it is plumbing nothing outside the tests can fire. The words that stood on the
+  Status line — *"Accepted (2026-07-18, built)"* — claimed all four decisions shipped. They are corrected
+  here rather than deleted, because that is the sentence a reader would otherwise carry forward, and an
+  unqualified "built" over a D3 with zero non-test callers over-claims what the tree delivers.
+  - **BUILT — D1 escalation tiers.** `EscalationTier` and `AlertRule.escalate` (`config/settings.py`); the
+    `_occurrences` counter and highest-satisfied-tier selection in `NotifierAlertSink._emit`
+    (`pipeline/alert_sinks.py`); the tier persisted through `upsert_alert_instance` (`store/base.py`) and
+    read back on `AlertInstance.escalation_tier` (`store/store.py`).
+  - **NOT BUILT — D1's operator-visible half.** D1 says the persisted tier is there so "the dashboard shows
+    the escalation level". It does not. `escalation_tier` appears nowhere under `messagefoundry/api/` or
+    `messagefoundry_webconsole/`, and `AlertInstanceInfo` (`api/models.py`) carries no such field, so
+    `GET /alerts/active` never returns it. The #143 `suspended_until` beside it does appear in both. The
+    rules API's `escalate_tiers` (`AlertRuleInfo`, `api/models.py`) is not this half: it reports how many
+    tiers a RULE configures, not which tier an instance reached.
+  - **BUILT — D2 schedule-aware rules.** `AlertRule.schedule` (`config/settings.py`), gated inside
+    `AlertRuleSet.decide` on `rule.schedule.is_active(...)` (`pipeline/alert_sinks.py`), reusing the ADR 0095
+    `Schedule`/`ActiveWindow` verbatim.
+  - **BUILT — D4's column on all three backends.** `alert_instance.escalation_tier` on SQLite (`ALTER TABLE
+    ADD COLUMN`, `store/store.py`), Postgres (`ADD COLUMN IF NOT EXISTS`, `store/postgres.py`) and SQL Server
+    (`COL_LENGTH`-gated `ADD`, `store/sqlserver.py`), kept monotonic by `MAX`/`GREATEST`/`CASE`.
+  - **BUILT — D3's config and notifier half only.** `content_match` is in `_ALERT_EVENT_TYPES`
+    (`config/settings.py`); `AlertRule.content_label` filters on it in `AlertRuleSet.decide`; and
+    `NotifierAlertSink.content_match(connection, *, label, rule_id=None)` exists with the PHI-free shape this
+    ADR specifies — no value parameter.
+  - **NOT BUILT — D3's reachability, which is the capability itself.** `content_match` is absent from the
+    `AlertSink` Protocol and from `LoggingAlertSink`, both in `pipeline/alerts.py`, while the engine holds
+    its sink as `self._alert_sink: AlertSink` (`pipeline/wiring_runner.py`). So the type the engine programs
+    against does not carry the method, and a deployment configuring no `[alerts]` transport gets
+    `LoggingAlertSink`, which cannot record the event at all. `messagefoundry/__init__.py` exports no alert
+    symbol of any kind, and a Handler is called as `HandlerFn = Callable[[Payload], HandlerResult]`
+    (`config/wiring.py`) — one payload argument, no sink. `.content_match(` has **zero** non-test callers.
+  - **D3's sentence "calls this via the alert sink the engine already threads into its runners" is FALSE as
+    written**, and is kept below so the correction sits beside the claim. The engine threads a sink into its
+    runners. It threads nothing into a Handler, and the threaded type lacks the method.
+  - **Every test this ADR names EXISTS.** `test_escalates_by_occurrence_count`, `test_schedule_aware_decide`,
+    `test_content_match_event_is_phi_free` and `test_content_match_reemit_is_idempotent` are all in
+    `tests/test_alert_escalation.py`, and `test_three_backend_parity_columns` is in
+    `tests/test_alert_state.py`. The defect is what AC-3 and AC-4 assert, not a missing test — see the note
+    under the Acceptance Criteria.
+  - **This is build state, not live impact.** There are zero deployments (CLAUDE.md section 0), so nothing
+    is exposed and no operator depends on this. The remainder is BACKLOG #81, which already records it.
 - **Date:** 2026-07-18
 - **Related:** BACKLOG #81 (the confirmed remainder of #56) · **refines** [ADR 0014](0014-alerting-rules-engine.md)
   (the rules engine + the pure `AlertRuleSet.decide` + the per-`(type, connection)` throttle this escalation
@@ -133,6 +175,14 @@ no new PHI tier.
   fold it into the one open instance (throttle/dedup) rather than open a second — the purity/at-least-once
   reconciliation.
   → `tests/test_alert_escalation.py::test_content_match_reemit_is_idempotent`
+- **NOTE added 2026-09-09 — AC-1, AC-2 and AC-5 are MET. AC-3 and AC-4 are NOT MET, and the tests they name
+  DO exist.** Both tests are real, and both call `NotifierAlertSink.content_match` **directly**. Neither
+  exercises the "WHEN a Handler emits a `content_match`" premise, because no Handler can emit one:
+  `content_match` is on neither the `AlertSink` Protocol nor `LoggingAlertSink` (`pipeline/alerts.py`), no
+  alert emitter is exported from `messagefoundry/__init__.py`, and a Handler is called with the payload
+  alone (`HandlerFn = Callable[[Payload], HandlerResult]`, `config/wiring.py`). What the two tests verify is
+  the event shape and the dedup grain. What stays unverified — and is unbuildable at this build state — is
+  the trigger the criteria open with. See the **Built** bullet at the top.
 - **AC-5** — THE SYSTEM SHALL create + operate the `escalation_tier` column identically on SQLite, Postgres,
   and SQL Server (schema/accessor parity), with the ADR 0064 schema hash bumped.
   → `tests/test_alert_state.py::test_three_backend_parity_columns`

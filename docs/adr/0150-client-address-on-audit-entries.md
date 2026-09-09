@@ -6,6 +6,19 @@ Date: 2026-07-22
 
 Accepted (2026-07-22) — built; pushes/PR owner-approved.
 
+**CORRECTED 2026-09-09 -- decision item 6 over-claims one of the three surfaces it names.** Five of
+the six decision items are built as written. Item 6 is BUILT on `GET /audit` and on the
+`audit:export` CSV. It is NOT BUILT on the web console audit page:
+`messagefoundry_webconsole/pages/audit.py::audit_log` renders the columns When / Actor / Action /
+Channel / Detail and never reads `AuditEntry.client`, so `/ui/audit` renders no address column. The
+value does reach that page -- the route hands it an `AuditList` whose entries carry `client` -- and
+only the table drops it. The over-claiming sentence is corrected in place in item 6 below rather
+than deleted, because it is what a reader would otherwise carry forward. The other five decision
+items hold: the column ships on all three backends, `store/store.py::audit_row_hash` takes `client`
+and appends it conditionally, and both tests this ADR cites (the crafted-`detail` injectivity test
+and the pre-existing-store migration test) exist in `tests/test_audit_integrity.py`. The
+Consequences section's audit-site counts were not re-checked.
+
 ## Context
 
 An `audit_log` row named **who** (`actor`) and **what** (`action`, `detail`) but never **where
@@ -103,6 +116,18 @@ then the audit trail would contradict the new-client-IP risk signal that reads t
 field so a SIEM can index it without parsing the redacted `detail`; it is an infrastructure
 identifier, not message content, so it is **not** run through `safe_text`. `AuditEntry` gains
 `client`, so `GET /audit`, the webconsole audit page, and the `audit:export` CSV all carry it.
+
+> **CORRECTED 2026-09-09 -- the sentence above over-claims one surface. It is kept rather than
+> deleted because it is what a reader would otherwise carry forward.** `AuditEntry` does gain
+> `client` (`api/auth_models.py::AuditEntry`), and two of the three named surfaces carry it:
+> `GET /audit` builds every entry with `client=r["client"]` (`api/auth_routes.py::_audit_list`), and
+> the CSV export emits a `client` column (`api/auth_routes.py::export_audit`). **The web console
+> audit page is NOT BUILT for it.** `messagefoundry_webconsole/pages/audit.py::audit_log` builds its
+> rows as When / Actor / Action / Channel / Detail and never reads `e.client`. An operator reading
+> `/ui/audit` would see no address, so only the JSON route and the CSV export attribute a row to a
+> host. The data is already in hand -- the same `_audit_list` core feeds the page through the
+> `_audit_ui_list` seam -- so closing this is a page change with no store, model or route work
+> behind it.
 
 ## Consequences
 
