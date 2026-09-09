@@ -5492,11 +5492,11 @@ def create_app(
           failing over correctly.
 
           **What this branch must NOT say is that a teardown just started.** The demotion edge fires
-          under ``if was_leader`` (``DbCoordinator.step_down_leadership``), which a RETRY has already
-          cleared, so a repeat refusal signals nothing new and an earlier body claiming otherwise was
-          false on exactly that branch. The body therefore describes the demotion teardown as a
-          mechanism — it runs on the graph supervisor, not in this call — rather than asserting one
-          began here.
+          under ``if was_leader`` — in ``DbCoordinator.step_down_leadership`` and identically in its
+          SQL Server twin, the only two that reach this raise — which a RETRY has already cleared, so
+          a repeat refusal signals nothing new and an earlier body claiming otherwise was false on
+          exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
+          runs on the graph supervisor, not in this call — rather than asserting one began here.
 
         Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
         endpoints and the ADR's own contract give that status.
