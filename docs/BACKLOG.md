@@ -6113,7 +6113,7 @@ complete result, not a stall.
 
 ## 1042. The `[vault]` key/secret/transit providers build a redirect-following HTTP client, so a diverted 3xx could carry `X-Vault-Token` off-path
 
-> ✅ **SHIPPED 2026-08-10 — all three `[vault]` clients now refuse redirects.** Value **4/10** · Difficulty **2/10** · _fill-in_. `allow_redirects=False` at both `hvac.Client` construction points (`store/keyprovider_vault.py` and `config/secretprovider_vault.py` `_build_client`); `store/crypto_transit.py` already reuses the first, so the Transit cipher inherits the policy rather than growing a second construction point. Verified against the library rather than assumed: hvac 2.4.0's `Client.__init__` takes `allow_redirects` (default `True`), stores it on the adapter, and the adapter passes `allow_redirects=self.allow_redirects` to `requests.Session.request` — recorded in the test module's docstring because CI never installs the `[vault]` extra and no test can reach it there. Four tests in `tests/test_vault_client_redirect_policy.py`: three watched RED (each reported the constructed kwargs as `dict_keys(['url', 'token'])`), and the fourth is a live positive control that the recording stand-in reports an absent policy rather than swallowing an unrecognised kwarg. The Transit client is driven end to end through `build_transit_cipher`, so a private client construction there would red rather than pass an identity check.
+> ✅ **SHIPPED 2026-08-10 — all three `[vault]` clients now refuse redirects.** Value **4/10** · Difficulty **2/10** · _fill-in_. `allow_redirects=False` at both `hvac.Client` construction points (`store/keyprovider_vault.py` and `config/secretprovider_vault.py` `_build_client`); `store/crypto_transit.py` already reuses the first, so the Transit cipher inherits the policy rather than growing a second construction point. Verified against the library rather than assumed: hvac 2.4.0's `Client.__init__` takes `allow_redirects` (default `True`), stores it on the adapter, and the adapter passes `allow_redirects=self.allow_redirects` to `requests.Session.request` — recorded in the test module's docstring because CI installed the `[vault]` extra nowhere and no test could reach it there. **That premise expired on 2026-09-03** ([#1317](#1317)): the `test` leg installs `[vault]` now, so a live assertion against hvac's real construction IS reachable in CI and a future revision of this policy should make one rather than inherit the docstring. Four tests in `tests/test_vault_client_redirect_policy.py`: three watched RED (each reported the constructed kwargs as `dict_keys(['url', 'token'])`), and the fourth is a live positive control that the recording stand-in reports an absent policy rather than swallowing an unrecognised kwarg. The Transit client is driven end to end through `build_transit_cipher`, so a private client construction there would red rather than pass an identity check.
 
 **Cluster:** Egress / secret handling. **Priority:** P3. **Verdict:** build (small). **Severity:** conditional, not an exposure on the shipping config. The vault provider is behind an optional pip extra and off by default; when selected it points at operator-trusted infrastructure. On first deployment, an on-path 3xx (absent TLS integrity) or a spoofed Vault could divert the bearer token, while every default egress refuses redirects.
 
@@ -16675,6 +16675,90 @@ measurement from this row's subject and it is named here rather than performed.*
 > **READ THE NEW COUNTER CORRECTLY: zero means NOT ESTABLISHED, never "no contention".** It counts
 > only the 1222 route on one backend. A lane silently dropped by the head-of-line skip still
 > increments nothing, on either backend, and still reads healthy from outside.
+>
+> **AMENDMENT 2026-09-09: THE HARNESS SIDE HAS A RESIDUE, AND IT IS THE ONLY NEW WORKABLE THING HERE.**
+> The mechanism this item describes is unchanged and is still correct. What is new is that the
+> **compensating instrument built for it never reached the block of tests that now carries every
+> failure.** `_wait_lane` at `tests/test_stage_dispatcher.py:1422` -- the bounded sweep stand-in,
+> capped at `_MAX_SWEEP_STANDINS = 1` (`:1418`), which re-readies a lane found in terminal IDLE,
+> warns so the real-world rate stays visible, and RAISES on a second strand because "that is a
+> contention regression, not the transient 1222 this stands in for" -- has **16 call sites, all
+> between `:1496` and `:1901`**, which is the ADR 0070 block. The operator PAUSE / RESUME block
+> begins at `tests/test_stage_dispatcher.py:1954` and uses bare `_wait_until` exclusively. **Every
+> failure measured below sits in that later block.**
+>
+> **THE RATE, WITH ITS DENOMINATOR AND ITS WINDOW.** 2026-09-01T22:10:56Z to 2026-09-09T15:23:59Z
+> (7.7 days), from 1,500 `ci.yml` runs paged at `per_page=100` with one jobs call per run, all 1,500
+> fetched, zero truncated job lists. The server reports 4,790 total runs of that workflow, so the
+> window is BOUNDED and nothing here is evidence about anything earlier.
+> ```
+> exact signature (test_pause_lane_synchronous_phases_conserve_slots)   1 of 702   sql server 2022
+> same terminal-IDLE family, same file, [sqlserver]                     5 of 702   sql server 2022
+> same family                                                           5 of 699   sql server 2025
+> ```
+> Denominator = 727 job appearances minus 25 cancelled. **It is NOT a 2022-only defect**, which a
+> reader of the single briefed occurrence would have concluded. The other 7 of the 2022 leg's 12
+> failures are unrelated families, one of them (`test_store_privilege_preflight`, twice, both on
+> `feat/store-privilege-preflight-carry`) a deterministic branch defect rather than a flake.
+>
+> **IT DOES NOT HIT `main`, AND PROVING THAT NEEDED A SECOND COUNT.** A skipped matrix job is
+> INVISIBLE under its expanded name -- it appears under the unexpanded `${{ matrix.label }}` literal
+> instead -- so "zero 2022 jobs on push" read alone cannot be told apart from "no push runs at all".
+> Counting per-run matrix SHAPE instead: 218 push runs, of which 212 carry the unexpanded (skipped)
+> entry, 11 cancelled there, 6 that never reached the job stage, and **0 with an expanded entry**.
+> The leg is gated off on push at `.github/workflows/ci.yml:1786-1789`, so it has not executed on a
+> push to `main` once in 7.7 days and cannot fail there.
+>
+> **A CORRECTION THIS ITEM SHOULD CARRY, BECAUSE SOMEBODY WILL GREP FOR THE WRONG SENTENCE.**
+> `sqlserver-store` is **not** a required context. Branch protection lists thirteen and none of them
+> names sql or server. It gates a merge INDIRECTLY: it is a `needs:` of the `ci-gate` job
+> (`.github/workflows/ci.yml:3042-3047`), whose name `CI gate` IS required. The net effect on merging
+> is identical; the sentence "this leg is a required context" is not, and this item's own gated-leg
+> paragraph above is the reason that distinction matters here.
+>
+> **THE OBVIOUS REMEDY IS NOT ONE MECHANICAL SUBSTITUTION, AND ASSUMING IT IS WOULD LEAVE A SIBLING
+> UNCOVERED.** `_wait_lane` is a drop-in at `tests/test_stage_dispatcher.py:1989`, where the lane is
+> `IB_PARK` waiting for PARKED and is not paused. It is **not** a drop-in for
+> `test_pause_while_processing_defers_then_mark_ready_cannot_drain`, whose failure is at
+> `tests/test_stage_dispatcher.py:2092` on a dispatch-record assertion reached AFTER its
+> `_wait_until(phase == IDLE)` at `:2091` SUCCEEDED -- because terminal IDLE is exactly what the
+> stranding produces, so the phase wait passes and the record assertion then fails on a message that
+> was never dispatched. `_wait_lane` deliberately disables the stand-in when IDLE is the target ("a
+> test that WANTS the lane idle must never have it re-readied underneath its assertion"), so that
+> site needs a different instrument. **Read the other family members before scoping the change.**
+>
+> **TWO GUARDS THAT MUST SURVIVE ANY SUCH CHANGE, both argued in their own comments.** The store's
+> EMPTY-on-a-contended-head is what buys the per-lane FIFO no-skip guarantee -- STEP 4 of the claim
+> says `rn=1` missing drops the whole lane so the batch can "never reach seq N+1" -- and claiming
+> past a locked head to make the EMPTY go away would deliver out of order, which is worse than
+> anything measured here. And the disabled sweep (`_HUGE_SWEEP = 3600.0`,
+> `tests/test_stage_dispatcher.py:388`) is what makes the pause tests mean anything: turning it back
+> on in these tests would delete the invariant under test. **The lever is the harness stand-in, not
+> either guard, and not the 8-second `_wait_until` bound** -- #344's own conclusion is that sizing
+> that bound against the work derives 1-2 seconds, TIGHTER than what is in place.
+>
+> **DO NOT REOPEN #344 ON THE STRENGTH OF THIS.** The "instance 2" paragraph above already rules that
+> the label is the diagnostic's lineage and not the defect's, and that ruling is unaffected. #344's
+> own record closes the timing reading for this class by measurement: the failing test took 8.185s,
+> so `_wait_until` burned its full 8.000s while setup and teardown cost 0.185s -- the store was fast.
+>
+> **VERDICT: HARNESS RACE, NOT A PRODUCT DEFECT, AND THE DISCRIMINATOR IS IN THE DUMP.** The predicate
+> is a terminal STATE, not a duration: no timer armed, the sweep at 3600s, and a ManualClock that only
+> advances when the test says so, so 80 seconds would fail identically. Shipped code bounds the same
+> state at a 0.25s sweep interval (`messagefoundry/pipeline/stage_dispatcher.py:1342-1353`, T20), so
+> an operator would see a fraction of a second of extra latency and no loss.
+>
+> **WHAT THIS AMENDMENT COULD NOT ESTABLISH, EACH NAMING ONE THING.** (a) WHICH of the two empty
+> routes fired. This is an instrument gap, not a missing log: the expiry report prints
+> `empty_claims`, `busy_violations`, `processing_lanes` and `slots_free` but NOT
+> `claim_lock_timeouts`, which is the counter that discriminates them and which PR #670 already
+> built. Adding it to that report would settle every future occurrence. (b) What held the lock --
+> unanswerable without a live SQL Server, and no container was started. (c) Whether the 2025 leg's
+> two `test_adr0070_8_correlated_outage_single_reload_rearms_all` failures share this mechanism: they
+> sit INSIDE the block that HAS the stand-in, so they either exercise its one bare `_wait_until` or
+> indicate the cap of 1 is sometimes short, and only their FAILED lines were read. **Do not treat the
+> ADR 0070 block as proven-covered on the strength of this note.** (d) Anything before
+> 2026-09-01T22:10:56Z.
 
 **Cluster:** Store / dispatcher observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no live exposure -- zero deployments (§0), and the production sweep recovers the lane. Would cost a deploying site stalled lanes recovered only on a sweep interval, with **no log line at all** on one route and **DEBUG-only** on the other, on **both** server backends.
@@ -17618,6 +17702,22 @@ point, which are the parts that must survive it.**
 > **AND THE ENGINE NOTE'S MECHANISM SENTENCE IS WRONG, WHICH MATTERS MORE THAN THE PORT.** `ci.yml` says the faulthandler belt "fires even when the thread-timer CANNOT interrupt a main-thread C-level wait", naming `subprocess.wait`. **Measured false**, paired local arms on a test blocking in `subprocess.run` with no `timeout=` of its own: **without** the faulthandler belt the thread method already fires and already names the frame down to `_winapi.WaitForSingleObject`, and the `+ Timeout +` header appears in **both** arms while the faulthandler header appears in **one**. Reading the pinned `pytest_timeout` on disk says why: `timeout_timer` dumps from a watchdog **thread** and calls `os._exit(1)`, so it never needs to interrupt anything. **So this tier was ALREADY instrumented for the observed signature, and the port is a second opinion rather than the thing that names the failure** -- an independent mechanism writing down a different path (a dup'd raw stderr fd, not `config.get_terminal_writer()`), which is worth having on the one tier that runs `-n 4`. The engine comment was left as it stands: its belt is still worth carrying, only its stated reason is wrong, and rewriting a contended region of another tier's derivation is not this change's business.
 > **A MECHANISM THE CRASHED-WORKER AMENDMENT ASKED FOR, READ FROM THE PINNED LIBRARY RATHER THAN INFERRED.** That amendment says "a timeout that takes the worker down with it would present exactly this way" and correctly refuses to assume it. `pytest_timeout.timeout_timer` ending in `os._exit(1)` **is** such a path: under `-n`, a worker that `os._exit`s closes its execnet channel with no `workerfinished`, which the controller reports as a crashed worker. **This establishes that the mechanism EXISTS, not that it fired.** Nothing here distinguishes it from a second cause, and the amendment's refusal stands.
 > **THE 60s BOUND IS CALIBRATED, AND CALIBRATING IT FOUND A DEFECT.** The surviving half of the not-measured list, closed at `tests/test_worktree_gate.py`. Worst case **4.6s per call** over n=127 real launches across both gate files (p50 2.1s, p99 4.2s), sequential on a box already running peer pytest sessions -- a contended sample, and still not a 4-vCPU runner, so the shape transfers and the numbers do not. **The defect: at 60 the diagnostic could never fire locally.** pytest-timeout arms in `pytest_runtest_protocol`, so its window strictly contains this one and at equal values it expires first -- measured with a paired control, 5s against `--timeout=5` gave pytest the win 2/2, 5s against `--timeout=30` gave the diagnostic the win 2/2. `addopts` carries `--timeout=60`. So the bound was live on CI's tooling leg (which overrides to 120) and **decorative on every local run**, which is exactly the silent one-platform failure its 45s sibling's comment was written to prevent. **Moved to 45**, a 9.8x margin, clearing both bounds. **Failures before this change read `after 60 seconds`.**
+> **AMENDMENT 2026-09-09: THE RATE IS MEASURED, AND IT IS 33 PERCENT. THIS ITEM HAS ARGUED FROM A STREAK SINCE 2026-08-21 AND SAID SO.** Window: every `ci.yml` run created on or after 2026-09-09T02:00:00Z, enumerated at 15:39Z with `gh api --paginate` on the workflow's runs endpoint -- 64 runs returned against the same endpoint's `total_count` of 64 at `per_page=1`, so this is a whole population and not a `--limit` truncation. Jobs were read with `?filter=all`, so re-run attempts are counted rather than assumed absent.
+> ```
+> repo harness tests (windows-2025)   12 of 36 completed executions failed on THIS       33%
+>   of which  push-to-main             5 of 15                                           33%
+>   of which  pull_request             7 of 21                                           33%
+> repo harness tests (ubuntu-latest)   0 of 37 completed executions          <- control, same command
+> ```
+> Denominator: 41 job records for the leg, minus 2 GitHub re-run carry-forwards (distinct job ids, byte-identical `started_at`/`completed_at`, so the leg executed once), minus 2 cancelled and 1 in progress. 14 leg failures occurred in all; 2 were not this arm (`test_gate_ci_mirror_parity`, `test_dangling_citation_check`, both real branch failures that also failed on the ubuntu leg of the same run). **The identical rate on `main`'s own pushes and on pull requests is the measurement that rules out branch content**, and it is the same argument this item's 2026-08-21 chronology made from four runs.
+> **THE LEG DID NOT RUN ON ANY OF THE 24 `merge_group` RUNS IN THAT WINDOW**, because the job's `if:` (`.github/workflows/ci.yml:1146`) names `push` and `workflow_dispatch` explicitly and admits a queue entry only through the `tooling` path filter. So this arm **can** red a queue batch and **did not** in this window. Do not read that as protection: it is a property of what those batches touched.
+> **THE BANNER TEXT CHANGED AND CI-HISTORY GREPS MUST ACCOUNT FOR IT.** Every occurrence in this window reads `PWSH LAUNCH TIMED OUT after 45s`. The calibration note at `tests/test_worktree_gate.py:56` already says failures before it read `after 60 seconds`; this is that prediction confirmed in the field.
+> **THE STRONGEST NEW EVIDENCE THAT THE HOST IS WHAT IS BEING MEASURED IS THE DIAGNOSTIC'S OWN SECOND LAUNCH.** `_pwsh_identity()` at `tests/test_worktree_gate.py:60` runs `pwsh -NoProfile -NonInteractive -Command $PSVersionTable.PSVersion.ToString()` with `timeout=15` while building the failure message. **In 5 of the 17 timeouts it ALSO expired**, printing `version unreadable (TimeoutExpired)`; in the other 12 it returned `7.6.5`. That second launch takes no script file, no stdin and no `-ReposFile`, so a one-line `pwsh` start failed to return in 15 seconds immediately after the 45-second expiry -- and the 12 successes say the excursion is transient rather than a wedged machine. Nothing here says WHY, and this item's refusal to name a cause off the runner stands.
+> **NOT A NEW LIST OF TEST NAMES -- the 2026-09-03 amendment above forbids that and it is right.** What is reported instead is a PROPERTY of the spread: 17 timeouts across 15 distinct test functions in 3 files, never the same function twice in a row. Run 34311101922 shows it without needing the names: attempts 1, 2 and 3 each failed a DIFFERENT function and attempt 4 was green with no change to the tree. Failing jobs are not globally slow either -- 1313-1425 seconds against 1051-1412 for passing ones -- so this is a localised spike, not a uniformly starved runner.
+> **A DIAGNOSTIC LINE IN `run_gate` DOES NOT DO WHAT ITS COMMENT CLAIMS, AND THIS IS THE ONE CHEAP REPAIR HERE.** The comment above `CHILD STDOUT before the kill` (`tests/test_worktree_gate.py:140-145`) says an empty child stdout "means it never reached its own first write, which separates a startup hang from a script that started and stalled later". **It cannot.** `scripts/hooks/worktree_gate.ps1` writes to stdout at exactly ONE place -- `[Console]::Out.Write(...)` at `scripts/hooks/worktree_gate.ps1:128`, on the DENY path -- and `run_gate` reads empty stdout as ALLOW (`tests/test_worktree_gate.py:153`). Empty output is the ordinary result of a passing allow case, so it discriminates nothing. The probe line above is the discriminator that actually works, and it fired in 5 of 17. **The repair strengthens the instrument rather than weakening a guard**; the two guards next to it (the 45-second bound's calibration and `run_gate`'s deliberate refusal to retry) are both argued in their own comments and neither is touched by it.
+> **AN INSTRUMENT FAULT FOUND WHILE MEASURING THIS, RECORDED BECAUSE IT PRODUCES A FALSE ZERO.** `gh run view --job <id> --log-failed` served the run's LATEST attempt log for EVERY attempt of a re-run run: attempts 1, 2 and 3 of run 34311101922 came back byte-identical (same md5) and all read as clean, because that run's final attempt succeeded. **Three real failures would have been reported as absent.** The per-job logs API (`repos/.../actions/jobs/<id>/logs`) returns the correct one; every log above was verified by matching its first timestamp to that job's own `started_at`.
+> **WHY THE UBUNTU ZERO IS NOT A SKIP ARTEFACT.** Both gate test files are gated on `shutil.which("pwsh")` and never on `os.name`, so if `pwsh` were absent on ubuntu the whole pwsh-only class would skip. It does not: ubuntu executes 2,893 tooling tests against windows' 3,591, a delta of 698, while the pwsh-only class alone holds 334 functions and the windows-only class 431. A missing interpreter would have to collapse 765 functions into a 698-item delta, which is a parametrization factor below 1 and impossible. **The control genuinely ran.**
+> **WHAT THIS AMENDMENT STILL CANNOT ESTABLISH, EACH NAMING ONE THING.** (a) The cause, unchanged. (b) Whether the 5 probe timeouts and the 12 probe successes are one mechanism or two. (c) Whether `-n 2` removes it: untried on this leg, and `.github/workflows/ci.yml:1486-1488` warns the cost is wall clock on every leg while the block above it records that `-n 8` was measured worse on all three. (d) Whether the ubuntu zero is attributable to the OS or partly to its lower spawn volume -- that confound is not separated. (e) The rate per individual `pwsh` launch: bounded at no worse than 17 failures across 36 executions of roughly 3,590 tests each, but the number of those tests that actually spawn a child was not counted, so the per-launch figure is not established. (f) Two arms this item's signature folds in did not appear in this window and are therefore neither confirmed nor excluded: the crashed xdist worker in `tests/test_worktree_prune_merged.py` and the `test_connscale_smoke` monotonicity failure. Nor did the second named script -- all 17 timeouts here were `worktree_gate.ps1`, none `claim-reconcile.ps1`.
 > **STILL OPEN, EACH NAMING EXACTLY ONE THING.** (1) **The cause**, unchanged and unmeasurable off the runner -- not touched here. (2) **`--max-worker-restart=0`**, the engine step's third belt, **not ported**: it is a behaviour change (a worker death fails the run instead of being survived) whose zero cost was measured on the engine tier's history and on **no** sample from this one. It is the belt that would answer a controller left polling a dead worker until the 30-minute step cap, so it is the strongest remaining candidate and it needs its own measurement first. (3) **The rerun budget**, still an unwritten norm; a recommendation is in this change's PR body and the decision is the owner's.
 > Verdict: build
 > Closing-act: code
@@ -18095,8 +18195,8 @@ so a decoy call cannot satisfy it. Deleting the call from any one site reds that
 for -- admitting only suites present on every current candidate list, rejecting anything unnamed -- is
 not built. This records a call site gaining an assertion, not the allowlist changing shape.
 
-***THAT PARAGRAPH IS FALSE, AND IT WAS FALSE ON THE DAY IT WAS WRITTEN. Superseded by the 2026-09-03
-amendment below, which measures it.*** Left standing rather than deleted because it is a dated record
+***THAT PARAGRAPH IS FALSE, AND IT WAS FALSE ON THE DAY IT WAS WRITTEN. Superseded by the FIRST
+2026-09-03 amendment below, which measures it.*** Left standing rather than deleted because it is a dated record
 of what a reader believed, and because the same reader's other claim on this row is sound. The
 allowlist landed eight days EARLIER, on 2026-08-22 in `ae72f5828` (PR 519), and this row's own BUILT
 paragraph says so a few paragraphs up. The banner is therefore not held open by the allowlist.
@@ -18145,7 +18245,10 @@ SAID SO.** Both rulings are re-measured here and both hold.
   **The ADR measured `store/sqlserver.py` alone and generalised to "ODBC Driver 18".** The ODBC
   *transport* -- the DATABASE destination and the ADR 0010 `db_lookup` hop, which is where message
   content crosses -- was never named in it. It is measured now.
-- **`hvac` -- NOT BUILT, deliberately, and the ADR names its own trigger.** hvac delegates to
+- **`hvac` -- NOT BUILT, deliberately, and the ADR names its own trigger.** ***Superseded by the
+  SECOND 2026-09-03 amendment below, which installed the extra and built it.*** Left standing because
+  it is why the CI leg had to come first, and because its own trigger is what reported the change.
+  hvac delegates to
   requests, which delegates to urllib3, which builds and owns the context per connection, so the
   engine holds no object -- the same shape as `ldap3`. Unlike `ldap3` the gap cannot be closed by
   measurement: `urllib3` is absent from the interpreter and **no CI leg installs the `[vault]` extra**
@@ -18164,14 +18267,22 @@ control and each proved non-vacuous by mutation.
 | `test_the_odbc_scope_out_premise_still_holds` | neither ODBC module reaches for an `ssl` context | appended an `ssl.create_default_context()` to `transports/database.py` |
 | (its control) | the scan finds contexts where they exist (`store/postgres.py`) | pointed the control at a module with none |
 | `test_the_sqlserver_hop_asserts_no_suites_and_pins_what_it_can_control` | the DSN path asserts nothing, and pins `Encrypt=yes` / `TrustServerCertificate=no`, which it CAN control | changed the emitted `Encrypt` value |
-| `test_the_hvac_scope_out_premise_still_holds` | `urllib3` absent AND no leg installs `[vault]` | made `urllib3` resolvable; separately added `vault` to a workflow's extras |
+| `test_the_hvac_scope_out_premise_still_holds` *(FIRED; converted 2026-09-04 to `test_the_hvac_arm_stays_built_and_stays_executable`)* | `urllib3` absent AND no leg installs `[vault]` | made `urllib3` resolvable; separately added `vault` to a workflow's extras |
 | (its control) | the workflow scan reads real install lines | removed `webauthn` from both workflows that install it |
 
 **These are TRIGGERS, not guards.** A red does not mean the engine got worse. It means the reason an
 arm was left unasserted has stopped being true and the arm is now buildable -- build it and amend
 ADR 0180, never delete the test.
 
-**5. THE RESIDUAL, and it is the only one left.** Install the `[vault]` extra on a CI leg; then
+***THE hvac TRIGGER FIRED, AND THAT SENTENCE IS WHAT WAS DONE WITH IT.*** The second 2026-09-03
+amendment below installed the extra and built the assertion, so both halves of that test went red by
+design. It was converted rather than deleted, and it now GUARDS the opposite failure: that the arm,
+once built, keeps being executed. **The two ODBC tests are still triggers and read exactly as written
+above.** They are no longer the same shape as the hvac one, so do not read them as a set.
+
+**5. THE RESIDUAL, and it is the only one left.** ***MET on the same day, by the amendment below.***
+Preserved as the dated statement of the precondition, because naming it is what made it satisfiable.
+Install the `[vault]` extra on a CI leg; then
 urllib3's own `urllib3.util.ssl_.create_urllib3_context()` -- the function urllib3 itself calls, not a
 look-alike -- becomes executable by a test, and the assertion belongs in both `_build_client`
 factories (`store/keyprovider_vault.py` and `config/secretprovider_vault.py`, which between them cover
@@ -18180,8 +18291,114 @@ none is allocated. **The trigger test above is what will report the day that pre
 
 **PROPOSED CLOSURE, not taken here.** Every claim this row still carries as open is now either built
 (the allowlist, the `ldap3` arm), permanently out with evidence (ODBC Driver 18), or a named residual
-gated on a CI change (`hvac`). A builder must not flip a banner while a residual stands, so the banner
-is left PARTIAL for the owner to rule on with the residual in view.
+gated on a CI change (`hvac`). *The `hvac` residual was met the same day -- see below -- so the
+banner is now held open by the allowlist SCOPE question alone.* A builder must not flip a banner while
+a residual stands, so the banner is left PARTIAL for the owner to rule on with the residual in view.
+
+**AMENDMENT 2026-09-03 (SECOND, same day; written after the one above and landed after it) -- THE
+VAULT ARM IS BUILT, AND THE CI LEG IS WHAT MAKES IT HONEST.** Owner-ruled
+the same day: install the `[vault]` extra on a CI job, *then* build the hvac assertion. A Builder
+earlier that day had refused to build it alone and was right to -- hvac is absent from every local
+interpreter and no CI leg installed the extra, so the assertion could have shipped without ever being
+executed once. See [ADR 0180](adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md)
+Amendment A for the full measurement; what this row records is what it now measures.
+
+**The order is the deliverable, not a preamble.** `[vault]` now installs on `ci.yml`'s `test` leg --
+the only leg that runs `tests/`, so the only install line that can exercise the control. Six small
+pure-Python wheels, every one already pinned in `requirements.lock` and `constraints.lock`, so **no
+re-lock was needed**. `tests/_extras_probe.py` gained a `vault` row, so an interpreter without the
+extra now announces the run as INCOMPLETE rather than reporting a quiet green over skipped security
+tests.
+
+**IT IS ASSERTABLE, AND THE MEASUREMENT SAYS WHY A REPLICA IS THE ONLY INSTRUMENT.** Measured against
+the locked pins (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0) by driving a real client at a real socket,
+not by reading source: `hvac.Client` carries zero `SSLContext` attributes, its `requests.Session`
+carries none, its `PoolManager` has `connection_pool_kw == {'maxsize': 10, 'block': False}` with no
+`ssl_context` key, and the module-level `requests.adapters._preloaded_ssl_context` that requests 2.32
+carried is **gone in 2.34**. urllib3 builds the context lazily, per connection, calling
+`create_urllib3_context` **once** and yielding **17 suites -- zero NULL, zero anonymous, zero
+non-forward-secret**. So `assert_hvac_tls_suites` replicates that construction with urllib3's OWN
+public constructor and refuses any `hvac.Client` argument it cannot replicate -- `session=` above all,
+since that is the documented way to hand this hop a different context.
+
+**ONE GUESS THIS ROW WOULD OTHERWISE HAVE INHERITED, corrected by measurement.**
+`create_urllib3_context()` and stdlib `create_default_context()` produce the **identical** 17 suites on
+the current OpenSSL. The reason to use urllib3's own constructor is therefore *not* that a stdlib
+look-alike is measurably wrong today -- it is that only the real function tracks urllib3 if urllib3
+narrows its own defaults. The satisfying version of that argument would have been false.
+
+**THE PROOF IT CARRIES, which is the shape this row demanded of its own first half.** Seven tests
+pinning the refusal AND a positive control -- the real 17-suite list is required to be non-empty and
+clean on all three shipped predicates, because a refusal pinned alone cannot tell a working control
+from one that refuses everything. Five mutations, each applied alone with the tree restored between,
+**every one RED**: delete the assertion from either construction point, make the unreplicable-argument
+refusal inert, drop `harden_cipher_suites` from the replica, and make the replica build a context that
+*differs* from urllib3's. The last is the one that matters for a replica -- it proves the equivalence
+test detects drift rather than merely passing.
+
+**TWO CONSTRUCTION POINTS COVER THREE CLIENTS, and that is now pinned by identity rather than prose:**
+a test asserts `crypto_transit._build_client is keyprovider_vault._build_client`. `_build_client` also
+moved OUT of its callers' `try` blocks in all three callers, whose `except Exception` would have
+relabelled this configuration refusal as a connectivity failure -- the same mistake ADR 0180 records
+for the LDAPS site. Fail-closed is unchanged: both paths propagate and the subsystem refuses to start.
+
+**THE TRIGGER THE AMENDMENT ABOVE LEFT BEHIND IS CONVERTED, NOT DELETED (2026-09-04).** That amendment
+shipped `test_the_hvac_scope_out_premise_still_holds`, asserting the two premises this one falsifies:
+`urllib3` absent, and no leg installing `[vault]`. Both halves went red on the merge, which is the
+trigger working rather than a defect, and that amendment's own text says what to do with it -- *"build
+it and amend ADR 0180, never delete the test."* It is now
+`test_the_hvac_arm_stays_built_and_stays_executable`, guarding the failure a fired trigger cannot see:
+that the built arm keeps being EXECUTED. Two halves again. A CI leg must still install `[vault]`, or
+all seven tests above skip and a suite reports green over a security control nothing ran; and both
+`_build_client` factories must still reach `assert_hvac_tls_suites`, checked at source level because
+on an interpreter without the extra those seven tests are exactly the ones that would not run.
+
+**WHERE THE ROW NOW STANDS. Every library named in the residual is closed or recorded with evidence:**
+`ldap3` asserts (2026-08-30), `hvac` asserts (this amendment), and **ODBC Driver 18 is
+un-assertable with the reason in ADR 0180** -- TLS is terminated inside the native driver, the suite
+list belongs to the driver and the OS TLS stack rather than to the interpreter's OpenSSL, and no
+Python-side context exists to hold or replicate. That is a finding, not a deferral.
+
+**THE BANNER STILL DOES NOT FLIP, AND THE TWO AMENDMENTS AGREE ON THAT WITHOUT AGREEING ON WHY. Read
+them together or you will read a contradiction that is not there.** The one above measures the strict
+positive allowlist as BUILT and finds nothing left to build. This one adds where it REACHES: it
+governs the operator KNOB (`validate_tls_ciphers`), and an inherited default context is still checked
+by the three property predicates alone. Build-state and reach are different questions about one
+measurement, so neither reading corrects the other. What is left is therefore a SCOPE question --
+should the positive allowlist extend to contexts no operator configured? -- and it is the row's only
+remaining ask. **Closure is proposed by both amendments and taken by neither.** The library half this
+row declared open is fully accounted for. A seat with the authority should rule on whether the
+allowlist scope survives as this row or as a new one.
+
+**AMENDMENT 2026-09-09 -- THE REFUSAL WAS TOO WIDE BY ONE ARGUMENT, AND MAIN IS WHERE THAT SHOWED.**
+The assertion above refused every `hvac.Client` argument outside `{url, token, allow_redirects}`.
+#1180 (ASVS 12.3.4) had meanwhile landed on `main` and resolves an operator-named internal CA into the
+**same** kwargs dict, on purpose, so that the assertion sees what the client is built with. Merged, the
+two produced a `ValueError` on every Vault hop with a CA configured -- three CI legs red, both
+providers, and the refusal message named `verify` while claiming the argument moved where the TLS
+context comes from, which it does not.
+
+**Narrowed rather than relocated, and the choice is the record.** The cheaper repair was to assert the
+base dict before splatting the CA in. That was declined: it gives up the ONE-dict property amendment 5
+of [ADR 0180](adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md) exists to
+state, and re-opens the drift the LDAPS site needed a second test to cover. Instead `verify` is
+admitted on the TYPE of its value -- a `str`/`os.PathLike` path, which chooses only WHICH roots verify
+the peer and leaves the suite list untouched (measured: `cert_reqs=CERT_NONE` yields the identical 17).
+`verify=False` stays refused, because that is the knob that turns peer verification off.
+
+**The bool arm is defence in depth and is labelled as such.** `vault_client_verify_kwargs` is typed
+`dict[str, str]` and returns a path or nothing, so no shipped caller can reach that refusal today. Six
+tests pin both sides -- the path admitted, and `False`/`True`/`""`/`0`/`1` each refused, the falsy
+non-bools included because `requests` reads every falsy value as "do not verify" and `bool` subclasses
+`int`, so the shorter spellings of the check all admit at least one of them.
+
+**Three repairs rode with it, all from the same hand-resolved merge, none of them a design question.**
+Two of the three Vault sites had kept BOTH the hoisted `_build_client` call and the original in-`try`
+one, so they constructed two clients where one is required; `scripts/security/crypto_inventory_check.py`
+had a duplicated comment line, an orphaned sentence fragment and a comment stranded inside a
+`frozenset()` call -- prose, so no gate reported it. And `scripts/worktree/new.ps1` gained the `vault`
+extra: the lane venv must install what the `test` leg installs, or a lane reads green over tests it
+never collected, which is the exact failure this row's own CI change was made to end (#1335).
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
@@ -28817,6 +29034,179 @@ Zero non-test callers exist in the engine.
 **`set_segment` does not exist.** `parsing/message.py` has `field` and `add_segment`; there is no `def set_segment` anywhere.
 
 **Scope, stated so nobody over-corrects.** The README index row is **honest** -- it names only `msg.set` / `msg.field`-copy / `msg.delete_segments` and the actions `set_field` / `copy_field` / `delete_segment`. `tests/test_lens_native.py` covers exactly the shipped forms, consistent with there being no read row. The over-claim is internal to the ADR file.
+
+## 1513. the harness server fixture budgets 10 seconds for the whole engine bring-up and calls the expiry a lost port
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **4/10** · Difficulty **3/10** · _fill-in_. The `server` fixture in `tests/test_harness_scenarios.py` gives the ENTIRE engine bring-up 10 seconds of wall clock, then reports the expiry as a port-bind race that its own job log refutes. Measured 2026-09-06T22:17:30Z to 2026-09-09T15:23:59Z: **1 of 600** `test (windows-2025, py3.14)` job executions carried the exact signature, **2 of 600** counting the sibling fixture. **Verdict: wall-clock assertion, not a product defect** -- the engine came up cleanly on all four attempts of the failing job.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI reliability / harness fixtures. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- a test fixture only. The cost is a red leg whose own message sends the next reader to `_free_port` when no port was ever contended.
+
+### What fails
+
+    ERROR at setup of tests/test_harness_scenarios.py::test_scenario_reaches_expected_disposition[ADT-A03-error]
+    ERROR at setup of tests/test_harness_scenarios.py::test_dead_letter_scenario
+    RuntimeError: server did not start (api_port=56029, mllp_port=56027)
+
+The sibling fixture at `tests/test_harness_monitor.py:76` raises the same sentence without the port suffix.
+
+### The rate, its denominator, and the edge the window rests on
+
+Window: `ci.yml` runs created 2026-09-06T22:17:30Z through 2026-09-09T15:23:59Z, 2 days 17 hours, enumerated with `gh run list --limit 600`. **The limit was hit -- exactly 600 rows came back -- so the older edge is set by the query and not by an absence of runs.** Nothing here is evidence about anything earlier.
+
+    exact signature (test_harness_scenarios.py)     1 of 600 executions   1 of 77 readable failures
+    same message incl. test_harness_monitor.py      2 of 600 executions   2 of 77 readable failures
+    test (windows-2022, py3.14)                     0 of 63 failed logs   <- control
+    test (ubuntu-latest, py3.14)                    0 of 46 failed logs   <- control
+
+Denominator: 569 latest-attempt windows-2025 test jobs plus 31 earlier attempts recovered with `filter=all`. Of the 78 failures, **77 logs were read and 1 is genuinely unknown** -- job 101912007622's log has expired, and it is reported as unknown rather than folded into a clean zero. The population was partitioned two ways and required to agree exactly: by event (261 pull_request + 235 merge_group + 70 push + 3 schedule) and by conclusion (473 success + 75 failure + 21 cancelled), both equal to 569.
+
+### The exhausted resource is TIME, and three independent facts say the ports were fine
+
+The clock starts at `thread.start()` and must cover thread scheduling, the Windows proactor loop, uvicorn's `config.load()`, and the whole ASGI lifespan -- which is where `create_managed_app`'s lifespan opens a fresh SQLite store with WAL and roughly 60 DDL statements, loads the config dir, and starts the engine graph. `tests/test_harness_scenarios.py:95` sets `deadline = time.time() + 10` and `:109` raises the port message.
+
+All four attempts of the failing job logged the full bring-up: the store privilege preflight, `pooled claim mode started`, `wiring started: 1 inbound, 2 outbound connection(s)`, `engine graph started`, then `engine stopping`. So:
+
+1. `wiring started: 1 inbound` means the MLLP listener bound its port, four times of four.
+2. uvicorn 0.49's only bind-failure path logs the `OSError` and calls `sys.exit(1)`. The job log carries no 10048, no WinError, no bind error, and pytest printed no captured-stderr section at all.
+3. uvicorn shuts the lifespan down only under `if self.started:`, and the log shows that shutdown on every attempt -- so the API socket bound and `started` was set. **The fixture had already stopped looking.**
+
+Measured from the engine's own timestamps, the four attempts' first log lines land roughly **10, 27, 10 and 21 seconds** after thread start. Every attempt blew the budget and two blew it by more than double, while the same job finished its 12,578 tests in 731 seconds -- far inside the leg's 55-minute step cap. The runner was not wedged; the budget was too small.
+
+### The retry re-rolls the wrong variable
+
+`tests/test_harness_scenarios.py:78` draws fresh ports and a fresh database on each of four attempts and hands each the same 10 seconds. **Four attempts are four independent bets on one over-tight budget, not a longer budget.** The comment's own warrant -- "a re-roll almost never collides twice" -- is a port model, and nothing collided. It also spends roughly 60 to 80 seconds of leg time before failing.
+
+On the collision question as it is usually asked: no other CI job can take these ports, because the failing job ran on a GitHub-hosted single-job VM. The real concurrency is inside the job -- 4 xdist workers under `--dist loadfile`, which pins a whole file to one worker, so the two harness files can never race each other. `_free_port()` at `tests/test_harness_scenarios.py:27` is a genuine time-of-check-to-time-of-use race. It is simply not what fired here.
+
+### What the fixture protects, and a remedy must keep all three
+
+1. **No test may get a base URL that is not accepting yet.** `run_scenario` opens an `EngineClient` against the port immediately, so without the wait the failure would surface inside the test body and be attributed to scenario logic.
+2. **A bring-up that genuinely never completes must fail loudly AT SETUP, naming the fixture**, and must be bounded so it cannot eat the leg's 55-minute step cap. The per-test `--timeout=120` and `faulthandler_timeout=150` are the outer nets; this is the inner one.
+3. **The per-attempt teardown at `tests/test_harness_scenarios.py:106-107`** stops a failed attempt leaking a live engine and a bound port into the rest of that worker's session. #1515 is the same fixture shape WITHOUT that teardown, so any consolidation of the two must take this file's version.
+
+### Remedy class, and what still needs reading
+
+Re-instrument the readiness wait so it measures readiness rather than the host's clock. Not deletion, and not a bigger number bolted onto the same four-bet structure. The class of fix: **prefer a SIGNAL over a deadline wherever one exists** -- `thread.is_alive()` going False already covers a dead listener, `uv.started` covers success, and only "still working" needs a clock at all; where a clock is still needed, hold **one** budget across the fixture rather than four independent ones, which is the shape this repository already reaches for at `tests/test_harness_monitor.py:184` ("ONE budget spanning both waits, not 30s each"); and correct the comment at `tests/test_harness_scenarios.py:72-76`, because it is what makes every future reader re-derive a port race.
+
+**NOT READ, AND THEREFORE NOT PRESCRIBED: any specific replacement value.** There is no comment defending the number 10 and no commit that introduces it -- this repository's history is three squashed snapshots and the value is byte-identical in all three, so it cannot be dated. Nor was `open_store` instrumented, so WHICH part of the pre-preflight window consumed the 10 to 27 seconds is not itemised; only that it is before the store's first log line and is not the socket bind. **Whoever sizes a new budget should measure that first rather than take the numbers here.**
+
+### Not established
+
+The true rate over any wider window (the 600-row query is truncated). Whether the expired log carried the signature. Which sub-step burned the time. Whether the 10 seconds was ever deliberately sized. And with n=1 for the exact signature and n=2 for the family, **this cannot be called windows-2025-exclusive** -- only that 109 failed logs on the other two legs in this window carry none of it. The claim that the leg got heavier over time is taken from `.github/workflows/ci.yml`'s own timing comments (the step cap moved from 26:00 to 55:00 and the largest observed run from 25:51 to 35:47) and is attributed, not measured here.
+
+---
+
+## 1514. the DICOM pacing assertion subtracts a load-sensitive control from a clamped treatment, so its margin goes to zero on a slow runner
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **5/10** · Difficulty **4/10** · _fill-in_. `tests/test_poll_and_association_intake_bounds.py:475` asserts that a paced run is at least 0.5s slower than an unpaced control. The paced arm is pinned near a 1.33s floor by the pacer's own schedule; the control is free to rise with runner load. **4 of 331** pytest legs in the test's entire life on `main` (18h50m) failed it, on **all three** operating systems, **including one push to `main`**. **Verdict: wall-clock assertion, not a product defect** -- on every failure the pacer delivered its designed schedule to within 45ms.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI reliability / timing assertions. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0). The shipped behaviour was correct in every observed failure; only the instrument for it failed.
+
+### What fails
+
+    FAILED tests/test_poll_and_association_intake_bounds.py::test_a_paced_scp_still_establishes_every_association
+    AssertionError: pacing applied no measurable delay: paced 1.378s vs unpaced 1.321s,
+    against an expected paced total near 1.33s
+    assert (1.378 - 1.321) >= 0.5
+
+### The rate, and why the window cannot be widened
+
+Window: 2026-09-08T20:33:26Z to 2026-09-09T15:23:59Z. **This is the entire life of the test on `main`** -- the file was added at 20:33:13Z that day, so no earlier measurement exists. The query returned 116 runs against a limit of 400, so the limit did not bind and this is not a bounded-query false zero.
+
+    4 of 331 legs that actually contained the test   1.2%
+      ubuntu-latest    2 of 111        windows-2022   1 of 110        windows-2025   1 of 110
+      pull_request     3 of 108        push           1 of 75         merge_group    0 of 148
+
+Denominator: 347 latest-attempt test-matrix jobs plus 33 prior-attempt jobs, of which 352 executed pytest, minus 21 on trees that predate the test file. Partitioned two ways and required to agree exactly: by OS (111 + 110 + 110) and by event (148 + 108 + 75), both 331. **The four printed their arms, and that is the evidence:** paced 1.360 / 1.374 / 1.376 / 1.378s against unpaced 1.189 / 1.321 / 0.924 / 1.341s.
+
+**One of the four is invisible to an ordinary read.** Occurrence 4 is attempt 1 of run 34296204321, whose latest attempt is green; the jobs API serves only that attempt. **The rate is a LOWER bound** for the same reason -- `gh run view --job <id> --log-failed` was measured serving the CURRENT attempt's log when handed an OLD attempt's job id.
+
+### The mechanism is arithmetic on the token bucket
+
+`_echo_run` (`tests/test_poll_and_association_intake_bounds.py:417`) opens six serial C-ECHO associations and returns elapsed monotonic time. Line 470 times an unpaced SCP, line 471 a paced one at 3/s with burst 1, and line 475 asserts the difference is at least 0.5s.
+
+The paced arm is a near-constant FLOOR. `_MessagePacer.charge` refills on wall time -- `self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)` at `messagefoundry/transports/mllp.py:1383` -- so association k is admitted no earlier than `(k - burst) / rate`, which for k=5, burst=1, rate=3 is 4/3 = **1.333s**. Across four failures on three operating systems the paced arm measured 1.360 to 1.378s: an **18ms spread** around a theoretical floor. **The pacer did exactly what it was built to do, every time.**
+
+What moved was the CONTROL. It measured 0.924 to 1.341s against the roughly 0.25 to 0.40s the test's own docstring records from the author's machine -- six pynetdicom associations plus AE setup inflating 2.5x to 5x under `pytest -n 4 --dist loadfile` on a 4-vCPU runner. Because the treatment is pinned and the control is free, the difference is approximately `1.37 - unpaced_elapsed`, and the assertion holds only while the control finishes inside about **0.87 seconds**. All four failures sit above that line.
+
+The two arms are also timed at different moments, so a spike landing on the first arm alone is sufficient: in occurrence 3 the control took 0.924s while the paced arm's own per-association work was about 40ms -- the two arms disagreeing about the machine they ran on.
+
+### Why this is not a product defect
+
+If the pacer were failing to pace, `paced_elapsed` would COLLAPSE toward the control. It never did. And the failing line is the **third** assertion in the test: `paced == [True] * _ECHOES` at `:474` passed in all four failures, so **all twelve associations established every time**, which is the actual shipped guarantee -- a bound on this plane may delay a modality, never turn one away.
+
+### What the assertion protects
+
+Two things. The never-refuses half is already asserted deterministically at `:473` and `:474` and needs no clock. The half the fragile line instruments is **proof that the pacer is not a no-op** -- and that was earned, not invented: the docstring records that the first draft asserted an absolute 0.15s while its own control measured 0.25s, so the threshold was met by the baseline and proved nothing. Deleting the timing arm reintroduces exactly that hole.
+
+### Remedy class, and three levers ruled out on what was read
+
+**Assert the pacer's delay on the PACER, with an injected clock, instead of on two subtracted host measurements.** This is available because the bucket already takes its clock as a parameter: `charge(messages, *, now)` and `deficit(*, now)` are pure functions of `now`. There is in-file precedent needing no new machinery -- `test_only_an_accepted_association_charges_the_budget` at `tests/test_poll_and_association_intake_bounds.py:342` already asserts `src._pacer.deficit(now=...) > 0.0` deterministically, and `test_the_wait_is_before_the_association_request_is_read` at `:329` pins the wiring by source inspection.
+
+Ruled out, each on something read rather than on taste:
+
+1. **Lowering `pytest_workers`.** `.github/workflows/ci.yml:1486-1488` forbids it by name for this family -- "the lever is the TOLERANCE or the pacing mechanism, not pytest_workers" -- recorded there against a measured sibling that missed by 1.2ms.
+2. **Widening 0.5.** It cannot be made safe. The control is unbounded above and the treatment is clamped, so the difference reaches zero and then goes negative on a slow enough runner. **No threshold greater than zero survives that shape.**
+3. **Deleting the timing arm.** It restores the vacuous-pass hole above.
+
+One mechanism-side option is NAMED WITHOUT BEING PRESCRIBED, since `ci.yml` sanctions the pacing mechanism as a lever: lowering the test's rate from 3/s toward 1/s raises the paced floor from 1.33s to 4s and puts it far above any plausible control time, at a cost of about 3 seconds of suite wall clock on every leg.
+
+### Not established
+
+No distribution of the PASSING margin -- a green run prints nothing, so there are four failures and no successes to compare against, and whether the fleet usually clears the 0.87s cliff comfortably is unknown. The rate has wide error bars: four events over 331 legs is roughly 0.3% to 3%, and the per-OS splits are single events that cannot support a per-leg claim. **The 0 of 148 on `merge_group` is NOT established as protection** -- it is the largest bucket and the only zero, which is suggestive, but at four total events it is equally consistent with luck and no mechanism was found that would make a queue batch immune. And the causal link between xdist load and the control inflation is inferred from the matrix knob and the observed 2.5x-5x, not profiled; a paired local run at two worker counts is the cheap way to close it and has not been done.
+
+---
+
+## 1515. test_harness_monitor's server fixture raises before its try/finally, leaking a live uvicorn thread and its bound port into the worker
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **1/10** · _fill-in_. Found while measuring #1513, in the sibling of the fixture that item is about. `tests/test_harness_monitor.py:76` raises `RuntimeError("server did not start")` from INSIDE its wait loop, before the `try` at `:78` is ever entered -- so `uv.should_exit` is never set and the daemon thread keeps running with the port bound for the rest of that xdist worker's session. The scenarios fixture does not have this defect; this one does.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI reliability / harness fixtures. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- a test fixture only. The cost is that one failed bring-up can poison every later test in the same worker with a stale engine and a held port, which presents as an unrelated failure somewhere downstream.
+
+### The defect, in the source
+
+    port = _free_port()
+    uv = uvicorn.Server(uvicorn.Config(app, host=<loopback>, port=port, ...))
+    thread = threading.Thread(target=uv.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not uv.started:
+        time.sleep(0.05)
+        if time.time() > deadline:
+            raise RuntimeError("server did not start")     # <- tests/test_harness_monitor.py:76
+    try:
+        yield f"http://127.0.0.1:{port}", inbox
+    finally:
+        uv.should_exit = True
+        thread.join(timeout=10)
+
+The teardown is real and correct; the raise simply never reaches it. Contrast `tests/test_harness_scenarios.py:106-107`, which tears the attempt down before re-rolling.
+
+**A second, smaller defect in the same loop:** it does not test `thread.is_alive()`. If uvicorn dies at bind -- its only bind-failure path logs the `OSError` and calls `sys.exit(1)` -- this loop still spins the full 10 seconds before reporting, and reports the wrong thing when it does.
+
+### Why it matters here rather than in the abstract
+
+This fixture shares #1513's 10-second bring-up budget, and **the family it belongs to has been observed failing on `main`'s own pushes**: job 102292947236 in run 34296074627, event `push`, branch `main`. So the raise is reachable in practice, not only in theory. The leak was found by reading the source, **not** by observing a downstream failure caused by it, and no such downstream failure is claimed here.
+
+### Remedy class
+
+Wrap the wait so the teardown runs on every exit path -- the shape `tests/test_harness_scenarios.py` already uses. Whoever takes #1513 will be standing next to this code, and the two are cheaper together than apart, but this is filed separately because it is a resource-leak defect that is true regardless of what the budget is set to. **Any consolidation of the two fixtures must take the scenarios file's teardown, not this one's.**
+
+### Not established
+
+Whether this leak has ever actually caused a downstream failure. It has not been correlated with any observed red, and looking for one would mean auditing the tests that run after it in the same worker, which was not done.
 
 ---
 
