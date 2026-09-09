@@ -29247,3 +29247,71 @@ Wrap the wait so the teardown runs on every exit path -- the shape `tests/test_h
 ### Not established
 
 Whether this leak has ever actually caused a downstream failure. It has not been correlated with any observed red, and looking for one would mean auditing the tests that run after it in the same worker, which was not done.
+
+## 1518. the SECURITY.md ingest row describes a poll ceiling that no longer exists, and its central claim is false
+
+> 🔢 **Filed 2026-09-09 by the Lander, found while resolving PR 948 and re-verified against `3ddd0dad2` after it landed. Not started.** Value **6/10** · Difficulty **3/10**. Value 6 -- this is the shipped security record describing a resource control, and every one of its four statements about that control is now wrong; the central one was wrong before 948 too. Difficulty 3 -- the measurement is done and quoted below; the work is rewriting one table cell and deciding how much of the corrected behaviour belongs in an operator-facing row.
+
+**Cluster:** security record / resource controls. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing is exposed. The defect is that an operator reading the shipped security page would form four false beliefs about a control they may be relying on.
+
+### The sentence
+
+`docs/SECURITY.md`, the Ingest plane row of the resource-limits table, item (2):
+
+```
+`max_files_per_poll` bounds one poll tick on the `File`, `Sftp` and `Ftp` sources, and it
+ships ON (1000) -- the opposite default, deliberately, because those sources have no sender
+to back-pressure and the excess is deferred to the next tick, never refused: the files stay
+where they are and a later tick takes them, so a guessed number costs latency, never a message.
+```
+
+### Four errors, each measured against `origin/main` at `3ddd0dad2`
+
+**1. The knob does not exist.** `max_files_per_poll` occurs **once** in `docs/SECURITY.md` and
+**zero** times in `messagefoundry/transports/*.py`. PR 948 replaced it. The live names are
+`poll_max_files` (15 uses), `poll_max_rows` (11) and `resolve_poll_ceiling` (8), and **none of the
+three appears in `SECURITY.md` at all**.
+
+**2. The default is wrong.** The row says `1000`. `messagefoundry/transports/base.py` ships
+`DEFAULT_MAX_ITEMS_PER_POLL = 500`.
+
+**3. THE CENTRAL CLAIM IS FALSE, AND WAS FALSE BEFORE 948.** *"deferred to the next tick, never
+refused ... a guessed number costs latency, never a message"*. Measured by driving the real
+`FileSource` out of `git archive` extractions, `after_read="leave"`, at the then-shipped ceiling
+of 1000:
+
+```
+999 stale files, then one new arrival   ingested        (positive control)
+1000 stale                              NEVER ingested
+1200 stale                              only 1000 EVER drained across 40 ticks,
+                                        every new arrival blocked, connection reporting running
+```
+
+The mechanism was structural: `_candidates` ended `return self._within_tick_ceiling(files)` while
+the leave-mode dedup `continue` ran afterwards in `_scan_once`, so already-ingested files consumed
+the budget forever. **A later tick did not take them.** 948 fixed the code. The sentence was never
+true of the code it described.
+
+**4. It calls the database poll uncovered.** The row's scope is `File`, `Sftp` and `Ftp`. The
+`Database` source now carries `poll_max_rows`, bounded at `fetchmany`.
+
+### Why this is filed rather than quietly corrected
+
+`docs/SECURITY.md` was **not** in 948's conflict set, so it auto-merged and carries the old wording
+under any resolution. Rewriting it inside that pull request would have put a security-record change
+in a merge nobody reviewed for it. The agent resolving 948 was told to report it and not touch it,
+and did.
+
+**The poll-ceiling half of the drift guard was WITHDRAWN rather than quietly rewritten** when 948
+landed, with the reason recorded in the new module's docstring. Restoring that guard belongs with
+this row's own change -- otherwise the guard is re-armed against wording nobody has fixed yet.
+
+### What the replacement has to decide, not just restate
+
+The corrected behaviour is not a one-word substitution. Under 948 the ceiling bounds **work
+finished**, not candidates considered, and a bad value is now refused at start-up rather than
+accepted. Both change what an operator should expect. Whoever takes this should decide how much of
+that belongs in an operator-facing table row and how much belongs in `CONNECTIONS.md`, rather than
+translating the old sentence into the new vocabulary and leaving its shape intact.
+
