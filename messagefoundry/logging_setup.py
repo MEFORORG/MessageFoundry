@@ -39,6 +39,7 @@ import ssl
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,13 @@ from messagefoundry.logging_guard import (
 )
 from messagefoundry.redaction import redact
 
+# THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
+# one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
+# about what a credential looks like. Stdlib ``re`` only, so no cycle. Deliberately NOT the engine's
+# credential REGISTRIES, which ``config/settings.py`` holds -- that module imports LOG_LEVELS from
+# here, so the dependency must not go the other way.
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
+
 __all__ = [
     "LogFile",
     "build_stderr_handler",
@@ -69,6 +77,7 @@ __all__ = [
     "RedactionFilter",
     "JsonFormatter",
     "CredentialQueryScrubFilter",
+    "CredentialScrubFilter",
     "SyslogForward",
     "query_sntp_offset",
     "LOG_LEVELS",
@@ -154,6 +163,41 @@ def _scrub_block(text: str) -> str:
     )
 
 
+def _rewrite_record(
+    record: logging.LogRecord,
+    scrub: Callable[[str], str],
+    *,
+    block: Callable[[str], str] | None = None,
+) -> None:
+    """Apply ``scrub`` to every field of ``record`` that reaches a sink: the rendered message, and the
+    two blocks ``Formatter.format`` appends VERBATIM (``exc_text``, ``stack_info``).
+
+    THE WALK IS SHARED BECAUSE THE OMISSION WAS INVISIBLE WHILE IT WAS NOT (BACKLOG #1478). Three
+    filters had hand-copied this body and the fourth, :class:`CredentialQueryScrubFilter`, had only
+    the message half -- so an OIDC authorization code inside a traceback was scrubbed by nothing,
+    and no reviewer comparing four separate ``filter`` methods would see the field that was missing
+    from one of them. With one walk it cannot be written.
+
+    ``block`` scrubs the two multi-line fields when they need different treatment from the rendered
+    message; it defaults to ``scrub``. Only :class:`ControlCharScrubFilter` needs it: a traceback's
+    line breaks must SURVIVE while every line is indented, which is a different function from the
+    one that collapses a single rendered line.
+
+    ``record.args`` is cleared whenever ``msg`` is rewritten, so the formatter cannot re-apply ``%``
+    substitution to text that no longer carries the placeholders. A record that needed no change
+    keeps its lazy ``msg``/``args`` untouched."""
+    message = record.getMessage()
+    scrubbed = scrub(message)
+    if scrubbed != message:
+        record.msg = scrubbed
+        record.args = ()
+    scrub_block = block if block is not None else scrub
+    if record.exc_text:
+        record.exc_text = scrub_block(record.exc_text)
+    if record.stack_info:
+        record.stack_info = scrub_block(record.stack_info)
+
+
 class ControlCharScrubFilter(logging.Filter):
     """Neutralize CR/LF and other control characters in the rendered log message to prevent log
     injection / forging (ASVS 16.4.1).
@@ -170,19 +214,11 @@ class ControlCharScrubFilter(logging.Filter):
     formatter to expand unscrubbed."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        scrubbed = scrub_control_chars(message)
-        if scrubbed != message:
-            record.msg = scrubbed
-            record.args = ()
         # The rendered message is only half the record: ``Formatter.format`` appends ``exc_text`` and
         # ``stack_info`` VERBATIM, so a CR/LF inside an exception message forged a whole line on the
         # text sink (BACKLOG #335). ``RedactionFilter`` is installed first and renders ``exc_info``
         # into ``exc_text``, so both fields are already populated when this filter runs.
-        if record.exc_text:
-            record.exc_text = _scrub_block(record.exc_text)
-        if record.stack_info:
-            record.stack_info = _scrub_block(record.stack_info)
+        _rewrite_record(record, scrub_control_chars, block=_scrub_block)
         return True
 
 
@@ -248,6 +284,15 @@ _CREDENTIAL_QUERY_RE = re.compile(
 )
 
 
+def _scrub_credential_query(text: str) -> str:
+    """Replace each credential-bearing query parameter's VALUE, keeping the parameter name.
+
+    ``CREDENTIAL_PLACEHOLDER`` rather than a second literal ``<redacted>``: one log line must not be
+    able to carry two spellings of "a credential was here", and a hand-copied literal is how it
+    would."""
+    return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+
+
 class CredentialQueryScrubFilter(logging.Filter):
     """Redact credential-bearing **query parameters** from every emitted record (ADR 0142 AC-10).
 
@@ -260,14 +305,37 @@ class CredentialQueryScrubFilter(logging.Filter):
     Installed as a **handler filter**, like :class:`RedactionFilter`, so it covers current *and future*
     call sites by construction rather than depending on each one remembering to pre-scrub. The
     parameter NAME is kept so a log stays diagnosable — only the value is replaced.
+
+    It reached ONLY the rendered message until BACKLOG #1478, so an authorization ``code`` inside an
+    exception traceback was scrubbed by nothing. That was not a decision — it was a hand-copied record
+    walk missing one field, which is why the walk is now :func:`_rewrite_record` and shared.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        scrubbed = _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}=<redacted>", message)
-        if scrubbed != message:
-            record.msg = scrubbed
-            record.args = ()
+        _rewrite_record(record, _scrub_credential_query)
+        return True
+
+
+class CredentialScrubFilter(logging.Filter):
+    """Redact credential VALUES from every emitted record -- the rendered **message**, the formatted
+    **exception traceback**, and ``stack_info`` -- via
+    :func:`~messagefoundry.secretscrub.scrub_credentials` (BACKLOG #1478).
+
+    THE GAP THIS CLOSES. Before it, the three filters :func:`_install_phi_filters` installed carried no
+    credential vocabulary between them: seven engine credential shapes passed all three verbatim, with
+    the OIDC ``code``/``state`` control scrubbing in the same run.
+    ``tests/test_logging_credential_scrub.py`` holds that measurement and the fixtures it was taken
+    with; :mod:`messagefoundry.secretscrub` holds the vocabulary and the boundary against
+    :class:`CredentialQueryScrubFilter`, which is scoped to a URL query string and stays separate.
+
+    ORDER. Installed **after** :class:`RedactionFilter` and **before**
+    :class:`ControlCharScrubFilter`. After, because ``RedactionFilter`` is what renders ``exc_info``
+    into ``exc_text`` and clears it -- running first would leave the realistic vector, a connection
+    error whose traceback carries a DSN, entirely uncovered. Before, because ``ControlCharScrubFilter``
+    must stay last (its own docstring says so)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        _rewrite_record(record, scrub_credentials)
         return True
 
 
@@ -496,19 +564,21 @@ def _make_formatter(fmt: str) -> logging.Formatter:
 
 
 def _install_phi_filters(handler: logging.Handler) -> None:
-    """Attach the PHI-redaction + control-char-scrub filters to ``handler``.
+    """Attach the PHI-redaction, credential-scrub and control-char-scrub filters to ``handler``.
 
-    Order matters: redact PHI from the raw content first, then scrub control chars from the result.
-    Applied to **every** handler a logger carries (stdout, stderr, and the off-box forwarder's queue
-    handler) so the forwarded stream is held to the same PHI-safety + log-injection guarantees as
-    stdout. The filters are idempotent, so a record dispatched to multiple filtered handlers is safely
-    re-scrubbed.
+    Order matters: redact PHI from the raw content first (which also renders ``exc_info`` into
+    ``exc_text``, so the credential passes have a traceback to read), scrub credentials from the
+    result, then scrub control chars last. Applied to **every** handler a logger carries (stdout,
+    stderr, and the off-box forwarder's queue handler) so the forwarded stream is held to the same
+    PHI-safety, secret-safety and log-injection guarantees as stdout. The filters are idempotent, so
+    a record dispatched to multiple filtered handlers is safely re-scrubbed.
 
     For the forwarder this means the **queue** handler, on the near side of the hand-off, and the
     socket handler behind it carries no chain of its own — see :class:`_ForwardQueueHandler`, which is
     where that placement is argued."""
     handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
+    handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
 
 

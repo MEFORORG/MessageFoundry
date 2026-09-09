@@ -858,6 +858,68 @@ def test_auth_oidc_secret_in_file_warns_not_binds(tmp_path: Path) -> None:
     assert s.auth.oidc_client_secret == "in-file"
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "oidc_issuer",
+        "oidc_client_id",
+        "oidc_authorization_endpoint",
+        "oidc_token_endpoint",
+        "oidc_jwks_uri",
+    ],
+)
+@pytest.mark.parametrize("blank", ["   ", "\t"])
+def test_auth_oidc_whitespace_only_required_field_is_refused(
+    tmp_path: Path, field: str, blank: str
+) -> None:
+    """A whitespace-only required field must be refused, exactly as an empty one already was.
+
+    The `missing` list tested ``if not value``, which catches ``""`` and lets ``"   "`` through,
+    while the client-secret guard twenty lines below already stripped before testing — so the
+    validator disagreed with itself about what "missing" means. Reproduced before the fix:
+    ``oidc_client_id=""`` was refused, while ``"   "`` and ``"\\t"`` both loaded and the value
+    survived verbatim.
+
+    Not cosmetic. ``oidc_client_id`` is the expected ``aud``, so the ID Token audience check would
+    have compared an incoming claim against whitespace; for the four pinned URLs it deferred the
+    failure to the https check, which then reports a SCHEME problem for what is really a missing
+    value.
+
+    **The assertion matches the MISSING-VALUE message, not the field name, and that is the whole
+    discriminator.** Matching the field name alone passes for the four URLs even with the fix
+    reverted, because the downstream https check refuses them too and names the same field — so the
+    test would have been green for eight of its ten cases against the unfixed code, measuring
+    nothing. Mutation: restore ``if not value``. Red on all ten cases (BACKLOG #1161, ASVS 10.5.4).
+    """
+    body = (_OIDC_AD + _OIDC_BLOCK).replace(
+        {
+            "oidc_issuer": 'oidc_issuer = "https://idp.example.com"',
+            "oidc_client_id": 'oidc_client_id = "mefor-console"',
+            "oidc_authorization_endpoint": (
+                'oidc_authorization_endpoint = "https://idp.example.com/authorize"'
+            ),
+            "oidc_token_endpoint": 'oidc_token_endpoint = "https://idp.example.com/token"',
+            "oidc_jwks_uri": 'oidc_jwks_uri = "https://idp.example.com/jwks"',
+        }[field],
+        f'{field} = "{blank}"',
+    )
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
+    with pytest.raises(ValidationError, match=f"oidc_enabled requires: {field}"):
+        load_settings(config_path=cfg, environ=dict(_OIDC_ENV))
+
+
+def test_auth_oidc_a_real_value_with_surrounding_space_still_loads(tmp_path: Path) -> None:
+    """THE CONTROL. Whitespace is stripped for the TEST only — a real value is never rewritten, and
+    a padded one must still load with its padding intact. Without this, tightening the test to
+    ``.strip()`` could not be told apart from silently normalising every operator value."""
+    body = (_OIDC_AD + _OIDC_BLOCK).replace(
+        'oidc_client_id = "mefor-console"', 'oidc_client_id = " mefor-console "'
+    )
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
+    s = load_settings(config_path=cfg, environ=dict(_OIDC_ENV))
+    assert s.auth.oidc_client_id == " mefor-console "
+
+
 # --- [cluster] settings (Track B Step 3) ------------------------------------
 
 

@@ -123,7 +123,6 @@ _BASELINE: dict[str, int] = {
     "docs/CONTAINER-EXPOSURE-EVALUATION.md": 3,
     "docs/EARLY-ADOPTER-GUIDE.md": 1,
     "docs/MENTAL-MODEL.md": 1,
-    "docs/REMOTE-CONSOLE-CUSTOMER-GUIDE.md": 2,
     "docs/REMOTE-CONSOLE.md": 1,
     "docs/SECURITY-LOOSENING.md": 3,
     "docs/testing/master-test-plan/03-store-and-data-lifecycle.md": 12,

@@ -38,6 +38,7 @@ jobs:
   reachable:
     name: required contexts belong to active workflows
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read # read workflow `state`; NOT the admin scope branch protection would need
@@ -67,6 +68,7 @@ jobs:
   accurate:
     name: the required-contexts file matches the server
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       # NO extra scope. The context list comes from `GET /repos/{owner}/{repo}/branches/{branch}`, which

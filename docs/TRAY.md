@@ -66,7 +66,7 @@ came up, stopped unexpectedly, went unreachable), rate-limited so a crash-loop c
 ## Menu
 
 - **Open Monitor Console** — opens `<engine_url>/ui` in your browser (disabled, with a hint, when the
-  console isn't enabled — set `[api].serve_ui = true` in the service settings).
+  console isn't enabled — set `[security].serve_web_console = true` in the service settings).
 - **Open Repo in VS Code** — opens the engine repo folder via the `code` CLI.
 - **Start / Stop / Restart Service** — drives the NSSM service; **Stop** and **Restart** ask for
   confirmation first (they halt message flow), then raise a single Windows **UAC prompt**. Cancelling
