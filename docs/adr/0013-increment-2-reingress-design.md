@@ -10,6 +10,28 @@
   observability endpoint + console view (Q7) — message-level correlation (`metadata.correlation_id` /
   `correlation_root_id` + the `reingressed`/`received` events) already links the chain; the aggregation
   endpoint and finer-grained per-delivery id are convenience polish, not correctness.
+  **Amendment (2026-09-09) -- the "SQLite + Postgres" backend list in the "Built:" sentence above is
+  superseded.** It is kept verbatim, because this ADR is append-only. `ingress_handoff` is BUILT on all
+  three backends: `SqlServerStore.ingress_handoff` sits beside the SQLite and Postgres ones. SQL Server
+  declares `supports_response_capture = True`, and the capture-then-re-ingress loop runs against a real
+  SQL Server in `tests/test_x12_rte.py`. The update notes under "Backend specifics" and "Required tests"
+  below record what changed and when. That correction had not reached this bullet, which is the line a
+  reader -- or a number-to-file index -- meets first. Current truth: the
+  [capability matrix](../CONFIGURATION.md#per-backend-capability-matrix). The rest of both lists was
+  re-verified against the tree on 2026-09-09 and stands. The deferrals hold too:
+  `OutboxItem.correlation_id`, `correlate_chain`, `GET /messages/{id}/chain` and the console chain view
+  are all still NOT BUILT.
+  **Amendment (2026-09-09) -- the "SQLite + Postgres" backend list in the "Built:" sentence above is
+  superseded.** It is kept verbatim, because this ADR is append-only. `ingress_handoff` is BUILT on all
+  three backends: `SqlServerStore.ingress_handoff` sits beside the SQLite and Postgres ones. SQL Server
+  declares `supports_response_capture = True`, and the capture-then-re-ingress loop runs against a real
+  SQL Server in `tests/test_x12_rte.py`. The update notes under "Backend specifics" and "Required tests"
+  below record what changed and when. That correction had not reached this bullet, which is the line a
+  reader -- or a number-to-file index -- meets first. Current truth: the
+  [capability matrix](../CONFIGURATION.md#per-backend-capability-matrix). The rest of both lists was
+  re-verified against the tree on 2026-09-09 and stands. The deferrals hold too:
+  `OutboxItem.correlation_id`, `correlate_chain`, `GET /messages/{id}/chain` and the console chain view
+  are all still NOT BUILT.
 - **Decision in one line:** feed a captured reply back into the pipeline as a **new inbound message** by
   (1) declaring a **no-source loopback inbound** plus an explicit **`reingress_to=` on the capturing
   outbound** (the two are coupled and validated at wiring time — no orphaned captures), (2) having
