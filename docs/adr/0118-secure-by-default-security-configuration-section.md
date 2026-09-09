@@ -19,6 +19,14 @@
 > renamed `allow_unencrypted_phi_in_production` → `allow_unencrypted_phi_under_strict_enforcement` (§5). At the
 > default (`enforce` × PHI) serve is byte-identical to the former production-PHI behaviour.
 
+> **Amended by [ADR 0186](0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) (2026-09-09):** the master posture lever
+> `handles_real_patient_data` is **REMOVED**, with `[ai].data_class` and the `DataClass` enum. Every
+> instance carries patient data and the PHI gates apply unconditionally; both spellings are refused at
+> load. §1's posture-lever row and §3's AC-6 relaxation no longer describe the shipped product. The rest
+> of the `[security]` section is unchanged, `production_instance` is retained as the informational tier,
+> and every per-gate switch this ADR introduced keeps its behaviour -- they are now the ONLY way to
+> relax a PHI gate.
+
 ---
 
 ## Context

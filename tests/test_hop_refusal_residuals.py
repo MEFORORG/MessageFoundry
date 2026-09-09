@@ -32,7 +32,6 @@ from messagefoundry.config import wiring
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AiSettings,
-    DataClass,
     EgressSettings,
 )
 from messagefoundry.config.tls_policy import (
@@ -51,9 +50,9 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-SYNTHETIC = HopPosture(is_phi=False, enforcing=False)
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
+SYNTHETIC = HopPosture(enforcing=False)
 
 # Non-routable / documentation hosts only (leak-gate): RFC 5737 TEST-NET-1 + RFC 2606 .example.
 REMOTE_DB = "192.0.2.10"
@@ -175,9 +174,7 @@ async def test_api_synthetic_insecure_hop_is_byte_identical(engine: Engine) -> N
     mid = await _seed(engine)
     # A synthetic (dev) instance over an insecure hop is UNAFFECTED — no PHI to protect, byte-identical.
     # GIVEN 1 (ADR 0148): dev derives PHI now, so the synthetic posture is declared explicitly.
-    async with _client(
-        engine, ai=AiSettings(environment="dev", data_class=DataClass.SYNTHETIC), secure=False
-    ) as c:
+    async with _client(engine, ai=AiSettings(environment="dev"), secure=False) as c:
         assert (await c.get(f"/messages/{mid}")).status_code == 200
 
 
@@ -369,7 +366,7 @@ def _write_config(
     module = _CONFIG_MODULE_ACCEPTED if accepted else _CONFIG_MODULE
     (cfg / "feed.py").write_text(module, encoding="utf-8")
     # GIVEN 1 (ADR 0148): dev derives PHI now, so a synthetic instance declares the opt-out explicitly.
-    synthetic_line = "security.handles_real_patient_data = false\n" if synthetic else ""
+    synthetic_line = "security.block_unlisted_outbound = true\n" if synthetic else ""
     (tmp_path / "messagefoundry.toml").write_text(
         synthetic_line + _TOML.format(env=env), encoding="utf-8"
     )

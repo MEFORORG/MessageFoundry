@@ -16918,9 +16918,10 @@ measurement from this row's subject and it is named here rather than performed.*
 >
 > **Two failures appeared in BOTH arms and are pre-existing, not sandbox-related.**
 > `OB_IMMUNIZATION_BODYCRED` and `OB_IMMUNIZATION_REGISTRY` fail to start because `environments/dev.toml`
-> carries none of the `registry_*` values; the engine isolates them and continues. The smoke also needs
-> `[security].handles_real_patient_data = false`, or `serve --env dev` refuses to start without a store
-> encryption key.
+> carries none of the `registry_*` values; the engine isolates them and continues. The smoke also needs a
+> store encryption key, or `serve --env dev` refuses to start. **CORRECTED 2026-09-09 (BACKLOG #1279):**
+> this line said to set `[security].handles_real_patient_data = false`, which the loader now REFUSES.
+> Mint a key, or set `[security].allow_unencrypted_phi` (plus its strict-enforcement ack).
 >
 > **THE DOCUMENTATION HALF OF THIS ROW SHIPPED AND STANDS AT THE CURRENT DEFAULT.** The five findings
 > this row named are now written down, phrased for an opt-in mode rather than a default one. Finding 1
@@ -17029,9 +17030,10 @@ anything about this change.**
 So **"the samples still load and run" is now earned** for the six MLLP sample feeds and the X12 one.
 Two pre-existing failures appear in every run including the `mode=off` control and are **not**
 sandbox-related: `OB_IMMUNIZATION_BODYCRED` and `OB_IMMUNIZATION_REGISTRY` fail to build because
-`environments/dev.toml` carries none of the `registry_*` values. Note the smoke needs
-`[security].handles_real_patient_data = false`, or `serve --env dev` refuses to start without a store
-encryption key.
+`environments/dev.toml` carries none of the `registry_*` values. Note the smoke needs a store encryption
+key, or `serve --env dev` refuses to start. **CORRECTED 2026-09-09 (BACKLOG #1279):** this line said to
+set `[security].handles_real_patient_data = false`, which the loader now REFUSES; mint a key, or set
+`[security].allow_unencrypted_phi` (plus its strict-enforcement ack).
 
 *FOUR CONSEQUENCES THIS ROW DOES NOT NAME, EACH FOUND BY READING THE SHIPPED CODE.* Any of them can
 turn "one default plus a release note" into something a reader would have been misled by.
@@ -17102,7 +17104,23 @@ note the row did not budget for. Suggest **difficulty 5-6**, and dispatch it to 
 can finish a suite rather than merely a lane with hours.
 ## 1279. treat every instance as carrying patient data and retire the synthetic-data declaration
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The opt-out still ships at settings.py:3738 and still translates to the enum at :4234-4235, while the comment at :3733-3735 continues to contradict :2318, which has said PHI since ADR 0148. Value is a secure-defaults simplification rather than a shipped-default defect, since only an explicit declaration loses the refusals; difficulty stays high on surface alone -- 77 data_class occurrences across the engine plus 45 in tests, and the api/models.py wire-contract change -- with no migration cost added per section 0. _(previously unscored.)_
+> ✅ **SHIPPED 2026-09-09 -- owner ruling, given directly: "I don't want to use handles_real_patient_data any more. I want mefor to always take a PHI posture as the default. Users can adjust individual settings as they need, but not use handles_real_patient_data = false as a combined override." Recorded as [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).**
+>
+> **NOT YET ON `main` when this line was written.** It lands with the PR that carries this edit; a reader who needs it verified should check `main` rather than trust this banner, which is the builder's claim about its own branch.
+>
+> **WHAT LANDED.** `[security].handles_real_patient_data`, `[ai].data_class` and the `DataClass` enum are removed. `HopPosture` loses `is_phi`; `derived_posture()`/`require_posture()` return the production tier alone; `SecurityPosture` drops `data_class` + `synthetic_relaxation` and `AiPolicy` drops `data_class`. Both key spellings are REFUSED at load (`_REMOVED_KEYS`) with a message naming the per-gate switches, rather than ignored -- a config asserting the gates are off while the engine runs them all is a silent contradiction. CI's SQL Server load leg and the failover harness take per-gate relaxations; both are NARROWER than the declaration they replace.
+>
+> **THREE THINGS THIS ROW DID NOT KNOW, ALL MEASURED AT `0ce6d95cf` BEFORE THE CHANGE.**
+>
+> 1. **The lever was not the audited opt-out the docs claimed, and the test that should have caught that could not fire.** `docs/SECURITY-LOOSENING.md` said it was *"named by `security_loosenings()`, surfaced in `GET /security/posture`, and warned at `serve`"*. `security_loosenings()` spans 364 lines and contained ZERO occurrences of `handles_real_patient_data`, `data_class`, `DataClass` or `synthetic`. The serve-time loosening warning reads that registry, so it never fired for the widest relaxation shipped. `tests/test_security_posture_defaults.py` exempted the field with the reason *"the data-class lever has its own entry keyed on the derived posture"* -- there was no such entry, and the exemption was also UNREACHABLE, because the completeness loop skips any field whose default is not a `bool` and this one defaults `None`. Two lines of dead code carrying a false statement about a security control, inside the test that exists to prevent exactly that (SDS-3.7).
+> 2. **The row's count of nineteen is right, and it was re-derived independently rather than trusted.** Sixteen branches in `_serve`, one lifespan check in `api/app.py`, two dispositions in `config/tls_policy.py`. Eight are hard refusals under the shipped `enforcement = enforce`.
+> 3. **The row's own line anchors had drifted** (`settings.py:3730`/`:3738` for one field across two scorings). Every site here was re-located by symbol. The row's substantive claims all held.
+>
+> **THE STALE COMMENT THE ROW FLAGGED WAS STILL THERE AND IS FIXED** -- `settings.py` described the derivation as `dev` -> synthetic, contradicting `_KNOWN_ENV_POSTURE` since ADR 0148. Two further stale doc lines went with it: `SECURITY-LOOSENING.md` claimed declaring a box synthetic was the only way to silence a PHI cleartext hop (ADR 0153 had removed that arm), and `DEPLOYMENT.md` claimed the declaration was audited in `security_loosenings()`.
+>
+> **ONE RESIDUAL, FILED AND UNALLOCATED, and it is a real gap rather than tidy-up.** ADR 0153 left `api_phi_hop_disposition` and `forward_hop_disposition` keyed on the data label because neither cell is a connection and so neither can carry a per-hop `cleartext_accepted`. Removing the label resolves those carve-outs by subtraction and makes 0153's recorded follow-up load-bearing: under `enforce`, an unproven API serve hop and an unattested plaintext log-forwarding hop now have NO per-cell way to accept a risk. The `[security]`-level declaration for each is unbuilt. Name the subject, not a number -- it is unallocated.
+>
+> _Original filing follows._ **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The opt-out still ships at settings.py:3738 and still translates to the enum at :4234-4235, while the comment at :3733-3735 continues to contradict :2318, which has said PHI since ADR 0148. Value is a secure-defaults simplification rather than a shipped-default defect, since only an explicit declaration loses the refusals; difficulty stays high on surface alone -- 77 data_class occurrences across the engine plus 45 in tests, and the api/models.py wire-contract change -- with no migration cost added per section 0. _(previously unscored.)_
 >
 > **Filed 2026-08-16 - not started. THE PRODUCT LETS AN OPERATOR DECLARE THAT AN INSTANCE HOLDS ONLY SYNTHETIC DATA, AND THAT DECLARATION UNLOCKS NINETEEN START-UP RELAXATIONS.** The lever is `[security].handles_real_patient_data` ([`config/settings.py:3730`](../messagefoundry/config/settings.py)), translated to `[ai].data_class` at `settings.py:4226-4227`, over the `DataClass` enum at [`config/ai_policy.py:66-75`](../messagefoundry/config/ai_policy.py). **THE CHANGE: remove the distinction entirely and treat every instance as carrying patient data.**
 > **THIS REMOVES AN OPT-OUT; IT DOES NOT FLIP A DEFAULT -- state it that way or the item overstates itself.** `dev` **already** derives the patient-data posture: `_KNOWN_ENV_POSTURE["dev"] = (DataClass.PHI, False)` (`settings.py:2310`, [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1), and `serve` requires an environment (`settings.py:2348-2350`, enforced by `require_posture()` at `__main__.py:1191`). **A stock development box is treated as carrying patient data today.** The only configurations that are not are those that explicitly declared `handles_real_patient_data = false`. Those are what stop working.

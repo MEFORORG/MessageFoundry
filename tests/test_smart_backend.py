@@ -328,7 +328,7 @@ def test_cleartext_token_url_is_decided_by_the_one_authority(
 
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with (
-        active_hop_posture(HopPosture(is_phi=True, enforcing=True)),
+        active_hop_posture(HopPosture(enforcing=True)),
         pytest.raises(SmartAuthError, match="cleartext"),
     ):
         SmartBackendTokenProvider(
@@ -345,7 +345,7 @@ def test_cleartext_token_url_crosses_on_a_per_connection_declaration(
     from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+    with active_hop_posture(HopPosture(enforcing=True)):
         provider = SmartBackendTokenProvider(
             token_url="http://auth.example/token",
             client_id="c",
@@ -372,7 +372,7 @@ def test_token_provider_from_settings_reads_the_declaration(rsa_pem: str) -> Non
         "cleartext_reason": "legacy IdP has no TLS listener",
         "cleartext_connection": "OB_LEGACY",
     }
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+    with active_hop_posture(HopPosture(enforcing=True)):
         provider = token_provider_from_settings(settings)
     assert provider is not None
 

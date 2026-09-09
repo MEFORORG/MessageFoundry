@@ -17,6 +17,7 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.checks import run_checks
+from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_TOML
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -91,14 +92,14 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     # GIVEN 1 (ADR 0148): dev derives PHI now, so a synthetic dev box declares the opt-out explicitly.
     (
         "keyless-synthetic-dev-allows",
-        "security.handles_real_patient_data = false\n",
+        PHI_GATE_PROVISIONS_TOML,
         "dev",
         False,
         0,
     ),
     (
         "keyless-declared-phi-on-dev-refuses",
-        "security.handles_real_patient_data = true\n",
+        "",
         "dev",
         False,
         2,
@@ -119,8 +120,10 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         # unlike a bare single-flag config whose exit 2 the later open-egress gate would also produce.
         "keyless-prod-phi-single-flag-refuses",
         "security.allow_unencrypted_phi = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n" + _RETENTION_DL + _ALERTS,
+        + PHI_GATE_PROVISIONS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
+        + _RETENTION_DL
+        + _ALERTS,
         "prod",
         False,
         2,
@@ -129,8 +132,10 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         "keyless-prod-phi-both-acks-allows",
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n" + _RETENTION_DL + _ALERTS,
+        + PHI_GATE_PROVISIONS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
+        + _RETENTION_DL
+        + _ALERTS,
         "prod",
         False,
         0,
@@ -139,8 +144,8 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         "mfa-off-exposed-prod-phi-single-factor-ack-allows",
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\nsecurity.allow_single_factor_admin_when_exposed = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n"
+        + PHI_GATE_PROVISIONS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
         + _MEMORY_ENCRYPTION
         + _PUBLIC_ADDRESS
         + _PROXY
@@ -179,8 +184,8 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         # path (a PHI cleartext off-loopback bind is clamped-refused under enforce — the prod-clamp row
         # below covers that).
         "cleartext-offloopback-dev-escape-allows",
-        "security.handles_real_patient_data = false\n"
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        PHI_GATE_PROVISIONS_TOML
+        + 'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_encryption_for_remote = false\n",
         "dev",
         True,
@@ -268,7 +273,7 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     # dev derives PHI now, so the synthetic posture is declared explicitly.
     (
         "synthetic-loopback-default-allows",
-        "security.handles_real_patient_data = false\n",
+        PHI_GATE_PROVISIONS_TOML,
         "dev",
         True,
         0,
@@ -323,7 +328,7 @@ def test_checks_mirror_posture_parity_through_security_keys(tmp_path: Path) -> N
     ok = _posture(
         _config_repo(
             tmp_path / "b",
-            "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+            "security.block_unlisted_outbound = true\nsecurity.production_instance = false\n"
             '[ai]\nenvironment = "poc"\n',
         )
     )

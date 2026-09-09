@@ -16,7 +16,6 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettings
 from messagefoundry.pipeline import Engine
@@ -1352,7 +1351,7 @@ async def test_security_posture_keyless_reports_off(engine: Engine) -> None:
     # The default engine fixture opens a keyless SQLite store → encryption off, no key_id, sqlite backend.
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
-    ai = AiSettings(environment="staging", data_class=DataClass.PHI, production=False)
+    ai = AiSettings(environment="staging", production=False)
     store = StoreSettings(allow_unencrypted_phi=True)
     async with _posture_client(engine, service, ai_settings=ai, store_settings=store) as c:
         vw = _auth((await _login(c, "vw")).json()["token"])
@@ -1360,7 +1359,9 @@ async def test_security_posture_keyless_reports_off(engine: Engine) -> None:
     assert body["encryption_enabled"] is False
     assert body["key_id"] is None
     assert body["backend"] == "sqlite"
-    assert body["data_class"] == "phi" and body["production"] is False
+    assert body["production"] is False
+    # `data_class` left the wire model with the declaration it reported (BACKLOG #1279).
+    assert "data_class" not in body
     assert body["environment"] == "staging"
     assert body["allow_unencrypted_phi"] is True and body["require_encryption"] is False
     assert body["plaintext_columns"] == []  # encryption off → N/A
@@ -1427,7 +1428,7 @@ async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
         service = AuthService(enc_engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         await _add(service, "vw", Role.VIEWER)
-        ai = AiSettings(environment="prod", data_class=DataClass.PHI, production=True)
+        ai = AiSettings(environment="prod", production=True)
         store_settings = StoreSettings(encryption_key=key_b64, key_provider="env")
         async with _posture_client(
             enc_engine, service, ai_settings=ai, store_settings=store_settings

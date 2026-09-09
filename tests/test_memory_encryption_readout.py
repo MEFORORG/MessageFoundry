@@ -379,7 +379,15 @@ def test_stock_start_does_not_consult_or_gate_on_any_of_this(
         "messagefoundry.config.memory_encryption.platform_memory_encryption_readout",
         _counting_readout,
     )
-    rc = _serve(tmp_path, monkeypatch, "security.handles_real_patient_data = false\n", env="dev")
+    rc = _serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
+        env="dev",
+    )
     assert rc == 0
     captured = capsys.readouterr()
     assert "memory" not in (captured.out + captured.err).lower()
@@ -544,7 +552,12 @@ def test_exposed_synthetic_instance_is_silent(
     rc = _serve(
         tmp_path,
         monkeypatch,
-        exposed_prod_phi("security.handles_real_patient_data = false\n"),
+        exposed_prod_phi(
+            "security.block_unlisted_outbound = true\n"
+            "security.allow_unencrypted_phi = true\n"
+            "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+            "alerts.security_notifications_required = false\n"
+        ),
         env="prod",
     )
     assert rc == 0
@@ -622,7 +635,15 @@ def test_contradiction_is_silent_when_nobody_declared(
     """A negative read-out on its own contradicts nothing — the contradiction branch is reachable
     only once the operator has opted in, which is why it costs no byte-identity."""
     _readout(monkeypatch, capability=True, active=False, source="test:neg")
-    rc = _serve(tmp_path, monkeypatch, "security.handles_real_patient_data = false\n", env="dev")
+    rc = _serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
+        env="dev",
+    )
     assert rc == 0
     assert "contradict" not in capsys.readouterr().err.lower()
 

@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
@@ -81,6 +80,19 @@ def _serve(
     return main(argv)
 
 
+#: What a stock instance must PROVIDE to start clean, now that every instance carries patient
+#: data (BACKLOG #1279). Before that, one line -- `handles_real_patient_data = false` -- stood in
+#: for all of it. Dotted keys throughout so a test can add its own `[section]` headers without
+#: TOML redefining a table.
+_PHI_PROVISIONS = (
+    "security.block_unlisted_outbound = true\n"
+    "security.delete_message_bodies_after_days = 30\n"
+    "retention.dead_letter_days = 30\n"
+    'alerts.email_smtp_host = "smtp.example.org"\n'
+    'alerts.email_from = "sec@example.org"\n'
+)
+
+
 # --- AC-1: [security] is the canonical, sole home; legacy keys no longer accepted -----------------
 
 
@@ -98,7 +110,6 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
         "security.sign_out_after_idle_minutes = 15\n"
         "security.max_session_hours = 8\n"
         "security.allow_unencrypted_phi = true\n"
-        "security.handles_real_patient_data = true\n"
         "security.production_instance = false\n",
     )
     assert s.auth.enabled is False and s.auth.require_mfa is False
@@ -108,11 +119,10 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
     assert s.diagnostics.audit_all_authz is True
     assert s.auth.session_idle_timeout_minutes == 15 and s.auth.session_absolute_hours == 8
     assert s.store.allow_unencrypted_phi is True
-    assert s.ai.data_class is DataClass.PHI and s.ai.production is False
+    assert s.ai.production is False
 
     # ...and the legacy scattered keys are REJECTED in their old sections (file OR env).
     legacy = [
-        ('[ai]\ndata_class = "phi"\n', "handles_real_patient_data"),
         ('[api]\nhost = "0.0.0.0"\n', "local_access_only"),
         ("[api]\nserve_ui = true\n", "serve_web_console"),
         ("[auth]\nenabled = false\n", "require_sign_in"),
@@ -126,9 +136,23 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
     for toml, replacement in legacy:
         with pytest.raises(ValueError, match=replacement):
             _load(tmp_path, toml)
-    # env form is rejected too (MEFOR_AI_DATA_CLASS moved).
-    with pytest.raises(ValueError, match="handles_real_patient_data"):
-        _load(tmp_path, "", environ={"MEFOR_AI_DATA_CLASS": "phi"})
+    # The two RETIRED keys are refused too, and with a DIFFERENT message: they were removed
+    # rather than relocated (BACKLOG #1279), so there is no forwarding address to name. Both
+    # spellings, and the env form of each, because a config asserting the PHI gates are off
+    # while the engine runs them all is a silent contradiction the next reader resolves wrongly.
+    for toml in (
+        '[ai]\ndata_class = "phi"\n',
+        "security.handles_real_patient_data = false\n",
+    ):
+        with pytest.raises(ValueError, match="was REMOVED"):
+            _load(tmp_path, toml)
+    for var in ("MEFOR_AI_DATA_CLASS", "MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA"):
+        with pytest.raises(ValueError, match="was REMOVED"):
+            _load(tmp_path, "", environ={var: "phi"})
+    # ...and the refusal names the per-gate switches that replaced it, so an operator who wanted
+    # ONE of the nineteen gates relaxed can find the one they actually meant.
+    with pytest.raises(ValueError, match="allow_unencrypted_phi"):
+        _load(tmp_path, "security.handles_real_patient_data = false\n")
 
 
 def test_web_console_on_by_default(tmp_path: Path) -> None:
@@ -259,12 +283,13 @@ def test_loosening_warns_and_prod_phi_refuses(
 
     # The serve-time consolidated warning fires naming the loosened switch (AC-4). It rides the logging
     # path (post-configure_logging), which routes to stdout — the gate REFUSE messages print to stderr.
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet — the
-    # loosening WARNING is the subject here.
+    # Every instance carries patient data (BACKLOG #1279), so this dev serve SATISFIES the PHI gates
+    # rather than declaring itself out of them -- the loosening WARNING is the subject here, and it
+    # must name require_mfa and nothing else.
     rc = _serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\nsecurity.require_mfa = false\n",
+        _PHI_PROVISIONS + "security.require_mfa = false\n",
         env="dev",
     )
     assert rc == 0
@@ -311,14 +336,15 @@ def test_production_acks_are_loosenings_when_set() -> None:
     assert _loosenings(SecuritySettings()) == []  # acks off => nothing named
 
 
-# --- AC-6: handles_real_patient_data=false relaxes the PHI-only gates (and it is posture-visible) --
+# --- BACKLOG #1279: no declaration relaxes the PHI gates; only the per-gate switch does -----------
 
 
-def test_synthetic_relaxation_visible(
+def test_no_declaration_relaxes_the_phi_gates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A synthetic instance (handles_real_patient_data=false) relaxes the PHI-only gates: it starts keyless,
-    # quietly, with no at-rest-encryption / egress / retention refusal.
+    # This test is the INVERSE of the one it replaces. `handles_real_patient_data = false` used to
+    # start a keyless dev box quietly; it is now refused at load, so the keyless gate fires and the
+    # operator is told which switch to reach for instead.
     rc = _serve(
         tmp_path,
         monkeypatch,
@@ -326,21 +352,30 @@ def test_synthetic_relaxation_visible(
         env="dev",
         key=False,
     )
-    assert rc == 0
+    assert rc == 2
     err = capsys.readouterr().err
-    assert "UNENCRYPTED at rest" not in err and "refusing to start" not in err
+    assert "was REMOVED" in err and "allow_unencrypted_phi" in err
 
-    # The SAME config marked as real patient data does NOT relax — the keyless at-rest gate fires. This
-    # posture split is what the read-only GET /security/posture view surfaces (AC-5).
+    # A bare dev box with no key refuses on the keyless gate itself -- the gate the declaration
+    # used to silence, now reachable by every instance.
+    rc = _serve(tmp_path, monkeypatch, "", env="dev", key=False)
+    assert rc == 2
+    assert "UNENCRYPTED at rest" in capsys.readouterr().err
+
+    # The PER-GATE ack is what starts it, and unlike the retired lever it relaxes ONE gate and says
+    # so: the AUDIT line fires and every other gate stays live. Under the shipped `enforce` it takes
+    # the second acknowledgment too (ADR 0140), which is the point -- keyless PHI under strict
+    # enforcement is never one flag away.
     rc = _serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = true\n",
+        _PHI_PROVISIONS
+        + "security.allow_unencrypted_phi = true\n"
+        + "security.allow_unencrypted_phi_under_strict_enforcement = true\n",
         env="dev",
         key=False,
     )
-    assert rc == 2
-    assert "UNENCRYPTED at rest" in capsys.readouterr().err
+    assert rc == 0
 
 
 # --- security enforcement dial (this refactor): decoupled REFUSE/WARN from the production tier -------
@@ -415,9 +450,8 @@ def test_debug_logging_gate_keys_on_tier_not_enforcement(
     rc = _serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n" + debug,
+        _PHI_PROVISIONS + debug,
         env="dev",
-        key=False,
     )
     assert rc == 0
     assert "DEBUG logging is refused" not in capsys.readouterr().err

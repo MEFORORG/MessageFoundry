@@ -93,7 +93,10 @@ def test_serve_refuses_inprocess_tls_offloopback_without_attestation(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         '[api]\ntls_cert_file = "cert.pem"\n',
         encoding="utf-8",
@@ -113,7 +116,10 @@ def test_serve_inprocess_tls_offloopback_attested_starts(
     monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         '[api]\ntls_cert_file = "cert.pem"\n',
         encoding="utf-8",
@@ -131,7 +137,10 @@ def test_serve_loopback_inprocess_tls_starts(
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
         'security.local_access_only = true\n[api]\ntls_cert_file = "cert.pem"\n',
         encoding="utf-8",
     )
@@ -148,7 +157,10 @@ def test_serve_proxy_terminated_offloopback_starts(
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
         encoding="utf-8",

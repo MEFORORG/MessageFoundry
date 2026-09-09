@@ -41,7 +41,9 @@ backend = "sqlite"
 environment = "dev"
 
 [security]
-handles_real_patient_data = false
+block_unlisted_outbound = true
+allow_unencrypted_phi = true
+allow_unencrypted_phi_under_strict_enforcement = true
 """
 
 #: One graph carrying every shape the reader has an opinion about and every shape it must stay quiet

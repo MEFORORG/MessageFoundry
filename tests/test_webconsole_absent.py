@@ -194,7 +194,11 @@ def _serve_with_console_absent(
     # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet — these
     # tests probe the ADR 0143 console soft-degrade / hard-refuse contract, not the security posture.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n" + toml, encoding="utf-8"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n" + toml,
+        encoding="utf-8",
     )
     real_find_spec = ilu.find_spec
 

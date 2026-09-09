@@ -36,6 +36,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline.alert_sinks import EmailTransport
 from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_TOML
 
 
 class _RecordingSMTP:
@@ -306,8 +307,8 @@ def _prod_phi_toml(*, alerts_lines: str = "", security_lines: str = "") -> str:
     header: appended after `[alerts]` they would land IN `[alerts]`, load clean, and silently do
     nothing."""
     return (
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n"
+        PHI_GATE_PROVISIONS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
         + security_lines
         + "[retention]\ndead_letter_days = 30\n"
         + '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
@@ -385,7 +386,7 @@ def test_a_synthetic_instance_is_not_gated(tmp_path: Path, monkeypatch: pytest.M
         monkeypatch,
         _prod_phi_toml(
             alerts_lines="email_tls_verify = false\n",
-            security_lines="security.handles_real_patient_data = false\n",
+            security_lines=PHI_GATE_PROVISIONS_TOML,
         ),
         env="dev",
     )

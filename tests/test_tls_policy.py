@@ -301,32 +301,44 @@ def test_in_process_tls_revocation_refused_matrix(
 
 @pytest.mark.parametrize("declared", ["none", "mtls", "network", "shared_secret"])
 @pytest.mark.parametrize("client_ca_configured", [False, True])
-@pytest.mark.parametrize("is_phi", [False, True])
 def test_proxy_mtls_declared_but_unverified_matrix(
-    declared: str, client_ca_configured: bool, is_phi: bool
+    declared: str, client_ca_configured: bool
 ) -> None:
-    # WARN on exactly one combination: the declaration says the proxy presents a certificate, the
-    # engine verifies none, and the instance carries PHI. Everything else is byte-identical silence.
-    expected = declared == "mtls" and not client_ca_configured and is_phi
+    # WARN on exactly one combination: the declaration says the proxy presents a certificate and the
+    # engine verifies none. Everything else is byte-identical silence.
+    #
+    # There used to be a third axis. `is_phi` went with BACKLOG #1279 -- every instance carries
+    # patient data, so a box could no longer be declared out of this diagnostic, and the matrix is
+    # eight cells rather than sixteen. That is a WIDENING: the four cells this predicate used to stay
+    # silent on (mtls, no client CA, synthetic) now warn.
+    expected = declared == "mtls" and not client_ca_configured
     assert (
         proxy_mtls_declared_but_unverified(
-            declared=declared, client_ca_configured=client_ca_configured, is_phi=is_phi
+            declared=declared, client_ca_configured=client_ca_configured
         )
         is expected
     )
 
 
-def test_proxy_mtls_predicate_warns_on_exactly_one_of_sixteen() -> None:
+def test_proxy_mtls_predicate_warns_on_exactly_one_of_eight() -> None:
     """The matrix above derives `expected` from the same rule the predicate implements, so on its own
     it would pass for a predicate that always returned False. This counts the True cells."""
     warned = [
-        (d, ca, phi)
+        (d, ca)
         for d in ("none", "mtls", "network", "shared_secret")
         for ca in (False, True)
-        for phi in (False, True)
-        if proxy_mtls_declared_but_unverified(declared=d, client_ca_configured=ca, is_phi=phi)
+        if proxy_mtls_declared_but_unverified(declared=d, client_ca_configured=ca)
     ]
-    assert warned == [("mtls", False, True)]
+    assert warned == [("mtls", False)]
+
+
+def test_proxy_mtls_predicate_no_longer_takes_a_data_label() -> None:
+    """BACKLOG #1279, pinned the way ADR 0153 pinned its own removal: on the SIGNATURE.
+
+    Asserting the eight cells above would not catch an `is_phi=True`-defaulted parameter being
+    reintroduced, because every call site would keep passing."""
+    params = set(inspect.signature(proxy_mtls_declared_but_unverified).parameters)
+    assert params == {"declared", "client_ca_configured"}
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "on"])
@@ -537,21 +549,23 @@ def test_enforce_insecure_hop_allow_is_noop() -> None:
 
 
 def test_hop_posture_fail_closed_defaults_unknown_to_strict() -> None:
-    assert HopPosture.fail_closed(is_phi=None, enforcing=None) == HopPosture(
-        is_phi=True, enforcing=True
-    )
+    assert HopPosture.fail_closed(enforcing=None) == HopPosture(enforcing=True)
     # A fully-declared posture passes through unchanged (not strictest-by-default).
-    assert HopPosture.fail_closed(is_phi=False, enforcing=False) == HopPosture(
-        is_phi=False, enforcing=False
-    )
-    assert HopPosture.fail_closed(is_phi=True, enforcing=None) == HopPosture(
-        is_phi=True, enforcing=True
-    )
+    assert HopPosture.fail_closed(enforcing=False) == HopPosture(enforcing=False)
+
+
+def test_hop_posture_carries_only_the_enforcement_dial() -> None:
+    """BACKLOG #1279 on the SIGNATURE, for the same reason ADR 0153 pinned its own removal there.
+
+    A reintroduced `is_phi` with a `True` default would keep every call site passing while handing
+    the data label back its influence over three dispositions."""
+    assert set(inspect.signature(HopPosture.fail_closed).parameters) == {"enforcing"}
+    assert set(HopPosture.__dataclass_fields__) == {"enforcing"}
 
 
 def test_active_hop_posture_stamps_and_restores() -> None:
     assert current_hop_posture() is None
-    posture = HopPosture(is_phi=True, enforcing=True)
+    posture = HopPosture(enforcing=True)
     with active_hop_posture(posture):
         assert current_hop_posture() is posture
         # nesting restores the outer value on exit

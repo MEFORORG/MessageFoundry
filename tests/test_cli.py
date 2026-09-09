@@ -487,7 +487,11 @@ def test_serve_quiet_in_dev_without_key(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n", encoding="utf-8"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
@@ -503,8 +507,7 @@ def test_serve_keyless_custom_phi_env_refuses(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = true\nsecurity.production_instance = false\n"
-        '[ai]\nenvironment = "test"\n',
+        'security.production_instance = false\n[ai]\nenvironment = "test"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
@@ -522,8 +525,7 @@ def test_serve_keyless_poc_phi_env_refuses_decoupled_from_name(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = true\nsecurity.production_instance = false\n"
-        '[ai]\nenvironment = "poc"\n',
+        'security.production_instance = false\n[ai]\nenvironment = "poc"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
@@ -541,8 +543,7 @@ def test_serve_keyless_poc_phi_env_refuses_when_production_true(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = true\nsecurity.production_instance = true\n"
-        '[ai]\nenvironment = "poc"\n',
+        'security.production_instance = true\n[ai]\nenvironment = "poc"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
@@ -616,7 +617,10 @@ def test_serve_custom_env_with_posture_starts(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+        "security.block_unlisted_outbound = true\nsecurity.production_instance = false\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         '[ai]\nenvironment = "test"\n',
         encoding="utf-8",
     )
@@ -636,7 +640,10 @@ def test_serve_refuses_non_loopback_bind_by_default(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet and only the bind gate decides.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
         encoding="utf-8",
     )
@@ -655,7 +662,10 @@ def test_serve_allows_non_loopback_bind_with_flag(
     # GIVEN 1 (ADR 0148): declare synthetic so the enforce clamp doesn't refuse the PHI cleartext bind
     # — this test is about the --allow-insecure-bind flag path on a synthetic instance.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
         encoding="utf-8",
     )
@@ -678,7 +688,10 @@ def test_serve_loopback_bind_needs_no_flag(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet and
     # only the loopback-bind (no-flag) behavior is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        "security.block_unlisted_outbound = true\nsecurity.local_access_only = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -742,7 +755,10 @@ def test_serve_auth_off_on_unexposed_loopback_still_starts(
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.local_access_only = true\n"
         "security.require_sign_in = false\n",
         encoding="utf-8",
@@ -763,7 +779,10 @@ def test_serve_auth_on_behind_terminator_unaffected_by_arm(
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.local_access_only = true\n"
         "[api]\n"
         "tls_terminated_upstream = true\n"
@@ -786,7 +805,7 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     base = (
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
-        "security.handles_real_patient_data = true\nsecurity.block_unlisted_outbound = true\n"
+        "security.block_unlisted_outbound = true\n"
     )
     # default enforce → a *staging* PHI cleartext bind is REFUSED at the bind gate (not just prod).
     (tmp_path / "messagefoundry.toml").write_text(base, encoding="utf-8")
@@ -865,7 +884,10 @@ def _expose_toml(
     enforce_line = f'security.enforcement = "{enforcement}"\n' if enforcement else ""
     # GIVEN 1 (ADR 0148): dev now derives PHI, so the synthetic-dev exposure case declares the opt-out
     # explicitly to keep the PHI gates (keyless/egress/MFA) relaxed the way the old dev default did.
-    synthetic_line = "security.handles_real_patient_data = false\n" if synthetic else ""
+    synthetic_line = "security.block_unlisted_outbound = true\n" if synthetic else ""
+    "security.allow_unencrypted_phi = true\n"
+    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+    "alerts.security_notifications_required = false\n"
     # Pass every non-MFA exposure gate (Posture-B declarations + egress deny-by-default + the #186/#188
     # secure retention + SMTP-alert channels) so require_mfa is the ONLY posture under test.
     (tmp_path / "messagefoundry.toml").write_text(
@@ -1168,7 +1190,10 @@ def test_serve_quiet_exposed_without_approvals_in_synthetic_dev(
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.local_access_only = false\n"
         'security.listen_address = "0.0.0.0"\n'
         "security.block_unlisted_outbound = true\n",
@@ -1385,7 +1410,10 @@ def test_serve_ui_upstream_with_public_origin_starts(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "https://mefor.example.org"\n'
         "security.block_unlisted_outbound = true\n"
@@ -1421,7 +1449,10 @@ def test_serve_ui_warns_on_undeclared_proxy_signal(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "https://mefor.example.org"\n'
         "security.block_unlisted_outbound = true\n",
@@ -1689,7 +1720,11 @@ def test_serve_ui_default_on_loopback_mounts_ui(
     # GIVEN 1 (ADR 0148): declare synthetic so the bare loopback serve stays quiet on the PHI gates and
     # only the ADR 0143 default-on console behavior is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n", encoding="utf-8"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
     )
     monkeypatch.setattr(
         "messagefoundry.api.create_managed_app", lambda **kw: captured.update(kw) or object()
@@ -1710,7 +1745,11 @@ def _bare_loopback_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n", encoding="utf-8"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
@@ -1790,7 +1829,10 @@ def test_serve_ui_default_on_offloopback_degrades_json_only(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.block_unlisted_outbound = true\n"
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
@@ -1810,7 +1852,10 @@ def test_serve_ui_default_on_public_origin_degrades_json_only(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.block_unlisted_outbound = true\n"
         'security.web_console_public_address = "https://ops.example.com"\n',
     )
@@ -1922,8 +1967,7 @@ def test_serve_auto_bounds_retention_on_loopback_phi(
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        'security.enforcement = "warn"\nsecurity.handles_real_patient_data = true\n'
-        "security.block_unlisted_outbound = true\n" + _SECURE_ALERTS,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n' + _SECURE_ALERTS,
         env="dev",
     )
     assert rc == 0
@@ -1960,7 +2004,10 @@ def test_serve_retention_quiet_in_synthetic_dev(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n",
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
         env="dev",
         key=False,
     )
@@ -2056,9 +2103,7 @@ def test_serve_auto_denies_egress_on_loopback_phi(
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        'security.enforcement = "warn"\nsecurity.handles_real_patient_data = true\n'
-        + _SECURE_RETENTION
-        + _SECURE_ALERTS,
+        'security.enforcement = "warn"\n' + _SECURE_RETENTION + _SECURE_ALERTS,
         env="dev",
     )
     assert rc == 0
@@ -2075,7 +2120,10 @@ def test_serve_egress_flip_skipped_for_synthetic_dev(
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        'security.handles_real_patient_data = false\n[egress]\nallowed_mllp = ["10.0.0.5"]\n',
+        'security.block_unlisted_outbound = true\n[egress]\nallowed_mllp = ["10.0.0.5"]\n'
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
         env="dev",
         key=False,  # synthetic — the flip keys on declared PHI
     )
@@ -2164,7 +2212,10 @@ def test_serve_notify_quiet_in_synthetic_dev(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "security.handles_real_patient_data = false\n",
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
         env="dev",
         key=False,
     )
@@ -2188,7 +2239,10 @@ def test_serve_require_encryption_starts_with_configured_key(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet and
     # only the require_encryption presence guard is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n[store]\nrequire_encryption = true\n",
+        "security.block_unlisted_outbound = true\n[store]\nrequire_encryption = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
         encoding="utf-8",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())

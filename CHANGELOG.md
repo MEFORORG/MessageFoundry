@@ -36,6 +36,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
   ([BACKLOG #1008](docs/BACKLOG.md))
 
+### Removed
+- **BREAKING: `[security].handles_real_patient_data` is gone, and with it the whole data-class axis.**
+  Every instance carries patient data; the PHI gates apply unconditionally. Setting the key — or its
+  pre-ADR-0118 spelling `[ai].data_class` — now **refuses at load** with a message naming the switch to
+  reach for instead. Removed with it: the `DataClass` enum, `HopPosture.is_phi`, the `data_class` and
+  `synthetic_relaxation` fields on `SecurityPosture`, and `data_class` on `AiPolicy`.
+  `derived_posture()` / `require_posture()` return the production tier alone.
+  **Why, in one line: it turned off nineteen start-up gates on one line, and it was not the audited
+  opt-out the documentation claimed.** `security_loosenings()` never named it, so the serve-time
+  loosening warning — the thing that fires for every other deviation — did not fire for the widest
+  relaxation the product shipped. The completeness test that should have caught that exempted the field
+  with a reason that was false, in an exemption branch that could never execute.
+  **What to use instead:** the gate you actually mean. Each is separately named, separately audited and
+  separately reported — `allow_unencrypted_phi` (plus `allow_unencrypted_phi_under_strict_enforcement`
+  under the shipped `enforcement = enforce`), `block_unlisted_outbound`,
+  `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`,
+  `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection
+  `cleartext_accepted` / `tls_revocation_attested`, or the `[security].enforcement` dial.
+  **What this costs:** a box that ran key-free on the declaration now needs a key or the audited
+  per-gate ack. Nothing is deployed (there is no migration), and both in-repo users of the declaration —
+  CI's SQL Server load leg and the failover load harness — moved to per-gate relaxations that are
+  *narrower* than what they replace. See
+  [ADR 0186](docs/adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
+  and BACKLOG #1279.
+
 ### Changed
 - **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
   additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.

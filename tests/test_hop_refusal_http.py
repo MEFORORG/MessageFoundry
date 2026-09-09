@@ -62,9 +62,9 @@ _HTTPS = {
     "DICOMweb": (ConnectorType.DICOMWEB, DICOMweb, "https://pacs.example.org/dicom-web"),
 }
 
-_STAGING = HopPosture(is_phi=True, enforcing=False)  # non-prod PHI (staging/dev)
-_PROD = HopPosture(is_phi=True, enforcing=True)  # production PHI
-_SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # no PHI on the wire
+_STAGING = HopPosture(enforcing=False)  # non-prod PHI (staging/dev)
+_PROD = HopPosture(enforcing=True)  # production PHI
+_SYNTHETIC = HopPosture(enforcing=False)  # no PHI on the wire
 
 _CELLS = list(_CLEARTEXT)
 

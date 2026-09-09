@@ -51,10 +51,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
 `-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
 engine resolves and the instance's PHI posture. `serve` refuses to start without it (no silent
 default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name.
-**A custom name must also declare its posture** — `[security].handles_real_patient_data` and
-`[security].production_instance` in the service config (`messagefoundry.toml`) — because a free-form
-environment name carries no PHI posture to derive one from (only `dev`/`staging`/`prod` do). Without
-both, `serve` exits 2 with *"environment '\<name\>' has no built-in security posture"*, so the service
+**A custom name must also declare its production tier** — `[security].production_instance` in the
+service config (`messagefoundry.toml`) — because a free-form environment name carries no tier to
+derive one from (only `dev`/`staging`/`prod` do). There is no second declaration to make: every
+instance carries patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). Without it, `serve` exits 2 with *"environment '\<name\>' has no built-in security posture"*, so the service
 registers fine and then dies on every start. (The pre-ADR-0118 spellings `[ai].data_class` /
 `[ai].production` are **rejected at config load** — see
 [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md).)

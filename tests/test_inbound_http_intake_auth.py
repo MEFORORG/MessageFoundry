@@ -487,9 +487,9 @@ def test_global_limit_trip_does_not_deny_authenticated_peer() -> None:
 
 # --- D7: the posture-keyed peer-control gate ----------------------------------------------------
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, but the dial is at warn
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # no real PHI
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)  # PHI, but the dial is at warn
+SYNTHETIC = HopPosture(enforcing=True)  # no real PHI
 
 
 def _http_source(**settings: Any) -> Source:

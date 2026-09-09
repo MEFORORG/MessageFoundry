@@ -261,8 +261,11 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 > - **Recommended — mint a throwaway dev key** (exercises the real encryption path): run `messagefoundry
 >   gen-key` and set the printed base64 value as `MEFOR_STORE_ENCRYPTION_KEY` (a dev key is fine; **never
 >   commit it**).
-> - **Genuinely no-PHI box** — declare it synthetic: set `[security].handles_real_patient_data = false` (a
->   loud, audited opt-out) to run **key-free**, for a dev/CI box that only ever processes synthetic HL7.
+> - **Run key-free anyway** — set `[security].allow_unencrypted_phi = true`, plus
+>   `allow_unencrypted_phi_under_strict_enforcement = true` under the shipped `enforcement = enforce`
+>   (ADR 0140: keyless PHI under strict enforcement is never one flag away). Both are audited at every
+>   start. There is no longer a way to declare a box synthetic and skip this — every instance carries
+>   patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 >
 > The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
 > `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind you hit only the

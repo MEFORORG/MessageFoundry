@@ -324,7 +324,7 @@ def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPat
     hop is encrypted-but-unauthenticated, not cleartext, so it is explicitly out of that scope and
     decides exactly as the MLLP/FTPS ``tls_verify=false`` cells do."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
+    with active_hop_posture(HopPosture(enforcing=False)):
         dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
     assert dest._opener is not None
 
@@ -340,7 +340,7 @@ def test_rest_verify_tls_false_not_relaxed_by_a_cleartext_declaration(
     from MLLP, which decides the same question through ``weakened_tls_escape_permitted_here()``."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with (
-        active_hop_posture(HopPosture(is_phi=True, enforcing=True)),
+        active_hop_posture(HopPosture(enforcing=True)),
         pytest.raises(ValueError, match="verify_tls=false"),
     ):
         _dest(
@@ -370,7 +370,7 @@ def test_rest_credentials_over_cleartext_http_allowed_when_accepted(
     # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
     # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+    with active_hop_posture(HopPosture(enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",
@@ -429,7 +429,7 @@ def test_rest_cleartext_http_nonloopback_allowed_when_accepted(
     # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
     # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+    with active_hop_posture(HopPosture(enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",

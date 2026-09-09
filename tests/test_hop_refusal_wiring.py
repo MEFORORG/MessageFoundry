@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.config.ai_policy import AiMode, DataClass, SecurityEnforcement
+from messagefoundry.config.ai_policy import AiMode, SecurityEnforcement
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     AiSettings,
@@ -167,49 +167,41 @@ def test_cleartext_acceptance_is_destination_only() -> None:
     assert "cleartext_accepted" in Destination.model_fields
 
 
-# --- decision 7: the [ai]->HopPosture mapping (is_phi from data_class; enforcing from [security]) --
+# --- decision 7: the [ai]->HopPosture mapping (enforcing from [security]; there is no other axis) --
 _ENFORCE = SecurityEnforcement.ENFORCE
 _WARN = SecurityEnforcement.WARN
 
 
-def test_hop_posture_from_ai_builtin_names_is_phi_mapping() -> None:
-    # is_phi keys on data_class (GIVEN 1, ADR 0148: dev/staging/prod all derive phi now); enforcing
-    # keys on the enforcement level, DECOUPLED from the tier — at the ENFORCE default all carry
-    # enforcing=True.
-    dev = AiSettings(mode=AiMode.BYO, environment="dev")
-    assert hop_posture_from_ai(dev, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
-    staging = AiSettings(mode=AiMode.BYO, environment="staging")
-    assert hop_posture_from_ai(staging, enforcement=_ENFORCE) == HopPosture(
-        is_phi=True, enforcing=True
-    )
-    prod = AiSettings(mode=AiMode.BYO, environment="prod")
-    assert hop_posture_from_ai(prod, enforcement=_ENFORCE) == HopPosture(
-        is_phi=True, enforcing=True
-    )
+def test_hop_posture_from_ai_builtin_names_all_map_to_the_enforcement_dial() -> None:
+    # The mapping is now one-dimensional. The data-class axis went with BACKLOG #1279, so no
+    # environment name and no declaration can produce a posture other than the dial's.
+    for name in ("dev", "staging", "prod"):
+        ai = AiSettings(mode=AiMode.BYO, environment=name)
+        assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(enforcing=True)
 
 
 def test_hop_posture_from_ai_enforcement_drives_enforcing() -> None:
-    # enforcement=warn reproduces the historical non-production dial (enforcing=False) on every tier;
-    # is_phi is unchanged. This is the dial DECOUPLING: the tier no longer sets the refuse/warn bit.
-    for env, is_phi in (("dev", True), ("staging", True), ("prod", True)):
+    # enforcement=warn reproduces the historical non-production dial (enforcing=False) on every tier.
+    # This is the dial DECOUPLING: the tier does not set the refuse/warn bit, and since #1279 nothing
+    # else contributes to the posture at all.
+    for env in ("dev", "staging", "prod"):
         ai = AiSettings(mode=AiMode.BYO, environment=env)
-        assert hop_posture_from_ai(ai, enforcement=_WARN) == HopPosture(
-            is_phi=is_phi, enforcing=False
-        )
-        assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(
-            is_phi=is_phi, enforcing=True
-        )
+        assert hop_posture_from_ai(ai, enforcement=_WARN) == HopPosture(enforcing=False)
+        assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(enforcing=True)
 
 
-def test_hop_posture_from_ai_explicit_posture_overrides_name() -> None:
-    ai = AiSettings(mode=AiMode.BYO, environment="poc", data_class=DataClass.PHI, production=True)
-    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
+def test_hop_posture_from_ai_explicit_tier_does_not_change_the_hop_posture() -> None:
+    # The production tier is a real property and it is still declarable, but it is not a hop input:
+    # an explicitly-production custom env produces the same posture as anything else at this dial.
+    ai = AiSettings(mode=AiMode.BYO, environment="poc", production=True)
+    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(enforcing=True)
 
 
 def test_hop_posture_from_ai_custom_unresolved_fails_closed() -> None:
-    # A custom env with no explicit data_class -> is_phi unknown -> strictest (fail-closed True).
+    # A custom env that resolves no tier at all still yields the strict posture -- the fail-closed
+    # property this test has always pinned, now carried by the dial alone.
     ai = AiSettings(mode=AiMode.BYO, environment="poc")
-    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
+    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(enforcing=True)
 
 
 # --- decision 7 wiring: build_check_registry stamps the posture during connector construction ---
@@ -229,7 +221,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
     reg = Registry()
     reg.add_outbound(build_outbound_connection("OB", File(directory=".")))
 
-    posture = HopPosture(is_phi=True, enforcing=True)
+    posture = HopPosture(enforcing=True)
     wr.build_check_registry(
         reg,
         inbound_bind_host="127.0.0.1",
@@ -460,7 +452,7 @@ def _mtls(**overrides: object) -> Source:
     )
 
 
-_PHI_ENFORCING = HopPosture(is_phi=True, enforcing=True)
+_PHI_ENFORCING = HopPosture(enforcing=True)
 
 
 def test_mtls_without_a_crl_is_refused_on_an_enforcing_phi_instance() -> None:
@@ -484,11 +476,11 @@ def test_the_per_connection_attestation_passes() -> None:
 
 
 def test_a_non_phi_instance_warns_rather_than_refusing() -> None:
-    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(is_phi=False, enforcing=True))
+    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=True))
 
 
 def test_a_non_enforcing_instance_warns_rather_than_refusing() -> None:
-    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(is_phi=True, enforcing=False))
+    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(enforcing=False))
 
 
 def test_an_unstamped_posture_never_acquires_a_new_refusal() -> None:

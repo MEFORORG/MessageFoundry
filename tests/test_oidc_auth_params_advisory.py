@@ -58,7 +58,7 @@ def _toml(tmp_path: Path, **auth: str) -> Path:
         # assertion in this file read a "settings did not load" detail instead of the advisory.
         '[store]\nbackend = "sqlite"\n\n'
         '[ai]\nenvironment = "dev"\n\n'
-        "[security]\nhandles_real_patient_data = false\n"
+        "[security]\nblock_unlisted_outbound = true\n"
         'web_console_public_address = "https://mefor.example.invalid"\n\n'
         f"[auth]\n{body}\n",
         encoding="utf-8",
@@ -174,7 +174,7 @@ def test_oidc_disabled_reports_that_and_stops(tmp_path: Path) -> None:
     path = tmp_path / "messagefoundry.toml"
     path.write_text(
         '[store]\nbackend = "sqlite"\n\n[ai]\nenvironment = "dev"\n\n'
-        "[security]\nhandles_real_patient_data = false\n",
+        "[security]\nblock_unlisted_outbound = true\n",
         encoding="utf-8",
     )
     result = _check_oidc_auth_params(tmp_path, service_config=path)

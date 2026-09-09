@@ -252,8 +252,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > factory parameter, no `connections.toml` key), so do not plan a per-hop revocation posture around it;
 > and routing egress through a revocation-checking proxy does **not** change the decision — the
 > authority has an input for it that no call site sets. Anything else is a *posture change* rather than
-> a fix: `[security].handles_real_patient_data = false` silences the gate instance-wide and
-> `[security].enforcement = warn` downgrades it to a WARN.
+> a fix: `[security].enforcement = warn` downgrades it to a WARN. Nothing silences it instance-wide
+> any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 >
 > **The engine's other verifying TLS hops are not gated at all** — the DICOM C-STORE SCU with
 > `tls=true`, FTPS, the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store

@@ -326,10 +326,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    exactly like `prod`/`staging` (closing the EF-3 perception gap where non-prod only warned). Since
    [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 1) **all
    three built-in envs (`dev`/`staging`/`prod`) derive PHI**, so the default/CI path is key-required too — a
-   **genuinely-synthetic** box (`data_class != phi`) stays **key-free** only when it declares
-   `[security].handles_real_patient_data = false` **explicitly** (a loud, audited opt-out — it is no longer
-   the `dev` default). Two further explicit overrides: `[store].require_encryption = true` forces the refusal
-   even for a synthetic instance; `[security].allow_unencrypted_phi = true` is the loud, **audited** opt-out that
+   key is required on **every** instance: [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) retired the synthetic declaration, so no
+   box can opt out of this gate as a class. Two further explicit overrides:
+   `[store].require_encryption = true` forces the refusal past the audited opt-out below; `[security].allow_unencrypted_phi = true` is the loud, **audited** opt-out that
    lets a PHI instance start keyless anyway (it still emits the UNENCRYPTED-at-rest warning, and
    `require_encryption` wins over it) — and under **strict enforcement** (`[security].enforcement = enforce`,
    the default) keyless PHI additionally requires the second ack

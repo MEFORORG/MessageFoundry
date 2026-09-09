@@ -605,7 +605,7 @@ def test_posture_ok_custom_env_with_explicit_posture(tmp_path: Path) -> None:
     # A custom name is fine once posture is set explicitly (decoupled from the name, ADR 0017).
     cfg = _config_repo(
         tmp_path,
-        "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+        "security.block_unlisted_outbound = true\nsecurity.production_instance = false\n"
         '[ai]\nenvironment = "poc"\n',
     )
     report = run_checks(cfg, run_lint=False)

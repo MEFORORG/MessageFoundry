@@ -10,7 +10,8 @@ revoked-but-unexpired peer cert would still be accepted, so a production-PHI ver
 REFUSED at construction / ``messagefoundry check`` / dry-run (store: at open) unless revocation is
 attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env).
 
-Loopback / synthetic (non-PHI) / attested hops are byte-identical; a non-production PHI hop WARNs. It
+Loopback / attested / proxy-proven hops are byte-identical; a non-enforcing hop WARNs. The fourth
+relaxation, a synthetic instance, went with BACKLOG #1279 -- every instance carries patient data. It
 COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation fires ONLY on a VERIFYING
 hop — the two gates key on disjoint conditions and never double-refuse one hop.
 """
@@ -36,10 +37,11 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
 
-# The three postures the gradient keys on (the AI-derived is_phi/production).
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
+# The postures the gradient keys on. `is_phi` went with BACKLOG #1279 -- only the dial is left.
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
+# Pre-#1279 this was the blanket carve-out ("not is_phi → ALLOW"). It is enforcing, so it REFUSES.
+SYNTHETIC_NOW_ENFORCING = HopPosture(enforcing=True)
 
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as remote/off-box)
 LOOPBACK = "127.0.0.1"
@@ -59,14 +61,12 @@ def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_revocation_hop_disposition_matrix() -> None:
     def disp(
         *,
-        is_phi: bool,
         enforcing: bool,
         is_loopback_hop: bool = False,
         proxy_proven: bool = False,
         attested: bool = False,
     ) -> HopDisposition:
         return revocation_hop_disposition(
-            is_phi=is_phi,
             enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
             proxy_proven=proxy_proven,
@@ -74,17 +74,19 @@ def test_revocation_hop_disposition_matrix() -> None:
         )
 
     # loopback → ALLOW (on-box, not a network exposure) even on enforcing-PHI.
-    assert disp(is_phi=True, enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
+    assert disp(enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
     # a proven revocation-checking terminator → ALLOW.
-    assert disp(is_phi=True, enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
+    assert disp(enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
     # attested → ALLOW.
-    assert disp(is_phi=True, enforcing=True, attested=True) is HopDisposition.ALLOW
-    # synthetic (no PHI) → ALLOW.
-    assert disp(is_phi=False, enforcing=True) is HopDisposition.ALLOW
-    # enforcing PHI, unproven → REFUSE.
-    assert disp(is_phi=True, enforcing=True) is HopDisposition.REFUSE
-    # non-enforcing PHI → WARN (crosses, loud-logged).
-    assert disp(is_phi=True, enforcing=False) is HopDisposition.WARN
+    assert disp(enforcing=True, attested=True) is HopDisposition.ALLOW
+    # A fourth ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
+    # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
+    # which used to ALLOW, now falls through to the refusal below.
+    #
+    # enforcing, unproven → REFUSE.
+    assert disp(enforcing=True) is HopDisposition.REFUSE
+    # non-enforcing → WARN (crosses, loud-logged).
+    assert disp(enforcing=False) is HopDisposition.WARN
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
@@ -106,13 +108,11 @@ def test_guard_refuses_prod_phi_remote() -> None:
         _guard(REMOTE).enforce_construction()
 
 
-def test_guard_allows_loopback_synthetic_nonprod_attested() -> None:
+def test_guard_allows_loopback_nonprod_attested() -> None:
     with active_hop_posture(PROD_PHI):
         _guard(LOOPBACK).enforce_construction()  # on-box
         _guard(REMOTE, attested=True).enforce_construction()  # attested
         _guard(REMOTE, proxy_proven=True).enforce_construction()  # proven terminator
-    with active_hop_posture(SYNTHETIC):
-        _guard(REMOTE).enforce_construction()  # no PHI
     with active_hop_posture(STAGING_PHI):
         _guard(REMOTE).enforce_construction()  # non-prod PHI → WARN (constructs)
 
@@ -153,12 +153,10 @@ def test_mllp_tls_verify_refuses_prod_phi_remote() -> None:
         MLLPDestination(mllp_cfg(REMOTE))
 
 
-def test_mllp_tls_verify_allows_attested_loopback_synthetic_nonprod() -> None:
+def test_mllp_tls_verify_allows_attested_loopback_nonprod() -> None:
     with active_hop_posture(PROD_PHI):
         MLLPDestination(mllp_cfg(REMOTE, revocation_attested=True))
         MLLPDestination(mllp_cfg(LOOPBACK))
-    with active_hop_posture(SYNTHETIC):
-        MLLPDestination(mllp_cfg(REMOTE))
     with active_hop_posture(STAGING_PHI):
         MLLPDestination(mllp_cfg(REMOTE))  # non-prod PHI → WARN, constructs
 
@@ -177,12 +175,14 @@ def test_mllp_sets_revocation_guard_only_on_verify_path() -> None:
     # verify-ON TLS hop carries a revocation guard; a cleartext (tls off) hop does not (its cleartext
     # #200 guard handles it — the two guards are disjoint, never both set).
     #
-    # SYNTHETIC used to suppress BOTH gates. Since ADR 0153 the data label no longer relaxes the
-    # CLEARTEXT one, so the cleartext leg carries an explicit declaration instead. The revocation gate
-    # (ADR 0078) still reads the label and is deliberately OUT of 0153's scope — which is precisely what
-    # makes the asymmetry in this test the thing worth pinning.
-    with active_hop_posture(SYNTHETIC):
-        verified = MLLPDestination(mllp_cfg(REMOTE))
+    # A synthetic declaration used to suppress BOTH gates. ADR 0153 took the data label off the
+    # CLEARTEXT one (so the cleartext leg carries an explicit declaration instead) and BACKLOG #1279
+    # took it off the revocation one too, so the asymmetry this test pinned is gone: BOTH gates now
+    # read the hop's own facts. What is still worth pinning is that only ONE guard is set per hop --
+    # a verify-ON hop carries the revocation guard, a cleartext hop carries the #200 guard, never both.
+    # The verified leg is attested so it constructs; the gate itself is covered above.
+    with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
+        verified = MLLPDestination(mllp_cfg(REMOTE, revocation_attested=True))
         cleartext = MLLPDestination(
             Destination(
                 name="OB",
@@ -274,12 +274,6 @@ def test_https_verified_warns_but_builds_staging(cell: str) -> None:
 
 
 @pytest.mark.parametrize("cell", _HTTP_CELLS)
-def test_https_verified_allows_synthetic(cell: str) -> None:
-    with active_hop_posture(SYNTHETIC):
-        _build_https(_HTTPS[cell])  # no PHI on the wire
-
-
-@pytest.mark.parametrize("cell", _HTTP_CELLS)
 def test_https_verified_unstamped_is_noop(cell: str) -> None:
     _build_https(_HTTPS[cell])  # no stamped posture → byte-identical
 
@@ -310,10 +304,9 @@ def test_store_verify_refuses_prod_phi_remote() -> None:
         _build_ssl(_pg(), posture=PROD_PHI)
 
 
-def test_store_verify_allows_loopback_synthetic_nonprod() -> None:
+def test_store_verify_allows_loopback_nonprod() -> None:
     assert _build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI) is True  # on-box
-    assert _build_ssl(_pg(), posture=SYNTHETIC) is True  # no PHI
-    assert _build_ssl(_pg(), posture=STAGING_PHI) is True  # non-prod PHI → WARN, returns verifying
+    assert _build_ssl(_pg(), posture=STAGING_PHI) is True  # non-enforcing → WARN, returns verifying
 
 
 def test_store_verify_unstamped_is_noop() -> None:
@@ -358,14 +351,41 @@ def test_email_tls_refuses_prod_phi_remote() -> None:
         EmailDestination(email_cfg(REMOTE))
 
 
-def test_email_tls_allows_attested_loopback_synthetic_nonprod() -> None:
+def test_email_tls_allows_attested_loopback_nonprod() -> None:
     with active_hop_posture(PROD_PHI):
         EmailDestination(email_cfg(REMOTE, revocation_attested=True))
         EmailDestination(email_cfg(LOOPBACK))
-    with active_hop_posture(SYNTHETIC):
-        EmailDestination(email_cfg(REMOTE))
     with active_hop_posture(STAGING_PHI):
-        EmailDestination(email_cfg(REMOTE))  # non-prod PHI → WARN, constructs
+        EmailDestination(email_cfg(REMOTE))  # non-enforcing → WARN, constructs
+
+
+def test_the_synthetic_arm_is_gone_and_those_hops_now_refuse() -> None:
+    """BACKLOG #1279: the `not is_phi -> ALLOW` arm went, so its inputs REFUSE.
+
+    Pinned once, on every cell that carried a SYNTHETIC arm before, rather than left implicit in six
+    deleted lines. Each of these constructed silently on an instance declared synthetic; each refuses
+    now, because there is no declaration that reaches this gate any more. The only relaxations left are
+    the three the disposition still names: on-box, a proven terminator, an operator attestation.
+    """
+    with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            _guard(REMOTE).enforce_construction()
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            MLLPDestination(mllp_cfg(REMOTE))
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            EmailDestination(email_cfg(REMOTE))
+        for cell in _HTTP_CELLS:
+            with pytest.raises(InsecureHopRefused, match="revocation"):
+                _build_https(_HTTPS[cell])
+    # The store hop takes its posture as an argument rather than off the contextvar, so it is asserted
+    # separately rather than dropped -- it carried a SYNTHETIC arm too.
+    with pytest.raises(ValueError, match="revocation"):
+        _build_ssl(_pg(), posture=SYNTHETIC_NOW_ENFORCING)
+    # ...and the three real relaxations still cross it, so this is a tightening rather than a wall.
+    with active_hop_posture(SYNTHETIC_NOW_ENFORCING):
+        _guard(LOOPBACK).enforce_construction()
+        _guard(REMOTE, attested=True).enforce_construction()
+        _guard(REMOTE, proxy_proven=True).enforce_construction()
 
 
 def test_email_tls_unstamped_is_noop() -> None:

@@ -37,11 +37,10 @@ DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at wiring
 **The cleartext-bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
 ADR 0092 decision 2). `serve --allow-insecure-bind` — and its config twin
 `[security].require_encryption_for_remote = false` — only warn-and-cross while the instance is **not**
-enforcing-PHI. `[security].enforcement` defaults `enforce`, and all three built-in environment names
-(`dev`, `staging`, `prod`) now derive `data_class = phi`, so a **stock instance refuses the cleartext
+enforcing. `[security].enforcement` defaults `enforce`, so a **stock instance refuses the cleartext
 bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
-`[security].enforcement = warn`, or declare the box synthetic with
-`[security].handles_real_patient_data = false`. Neither is a supported production setting.
+`[security].enforcement = warn`. That is now the only way — the synthetic declaration that also did it
+was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md), and it is not a supported production setting either.
 
 ---
 
@@ -459,9 +458,9 @@ switch that turns the remaining fail-closed verification checks into best-effort
 **It is not the only way to weaken TLS, so do not audit for it alone.** Three further families of lever
 sit outside this variable entirely, and a config review that greps for `MEFOR_ALLOW_INSECURE_TLS` will
 miss all of them: per-connection **`cleartext_accepted` + `cleartext_reason`** (the sanctioned cleartext-hop
-declaration — warned, audited and reported); **`[security].enforcement = warn`** or
-**`handles_real_patient_data = false`** (instance-wide, and they downgrade or silence the gates
-themselves); and per-connection
+declaration — warned, audited and reported); **`[security].enforcement = warn`** (instance-wide, and it
+downgrades the gates themselves — its retired companion `handles_real_patient_data = false` silenced
+them outright and is now refused at load, [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); and per-connection
 **[`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-at-all)**, which no
 environment variable or posture clamp covers at all — the loosening register **does** report it, so the
 posture read-out is where to audit it.
@@ -558,8 +557,8 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 - **The clamp, precisely** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
   ADR 0092 decision 2): all four inbound gates and the API gate honour `--allow-insecure-bind` only while
   the instance is **not** (`enforcement = enforce` **and** PHI). Both halves are the default, so on a stock
-  instance the flag changes nothing — the recorded loosening is `[security].enforcement = warn` or
-  `[security].handles_real_patient_data = false`. These refusals also name `tls_hop_attested`, which the
+  instance the flag changes nothing — the recorded loosening is `[security].enforcement = warn`. These
+  refusals also name `tls_hop_attested`, which the
   gates do read, but that field has no authoring surface on a connection today (see
   [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
 - **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS or a declared
@@ -633,12 +632,11 @@ attestation:
    and no `connections.toml` key, so it is unreachable from config today. The blanket env var is the
    only attestation you can actually set. Do not plan a per-hop revocation posture around it.)
 3. **Stay on loopback**, which neither gate reaches.
-4. **Declare the box synthetic** — `[security].handles_real_patient_data = false` **silences the
-   outbound gate entirely**: the disposition returns ALLOW before it ever reaches the refuse arm, on
-   every hop, with no per-hop record. This is the widest crossing on the list and the easiest to reach
-   for by accident (it is also a plausible way to quieten startup output), so treat a synthetic
-   declaration on a box that carries real feeds as a **revocation-control failure**, not a labelling nit.
-   It is named in `security_loosenings()` / `GET /security/posture` — audit it there.
+4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
+   outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
+   the widest crossing on this list, the easiest to reach for by accident, and this page claimed it was
+   audited in `security_loosenings()`, which it never was. [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed it; the key is refused at
+   load. Nothing on this list silences the gate without a per-hop record any more.
 5. **`[security].enforcement = warn`** — downgrades every outbound revocation refusal to a **warning**
    and lets the hop proceed. Also a named loosening in the posture read-out.
 
@@ -660,6 +658,6 @@ on it — **reported is not gated**, and the two must never be written as if eit
 and a field with no factory parameter and no `connections.toml`
 key (`tls_hop_attested`, `tls_revocation_attested`) must never be offered as an operator lever.
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
-`enforcement`, `handles_real_patient_data`), and never describe `[egress]` as bounding a *transform* —
+`enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.
 Cross-referenced from `PHI.md` §4, `CLUSTERING.md`, and ADRs 0002 / 0078 / 0148 / 0153.*

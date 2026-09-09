@@ -28,7 +28,9 @@ backend = "sqlite"
 environment = "dev"
 
 [security]
-handles_real_patient_data = false
+block_unlisted_outbound = true
+allow_unencrypted_phi = true
+allow_unencrypted_phi_under_strict_enforcement = true
 """
 
 #: An outbound holding an expiry bridge open, and a generic-ODBC DATABASE pair — one outbound with no

@@ -175,7 +175,10 @@ def test_serve_allows_non_loopback_bind_with_tls(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet — the
     # TLS bind-guard is the subject here.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\n',
@@ -203,7 +206,10 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the mTLS shim wiring is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
@@ -231,7 +237,10 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the stock-protocol path is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n',
@@ -335,7 +344,10 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the upstream-TLS exposed-gate
     # is the subject here.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
         encoding="utf-8",
@@ -454,7 +466,14 @@ def _posture_b_toml(
     # there, which is exactly why the attestation gate had to move onto the declaration.
     body = (
         (f'security.enforcement = "{enforcement}"\n' if enforcement else "")
-        + ("security.handles_real_patient_data = false\n" if synthetic else "")
+        + (
+            "security.block_unlisted_outbound = true\n"
+            "security.allow_unencrypted_phi = true\n"
+            "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+            "alerts.security_notifications_required = false\n"
+            if synthetic
+            else ""
+        )
         + (
             ""
             if loopback

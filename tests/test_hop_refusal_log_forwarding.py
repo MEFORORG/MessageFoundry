@@ -40,9 +40,9 @@ from messagefoundry.config.tls_policy import HopDisposition, HopPosture
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, dial at warn
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)  # PHI, dial at warn
+SYNTHETIC = HopPosture(enforcing=True)  # not is_phi → always ALLOW
 
 REMOTE = "10.0.0.5"  # RFC 1918, non-loopback (never resolves; treated as off-box)
 LOOPBACK = "127.0.0.1"
