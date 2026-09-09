@@ -49,11 +49,11 @@ operational notes.
 |---|---|---|
 | API/WSS in-process TLS (WP-13a) | [`api/tls.py`](../messagefoundry/api/tls.py) `build_api_ssl_context`; [`config/settings.py`](../messagefoundry/config/settings.py) `ApiSettings.tls_*` | `PROTOCOL_TLS_SERVER`, `minimum_version` from `tls_min_version` (1.2/1.3 floor), `load_cert_chain(cert, key, password)`, optional ciphers, inherited KEX groups (approved-group pin inert until Python 3.15 - see [PHI.md](PHI.md) §4) + strict X.509; opt-in mTLS via `tls_client_ca_file` → `CERT_REQUIRED`. Wired into the single `uvicorn.run(...)` via `ssl_context_factory` ([`__main__.py`](../messagefoundry/__main__.py) ~538-545). |
 | API bind guard ("exposed" gate) | [`__main__.py`](../messagefoundry/__main__.py) ~419-451 | Non-loopback `[api].host` → **allow** if `tls_enabled`, **allow** if `tls_terminated_upstream` (+`trusted_proxies`), **warn** if `--allow-insecure-bind`, else **refuse (exit 2)**. Auth-disabled non-loopback is refused by a separate earlier gate **regardless of** `--allow-insecure-bind`. |
-| MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py) ~462-481 | Non-loopback + `auth.enabled` + **not** `require_mfa`: **refuse** on a production PHI instance, **warn** on a non-production PHI instance, quiet on synthetic. Gates **local** Administrator accounts only (AD MFA delegated). |
+| MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py) ~462-481 | Non-loopback + `auth.enabled` + **not** `require_mfa`: **refuse** on a production PHI instance, **warn** on a non-production PHI instance, quiet on synthetic. Gates every account `[security].require_mfa_scope` covers -- `every_local_account` by default, directory accounts included (BACKLOG #1144). |
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) ~540-610 | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` ~1655-1678 | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); `--allow-insecure-bind` downgrades to a warning; loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
 | Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips` in `uvicorn.run` ([`__main__.py`](../messagefoundry/__main__.py) ~531-533) | `tls_terminated_upstream` satisfies the gate **without** in-process TLS, but the model validator **requires** `trusted_proxies` to be set with it. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). |
-| TOTP MFA (WP-14) | ADR 0002 §3; `[auth].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP for local accounts; step-up boundary; admin reset; recovery codes. Built 2026-06-17. |
+| TOTP MFA (WP-14) | ADR 0002 §3; `[security].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP; access gate on every authorized route; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
 | Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
 | At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; `require_encryption=true` refuses start without a key; rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
@@ -81,7 +81,7 @@ the gate. The right topology depends on the orchestrator.
 
 ### The three options, justified
 
-- **(a) In-process TLS (WP-13a) — default for the shipped image.** Bind `[api].host = 0.0.0.0`,
+- **(a) In-process TLS (WP-13a) — default for the shipped image.** Bind `[security].listen_address = "0.0.0.0"` with `[security].local_access_only = false`,
   mount `tls_cert_file`/`tls_key_file`, publish `8443`. The bind guard sees `tls_enabled` → allows;
   HSTS engages on `https`, `/ws/stats` is `wss`. One image, no second process. Best for "docker run
   it and go" and for the byte-identical multi-instance rollout ADR 0017 wants.
@@ -384,7 +384,7 @@ The console stays a **host-side process**; only its target URL changes.
 
 7. **Production-PHI + local accounts must enable MFA to even start.** The MFA-at-exposure gate
    *refuses* a non-loopback bind on a production PHI instance with local accounts unless
-   `[auth].require_mfa = true`. An all-AD deployment is no exception: BACKLOG #1144 retired the
+   `[security].require_mfa = true`. An all-AD deployment is no exception: BACKLOG #1144 retired the
    directory delegation, so directory accounts are in scope too. The container's
    default config and docs must make `require_mfa = true` the production default, or the operator hits
    a hard startup refusal — which is correct, but should be expected, not surprising.

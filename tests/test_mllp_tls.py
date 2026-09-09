@@ -18,6 +18,7 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
 from messagefoundry.pipeline.wiring_runner import check_mllp_tls_exposure
+from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.mllp import (
     MLLPDestination,
     MLLPSource,
@@ -424,3 +425,114 @@ def test_a_crl_without_mtls_is_not_loaded(tmp_path: Path) -> None:
     assert ctx is not None
     assert ctx.verify_mode == ssl.CERT_NONE
     assert not (ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+
+# --- the connection test speaks the hop's own transport (#1178, ASVS 12.3.1) -------------------
+
+
+async def test_test_connection_handshakes_against_a_tls_listener(tmp_path: Path) -> None:
+    """A verified TLS destination's reachability probe completes the handshake, not just the TCP
+    connect. Passing on its own proves little -- the plaintext probe passed here too, because a
+    TCP connect to a TLS listener returns cleanly on the client side. Its partner below is the
+    test that discriminates."""
+    cert, key = _cert(tmp_path)
+    source = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={
+                "host": "127.0.0.1",
+                "port": 0,
+                "tls": True,
+                "tls_cert_file": cert,
+                "tls_key_file": key,
+            },
+        )
+    )
+    await source.start(lambda raw: build_ack(raw, code="AA"))
+    try:
+        dest = MLLPDestination(
+            Destination(
+                name="out",
+                type=ConnectorType.MLLP,
+                settings={
+                    "host": "127.0.0.1",
+                    "port": source.sockport,
+                    "timeout_seconds": 5,
+                    "tls": True,
+                    "tls_ca_file": cert,
+                    "tls_check_hostname": True,
+                },
+            )
+        )
+        try:
+            await dest.test_connection()
+        finally:
+            await dest.aclose()
+    finally:
+        await source.stop()
+
+
+async def test_test_connection_on_a_tls_destination_fails_against_a_cleartext_peer(
+    tmp_path: Path,
+) -> None:
+    """THE DISCRIMINATOR. Before #1178 this passed: the probe opened a plaintext socket, so a
+    tls=true destination reported a cleartext peer reachable and the operator learned nothing until
+    the first delivery failed. Two things would now have to be true for it to pass again -- the
+    probe would have to stop carrying the context, or stop handshaking with it."""
+    cert, _key = _cert(tmp_path)
+    plaintext = MLLPSource(
+        Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0})
+    )
+    await plaintext.start(lambda raw: build_ack(raw, code="AA"))
+    try:
+        dest = MLLPDestination(
+            Destination(
+                name="out",
+                type=ConnectorType.MLLP,
+                settings={
+                    "host": "127.0.0.1",
+                    "port": plaintext.sockport,
+                    "timeout_seconds": 5,
+                    "tls": True,
+                    "tls_ca_file": cert,
+                    "tls_check_hostname": True,
+                },
+            )
+        )
+        try:
+            with pytest.raises(
+                DeliveryError, match=r"MLLP (connect|TLS handshake) to 127\.0\.0\.1"
+            ):
+                await dest.test_connection()
+        finally:
+            await dest.aclose()
+    finally:
+        await plaintext.stop()
+
+
+async def test_a_plaintext_destination_still_probes_plaintext(tmp_path: Path) -> None:
+    """The control for the pair above, and the guarantee for TCP and X12: a destination with no
+    context passes none, so its probe is the same plain socket as before."""
+    plaintext = MLLPSource(
+        Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0})
+    )
+    await plaintext.start(lambda raw: build_ack(raw, code="AA"))
+    try:
+        dest = MLLPDestination(
+            Destination(
+                name="out",
+                type=ConnectorType.MLLP,
+                settings={
+                    "host": "127.0.0.1",
+                    "port": plaintext.sockport,
+                    "timeout_seconds": 5,
+                },
+            )
+        )
+        try:
+            assert dest._ssl is None
+            await dest.test_connection()
+        finally:
+            await dest.aclose()
+    finally:
+        await plaintext.stop()

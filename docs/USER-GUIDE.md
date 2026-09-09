@@ -158,7 +158,7 @@ Put it under version control with **Set Up Version Control & Checks** in the IDE
 
 ### 5. Open the admin console (in a browser)
 
-The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine and set `[api].serve_ui = true`). With the engine running, browse to:
+The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine and set `[security].serve_web_console = true`). With the engine running, browse to:
 
 ```
 http://127.0.0.1:8765/ui

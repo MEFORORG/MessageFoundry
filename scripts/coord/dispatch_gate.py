@@ -39,6 +39,21 @@ READ** and decides nothing. Four open rows state plainly that their work shipped
 built again, and every field above still says buildable on all four, because the verb in them is
 **REBUILD** and no screen in this repo reads for it.
 
+**And it reads the item's prose for a DISPATCH FENCE** (BACKLOG #1469). A fence is an imperative
+sentence a person wrote about one row, saying in terms that the row is not for a build lane and
+naming the seat it belongs to. Two rows carry one, both with byte-identical text. Measured
+2026-09-06 at 679 items, before this limb: a case-insensitive grep for "fence" over this file
+returned **zero** -- there was no concept of a fence here at all -- and both fenced rows came back
+``ok``, with a note byte-identical to an ordinary build item's. **That was not a broken gate.** On
+the same run it correctly raised MUST BE READ on two other rows from landed-code citations; the
+warning channel worked and populated from the tree. A fence was simply not one of its inputs.
+
+**AND IT IS THE ONE MUST-BE-READ ``--refuse`` BLOCKS ON.** Everything else at that level is
+INFERRED -- a token match in prose, or a citation in the tree -- and this file argues at length
+against blocking on an inference, because the screen #1394 records discarded 46 percent of the live
+ledger on one. A fence is a different kind of sentence: deliberate, imperative, and rare. Two in 679
+rows cannot produce that sweep.
+
 **And then it stops reading the row and ASKS THE TREE** (BACKLOG #1398). Every needle above reads
 prose somebody wrote about the code. A row can be fully built and shipped with **nothing in its text
 saying so**, and no amount of careful reading finds it. That is not the same class as the paragraph
@@ -73,9 +88,10 @@ it*.
 
 So each item comes back as one of four levels. ``ok`` closes by the builder's own act. ``advise``
 is workable, with the closing act and its owning seat named. ``read`` is **MUST BE READ**: the row
-itself says the work is already built, so this gate stops claiming to know and hands the question
-back. ``refuse`` is reserved for an item whose state nobody has declared, because there the dispatch
-can name nothing at all -- and even that blocks only under ``--refuse``.
+carries a fence, or says its work is already built, or landed code cites it -- so this gate stops
+claiming to know and hands the question back. ``refuse`` is reserved for an item whose state nobody
+has declared, because there the dispatch can name nothing at all. Neither blocks unless ``--refuse``
+is given, and under it only the undeclared, the unknown and the **fenced** block.
 
 **It is a DISPATCH aid, not a CI gate, on purpose.** Making missing fields a CI error would red the
 build for all 330 items at once and be disabled within a day.
@@ -318,6 +334,78 @@ def rebuild_marker(text: str) -> str | None:
     return " ".join(found.group(0).split()).lstrip("> ")[:180]
 
 
+# A DISPATCH FENCE IS THE ONLY SENTENCE HERE A PERSON WROTE ON PURPOSE ABOUT ONE ROW (BACKLOG
+# #1469).
+#
+# Every other needle in this file infers. The retirement one reads a declaration and decides what it
+# implies about dispatch; the already-built one reads a claim about state; the tree limb reads a
+# citation and says out loud that a citation is not a completion. A fence skips the inference: it
+# names the bar and the owning seat in the imperative. That is why this is the one level ``--refuse``
+# blocks on, and why blocking on it cannot rebuild the #1394 sweep -- two rows in 679 carry one.
+#
+# WHAT THE MARKER IS, DECIDED FROM THE TWO REAL INSTANCES rather than from the word. Both open a
+# line with ``**DISPATCH FENCE 2026-08-23:`` and both continue "NOT to a build lane ... Do not
+# dispatch it to a builder." The needle takes the DATED MARKER AT A LINE START and nothing else. The
+# date and the colon are load-bearing: they are what makes it a filed act rather than a mention. A
+# row narrating the convention writes "the marker is the words DISPATCH FENCE followed by a date",
+# which carries the words and not the shape, so it does not fire.
+#
+# THE BARE WORD IS NOT A CANDIDATE and the ledger settles it: measured 2026-09-06, 38 of 679 bodies
+# contain "fenc" in at least four unrelated senses -- self-fencing leader election, a ciphertext
+# prefix, a bold line-leading "Scope fence", and a fenced file. The needle below fires on 2. (With
+# this change's own row filed the corpus is 39 of 680, and the needle still fires on the same 2.)
+# ``test_the_fence_needle_does_not_fire_on_the_rest_of_the_ledger`` re-derives that pair rather than
+# trusting this sentence.
+#
+# THIS READS THE ITEM'S PROSE, NOT ITS BANNER, for the reason the retirement limb records: a banner
+# is what a machine writes ABOUT a row, and the 2026-09-03 scoring pass already quoted one row's
+# wording into another's. Both real fences are prose, so the narrower region costs no detection.
+#
+# TWO GUARDS, BOTH MEASURED AGAINST THE ROW THAT DOCUMENTS THIS:
+#
+# ``(?!#)`` -- a HEADING may not start a match. A row about fencing can name the marker in its title.
+#
+# The anchor allows only whitespace and markdown emphasis before the words. That is what keeps a
+# fence QUOTED IN A TABLE CELL from reading as this row's own: a documenting row lists the fenced
+# population in a table, and those lines begin ``| #1007 | "``.
+#
+# A BLOCKQUOTE PREFIX IS DELIBERATELY NOT ALLOWED, unlike in the already-built needle above. That
+# needle reads the banner, where every line is a blockquote, so it has no choice. This one reads
+# prose, where no fence has ever been written as one -- both live instances open with ``**``. Adding
+# the allowance would widen the needle toward the single false positive that matters here, a
+# documenting row quoting a fence as a blockquote, and buy a form the corpus does not contain.
+#
+#: The declaration: a dated dispatch fence, opening a line, plus the lines it wraps onto. The
+#: continuation is not cosmetic -- the ledger hard-wraps at ~100 columns and BOTH live fences put
+#: their actual imperative on the second and third lines, so a first-line-only capture quotes
+#: "...so it needs the vaulted" and drops "NOT to a build lane. Do not dispatch it to a builder."
+#: The quote is what lets a reader check the claim, and half a sentence does not.
+_DISPATCH_FENCE = re.compile(
+    r"(?m)^(?!#)[ \t]*[*_]{0,3}DISPATCH\s+FENCE\s+\d{4}-\d{2}-\d{2}\s*:"
+    r"[^\n]*(?:\n(?![ \t]*$)(?!#)[^\n]*){0,3}",
+    re.I,
+)
+
+#: How much of the fence the note quotes. Longer than the other markers on purpose: this is the one
+#: that blocks a wave, so the reader gets the whole imperative rather than its opening clause.
+FENCE_QUOTED = 280
+
+
+def fence_marker(body: str) -> str | None:
+    """The fence text if ``body`` fences this row off a build lane, else ``None``.
+
+    ``body`` is the item's heading and its own prose, the same region
+    :func:`retirement_marker` reads and for the same reason.
+
+    Returns WHAT FIRED, whitespace-collapsed and clipped, so the note can quote it and a reader can
+    check the claim instead of taking the gate's word for it.
+    """
+    found = _DISPATCH_FENCE.search(body)
+    if found is None:
+        return None
+    return " ".join(found.group(0).split()).lstrip("*_ ")[:FENCE_QUOTED]
+
+
 class Row(NamedTuple):
     """One ledger item, its heading plus prose, and its banner block on its own."""
 
@@ -401,6 +489,11 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
     only names who closes it, while a row that may already be built can cost a whole lane-window
     rebuilding shipped code. Nothing is hidden by the ranking -- every ``advise`` reason still rides
     in the note, after the MUST BE READ lead.
+
+    **A DISPATCH FENCE IS THE ONE EXCEPTION TO "DECIDES NOTHING", and only at the exit code.** The
+    level it returns is the same ``read``, so nothing about this function's contract moves; what
+    changes is that ``main`` blocks on it under ``--refuse``. See :func:`fence_marker` for why a
+    fence is not the same kind of sentence as the inferences beside it.
     """
     act = item.fields.get("closing-act", "").strip().lower()
     verdict = item.fields.get("verdict", "").strip().lower()
@@ -419,7 +512,23 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
         )
     )
 
-    # THE SECOND CONSULT, and the same single-line shape: turning this limb off kills every
+    # THE SECOND CONSULT. A fence is the only sentence here written deliberately about this row, so
+    # it is the only one that reaches the exit code -- `main` asks this same function again for that
+    # decision rather than sniffing the note text.
+    fenced = fence_marker(body)
+    fence_note = (
+        ""
+        if fenced is None
+        else (
+            f'MUST BE READ -- THIS ROW CARRIES A DISPATCH FENCE. It declares: "{fenced}". A person '
+            f"wrote that about this row and named the seat the work belongs to, so it is not an "
+            f"inference from a token match the way every other level here is. THIS IS THE ONE "
+            f"MUST-BE-READ --refuse BLOCKS ON. Brief the seat the fence names; a build lane is the "
+            f"one place this must not go."
+        )
+    )
+
+    # THE THIRD CONSULT, and the same single-line shape: turning this limb off kills every
     # already-built test at once. It reads the WHOLE row -- banner included -- because #1242
     # declares in its banner and its prose region is two lines long.
     already_built = rebuild_marker("\n".join((body, banner)))
@@ -446,7 +555,7 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
             f"declares no Closing-act (missing: {', '.join(missing)}). The dispatch cannot tell the "
             f"seat what would close this, or who closes it. Add the three lines to the banner."
         )
-        leads = [n for n in (retired_note, read_note) if n]
+        leads = [n for n in (retired_note, fence_note, read_note) if n]
         return "refuse", " ".join([*leads, undeclared])
 
     notes: list[str] = []
@@ -459,9 +568,17 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
     if retired_note:
         notes.append(retired_note)
 
+    # THE FENCE COMES NEXT, and the two orderings around it are both measured against what a reader
+    # who acts on the first sentence alone would do. A RETIREMENT still leads it: that row is dead,
+    # which is stronger than "not in this lane". The fence leads the ALREADY-BUILT note because the
+    # fence says who may work the row at all, and "this work has shipped" read first sends a
+    # dispatcher to close a row that was never theirs. test_a_retirement_still_leads_a_fence and
+    # test_the_fence_note_leads_the_already_built_note pin both, because a comment cannot.
+    if fence_note:
+        notes.append(fence_note)
+
     # AND THE ALREADY-BUILT NOTE LEADS THE REST, for that same reason: on a row whose work has
-    # shipped there is no work to start either. It sits behind the retirement note because a
-    # retirement is the stronger claim. test_the_must_be_read_note_leads pins this.
+    # shipped there is no work to start either. test_the_must_be_read_note_leads pins this.
     if read_note:
         notes.append(read_note)
 
@@ -491,8 +608,9 @@ def judge(item: Item, body: str = "", banner: str = "") -> tuple[str, str]:
         )
     # ORDER MATTERS HERE AND A SWAP IS SILENT. `read` is tested BEFORE `advise` because most rows
     # that fire the already-built needle also earn an advise reason, so an `if notes` first would
-    # make this level unreachable on the live ledger while every fixture still passed.
-    if read_note:
+    # make this level unreachable on the live ledger while every fixture still passed. The same
+    # holds for the fence: both live fenced rows close by `code`, so both would otherwise be `ok`.
+    if fence_note or read_note:
         return "read", " ".join(notes)
     if notes:
         return "advise", " ".join(notes)
@@ -649,6 +767,22 @@ def _self_test() -> int:
         "> **THE CORRECTION IS ALREADY BUILT AND PUSHED. Do not rebuild it.**\n"
         "> Closing-act: code\n"
     )
+    # A FENCED BODY, WORDED AS THE TWO LIVE ROWS WORD IT, with the row's own subject replaced.
+    fenced_body = (
+        "## 4253. the residual prose carries ungated file-line citations\n\n"
+        "**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs\n"
+        "the vaulted data and belongs to the seat that owns that record -- NOT to a build lane.**\n"
+        "*Do not dispatch it to a builder.*\n"
+    )
+    # THE FENCE'S OWN FALSE-POSITIVE TWIN, and it is the shape of the row that FILED this limb. The
+    # second line opens with the marker words and carries no date, which is the whole reason the
+    # needle requires one: it is what separates a filed act from a row naming the convention.
+    discusses_fencing = (
+        "## 4254. the dispatch gate does not read a row's DISPATCH FENCE\n\n"
+        "Two rows carry a dispatch fence and the gate reads none of it. The marker is the words\n"
+        "DISPATCH FENCE followed by a date and a colon, at the start of a line -- do not dispatch\n"
+        "it to a builder is the imperative they carry, and quoting it is not declaring it.\n"
+    )
     # THE SELF-REFERENCE TWIN, and it is #1393's own table verbatim with the numbers changed. This
     # row DESCRIBES the class the needle detects, so a needle allowed to start mid-line stops the
     # only row that explains the trap.
@@ -780,6 +914,22 @@ def _self_test() -> int:
             "MUST BE READ OUTRANKS ADVISE: #1107's real shape, where the advise reasons are present "
             "too and would otherwise take the headline off a row that may already be built",
         ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            fenced_body,
+            "",
+            "read",
+            "THE FENCE CASE: identical fields to the ok case, only the body differs. Both live "
+            "fenced rows close by 'code', so both graded ok with an ordinary build item's note",
+        ),
+        (
+            {"closing-act": "code", "verdict": "build", "research": "none"},
+            discusses_fencing,
+            "",
+            "ok",
+            "THE FENCE'S FALSE-POSITIVE TWIN: a row NAMING the marker without a date is describing "
+            "the convention, and stopping it stops the row that documents the rule",
+        ),
     ]
     for fields, body, banner, want, why in cases:
         got, reason = judge(mk(fields), body=body, banner=banner)
@@ -869,8 +1019,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--refuse",
         action="store_true",
-        help="exit 1 when any item is UNDECLARED or unknown. OFF by default: a dispatch names "
-        "closing acts, it does not block work. A tree hit never affects this.",
+        help="exit 1 when any item is UNDECLARED, unknown, or carries a DISPATCH FENCE. OFF by "
+        "default: a dispatch names closing acts, it does not block work. A tree hit never affects "
+        "this, and neither does a must-be-read inferred from prose.",
     )
     # ON BY DEFAULT, AND THAT IS THE WHOLE CHANGE. An opt-in tree check is a tree check nobody runs,
     # and the failure it catches is invisible to every reader who does not run it -- which is how
@@ -919,6 +1070,7 @@ def main(argv: list[str] | None = None) -> int:
     must_read: list[tuple[int, str]] = []
     refused: list[tuple[int, str]] = []
     unknown: list[int] = []
+    fenced: list[int] = []
     tree_hits = 0
     for num in asked:
         row = items.get(num)
@@ -926,6 +1078,12 @@ def main(argv: list[str] | None = None) -> int:
             unknown.append(num)
             continue
         level, note = judge(row.item, body=row.body, banner=row.banner)
+        # THE EXIT CODE ASKS THE NEEDLE, NOT THE NOTE. `judge` already consulted `fence_marker` for
+        # the wording; sniffing its output for a phrase would be a second, silently different
+        # definition of "fenced" that drifts the day the sentence is reworded. One function, two
+        # call sites, no second definition.
+        if fence_marker(row.body) is not None:
+            fenced.append(num)
         cited = cited_locations(tree.get(num))
         if cited:
             tree_hits += 1
@@ -975,11 +1133,23 @@ def main(argv: list[str] | None = None) -> int:
         "wave lacked was the NAME, not permission -- nobody was told the closing act was elsewhere."
     )
     if must_read:
+        # THE QUALIFIER IS LOAD-BEARING NOW THAT A FENCE BLOCKS. Left unqualified, this paragraph
+        # would tell a reader --refuse never blocks on a MUST BE READ while the exit code did
+        # exactly that -- a compensating control resting on a false premise, in the output of the
+        # tool that carries it.
         print(
-            "A MUST BE READ ROW IS NOT REFUSED, AND --refuse DOES NOT BLOCK ON ONE. A row can be\n"
-            "stale in either direction, whether the claim came from its own sentence or from the\n"
-            "tree. Blocking on it would rebuild the screen #1394 records, which discarded 46\n"
-            "percent of the live ledger on a token match."
+            "A MUST BE READ ROW INFERRED FROM PROSE OR FROM THE TREE IS NOT REFUSED, AND --refuse\n"
+            "DOES NOT BLOCK ON ONE. A row can be stale in either direction, whether the claim came\n"
+            "from its own sentence or from the tree. Blocking on it would rebuild the screen #1394\n"
+            "records, which discarded 46 percent of the live ledger on a token match."
+        )
+    if fenced:
+        print(
+            "A DISPATCH FENCE IS THE ONE MUST BE READ --refuse BLOCKS ON, and the difference is the\n"
+            "KIND of sentence rather than its strength. Every other level here is inferred. A fence\n"
+            "is an imperative a person wrote about this row, naming the seat it belongs to, and two\n"
+            "rows in the whole ledger carry one -- so refusing on it cannot produce a token-match\n"
+            "sweep. Brief the seat the fence names."
         )
     if tree_off is None:
         print(
@@ -995,9 +1165,14 @@ def main(argv: list[str] | None = None) -> int:
             "about the code. That is the class #1300 belongs to, and no amount of careful reading\n"
             "finds it. Re-run without --no-tree, or fetch the ref, before spending a lane-window."
         )
-    if args.refuse and (refused or unknown):
-        print("--refuse given: the wave contains undeclared or unknown items.")
-        return 1
+    if args.refuse:
+        if fenced:
+            named = ", ".join(f"#{n}" for n in fenced)
+            print(f"--refuse given: DISPATCH-FENCED, so not to a build lane: {named}.")
+        if refused or unknown:
+            print("--refuse given: the wave contains undeclared or unknown items.")
+        if refused or unknown or fenced:
+            return 1
     return 0
 
 

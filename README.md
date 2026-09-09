@@ -117,7 +117,7 @@ pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 te
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate, version-matched
-wheel (`messagefoundry-webconsole`) the engine mounts in-process (turn it on with `[api].serve_ui`), so
+wheel (`messagefoundry-webconsole`) the engine mounts in-process (turn it on with `[security].serve_web_console`), so
 a headless server, container, or adopter install stays lean. (The former PySide6 desktop console was
 retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
 tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
@@ -165,7 +165,7 @@ python -m messagefoundry serve --config samples/config --db messagefoundry.db --
 ```
 
 Then open the admin console in a browser (install the web console alongside the engine —
-`pip install -e packaging/messagefoundry-webconsole` — and set `[api].serve_ui = true`):
+`pip install -e packaging/messagefoundry-webconsole` — and set `[security].serve_web_console = true`):
 
 ```bash
 # browse to http://127.0.0.1:8765/ui and sign in

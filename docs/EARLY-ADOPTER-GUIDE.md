@@ -86,7 +86,7 @@ use the table below alongside them when planning.
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
-| **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[auth].require_mfa` enforces a second factor for local Administrators at the step-up boundary. AD/Entra users' MFA stays delegated to the IdP. See [SECURITY.md](SECURITY.md). |
+| **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; a directory account is in scope like any other (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
 | **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
@@ -397,7 +397,7 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
       in production, and configure the directory's lockout/complexity policy (the engine's account
       lockout covers local accounts only). AD/Entra MFA is enforced by your directory; **local
-      accounts** use the engine's **native TOTP MFA** (`[auth].require_mfa`, WP-14) — enable it before
+      accounts** use the engine's **native TOTP MFA** (`[security].require_mfa`, WP-14, **on by default**) — keep it on for
       an off-loopback PHI exposure.
 - [ ] **Populate the fail-closed `[egress]` allowlist** (it defaults to unrestricted) for REST/Database
       destinations.
