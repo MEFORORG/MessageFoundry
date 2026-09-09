@@ -26998,3 +26998,102 @@ off; if it is re-enabled, this row is the thing to argue with.
 **Source:** measured 2026-09-08 by the Lander while draining the merge queue, after the queue
 dropped a green pull request for want of a runner.
 ---
+
+## 1491. the web console step's cap rests on a CENSORED anchor, and the whole cost lands on the merge queue as evicted, healthy pull requests
+
+> 🔢 **Filed 2026-09-08 -- measured, not built. Owner ruled: file it, change nothing.**
+>
+> **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10**. Value 6 -- it removes a
+> failure that costs a healthy pull request a full extra CI cycle, about an hour, at roughly one
+> queue batch in twenty, and it does so without touching a single test. Difficulty 3 -- two numbers
+> in two files, both with a stated derivation rule to follow; the work is the MEASUREMENT, and most
+> of it is below.
+
+### The chain, and every link is in the tree already
+
+`scripts/ci/step_margin.py` reports **LOW** and exits 1 when `cap / elapsed < 1.30`
+(`DEFAULT_MIN_MARGIN`). For `Web console tests (pytest)` on `windows-2025` the cap is
+`matrix.webconsole_step_timeout = 6` in `.github/workflows/ci.yml`, so the step fails above **4:36**.
+
+`ci.yml` states the sizing rule: `step_timeout = ceil_minute(1.35 x that leg's anchor)`. Six minutes
+is `ceil(1.35 x 3:59)`. That **3:59** is the `windows-2025` web-console row in
+`scripts/ci/step_margin_baseline.toml`, and the row says of itself:
+
+    max_passing = "3:59"
+    censored    = true
+    censored_by = "the JOB cap of the `test` job -- ... equally retired by the move to a separate
+                   `webconsole` job"
+    source      = "measured 2026-08-08; ... Predates the job split (2026-08-16)."
+
+**So the cap was sized from a number the file marks as a LOWER BOUND, taken before the job split
+that retired the mechanism which censored it.** The file already prescribes the remedy, in the
+ubuntu row's `censored_by`: *"the first row measured under the new topology supersedes it."*
+
+### What it actually takes now, measured 2026-09-08
+
+Pool: the 300 most recent of 3,055 CI runs created since 2026-08-16. Step duration is
+`completed_at - started_at` on the step named `Web console tests (pytest)`, over steps that
+CONCLUDED SUCCESS.
+
+| leg | n | p50 | p95 | max | cap | LOW above | over |
+|---|---|---|---|---|---|---|---|
+| ubuntu-latest | 237 | 2:26 | 2:42 | 2:56 | 5:00 | 3:50 | 0 (0.0%) |
+| windows-2022 | 240 | 3:09 | 3:30 | 4:28 | 6:00 | 4:36 | 0 (0.0%) |
+| **windows-2025** | 240 | 3:28 | 4:27 | 5:09 | 6:00 | 4:36 | **6 (2.5%)** |
+
+**THE POOL WAS PROVED WHOLE BEFORE ANY NUMBER WAS READ FROM IT.** The five-way partition by event
+sums EXACTLY to the total the API reports for the same window -- `push 463 + pull_request 1872 +
+merge_group 696 + schedule 23 + workflow_dispatch 1 = 3055`, against a `total_count` of 3055. A page
+that came back silently short breaks that identity and cannot break it in a compensating way. Credit
+for the control: a peer session, same day.
+
+### The finding that matters: it is a MERGE-QUEUE-ONLY failure
+
+Same step, same leg, split by the event that started the run (120 most recent runs of each):
+
+| event | n | p50 | p95 | max | over 4:36 |
+|---|---|---|---|---|---|
+| `pull_request` | 72 | 3:28 | 4:25 | 4:33 | **0 (0.0%)** |
+| `merge_group` | 116 | 3:29 | 4:46 | 5:38 | **6 (5.2%)** |
+
+**The medians differ by one second. The entire difference is in the tail.** Every observed failure is
+a `merge_group` run and not one is a pull request's own check. That is why the symptom is so
+confusing from the outside: a pull request passes all 13 required contexts, is silently removed from
+the queue, and still passes all 13 afterwards. The check that removed it never ran as part of its own
+tests.
+
+Seven evictions on 2026-09-08 across four pull requests -- 859 (x2), 976 (x2), 974 (x2), 993 (x1) --
+none caused by the pull request. 859 and 976 both merged on a later attempt, so the cost is roughly
+**one extra CI cycle, about an hour, per eviction**, not correctness.
+
+### What a fix would be, and why it is NOT in this pull request
+
+Re-deriving the anchor to the measured **5:38** gives `ceil_minute(1.35 x 5:38)` = **8:00**, and a LOW
+point of `8:00 / 1.30` = **6:09**, which no run in either pool reaches. That is two numbers:
+the `windows-2025` web-console row in `step_margin_baseline.toml`, and `webconsole_step_timeout` for
+`W25` (and `W22`, if its 2:51 row gets the same treatment) in `ci.yml`.
+
+**Owner ruling 2026-09-08: file the measurement, change nothing.** A gate's sensitivity is not the
+Lander's to move on its own measurement.
+
+**WHAT IS STILL OWED BEFORE THE NUMBER IS WRITTEN IN, and this is the real work of the item.** The
+5:38 above is from a BOUNDED pool -- the most recent 120 `merge_group` runs -- so it is itself a
+lower bound, and swapping one lower bound for another is how this row got wrong the first time.
+Walking all 3,055 runs since the split costs about 3,055 API calls against a budget SHARED by every
+session on this machine; exhausting it on 2026-09-08 is what stopped the first attempt at this
+measurement. Whoever takes this should either walk the full pool deliberately with that cost
+budgeted, or state the bound in the row exactly as the file's contract requires -- pool AND count --
+and set `censored` honestly rather than asserting an uncensored maximum it did not observe.
+
+The nesting invariant in `ci.yml` must also still hold after any cap change:
+`setup(max) + webconsole_step_timeout < webconsole_job_timeout`, currently 20.
+
+**Related:** `#1304` (the sibling contention failure -- a pwsh launch that never returns, which
+evicts by a different mechanism on the same runners), `#344` (the item the baseline file and the
+sizing rule both come from).
+
+**Source:** measured 2026-09-08 by the Lander while draining the merge queue, after four pull
+requests were evicted while fully green and the cause was twice misdiagnosed -- first as runner
+starvation, then as an exceedance of the recorded maximum. It is neither: it is the margin against
+the cap, and the cap's anchor is censored.
+---
