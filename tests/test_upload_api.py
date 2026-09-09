@@ -374,11 +374,19 @@ async def test_browse_and_delete_path_traversal_404(engine: Engine, tmp_path: Pa
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
-        # A path-traversal-shaped id never resolves to a file — 404, no filesystem touch.
-        for bad in ("..%2f..%2fetc", "abc", "0" * 31):
+        # A path-traversal-shaped id never resolves to a file, and no filesystem touch happens.
+        # WHICH refusal you get depends on how far the value gets, and both are asserted so that a
+        # later widening of the id rule cannot pass silently:
+        #   * an encoded slash decodes to a path separator, so the router finds no matching route (404);
+        #   * anything else that is not 32 lowercase hex is refused by the file-id rule the request
+        #     edge now carries (422, BACKLOG #1108) rather than by the store's own guard.
+        r = await c.get("/uploads/..%2f..%2fetc/messages", headers=h)
+        assert r.status_code == 404, r.status_code
+        for bad in ("abc", "0" * 31, "0" * 33, ("0" * 31) + "G"):
             r = await c.get(f"/uploads/{bad}/messages", headers=h)
-            assert r.status_code == 404, (bad, r.status_code)
-        # A well-formed but non-existent id is also 404.
+            assert r.status_code == 422, (bad, r.status_code)
+        # A well-formed but non-existent id gets past the shape rule and is 404 — the control that
+        # proves the loop above is measuring the shape and not simply refusing everything.
         r = await c.delete(f"/uploads/{'0' * 32}", headers=h)
         assert r.status_code == 404
 

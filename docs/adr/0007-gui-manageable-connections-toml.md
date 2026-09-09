@@ -1,8 +1,37 @@
 # ADR 0007 — GUI-manageable connections as a config-as-data TOML artifact
 
-- **Status:** Proposed (2026-06-13) — drafted on the owner's go; ratified-on-build. Supersedes the
+- **Status:** **Accepted** — drafted on the owner's go (2026-06-13); the ratified-on-build condition
+  is met, recorded here 2026-09-09. Supersedes the
   implicit "connections are code-only" stance of earlier ADRs for the *transport/wiring* layer.
-- **Built:** Not yet — design record. Build is phased (see *Phasing*); Phase 1 (read path) first.
+  **This line read "Proposed (2026-06-13)" until 2026-09-09.** That was true at drafting; it was left
+  behind by the build it was conditioned on — see *Built* below for what shipped and where.
+- **Built:** **Yes — Phases 1, 2 and 3 are in the tree; re-verified against the working tree
+  2026-09-09.** *Phase 1, read path* — `CONNECTIONS_FILE_NAME` and `load_connections_file` in
+  [`config/connections_file.py`](../../messagefoundry/config/connections_file.py), called from both
+  loader entry points (`load_config` and `validate_config`) in
+  [`config/wiring.py`](../../messagefoundry/config/wiring.py), with a sample
+  `samples/config/connections.toml` and `tests/test_connections_file.py`. *Phase 2, CLI write path* —
+  the style-preserving `upsert_connection` / `remove_connection` writer in
+  [`config/connections_edit.py`](../../messagefoundry/config/connections_edit.py) on `tomlkit`
+  (`tomlkit>=0.12` in `pyproject.toml`, its comment naming this ADR), behind the
+  `connection list|upsert|remove|schema` subcommand registered and dispatched in
+  [`__main__.py`](../../messagefoundry/__main__.py). *Phase 3, VS Code editor* — the engine-derived
+  `SCHEMA_VERSION` schema in
+  [`config/connection_schema.py`](../../messagefoundry/config/connection_schema.py) plus the
+  `connectionEditor` / `connectionForm` / `connectionQuickInput` modules under `ide/src/`.
+  The 2026-07-19 amendment below is built too: `flagged` on both connection models and in the read and
+  write key sets, `Engine.set_connection_flag`
+  ([`pipeline/engine.py`](../../messagefoundry/pipeline/engine.py)) behind
+  `POST /connections/{name}/flag` ([`api/app.py`](../../messagefoundry/api/app.py)), and
+  `tests/test_connection_flag.py`. *Phase 4* is confirmed only in part: the decomposition
+  convention is documented ([docs/CONNECTIONS.md](../CONNECTIONS.md) section "Decomposing by role")
+  with the `IB_DEMO_ORU_*` sample, but the re-port of the deferred multi-destination fan-out feeds
+  sits outside this repository and is **not claimed** here.
+  **This line read "Not yet — design record. Build is phased (see *Phasing*); Phase 1 (read path)
+  first." until 2026-09-09.** It was accurate on 2026-06-13 and then went stale in silence: the
+  *Amendment (2026-07-19)* section below describes code in the tree while this header still said
+  nothing was built. The defect is an **under-claim** — a reader planning off the old line would plan
+  to build what already exists.
 - **Decision in one line:** add an **optional `connections.toml`** data artifact in the config dir
   that the loader reads into the **same** `InboundConnection`/`OutboundConnection` registry entries the
   code-first `inbound()`/`outbound()` factories produce — a flat, hand-editable **and**

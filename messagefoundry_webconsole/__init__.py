@@ -24,9 +24,8 @@ from pathlib import Path
 #: ``messagefoundry-harness``); its own tag / changelog / PyPI cadence. Starts matched to the engine.
 __version__ = "0.2.15"
 
-#: The engine contract versions this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). A pair
-#: outside this set is refused at startup — the runtime backstop behind the PEP 508 compat range.
-# Seam 9 is the S8a console-dashboard lane (#76/#131/#136, ADR 0065 + ADR 0007 amendments): the
+#: The engine seam this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). Any other engine is
+#: refused at startup — the runtime backstop behind the PEP 508 compat range.
 # The console supports EXACTLY the engine seam it was built against — deliberately a single value,
 # not a range (BACKLOG #279, resolved 2026-07-21 in favour of option (b)).
 #
@@ -45,7 +44,7 @@ __version__ = "0.2.15"
 # If cross-seam support is ever genuinely wanted, re-widen this set AND add the CI matrix that
 # installs the MIN and MAX supported engine builds — the claim and its test land together, or not
 # at all.
-SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"42fb8b34514ffc0f"})
+SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"fe0cb20044ca984d"})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"

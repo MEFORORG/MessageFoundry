@@ -86,6 +86,7 @@ from messagefoundry.config.wiring import (
     router,
 )
 from messagefoundry.diagnostics import checkpoint, log_note
+from messagefoundry.fhirsearch import FhirRaw, FhirToken
 from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
@@ -152,6 +153,8 @@ __all__ = [
     "FhirLookup",
     "fhir_lookup",
     "FhirLookupError",
+    "FhirToken",
+    "FhirRaw",
     "current_ingest_time",
     "current_environment",
     "AckMode",

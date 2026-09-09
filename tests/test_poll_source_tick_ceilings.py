@@ -230,6 +230,33 @@ async def test_file_stuck_files_do_not_charge_the_ceiling(
     assert _pending(inbox) == ["a_locked1.hl7", "a_locked2.hl7"]  # still there, still retryable
 
 
+async def test_a_tick_in_progress_stops_when_the_source_stops(tmp_path: Path) -> None:
+    """``_scan_once`` consults the stop event per file, as ``remotefile.py`` already did.
+
+    Measured before that check existed: ``file.py`` held exactly one ``_stop.is_set()``, in the
+    ``_run`` loop header, so a tick over a large drop ran to completion before ``stop()`` could
+    return. The check is the sibling of the ceiling break above and is read here with the CEILING
+    DISABLED on purpose -- left on, a low ceiling would end the scan by itself and this test would
+    pass with the stop check deleted.
+    """
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    _drop(inbox, 7)
+    src = _file_source(inbox, poll_max_files=0)  # unlimited: only the stop may end this scan
+    seen: list[bytes] = []
+
+    async def handler(raw: bytes) -> str | None:
+        seen.append(raw)
+        if len(seen) == 2:
+            src._stop.set()
+        return None
+
+    src._handler = handler
+    await src._scan_once()
+    assert len(seen) == 2, "the scan ignored the stop signal and drained the whole directory"
+    assert len(_pending(inbox)) == 5, "the unscanned remainder must be left in place"
+
+
 # === REMOTEFILE ===============================================================
 
 

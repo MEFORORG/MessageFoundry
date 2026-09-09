@@ -155,6 +155,12 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("PendingApprovalResponse", "detail"): None,  # why the action is held for a second approver
     ("AlertTestEmailResult", "detail"): None,  # a safe_exc-scrubbed SMTP send failure
     ("ConnectionTestResult", "detail"): None,  # a reachability-probe outcome
+    # The store-privilege preflight's own outcome. app.py copies it from the in-memory
+    # StorePrivilegePosture the serve lifespan stashed, so the route reads no store row: per
+    # backend the string is a fixed literal, or a driver exception's class name plus str(exc)
+    # through redact_log_line and cut to 300 characters. Its PERSISTED twin is audit_log.detail
+    # (PL-4), not either of the PL-2 `detail` columns this field NAME collides with.
+    ("StorePrivilegeView", "detail"): None,
     ("AiPolicy", "reason"): None,  # why the AI policy clamped, derived from config
     ("ConnectionMetadata", "metadata"): None,  # the operator's own connections.toml label table
     # OPEN QUESTION, recorded on BACKLOG #1185 and deliberately NOT ruled here. These two carry a

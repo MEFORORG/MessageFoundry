@@ -33,8 +33,8 @@
 # Nominating a public remote turns a durability control into an unreviewed publication channel.
 #
 # AND THE SAFE REMOTE IS NOT THE DEFAULT ONE. This checkout carries two remotes that differ in KIND:
-#     origin   MEFORORG/MessageFoundry       PUBLIC
-#     private  wshallwshall/MessageFoundry   PRIVATE
+#     origin   MEFORORG/MessageFoundry             PUBLIC
+#     private  wshallwshall/MessageFoundry-vault   PRIVATE
 # `git push` with no remote named resolves to `origin`, so the dangerous target is the one a hand
 # reaches by default and the safe one must be typed. That is a sharper trap than assuming a remote is
 # private and being wrong: here the wrong answer is what happens when nobody decides anything. It is

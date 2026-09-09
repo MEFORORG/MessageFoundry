@@ -25,6 +25,14 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+concurrency:
+  # security.yml's pattern, and its note there is the reasoning: per-ref for PR events so a rapid
+  # re-push supersedes its own in-flight run; schedule/dispatch runs get a unique group (run_id) and
+  # are never superseded, never cancelled. Without this block every superseded push left a run alive
+  # competing for one of the account's 20 concurrent slots.
+  group: zizmor-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -32,6 +40,7 @@ jobs:
   zizmor:
     name: zizmor (GitHub Actions static analysis)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: static analysis of the workflow files THEMSELVES — template injection, over-broad
     # GITHUB_TOKEN permissions, dangerous triggers, artifact-credential persistence. The baseline is
     # clean — high-confidence findings are fixed in-tree (least-privilege per-job permissions,

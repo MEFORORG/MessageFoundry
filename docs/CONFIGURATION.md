@@ -106,6 +106,7 @@ backend-limited.
 | `username` | str | — | server DBs (required when `auth = sql`) |
 | `password` | secret | — | **env only** (`MEFOR_STORE_PASSWORD`) |
 | `require_managed_identity` | bool | `false` | delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when `true`, `serve` **refuses to start (exit 2)** unless the store authenticates via a managed identity — SQL Server `auth = integrated`/`entra`. SQLite is exempt; Postgres cannot satisfy it. Off by default. **The refuse/warn split is `[security].enforcement`, not the production tier** — the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py), the `managed_identity_precondition` block), and `enforce` is the shipped default on `dev` and `staging` as much as on `prod`, so a staging box that turns this on and leaves `auth = "sql"` is **refused**, not warned. It downgrades to a warning only under `enforcement = warn`. **It covers the STORE hop and nothing else** — the check is a `StoreSettings` method, so the graph's own `Database` / `DatabasePoll` / `DatabaseLookup` / `DatabaseRef` hops are outside its reach by construction and each defaults to a static SQL login; `messagefoundry check`'s advisory `static-db-credentials` line names that set (BACKLOG #1182, [`CONNECTIONS.md`](CONNECTIONS.md) §*Static database credentials*) |
+| `require_least_privilege` | bool | `false` | least-**privilege** precondition on the store principal (#1008, ASVS 13.2.2) — the privilege sibling of `require_managed_identity` above, which constrains the credential's *kind* and never what it may do (a `sysadmin` gMSA satisfies that one clean; never grant one — [`DEPLOY-SERVER-DB.md` §1.1](DEPLOY-SERVER-DB.md)). **The probe itself is NOT gated by this setting:** it runs at every start regardless, logs what it observed, writes a `store_privilege_preflight` audit row, and reports any excess grant in `security_loosenings()` / `GET /security/posture`. This flag adds the **refusal**: when `true`, `serve` refuses to start if the principal holds more than the grant [`DEPLOY-SERVER-DB.md` §1.1/§1.2](DEPLOY-SERVER-DB.md) prescribes — **and also if the probe could not run at all**, since a declared refusal that passed an unobservable principal would be the fail-open shape it exists to prevent. Off by default so it can never block a legitimate deployment mid-setup. Refuse/warn splits on `[security].enforcement` exactly like `require_managed_identity`. SQLite is exempt (a local file has no server principal). |
 | `encrypt`, `trust_server_certificate` | bool | `true`/`false` | TLS to the DB |
 | `ssl_root_cert` | path | — | server DBs — pin the DB server's certificate by **file** so a private/self-signed DB CA verifies **without** a machine-wide trust import, on the **secure** posture only (`encrypt = true`, `trust_server_certificate = false`) — it never disables verification. **Postgres:** an asyncpg `SSLContext` CA-bundle (chain + hostname still checked). **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate` keyword (a leaf/exact-cert match; needs driver ≥ 18.1). Rejected for SQLite (no TLS); a missing file fails loud at load. A path, not a secret — may live in the file. See [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md). |
 | `multi_subnet_failover` | bool | `false` | **SQL Server only** — emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an Always On Availability Group **listener** reaches the current primary promptly across subnets, instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for Postgres/SQLite (they never see the ODBC string). Off by default — only a multi-subnet AOAG needs it. |
@@ -830,16 +831,46 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 
 ### `[sandbox]`
 **Opt-in subprocess isolation for Routers/Handlers** ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md),
-BACKLOG #197, ASVS 15.2.5). Routers/Handlers are admin-authored pure Python the engine runs in its own
-address space (the DEK, audit chain, and live sockets live there). `mode="off"` (the default) runs them
-in-process, **byte-identically and with zero overhead**. `mode="subprocess"` runs each inbound's
-Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing a
-forbidden-import guard (socket/store/crypto), the resource caps below, and a **fail-closed** refusal of
-the live `db_lookup`/`fhir_lookup` bridges (they re-enter the event loop — a subprocess boundary breaks
-that; a Handler needing live enrichment runs with `mode=off`). An isolation denial (forbidden op, cap
-overrun, worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK,
-never dropped).
+BACKLOG #197, ASVS 15.2.5).
+
+**It does not stop config Python executing in the engine process — read that before anything else.**
+The loader executes every `*.py` in your config directory in-process, as the service account, at every
+`serve` and every reload, and no value of `mode` changes that. What `mode` governs is where a Router's
+or Handler's **body** runs once the graph is built. Module top level is outside its reach either way.
+
+Routers/Handlers are admin-authored pure Python. The engine's own address space holds the DEK, the audit
+chain, and every live socket. `mode="off"` (**the default**) runs them in-process, **byte-identically and
+with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
+per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
+(socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
+worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never
+dropped).
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
+
+**`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
+whole graph, so whichever mode you pick governs **every** Router and Handler in the process. That
+matters most in the other direction: setting `mode="off"` because one Handler needs live enrichment
+takes every other Router and Handler out of the sandbox too. To isolate some feeds and not others you
+need separate engine processes.
+
+**What turning it on costs you.** Four things change relative to `mode="off"`:
+
+| | At `mode="subprocess"` |
+|---|---|
+| **Live enrichment** | `db_lookup` / `fhir_lookup` are **refused, fail-closed**. They re-enter the event loop and a process boundary breaks that. **A Handler needing either must run `mode="off"`** — that escape is supported and is not going away, and per the note above it applies to the whole engine, not to that Handler alone. |
+| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `cpu_seconds`/`mem_mb` arm with it. |
+| **Throughput** | About **0.19 ms per dispatch** with no reference view; a 20k-entry crosswalk costs about **4.5 ms** marshalling and **6.2 ms** end-to-end, roughly 1.4x a pickle round-trip — inside the pipeline's existing per-interface bound. **One message is not one dispatch:** a message routed to one handler with an `accepts=` predicate costs **three** (router, predicate, transform), and fan-out to K handlers costs **1 + 2K**, each re-marshalling the reference view. |
+| **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter with its own re-loaded copy of your config dir), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
+
+**Two more things the setting does not reach.** `messagefoundry check` and `messagefoundry dryrun`
+always run Routers/Handlers **in-process** and never consult `mode`. On the default that costs nothing,
+because `serve` runs them in-process too; once you set `mode="subprocess"` the preview stops matching
+the engine, so a Handler calling `db_lookup`/`fhir_lookup` passes the pre-deploy gate green and then
+fails closed at `serve`, and `wall_seconds` is unenforced in the preview. And
+`[pipeline].fuse_thread_hops` is **hard-disabled** whenever `mode="subprocess"`: fusion runs
+Router/Handler code in-process on an executor hop, so honouring both would silently unsandbox the code
+you asked to isolate. The runner fails closed to the async sandboxed path and logs it. To get fusion you
+must leave `mode="off"`.
 
 **The pipe itself is a control, and it is not configurable.** Both directions speak a **non-executing
 frame codec**: a closed tag set decoded with `json.loads` + `bytes.decode` and a literal tag match over a

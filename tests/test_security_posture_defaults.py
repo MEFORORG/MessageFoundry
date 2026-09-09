@@ -73,6 +73,7 @@ def _names(
             cleartext_hops,
             expiry_hops,
             db_hops,
+            None,
         )
     ]
 
@@ -107,6 +108,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             (),
             (),
             (),
+            None,
         )
     )
     assert "aad_bind" in named
@@ -130,6 +132,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             (),
             (),
             (),
+            None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -150,6 +153,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             (),
             (),
             (),
+            None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -442,6 +446,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             ("OB_LEGACY", "OB_LAB"),
             (),
             (),
+            None,
         )
     )
     assert "cleartext_accepted" in named
@@ -476,6 +481,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             (),
             ("OB_PARTNER_ADT", "OB_LAB_ORU"),
             (),
+            None,
         )
     )
     assert "tls_allow_expired" in named
@@ -502,6 +508,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             (),
             (),
             ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+            None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -785,6 +792,11 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # HARDENINGS at their non-default value (turning them ON tightens), so a flip is not a loosening.
         "require_encryption",
         "require_managed_identity",
+        # #1008: turning it ON adds a REFUSAL on an over-granted / unobservable store principal. The
+        # deviation it acts on IS reported — as the OBSERVATION passed in `store_privilege`, not as
+        # this switch — so it stays visible either way, and reporting the switch would make a
+        # hardening read as a weakening.
+        "require_least_privilege",
         # Security-relevant and gated ELSEWHERE, not by this registry. Extending it over them is real
         # work with its own SECURITY-LOOSENING.md entries — recorded as owed, not done silently.
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right

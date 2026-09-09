@@ -519,11 +519,13 @@ def FhirLookup(
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
     "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
-    mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
-    search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
-    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). That encoding is a
-    URL-layer control only; see ``transports.fhir._encode_search_params`` for the FHIR value-layer
-    separators it leaves intact. The parsed resource / searchset ``Bundle`` comes back as a dict.
+    mapping (``fhir_lookup(name, "Patient", {"identifier": FhirToken("MRN", mrn)})``). ``params`` is the
+    **only** search form — each value is percent-encoded by the engine, so a value cannot inject an extra
+    search parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). Percent-encoding is
+    a URL-layer control only, so each value also states its **kind** at the FHIR value layer: a plain
+    ``str`` is data and is refused if it carries ``,`` ``|`` or ``$``, a ``FhirToken`` is a
+    ``system|code`` pair, and a ``FhirRaw`` is author-written search syntax — see
+    :mod:`messagefoundry.fhirsearch`. The parsed resource / searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 
@@ -2280,6 +2282,10 @@ def DICOM(
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
+    max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
+    # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
+    # intakes' max_messages_per_second: this one makes a real modality wait.
+    association_burst: float | None = None,  # SCP: tokens the bucket holds (default = the rate)
     max_pdu_size: int = 16384,  # cap one PDU's bytes (0 = unbounded); DoS guard
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
@@ -2303,7 +2309,21 @@ def DICOM(
     bytes from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and
     classifies the C-STORE status onto the retry model (out-of-resources → retry; a hard refusal →
     dead-letter). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
-    imaging lane is the sibling :func:`DICOMweb` STOW-RS destination."""
+    imaging lane is the sibling :func:`DICOMweb` STOW-RS destination.
+
+    **Association-rate pacing (SCP, ASVS 2.4.1 / 15.2.2, BACKLOG #1114).**
+    ``max_associations_per_second`` bounds how fast this SCP ACCEPTS new associations;
+    ``association_burst`` is how large a burst passes before the sustained rate applies (default: one
+    second's worth). Over budget the SCP **waits before reading the association request**, so the peer
+    is back-pressured by TCP and then served in full — nothing is dropped, refused or answered
+    differently, and a rejected association charges nothing. **The unit is an association, not a
+    message**, and that is a property of DIMSE rather than a shortcut: ``pynetdicom`` owns the read
+    loop, so by the time a C-STORE reaches this engine the object has already been read and decoded,
+    and pacing there would delay a message the count-and-log invariant has already obliged us to
+    account for. So an established association is NOT bounded in the objects it may push — those are
+    bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
+    guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
+    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace."""
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -2323,6 +2343,8 @@ def DICOM(
             "tls_allow_expired": tls_allow_expired,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,
+            "max_associations_per_second": max_associations_per_second,
+            "association_burst": association_burst,
             "max_pdu_size": max_pdu_size,
             "timeout_seconds": timeout_seconds,
             "connect_timeout": connect_timeout,

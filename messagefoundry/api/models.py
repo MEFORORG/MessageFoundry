@@ -29,6 +29,21 @@ from pydantic import BaseModel, Field
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
+from messagefoundry.api.validation import (
+    MAX_EXPORT_IDS,
+    MAX_MAP_ENTRIES,
+    ConnectionName,
+    ControlIdFilter,
+    DisplayLabel,
+    EmailAddress,
+    FilesystemPath,
+    IdempotencyKey,
+    LogLevelName,
+    MessageTypeFilter,
+    ResourceId,
+    SearchText,
+    StatusFilter,
+)
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -104,16 +119,21 @@ class MessageSearchRequest(RequestModel):
     :mod:`messagefoundry.store.content_search`, and importing them here would drag the engine into
     every process that imports these models (ADR 0088 keeps the apiclient engine-free), so the route
     resolves the default and enforces the ceiling instead of the field doing it.
+
+    ``field_path`` carries a length bound only, and deliberately so: its grammar is
+    :func:`messagefoundry.parsing.peek.parse_path`, applied eagerly by
+    :func:`messagefoundry.store.content_search.make_spec` at every acceptance point, so a malformed
+    path is already a 4xx. A pattern here would be a second definition of a rule that has one.
     """
 
-    content: str | None = Field(None, max_length=512)
+    content: SearchText | None = None
     field_path: str | None = Field(None, max_length=32)
-    field_value: str | None = Field(None, max_length=512)
+    field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
-    channel_id: str | None = Field(None, max_length=256)
-    status: str | None = Field(None, max_length=64)
-    message_type: str | None = Field(None, max_length=64)
-    control_id: str | None = Field(None, max_length=256)
+    channel_id: ConnectionName | None = None
+    status: StatusFilter | None = None
+    message_type: MessageTypeFilter | None = None
+    control_id: ControlIdFilter | None = None
     limit: int = Field(50, ge=1, le=500)
     scan_limit: int | None = Field(None, ge=1)
 
@@ -123,7 +143,7 @@ class MessageExportRequest(MessageSearchRequest):
     console's *save-selected*) beside the inherited search criteria (*save-all*), and raises ``limit``
     to the export route's own ceiling."""
 
-    ids: list[str] = Field(default_factory=list)
+    ids: list[ResourceId] = Field(default_factory=list, max_length=MAX_EXPORT_IDS)
     limit: int = Field(1000, ge=1, le=100_000)
 
 
@@ -132,12 +152,12 @@ class UploadedMessageSearchRequest(RequestModel):
     browse takes no channel/status filter and pages with ``offset``, so it is a sibling of
     :class:`MessageSearchRequest` rather than a subclass of it."""
 
-    content: str | None = Field(None, max_length=512)
+    content: SearchText | None = None
     field_path: str | None = Field(None, max_length=32)
-    field_value: str | None = Field(None, max_length=512)
+    field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
-    message_type: str | None = Field(None, max_length=64)
-    control_id: str | None = Field(None, max_length=256)
+    message_type: MessageTypeFilter | None = None
+    control_id: ControlIdFilter | None = None
     limit: int = Field(50, ge=1, le=500)
     offset: int = Field(0, ge=0)
 
@@ -238,12 +258,13 @@ class ResendRequest(RequestModel):
 
     ``to`` is the alternate outbound connection; ``source`` (optional) names which delivered
     destination's stored body to copy when the origin fanned out to several (omit when there was one).
-    ``idempotency_key`` makes a retry a no-op — a *new* key is a genuine second resend. Values are
-    bounded so an over-long name can't reach a store query (ASVS 1.3.3)."""
+    ``idempotency_key`` makes a retry a no-op — a *new* key is a genuine second resend. Values carry
+    the connection-name rule (BACKLOG #1108), so an over-long or structurally impossible name is
+    refused before it can reach a store query (ASVS 1.3.3, 2.1.1)."""
 
-    to: str = Field(min_length=1, max_length=256)  # the alternate outbound connection
-    idempotency_key: str = Field(min_length=1, max_length=256)
-    source: str | None = Field(None, max_length=256)  # source delivery to copy the body from
+    to: ConnectionName  # the alternate outbound connection
+    idempotency_key: IdempotencyKey
+    source: ConnectionName | None = None  # source delivery to copy the body from
 
 
 class ResendResult(BaseModel):
@@ -270,10 +291,13 @@ class EditResendRequest(RequestModel):
     it overrides ``reroute``. ``idempotency_key`` makes a retry a no-op — a *new* key is a genuine second
     resubmit. The ORIGINAL message stays byte-identical either way."""
 
+    # ``raw`` is a MESSAGE BODY — the data plane. It keeps a size bound and no alphabet rule: an HL7
+    # v2 body is separated by carriage returns and may carry any encoding the sender used, so the
+    # control-plane printable rule (BACKLOG #1108) must not reach it.
     raw: str = Field(min_length=1, max_length=16_000_000)  # the edited body (PHI — never echoed)
-    idempotency_key: str = Field(min_length=1, max_length=256)
+    idempotency_key: IdempotencyKey
     reroute: bool = True
-    to: str | None = Field(None, max_length=256)  # optional direct alternate outbound (power-path)
+    to: ConnectionName | None = None  # optional direct alternate outbound (power-path)
 
 
 class EditResendResult(BaseModel):
@@ -374,9 +398,11 @@ class AlertInstanceList(BaseModel):
 
 
 class DeadLetterReplayRequest(RequestModel):
-    # Connection names; bounded so an over-long value can't reach the store query (ASVS 1.3.3).
-    channel_id: str | None = Field(None, max_length=256)  # scope replay to one inbound (None = all)
-    destination_name: str | None = Field(None, max_length=256)  # scope to one outbound (None = all)
+    # Connection names; they carry the connection-name rule so a value that could not name a
+    # connection never reaches the store query (ASVS 1.3.3, 2.1.1 — BACKLOG #1108). The pattern
+    # bounds length at 256 as well, so this keeps main's bound and adds the character rule.
+    channel_id: ConnectionName | None = None  # scope replay to one inbound (None = all)
+    destination_name: ConnectionName | None = None  # scope to one outbound (None = all)
 
 
 class DeadLetterReplayResult(BaseModel):
@@ -424,7 +450,7 @@ class ReloadRequest(RequestModel):
     # server's startup --config dir. Any value must resolve within an allowed reload root (the
     # startup dir or [api].config_reload_roots) — the loader executes Python from it. Length-bounded
     # (ASVS 1.3.3); the allow-list confinement remains the real control.
-    config_dir: str | None = Field(None, max_length=4096)
+    config_dir: FilesystemPath | None = None
     # dry_run: validate the graph against THIS environment (loads + build-checks connectors, which
     # resolves env() values for the target) and report the result WITHOUT swapping the live graph.
     # The promote pre-flight: catch a missing env value / bad spec before it goes live.
@@ -536,15 +562,15 @@ class StatsResetTarget(RequestModel):
     For ``source`` rows ``destination`` is ignored; for ``destination`` rows it is required."""
 
     role: Literal["source", "destination"]
-    channel_id: str = Field(min_length=1, max_length=256)
-    destination: str | None = Field(default=None, max_length=256)
+    channel_id: ConnectionName
+    destination: ConnectionName | None = None
 
 
 class StatsResetRequest(RequestModel):
     """Reset the dashboard's cumulative counters for ``targets``, or for every connection (``all``)."""
 
     all: bool = False
-    targets: list[StatsResetTarget] = Field(default_factory=list)
+    targets: list[StatsResetTarget] = Field(default_factory=list, max_length=MAX_MAP_ENTRIES)
 
 
 class StatsResetResult(BaseModel):
@@ -771,7 +797,9 @@ class LogLevelUpdate(RequestModel):
     """PATCH body for the runtime verbosity control (BACKLOG #171): the new root/uvicorn level. Ephemeral
     — the override resets on process restart, and NOT on ``/config/reload`` (ADR 0130 §1)."""
 
-    level: str
+    # The authority for which names are legal is ``logging_setup.LOG_LEVELS``, which the route calls
+    # and 4xxs on; this only fixes the shape (BACKLOG #1108).
+    level: LogLevelName
 
 
 class LogTailPage(BaseModel):
@@ -1004,7 +1032,7 @@ class DrActivateRequest(RequestModel):
     attestation does NOT prove the restore's vintage or completeness — that rests on the DBA runbook
     (BACKLOG #102)."""
 
-    archive: str | None = None
+    archive: FilesystemPath | None = None
     dba_attests_restored: bool = False
 
 
@@ -1055,6 +1083,32 @@ class SecurityLoosening(BaseModel):
     risk: str
 
 
+#: The value ``StorePrivilegeView.status`` carries when no preflight ran in THIS process (an
+#: embedding, or an app built without the managed lifespan). It is deliberately its own value: the
+#: three real statuses are what the probe found, and "nobody looked" must never render as one of them.
+STORE_PRIVILEGE_NOT_PROBED = "not_probed"
+
+
+class StorePrivilegeView(BaseModel):
+    """What the startup preflight OBSERVED about the store principal's effective privileges (#1008,
+    ASVS 13.2.2).
+
+    ``status`` is the load-bearing field and has four values, three of which come straight from
+    ``StorePrivilegeStatus``: ``observed`` (the probe read the principal — ``excess`` then tells you
+    whether it is clean), ``not_applicable`` (SQLite: a local file, no server principal exists),
+    ``unobservable`` (the probe could NOT run) and ``not_probed`` (no preflight ran in this process).
+    Only ``observed`` with an empty ``excess`` is a clean bill of health; the other three are each a
+    DIFFERENT reason there isn't one, and none of them may be read as a pass."""
+
+    status: str
+    #: Privileges the principal holds beyond the documented least-privilege grant, named individually.
+    #: A count would say "3 grants are excessive" without saying which, which is the shape that lets a
+    #: grant nobody intended survive a posture review.
+    excess: list[str] = Field(default_factory=list)
+    #: Why the probe could not observe, or what it observed against. Never secret material.
+    detail: str = ""
+
+
 class SecurityPosture(BaseModel):
     """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
     permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
@@ -1098,6 +1152,13 @@ class SecurityPosture(BaseModel):
     # settings-only subset with no marker would understate the posture, which is the one thing this
     # route must not do; ``messagefoundry security show`` carries the same marker for the same reason.
     loosenings_scope: str | None = None
+    # #1008 (ASVS 13.2.2): the store principal's OBSERVED effective privileges. Always present — the
+    # default is the explicit ``not_probed`` status, never an empty/clean-looking value, so an app that
+    # never ran the preflight says so rather than reading as observed-and-fine. An over-grant and an
+    # unobservable probe ALSO appear in `loosenings` above; this field is the full observation.
+    store_privilege: StorePrivilegeView = Field(
+        default_factory=lambda: StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
+    )
     # Set WHERE handles_real_patient_data=false: the strict PHI-only controls (at-rest-encryption refusal,
     # deny-by-default egress, bounded retention) are relaxed because the instance carries no ePHI (AC-6).
     synthetic_relaxation: str | None = None
@@ -1244,7 +1305,7 @@ class AlertTestEmailRequest(RequestModel):
     when set, redirects this one test send to a single alternate address (operator config, admin-gated);
     it is never echoed back in the result."""
 
-    recipient_override: str | None = None
+    recipient_override: EmailAddress | None = None
 
 
 class AlertTestEmailResult(BaseModel):
@@ -1324,7 +1385,7 @@ class UploadResendRequest(RequestModel):
     ``idempotency_key`` is unused today (each inject is a distinct receipt) but reserved for parity."""
 
     index: int = Field(ge=0)
-    to: str = Field(min_length=1, max_length=256)  # the target inbound connection
+    to: ConnectionName  # the target inbound connection
 
 
 class UploadResendResult(BaseModel):
@@ -1352,14 +1413,14 @@ class SearchPresetCriteria(RequestModel):
     ADR 0046 seam). ``content`` / ``field_value`` are PHI-shaped — the preset column is encrypted at
     rest and every save/recall is step-up-gated + audited."""
 
-    content: str | None = Field(None, max_length=512)
+    content: SearchText | None = None
     field_path: str | None = Field(None, max_length=32)
-    field_value: str | None = Field(None, max_length=512)
+    field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
-    channel_id: str | None = Field(None, max_length=256)
-    status: str | None = Field(None, max_length=64)
-    message_type: str | None = Field(None, max_length=64)
-    control_id: str | None = Field(None, max_length=256)
+    channel_id: ConnectionName | None = None
+    status: StatusFilter | None = None
+    message_type: MessageTypeFilter | None = None
+    control_id: ControlIdFilter | None = None
     limit: int = Field(50, ge=1, le=500)
 
 
@@ -1381,7 +1442,7 @@ class SearchPresetList(BaseModel):
 class SearchPresetCreateRequest(RequestModel):
     """Create-or-replace a named preset for the calling user. ``name`` is a per-user unique label."""
 
-    name: str = Field(min_length=1, max_length=128)
+    name: DisplayLabel
     criteria: SearchPresetCriteria
 
 

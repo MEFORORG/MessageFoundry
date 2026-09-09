@@ -17,7 +17,36 @@
   SAML via Entra) and SMART on FHIR are *out of this ADR's scope*** — they get a dedicated
   federated-SSO ADR when 0.2 design begins. *(Originally Proposed 2026-06-12 as design-only under the
   "design now, build then" rule; this acceptance supersedes that deferral.)*
-- **Built:** Nothing in this ADR is built yet — it designs **WP-13a** (API/WebSocket TLS), **WP-13b**
+- **Built:** **All four work packages are BUILT.** Corrected 2026-09-09. The stale sentence below is
+  kept rather than deleted, because a reader planning off it would plan to build code that already
+  exists. Its WP-14 parenthetical is that sentence's only build marker, so the leading claim reads as
+  scoping the exception to MFA alone while WP-13a, WP-13b and WP-15 shipped underneath it. Verified by
+  symbol against the tree on 2026-09-09, because line numbers rot and symbols do not: **WP-13a** is
+  `build_api_ssl_context` and `ensure_api_tls_material` ([api/tls.py](../../messagefoundry/api/tls.py)),
+  imported and called on the `serve` path ([__main__.py](../../messagefoundry/__main__.py)) for every
+  topology that terminates TLS in-process -- a declared `[api].tls_terminated_upstream` proxy is the
+  deliberate exception, where `ensure_api_tls_material` returns `None` and the serve path builds no
+  context at all
+  ([ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+  decision 3); **WP-13b** is `_mllp_ssl_context`
+  ([transports/mllp.py](../../messagefoundry/transports/mllp.py)), built once per connection and wired
+  on both the outbound (`MLLPDestination`) and the inbound (`MLLPSource`) side, each call site
+  self-labelled WP-13b; **WP-14** is `auth/totp.py` (RFC 6238) with the enroll / verify / step-up flow
+  in [auth/service.py](../../messagefoundry/auth/service.py); **WP-15** is `[api].trusted_proxies` and
+  `[api].tls_terminated_upstream` ([config/settings.py](../../messagefoundry/config/settings.py)),
+  reaching uvicorn as `forwarded_allow_ips` and the app as `app.state.trusted_proxies`
+  ([api/app.py](../../messagefoundry/api/app.py)); `ApiSettings.exposure_protected` is the §0
+  exposed-gate predicate. **Scope: the four work packages shipped. That is NOT a claim that every
+  clause of this ADR is live.** Two sub-clauses it already scopes stay unbuilt on purpose -- the mTLS
+  client-certificate identity resolver is inert under stock uvicorn (§4,
+  [ADR 0083](0083-mtls-client-certificate-identity.md)), and in-engine OCSP/CRL revocation is delegated
+  rather than implemented (*Certificate revocation*,
+  [ADR 0078](0078-certificate-revocation-posture.md)).
+  **STALE AS WRITTEN, kept for the record. The stale span ENDS at "forwarded-header hardening)" and
+  the claim was true only of the original design-only ADR. The Phase-0/1 groundwork sentence after
+  that point is NOT stale and NOT corrected here -- its four anchors (`_security_headers`,
+  `_ws_origin_allowed`, the `--allow-insecure-bind` bind guard, `insecure_tls_allowed()`) each still
+  resolve to a live symbol, checked 2026-09-09:** Nothing in this ADR is built yet — it designs **WP-13a** (API/WebSocket TLS), **WP-13b**
   (MLLP-over-TLS, v0.1), **WP-14** (MFA, **built 2026-06-17 — see §3**), and **WP-15** (reverse-proxy /
   forwarded-header hardening). The
   Phase-0/1 groundwork it *builds on* is already shipped and must **not** be redesigned:

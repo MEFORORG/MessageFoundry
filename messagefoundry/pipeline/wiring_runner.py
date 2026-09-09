@@ -87,6 +87,7 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
     resolve_listener_binding,
 )
+from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.parsing import (
@@ -1589,13 +1590,14 @@ class RegistryRunner:
         self,
         connection: str,
         query: str,
-        params: Mapping[str, str | list[str]] | None = None,
+        params: FhirSearchParams | None = None,
     ) -> dict[str, Any]:
         """The FHIR-lookup runner published to Handlers (``fhir_lookup`` → this). Called FROM the handler's
         worker thread, it bridges the async GET onto the engine loop via ``run_coroutine_threadsafe`` and
         blocks the WORKER THREAD — never the loop — for the result (bounded by
         ``_LOOKUP_RESULT_TIMEOUT_SECONDS``). ``params`` (BACKLOG #204) carries the safely-encoded
-        structured search form; the executor percent-encodes each value before it reaches the URL."""
+        structured search form; the executor percent-encodes each value and resolves its kind at the FHIR
+        value layer, refusing a plain ``str`` that carries a separator (BACKLOG #1243)."""
         executor = self._fhir_lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
@@ -2983,8 +2985,11 @@ class RegistryRunner:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
-        AND a config source is available (an embedded runner with no config dir can't re-load the
-        graph in a child, so it degrades to in-process). The :class:`SandboxSession` object is created
+        AND a config source is available. **An embedded runner with no config dir cannot isolate** —
+        the child re-loads the graph from ``(config_dir, env)`` to look a function up by name, so with
+        no config dir it degrades to in-process. That degradation is **silent**: a library embedder
+        that asked for ``subprocess`` gets the in-process path and nothing says so. Every ``serve``
+        route carries a config dir. The :class:`SandboxSession` object is created
         here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
         first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
         at :meth:`stop`."""

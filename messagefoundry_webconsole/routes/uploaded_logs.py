@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import UploadedMessageSearchRequest, UploadResendRequest
@@ -381,10 +382,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # destructive or PHI-shaped. ``to`` is a connection name, i.e. a structural locator, which the
         # engine already writes to the audit store by name on every resend.
         #
-        # Bounds live on the Query params now: the request body no longer passes through
-        # UploadResendRequest's own Field(ge=0) / max_length=256 before reaching us.
+        # The Query params carry the LENGTH bounds; the model carries the connection-name RULE
+        # (BACKLOG #1108), which the query declaration deliberately does not repeat -- a second copy
+        # would be a second definition. So the model can still refuse a value the query accepted, and
+        # a `to` that could not name a connection is refused HERE, before the engine sees it.
         assert_same_origin(request)
-        body = UploadResendRequest(index=index, to=to)
+        try:
+            body = UploadResendRequest(index=index, to=to)
+        except ValidationError:
+            # Same shape as an engine refusal below, and for the same reason: answering with the
+            # SUCCESS response would tell the operator a message was injected when none was. The
+            # rejected value is caller-supplied, so it travels nowhere -- not into the URL, the HTML
+            # or the log.
+            _log.warning(
+                "uploaded-log resend refused: file_id=%s reason=malformed_target",
+                _log_file_id(file_id),
+            )
+            return _refused("resend_failed")
         try:
             await core.resend_uploaded_message(
                 request, file_id=file_id, body=body, engine=engine, identity=identity

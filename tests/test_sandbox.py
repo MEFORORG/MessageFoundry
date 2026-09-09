@@ -1490,3 +1490,51 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
             raise OSError("pipe died with the worker")
 
     _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]
+
+
+# --- (l) one default, in one place, all the way to the runner policy ---------
+
+
+def test_the_sandbox_mode_default_is_off_and_lives_in_exactly_one_place() -> None:
+    """The shipped mode is ``off``, and only ONE object is allowed to say so.
+
+    BACKLOG #1278 proposed flipping this default to ``subprocess``; the owner ruled on 2026-09-09
+    that it stays ``off`` and the mode stays available opt-in. What survives from that work is the
+    single-default discipline, which is what this test pins. Three separate objects could each answer
+    "which mode does a stock engine run?", and a test on any one of them alone would pass while
+    another quietly disagreed:
+
+    1. ``SandboxSettings.mode`` — the setting itself, and the only place a default belongs.
+    2. ``Engine(sandbox_settings=None)`` — the caller that passes nothing. It must resolve to the
+       same mode as the setting, not to something it chose for itself.
+    3. ``SandboxPolicy`` — which used to carry ``mode = SandboxMode.OFF`` as a SECOND default. It no
+       longer carries one at all, and this pins that: a default there would be free to disagree with
+       the setting silently, and the two agreeing today is what makes such a drift invisible.
+
+    Deliberately NOT a subprocess round-trip — the parity and isolation behaviour is covered above.
+    This asserts only which mode a stock engine resolves to, and where that answer comes from."""
+    import dataclasses
+
+    from messagefoundry.config.settings import SandboxSettings, ServiceSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    assert SandboxSettings().mode == "off"
+    assert ServiceSettings().sandbox.mode == "off"
+
+    # An Engine handed no [sandbox] section renders the SAME mode, not a quietly different one.
+    engine = Engine(store=None, sandbox_settings=None)  # type: ignore[arg-type]
+    assert engine._sandbox_settings.mode == "off"
+
+    # SandboxPolicy must have NO default for `mode`, so it can never contradict the setting.
+    mode_field = next(f for f in dataclasses.fields(SandboxPolicy) if f.name == "mode")
+    assert mode_field.default is dataclasses.MISSING, (
+        "SandboxPolicy.mode grew a default again. The one default lives in SandboxSettings; a "
+        "second one here is free to drift away from it without any test noticing."
+    )
+
+    # Both modes stay constructible. mode=subprocess is the opt-in isolation posture; mode=off is
+    # also the supported escape for a Handler needing db_lookup/fhir_lookup, which fail closed
+    # inside the child.
+    assert SandboxSettings(mode="subprocess").mode == "subprocess"
+    assert SandboxPolicy(mode=SandboxMode.SUBPROCESS).mode is SandboxMode.SUBPROCESS
+    assert SandboxPolicy(mode=SandboxMode.OFF).mode is SandboxMode.OFF

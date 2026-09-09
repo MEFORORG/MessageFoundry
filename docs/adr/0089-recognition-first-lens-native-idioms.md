@@ -1,6 +1,6 @@
 # ADR 0089 — Recognition-first lens: render native Message-API idioms as editable action rows
 
-**Status:** Accepted (2026-07-13) — owner-ratified. Extends ADR 0076. Phase A (native-idiom recognition) is built and adopted (owner Steps-view endorsement); the ADR 0104 §2.3 HL7 field picker and the remaining phases build against it. (The 0/1,283 scan measured non-use of the ADR 0076 vocabulary API — **not** Steps-view adoption.)
+**Status:** Accepted (2026-07-13) — owner-ratified. Extends ADR 0076. Phase A (native-idiom recognition) is built and adopted (owner Steps-view endorsement); the ADR 0104 §2.3 HL7 field picker and the remaining phases build against it. (The 0/1,283 scan measured non-use of the ADR 0076 vocabulary API — **not** Steps-view adoption.) **Correction 2026-09-09 -- "Phase A (native-idiom recognition) is built and adopted" OVER-CLAIMS this ADR's own §2 Phase A table: three of its six rows claim more than the tree delivers.** That sentence is kept for the record. The §2 correction block carries the verified build state and is the statement of record; BACKLOG **#1505** files two of the three findings. `docs/adr/README.md` is not edited -- its index row for this ADR enumerates only forms that are built.
 **Deciders:** owner + IDE/DX working group
 **Related:** ADR **0076** (the Steps lens this extends — vocabulary + `lens parse`/`rewrite` machinery, byte-stability gate 2, sync-on-save, one-editor, text fallback), BACKLOG **#222** (the lens), **#225** (live values), **#226–#230** (this ADR's build phases; *erratum 2026-07-16: this pre-allocated range is stale — the live #226–#229 are unrelated ledger items and phases are tracked per-item at filing time; see the §7 erratum*), ADR **0072** (traced dry-run / live values rendered beside rows), ADR **0010/0043** (`db_lookup`/`fhir_lookup` — the read-only lookups a value expression may call), CLAUDE.md §8 (Message API), §9 (PHI).
 **Code references** are `origin/main @ 1bbb409`; line numbers drift — locate at implementation time.
@@ -28,6 +28,41 @@ Pivot the lens from *vocabulary-first* to **recognition-first**: teach the parse
 Recognition is added in phases, ordered by leverage (statement counts from the scan in §5):
 
 ### Phase A — native write/read atoms → editable rows  (~1,035 statements)
+
+> **CORRECTION 2026-09-09 -- the Status line's "Phase A ... is built and adopted" OVER-CLAIMS this
+> table.** The table is kept unchanged for the record; read it with this block. Measured on this tree
+> by running `messagefoundry.lens.parse_source` over a handler holding every form below, and by
+> reading `_recognize_native_method` (`messagefoundry/lens.py`). Nothing built changed for this
+> correction. **Scope: Phase A only** -- this block makes no claim about Phase B, C or E, and Phase D
+> stays DECLINED in its own block below.
+>
+> **BUILT -- rows 1, 2 and 5.** `msg.set(path, "lit")` (Set Field), `msg.set(dst, msg.field(src))`
+> (Copy Field) and `msg.delete_segments("SEG")` (Delete Segment). `occurrence=` survives as the
+> bullet below requires: it lands in the row's `params` and is withheld from `literal_params`, so it
+> renders read-only. Also built, though this table never lists it: `msg.add_repetition(path, value)`.
+>
+> **OVER-CLAIM -- row 3, "value editable as an expression string".** The Set Field row IS emitted for
+> `msg.set("X", localvar)` and its `path` IS editable. But an expression-valued `value` is left out
+> of `literal_params`, and `editableParamNames` (`ide/src/stepsModel.ts`) offers only literal params.
+> The value renders read-only.
+>
+> **NOT BUILT -- row 4, `x = msg.field("Y")`.** It renders as a read-only `code` row.
+> `_recognize_native_method` is called only inside an `isinstance(s, ast.Expr)` guard, at both of its
+> call sites, so an `ast.Assign` can never reach it; the function carries no `field` branch in any
+> case. The lens defines no read-field action.
+>
+> **HALF BUILT -- row 6.** `msg.add_segment(line)` is built, and emits an **Add Segment** row, not
+> "Add/Copy Segment" (the lens credits it to ADR 0106 §3 Group 1). `set_segment` names a method the
+> `Message` API does not have: `messagefoundry/parsing/message.py` defines, among others, `field`,
+> `set`, `__setitem__`, `add_repetition`, `add_segment` and `delete_segments`, and no `set_segment`.
+> Nothing under `messagefoundry/` defines one and the class has no `__getattr__`, so
+> `msg.set_segment(...)` would raise `AttributeError`; the lens renders it as a `code` row.
+>
+> **Filed as BACKLOG #1505**, which carries the row-4 and `set_segment` measurement -- read it there
+> rather than re-deriving it. The row-3 finding is recorded here only. `docs/adr/README.md` needs no
+> edit: its index row for this ADR enumerates `msg.set` / `msg.field`-copy / `msg.delete_segments`,
+> all three built.
+
 | Native idiom | Editable row | Editable fields |
 |---|---|---|
 | `msg.set("X", "lit")` | **Set Field** | path, value (883) |

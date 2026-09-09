@@ -1,7 +1,10 @@
 # ADR 0184 — Identify a federated login by the IdP-namespaced subject, not by the username it claims
 
-- **Status:** Proposed — **the build must not start yet.** One item under *To resolve on acceptance*
-  is an owner trust decision, and the code that closes ASVS 6.8.1 cannot be written until it is taken.
+- **Status:** Proposed — **the build must not start yet.** The owner trust decision was TAKEN on
+  2026-09-06 (recorded against the first item under *To resolve on acceptance*), so the sentence that
+  stood here — that the code cannot be written until it is taken — no longer states what blocks this.
+  Four items remain open, and the second follows directly from the ruling: the bootstrap posture.
+  Accepting this ADR is a separate act and has not happened.
 - **Date:** 2026-09-05
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -244,12 +247,25 @@ to a closed item reads as done.
 
 ## To resolve on acceptance
 
-- [ ] **THE OWNER DECISION. What, besides an administrative binding surface, may create a federated
+- [x] **THE OWNER DECISION. What, besides an administrative binding surface, may create a federated
       binding?** The surface itself is entailed (see *Consequences*). The residue is the policy on top
       of it: bind on first presentation during a bounded bootstrap window, a self-service link proved
       by the user's own directory password (unavailable for Kerberos-only and other passwordless
       accounts, so it can never be the only path), or nothing at all. This is a trust decision about a
       counterparty, and it is not a researcher's or a builder's to take.
+      > **RULED 2026-09-06 by the owner: NOTHING ELSE. The administrative binding surface is the only
+      > path that may create a federated binding.** Neither bind-on-first-presentation nor the
+      > self-service link is adopted. **What this buys:** the spoofing path 6.8.1 names is closed by
+      > construction rather than bounded by a window — there is no state in which presenting a claim
+      > creates a binding, so the never-federated account the severity statement is about cannot be
+      > landed on at all. **What it costs, and it is not small:** a site enabling federation must bind
+      > every account through the administrative surface before its users can log in federated, and
+      > the second box below is now the live question rather than an open one — a fresh deployment
+      > refusing every federated login until an operator acts is the direct consequence of this
+      > ruling, and whether that is the shipped default still needs answering.
+      > **Bounding the ruling, so it is not read wider than it was given:** it decides what may CREATE
+      > a binding. It does not decide the resolution ORDER (the body of this ADR), the reconciler
+      > question, or the AD limb, which is BACKLOG #1471 and is not governed by this ADR at all.
 - [ ] **The bootstrap posture that follows from it.** With no bindings and no bind-on-first-
       presentation, a fresh deployment refuses every federated login until an operator binds each
       account. Is that the shipped default? Zero deployments means migration cost is zero, which

@@ -68,6 +68,14 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
 )
+from messagefoundry.api.validation import (
+    ActionFilter,
+    ActorFilter,
+    CustomRoleId,
+    DigestId,
+    EpochSeconds,
+    ResourceId,
+)
 from messagefoundry.auth import (
     BUILTIN_ROLE_PERMISSIONS,
     ROLE_METADATA,
@@ -534,7 +542,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
-        session_id: str,
+        session_id: DigestId,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
@@ -633,7 +641,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.put("/roles/custom/{role_id}", response_model=CustomRoleInfo)
     async def update_custom_role(
-        role_id: str,
+        role_id: CustomRoleId,
         body: CustomRoleRequest,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
@@ -659,7 +667,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.delete("/roles/custom/{role_id}", response_model=SimpleMessage)
     async def delete_custom_role(
-        role_id: str,
+        role_id: CustomRoleId,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
@@ -682,7 +690,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)
     async def get_user_permissions(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_READ)),
     ) -> UserPermissions:
@@ -732,7 +740,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(
-        user_id: str,
+        user_id: ResourceId,
         body: UserUpdateRequest,
         service: AuthService = Depends(_service),
         # 7.5.1 (ASVS): the one broad-admin route promoted to ACTION-binding (fresh single-use grant
@@ -774,7 +782,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.delete("/users/{user_id}", response_model=SimpleMessage)
     async def delete_user(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
@@ -791,7 +799,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.delete("/users/{user_id}/sessions", response_model=SimpleMessage)
     async def admin_revoke_user_sessions(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
@@ -803,7 +811,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.put("/users/{user_id}/roles", response_model=SimpleMessage)
     async def set_user_roles(
-        user_id: str,
+        user_id: ResourceId,
         body: RolesUpdateRequest,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
@@ -825,7 +833,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.post("/users/{user_id}/reset-password", response_model=PasswordResetResponse)
     async def reset_user_password(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
         # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
@@ -857,7 +865,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)
     async def reset_user_mfa(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1). This is the sharper of the two: one call clears the TOTP
         # secret, every recovery code and every passkey on the target account.
@@ -907,7 +915,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/users/{user_id}/channel-scope", response_model=ChannelScope)
     async def get_channel_scope(
-        user_id: str,
+        user_id: ResourceId,
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> ChannelScope:
@@ -918,7 +926,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.put("/users/{user_id}/channel-scope", response_model=SimpleMessage)
     async def set_channel_scope(
-        user_id: str,
+        user_id: ResourceId,
         body: ChannelScope,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
@@ -1011,12 +1019,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
-        actor: str | None = Query(None, max_length=256),
-        action: str | None = Query(None, max_length=128),
-        since: float | None = Query(
+        actor: ActorFilter | None = Query(None),
+        action: ActionFilter | None = Query(None),
+        since: EpochSeconds | None = Query(
             None, description="inclusive lower bound on the epoch-float ts"
         ),
-        until: float | None = Query(
+        until: EpochSeconds | None = Query(
             None, description="inclusive upper bound on the epoch-float ts"
         ),
     ) -> AuditList:
@@ -1039,12 +1047,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require(Permission.AUDIT_EXPORT)),
         format: str = Query("csv", pattern="^csv$"),
         limit: int = Query(10000, ge=1, le=1_000_000),
-        actor: str | None = Query(None, max_length=256),
-        action: str | None = Query(None, max_length=128),
-        since: float | None = Query(
+        actor: ActorFilter | None = Query(None),
+        action: ActionFilter | None = Query(None),
+        since: EpochSeconds | None = Query(
             None, description="inclusive lower bound on the epoch-float ts"
         ),
-        until: float | None = Query(
+        until: EpochSeconds | None = Query(
             None, description="inclusive upper bound on the epoch-float ts"
         ),
     ) -> StreamingResponse:

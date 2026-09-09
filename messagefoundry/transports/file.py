@@ -544,6 +544,8 @@ class FileSource(SourceConnector):
         candidates = await self._run_fs(self._candidates)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
+            if self._stop.is_set():
+                break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(candidates) - position):
                 break
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set

@@ -39,6 +39,7 @@ import re
 import string
 import tomllib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -176,6 +177,36 @@ class StoreBackend(str, Enum):  # noqa: UP042
     POSTGRES = (
         "postgres"  # production server-DB backend with single-node parity (see store/postgres.py)
     )
+
+
+class StorePrivilegeStatus(str, Enum):  # noqa: UP042
+    """Whether the store principal's effective privileges were actually READ (#1008, ASVS 13.2.2).
+
+    Three values, and the third is the point. ``OBSERVED`` with an empty excess list is a clean bill
+    of health; ``UNOBSERVABLE`` is the ABSENCE of one. A two-valued version of this enum would let a
+    probe that never ran report as a pass, which is the fail-open shape the preflight exists to close.
+    """
+
+    OBSERVED = "observed"  # the probe ran and read the principal's effective privileges
+    NOT_APPLICABLE = "not_applicable"  # SQLite: a local file, no server principal exists to probe
+    UNOBSERVABLE = "unobservable"  # the probe could NOT run — permission denied, no probe, an error
+
+
+@dataclass(frozen=True, slots=True)
+class StorePrivilegePosture:
+    """The store-privilege preflight's finding in the plain data shape :func:`security_loosenings`
+    consumes.
+
+    A plain dataclass rather than the store package's richer report for the same reason the
+    connection-scoped deviations arrive there as plain NAMES: ``config.settings`` must never import
+    the store package (``store/*`` imports THIS module, so the reverse direction is a cycle)."""
+
+    status: StorePrivilegeStatus
+    #: What the principal holds beyond the documented least-privilege grant; empty when it holds
+    #: nothing extra, and always empty when ``status`` is not ``OBSERVED``.
+    excess: tuple[str, ...] = ()
+    #: Why the probe could not observe (``UNOBSERVABLE``), or what it observed against (otherwise).
+    detail: str = ""
 
 
 class SqliteSync(str, Enum):  # noqa: UP042
@@ -520,6 +551,23 @@ class StoreSettings(_Section):
     # credential) is exempt; Postgres has no managed-identity auth mode, so it cannot satisfy it. Admin
     # device posture + AD/SMTP managed identity stay deployment-delegated (see docs/SECURITY.md).
     require_managed_identity: bool = False
+    # Least-PRIVILEGE precondition on the store principal (#1008, ASVS 13.2.2) — the privilege sibling
+    # of require_managed_identity above, which constrains the credential's KIND and never what it may
+    # do (a `sysadmin` gMSA satisfies that one clean). The serve-time probe
+    # (store/privilege.py) reads the principal's EFFECTIVE fixed-server-role / database-role membership
+    # on SQL Server and its role attributes / grants on Postgres, and compares them against the grant
+    # docs/DEPLOY-SERVER-DB.md §1.1/§1.2 prescribes.
+    #
+    # OFF BY DEFAULT, and this default governs the REFUSE arm only. The WARN arm ships ON: the probe
+    # always runs, always logs, always audits, and always feeds security_loosenings() — it cannot block
+    # an install, so nothing is gated behind this. Refusal is what is gated, because a preflight that
+    # refused on over-grant by default could block a legitimate deployment mid-setup, which is not this
+    # control's job. When TRUE, `serve` refuses to start on an observed over-grant — AND on a probe that
+    # could NOT RUN, because a declared refusal that passes an unobservable principal is exactly the
+    # fail-open shape the operator turned it on to prevent. Like require_managed_identity the split
+    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
+    # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
+    require_least_privilege: bool = False
     encrypt: bool = True
     trust_server_certificate: bool = False
     # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
@@ -1252,6 +1300,12 @@ class PipelineSettings(_Section):
     # (never a lane outage). Reliability-core + read ONCE at engine construction (a /config/reload does
     # NOT re-read it — restart to change, exactly like claim_mode). Harness A/B via
     # MEFOR_PIPELINE_FUSE_THREAD_HOPS.
+    # ONE OTHER SETTING CAN CANCEL THIS ONE, and you must be told here rather than in that knob's
+    # docs: the runner HARD-DISABLES fusion whenever [sandbox].mode is subprocess (it ships off, so
+    # this bites only a site that turned the sandbox on). Fusion runs Router/Handler/accepts= code
+    # in-process on an executor hop, so honouring both would silently run unsandboxed the code a
+    # config asked to isolate; the runner fails CLOSED to the async sandboxed path and logs it. To
+    # get fusion you must also set [sandbox].mode=off, and that trade is yours to make on purpose.
     fuse_thread_hops: bool = Field(default=False)
     # Worker count for each per-stage fusing executor (ADR 0071 B5). Each fused stage (INGRESS/ROUTED)
     # gets its OWN ThreadPoolExecutor of this width plus a matching-width dedicated synchronous pyodbc
@@ -1295,20 +1349,54 @@ class PipelineSettings(_Section):
 class SandboxSettings(_Section):
     """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
-    Routers/Handlers are admin-authored pure Python the engine runs in its own address space (the
-    DEK, audit chain, and live sockets live there). ASVS 15.2.5 wants a hard isolation boundary; this
-    section turns one on. ``mode="off"`` (the default) runs them in-process, **byte-identically and
-    with zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
+    **THIS DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS, and that is the first thing
+    to know about it.** The loader executes every ``*.py`` in the config directory in-process, as the
+    service account, at every ``serve`` and every reload, ungated by ``mode``
+    (:func:`messagefoundry.config.wiring.load_config`). What ``mode`` governs is where a Router's or
+    Handler's *body* runs once the graph is built — module top level is out of its reach either way,
+    and the safe-source DACL gate is still what covers that.
+
+    Routers/Handlers are admin-authored pure Python. In the engine's own address space sit the DEK,
+    the audit chain, and every live socket. ASVS 15.2.5 wants a hard isolation boundary; this section
+    turns one on. ``mode="off"`` (**the default**) runs them in-process, **byte-identically and with
+    zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop — a subprocess
-    boundary breaks that; a Handler needing live enrichment runs with ``mode=off``). An isolation
-    denial routes the message to ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
+    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+
+    **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
+
+    * **Live enrichment is refused.** ``db_lookup``/``fhir_lookup`` re-enter the event loop, which a
+      process boundary breaks, so they fail closed inside the child. **A Handler needing either must
+      run ``mode="off"``** — that escape is supported and is not going away. ``[sandbox]`` is a
+      single **engine-wide** section: :meth:`messagefoundry.pipeline.engine.Engine.add_registry`
+      renders ONE ``SandboxPolicy`` for the whole graph and a connection carries no per-connection
+      sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
+      process in-process, not just that one.
+    * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
+      ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
+      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
+      to finish now dead-letters. ``startup_seconds`` and the POSIX ``cpu_seconds``/``mem_mb`` arm
+      with it.
+    * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
+      marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
+      per-interface bound. **One message is not one dispatch:** a message routed to one handler with
+      an ``accepts=`` predicate costs three (router, predicate, transform), and fan-out to K handlers
+      costs 1 + 2K, each re-marshalling the reference view.
+    * **Per inbound with traffic:** one child process, two parent daemon threads (frame reader +
+      stderr relay), three parent pipe fds, and on Windows a job-object handle.
+    * **The pre-deploy gate does not learn this setting.** ``messagefoundry check`` and ``dryrun``
+      always run in-process (:func:`messagefoundry.pipeline.dryrun.dry_run` takes no ``sandbox``
+      argument), so a Handler calling ``db_lookup``/``fhir_lookup`` passes the gate green and then
+      fails closed at ``serve``.
 
     Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
-    restart to change, exactly like ``claim_mode``)."""
+    **restart to change**, exactly like ``claim_mode``)."""
 
-    # off (default, byte-identical, no subprocess) | subprocess (persistent per-inbound worker child).
+    # off (default, byte-identical, no subprocess — and the supported escape for a Handler needing
+    # live enrichment) | subprocess (persistent per-inbound worker child). ENGINE-WIDE, not per
+    # connection: one policy is rendered for the whole graph.
     mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
@@ -2366,6 +2454,17 @@ class AuthSettings(_Section):
                 "oidc_enabled requires ad_enabled (federated logins resolve roles via AD)"
             )
 
+        # BLANK, not merely empty — the same test the client-secret guard below already applies, and
+        # for the same reason. `if not value` catches "" and lets "   " through, so a stray space in
+        # a config file or an NSSM environment entry produced a whitespace-only value that loaded
+        # clean. This validator disagreed with itself about what "missing" means: measured before the
+        # fix, `oidc_client_id=""` was refused while "   " and "\t" both loaded.
+        #
+        # It is not cosmetic for `oidc_client_id`, which is the expected `aud` — the ID Token
+        # audience check would have compared an incoming claim against whitespace. For the four
+        # pinned URLs it deferred the failure to the https check below, which then reports a SCHEME
+        # problem for what is really a missing value. Whitespace is stripped for the TEST only; the
+        # value itself is never rewritten (BACKLOG #1161, ASVS 10.5.4).
         missing = [
             name
             for name, value in (
@@ -2375,7 +2474,7 @@ class AuthSettings(_Section):
                 ("oidc_token_endpoint", self.oidc_token_endpoint),
                 ("oidc_jwks_uri", self.oidc_jwks_uri),
             )
-            if not value
+            if not (value or "").strip()
         ]
         if missing:
             raise ValueError(f"oidc_enabled requires: {', '.join(missing)}")
@@ -4444,6 +4543,7 @@ def security_loosenings(
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
+    store_privilege: StorePrivilegePosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -4453,9 +4553,10 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), and three per-connection
-    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
-    generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
+    with TLS unenforced (#333) -- and the store principal's OBSERVED privilege posture (#1008). It
+    is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -4479,7 +4580,17 @@ def security_loosenings(
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
     one makes omission a type error at every call site.
 
-    The last three parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
+    ``store_privilege`` is the store-principal privilege OBSERVATION (#1008, ASVS 13.2.2), for the same
+    reason and in the same plain shape: it is what the principal actually holds, produced by the
+    serve-time probe in ``store/privilege.py`` and passed in as a
+    :class:`StorePrivilegePosture` so this module never imports the store package. ``None`` means THIS
+    CALL SITE has no probe result (no store is open — ``messagefoundry security show``, or a posture
+    read on an engine that never ran the preflight), and the caller SAYS SO in its own output. It is not
+    a clean result and this registry never renders it as one. Note the switch that acts on the finding
+    — ``[store].require_least_privilege`` — is a HARDENING, so it is not itself reported here; the
+    DEVIATION is what the observation found, exactly as with the three connection-scoped entries.
+
+    The three sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), and ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment). They arrive as
@@ -4757,6 +4868,33 @@ def security_loosenings(
                 "rows, and the DSN credential, may cross in plaintext",
             )
         )
+    # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
+    # the three connection-scoped entries above and unlike every switch: the deviation is what the
+    # engine's own database credential turns out to hold, which no [store] flag declares. Both arms are
+    # reported and they read DIFFERENTLY on purpose — "could not observe" is the ABSENCE of a clean
+    # result, and collapsing it into silence would make this registry assert a posture nobody checked.
+    if store_privilege is not None:
+        if store_privilege.status is StorePrivilegeStatus.UNOBSERVABLE:
+            out.append(
+                (
+                    "store_principal_privileges_unobserved",
+                    "the store principal's EFFECTIVE privileges could not be read "
+                    f"({store_privilege.detail}) — the least-privilege grant both server-DB runbooks "
+                    "prescribe is UNVERIFIED on this instance, so an over-granted database credential "
+                    "would not be detected here; this is the absence of a clean result, not one",
+                )
+            )
+        elif store_privilege.excess:
+            named = ", ".join(store_privilege.excess)
+            out.append(
+                (
+                    "store_principal_over_granted",
+                    f"the store principal holds {len(store_privilege.excess)} privilege(s) BEYOND the "
+                    f"least-privilege grant docs/DEPLOY-SERVER-DB.md prescribes ({named}) — the "
+                    "engine's own database credential can reach data and administrative operations "
+                    "its runbook says it must not",
+                )
+            )
     return out
 
 

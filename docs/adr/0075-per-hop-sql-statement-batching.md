@@ -1,6 +1,6 @@
 # 0075 — Per-hop SQL statement batching (`batch_handoff_statements`)
 
-- **Status:** Accepted (2026-07-07) — owner ratified; prototype built (#820, CI SS-gated). **Promote target reframed 2026-07-07: `default-ON` gated on a _harmless-near + helps-far_ rig result (see Amendment below), not the single-RTT ≥10% bar.** **PROMOTED default-ON 2026-07-08** — Bench B met the reframed criterion over a green SS correctness precondition (see the _Promoted_ section below + `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`); the flag is retained only as an emergency off-switch.
+- **Status:** Accepted (2026-07-07) — owner ratified; prototype built (#820, CI SS-gated). **Promote target reframed 2026-07-07: `default-ON` gated on a _harmless-near + helps-far_ rig result (see Amendment below), not the single-RTT ≥10% bar.** **PROMOTED default-ON 2026-07-08** — Bench B met the reframed criterion over a green SS correctness precondition (see the _Promoted_ section below + `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`); the flag is retained only as an emergency off-switch. **SCOPE CORRECTION (2026-09-09): the batched hops are `route_handoff` and `transform_handoff` only. `mark_done` is NOT batched -- see the correction under AC-1.**
 - **Deciders:** throughput working group (owner ratifies; build + promote gated on a live-rig A/B)
 - **Related:** **builds the lever [ADR 0069](0069-durable-write-throughput-lever.md) named and left un-attacked** ("batching SQL statements per executor hop" — the round-trip half of the feed wall, distinct from its rejected durable-write levers) · **complements [ADR 0071](0071-cut-executor-round-trips-b5.md)** (B5 thread-hop fusion — NO-GO 2026-07-06; cut executor→loop *crossings* but not the per-hop *network round-trips* the fusion NO-GO explicitly attributed part of its dilution to) · [ADR 0055](0055-group-commit-durable-write.md) / [ADR 0053](0053-free-threaded-multicore-engine.md) (the other throughput levers) · [ADR 0001](0001-staged-pipeline-architecture.md) / [ADR 0066](0066-pooled-stage-claimers.md) (staged-pipeline + pooled-claimer invariants) · CLAUDE.md §2 (reliability / at-least-once / count-and-log invariants) · the throughput-microbench statement/RT inventory (`docs/benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/statement_rt_inventory.py`)
 
@@ -142,6 +142,33 @@ A microbench measured off the **real shipped store methods** (driving `route_han
 
 - **AC-1** — WHEN `batch_handoff_statements=true` on a SQL Server store, THE SYSTEM SHALL emit, for each of `route_handoff` / `transform_handoff` / `mark_done`, the **identical logical `(sql, params)` sequence** as the unbatched path, grouped into fewer `execute()` round-trips, with **`commits/msg` unchanged (2.000 per handoff pair)**.
   → `tests/test_adr0075_batch_golden_sql.py::test_batched_matches_unbatched_sequence`
+
+  > **CORRECTION (2026-09-09) -- AC-1 OVER-CLAIMS, AND IT CITES A TEST THAT DOES NOT EXIST.** Both lines
+  > above are kept verbatim, because they are what the record asserted. Both are wrong against the tree.
+  >
+  > **`mark_done` is NOT batched, and never was.** `messagefoundry/store/sqlserver.py` defines no
+  > `_mark_done_batched`, and no such symbol exists anywhere in the repository. Its batched handoff
+  > bodies are `_route_handoff_batched` and `_transform_handoff_batched`. A grep for `_batched` in that
+  > file returns a third method, `_maybe_finalize_batched` -- that one is the disposition finalizer
+  > `_transform_handoff_batched` calls, not a hop, and `_route_handoff_batched` does not call it.
+  > `route_handoff` and `transform_handoff` are the only two write-path readers of
+  > `self._batch_handoff_statements`; `mark_done` never reads it. **BUILT: `route_handoff`,
+  > `transform_handoff`. NOT BUILT: `mark_done`.**
+  >
+  > **Deferring it was a decision, not an oversight.** `tests/test_adr0075_batch_sqlserver.py` says so at
+  > the call site: `mark_done is not batched (by design); it finalizes PROCESSED`. The open item
+  > **`mark_done` inclusion** at the foot of this ADR is that question, and DEFER is its answer.
+  >
+  > **The cited test name does not exist.** `tests/test_adr0075_batch_golden_sql.py` defines
+  > `test_route_batched_matches_unbatched_sequence` and `test_transform_batched_matches_unbatched_sequence`.
+  > It defines no `test_batched_matches_unbatched_sequence`, and the string `mark_done` does not appear in
+  > that file at all. Those two real names are AC-1's evidence, for the two hops that exist.
+  >
+  > **The false citation survived because nothing checks the node id.** `messagefoundry/adr_analyze.py`
+  > splits each `→` reference on `::` and tests only that the FILE exists. So the note above this list --
+  > *"checks each `→` resolves"* -- holds for the path and not for the test name. Citing a test nobody
+  > wrote reads as verified evidence, which is worse than citing none. Filed as BACKLOG #1503.
+
 - **AC-2** — WHEN `batch_handoff_statements=true`, THE SYSTEM SHALL preserve per-handoff atomicity and idempotency: a crash after the claim commit / after the body but before the handoff commit / after the handoff commit SHALL, on restart + `reset_stale_inflight`, re-run in seq order with **zero loss and zero duplicate next-stage rows**.
   → `tests/test_staged_pipeline.py::test_batched_handoff_crash_replay` (SQLite skip; SS CI leg)
 - **AC-3** — IF a batched `execute()` fails, THEN THE SYSTEM SHALL attribute the failure to the correct statement and classify it CONTENT vs INFRA — an **infrastructure fault re-pends** the message (never a content dead-letter), a content/constraint fault dead-letters — identically to the unbatched path.
@@ -181,4 +208,4 @@ A microbench measured off the **real shipped store methods** (driving `route_han
 - [ ] **The applock-rc-fold behaviour question.** The re-review found folding technically sound (rc<0 raises → whole-transaction rollback, so any statement that ran server-side before the rc is read is never committed and is invisible to other sessions) — but **confirm it against the FINAL batched control flow** (the guard-DELETE-opens-the-transaction ordering and the finalize applock's position in the trailing batch), and decide whether v1 ships `applock_soft` (fold) or `applock_hard` (gate). This single choice is what separates a ≥40%-clearing model from the strict 27–33% one.
 - [ ] **The live-rig A/B result** — the GO/NO-GO. Meets the conjunctive bar (≥10% median AND >2σ, zero-loss, `delivered/offered ≥ 0.98`, per-lane FIFO, `in_pipeline` flat-or-lower) at C ≥ 256 on a real two-box SQL Server rig, or it banks nothing and the flag stays default-OFF.
 - [ ] **Statement-level error attribution under a batched `execute()`** — confirm pyodbc surfaces enough to attribute WHICH statement in a batch failed (or fix the batch boundaries so a fetch/gating statement that needs distinct attribution stays its own `execute()`).
-- [ ] **`mark_done` inclusion** — the delivery-complete hop clears neither floor's ≥40% (36.4% soft / 27.3% strict); decide whether to batch it in v1 or defer it behind the route/transform pair.
+- [x] **`mark_done` inclusion** — the delivery-complete hop clears neither floor's ≥40% (36.4% soft / 27.3% strict); decide whether to batch it in v1 or defer it behind the route/transform pair. **RESOLVED -- DEFERRED.** Recorded 2026-09-09 from the tree; see the AC-1 correction for what is built and what is not.

@@ -34,14 +34,28 @@
          stamped with a config root other than the one it sits under is reported UNKNOWN, never as this
          session's headroom. A document carrying no stamp is read, and labelled UNVERIFIED -- absence
          of provenance and wrong provenance are different facts, and only one of them is an error.
+      5. AN ACCOUNT WITH NO SUBSCRIPTION HAS NO HEADROOM, AND THAT IS A MEASUREMENT, NOT A GAP. A
+         cancelled account is the one condition none of the four rules above could catch, and it fails
+         in the worst direction: it stops burning quota, so its numbers freeze low and its publish
+         directory goes quiet -- exactly what an IDLE account with a full pool looks like. Read
+         through the marker (config-roots.ps1, Get-RootUnavailability), such a root reports
+         UNAVAILABLE and NEVER a percentage.
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
-        10 WARN     -- high, or projected to exhaust before reset with slack
-        11 CRITICAL -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN  -- no data, stale data, not enough samples, or a reading this root may not trust
+        10 WARN        -- high, or projected to exhaust before reset with slack
+        11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling
+        20 UNKNOWN     -- no data, stale data, not enough samples, or a reading this root may not trust
+        21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
-    FIX to apply, not how bad the situation is, and a coordinator branches on the four codes above.
+    FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
+
+    21 IS DELIBERATELY NOT 20, and the distinction is the whole point of adding it. UNKNOWN means no
+    measurement was obtained and the advice attached to it is "treat headroom as unknown, not as fine".
+    UNAVAILABLE means a measurement WAS obtained and it is zero-spendable-forever. Folding the second
+    into the first would understate a known fact, and would leave a coordinator waiting for a reading
+    that is never coming. It is also not CRITICAL/11: CRITICAL says commit now because you are about to
+    be cut off mid-task, which is a live pool running out, not an account that has none.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\usage.ps1
@@ -101,6 +115,55 @@ if (-not $haveLib) {
     exit 20
 }
 if (-not $StateDir) { $StateDir = Get-UsageStateDir $rootInfo.Path }
+
+# HONESTY RULE 5, AND IT RUNS BEFORE ANYTHING IS READ. Checking availability after loading latest.json
+# would leave a leftover document able to answer first on the JSON path, and the whole hazard here is a
+# frozen low percentage on a dead account reading as headroom. There is no ordering in which a stale
+# number should win over "this account has no subscription", so the marker is consulted at the top.
+$avail = Get-RootUnavailability -StateDir $StateDir
+if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
+    $availRoot = Split-Path $StateDir -Parent
+    # NO five_hour / seven_day KEYS AT ALL, deliberately. Emitting them as nulls would let a consumer
+    # that reaches straight for a percentage read this as a window that merely has not published yet.
+    # Their absence is what forces the state to be looked at.
+    if ($Json) {
+        [ordered]@{
+            state          = "UNAVAILABLE"
+            exit_code      = 21
+            reason         = $avail.reason
+            marker_state   = $avail.state
+            marker_path    = $avail.marker_path
+            marked_at      = $avail.marked_at
+            marked_by      = $avail.marked_by
+            effective_from = $avail.effective_from
+            advice         = "There is no pool here to spend. Do not send work to this account, and do not read a quiet publish directory under it as spare capacity."
+            config_root    = $availRoot
+            config_root_source = $(if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" })
+            state_dir      = $StateDir
+        } | ConvertTo-Json -Compress | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "Claude account usage  --  UNAVAILABLE" -ForegroundColor Magenta
+        Write-Host "  config root: $availRoot" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  This account has NO SUBSCRIPTION. There is no pool here to be a percentage of." -ForegroundColor Magenta
+        Write-Host "  reason: $($avail.reason)"
+        if ($avail.marked_at) { Write-Host "  marked: $($avail.marked_at)$(if ($avail.marked_by) { " by $($avail.marked_by)" })" -ForegroundColor DarkGray }
+        Write-Host "  marker: $($avail.marker_path)" -ForegroundColor DarkGray
+        if ($avail.state -eq 'MALFORMED') {
+            Write-Host ""
+            Write-Host "  The marker itself is damaged, so this is a FAIL-CLOSED refusal rather than a" -ForegroundColor Yellow
+            Write-Host "  recorded cancellation. Fix or remove it:" -ForegroundColor Yellow
+            Write-Host "    pwsh -NoProfile -File scripts\coord\account-availability.ps1 -Status -ConfigDir `"$availRoot`"" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Host "  A dead account never burns quota, so a quiet publish directory under it looks exactly"
+        Write-Host "  like an idle account with a full pool. That is what this marker exists to stop."
+        Write-Host ""
+    }
+    exit 21
+}
 
 $latestPath = Join-Path $StateDir "latest.json"
 $histPath = Join-Path $StateDir "history.jsonl"
@@ -276,25 +339,18 @@ $nowUtc = (Get-Date).ToUniversalTime()
 
 function Get-AgeMinutes($v) {
     if (-not $v) { return $null }
-    # DO NOT STRINGIFY THIS VALUE. ConvertFrom-Json has ALREADY coerced the ISO-8601 field into a
-    # [datetime] with Kind=Utc (verified, not assumed). Rendering it back to a string drops the 'Z',
-    # and re-parsing a Z-less string assumes LOCAL -- which added this machine's UTC-5 offset and
-    # reported a reading taken 90 seconds earlier as 299 minutes in the FUTURE.
+    # THE DATE READING ITSELF LIVES IN ConvertTo-UtcDateTime (config-roots.ps1), which carries the
+    # measurement behind it. This function is the SUBTRACTION and nothing else, because the marker
+    # reader needs the same coercion and two copies of it is how one of them comes to disagree.
     #
-    # The sign is what made it dangerous rather than merely wrong: a negative age passes an
-    # `age -gt max` staleness test unconditionally, so the guard against a dead publisher would have
-    # been disarmed on every non-UTC machine while still looking present. Same ConvertFrom-Json date
-    # coercion that silently downgraded the stamp in claim.ps1; it is worth expecting now.
-    $t = $null
-    if ($v -is [datetime]) {
-        $t = switch ($v.Kind) {
-            ([System.DateTimeKind]::Utc) { $v }
-            ([System.DateTimeKind]::Local) { $v.ToUniversalTime() }
-            default { [datetime]::SpecifyKind($v, [System.DateTimeKind]::Utc) }  # we only ever write UTC
-        }
-    }
-    elseif ($v -is [datetimeoffset]) { $t = $v.UtcDateTime }
-    else { try { $t = [System.DateTimeOffset]::Parse([string]$v).UtcDateTime } catch { return $null } }
+    # What that rule is protecting, kept here because it is what makes the guard below load-bearing:
+    # a stringified-then-reparsed timestamp loses its 'Z', is read as LOCAL, and dated a reading taken
+    # 90 seconds earlier as 299 minutes in the FUTURE. The SIGN is what made it dangerous rather than
+    # merely wrong -- a negative age passes an `age -gt max` staleness test unconditionally, so the
+    # guard against a dead publisher would have been disarmed on every non-UTC machine while still
+    # looking present.
+    $t = ConvertTo-UtcDateTime $v
+    if ($null -eq $t) { return $null }
     return [math]::Round(($nowUtc - $t).TotalMinutes, 1)
 }
 
@@ -426,6 +482,12 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
 $five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset" $readRoot
 $seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset" $readRoot
 
+# NO "UNAVAILABLE" ENTRY, DELIBERATELY. It would be unreachable: Get-WindowReport only ever emits the
+# four states below, and the UNAVAILABLE path exits far above this line. Adding it would also make this
+# table disagree with the three sibling lists that have no UNAVAILABLE arm -- the verdict chain, the
+# $advice switch (which would fall through to "Normal working") and Show-Window's colours. The comment
+# below already warns that two lists naming different states is how the prose and the exit code come to
+# describe different situations; a fifth key here would be that defect, planted.
 $rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
 $states = @($five.state, $seven.state)
 # CRITICAL outranks UNKNOWN: a known emergency in one window is not softened by the other being unknown.
@@ -466,7 +528,19 @@ $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan 
 function Get-RootSummary([string]$Root) {
     $sd = Get-UsageStateDir $Root
     $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null; stale = $false }
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
+    # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
+    # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
+    # row against that row's own root, before its document is opened, for the same ordering reason the
+    # single-root read states: a leftover latest.json under a cancelled root must never answer first.
+    $av = Get-RootUnavailability -StateDir $sd
+    if ($av.state -in @('UNAVAILABLE', 'MALFORMED')) {
+        $s.available = $false
+        $marked = if ($av.marked_at) { ", marked $($av.marked_at)" } else { "" }
+        $s.note = if ($av.state -eq 'MALFORMED') { "UNAVAILABLE -- the marker is damaged, refusing fail-closed" } else { "UNAVAILABLE -- $($av.reason)$marked" }
+        return $s
+    }
+    if ($av.state -eq 'PENDING') { $s.pending_from = $av.effective_from }
     $d = $null
     try { $d = Get-Content -LiteralPath $lp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
     if (-not $d) {
@@ -505,6 +579,12 @@ function Get-RootSummary([string]$Root) {
         $s.note = "REFUSED -- a window here was observed under a DIFFERENT config root"
     }
     elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
+    # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
+    # live until that date, so suppressing the percentage would throw away a reading that is true and
+    # spendable today; the end date is what the reader would otherwise have no way to know.
+    if ($s.pending_from) {
+        $s.note = ("cancelled, still live until $($s.pending_from)" + $(if ($s.note) { " -- $($s.note)" } else { "" }))
+    }
     return $s
 }
 
@@ -526,6 +606,12 @@ if ($Json) {
         advice       = $advice
         not_measured = $blindSpot
         provenance   = $provenance
+        # ALWAYS PRESENT, null when there is no pending cancellation. An earlier comment here claimed
+        # the key was emitted only when dated, which was simply false -- an [ordered] literal emits the
+        # key whatever the value, and the test asserts the null. The five_hour/seven_day keys really
+        # are absent on the UNAVAILABLE path and are pinned that way; this one is not, and a comment
+        # describing a shape the code does not have is worse than no comment.
+        cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
         wired_state_dir = $dx.wired_state_dir
         config_root  = $readRoot
@@ -559,6 +645,11 @@ Write-Host "Claude account usage  --  $overall" -ForegroundColor $(switch ($over
 # separate pools, so a percentage with no root beside it is an unattributed number -- the same shape of
 # omission as a percentage with no age.
 Write-Host "  config root: $readRoot   (from $rootSource)" -ForegroundColor DarkGray
+# THE NUMBERS BELOW ARE REAL AND SPENDABLE, AND THEY HAVE AN END DATE. Said above them, because a
+# reader who takes the percentage and stops has taken the half that expires.
+if ($avail.state -eq 'PENDING') {
+    Write-Host "  CANCELLED, still live until $($avail.effective_from) -- the pool below is real until then, and gone after." -ForegroundColor Magenta
+}
 # A MIS-WIRE IS PRINTED ABOVE THE NUMBERS, not below them and not only when there are none. If this root
 # publishes somewhere else, the percentages under this heading are a leftover, and saying so after the
 # reader has already read them is too late to stop the wrong decision.
@@ -614,7 +705,14 @@ if ($survey) {
     Write-Host "  A survey -- nothing is summed across accounts:"
     foreach ($s in $survey) {
         $mark = if (Test-SameRoot $s.root $readRoot) { "  <- this session" } else { "" }
-        if ($s.published) {
+        # AN UNAVAILABLE ROOT IS NOT PRINTED IN THE "nothing here" COLOUR. Every other unpublished row
+        # is DarkGray because it means "no reading yet", and a cancelled account rendered identically
+        # would be read as one more root waiting to warm up -- which is precisely the misreading the
+        # marker exists to end. It gets its own colour so the eye separates them in a five-row list.
+        if (-not $s.available) {
+            Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor Magenta
+        }
+        elseif ($s.published) {
             $f = if ($null -ne $s.five) { "5h {0,3:0}%" -f $s.five } else { "5h   -" }
             $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
             # Two branches rather than a computed -ForegroundColor: passing $null to that parameter

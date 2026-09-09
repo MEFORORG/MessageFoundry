@@ -474,3 +474,73 @@ def test_the_only_thing_it_spawns_is_the_reader() -> None:
     assert code.count("& pwsh") == 1, (
         f"expected exactly one child process, found {code.count('& pwsh')}"
     )
+
+
+# ------------------------------------------------------------ a cancelled account is not UNKNOWN
+
+AVAIL = ROOT / "scripts" / "coord" / "account-availability.ps1"
+
+
+def mark_cancelled(root: Path, reason: str = "subscription cancelled") -> None:
+    """Mark through the REAL script, so the marker shape is the one production writes."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(AVAIL),
+            "-Mark",
+            "-ConfigDir",
+            str(root),
+            "-Reason",
+            reason,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(),
+    )
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_a_cancelled_account_is_reported_as_unavailable_and_not_as_unknown(tmp_path: Path) -> None:
+    """ROUTING THIS THROUGH THE UNKNOWN PATH WOULD BE A LIE IN THE SAFE-LOOKING DIRECTION.
+
+    The UNKNOWN text says the verdict "is no measurement" and tells the session to spawn on its own
+    judgment. That is exactly the wrong instruction for an account with no subscription: the honest
+    reading is a hard zero and there is no judgment call left. The trap is structural rather than
+    stylistic -- an UNAVAILABLE document deliberately carries NO ``five_hour`` key, so the hook's
+    existing "no windows" branch would swallow it and report a known zero as an unread number.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    collect(state, reading(five=3.0, seven=2.0))
+
+    # Positive control: before the marker this is an ordinary reading with a percentage in it, so the
+    # assertions below are measuring the marker and not an empty fixture.
+    assert "verdict: OK" in context_of(state)
+
+    mark_cancelled(root)
+    ctx = context_of(state)
+
+    assert "verdict: UNAVAILABLE" in ctx, ctx
+    assert "UNKNOWN" not in ctx, f"a cancelled account was downgraded to UNKNOWN: {ctx}"
+    assert "subscription cancelled" in ctx
+    # The frozen 3% is the whole hazard: it is what gets this account CHOSEN.
+    assert _PERCENTAGE.search(ctx) is None, f"a percentage survived a cancelled account: {ctx}"
+
+
+def test_a_cancelled_account_still_never_blocks_the_spawn(tmp_path: Path) -> None:
+    """There is no deny path in this hook at all, and adding a state must not quietly introduce one.
+    A separate gate decides whether a launch may proceed; this one only makes sure the session can see
+    what it is about to spend."""
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    collect(root / "mefor-usage", reading())
+    mark_cancelled(root)
+    code, out, _ = run_hook(root / "mefor-usage")
+    assert code == 0
+    assert '"permissionDecision"' not in out, out
