@@ -57,6 +57,37 @@ pytestmark = pytest.mark.skipif(
 GATE_TIMEOUT_S = 45
 
 
+def _pwsh_identity() -> str:
+    """Which ``pwsh`` this run actually launched, for the next BACKLOG #1304 occurrence.
+
+    The item names a pwsh STARTUP REGRESSION as one of its three candidates, and nothing anywhere
+    records which interpreter ran -- so that candidate cannot be tested even after the fact. This
+    turns it into a one-line check on the next failure instead of an unfalsifiable guess.
+
+    Resolution is a PATH lookup, which launches nothing. The version needs a launch, so it is
+    bounded and swallowed: this runs only while building a failure message about a launch that has
+    already hung, and it must never become a second hang or mask the report it is decorating.
+    """
+    where = shutil.which("pwsh") or "NOT ON PATH"
+    try:
+        probe = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        version = (probe.stdout or probe.stderr or "").strip() or "no output"
+    except Exception as probe_failure:  # noqa: BLE001 - diagnostic only, never mask the real failure
+        version = "unreadable (" + type(probe_failure).__name__ + ")"
+    return "pwsh at " + where + ", version " + version
+
+
 def run_gate(
     payload: dict[str, Any] | str, repos_file: Path, gate: Path | None = None
 ) -> dict[str, Any] | None:
@@ -105,7 +136,16 @@ def run_gate(
             "it and NONE is evidenced.\n"
             "DO NOT read this as a regression in the change under test, and DO NOT rerun until green "
             "without recording that you did: a manufactured green and an earned one are "
-            "indistinguishable afterwards."
+            "indistinguishable afterwards.\n"
+            # The child is killed AT the bound, so whatever it emitted first is the only direct
+            # evidence of how far it got. Empty means it never reached its own first write, which
+            # separates a startup hang from a script that started and stalled later. The ubuntu
+            # sibling of this failure aborts with "Stack overflow." rather than hanging, and that
+            # text arrives on these same channels -- so this is also what will say whether the two
+            # arms are one bug or two, which the item currently cannot answer.
+            f"CHILD STDOUT before the kill: {exc.stdout!r}\n"
+            f"CHILD STDERR before the kill: {exc.stderr!r}\n"
+            f"LAUNCHED {_pwsh_identity()}"
         ) from exc
     # A hook must never crash the tool call: a non-zero exit that is not 2 is silently ignored by the
     # harness, which would leave the gate off with nobody the wiser.

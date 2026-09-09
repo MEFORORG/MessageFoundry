@@ -357,15 +357,28 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
 # LOUD OMISSION: an incomplete run must SAY SO (BACKLOG #1230 — the loud-omission half only, per the
 # owner's 2026-08-12 scope ruling; the venv is deliberately NOT changed here).
 #
-# scripts/worktree/new.ps1:232 creates a worktree venv with `.[dev,harness]`. CI installs
-# `.[dev,harness,fhir,dicom,x12,xml,webauthn]` (.github/workflows/ci.yml:273). Every module gated on
-# that five-extra gap removes ITSELF at collection time via a module-level `pytest.importorskip`, so
-# those tests never become test items at all: a large block of coverage collapses into a short skip
-# tally and the run still prints as green.
+# WHAT PROMPTED IT, IN THE PAST TENSE BECAUSE IT IS FIXED. `scripts/worktree/new.ps1` USED TO build a
+# lane venv from `.[dev,harness]` while CI installed five more extras and the web console package on
+# top. Every module gated on that gap removed ITSELF at collection time via a module-level
+# `pytest.importorskip`, so those tests never became test items at all: a large block of coverage
+# collapsed into a short skip tally and the run still printed as green.
+#
+# THAT PARTICULAR GAP IS CLOSED (BACKLOG #1335). `new.ps1` now installs CI's full extras list plus
+# `-e packaging/messagefoundry-webconsole`, and `tests/test_worktree_venv_extras_parity.py` compares
+# the installer's line against `ci.yml`'s and goes red when they drift. Cite that test, not a line
+# number: this comment used to name `new.ps1:232` and `ci.yml:273`, and both had moved by the time
+# anyone read them. A stale line citation is worse than no citation, because following it lands
+# somewhere plausible and so reads as verified.
+#
+# THE HOOKS BELOW ARE NOT THEREBY REDUNDANT. Parity covers ONE way to reach an incomplete run: the
+# installer's. A venv built by hand, an installer skipped, a subset installed on purpose, or an extra
+# CI gains before a lane is rebuilt all land in the same place, and none of them is a drift between
+# two files that the parity test can see.
 #
 # THE DEFECT IS THE SILENCE, NOT THE ABSENCE. Skipping an uninstalled optional extra is correct and
 # intended. Rendering an incomplete run as a complete one is not — "the full suite is green" is the
-# sentence the next session bases its own scope on, and a local run cannot currently earn it.
+# sentence the next session bases its own scope on, and a run earns it only when the venv under it
+# really did install everything.
 #
 # Deliberately NOT a pinned test count. A hard-coded figure would be right the day it was written and
 # silently wrong after, and a stale number in a measurement surface is worse than none: re-running

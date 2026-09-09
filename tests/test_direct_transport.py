@@ -16,11 +16,16 @@ recipient's private key:
 Plus the construction fail-closed refusals (key↔cert mismatch, untrusted recipient, missing material,
 cleartext), the DeliveryError mapping, the STARTTLS probe, and the ``[egress].allowed_direct`` gate. No
 real SMTP server is ever contacted (an in-process fake).
+
+The last section is a different kind of test: it exercises no engine code and needs no fixture. It
+watches the pinned ``cryptography`` for the CMS key-encryption seam whose absence is why ASVS 11.3.1
+cannot pass on this connector (BACKLOG #1168).
 """
 
 from __future__ import annotations
 
 import datetime
+import inspect
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -788,3 +793,45 @@ def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) 
     )
     with pytest.raises(ValueError, match="secp192r1"):
         DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
+
+
+# --- library-capability tripwire for BACKLOG #1168 --------------------------------------------------
+
+# ASVS 11.3.1 fails on this connector for a reason that lives OUTSIDE this repository, and #1168
+# carries the measurement. In one sentence: `DirectDestination._build_smime` (direct.py) signs with a
+# padding the pinned `cryptography` lets a caller choose, then wraps the content-encryption key with
+# one it does not -- so the signer is a CODE CHOICE and the recipient is a LIBRARY LIMIT, and the two
+# must never be reported as one defect. The evidence is in #1168 and is not restated here.
+#
+# The limit is a fact about an external library on a pin that moves, and nothing watched it. A release
+# growing an RSA-OAEP seam would make #1168 actionable and would announce itself nowhere. These two
+# tests are that alarm. Same class as the paramiko key-name pin in tests/test_remotefile_transport.py.
+#
+# SCOPE: a TRIPWIRE, not a fix. Nothing here asserts what the engine emits and nothing here moves the
+# cell -- DIRECT still wraps its content-encryption key with RSAES-PKCS1-v1_5.
+
+
+def test_pkcs7_envelope_builder_still_has_no_key_encryption_seam() -> None:
+    # A seam can arrive in two shapes and `dir()` sees only the first: a new METHOD, or a new
+    # PARAMETER on the method already there. Subset rather than equality, because the failure mode is
+    # an ADDITION -- an upstream rename must not raise an alarm about a seam that did not appear.
+    public = {n for n in dir(pkcs7.PKCS7EnvelopeBuilder) if not n.startswith("_")}
+    assert public <= {"add_recipient", "encrypt", "set_content_encryption_algorithm", "set_data"}, (
+        "PKCS7EnvelopeBuilder grew a public method. If it is a key-encryption or padding seam, the "
+        "DIRECT key-transport limb of BACKLOG #1168 just became reachable -- re-read that item "
+        "before widening this set."
+    )
+    params = list(inspect.signature(pkcs7.PKCS7EnvelopeBuilder.add_recipient).parameters)
+    assert params == ["self", "certificate"], (
+        "add_recipient grew a parameter -- same seam, see above."
+    )
+
+
+def test_pkcs7_add_signer_still_accepts_rsa_padding() -> None:
+    # POSITIVE CONTROL on the test above: it proves the introspection CAN see a padding parameter
+    # when the library exposes one, so "add_recipient takes none" is not green merely because the
+    # probe is blind. Load-bearing on its own too -- lose this keyword and the DIRECT signer stops
+    # being a code choice, both sites collapse into one library limit, and #1168 changes shape.
+    param = inspect.signature(pkcs7.PKCS7SignatureBuilder.add_signer).parameters["rsa_padding"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is None

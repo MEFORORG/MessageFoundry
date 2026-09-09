@@ -1138,6 +1138,192 @@ def test_rules_3_and_3d_are_unchanged_by_the_candidate_switches(repo: SimpleName
     assert "working tree of the SHARED PRIMARY checkout" not in removal
 
 
+# ------------------------- rule 3c: a chdir INSIDE the guard window (BACKLOG #1065, third half)
+#
+# The rows above close "a `-C` owned by another command must not end the rule". The guard that closed
+# them also SUPPRESSES the base candidate whenever a chdir appears between the first git token and the
+# disarm -- correctly, because after a chdir the session cwd is no longer where the write lands.
+#
+# But suppressing the base is not the same as knowing where the write DOES land. The resolver cannot
+# follow that chdir either: its ``$Prefix`` is sliced at the FIRST git token and the chdir sits after
+# it. So on a line that also carries a decoy ``-C`` the candidate set collapsed to the decoy alone, git
+# rejected it, and the rule allowed -- reverting the closure above with ONE ordinary token:
+#
+#     git commit -C HEAD && git config core.hooksPath /nope           DENY
+#     git commit -C HEAD && cd . && git config core.hooksPath /nope   ALLOW, same write
+#
+# ``cd .`` is a no-op. The poison needs no intent, no relative path and no unusual spelling, and it was
+# measured ALLOW from the primary, a nested worktree and a linked worktree, on every chdir verb the
+# guard enumerates. The rule now FOLLOWS that chdir with the same helper the resolver uses and appends
+# it as the LAST candidate.
+#
+# BOTH DIRECTIONS ARE ASSERTED AND NEITHER IS OPTIONAL. Appending a candidate can only add denials, so
+# the risk this change carries is a refusal EARNED BY THE WRONG CANDIDATE -- the BACKLOG #1085 shape,
+# which is the reason the chdir guard exists at all. The chdir-away and explicit-target rows below are
+# that direction; a suite carrying only the deny rows would pass against a rule that denied everything.
+
+
+@pytest.mark.parametrize(
+    "chdir",
+    ["cd .", "cd ./", "pushd .", "chdir .", "sl .", "Set-Location .", "Push-Location ."],
+)
+def test_a_chdir_between_the_decoy_and_the_disarm_does_not_revert_the_closure(
+    repo: SimpleNamespace, chdir: str
+) -> None:
+    """One no-op chdir, seven spellings, and every one was ALLOW before this fix.
+
+    The verb list is the guard's own, so a spelling it suppresses the fallback for is a spelling this
+    row has to cover -- otherwise the fix closes ``cd`` and leaves ``Push-Location`` open.
+    """
+    command = f"git commit -C HEAD && {chdir} && git config core.hooksPath /nope"
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_chdir_between_the_decoy_and_the_disarm_is_followed_across_a_SEMICOLON(
+    repo: SimpleNamespace,
+) -> None:
+    """``&&`` short-circuits on a failed decoy; ``;`` does not, so this is the reachable spelling.
+
+    It also asserts a DIFFERENT key, which is what stops the group from being seven names for one
+    assertion: a rule that recognised only ``core.hooksPath`` passes the rows above and fails here.
+    """
+    command = 'git commit -C HEAD ; cd . ; git config alias.zz "commit --no-verify"'
+    reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
+    assert "setting 'alias.zz'" in reason
+    assert "setting 'core.hooksPath'" not in reason
+
+
+def test_a_chdir_INTO_the_governed_repo_beside_a_decoy_is_denied(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The session stands in an ungoverned clone and walks into the governed repo before writing.
+
+    Nothing on this line names the governed repository except the chdir, so a rule that cannot follow
+    the chdir cannot see the target at all.
+    """
+    command = f'git commit -C HEAD && cd "{repo.primary}" && git config core.hooksPath /nope'
+    reason = assert_denied(run_gate(shell(command, cwd=vendored), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_chdir_AWAY_from_the_governed_repo_still_allows(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The anti-narrowing direction, and the reason the chdir guard exists in the first place.
+
+    The session stands in the governed primary, walks into an independent clone, and writes there. A
+    refusal here would name a repository the write never touches -- the BACKLOG #1085 defect. This row
+    passes against the pre-fix gate too, so it pins a property the fix had to KEEP, not one it added.
+    """
+    command = f'git commit -C HEAD && cd "{vendored}" && git config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_an_EXPLICIT_target_beside_a_chdir_still_decides(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """A chdir does not aim a write that carries its own ``-C``, and must not be able to refuse one.
+
+    The followed chdir is appended only when the disarming invocation names no repository itself. Here
+    it names one, and it names the ungoverned clone, so the governed chdir must not manufacture a deny.
+    """
+    command = f'git commit -C HEAD && cd . && git -C "{vendored}" config core.hooksPath /nope'
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_an_UNFOLLOWABLE_chdir_appends_no_candidate(repo: SimpleNamespace) -> None:
+    """A stated residual, recorded as a negative control rather than left to be discovered.
+
+    Two chdirs are not a single token and this gate is not a shell, so the helper declines to answer and
+    nothing is appended -- the pre-fix behaviour, unchanged. This is BACKLOG #1000's shape: the ALLOW is
+    documentation of a limit, not an endorsement of it. It is also what stops a later fix from guessing
+    a base it cannot compute and refusing the wrong repository with confidence.
+    """
+    command = "git commit -C HEAD && cd . && cd . && git config core.hooksPath /nope"
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+def test_ordinary_config_after_a_chdir_is_untouched(repo: SimpleNamespace) -> None:
+    """The rule must not become a general ban on configuring a repository you walked into."""
+    for command in (
+        "git commit -C HEAD && cd . && git config user.email a@b.c",
+        "git commit -C HEAD && cd . && git config --get core.hooksPath",
+        "git commit -C HEAD && cd .",
+    ):
+        assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
+# ---------------------- rule 3c: the READ exclusion belongs to ONE invocation (BACKLOG #1065)
+#
+# Same class as the rows above with a different token. The explicit read flags were matched against
+# the WHOLE SEGMENT, so a read belonging to a NEIGHBOURING command excused the write beside it:
+#
+#     git config core.hooksPath /nope                        DENY
+#     git config --list && git config core.hooksPath /nope   ALLOW, and the write still lands
+#
+# Measured ALLOW on origin/main for every disarm key this rule names, from the primary, a nested
+# worktree and a linked worktree -- fifteen rows. `git config --list` is an ordinary thing to run, so
+# the excusing token needs no more intent than the `-C HEAD` this item was filed about.
+#
+# THE MUST-ALLOW ROWS ARE THE POINT OF THE PAIRING. Narrowing an exclusion can only add denials, and
+# the thing that would break is an honest read: a suite carrying only the deny row passes against a
+# rule that had lost the exclusion altogether.
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "git config --list",
+        "git config --get user.email",
+        "git config --get-all user.email",
+        "git config --get-regexp user",
+        "git config --list --show-origin",
+    ],
+)
+def test_a_NEIGHBOURING_read_does_not_excuse_the_write(repo: SimpleNamespace, read: str) -> None:
+    """The read is a different command on the same line, so it says nothing about the write."""
+    reason = assert_denied(
+        run_gate(shell(f"{read} && git config core.hooksPath /nope", cwd=repo.wt), repo.repos)
+    )
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_a_neighbouring_read_does_not_excuse_the_write_across_a_semicolon(
+    repo: SimpleNamespace,
+) -> None:
+    """A second separator and a second key, so the pair is not one assertion under two names."""
+    reason = assert_denied(
+        run_gate(
+            shell('git config --list ; git config alias.zz "commit --no-verify"', cwd=repo.wt),
+            repo.repos,
+        )
+    )
+    assert "setting 'alias.zz'" in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git config --get core.hooksPath",
+        "git config --get-all core.hooksPath",
+        "git config --get-regexp core.hooksPath",
+        "git config --list --show-origin",
+        "git --no-pager config --get core.hooksPath",
+        "git config core.hooksPath",
+        "git config --list && git config --get core.hooksPath",
+    ],
+)
+def test_reading_a_disarm_key_is_still_not_a_write(repo: SimpleNamespace, command: str) -> None:
+    """The exclusion still fires for the invocation that owns the flag, which is the whole point.
+
+    The last row is the pairing that matters: a read beside a read stays allowed, so narrowing the
+    window has not turned the exclusion off. ``git config <key>`` with no value is the implicit read
+    (BACKLOG #1306) and is excluded by a different clause -- kept here so a change to either is visible.
+    """
+    assert run_gate(shell(command, cwd=repo.wt), repo.repos) is None
+
+
 # ------------------------------- rule 3c: an EXPLICIT target outranks the IMPLICIT cwd (ordering)
 #
 # Get-GitTargetCandidatesRaw builds an ORDERED candidate list and rule 3c takes the first candidate git

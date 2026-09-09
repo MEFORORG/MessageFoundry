@@ -73,6 +73,10 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "is hashed, and the digest is committed in source on both sides of the seam",
     "ASVS corpus pin": "a keyless content hash over a build input (the OWASP ASVS corpus file), "
     "not a key, a secret, or a message authenticator",
+    "Common-password corpus pin": "a keyless content hash over a shipped data file (the offline "
+    "password-screening corpus), recorded so its .NOTICE cannot describe a file that no longer "
+    "exists; not a key, a secret, or a message authenticator. The input is a published MIT-licensed "
+    "third-party wordlist committed beside the digest, so nothing user- or PHI-derived is hashed",
     "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
     "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
     "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",

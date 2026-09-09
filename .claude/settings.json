@@ -51,6 +51,19 @@
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/seat-declare-prompt.ps1"
             ],
             "statusMessage": "Asking this seat to declare its goal"
+          },
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1",
+              "-Worktree",
+              "${CLAUDE_PROJECT_DIR}"
+            ],
+            "statusMessage": "Injecting this worktree's role card"
           }
         ]
       },
@@ -86,6 +99,59 @@
             ],
             "timeout": 20,
             "statusMessage": "Reading this account's pool headroom"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-api-burn.ps1"
+            ],
+            "timeout": 15,
+            "statusMessage": "Checking for GitHub API polling"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/context-budget.ps1"
+            ],
+            "timeout": 15,
+            "statusMessage": "Reading this session context budget"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/precompact-reprime.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Restoring seat, goal and held ledger numbers"
           }
         ]
       }
