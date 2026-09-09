@@ -141,6 +141,20 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _rotated(response: httpx.Response, token: str) -> str:
+    """The bearer to use AFTER an elevation call (ASVS 7.2.4).
+
+    A successful elevation re-keys the session and returns the new token in the body, so every later
+    request has to carry it -- keeping the old one would 401 and quietly turn a real assertion into a
+    test of an expired token. A refusal rotates nothing and the incoming token is handed back. Same
+    helper, same wording, as ``tests/test_step_up.py`` and ``tests/test_api_auth.py``."""
+    if response.status_code != 200:
+        return token
+    fresh = response.json().get("token")
+    assert isinstance(fresh, str) and fresh, "an elevation route returned no rotated token"
+    return fresh
+
+
 @asynccontextmanager
 async def _admin(
     tmp_path: Path,
@@ -214,6 +228,10 @@ async def test_stepdown_rbac_audit_and_status_codes(tmp_path: Path) -> None:
         assert coord.step_down_calls == 0
         reauth = await c.post("/me/reauth", headers=_auth(boss), json={"password": PW})
         assert reauth.status_code == 200
+        # A successful re-auth ROTATES the session (ASVS 7.2.4), so the old bearer stops resolving.
+        # Without this rebind every assertion below silently becomes a test of an expired token: the
+        # 422 arrives as a 401 and the 200/409 arms never reach the handler at all.
+        boss = _rotated(reauth, boss)
 
         # 422 — the deferred `force` flag is refused rather than silently ignored (RequestModel).
         forced = await c.post("/cluster/stepdown", headers=_auth(boss), json={"force": True})
