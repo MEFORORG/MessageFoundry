@@ -20,6 +20,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.ai_policy import AiDataScope, AiMode, resolve_effective_policy
 from messagefoundry.config.settings import AiSettings, AuthSettings
@@ -302,6 +303,10 @@ async def test_ai_chat_requires_ai_assist_permission(
             roles=[role.value],
             actor="test",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
         user = await service.store.get_user(user_id)
         assert user is not None and user.password_hash is not None
         # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable login so

@@ -53,8 +53,16 @@ _PHI_VIEW_PERMISSIONS: frozenset[Permission] = frozenset(
 )
 
 # Identity used when auth is explicitly disabled via allow_no_auth (embedding/dev): full access.
+# allowed_channels=None is EXPLICIT and load-bearing: the field defaults to the empty set (deny)
+# since BACKLOG #1152, and this identity exists precisely to stand in for "authorization is off",
+# so it must carry the whole estate rather than inherit the deny-by-default an unprovisioned
+# operator gets.
 _SYSTEM_IDENTITY = Identity.build(
-    user_id="system", username="system", auth_provider=AuthProvider.LOCAL, roles=list(Role)
+    user_id="system",
+    username="system",
+    auth_provider=AuthProvider.LOCAL,
+    roles=list(Role),
+    allowed_channels=None,
 )
 
 # While an account is flagged to rotate its password, only these self-service routes stay reachable.

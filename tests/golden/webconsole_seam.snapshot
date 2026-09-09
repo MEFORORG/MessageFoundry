@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-1c29d21c864c1366
+8753d225e1094901
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -118,10 +118,10 @@ begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str') -> 'tupl
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
-confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'list[str] | None'
+confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
-finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
-finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
+finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
+finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
 has_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 has_recent_step_up: (self, token: 'str | None') -> 'bool'
@@ -134,11 +134,11 @@ mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
 oidc_enabled: property -> 'bool'
 oidc_flow_ttl_seconds: property -> 'int'
-reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'bool'
+reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'Elevation'
 revoke_other_sessions: (self, identity: 'Identity', current_token_hash: 'str', *, actor: 'str') -> 'int'
 revoke_own_session: (self, identity: 'Identity', session_id: 'str', *, actor: 'str') -> 'bool'
 store: property -> 'AdminStore'
-verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'bool'
+verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'Elevation'
 webauthn_available: (self) -> 'bool'
 
 ## app.state attributes the console sets/reads
@@ -212,7 +212,7 @@ messagefoundry.api.models.PendingApprovalResponse: approval_id, detail, operatio
 messagefoundry.api.models.PoolInfo: acquire_wait, backend, claim_pool, idle, max_size, size
 messagefoundry.api.models.PoolWaitInfo: count, max_ms, mean_ms, p50_ms, p95_ms, p99_ms
 messagefoundry.api.models.ReloadRequest: config_dir, dry_run
-messagefoundry.api.models.ReloadResult: dry_run, handlers, inbound, outbound, routers, running
+messagefoundry.api.models.ReloadResult: degraded, dry_run, failures, handlers, inbound, outbound, routers, running
 messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
 messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
 messagefoundry.api.models.SecurityLoosening: risk, switch
@@ -225,7 +225,7 @@ messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, log_sinks,
 messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
 messagefoundry.api.models.UploadResendRequest: index, to
 messagefoundry.api.models.UploadedFileInfo: content_type, file_id, filename, message_count, sha256, size, uploaded_at, uploader
-messagefoundry.api.models.UploadedFileList: files, scope, total
+messagefoundry.api.models.UploadedFileList: files, limit, offset, scope, total
 messagefoundry.api.models.UploadedMessageSearchRequest: content, control_id, field_path, field_value, limit, message_type, offset, target
 messagefoundry.api.models.UploadedMessageSummary: control_id, index, message_type, size
 messagefoundry.api.models.UploadedMessagesResult: file_id, filename, matched, messages, scanned, total_messages, truncated

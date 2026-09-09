@@ -643,7 +643,15 @@ class MLLPDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
-        self.host: str = s.get("host", "127.0.0.1")
+        # Refuse a missing/blank host rather than invent one, for the reason spelled out in full on
+        # TcpDestination.__init__: a defaulted peer would dial THIS machine, and where the same engine
+        # runs a listener on that port the delivery would succeed into its own intake rather than
+        # failing. `_mllp_ssl_context` below carries its own `s.get("host", "127.0.0.1")` defaults;
+        # this refusal runs first, so those become unreachable through the destination path.
+        host = s.get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("MLLP destination requires a 'host' setting (the downstream peer)")
+        self.host: str = host
         self.port: int = int(s["port"])
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.connect_timeout: float = float(s.get("connect_timeout", 10.0))

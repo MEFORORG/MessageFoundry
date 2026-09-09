@@ -83,6 +83,6 @@ def test_loud_when_an_extra_is_absent(monkeypatch: Any) -> None:
 
 
 def test_the_real_extra_table_matches_pyproject() -> None:
-    """The table is hand-maintained beside pyproject.toml; assert it still names the five extras CI
+    """The table is hand-maintained beside pyproject.toml; assert it still names the six extras CI
     installs, so a renamed or dropped extra fails here instead of silently never being reported."""
-    assert set(probe.OPTIONAL_EXTRAS) == {"fhir", "dicom", "x12", "xml", "webauthn"}
+    assert set(probe.OPTIONAL_EXTRAS) == {"fhir", "dicom", "x12", "xml", "webauthn", "vault"}

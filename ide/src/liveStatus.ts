@@ -3,19 +3,39 @@
 // Live per-element decorations for the CONNECTIONS view (ADR 0091 "live decorations"): an opt-in
 // (`messagefoundry.liveStatus.enabled`, default OFF) poll of the engine's `GET /connections`
 // (Permission.MONITORING_READ) that feeds status + message counts onto inbound/outbound rows via
-// GraphProvider.setRuntime. Deliberately PASSIVE about auth: it reuses the session Stage → Promote
-// cached in SecretStorage (auth.peekToken — never prompts), and treats 401/403/unreachable as
-// "no live data" (undecorated rows), never a toast or a login popup from a background timer. A dev
-// engine embedded with allow_no_auth serves /connections tokenless, so the local loop needs no
-// sign-in at all. The row aggregation is the pure liveStatusModel; this is the Extension-Host shell.
+// GraphProvider.setRuntime. It never prompts and never toasts: 401/403/unreachable all degrade to
+// "no live data" (undecorated rows), because a background timer must not interrupt anyone. The row
+// aggregation is the pure liveStatusModel; this is the Extension-Host shell.
+//
+// TWO THINGS HERE ARE LOAD-BEARING AND EASY TO "TIDY" INTO BUGS:
+//   1. The poll sends NO TOKEN — the same rule statusBar.ts states as its item 1, for the same
+//      reason. `GET /connections` is gated by plain `require(Permission.MONITORING_READ)`, and
+//      `require()` resolves the bearer with `identity_for_token(bearer_token(request))` — the
+//      default `activity=True`, which refreshes the session's idle clock. So a bearer on
+//      this timer would refresh the session's idle clock on every tick and make the engine's
+//      30-minute idle timeout unreachable while a VS Code window is open (CWE-613). No client-side
+//      opt-out exists: nothing in the engine API reads a header, query parameter, or route that lets
+//      a caller ask for `activity=False` — that flag is a server-side per-route decision only. This
+//      file DID send a bearer here, which is the defect this block exists to stop coming back. The
+//      tokenlessness is DATA (`LIVE_STATUS_PLAN`, asserted in CI), not this comment. Read against
+//      the engine source, not a running engine: the claim rests on `identity_for_token`'s signature
+//      and the route's dependency chain.
+//   2. What that costs, accepted on purpose. Against an engine with auth ENABLED the poll gets a 401
+//      and the rows stay undecorated, so decorations now appear only where `/connections` answers
+//      tokenless — a dev or embedded engine run with `allow_no_auth`. The setting ships OFF by
+//      default, so no one who has not asked for it loses anything; what is given up is a status word
+//      and a count on a tree row, and what is kept is an automatic-logoff control on the one client
+//      that stays open all day. The full monitor is the web console at /ui, which reads the same
+//      data under `activity=False` and is the surface built for it. Making a bearer safe instead
+//      needs an engine-side passive-read surface, which is its own change, not a tidy-up here.
 import * as vscode from "vscode";
-import { clearToken, peekToken } from "./auth";
+import { peekToken } from "./auth";
 import { engineUrl, environments } from "./cli";
 import { getJson, HttpError } from "./engineClient";
 import { resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
 import type { GraphProvider } from "./graphTree";
-import { buildRuntimeMap, type ConnectionRowLite } from "./liveStatusModel";
+import { buildRuntimeMap, LIVE_STATUS_PLAN, type ConnectionRowLite } from "./liveStatusModel";
 import type { RuntimeMap } from "./graphModel";
 
 /** Floor for the poll interval (seconds) — the settings schema declares the same minimum; this
@@ -65,6 +85,16 @@ export class LiveStatusPoller implements vscode.Disposable {
     this.timer = setInterval(() => void this.poll(), intervalMs);
   }
 
+  /** Stop the timer without touching the decorations already shown, for a failure that repeating
+   *  cannot fix. Distinct from `applySettings()`'s stop, which also clears the tree: here the engine
+   *  simply will not answer this route tokenlessly, and the rows are already undecorated. */
+  private standDown(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
   /** One poll cycle. Every failure path degrades silently to "no live data" — a background timer
    *  must never surface an error toast loop (the status bar already tells the user the engine is
    *  down; a missing/expired session is a normal state, not an error). */
@@ -78,20 +108,33 @@ export class LiveStatusPoller implements vscode.Disposable {
     try {
       // Same target the engine status bar reflects (first named environment, else engineUrl).
       const url = resolveEngineStatusTarget(engineUrl(), environments()).url;
-      // SEC-005: never send a bearer token in clear to a non-loopback http:// host.
+      // The SEC-005 host gate (ADR 0035). Kept even though the poll is now tokenless: it is about
+      // the TARGET, and a background timer should not reach an arbitrary non-loopback plaintext host
+      // either. It is also the guard that would still hold if LIVE_STATUS_PLAN ever gained a bearer.
       if (assertTargetAllowed(url).ok) {
-        const bearer = await peekToken(this.ctx, url);
+        const entry = LIVE_STATUS_PLAN[0];
+        // The bearer is attached IFF the plan says so — which is what makes `authenticated: false`
+        // an actual control rather than a comment (same shape as statusBar.runProbe). No entry says
+        // so today, so the token is never even read and the request carries no Authorization header.
+        const bearer = entry.authenticated ? await peekToken(this.ctx, url) : undefined;
         try {
-          const rows = await getJson<ConnectionRowLite[]>(url, "/connections", bearer);
+          const rows = await getJson<ConnectionRowLite[]>(url, entry.route, bearer);
           map = Array.isArray(rows) ? buildRuntimeMap(rows) : undefined;
         } catch (e) {
-          if (e instanceof HttpError && e.status === 401 && bearer) {
-            // The cached session is dead — clear it so the next interactive action (promote)
-            // re-authenticates cleanly. A 403 is NOT cleared: the session is valid, the account
-            // just lacks MONITORING_READ; clearing would only churn the promote sign-in.
-            await clearToken(this.ctx, url);
+          // Unauthorized / unreachable / non-JSON → undecorated rows, silently. Nothing is cleared
+          // here: the poll sends no bearer, so a 401 is the engine saying "this route needs auth",
+          // NOT evidence that the cached session died. Clearing on it would sign the user out from a
+          // timer over a request their session never took part in. `auth.withAuth` still clears on a
+          // 401 from a request that DID carry the token — the only place that inference is sound.
+          map = undefined;
+          // A 401 against a TOKENLESS plan entry is deterministic, not transient: the plan is a
+          // compile-time constant, so nothing this timer can do will make the next attempt succeed.
+          // Left running it would issue a guaranteed-waste request every intervalMs for the life of
+          // the window. Stand down instead; applySettings() re-arms on a settings or target change,
+          // which is the only thing that could change the answer.
+          if (e instanceof HttpError && e.status === 401 && !entry.authenticated) {
+            this.standDown();
           }
-          map = undefined; // unauthorized / unreachable / non-JSON → undecorated rows, silently
         }
       }
     } finally {

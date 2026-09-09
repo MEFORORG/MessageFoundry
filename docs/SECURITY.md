@@ -229,8 +229,10 @@ route handler only when all of them pass.
    sensitive permission set on non-GET requests only. ADR 0118 relocated the knob, and the old
    `[diagnostics].audit_all_authz` TOML spelling is **refused at load**.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
-   connections. Out-of-scope *message* access returns **404** (existence-hiding); connection control and
-   inbound injection return **403**. Denials are audited `auth.channel_denied`.
+   connections, and it **denies by default**: a new non-administrator is granted no channel until
+   somebody grants one (BACKLOG #1152; the full rule is *Per-channel scoping (DLQ-SCOPE)* below).
+   Out-of-scope *message* access returns **404** (existence-hiding); connection control and inbound
+   injection return **403**. Denials are audited `auth.channel_denied`.
 
 The table below has **seven** rows. `require` is the ladder itself; five wrappers extend it
 (`require_paced`, `require_phi_read`, `require_step_up`, `require_step_up_action`, and the shared
@@ -508,7 +510,7 @@ tuple: they act only on the caller's own account.
 | Method | Path | Permission | Gate | Extra constraints |
 |---|---|---|---|---|
 | `POST` | `/uploads` | `files:upload` | `require_step_up` | stdlib multipart parse (no `python-multipart`) |
-| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any` |
+| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any`; **paged** `limit`/`offset` (50, 1..500 / 0..), the window applied AFTER the owner filter so a page's length can never encode another operator's file count |
 | `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
 | `POST` | `/uploads/{file_id}/messages/search` | `files:browse` | `require_step_up` | the needle-bearing sibling of the browse GET (BACKLOG #1184); same owner-only 404 before the decrypt, same bulk PHI-read pacing |
 | `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
@@ -535,10 +537,13 @@ tuple: they act only on the caller's own account.
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
 > the whole catalogue), never to Operator, and never mintable onto a custom role
-> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here —
-> `Identity.allowed_channels` defaults to `null` (= every channel) and an uploaded file carries no
-> channel, so a channel-scoped rule would protect nobody on a default install and would deny every
-> scoped operator their own file. A denied by-id request answers **404** with the same body as a
+> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here, and one
+> of the two reasons originally given has since expired. The surviving reason decides it on its own:
+> an uploaded file carries no channel, so a channel-scoped rule has nothing to match on and would
+> deny every scoped operator their own file. The expired reason was that `Identity.allowed_channels`
+> defaulted to `null` (= every channel), so such a rule would have protected nobody on a default
+> install — BACKLOG #1152 flipped that default to deny, which changes nothing about the owner-only
+> decision but does retire half of its stated justification. A denied by-id request answers **404** with the same body as a
 > malformed or absent id; what makes the by-id routes non-enumerable is that a `file_id` is 128 bits
 > of `secrets.token_hex(16)` and the listing no longer hands out another operator's — the denial is
 > still distinguishable by timing and by its audit row. That denial is audited as `upload.denied` with
@@ -761,18 +766,26 @@ else would need its own authorization rule stated here.
 Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
 
-> **Per-channel scoping (DLQ-SCOPE).** Operational permissions can be confined to a set of
-> connections per user via `users.channel_scope` (`PUT /users/{id}/channel-scope`; `null` = all,
-> the default). When a user is scoped, **at least** `messages:read/view_raw/replay`, dead-letter
-> list/replay, `connections:control` and both monitoring permissions are restricted to their channels
-> (out-of-scope message access returns 404 to avoid leaking existence; connection control returns 403;
-> denials are audited `auth.channel_denied`). The scoped set is whichever route narrows on
-> `Identity.can_access_channel`, not a fixed list — treat the names here as examples, not an
-> enumeration. **Administrators are always all-channels.** A channel-scoped user
-> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit their
-> scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on login the
-> group-derived scope is persisted and stale sessions revoked. It's opt-in — with no matching mapped
-> group, the user's existing scope (all by default) is left untouched.
+> **Per-channel scoping (DLQ-SCOPE), and it DENIES BY DEFAULT (BACKLOG #1152, ASVS 8.2.2).**
+> Operational permissions are confined to a set of connections per user via `users.channel_scope`
+> (`PUT /users/{id}/channel-scope`). A new non-administrator is granted **no channel** — `create_user`
+> writes no scope, and an absent scope denies — so `messages:read/view_raw/replay`, dead-letter
+> list/replay and `connections:control` reach nothing until somebody grants a channel. Out-of-scope
+> message access returns 404 to avoid leaking existence; connection control returns 403; denials are
+> audited `auth.channel_denied`. All-channels survives as a grant somebody typed: the `*` token in the
+> scope list (`{"channels": ["*"]}`). Sending `{"channels": null}` **clears** the scope and therefore
+> denies — it is not the wide value it was before #1152.
+>
+> **Administrators are always all-channels**, by role, which is what keeps the first operator of a
+> fresh install from locking themselves out of their own console. A non-administrator with an empty
+> scope sees an empty console, and the landing page says so in a sentence rather than leaving it to
+> read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
+> make a fresh single-operator install unbootable for the same condition. A channel-scoped user
+> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
+> their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all): on
+> login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
+> and stale sessions revoked. It's opt-in: with no matching mapped group the user's existing scope
+> is left untouched, which for a never-granted account means it stays denied.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
 > caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
@@ -787,8 +800,8 @@ the same permission set on the same method reds CI until it is listed here.
 > connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
 > holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
 > This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
-> route above against a scoped caller with an unscoped caller as the control, and reds if the prose
-> and the app disagree.
+> route above against a scoped caller with an all-channels caller as the control, and reds if the
+> prose and the app disagree.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
@@ -1457,12 +1470,26 @@ session alive. `[auth].max_sessions_per_user` caps concurrent sessions (default 
 the cap revokes the user's oldest — ASVS 7.1.2; `0` = unlimited). Clients send the token as
 `Authorization: Bearer <token>` (the WebSocket prefers the header; the legacy `?token=` query param is
 deprecated because it leaks into proxy/access logs). The token is a **PHI-scoped** credential (the
-user's full RBAC for the session lifetime): the web console holds it in the browser session and the
-`apiclient` (test harness / automation) keeps it in memory, each re-validating it against `/auth/me`
-before use (discarding a stale/revoked one); `apiclient` also **refuses to send credentials over
-plaintext `http` to a non-loopback host** (no TLS yet) unless explicitly run with `--insecure` for
-trusted-network dev. (The retired PySide6 desktop console's OS-keyring token cache is an accepted
-retirement loss — BACKLOG #103.)
+user's full RBAC for the session lifetime), so where each client keeps it matters. **At least** these
+three shipped clients hold one:
+
+| Client | Where the token lives | Outlives the process that got it? |
+|---|---|---|
+| Web console | the browser session | no |
+| `apiclient` (test harness / automation) | process memory | no |
+| VS Code extension (`ide/src/auth.ts`) | VS Code **SecretStorage**, keyed by engine URL | **yes** |
+
+The console and `apiclient` each re-validate against `/auth/me` before use, discarding a stale or
+revoked token; `apiclient` also **refuses to send credentials over plaintext `http` to a non-loopback
+host** (no TLS yet) unless explicitly run with `--insecure` for trusted-network dev. The extension is
+the one holder that puts the credential in **durable, OS-managed** storage. It persists across VS Code
+restarts, so on a deploying site the token would outlive the editor window that acquired it and stay
+usable until the session's own idle or absolute timeout retires it server-side. The extension clears
+its copy on sign-out (revoking the session on the engine first, where the engine is reachable) and on
+a 401 from a request that carried the token; a background timer never clears it, because a request the
+session took no part in is not evidence about the session. (The retired PySide6 desktop console's
+OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
+durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
 
 ### Directory session reconciliation — propagating an AD disable (ADR 0079 mechanism 2)
 
@@ -1515,15 +1542,24 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   flagged). The session `id` is the session's `token_hash` (a one-way hash of the opaque token, safe to
   expose).
 - **`DELETE /me/sessions/{id}`** — revoke one of **your own** sessions (ownership-checked: another
-  user's id returns 404, never revealing or touching it).
+  user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
+  to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
+  already hold does not unlock a terminate, and the grant is single-use.
 - **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
+  Same `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
+The two self-service terminates are **password-only** step-ups deliberately: a second-factor gate
+would deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions.
+
 Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
-revoke + "sign out everywhere else" (the current session is shown but only revocable via *Sign out*),
-and the **Users** page has a **Revoke sessions** action for admin force-sign-out.
+revoke + "sign out everywhere else". The console renders **no Revoke button on the current session**,
+so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is
+a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks ownership only, so it
+accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
+sessions** action for admin force-sign-out.
 
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 

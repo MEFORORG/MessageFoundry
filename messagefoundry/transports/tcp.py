@@ -106,7 +106,19 @@ class TcpDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
-        self.host: str = s.get("host", "127.0.0.1")
+        # Refuse a missing/blank host rather than invent one. Defaulting to loopback would name a peer
+        # the operator never chose: on first deployment the delivery would dial THIS machine, and where
+        # the same engine runs a listener on that port it would SUCCEED into its own intake instead of
+        # failing, so the fault would surface as a misdelivered feed rather than a connection error.
+        # Raising at construction fails at `check`/dry-run/start (build_check_registry builds every
+        # deployed outbound), matching EmailDestination/DirectDestination/DicomScuDestination.
+        # build_outbound_connection already refuses an ABSENT host on both authoring surfaces, but it
+        # tests `is None`, so a blank or non-string one still arrives here; this is the layer that owns
+        # the peer address, so it is the layer that must not fabricate one.
+        host = s.get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("TCP destination requires a 'host' setting (the downstream peer)")
+        self.host: str = host
         self.port: int = int(s["port"])
         self.codec = _codec_from_settings(s)
         self.timeout: float = float(s.get("timeout_seconds", 30.0))

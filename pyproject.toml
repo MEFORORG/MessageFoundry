@@ -174,8 +174,11 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # >=2.3.0,<3: the current 2.x line (Python 3.8+, requests-based). The cap is the half that was missing —
 # the prose already said "a bare `>=` would silently jump a major on re-lock", which is exactly what
 # `hvac>=2.3.0` was, so the intent was documented and unenforced. hvac fronts the store DEK (ADR 0019
-# §3), and CI never installs the [vault] extra, so a major arriving through a re-lock would reach a
-# release without a single test exercising it. Deliberately NOT mirrored by a Dependabot ignore entry:
+# §3). The cap was written when CI installed this extra NOWHERE, so a major arriving through a re-lock
+# would have reached a release with no test exercising it. The `test` leg installs it now (ADR 0180's
+# TLS suite assertion needs to be executed, not merely shipped), so a major would at least be caught
+# by that leg -- keep the cap regardless: the leg proves the client still constructs, not that a major
+# preserved its TLS or redirect behaviour. Deliberately NOT mirrored by a Dependabot ignore entry:
 # auto-merge already routes majors to manual review, and an ignore would suppress hvac's security track
 # for no gain. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
@@ -409,5 +412,9 @@ strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*"]
+# urllib3 and requests ride in on the optional [vault] extra. Both SHIP py.typed, so where the extra is
+# installed (the CI `test` leg, since ADR 0180's assertion needs it) mypy still type-checks them for
+# real -- ignore_missing_imports only suppresses the not-found error on an install without the extra,
+# so a contributor running mypy on a base install is not reddened by a lazy import they never execute.
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*"]
 ignore_missing_imports = true

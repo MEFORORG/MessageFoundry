@@ -43,7 +43,7 @@ from harness._console_widgets import (
     fmt_ts,
 )
 from harness._login import LoginDialog
-from messagefoundry.api.models import ConnectionRow, DeadLetterRow
+from messagefoundry.api.models import ConnectionRow, DeadLetterRow, PendingApprovalResponse
 from messagefoundry.apiclient import ApiError, EngineClient
 
 _DEFAULT_URL = "http://127.0.0.1:8765"
@@ -486,6 +486,9 @@ class MonitorPanel(QWidget):
         except ApiError as exc:
             self._set_status(str(exc), error=True)
             return
+        if isinstance(result, PendingApprovalResponse):
+            self._set_held_status(result)
+            return
         self._set_status(f"purged {result.cancelled} queued delivery(ies) from {key[2]}")
 
     def _replay_selected_dead(self) -> None:
@@ -525,6 +528,9 @@ class MonitorPanel(QWidget):
         except ApiError as exc:
             self._set_status(str(exc), error=True)
             return
+        if isinstance(result, PendingApprovalResponse):
+            self._set_held_status(result)
+            return
         self._set_status(f"re-queued {result.requeued} dead-lettered delivery(ies)")
 
     def _reload_config(self) -> None:
@@ -534,12 +540,24 @@ class MonitorPanel(QWidget):
         except ApiError as exc:
             self._set_status(str(exc), error=True)
             return
+        if isinstance(result, PendingApprovalResponse):
+            self._set_held_status(result)
+            return
         self._set_status(
             f"reloaded: {result.inbound} inbound · {result.outbound} outbound · "
             f"{result.routers} routers · {result.handlers} handlers"
         )
 
     # --- status --------------------------------------------------------------
+
+    def _set_held_status(self, held: PendingApprovalResponse) -> None:
+        """Report a dual-control hold (ASVS 2.3.5): the engine accepted the request and did NOT run
+        it, so this is neither a failure nor a completed action. A distinct second approver must
+        release it, and the requester cannot release their own."""
+        self._set_status(
+            f"{held.operation} held for a second approver (approval {held.approval_id}): "
+            f"{held.detail}"
+        )
 
     def _set_status(self, message: str, *, error: bool = False) -> None:
         self._status.setStyleSheet("color: #c62828;" if error else "")

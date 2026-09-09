@@ -59,6 +59,7 @@ from messagefoundry.api.models import (
     MessageDetail,
     MessageList,
     MessageSearchResults,
+    PendingApprovalResponse,
     PurgeResult,
     ReloadResult,
     ReplayResult,
@@ -84,6 +85,11 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 # TEST process (where the coupling is harmless) and fails if either drifts.
 MAX_REQUEST_URL_LEN = 8192
 MAX_REQUEST_HEADER_VALUE_LEN = 8192
+
+# ASVS 2.3.5 (BACKLOG #1113): the status the engine answers when dual-control holds a gated
+# operation for a second approver instead of running it. Pinned against the engine's own route
+# handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
+_HTTP_PENDING_APPROVAL = 202
 
 
 class ApiError(RuntimeError):
@@ -115,6 +121,27 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
         return [model.model_validate(item) for item in response.json()]
     except (ValidationError, JSONDecodeError, TypeError) as exc:
         raise ApiError(f"invalid response from engine: {exc}") from exc
+
+
+def _decode_approvable(  # noqa: UP047
+    response: httpx.Response, model: type[_Model]
+) -> _Model | PendingApprovalResponse:
+    """Decode a 2xx body from a route that dual-control may hold (ASVS 2.3.5, BACKLOG #1113).
+
+    A held operation is **not** an error and **not** a completed one. The engine answers
+    :data:`_HTTP_PENDING_APPROVAL` with a :class:`PendingApprovalResponse` instead of executing
+    inline, and its route signatures say so (``response_model=X | PendingApprovalResponse`` on
+    ``/connections/{name}/purge``, ``/dead-letters/replay`` and ``/config/reload``). This decoder is
+    the client half of that contract, so the three gated methods answer a hold identically.
+
+    The status code is the discriminator, not the body shape. It is what the engine actually
+    varies, and a pydantic union over two models whose fields are disjoint-but-all-optional-looking
+    would guess. ``_decode`` still does the validating, so a malformed body of either shape stays an
+    :class:`ApiError` rather than a bare ``ValidationError`` escaping into a caller's event loop.
+    """
+    if response.status_code == _HTTP_PENDING_APPROVAL:
+        return _decode(response, PendingApprovalResponse)
+    return _decode(response, model)
 
 
 def _seg(value: str | int) -> str:
@@ -260,6 +287,26 @@ def _build_verify_context(
     return ctx
 
 
+class _TokenCell:
+    """The bearer token, in a cell SHARED by a client and every :meth:`EngineClient.for_polling`
+    clone it makes.
+
+    A clone used to copy the token by value. That was sound only while a session's token never
+    changed after sign-in, which stopped being true with session rotation on re-authentication
+    (ASVS 7.2.4): a poll client cloned BEFORE a re-auth or an MFA verify would hold the retired
+    token and every background read on it would start failing, while the main-thread client
+    carried on fine. Sharing the cell means one rotation reaches every clone.
+
+    This does not widen who may WRITE the token: the clones still have no step-up/MFA handlers and
+    never call an entry point that sets one. The primary remains the only writer.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: str | None = None) -> None:
+        self.value = value
+
+
 class EngineClient:
     """Blocking client for the MessageFoundry localhost API.
 
@@ -297,7 +344,7 @@ class EngineClient:
         if self.base_url.lower().startswith("https"):
             verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout, verify=verify)
-        self._token: str | None = None
+        self._token_cell = _TokenCell()
         self._user: CurrentUser | None = None
         #: Invoked when the engine demands step-up re-verification (403 + X-Step-Up-Required); the GUI
         #: prompts, calls reauth(), and returns True iff re-verified — then the request is retried.
@@ -309,6 +356,18 @@ class EngineClient:
         #: Invoked when the engine demands a second factor (403 + X-MFA-Required, WP-14); the GUI
         #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
         self._mfa_handler: Callable[[], bool] | None = None
+
+    @property
+    def _token(self) -> str | None:
+        """The bearer token, read through the shared cell (see :class:`_TokenCell`).
+
+        Kept as an attribute-shaped property so every existing read and write is unchanged; only
+        WHERE the value lives moved."""
+        return self._token_cell.value
+
+    @_token.setter
+    def _token(self, token: str | None) -> None:
+        self._token_cell.value = token
 
     def __enter__(self) -> EngineClient:
         return self
@@ -328,17 +387,26 @@ class EngineClient:
         """A second client dedicated to **background (off-thread) reads** — the nav health poll, the
         Engine Status refresh, and the per-page auto-refresh.
 
-        It shares this client's bearer token but has its **own** ``httpx.Client`` connection pool and
-        **no step-up/MFA handlers**, so background reader threads never contend on the main-thread
+        It shares this client's bearer token — by REFERENCE, through the cell described in
+        :class:`_TokenCell` — but has its **own** ``httpx.Client`` connection pool and **no
+        step-up/MFA handlers**, so background reader threads never contend on the main-thread
         client's pool or its mutable auth state. That separation is what makes the console
         concurrency-safe: the handler-bearing, token-mutating primary client stays **main-thread
         only** (it serves the modal sign-in/step-up/MFA flows and user actions), while this read-only
-        client is the only one shared across worker threads — and sharing *it* is safe because its
-        token is never mutated, its 403→prompt retry branches are inert (no handlers), and
+        client is the only one shared across worker threads — and sharing *it* is safe because it
+        never WRITES the token, its 403→prompt retry branches are inert (no handlers), and
         ``httpx.Client`` is itself thread-safe for concurrent requests.
 
-        The token is copied at creation. A mid-session credential change relaunches the console
-        (sign-out/expiry quits the app), so this snapshot can't drift out from under a live window.
+        **The token is shared, not snapshotted, and that is the point.** This method previously
+        copied it and justified the copy with "a mid-session credential change relaunches the
+        console, so the snapshot can't drift". Session rotation on re-authentication (ASVS 7.2.4)
+        retired that premise: a re-auth, an MFA verify, or a passkey ceremony now re-keys the session
+        WITHOUT relaunching anything, so a copy taken before one would be a dead token in every
+        background reader. Reading through the cell means the rotation reaches them.
+
+        A read racing a rotation can still see either the old or the new token — the cell is a shared
+        reference, not a lock. That is a plain retry (one background read 401s and the next succeeds),
+        not the permanent breakage a stale copy would cause.
         """
         poll = EngineClient(
             self.base_url,
@@ -348,7 +416,7 @@ class EngineClient:
             tls_client_cert=self._tls_client_cert,
             tls_client_key=self._tls_client_key,
         )
-        poll._token = self._token
+        poll._token_cell = self._token_cell  # shared by reference — see the docstring
         poll._user = self._user
         return poll
 
@@ -456,6 +524,26 @@ class EngineClient:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
 
+    def _adopt_rotated(self, response: httpx.Response) -> None:
+        """Adopt the re-keyed session token an elevation route hands back (ASVS 7.2.4).
+
+        The engine rotates the session on every successful elevation, so the token this client
+        authenticated the call with is already dead when the response arrives. Not adopting the new
+        one signs the client out at the exact moment it succeeded -- and the retry that follows a
+        step-up would then fail on a token the ceremony itself retired.
+
+        Writing through the shared cell (see :class:`_TokenCell`) is what carries the rotation to the
+        background poll clients too. A body without a usable ``token`` leaves the current one in
+        place rather than clearing it: that is an engine older than this contract, and dropping the
+        token there would turn a version skew into a sign-out.
+        """
+        try:
+            token = response.json().get("token")
+        except (JSONDecodeError, AttributeError):
+            return
+        if isinstance(token, str) and token:
+            self._token = token
+
     def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands step-up re-verification (403 +
         ``X-Step-Up-Required``). It must prompt the user, call :meth:`reauth`, and return ``True`` iff
@@ -477,7 +565,7 @@ class EngineClient:
         body: dict[str, str] = {"password": password}
         if action is not None:
             body["purpose"] = action
-        self._request("POST", "/me/reauth", json=body, _allow_step_up=False)
+        self._adopt_rotated(self._request("POST", "/me/reauth", json=body, _allow_step_up=False))
 
     def set_mfa_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands a second factor (403 +
@@ -498,16 +586,27 @@ class EngineClient:
 
     def confirm_mfa(self, code: str) -> list[str]:
         """Confirm enrollment with a live TOTP code; activates MFA and returns the one-time recovery
-        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code."""
-        return _decode(
-            self._request("POST", "/me/mfa/confirm", json={"code": code}), MfaConfirmResponse
-        ).recovery_codes
+        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code.
+
+        Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
+        token is adopted here — the caller keeps getting just the codes.
+
+        Through :meth:`_adopt_rotated` like the other two elevation calls, deliberately. Assigning
+        ``self._token`` directly worked only by accident of an annotation elsewhere:
+        ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
+        ``_decode`` rather than clearing the session. That is a property of a different file, not of
+        the rule, and the rule is the one thing all three sites must share."""
+        response = self._request("POST", "/me/mfa/confirm", json={"code": code})
+        self._adopt_rotated(response)
+        return _decode(response, MfaConfirmResponse).recovery_codes
 
     def verify_mfa(self, code: str) -> None:
         """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises
         :class:`ApiError` (401) on a wrong code. Does not itself trigger the MFA handler."""
         self._refuse_credential_on_cleartext("a second factor")
-        self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)
+        self._adopt_rotated(
+            self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)
+        )
 
     def disable_mfa(self) -> None:
         """Turn off the signed-in user's TOTP MFA (step-up gated)."""
@@ -540,8 +639,16 @@ class EngineClient:
     def restart_connection(self, name: str) -> None:
         self._request("POST", f"/connections/{_seg(name)}/restart")
 
-    def purge_connection(self, name: str, scope: str = "all") -> PurgeResult:
-        return _decode(
+    def purge_connection(
+        self, name: str, scope: str = "all"
+    ) -> PurgeResult | PendingApprovalResponse:
+        """Soft-cancel queued deliveries to an outbound connection.
+
+        Returns a :class:`PurgeResult` when the purge ran, or a :class:`PendingApprovalResponse`
+        when dual-control held it for a second approver (ASVS 2.3.5). Narrow with
+        ``isinstance(result, PendingApprovalResponse)``. The two models share no field, so mypy
+        refuses ``result.cancelled`` until the hold is handled."""
+        return _decode_approvable(
             self._request("POST", f"/connections/{_seg(name)}/purge", params={"scope": scope}),
             PurgeResult,
         )
@@ -671,23 +778,38 @@ class EngineClient:
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None
-    ) -> DeadLetterReplayResult:
+    ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (``None`` scope = all; a channel-scoped user must
-        name their channel — an unscoped replay-all is denied server-side)."""
-        return DeadLetterReplayResult.model_validate(
+        name their channel — an unscoped replay-all is denied server-side).
+
+        Returns a :class:`DeadLetterReplayResult` when the replay ran, or a
+        :class:`PendingApprovalResponse` when dual-control held it for a second approver (ASVS
+        2.3.5). Narrow with ``isinstance(result, PendingApprovalResponse)``. The two models share no
+        field, so mypy refuses ``result.requeued`` until the hold is handled."""
+        return _decode_approvable(
             self._request(
                 "POST",
                 "/dead-letters/replay",
                 json={"channel_id": channel_id, "destination_name": destination_name},
-            ).json()
+            ),
+            DeadLetterReplayResult,
         )
 
     # --- config --------------------------------------------------------------
 
-    def reload_config(self, config_dir: str | None = None) -> ReloadResult:
-        """Apply code-first config atomically (``None`` = the server's startup --config dir)."""
-        return ReloadResult.model_validate(
-            self._request("POST", "/config/reload", json={"config_dir": config_dir}).json()
+    def reload_config(
+        self, config_dir: str | None = None
+    ) -> ReloadResult | PendingApprovalResponse:
+        """Apply code-first config atomically (``None`` = the server's startup --config dir).
+
+        Returns a :class:`ReloadResult` when the graph was swapped, or a
+        :class:`PendingApprovalResponse` when dual-control held the reload for a second approver
+        (ASVS 2.3.5). Narrow with ``isinstance(result, PendingApprovalResponse)``. The two models
+        share no field, so mypy refuses ``result.inbound`` until the hold is handled. A held reload
+        has changed nothing yet; the captured ``config_dir`` is replayed on release."""
+        return _decode_approvable(
+            self._request("POST", "/config/reload", json={"config_dir": config_dir}),
+            ReloadResult,
         )
 
     def stats(self) -> StatsResponse:
@@ -885,11 +1007,13 @@ class EngineClient:
         self._request("PUT", f"/users/{_seg(user_id)}/roles", json={"roles": roles})
 
     def get_channel_scope(self, user_id: str) -> list[str] | None:
-        """A user's per-channel RBAC scope (``None`` = all channels)."""
+        """A user's per-channel RBAC scope: the granted connections, ``["*"]`` for every channel, or
+        ``None`` when no scope is stored — which denies (BACKLOG #1152)."""
         return _decode(self._get(f"/users/{_seg(user_id)}/channel-scope"), ChannelScope).channels
 
     def set_channel_scope(self, user_id: str, channels: list[str] | None) -> None:
-        """Set a user's per-channel RBAC scope (``None`` = all channels)."""
+        """Set a user's per-channel RBAC scope. ``["*"]`` grants every channel; ``None`` clears the
+        scope and therefore DENIES every channel — it is not the wide value it used to be."""
         self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json={"channels": channels})
 
     def delete_user(self, user_id: str) -> None:

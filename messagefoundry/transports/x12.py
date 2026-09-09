@@ -81,7 +81,14 @@ class X12Destination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
-        self.host: str = str(s.get("host", "127.0.0.1"))
+        # Refuse a missing/blank host rather than invent one, for the reason spelled out on
+        # TcpDestination.__init__ (a defaulted peer would dial this machine and can land in the
+        # engine's own listener). The str() this replaces was the worse half of the same defect: it
+        # turned a None host into the literal hostname "None" instead of failing.
+        host = s.get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("X12 destination requires a 'host' setting (the downstream peer)")
+        self.host: str = host
         self.port: int = int(s["port"])
         self.encoding: str = str(s.get("encoding", "utf-8"))
         self.timeout: float = float(s.get("timeout_seconds", 30.0))

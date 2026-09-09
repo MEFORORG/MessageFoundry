@@ -148,6 +148,9 @@ _RESPONSE_FIELD_COLUMN: dict[tuple[str, str], str | None] = {
     ("SecurityEventInfo", "detail"): "audit_log.detail",
     # --- composed in the route body; no store column to rate -----------------------------------
     ("SimpleMessage", "detail"): None,  # a literal operation-result string
+    # Both construction sites are engine-authored literals -- auth_routes.py `detail="re-verified"`
+    # on /me/reauth and `detail="verified"` on /auth/mfa-verify. Neither route reads the store.
+    ("ElevatedResponse", "detail"): None,
     ("IntegrityResult", "detail"): None,  # the backend's own integrity-check output
     ("PendingApprovalResponse", "detail"): None,  # why the action is held for a second approver
     ("AlertTestEmailResult", "detail"): None,  # a safe_exc-scrubbed SMTP send failure

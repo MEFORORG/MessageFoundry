@@ -675,7 +675,7 @@ def route(msg):
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
 | `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited. |
-| `max_files_per_poll` | in | `1000` | most files ONE poll may take (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over the ceiling the scan takes the **first N in `sort` order** and **leaves the rest in the directory for the next poll** — nothing is dropped, refused or reordered. Unlike `max_messages_per_second` on the listen intakes this one **ships on**, because there is no sender to back-pressure: a partner writes to the directory and leaves, so the excess is deferred rather than refused, and a number the project picked costs latency (one extra poll interval per ceiling's worth of backlog) instead of throttling a feed. Raise it if a sustained drop rate exceeds `max_files_per_poll` per `poll_seconds` and the directory grows; `None`/`0` = unlimited. |
+| `poll_max_files` | in | `500` | most files one scan will take. The rest stay in the drop directory and the next scan takes them — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for the number and when to raise it. `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
 | `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. |
@@ -902,16 +902,33 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
 **verbatim** (the preserve-the-original invariant forbids rewriting a clinical payload) but neutralizes
-them at the response: the sender-influenced OBX-5.2 MIME is forced through `_safe_attachment_content_type`
-to `application/octet-stream` on any non-clean value **and** on any **browser-active** type (`html`,
-`xml`, `script`, `svg` subtypes + `multipart`, matched case-folded, length-bounded); the response carries
-`Content-Disposition: attachment` (a download, never an inline render), `X-Content-Type-Options: nosniff`
-(no MIME re-sniff), and `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`
-(an opaque origin with scripts/forms disabled, and no framing), re-asserted on the `/ui` delegate from
-**outside** the console's own CSP writers so a browser-active representation can never execute in the
-application origin. `frame-ancestors` is named in that policy rather than left to the API's security
-header floor because it takes **no fallback from `default-src`** — without it, the strictest policy the
-engine writes was the one response family carrying no framing decision at all (ASVS 3.4.6).
+them at the response. The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
+which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
+reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
+`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
+`application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
+matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
+no further executable type existed, and `application/hta` showed that negative could not be proved. The
+same table supplies the download-name extension, defaulting to `.bin`, so the served filename is a
+property of the product rather than of the host's MIME registry.
+
+The allow-list decides what is **declared**, never whether the file is served: an unrecognized type
+downloads exactly as a refused one does. The response carries `Content-Disposition: attachment` (a
+download, never an inline render), `X-Content-Type-Options: nosniff` (no MIME re-sniff), and
+`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` (an opaque origin with scripts/forms disabled, and no framing),
+re-asserted on the `/ui` delegate from **outside** the console's own CSP writers, so a browser-active
+representation can never execute in the application origin, and none can be framed.
+`frame-ancestors` is named in that policy rather than left to the API's security header
+floor because it takes **no fallback from `default-src`** -- without it, the strictest
+policy the engine writes was the one response family carrying no framing decision at all
+(ASVS 3.4.6).
+
+`application/pdf` is allow-listed by a decision recorded beside the table in `api/app.py`, not by
+oversight: a PDF can carry script that runs in a viewer once a saved file is opened, but that script runs
+against the document rather than against the serving origin, and the declared type stops governing the
+moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
+route does not do.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -951,7 +968,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
 | `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges. |
-| `max_files_per_poll` | in | `1000` | most files ONE poll may take (ASVS 2.4.1 / 15.2.2, BACKLOG #1114) — the same control, default and semantics as the local `File` source, and it **bites harder here** because every file costs a network round trip. Counted over the files that pass the name/pattern/dedup filters, **not** over listing entries, so a share full of non-matching names cannot starve the few that match. The remainder stays on the share for the next poll: deferred, never dropped. `None`/`0` = unlimited. |
+| `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`; an upload into a vanished dir fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
@@ -1240,6 +1257,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls |
+| `poll_max_rows` | `500` | most rows one poll will **fetch** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Charged at the fetch, so a long-unattended table is no longer materialised whole into memory. Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
@@ -2517,6 +2535,47 @@ mechanism differs per class: a timeout for the bounded hops, the 5 s strict-vali
 `[store].command_timeout` for the store hop, cooperative cancellation on stop for the workers, and —
 for the Router/Handler and the SMB worker — nothing but a restart.
 
+### Per-tick poll ceilings
+
+The three **poll** sources — `File(...)`, `Sftp(...)`/`Ftp(...)` and `DatabasePoll(...)` — each take at
+most **500 items per tick** (`poll_max_files`, `poll_max_rows`). The ceiling **ships on**, and a falsy
+value (`None`/`0`) turns it off.
+
+**It is a deferral, not a drop.** A file the scan does not reach is still in the drop directory; a row
+the poll does not fetch is still in the table, unmarked. The next tick takes it. Nothing is quarantined,
+errored, or accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never
+read was never received, and there is no disposition to record.
+
+**Why these three default on when the MLLP message pacer ships off.** On a listen socket a rate bound
+has to refuse or stall a sender mid-conversation, and the right number comes from a real feed profile
+the project does not have — so that one stays opt-in ([`transports/mllp.py`](../messagefoundry/transports/mllp.py),
+ruled 2026-08-11). A poll source has no sender to refuse. The two cases differ in what a bound does to
+the partner, not in appetite for risk.
+
+**Why 500.** At the shipped poll intervals it allows 500 items/s on `File(...)` (`poll_seconds` 1.0) and
+100/s on the remote and database sources (`poll_seconds` 5.0). The published measurements are ~450 msg/s
+at intake and ~97 msg/s sustained end-to-end from one engine process
+([`docs/THROUGHPUT.md`](THROUGHPUT.md), [`docs/SYSTEM-REQUIREMENTS.md`](SYSTEM-REQUIREMENTS.md)), so the
+ceiling sits at or above every rate this engine has been measured achieving. It cannot be the thing that
+throttles a feed the engine could otherwise have kept up with, and ingesting faster than the engine
+drains would only move the backlog from the source system into this engine's store.
+
+**When to raise it.** The drain rate is `poll_max_files ÷ poll_seconds`, so a long interval shrinks it: a
+30,000-file nightly drop on a 60-second poll needs 60 ticks at the default. Raise the ceiling, shorten
+the interval, or set the knob to `0` for that connection.
+
+**What it bounds, and what it does not.** It bounds the ingest — the read, the pre-ingest scan, the
+pipeline hand-off and the durable commit. The `File(...)` source still lists and sorts the whole
+directory each scan, because taking the first N in name or mtime order requires seeing all of them. On
+the database source the ceiling is charged at the **fetch**, so the rest of the result set is never
+pulled out of the driver.
+
+**Files left for a retry do not spend the budget.** A locked or vanished file, a malfunctioning
+pre-ingest scan hook, a handler failure, and a listing entry refused as an unsafe name all leave the
+item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
+tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
+quarantined to the error directory — charges.
+
 ### Table A — concurrency limits & behaviour at the limit (ASVS 13.1.2 / 13.2.6)
 
 | Service/hop | Concurrency bound (setting + default) | Behaviour when the limit is reached | Fallback / recovery |
@@ -2527,9 +2586,9 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. **No ADR 0021 connection_event is emitted** — `transports/x12.py` emits none at all; an allow-list refusal is a logged warning only, and the at-capacity path emits **no log line either** | as MLLP |
 | Raw TCP / X12 destination | as MLLP destination — one delivery per outbound lane | a lane waits for a processing slot; a fresh connection is dialled per delivery | transient failure re-queues into the retry path |
 | HTTP web-service listener (inbound) | `max_connections` default 256; `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout` |
-| File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bound is the poll interval `poll_seconds` (default 1.0) and `max_file_bytes` (16 MiB) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
+| File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bounds are the poll interval `poll_seconds` (default 1.0), `max_file_bytes` (16 MiB) and `poll_max_files` (500 files per scan, [deferring the rest to the next scan](#per-tick-poll-ceilings)) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
 | File endpoint — UNC / SMB share | as local File, plus one dedicated impersonation worker thread per endpoint | the OS redirector queues; no engine-side cap | an SMB failure surfaces as a transient delivery/poll error and re-queues |
-| SFTP (remote-file) | one session per poll or per delivery — no session pool | sessions are serialized by the lane budget; there is no server-side connection cap the engine enforces | a refused/limited server surfaces as a transient error and re-queues per `RetryPolicy` |
+| SFTP (remote-file) | one session per poll or per delivery — no session pool | sessions are serialized by the lane budget; there is no server-side connection cap the engine enforces; one poll takes at most `poll_max_files` (500) files and [defers the rest](#per-tick-poll-ceilings) | a refused/limited server surfaces as a transient error and re-queues per `RetryPolicy` |
 | FTP / FTPS (remote-file) | one session per poll or per delivery — no session pool | as SFTP | as SFTP |
 | Reference-set sync (`FileRef`) | one read per set per `refresh_seconds` pass (default 3600); no concurrency knob — the OS / SMB redirector queues on a UNC path | a slow or unreachable path stretches that set's sync; the sync is isolated per reference set | the previous encrypted snapshot keeps serving reads |
 | REST destination | no per-connection HTTP connection cap exists; the indirect bound is `[pipeline].pooled_max_processing_lanes` (default 256) | requests queue behind the lane budget; the backend's own 429/503 is classified transient | transient → `RetryPolicy` with backoff; permanent → dead-letter |
@@ -2540,7 +2599,7 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
-| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
+| DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |

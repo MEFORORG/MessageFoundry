@@ -33,7 +33,6 @@ import binascii
 import datetime
 import json
 import logging
-import mimetypes
 import os
 import re
 import shutil
@@ -633,11 +632,22 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
-        registry = await engine.reload(config_dir, dry_run=False, propagate=True)
-        await _record_reload_audit(engine, actor=str(p["requester"]), dir_arg=config_dir)
+        # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
+        # swapped the graph and then failed a follow-on step must report the same degraded outcome
+        # the inline path reports, or dual control would be the quieter of the two.
+        outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        registry = outcome.registry
+        await _record_reload_audit(
+            engine,
+            actor=str(p["requester"]),
+            dir_arg=config_dir,
+            failed_steps=[f.step for f in outcome.failures],
+        )
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
+            "degraded": outcome.degraded,
+            "failures": [f.step for f in outcome.failures],
         }
 
     gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _replay)
@@ -647,7 +657,12 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
 
 
 async def _record_reload_audit(
-    engine: Engine, *, actor: str, dir_arg: object, client: str | None = None
+    engine: Engine,
+    *,
+    actor: str,
+    dir_arg: object,
+    client: str | None = None,
+    failed_steps: Sequence[str] = (),
 ) -> None:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -659,7 +674,12 @@ async def _record_reload_audit(
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
     is the original *requester*, while the request in flight belongs to the *approver*, so stamping the
-    approver's address would attribute one person's action to another's host — worse than NULL."""
+    approver's address would attribute one person's action to another's host — worse than NULL.
+
+    ``failed_steps`` names the follow-on steps that did not complete when the graph DID swap
+    (BACKLOG #1111). It is recorded on the row rather than only returned, because the response goes
+    to one caller once and the audit is what a later reader has: a reload whose reference sets never
+    re-armed must be findable after the fact, not only by whoever happened to read the 200."""
     fingerprint: dict[str, object] = {}
     if engine.last_reload_dir is not None:
         try:
@@ -676,6 +696,7 @@ async def _record_reload_audit(
                 "inbound": len(rr.registry.inbound) if rr else 0,
                 "outbound": len(rr.registry.outbound) if rr else 0,
                 "dry_run": False,
+                **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **fingerprint,
             }
         ),
@@ -725,8 +746,8 @@ def _export_ndjson_line(row: Row) -> bytes:
 #: (``;``/space/CR/LF/``"``) that could inject or split the ``Content-Type`` header. An attachment's
 #: ``content_type`` originates from an attacker-influenced OBX-5.2 label, so a value failing this is
 #: served as the generic binary type below rather than trusted into the response header. This is a
-#: shape screen ONLY — it admits ``image/svg+xml``/``text/html``; the browser-active downgrade below is
-#: what makes the served type inert (ASVS 1.3.4).
+#: shape screen ONLY — it admits ``image/svg+xml``/``text/html``/``application/hta``; the allow-list
+#: below is what makes the served type inert (ASVS 1.3.4).
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
 #: Length bound on the served ``Content-Type``. The token grammar above is unbounded and the stored
 #: label has no column check, so an arbitrarily long attacker string would otherwise be echoed into a
@@ -734,16 +755,66 @@ _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+
 _MAX_ATTACHMENT_MIME_LEN = 255
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 
-#: Case-folded subtype tokens that make a media type **browser-active** — a representation a browser may
-#: execute, or render as markup, rather than treat as opaque bytes. Matched as SUBSTRINGS of the
-#: case-folded subtype, deliberately wider than exact-subtype equality or a ``+xml``-suffix test:
+#: The **inert** media types an attachment download may DECLARE, each mapped to the extension its download
+#: name carries. This is an ALLOW-LIST, and the direction is the point. The control it replaced listed
+#: the **browser-active** subtypes to refuse (``html``/``xml``/``script``/``svg``, plus a ``multipart``
+#: top-type), which asks a reviewer to prove a negative — that no further executable type exists. That
+#: cannot be proved, and it was not true: ``application/hta`` names a scriptable HTML application and
+#: passes every one of those tokens. Enumerating what is SAFE makes completeness a property of a list a
+#: reviewer can read, and puts every unforeseen type on the safe side of the default.
+#:
+#: **Exact match on the case-folded type — never a substring or suffix test, in either direction.** The
+#: refusal list matched substrings deliberately, and its reasoning about the threat was right:
 #: ``application/x-javascript``, ``text/x-html``, ``image/svg`` (no ``+xml``) and ``application/xml-dtd``
-#: are all browser-active and every one of them slips past an equality/suffix check. ``script`` also
-#: catches ``ecmascript``/``vbscript``/``jscript``; the only benign type it sweeps up is
-#: ``application/postscript``, which no browser renders and which is not a pass-through requirement.
-_BROWSER_ACTIVE_SUBTYPE_TOKENS = ("html", "xml", "script", "svg")
-#: Top-level types that are browser-active whatever the subtype (``multipart/x-mixed-replace`` renders).
-_BROWSER_ACTIVE_TYPES = ("multipart",)
+#: are all browser-active, and every one slips past an equality or ``+xml``-suffix check. That density of
+#: near-miss spellings is why refusal cannot be enumerated — and it is also why an allow-list has to be
+#: exact: a substring match in the *allow* direction would hand the same near-miss family a pass, since
+#: ``application/pdf-javascript`` contains ``application/pdf``. The fold stays because browsers match
+#: media types case-insensitively, so ``Image/PNG`` and ``image/png`` name one type.
+#:
+#: What is served is the CANONICAL key from this table, not the stored label, so no attacker-influenced
+#: byte reaches the ``Content-Type`` header at all. The shape screen above becomes a first cut rather
+#: than the last line of defence.
+#:
+#: **``application/pdf`` is on this list deliberately, and it is the entry that is not inert.** A genuine
+#: PDF passes the shape screen and the magic check, and a PDF may carry ``/JavaScript`` that runs when a
+#: saved file is opened in a viewer. It stays, for three reasons.
+#:
+#: 1. The clause this control answers is about a representation executing **in the application origin** —
+#:    reading the console's DOM, its session, its cookies. PDF script runs inside the viewer, against the
+#:    document, not against the origin that served it. Declaring ``application/octet-stream`` here would
+#:    not narrow that clause by anything.
+#: 2. The declared type stops governing the moment the file is on disk. From there the file extension and
+#:    the operator's application association decide what opens it, and an operator who wants to read a
+#:    downloaded report will supply ``.pdf`` whatever this header said. So the downgrade would buy nothing
+#:    against the local-open threat, while costing the operator a usable type hint on the commonest
+#:    OBX-5 attachment in a clinical feed.
+#: 3. What WOULD narrow the local-open threat is content scanning, which this download route does not do
+#:    (the ``ScanRejected`` pre-ingest seam covers the ``File(...)``/remote directory sources, not this
+#:    route). A serve-time MIME choice is the wrong instrument for it. A scan seam on this path is
+#:    unfiled work, named by subject rather than by a number.
+#:
+#: Anyone reversing this decision should reverse it on evidence about the **origin**, because the origin
+#: is the only thing this header controls.
+_INERT_ATTACHMENT_TYPES: dict[str, str] = {
+    "application/dicom": ".dcm",
+    "application/json": ".json",
+    "application/pdf": ".pdf",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/tiff": ".tif",
+    "text/csv": ".csv",
+    "text/plain": ".txt",
+}
+#: The download-name extension for every type the allow-list does not name — the partner of
+#: :data:`_DEFAULT_ATTACHMENT_MIME`. Both the served type and the served extension now come from this
+#: module's own tables, never from :mod:`mimetypes`: ``mimetypes.guess_extension`` consults the HOST
+#: registry on Windows, which would make the served filename a property of the machine the engine happens
+#: to run on rather than of the product. Measured on a Windows host:
+#: ``mimetypes.guess_extension("application/hta")`` returns ``.hta``.
+_DEFAULT_ATTACHMENT_EXT = ".bin"
 
 #: The attachment download's Content-Security-Policy (ASVS 1.3.4 + 3.4.6). ``default-src 'none'`` denies
 #: every subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique
@@ -762,47 +833,50 @@ _ATTACHMENT_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
 _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
 
 
-def _is_browser_active_mime(mime: str) -> bool:
-    """True when ``mime`` (already shape-screened ``type/subtype``) names a representation a browser may
-    execute or render as markup.
-
-    **Case-folded, deliberately.** The token grammar admits uppercase and browsers match media types
-    case-insensitively, so ``Image/SVG+XML`` is exactly the threat ``image/svg+xml`` is (``mimetypes``
-    lower-cases internally too, so the mixed-case form even yields a ``.svg`` download name)."""
-    top, _, subtype = mime.casefold().partition("/")
-    if top in _BROWSER_ACTIVE_TYPES:
-        return True
-    return any(token in subtype for token in _BROWSER_ACTIVE_SUBTYPE_TOKENS)
-
-
 def _safe_attachment_content_type(content_type: str | None) -> str:
-    """The download ``Content-Type``: the stored ``content_type`` when it is a clean, bounded
-    ``type/subtype`` MIME that is **not browser-active**, else ``application/octet-stream``.
+    """The download ``Content-Type``: the canonical spelling from :data:`_INERT_ATTACHMENT_TYPES` when the
+    stored ``content_type`` is a clean, bounded ``type/subtype`` naming one of them, else
+    ``application/octet-stream``.
 
     The stored value is a verbatim, attacker-influenced OBX-5.2 label, so it is never trusted into the
-    response header (header-splitting shapes) and never trusted into the *browser* either: an
-    ``image/svg+xml`` or ``text/html`` label is downgraded to the inert binary type, which also stops
-    :func:`_attachment_filename` from deriving a ``.svg``/``.html`` download name (ASVS 1.3.4).
+    response header (header-splitting shapes) and never trusted into the *browser* either. An
+    ``image/svg+xml``, ``text/html`` or ``application/hta`` label is simply not on the list, so it is
+    declared as the inert binary type — which also makes :func:`_attachment_filename` produce ``.bin``
+    instead of a ``.svg``/``.html``/``.hta`` download name (ASVS 1.3.4).
+
+    **This decides what is DECLARED, never whether the file is served.** An unrecognized type downloads
+    exactly as a refused one does, under the generic type. Neither the route's availability nor the
+    count-and-log invariant depends on this function.
 
     **Why downgrade rather than sanitize.** Attachment bytes are verbatim clinical payloads — ADR 0105
     Approach B stores the OBX-5.5 value untouched and the preserve-the-original invariant forbids
     rewriting them — so the control is *neutralize at serve* (inert MIME + attachment disposition +
-    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. Inert types
-    (``application/pdf``, ``image/png``, …) still pass through under their own type."""
+    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document."""
     ct = (content_type or "").strip()
     if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
-    return _DEFAULT_ATTACHMENT_MIME if _is_browser_active_mime(ct) else ct
+    # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
+    # case-fold is the only normalization an exact lookup still needs.
+    key = ct.casefold()
+    return key if key in _INERT_ATTACHMENT_TYPES else _DEFAULT_ATTACHMENT_MIME
+
+
+def _attachment_extension(content_type: str) -> str:
+    """The download-name extension for an ALREADY-downgraded served type: the allow-list's own value, or
+    :data:`_DEFAULT_ATTACHMENT_EXT` for anything else (``application/octet-stream`` included)."""
+    return _INERT_ATTACHMENT_TYPES.get(content_type.casefold(), _DEFAULT_ATTACHMENT_EXT)
 
 
 def _attachment_filename(attachment_id: str, content_type: str) -> str:
     """A header-safe download filename. ``attachment_id`` is a 64-hex sha256 (safe by construction); a
-    short prefix keeps it readable and a ``mimetypes`` extension (when the MIME is known) hints the type.
-    No user/attacker text reaches the ``Content-Disposition`` header. Callers pass the ALREADY-downgraded
-    :func:`_safe_attachment_content_type` result, so a browser-active label can never source the
+    short prefix keeps it readable and the allow-list's own extension hints the type.
+
+    No user/attacker text reaches the ``Content-Disposition`` header, and no HOST state reaches it either:
+    the extension comes from :func:`_attachment_extension`, never from :func:`mimetypes.guess_extension`,
+    which reads the Windows registry. Callers pass the ALREADY-downgraded
+    :func:`_safe_attachment_content_type` result, so only a type on the allow-list can source an
     extension."""
-    ext = mimetypes.guess_extension(content_type) or ""
-    return f"attachment-{attachment_id[:16]}{ext}"
+    return f"attachment-{attachment_id[:16]}{_attachment_extension(content_type)}"
 
 
 def _is_attachment_download_path(path: str) -> bool:
@@ -3044,9 +3118,14 @@ def create_app(
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
             # (it doesn't apply anything) and single-node ignores it (is_clustered() False).
-            registry = await engine.reload(
+            # reload_detail, not reload: the graph swap can succeed while a follow-on step (the
+            # provenance fingerprint, the reference-set reconcile, the cluster version bump) fails,
+            # and reload() projects that away to a Registry. Reporting it is the whole point of
+            # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
+            outcome = await engine.reload_detail(
                 req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
             )
+            registry = outcome.registry
         except ConfigReloadDenied as exc:
             await engine.store.record_audit(
                 "config_reload_denied",
@@ -3114,7 +3193,11 @@ def create_app(
             )
         else:
             await _record_reload_audit(
-                engine, actor=user.username, dir_arg=req.config_dir, client=client_ip(request)
+                engine,
+                actor=user.username,
+                dir_arg=req.config_dir,
+                client=client_ip(request),
+                failed_steps=[f.step for f in outcome.failures],
             )
         rr = engine.registry_runner
         return ReloadResult(
@@ -3124,6 +3207,8 @@ def create_app(
             handlers=len(registry.handlers),
             running=bool(rr and rr.running),
             dry_run=req.dry_run,
+            degraded=outcome.degraded,
+            failures=[f.step for f in outcome.failures],
         )
 
     # --- messages ------------------------------------------------------------
@@ -3672,10 +3757,11 @@ def create_app(
             detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
             client=client_ip(request),
         )
-        # Neutralize at serve (ASVS 1.3.4): a browser-active OBX-5.2 label (svg/html/xml/script) is
-        # downgraded to the inert binary type, which also keeps the .svg/.html extension out of the
-        # download name, and the response carries a sandbox CSP so no served representation can execute
-        # in the application origin. The stored bytes are NEVER rewritten (ADR 0105 Approach B keeps the
+        # Neutralize at serve (ASVS 1.3.4): the sender-influenced OBX-5.2 label is declared only when it
+        # names one of the inert types on the _INERT_ATTACHMENT_TYPES allow-list, so a browser-active
+        # label (svg/html/hta/script and every type nobody listed) is declared as the inert binary type,
+        # which also keeps a .svg/.html extension out of the download name; the response carries a
+        # sandbox CSP so no served representation can execute in the application origin. The stored bytes are NEVER rewritten (ADR 0105 Approach B keeps the
         # OBX-5.5 value verbatim). AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
         # the /ui CSP writers so the console delegate serves it too.
         content_type = _safe_attachment_content_type(match["content_type"])
@@ -4058,9 +4144,14 @@ def create_app(
         ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
         ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
 
-        The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
-        (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule
-        would protect nobody on a default install and would deny every scoped operator their own file.
+        The channel axis is deliberately NOT used, and ONE of its two original reasons has since
+        expired. The surviving one is decisive on its own: an uploaded file carries no channel at
+        all — it is decoupled from every connection by construction — so a channel-scoped rule has
+        nothing to match on and would deny every scoped operator their own file. The expired one was
+        that ``Identity.allowed_channels`` defaulted to ``None`` (= every channel), which would have
+        made such a rule protect nobody on a default install; BACKLOG #1152 flipped that default to
+        deny. Recorded rather than deleted, because a reader who remembers only the expired half
+        would think the owner-ratified decision (ADR 0134 Amendment A) had lost its ground.
 
         FAIL CLOSED on a sidecar with no ``uploader_id``. ``save()`` refuses to write one, but the
         tolerant loader yields ``""`` for a sidecar missing the key (a hand-placed one under the no-key
@@ -4265,8 +4356,10 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.FILES_BROWSE)),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
     ) -> UploadedFileList:
-        """List the caller's OWN uploaded files (metadata only — no bodies). Audited.
+        """List one page of the caller's OWN uploaded files (metadata only — no bodies). Audited.
 
         Object-level authorization (ASVS 8.2.2): the listing is owner-scoped, so one operator never
         sees another's filenames, sizes, digests or ``file_id`` s — the ``file_id`` being the token the
@@ -4274,7 +4367,18 @@ def create_app(
         The scope is returned in the response AND recorded in the audit row — computed once, here — so
         a count means the same thing to every reader and no consumer has to re-derive whose files it
         is holding. The web console renders the sentence that matches it rather than asserting the
-        owner-scoped case at an override holder, for whom it is false."""
+        owner-scoped case at an override holder, for whom it is false.
+
+        **Paged (BACKLOG #1152).** The route was pageless, so one response carried every visible file
+        and its size grew with the age of the install — an uploads directory has no bound, and
+        ``list_files`` decrypts a sidecar per entry. ``total`` remains the whole visible count, which
+        is what the audit row and the console's "N file(s)" both mean; ``files`` is the window.
+
+        **The window is applied AFTER the owner filter, and that order is the security-relevant
+        part.** Paging first would make each page's size depend on how many of another operator's
+        files happened to fall inside it, which turns the page length into a count of files the
+        caller may not know exist. Filter, then slice, and a scoped caller's pages are a function of
+        their own files only."""
         us = _require_upload_store(request)
         # Filtered HERE, not in UploadStore.list_files(): the store's unscoped scan is what the
         # per-uploader quota and the age-based retention sweep are built on, and both must keep seeing
@@ -4283,14 +4387,31 @@ def create_app(
         scope: Literal["own", "any_owner"] = (
             "any_owner" if identity.has(Permission.FILES_ACCESS_ANY) else "own"
         )
+        window = files[offset : offset + limit]
         await engine.store.record_audit(
             "upload.list",
             actor=identity.username,
-            detail=json.dumps({"count": len(files), "scope": scope}),
+            # `count` keeps meaning the whole visible set, unchanged from the pageless route, so an
+            # existing reader of this trail is not silently re-based onto a page size. `returned`,
+            # `limit` and `offset` are the new window. No filename and no owner: the audit of a
+            # listing is a count, not an inventory.
+            detail=json.dumps(
+                {
+                    "count": len(files),
+                    "returned": len(window),
+                    "limit": limit,
+                    "offset": offset,
+                    "scope": scope,
+                }
+            ),
             client=client_ip(request),
         )
         return UploadedFileList(
-            total=len(files), files=[_upload_info(m) for m in files], scope=scope
+            total=len(files),
+            files=[_upload_info(m) for m in window],
+            scope=scope,
+            limit=limit,
+            offset=offset,
         )
 
     async def browse_uploaded_file(

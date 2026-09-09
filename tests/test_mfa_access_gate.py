@@ -24,6 +24,7 @@ from _mfa_grant import mfa_grant_values
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -59,6 +60,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
         roles=[r.value for r in roles],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     # Admin-created accounts force first-login rotation; clear it so must_change does not mask the
     # MFA refusal under test (must_change is enforced FIRST by design).
     user = await service.store.get_user(user_id)
@@ -243,9 +248,11 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
     setup = await service.login("vic", PW)
     assert setup.ok and setup.token is not None
     enrollment = await service.begin_mfa_enrollment(identity)
-    assert await service.confirm_mfa_enrollment(
-        identity, totp.totp(enrollment.secret), token=setup.token
-    )
+    assert (
+        await service.confirm_mfa_enrollment(
+            identity, totp.totp(enrollment.secret), token=setup.token
+        )
+    ).ok
 
     async with _client(engine, service) as c:
         # The attacker knows the password and nothing else.
@@ -257,6 +264,11 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
         # succeeds as a re-auth (the session window legitimately refreshes)...
         r = await c.post("/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h)
         assert r.status_code == 200
+        # The re-auth re-keyed the session (ASVS 7.2.4), so the rest of the chain has to be driven
+        # with the ROTATED bearer -- otherwise the enroll below would 401 on a dead token and the
+        # test would "pass" without ever reaching the guard it exists to prove.
+        tok = str(r.json()["token"])
+        h = _auth(tok)
 
         # ...but it must NOT have minted the action grant, so the enrollment route stays shut.
         enroll = await c.post("/me/mfa/enroll", headers=h)
@@ -283,9 +295,11 @@ async def test_bootstrap_enrollment_from_a_pending_session_still_works(engine: E
         tok = await _login(c, "fresh")
         h = _auth(tok)
         assert (await c.get("/messages", headers=h)).status_code == 403
-        assert (
-            await c.post("/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h)
-        ).status_code == 200
+        elevated = await c.post(
+            "/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=h
+        )
+        assert elevated.status_code == 200
+        h = _auth(str(elevated.json()["token"]))  # re-keyed by the re-auth
         assert (await c.post("/me/mfa/enroll", headers=h)).status_code == 200
 
 
@@ -403,11 +417,14 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
 
     # The confinement is survivable: the ceremony accepts the directory account.
     enroll = await service.begin_mfa_enrollment(out.identity)
-    codes = await service.confirm_mfa_enrollment(
+    confirmed = await service.confirm_mfa_enrollment(
         out.identity, totp.totp(enroll.secret), token=out.token
     )
-    assert codes is not None
-    assert await service.mfa_satisfied(out.token) is True
+    assert confirmed.recovery_codes
+    # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146): the gate lifts on the NEW token,
+    # and the one that walked into the ceremony has stopped authenticating by design.
+    assert isinstance(confirmed.token, str)
+    assert await service.mfa_satisfied(confirmed.token) is True
 
 
 async def test_the_directory_login_outcome_reports_the_debt_it_created(engine: Engine) -> None:

@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -56,6 +57,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
         roles=[Role.ADMINISTRATOR.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable test login.
@@ -126,6 +131,7 @@ async def test_stale_session_blocked_then_reauth_refreshes(engine: Engine) -> No
         # Correct password refreshes it; the sensitive op now succeeds.
         ok = await c.post("/me/reauth", headers=_auth(token), json={"password": PW})
         assert ok.status_code == 200
+        token = _rotated(ok, token)
         assert (await c.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
 
 
@@ -138,7 +144,9 @@ async def test_app_replay_route_is_also_step_up_gated(engine: Engine) -> None:
         # The message doesn't exist, but step-up fires first → 403, not 404.
         blocked = await c.post("/messages/nonexistent/replay", headers=_auth(token))
         assert blocked.status_code == 403
-        await c.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        token = _rotated(
+            await c.post("/me/reauth", headers=_auth(token), json={"password": PW}), token
+        )
         # Past the gate now: a missing message is a normal 404 (anything but the step-up 403).
         passed = await c.post("/messages/nonexistent/replay", headers=_auth(token))
         assert passed.status_code != 403
@@ -179,9 +187,9 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
             await c.post("/me/reauth", headers=_auth(token), json={"password": "wrong"})
         ).status_code == 403
         # Correct AD password re-binds and refreshes the window.
-        assert (
-            await c.post("/me/reauth", headers=_auth(token), json={"password": "ad-pw"})
-        ).status_code == 200
+        rebind = await c.post("/me/reauth", headers=_auth(token), json={"password": "ad-pw"})
+        assert rebind.status_code == 200
+        token = _rotated(rebind, token)
         assert (await c.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
 
 
@@ -204,13 +212,27 @@ async def test_has_recent_step_up_tracks_the_window(engine: Engine) -> None:
 
 
 # --- ADR 0077: action-bound step-up for the durable-takeover routes ----------
+def _rotated(response: httpx.Response, token: str) -> str:
+    """The bearer to use AFTER an elevation call (ASVS 7.2.4).
+
+    A successful elevation re-keys the session and returns the new token in the body, so every later
+    request must carry it. A refusal rotates nothing and the incoming token is handed back."""
+    if response.status_code != 200:
+        return token
+    fresh = response.json().get("token")
+    assert isinstance(fresh, str) and fresh, "an elevation route returned no rotated token"
+    return fresh
+
+
 async def _reauth(
     c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
-) -> httpx.Response:
+) -> tuple[httpx.Response, str]:
+    """Returns ``(response, the token to use next)`` -- see :func:`_rotated`."""
     body: dict[str, str] = {"password": password}
     if purpose is not None:
         body["purpose"] = purpose
-    return await c.post("/me/reauth", headers=_auth(token), json=body)
+    r = await c.post("/me/reauth", headers=_auth(token), json=body)
+    return r, _rotated(r, token)
 
 
 async def test_login_window_does_not_unlock_factor_binding(engine: Engine) -> None:
@@ -232,7 +254,8 @@ async def test_login_window_does_not_unlock_factor_binding(engine: Engine) -> No
             assert r.headers.get("X-Step-Up-Required") == "1"
             assert r.headers.get("X-Step-Up-Action") == action  # the 403 names the action to reauth
         # A per-action reauth for enroll unlocks exactly enroll (the staged secret is returned).
-        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        r, token = await _reauth(c, token, purpose="mfa_enroll")
+        assert r.status_code == 200
         enrolled = await c.post("/me/mfa/enroll", headers=_auth(token))
         assert enrolled.status_code == 200 and enrolled.json()["secret"]
 
@@ -245,13 +268,15 @@ async def test_action_grant_is_single_use_and_bound(engine: Engine) -> None:
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
         # One reauth → one enroll.
-        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        r, token = await _reauth(c, token, purpose="mfa_enroll")
+        assert r.status_code == 200
         assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
         # Single-use: the grant was consumed, so a second enroll re-prompts.
         again = await c.post("/me/mfa/enroll", headers=_auth(token))
         assert again.status_code == 403 and again.headers.get("X-Step-Up-Action") == "mfa_enroll"
         # Bound: an enroll grant does NOT unlock confirm (a different action).
-        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        r2, token = await _reauth(c, token, purpose="mfa_enroll")
+        assert r2.status_code == 200
         confirm = await c.post("/me/mfa/confirm", headers=_auth(token), json={"code": "000000"})
         assert (
             confirm.status_code == 403 and confirm.headers.get("X-Step-Up-Action") == "mfa_confirm"
@@ -271,6 +296,10 @@ async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(target_id, [ALL_CHANNELS], actor="test")
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
         body = {"display_name": "Renamed"}
@@ -280,7 +309,8 @@ async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
         assert blocked.headers.get("X-Step-Up-Required") == "1"
         assert blocked.headers.get("X-Step-Up-Action") == "admin_user_update"
         # A per-action reauth unlocks exactly one PATCH (single-use).
-        assert (await _reauth(c, token, purpose="admin_user_update")).status_code == 200
+        r, token = await _reauth(c, token, purpose="admin_user_update")
+        assert r.status_code == 200
         ok = await c.patch(f"/users/{target_id}", headers=_auth(token), json=body)
         assert ok.status_code == 200, ok.text
         # Consumed → a second PATCH re-prompts for the same action.
@@ -301,6 +331,10 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="test",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(target_id, [ALL_CHANNELS], actor="test")
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
         r = await c.patch(f"/users/{target_id}", headers=_auth(token), json={"display_name": "X"})
@@ -336,11 +370,16 @@ async def test_login_and_verify_mfa_never_grant_an_action(
         pin_totp_clock(monkeypatch, t1)
         token2 = (await service.login("boss", PW)).token
         assert token2 is not None
-        assert await service.verify_mfa(token2, totp.totp(enroll.secret, now=t1)) is True
+        verified = await service.verify_mfa(token2, totp.totp(enroll.secret, now=t1))
+        assert verified.ok is True and verified.token is not None
+        token2 = verified.token  # re-keyed by the verify (ASVS 7.2.4)
         assert await service.has_recent_step_up(token2) is True  # verify_mfa re-anchored the window
         assert await service.has_action_step_up(token2, "mfa_disable") is False  # but no grant
-        # Only reauth(purpose=…) mints one — and it is single-use.
-        assert await service.reauth(identity, PW, token=token2, purpose="mfa_disable") is True
+        # Only reauth(purpose=…) mints one — and it is single-use. The grant is minted against the
+        # ROTATED hash (ASVS 7.2.4), so the check has to run on the token reauth handed back.
+        granted = await service.reauth(identity, PW, token=token2, purpose="mfa_disable")
+        assert granted.ok is True and granted.token is not None
+        token2 = granted.token
         assert await service.has_action_step_up(token2, "mfa_disable") is True  # consumes it
         assert await service.has_action_step_up(token2, "mfa_disable") is False  # gone
 
@@ -361,7 +400,8 @@ async def test_opt_out_restores_session_window(engine: Engine) -> None:
         # reauth carrying no purpose.
         await _make_stale(service, token)
         assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 403
-        assert (await _reauth(c, token)).status_code == 200
+        r, token = await _reauth(c, token)
+        assert r.status_code == 200
         assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
 
 
@@ -381,7 +421,8 @@ async def test_mfa_pending_and_ad_do_not_deadlock(engine: Engine) -> None:
         assert blocked.headers.get("X-Step-Up-Required") == "1"
         assert blocked.headers.get("X-MFA-Required") is None  # no MFA deadlock
         # The password-only per-action reauth unlocks enrollment for the MFA-pending session.
-        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        r, token = await _reauth(c, token, purpose="mfa_enroll")
+        assert r.status_code == 200
         assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
 
 
@@ -417,10 +458,12 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
     identity = await service.identity_for_token(token)
     assert identity is not None
     # Wrong AD password: the live re-bind fails and mints nothing.
-    assert await service.reauth(identity, "wrong", token=token, purpose="mfa_disable") is False
+    assert (await service.reauth(identity, "wrong", token=token, purpose="mfa_disable")).ok is False
     assert await service.has_action_step_up(token, "mfa_disable") is False
     # Correct AD password: the re-bind succeeds and the single-use grant is minted.
-    assert await service.reauth(identity, "ad-pw", token=token, purpose="mfa_disable") is True
+    rebound = await service.reauth(identity, "ad-pw", token=token, purpose="mfa_disable")
+    assert rebound.ok is True and rebound.token is not None
+    token = rebound.token
     assert await service.has_action_step_up(token, "mfa_disable") is True
 
 
@@ -434,6 +477,10 @@ async def test_create_session_stamps_reauth_at(engine: Engine) -> None:
         roles=[Role.VIEWER.value],
         actor="t",
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     await engine.store.create_session(
         token_hash="deadbeef", user_id=uid, expires_at=2e12, client="t"
     )

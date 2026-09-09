@@ -77,23 +77,35 @@ async def _login(service: AuthService, password: str) -> str:
 
 async def _enroll_totp(
     service: AuthService, identity: Identity, token: str, *, now: float | None = None
-) -> str:
-    """Run a real enrollment ceremony; returns the shared secret.
+) -> tuple[str, str]:
+    """Run a real enrollment ceremony; returns ``(shared secret, the token to use next)``.
 
     Pass ``now`` (with the clock pinned there) when the test verifies a code LATER: enrollment
     consumes its activating step, so a later code from the same step is refused as a replay.
+
+    Confirming an enrolment ELEVATES the session, so it re-keys it (ASVS 7.2.4) and the token passed
+    in stops authenticating. The rotated one is returned rather than left for each caller to dig out
+    of the Elevation, because a caller that kept the old one would 401 on its next line and read as a
+    bug in the thing under test.
     """
     enroll = await service.begin_mfa_enrollment(identity)
     code = totp.totp(enroll.secret, now=now) if now is not None else fresh_totp(enroll.secret)
-    assert await service.confirm_mfa_enrollment(identity, code, token=token) is not None
-    return enroll.secret
+    elevation = await service.confirm_mfa_enrollment(identity, code, token=token)
+    assert elevation.recovery_codes, "enrollment confirm returned no recovery codes"
+    fresh = elevation.token
+    assert isinstance(fresh, str) and fresh, "enrollment confirm returned no rotated token"
+    return enroll.secret, fresh
 
 
-async def _enroll_passkey(service: AuthService, identity: Identity, token: str) -> object:
-    """Run a real registration ceremony against the in-repo soft authenticator; returns it.
+async def _enroll_passkey(
+    service: AuthService, identity: Identity, token: str
+) -> tuple[object, str]:
+    """Run a real registration ceremony against the in-repo soft authenticator.
 
-    The return is opaque here because the ``webauthn`` import is deferred to the two gated tests —
-    only ``_assert_passkey`` consumes it.
+    Returns ``(the authenticator, the token to use next)``. The first is opaque here because the
+    ``webauthn`` import is deferred to the two gated tests — only ``_assert_passkey`` consumes it.
+    The second exists because registration ELEVATES the enrolling session, so it re-keys it
+    (ASVS 7.2.4) and the token passed in stops authenticating.
     """
     from webauthn.helpers import base64url_to_bytes
 
@@ -104,33 +116,39 @@ async def _enroll_passkey(service: AuthService, identity: Identity, token: str) 
         identity, token=token, rp_id=RP, rp_name="MessageFoundry"
     )
     challenge = base64url_to_bytes(json.loads(options)["challenge"])
-    assert (
-        await service.finish_webauthn_registration(
-            identity,
-            soft.create_response(challenge, transports=["usb"]),
-            label="test key",
-            token=token,
-            rp_id=RP,
-            origin=ORIGIN,
-        )
-        is True
+    elevation = await service.finish_webauthn_registration(
+        identity,
+        soft.create_response(challenge, transports=["usb"]),
+        label="test key",
+        token=token,
+        rp_id=RP,
+        origin=ORIGIN,
     )
-    return soft
+    assert elevation.ok is True
+    fresh = elevation.token
+    assert isinstance(fresh, str) and fresh, "passkey registration returned no rotated token"
+    return soft, fresh
 
 
-async def _assert_passkey(service: AuthService, token: str, soft: object) -> bool:
-    """Run a real assertion ceremony for ``token`` with the authenticator ``_enroll_passkey`` built."""
+async def _assert_passkey(service: AuthService, token: str, soft: object) -> tuple[bool, str]:
+    """Run a real assertion ceremony for ``token`` with the authenticator ``_enroll_passkey`` built.
+
+    Returns ``(ok, the token to use next)``. A successful assertion elevates and therefore re-keys;
+    a failed one rotates nothing and hands the incoming token straight back, so a caller can rebind
+    unconditionally without branching on the outcome.
+    """
     from webauthn.helpers import base64url_to_bytes
 
     options = await service.begin_webauthn_assertion(token, rp_id=RP)
     assert options is not None
     challenge = base64url_to_bytes(json.loads(options)["challenge"])
-    return await service.finish_webauthn_assertion(
+    elevation = await service.finish_webauthn_assertion(
         token,
         soft.get_response(challenge),  # type: ignore[attr-defined]
         rp_id=RP,
         origin=ORIGIN,
     )
+    return elevation.ok, (elevation.token if elevation.token is not None else token)
 
 
 # --- the five in-place elevation sites --------------------------------------
@@ -139,16 +157,17 @@ async def _assert_passkey(service: AuthService, token: str, soft: object) -> boo
 async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED when: verify_mfa rotates the session token.
+    """RED when: verify_mfa stops rotating the session token.
 
-    Invert to ``identity_for_token(pre_mfa) is None``. This is the arm the severity rests on: a token
-    captured while the session was still MFA-pending becomes a fully authenticated session the moment
-    the legitimate user completes the second factor, with no new token minted and nothing revoked.
+    INVERTED when the wiring landed, exactly as this file was written to be. The pre-MFA token now
+    stops authenticating at the moment of elevation, which is the arm the severity rested on: a token
+    captured while the session was still MFA-pending no longer becomes a fully authenticated session
+    when the legitimate user completes the second factor.
 
-    BOTH of ``verify_mfa``'s stamps are asserted. #1146 names the ordering trap — every session UPDATE
-    but ``revoke_session``/``rotate_session`` is rowcount-blind — so a rotation slipped between the two
-    would drop the client re-anchor and report success. Asserting only the MFA leg would still go red
-    on the line above and be inverted without anyone reading the second write.
+    BOTH of ``verify_mfa``'s stamps are still asserted, now against the NEW token. #1146 names the
+    ordering trap — every session UPDATE but ``revoke_session``/``rotate_session`` is rowcount-blind —
+    so a stamp written AFTER the rotation writes nothing and reports success. Reading the elevated
+    state off the new token is what catches that: it is only there if both stamps landed first.
     """
     store, service = await _service()
     try:
@@ -158,7 +177,9 @@ async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
         # step, so a verify from the SAME step is refused as a replay rather than accepted.
         t0 = 1_000_000.0
         pin_totp_clock(monkeypatch, t0)
-        secret = await _enroll_totp(service, identity, enrolling, now=t0)
+        # The rotated token is discarded here on purpose: this arm logs in AFRESH below to get a
+        # genuinely pre-MFA session, which is the thing under test.
+        secret, _ = await _enroll_totp(service, identity, enrolling, now=t0)
 
         pre_mfa = await _login(service, password)
         assert await service.mfa_satisfied(pre_mfa) is False
@@ -166,51 +187,63 @@ async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
 
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
-        assert await service.verify_mfa(pre_mfa, totp.totp(secret, now=t1)) is True
+        elevation = await service.verify_mfa(pre_mfa, totp.totp(secret, now=t1))
+        assert elevation.ok is True
+        fresh = elevation.token
+        assert isinstance(fresh, str) and fresh != pre_mfa
 
-        assert await service.identity_for_token(pre_mfa) is not None, (
-            "the pre-MFA token still authenticates after the second factor"
+        assert await service.identity_for_token(pre_mfa) is None, (
+            "the pre-MFA token stops authenticating at the moment of elevation"
         )
-        assert await service.mfa_satisfied(pre_mfa) is True, (
-            "...and it was elevated in place: same token, now MFA-satisfied"
+        assert await service.mfa_satisfied(fresh) is True, (
+            "...and the elevation landed on the NEW token instead"
         )
-        assert await service.has_recent_step_up(pre_mfa) is True, (
-            "...including the second stamp, the WP-L3-13 client re-anchor"
+        assert await service.has_recent_step_up(fresh) is True, (
+            "...including the second stamp, the WP-L3-13 client re-anchor -- which is only "
+            "readable here if it was written BEFORE the rotation, since it is rowcount-blind"
         )
     finally:
         await store.close()
 
 
 async def test_the_totp_enrollment_confirm_elevates_the_enrolling_token_in_place() -> None:
-    """RED when: confirm_mfa_enrollment rotates the session token.
+    """RED when: confirm_mfa_enrollment stops rotating the session token.
 
-    Invert to ``identity_for_token(enrolling) is None``. Nothing here is a "re-auth" by name, so this
-    leg is missed by any wiring scoped to the re-authentication routes — yet the session's second
-    factor goes from pending to satisfied on the token it already had.
+    INVERTED when the wiring landed. Nothing here is a "re-auth" by name, so this leg is missed by
+    any wiring scoped to the re-authentication routes — which is exactly why #1146 refused the
+    owner-named two-route subset. The session's second factor now goes from pending to satisfied on a
+    NEW token, and the one it had stops working.
     """
     store, service = await _service()
     try:
         identity, enrolling, _ = await _bootstrap_login(service)
         assert await service.mfa_satisfied(enrolling) is False
 
-        await _enroll_totp(service, identity, enrolling)
+        _, fresh = await _enroll_totp(service, identity, enrolling)
 
-        assert await service.identity_for_token(enrolling) is not None
-        assert await service.mfa_satisfied(enrolling) is True, (
-            "the enrolling token was promoted to MFA-satisfied in place"
+        assert await service.identity_for_token(enrolling) is None, (
+            "the enrolling token stops authenticating at the moment of elevation"
+        )
+        assert await service.mfa_satisfied(fresh) is True, (
+            "...and the MFA-satisfied state landed on the NEW token instead"
         )
     finally:
         await store.close()
 
 
 async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
-    """RED when: reauth rotates the session token.
+    """RED when: reauth stops rotating the session token.
 
-    Invert to ``identity_for_token(token) is None``. Both of this site's elevations are asserted: the
-    session-window stamp and the ADR 0077 action-bound grant, which is minted against the OLD hash
-    today and must move to the NEW one after a rotation. ``purpose`` is a NON-factor-binding action on
-    purpose — ``_factor_binding_is_blocked`` would correctly refuse a binding one from a pending
-    session whose account already has a factor, and that refusal would hide the grant this asserts.
+    INVERTED when the wiring landed. Both of this site's elevations are still asserted: the
+    session-window stamp and the ADR 0077 action-bound grant, which has MOVED to the new hash as this
+    docstring predicted it must. That pair is the #1146 ordering trap in miniature —
+    ``_factor_binding_is_blocked`` resolves by the OLD token and fails closed, so it must run BEFORE
+    the rotation, while the grant is minted AFTER against the new hash. Reading the grant off the new
+    token is what proves both halves happened in that order.
+
+    ``purpose`` is a NON-factor-binding action on purpose — ``_factor_binding_is_blocked`` would
+    correctly refuse a binding one from a pending session whose account already has a factor, and
+    that refusal would hide the grant this asserts.
     """
     store, service = await _service()
     try:
@@ -221,24 +254,30 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
         identity, token, password = await _bootstrap_login(service)
         assert await service.has_recent_step_up(token) is False
 
-        assert (
-            await service.reauth(
-                identity,
-                password,
-                token=token,
-                client="10.0.0.7",
-                purpose=STEP_UP_ACTION_SESSION_TERMINATE,
-            )
-            is True
+        elevation = await service.reauth(
+            identity,
+            password,
+            token=token,
+            client="10.0.0.7",
+            purpose=STEP_UP_ACTION_SESSION_TERMINATE,
         )
+        assert elevation.ok is True
+        fresh = elevation.token
+        assert isinstance(fresh, str) and fresh != token
 
-        assert await service.identity_for_token(token) is not None
-        assert await service.has_recent_step_up(token) is True, (
-            "the step-up window opened on the token the caller already held"
+        assert await service.identity_for_token(token) is None, (
+            "the re-authenticated token stops authenticating at the moment of elevation"
+        )
+        assert await service.has_recent_step_up(fresh) is True, (
+            "the step-up window opened on the NEW token -- which it can only be read on if the "
+            "stamp landed before the rotation, since it is rowcount-blind"
         )
         # has_action_step_up is single-use, so this both proves the key and spends the grant.
-        assert await service.has_action_step_up(token, STEP_UP_ACTION_SESSION_TERMINATE) is True, (
-            "...and the action-bound grant was minted against that same token"
+        assert await service.has_action_step_up(fresh, STEP_UP_ACTION_SESSION_TERMINATE) is True, (
+            "...and the action-bound grant was re-keyed onto the new token, not stranded on the old"
+        )
+        assert await service.has_action_step_up(token, STEP_UP_ACTION_SESSION_TERMINATE) is False, (
+            "...and is NOT reachable on the retired one"
         )
     finally:
         await store.close()
@@ -246,23 +285,26 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
 
 @requires_webauthn
 async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() -> None:
-    """RED when: finish_webauthn_registration rotates the session token.
+    """RED when: finish_webauthn_registration stops rotating the session token.
 
-    Invert to ``identity_for_token(enrolling) is None``. For a passkey-only account this leg and the
-    assertion below are the ONLY ways a session becomes MFA-satisfied, so wiring rotation on the TOTP
-    routes alone would leave a cell reading "rotates on re-authentication" while the whole passkey
-    path still elevates in place.
+    INVERTED when the wiring landed. For a passkey-only account this leg and the assertion below are
+    the ONLY ways a session becomes MFA-satisfied, so wiring rotation on the TOTP routes alone would
+    have left a cell reading "rotates on re-authentication" while the whole passkey path still
+    elevated in place. That is the trap #1146 names against the owner-specified two-route subset, and
+    this arm is what would have caught it.
     """
     store, service = await _service()
     try:
         identity, enrolling, _ = await _bootstrap_login(service)
         assert await service.mfa_satisfied(enrolling) is False
 
-        await _enroll_passkey(service, identity, enrolling)
+        _, fresh = await _enroll_passkey(service, identity, enrolling)
 
-        assert await service.identity_for_token(enrolling) is not None
-        assert await service.mfa_satisfied(enrolling) is True, (
-            "the enrolling token was promoted to MFA-satisfied in place"
+        assert await service.identity_for_token(enrolling) is None, (
+            "the enrolling token stops authenticating at the moment of elevation"
+        )
+        assert await service.mfa_satisfied(fresh) is True, (
+            "...and the MFA-satisfied state landed on the NEW token instead"
         )
     finally:
         await store.close()
@@ -270,27 +312,30 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
 
 @requires_webauthn
 async def test_the_passkey_assertion_elevates_the_pre_mfa_token_in_place() -> None:
-    """RED when: finish_webauthn_assertion rotates the session token.
+    """RED when: finish_webauthn_assertion stops rotating the session token.
 
-    Invert to ``identity_for_token(pre_mfa) is None``. Same shape as the TOTP arm — a token captured
-    before the second factor is elevated by the legitimate user's assertion. Only the MFA leg is
-    asserted here, and that is the site's whole contract: ADR 0068 decision 1 keeps ``reauth_at`` off
-    the assertion path deliberately.
+    INVERTED when the wiring landed. Same shape as the TOTP arm — a token captured before the second
+    factor is no longer elevated by the legitimate user's assertion; it stops working and a new one
+    carries the elevation. Only the MFA leg is asserted here, and that is the site's whole contract:
+    ADR 0068 decision 1 keeps ``reauth_at`` off the assertion path deliberately, so this arm must NOT
+    grow a ``has_recent_step_up`` assertion on the way past.
     """
     store, service = await _service()
     try:
         identity, enrolling, password = await _bootstrap_login(service)
-        soft = await _enroll_passkey(service, identity, enrolling)
+        soft, _ = await _enroll_passkey(service, identity, enrolling)
 
         pre_mfa = await _login(service, password)
         assert await service.mfa_satisfied(pre_mfa) is False
 
-        assert await _assert_passkey(service, pre_mfa, soft) is True
+        ok, fresh = await _assert_passkey(service, pre_mfa, soft)
+        assert ok is True
+        assert fresh != pre_mfa
 
-        assert await service.identity_for_token(pre_mfa) is not None, (
-            "the pre-MFA token still authenticates after the assertion"
+        assert await service.identity_for_token(pre_mfa) is None, (
+            "the pre-MFA token stops authenticating at the moment of the assertion"
         )
-        assert await service.mfa_satisfied(pre_mfa) is True
+        assert await service.mfa_satisfied(fresh) is True
     finally:
         await store.close()
 

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -36,6 +37,10 @@ async def _user(engine: Engine, role: Role, name: str) -> AuthService:
     uid = await service.create_local_user(
         username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
     )
+    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+    # fixture still stands for an operator who has been provisioned; the channel axis itself
+    # is exercised in tests/test_channel_rbac.py.
+    await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
@@ -267,6 +272,10 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
             roles=[Role.OPERATOR.value],
             actor="t",
         )
+        # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
+        # fixture still stands for an operator who has been provisioned; the channel axis itself
+        # is exercised in tests/test_channel_rbac.py.
+        await service.set_channel_scope(new_id, [ALL_CHANNELS], actor="test")
         fresh = await service.store.get_user(new_id)
         assert fresh is not None and fresh.password_hash is not None
         await service.store.set_password(

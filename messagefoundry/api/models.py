@@ -458,7 +458,14 @@ class ReloadRequest(RequestModel):
 
 class ReloadResult(BaseModel):
     """Summary of the graph that is now live after a reload — or, for a dry run, the graph that
-    *would* go live (``dry_run=True``; ``running`` then reflects the still-current graph)."""
+    *would* go live (``dry_run=True``; ``running`` then reflects the still-current graph).
+
+    ``degraded`` reports the third outcome (ASVS 2.3.3, BACKLOG #1111): the graph SWAPPED and a
+    follow-on step did not complete, so ``failures`` names each one. A 200 with ``degraded`` True
+    is not a clean reload — the new graph is live and an operator has a step to finish by hand.
+    Reporting outright failure there would describe an engine that does not exist; reporting plain
+    success would hide the step. The step labels are stable and PHI-free
+    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``)."""
 
     inbound: int
     outbound: int
@@ -466,6 +473,8 @@ class ReloadResult(BaseModel):
     handlers: int
     running: bool
     dry_run: bool = False
+    degraded: bool = False
+    failures: list[str] = []
 
 
 class ConfigProvenance(BaseModel):
@@ -1334,11 +1343,22 @@ class UploadedFileList(BaseModel):
     ``any_owner`` when the caller holds ``files:access_any``. It is the same value the ``upload.list``
     audit row records, computed once at the route — so a reader of the response and a reader of the
     audit interpret the same count the same way, and a UI can state which listing it is showing
-    instead of asserting one of the two unconditionally. It is a fixed enum, never operator text."""
+    instead of asserting one of the two unconditionally. It is a fixed enum, never operator text.
+
+    **``total`` is the whole visible set; ``files`` is one page of it (BACKLOG #1152).** The two were
+    the same number while the route was pageless, and a consumer that assumed ``len(files) ==
+    total`` is now wrong — which is the point: an uploads directory grows without bound, and a
+    listing that renders all of it makes response size a function of how long the install has been
+    running. ``limit`` and ``offset`` echo the window the route actually applied after clamping, so a
+    client paginates off the response rather than off the request it hoped was honoured."""
 
     total: int
     files: list[UploadedFileInfo]
     scope: Literal["own", "any_owner"]
+    #: The page window, as APPLIED. Defaulted so a client built against the pageless shape still
+    #: decodes this model; the route always sets both.
+    limit: int = 50
+    offset: int = 0
 
 
 class UploadedMessageSummary(BaseModel):

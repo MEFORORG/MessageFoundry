@@ -53,6 +53,10 @@ async def test_reload_endpoint_applies_config(client: httpx.AsyncClient, tmp_pat
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
     r = await client.post("/config/reload", json={"config_dir": str(cfg)})
     assert r.status_code == 200, r.text
+    # Compared WHOLE rather than field-by-field on purpose: this is the shape contract the shipped
+    # apiclient and console read. BACKLOG #1111 added `degraded` and `failures`, and their values
+    # here are the clean-reload NEGATIVE CONTROL -- a route that reported every apply as degraded
+    # would satisfy the degraded-path test and only fail here.
     assert r.json() == {
         "inbound": 1,
         "outbound": 1,
@@ -60,7 +64,46 @@ async def test_reload_endpoint_applies_config(client: httpx.AsyncClient, tmp_pat
         "handlers": 1,
         "running": True,
         "dry_run": False,
+        "degraded": False,
+        "failures": [],
     }
+
+
+async def test_a_degraded_apply_is_reported_and_audited_not_answered_as_clean(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload whose graph SWAPPED but whose follow-on step failed answers 200 with degraded=True.
+
+    RED when: the route calls Engine.reload instead of reload_detail, or drops either field. That
+    reverts to reporting a degraded apply as a clean success, which is the defect BACKLOG #1111
+    exists to fix -- and it is invisible without this test, because the status code does not move.
+
+    The negative control is test_reload_endpoint_applies_config, which pins degraded False on a
+    clean reload; a route hardcoding degraded=True passes this test and fails that one.
+    """
+    cfg, inbox, outdir = tmp_path / "cfg", tmp_path / "in", tmp_path / "out"
+    _write_valid_config(cfg, inbox, outdir)
+
+    async def _boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("reference sync exploded")
+
+    monkeypatch.setattr(engine, "_reconcile_reference_sync", _boom)
+    r = await client.post("/config/reload", json={"config_dir": str(cfg)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["degraded"] is True
+    assert body["failures"] == ["reference_sync"]
+    # The graph really did swap -- otherwise this is a test about an enum, not about the defect.
+    assert body["inbound"] == 1 and body["running"] is True
+    rows = [
+        json.loads(row["detail"])
+        for row in await engine.store.list_audit(limit=50)
+        if row["action"] == "config_reload"
+    ]
+    assert rows and rows[0].get("failed_steps") == ["reference_sync"], (
+        "the degraded step must reach the AUDIT row, not only the response body -- the response "
+        "goes to one caller once, the audit is what a later reader has"
+    )
 
 
 async def test_reload_failures_are_audited(

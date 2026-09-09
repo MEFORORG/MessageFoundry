@@ -26,7 +26,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
-from messagefoundry.auth.identity import AuthProvider, Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
@@ -263,6 +263,48 @@ class LoginOutcome:
 
 
 @dataclass(frozen=True)
+class Elevation:
+    """The outcome of a session-elevating ceremony, carrying the ROTATED session token (ASVS 7.2.4).
+
+    Every ceremony that raises a session's authentication state -- re-auth, TOTP verify, TOTP
+    enrollment confirm, passkey registration, passkey assertion -- re-keys the session to a fresh
+    token instead of stamping the elevation onto the token the caller already holds. One shape for
+    all five, deliberately: three different shapes is exactly the defect that makes a caller adopt
+    the new token on some legs and quietly keep the dead one on others.
+
+    Three states, and a caller must be able to tell them apart:
+
+    * ``ok`` -- elevated. ``token`` is the caller's NEW session token and is never ``None`` here;
+      the token they presented has stopped authenticating. The caller MUST hand it back (response
+      body, cookie), or it has just made the session it elevated unreachable.
+    * not ``ok``, ``session_lost`` False -- the proof was wrong (bad password, bad code, bad
+      assertion). Nothing rotated, and the token the caller presented still authenticates.
+    * not ``ok``, ``session_lost`` True -- the proof was GOOD but the session was revoked or expired
+      underneath the ceremony, so there was no row to re-key. Fails CLOSED: no token is handed back
+      and the caller must sign in again. Held apart from a wrong proof so a route can say which one
+      happened rather than report a correct credential as incorrect.
+
+    ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
+
+    ``ok`` is DERIVED, not stored, and that is load-bearing rather than tidiness. Held as a field it
+    was a second spelling of ``token is not None`` -- true of all 19 constructions -- so the type
+    could represent a state the system never produces, mypy could not narrow ``token`` from ``ok``,
+    and every consuming site paid ``if not elevation.ok or elevation.token is None``: a second clause
+    whose only job was to re-derive the first in a form the checker accepts. As a property the
+    impossible combination cannot be constructed and one clause narrows.
+    """
+
+    token: str | None = None
+    session_lost: bool = False
+    recovery_codes: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Elevated: a new session token was minted. See the class docstring for the three states."""
+        return self.token is not None
+
+
+@dataclass(frozen=True)
 class MfaEnrollment:
     """A staged (not-yet-confirmed) TOTP enrollment: the base32 secret to render as a QR + the
     ``otpauth://`` URI. Returned **once**; confirmed by proving a live code."""
@@ -349,18 +391,29 @@ def _json(obj: Any) -> str:
 
 
 def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str] | None:
-    """Resolve a user's per-channel RBAC scope to a frozenset, or ``None`` for all channels.
+    """Resolve a user's stored per-channel RBAC scope to a frozenset, or ``None`` for all channels.
 
-    Administrators are always all-channels. A NULL ``channel_scope`` is all; a JSON list is exactly
-    those connections; anything malformed is treated as **no** channels (deny-by-default)."""
-    if Role.ADMINISTRATOR in roles or user.channel_scope is None:
+    **An ABSENT scope denies (BACKLOG #1152, ASVS 8.2.2).** ``create_user``'s INSERT does not list
+    ``channel_scope``, so every account is minted with SQL NULL there; NULL used to resolve to
+    ``None`` = every channel, which made every per-channel check in the API narrow nobody on a
+    default install. It now resolves to the empty set, so a freshly minted non-administrator reaches
+    no connection until an administrator grants one.
+
+    Unrestricted is still reachable, and both ways are a deliberate grant: the ADMINISTRATOR role,
+    or :data:`~messagefoundry.auth.identity.ALL_CHANNELS` present in the stored list. A JSON list is
+    otherwise exactly those connections, and anything malformed is no channels."""
+    if Role.ADMINISTRATOR in roles:
         return None
+    if user.channel_scope is None:
+        return frozenset()
     try:
         names = json.loads(user.channel_scope)
     except (ValueError, TypeError):
         return frozenset()
     if not isinstance(names, list):
         return frozenset()
+    if ALL_CHANNELS in names:
+        return None
     return frozenset(str(n) for n in names)
 
 
@@ -1749,15 +1802,21 @@ class AuthService:
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Administrators are always all-channels. If no group mapping
-        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope
-        or the all-channels default. Returns the (possibly refreshed) user record."""
+        matches, the per-user scope is left untouched — opt-in, so it never clobbers a manual scope,
+        and since BACKLOG #1152 an untouched scope is a DENY rather than the whole estate. Returns
+        the (possibly refreshed) user record.
+
+        A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
+        rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
+        inverted a deliberate all-channels mapping into a deny-everything one."""
         if Role.ADMINISTRATOR in roles:
             return user
         channels = await self._store.channels_for_ad_groups(groups)
         if not channels:
             return user
-        specific = sorted(c for c in channels if c != "*")
-        scope_json = None if "*" in channels else _json(specific)
+        wildcard = ALL_CHANNELS in channels
+        specific = sorted(c for c in channels if c != ALL_CHANNELS)
+        scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
         if user.channel_scope == scope_json:
             return user
         await self._store.set_user_channel_scope(user.id, scope_json)
@@ -1767,7 +1826,7 @@ class AuthService:
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
-            detail=_json({"channels": "*" if scope_json is None else specific}),
+            detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
         )
         return await self._store.get_user(user.id) or user
 
@@ -2173,6 +2232,60 @@ class AuthService:
         self._rekey_token_state(old_hash, hash_token(new_token))
         return new_token
 
+    async def _elevated(
+        self,
+        token: str,
+        *,
+        ceremony: str,
+        actor: str | None,
+        client: str | None = None,
+        recovery_codes: tuple[str, ...] = (),
+    ) -> Elevation:
+        """Rotate the caller's session and package the :class:`Elevation` (ASVS 7.2.4).
+
+        **The single place the five elevation sites rotate.** The ordering invariant that makes
+        rotation safe (see :meth:`_rotate_session_token`) is subtle and silent when broken, so it is
+        enforced by having exactly one caller of the primitive rather than nine route handlers each
+        getting it right. Every store stamp for the elevation must ALREADY be written against the
+        old hash when this runs; anything purpose-bound is minted after, against the new hash.
+
+        A ``None`` rotate means the session was revoked or expired underneath a ceremony that
+        otherwise succeeded, so this fails CLOSED -- ``ok=False`` with no token, flagged
+        ``session_lost`` so the route can say "sign in again" rather than "wrong password".
+
+        Both outcomes are audited. The in-place re-key would otherwise leave no store trace at all:
+        a session's token changing is exactly the event an operator reconstructing a timeline needs,
+        and the fail-closed branch is the more interesting of the two (a good proof landing on a
+        session that just vanished).
+
+        **A rotation drops any open ``/ws/stats`` socket, and that is accepted.** The socket
+        authenticates once at handshake and its keepalive re-validates the token CAPTURED there, so
+        on a first deployment a rotation would make that captured token stop resolving and the server
+        would close the socket at the next revalidation tick -- indistinguishable from a revoke,
+        which is the fail-closed direction and the right one. The console does not reconnect it;
+        ``app.js`` wires ``ws.onclose`` to resume the 5-second HTTP poll, and that poll carries the
+        NEW cookie, so the dashboard would keep updating over the fallback until the next full page
+        load re-opened a socket. Completing MFA on the dashboard would therefore cost the live push
+        for the rest of that page's life -- a LIVENESS regression, not a correctness or data-loss
+        one, which is why a bounded reconnect is filed as follow-up rather than built here.
+        """
+        rotated = await self._rotate_session_token(token)
+        if rotated is None:
+            await self._audit(
+                "auth.session_rotation_failed",
+                actor=actor,
+                detail=_json({"ceremony": ceremony, "reason": "session_gone"}),
+                client=client,
+            )
+            return Elevation(session_lost=True)
+        await self._audit(
+            "auth.session_rotated",
+            actor=actor,
+            detail=_json({"ceremony": ceremony}),
+            client=client,
+        )
+        return Elevation(token=rotated, recovery_codes=recovery_codes)
+
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
     ) -> Identity | None:
@@ -2344,7 +2457,7 @@ class AuthService:
         token: str,
         client: str | None = None,
         purpose: str | None = None,
-    ) -> bool:
+    ) -> Elevation:
         """Step-up re-verification (ASVS 7.5.3): re-prove the caller's credential and, on success,
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
@@ -2354,26 +2467,54 @@ class AuthService:
         named action, so a durable-takeover route (TOTP enroll/confirm, disable-MFA) can require a fresh
         proof tied to *it* rather than riding the broad session window. It is purely
         additive — the session-window refresh above is unchanged (the broad admin/replay/config routes
-        keep using it), and the grant is minted ONLY here, never by login or ``verify_mfa``."""
+        keep using it), and the grant is minted ONLY here, never by login or ``verify_mfa``.
+
+        Returns an :class:`Elevation`: on success the session is re-keyed (ASVS 7.2.4) and the NEW
+        token is in ``Elevation.token``. The three steps below are ORDER-CRITICAL -- see the inline
+        notes and :meth:`_rotate_session_token`."""
         if identity.auth_provider is AuthProvider.AD:
             ok = await self._reauth_ad(identity.username, password)
         else:
             ok = await self.verify_current_password(identity, password)
+        elevation = Elevation()
         if ok:
+            # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
+            # columns forward; a stamp issued after it would silently write nothing.
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
-            if purpose is not None and not await self._factor_binding_is_blocked(token, purpose):
+            # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
+            # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
+            # asking after would refuse every factor-binding grant on a session that is perfectly fine.
+            binding_blocked = purpose is not None and await self._factor_binding_is_blocked(
+                token, purpose
+            )
+            # (2) Rotate. Past this line `token` no longer authenticates.
+            elevation = await self._elevated(
+                token, ceremony="reauth", actor=identity.username, client=client
+            )
+            if purpose is not None and not binding_blocked and elevation.token is not None:
+                # (3) Purpose-bound grants are minted AFTER, against the NEW hash -- minted against the
+                # old one they would be stranded on a hash nothing resolves any more.
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
                 # login-seeded window can never authorize a factor-binding action (ASVS 7.5.1 / 8.2.4).
-                self._grant_action_step_up(hash_token(token), purpose)
+                self._grant_action_step_up(hash_token(elevation.token), purpose)
         await self._audit(
             "auth.reauth",
             actor=identity.username,
-            detail=_json({"ok": ok, "provider": identity.auth_provider.value, "purpose": purpose}),
+            detail=_json(
+                {
+                    "ok": ok,
+                    "provider": identity.auth_provider.value,
+                    "purpose": purpose,
+                    # A good password on a session that vanished mid-ceremony is neither a success nor
+                    # a credential failure; without this the audit row would read as a clean re-auth.
+                    "session_lost": elevation.session_lost,
+                }
+            ),
             client=client,
         )
-        return ok
+        return elevation
 
     #: The step-up actions that BIND A NEW SECOND FACTOR. Reaching one from an MFA-pending session is
     #: legitimate only while the account has no factor at all — that is the bootstrap escape the MFA
@@ -2669,13 +2810,20 @@ class AuthService:
 
     async def confirm_mfa_enrollment(
         self, identity: Identity, code: str, *, token: str, client: str | None = None
-    ) -> list[str] | None:
+    ) -> Elevation:
         """Confirm a staged enrollment by proving a live TOTP code. On success: activate MFA, mint the
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
-        current session MFA-verified, audit + notify. Returns the recovery codes, or ``None`` when the
-        code was wrong or its time-step was already consumed (single-use, BACKLOG #1021). Raises
+        current session MFA-verified, re-key the session (ASVS 7.2.4), audit + notify. Raises
         :class:`ValueError` for an unknown account or when no enrollment is staged. Accepts a
-        directory account, for the reason :meth:`begin_mfa_enrollment` states."""
+        directory account, for the reason :meth:`begin_mfa_enrollment` states.
+
+        Returns an :class:`Elevation` whose ``recovery_codes`` carry the plaintext codes; a wrong code
+        (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
+        none.
+
+        This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
+        FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
+        token captured before the ceremony would be elevated in place on a first deployment."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
@@ -2704,29 +2852,44 @@ class AuthService:
                 detail=_json({"phase": "enroll"}),
                 client=client,
             )
-            return None
+            return Elevation()
         plain = totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
         hashes = [await self._argon2(hash_password, c) for c in plain]
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
+        # Stamp against the OLD hash, then rotate — never the other way round.
         await self._store.mark_session_mfa_verified(hash_token(token))
+        elevation = await self._elevated(
+            token,
+            ceremony="mfa_enroll_confirm",
+            actor=identity.username,
+            client=client,
+            recovery_codes=tuple(plain),
+        )
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
-        return plain
+        return elevation
 
-    async def verify_mfa(self, token: str | None, code: str, *, client: str | None = None) -> bool:
+    async def verify_mfa(
+        self, token: str | None, code: str, *, client: str | None = None
+    ) -> Elevation:
         """Validate a TOTP code (or a single-use recovery code) for the caller's session and, on
-        success, mark the session's second factor satisfied. Always audited; the API gates this behind
-        the login rate limiter. Returns False (never raises) for any invalid input."""
+        success, mark the session's second factor satisfied and re-key the session (ASVS 7.2.4).
+        Always audited; the API gates this behind the login rate limiter. Returns a not-``ok``
+        :class:`Elevation` (never raises) for any invalid input.
+
+        This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
+        before the second factor would be elevated in place to a fully authenticated session on a
+        first deployment."""
         if not token:
-            return False
+            return Elevation()
         session = await self._store.get_session(hash_token(token))
         if session is None or session.revoked_at is not None:
-            return False
+            return Elevation()
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
-            return False
+            return Elevation()
         now = time.time()
         # Per-account lockout covers the SECOND factor too (parity with the password path): a run of
         # wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
@@ -2738,8 +2901,11 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return False
+            return Elevation()
         if await self._verify_second_factor(user, code, client=client):
+            # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
+            # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
+            # success — every session UPDATE but revoke/rotate is rowcount-blind.
             # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
             # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
             # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
@@ -2750,7 +2916,9 @@ class AuthService:
             await self._store.mark_session_reauthed(hash_token(token), client=client)
             await self._store.record_login_success(user.id, now=now)
             await self._audit("auth.mfa_verified", actor=user.username, client=client)
-            return True
+            return await self._elevated(
+                token, ceremony="mfa_verify", actor=user.username, client=client
+            )
         # Wrong code: register the failure through the SAME machinery the password path uses, so the
         # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
         attempts, just_locked = await self._register_failure(user, now)
@@ -2763,7 +2931,7 @@ class AuthService:
                 client=client,
                 detail={"failed_attempts": attempts},
             )
-        return False
+        return Elevation()
 
     async def _verify_second_factor(
         self, user: UserRecord, code: str, *, client: str | None = None
@@ -3011,14 +3179,18 @@ class AuthService:
         client: str | None = None,
         rp_id: str,
         origin: str,
-    ) -> bool:
-        """Verify an attestation response and persist the passkey. Returns ``False`` when the
-        response fails verification (audited — parity with a wrong TOTP code); raises
-        :class:`ValueError` for flow errors with safe, renderable messages (unknown account, bad
-        label, expired ceremony, duplicate label/credential). On success the enrolling session is
-        marked MFA-verified (exact :meth:`confirm_mfa_enrollment` parity) — **no recovery codes are
-        minted** (ADR 0068 decision 5). Accepts a directory account, for the reason
-        :meth:`begin_mfa_enrollment` states."""
+    ) -> Elevation:
+        """Verify an attestation response and persist the passkey. Returns a not-``ok``
+        :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
+        code); raises :class:`ValueError` for flow errors with safe, renderable messages (unknown
+        account, bad label, expired ceremony, duplicate label/credential). On success the enrolling
+        session is marked MFA-verified and re-keyed (exact :meth:`confirm_mfa_enrollment` parity,
+        ASVS 7.2.4) — **no recovery codes are minted** (ADR 0068 decision 5). Accepts a directory
+        account, for the reason :meth:`begin_mfa_enrollment` states.
+
+        The other first-enrolment promotion leg. For a passkey-only account this and
+        :meth:`finish_webauthn_assertion` are the ONLY ways a session becomes MFA-satisfied, so a
+        7.2.4 build that rotated the TOTP legs alone would miss the passkey path entirely."""
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
@@ -3042,7 +3214,7 @@ class AuthService:
                 detail=_json({"phase": "enroll"}),
                 client=client,
             )
-            return False
+            return Elevation()
         credential_id_hash = hash_bytes(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
@@ -3072,8 +3244,12 @@ class AuthService:
                 raise ValueError("label already in use") from exc
             raise
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
-        # proved possession of the freshly-bound authenticator).
+        # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
+        # rotated — the reverse order writes nothing and still reports success.
         await self._store.mark_session_mfa_verified(hash_token(token))
+        elevation = await self._elevated(
+            token, ceremony="webauthn_enroll", actor=identity.username, client=client
+        )
         await self._audit(
             "auth.webauthn_enrolled",
             actor=identity.username,
@@ -3083,7 +3259,7 @@ class AuthService:
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
-        return True
+        return elevation
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
@@ -3119,23 +3295,26 @@ class AuthService:
         client: str | None = None,
         rp_id: str,
         origin: str,
-    ) -> bool:
+    ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
-        factor satisfied — **`mfa_verified` ONLY** (ADR 0068 decision 1: ``reauth_at`` + the
-        WP-L3-13 client re-anchor come from the password leg of ``POST /ui/reauth``, never from
-        the assertion — the loop-class defense). Returns ``False`` (never raises) for any invalid
-        input, always audited. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
+        factor satisfied and re-key the session (ASVS 7.2.4) — **`mfa_verified` ONLY** (ADR 0068
+        decision 1: ``reauth_at`` + the WP-L3-13 client re-anchor come from the password leg of
+        ``POST /ui/reauth``, never from the assertion — the loop-class defense). Returns a
+        not-``ok`` :class:`Elevation` (never raises) for any invalid input, always audited.
+
+        For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
+        what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
         0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
         route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits."""
         if not token:
-            return False
+            return Elevation()
         session = await self._store.get_session(hash_token(token))
         if session is None or session.revoked_at is not None:
-            return False
+            return Elevation()
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled:
-            return False
+            return Elevation()
         now = time.time()
         # A locked account is refused BEFORE any verify (verify_mfa parity).
         if user.locked_until is not None and now < user.locked_until:
@@ -3145,7 +3324,7 @@ class AuthService:
                 detail=_json({"reason": "locked"}),
                 client=client,
             )
-            return False
+            return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:
             await self._audit(
@@ -3154,7 +3333,7 @@ class AuthService:
                 detail=_json({"reason": "expired"}),
                 client=client,
             )
-            return False
+            return Elevation()
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
@@ -3164,7 +3343,7 @@ class AuthService:
                 detail=_json({"reason": "malformed"}),
                 client=client,
             )
-            return False
+            return Elevation()
         cred = await self._store.get_webauthn_credential(hash_bytes(raw_id))
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
@@ -3175,7 +3354,7 @@ class AuthService:
                 detail=_json({"reason": "unknown_credential"}),
                 client=client,
             )
-            return False
+            return Elevation()
         try:
             new_count = webauthn.verify_assertion(
                 response_json=response_json,
@@ -3194,7 +3373,7 @@ class AuthService:
                 detail=_json({"label": cred.label}) if clone else None,
                 client=client,
             )
-            return False
+            return Elevation()
         if not await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         ):
@@ -3205,10 +3384,12 @@ class AuthService:
                 detail=_json({"label": cred.label}),
                 client=client,
             )
-            return False
+            return Elevation()
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit("auth.webauthn_verified", actor=user.username, client=client)
-        return True
+        return await self._elevated(
+            token, ceremony="webauthn_assert", actor=user.username, client=client
+        )
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None
@@ -3518,8 +3699,14 @@ class AuthService:
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str
     ) -> None:
-        """Set a user's per-channel RBAC scope (``None`` = all). Revokes their sessions so the new
-        scope takes effect immediately, and audits the change."""
+        """Set a user's per-channel RBAC scope. Revokes their sessions so the new scope takes effect
+        immediately, and audits the change.
+
+        Three writable states, and ``None`` is no longer the wide one (BACKLOG #1152): ``None``
+        clears the scope back to unset, which now DENIES every channel; ``[]`` denies too, and says
+        somebody chose it; a list containing
+        :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
+        are all-channels by role, so a scope set on one still has no effect."""
         scope_json = None if channels is None else _json(sorted(set(channels)))
         await self._store.set_user_channel_scope(user_id, scope_json)
         await self._store.revoke_user_sessions(user_id)

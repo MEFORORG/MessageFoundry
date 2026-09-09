@@ -13,8 +13,8 @@ HOW THIS GUARD DIFFERS FROM PROSE-PINNING. The narrowed and global route sets ar
 and BOTH halves are checked against BOTH the code and the doc in the same run:
 
 * :func:`test_monitoring_plane_scope_is_measured_against_a_live_app` EXECUTES every route in both
-  sets against a channel-scoped operator, with an UNSCOPED operator in the same run as the positive
-  control, and asserts the constants describe what the app does.
+  sets against a channel-scoped operator, with an ALL-CHANNELS operator in the same run as the
+  positive control, and asserts the constants describe what the app does.
 * :func:`test_security_doc_states_the_measured_monitoring_scope` asserts the doc's blockquote names
   those same routes on the correct side.
 
@@ -42,6 +42,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
@@ -57,8 +58,12 @@ from messagefoundry.pipeline import Engine
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
 
-#: The blockquote that IS the public statement of the per-channel data rule.
-_SCOPE_MARKER = "**Per-channel scoping (DLQ-SCOPE).**"
+#: The blockquote that IS the public statement of the per-channel data rule. Pinned to the rule's
+#: NAME and its bold open, NOT to the punctuation that follows: an earlier form ended the literal at
+#: ``).**`` and a doc edit that appended to the same heading broke the locator, which silently took
+#: every check below with it. The bold open is load-bearing -- without it this also matches the
+#: italic cross-reference earlier in the document and anchors the scan on the pointer, not the rule.
+_SCOPE_MARKER = "**Per-channel scoping (DLQ-SCOPE)"
 
 #: The retired falsehood. It was inherited verbatim from an internal design document, where it was a
 #: decision the code later outgrew. It must never come back.
@@ -91,7 +96,7 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 
 # =====================================================================================================
-# The measurement — executed against a live app, scoped caller vs unscoped positive control
+# The measurement — executed against a live app, scoped caller vs all-channels positive control
 # =====================================================================================================
 
 
@@ -174,19 +179,24 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
     """Every route in ``_NARROWED_READS`` narrows for a scoped caller; every route in
     ``_GLOBAL_AGGREGATES`` does not; ``_UNSCOPED_PER_CONNECTION`` is per-connection and not narrowed.
 
-    The unscoped operator is the positive control, in the SAME run: if the fixture were mis-seeded,
-    or a route 500'd, the control's assertions fail too rather than the scoped side passing vacuously.
+    The all-channels operator is the positive control, in the SAME run: if the fixture were
+    mis-seeded, or a route 500'd, the control's assertions fail too rather than the scoped side
+    passing vacuously.
     """
     service = await _service(engine)
     scoped_id = await _operator(service, "scoped")
     await service.set_channel_scope(scoped_id, ["IB_A"], actor="admin")
-    await _operator(service, "unscoped")  # no scope -> NULL -> every channel
+    # Deny-by-default (BACKLOG #1152): an absent scope now resolves to NO channel, so the control
+    # has to be granted the estate rather than left unset. It is still a genuinely wide caller --
+    # "*" resolves to every channel -- which is what makes it a control and not a second scoped user.
+    wide_id = await _operator(service, "allchannels")
+    await service.set_channel_scope(wide_id, [ALL_CHANNELS], actor="admin")
 
     async with _client(engine, service) as c:
         s = await _login(c, "scoped")
-        u = await _login(c, "unscoped")
+        u = await _login(c, "allchannels")
 
-        # --- positive control: the unscoped caller sees the whole estate on every read -------------
+        # --- positive control: the all-channels caller sees the whole estate on every read ---------
         assert {ch["id"] for ch in (await c.get("/channels", headers=u)).json()} == {"IB_A", "IB_B"}
         assert {r["channel_id"] for r in (await c.get("/connections", headers=u)).json()} == {
             "IB_A",
@@ -208,8 +218,8 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
         assert {r["channel_id"] for r in conns} == {"IB_A"}
         # A destination row only materialises once an (inbound -> outbound) edge has carried traffic,
         # so this alone would not discriminate on a quiet fixture. The shared-outbound suppression is
-        # measured non-vacuously by /events and /graph/edges below, where the unscoped control DOES
-        # see OB_X and the scoped caller does not.
+        # measured non-vacuously by /events and /graph/edges below, where the all-channels control
+        # DOES see OB_X and the scoped caller does not.
         assert all(r["destination"] is None for r in conns)
         assert {e["connection"] for e in (await c.get("/events", headers=s)).json()} == {"IB_A"}
         sgraph = (await c.get("/graph/edges", headers=s)).json()
@@ -244,7 +254,7 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
             "the exposition is keyed by connection name, so a scoped caller reads a connection "
             "outside their scope — BACKLOG #1152 (metrics-exposition scoping)"
         )
-        # ...and it is identical to what the unscoped caller reads, i.e. not narrowed at all.
+        # ...and it is identical to what the all-channels caller reads, i.e. not narrowed at all.
         assert _strip_volatile(smetrics) == _strip_volatile(umetrics)
 
 
@@ -307,9 +317,12 @@ def _route_tokens(block: str) -> set[str]:
 def _monitoring_scope_problems(text: str) -> list[str]:
     """Every way the monitoring-scope statement fails to say what the app does. Empty list = sound."""
     problems: list[str] = []
-    if _RETIRED_FALSEHOOD in text:
-        problems.append(f"the retired falsehood is back: {_RETIRED_FALSEHOOD!r}")
     block = _scope_blockquote(text)
+    # BOTH readings, because each misses what the other catches. The raw document finds the sentence
+    # anywhere, including outside this blockquote; the unwrapped block finds it when a reflow has
+    # split it across a line break, which is exactly how it survived one merge unnoticed.
+    if _RETIRED_FALSEHOOD in text or _RETIRED_FALSEHOOD in block:
+        problems.append(f"the retired falsehood is back: {_RETIRED_FALSEHOOD!r}")
     tokens = _route_tokens(block)
     for route in _NARROWED_READS:
         if route not in tokens:
@@ -336,7 +349,12 @@ def test_security_doc_states_the_measured_monitoring_scope() -> None:
 def test_scope_guard_detects_the_retired_falsehood() -> None:
     """A planted mutation, in the house pattern: re-assert the retired sentence and the guard must
     catch it. Without this, a guard that silently stopped locating the blockquote would stay green."""
-    anchor = "**Administrators are always all-channels.**"
+    # Same rule as _SCOPE_MARKER: pin the claim, not the punctuation the surrounding prose owns.
+    # The closing ``.**`` was in the literal once and a rewrite to "**...all-channels**, by role,"
+    # broke it, which cost this planted mutation its anchor while every other assertion still read
+    # green. Where the falsehood lands inside the plant does not matter -- the planted string is
+    # graded, never written -- only that it lands inside THIS blockquote.
+    anchor = "**Administrators are always all-channels"
     planted = _plant_in_blockquote(_doc_text(), anchor, f"{anchor} {_RETIRED_FALSEHOOD}")
     assert planted != _doc_text(), "the planted-mutation anchor no longer exists in the blockquote"
     assert any("retired falsehood" in p for p in _monitoring_scope_problems(planted))

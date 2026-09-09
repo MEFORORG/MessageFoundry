@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    ConnectionName,
+    ChannelScopeEntry,
     PermissionId,
     RoleId,
 )
@@ -81,7 +81,9 @@ class UserSummary(BaseModel):
     notify_email: str | None = None
     disabled: bool
     roles: list[str]
-    channel_scope: list[str] | None = None  # per-channel RBAC: allowed connections; None = all
+    #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
+    #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
+    channel_scope: list[str] | None = None
 
 
 class UserPermissions(BaseModel):
@@ -98,9 +100,18 @@ class UserPermissions(BaseModel):
 
 
 class ChannelScope(RequestModel):
-    """A user's per-channel RBAC scope. ``None`` = all channels; a list = exactly those connections."""
+    """A user's per-channel RBAC scope: a list of exactly those connections.
 
-    channels: list[ConnectionName] | None = Field(default=None, max_length=512)
+    ``["*"]`` is the explicit all-channels grant. ``None`` clears the scope back to unset, and unset
+    DENIES every channel (BACKLOG #1152, ASVS 8.2.2) — it is not the wide value it used to be, so a
+    client that sends null to widen a scope now narrows it to nothing. Administrators are
+    all-channels by role, so a scope set on one has no effect either way.
+
+    A member is a connection name or that one token, which is why this list is typed
+    ``ChannelScopeEntry`` and not ``ConnectionName``; ``api/validation.py`` states the rule and why
+    the token stops here rather than widening the connection-name rule everything else uses."""
+
+    channels: list[ChannelScopeEntry] | None = Field(default=None, max_length=512)
 
 
 class UserCreateRequest(RequestModel):
@@ -171,9 +182,26 @@ class MfaConfirmRequest(RequestModel):
 
 class MfaConfirmResponse(BaseModel):
     """The one-time single-use recovery codes minted on enrollment — shown **once** for the user to
-    save (lost-authenticator escape hatch)."""
+    save (lost-authenticator escape hatch), plus the rotated session token.
+
+    ``token`` is the caller's NEW bearer token: confirming an enrolment elevates the session, and
+    ASVS 7.2.4 re-keys it on every elevation, so the token the client authenticated this very call
+    with has stopped working. A client that ignores this field has locked itself out."""
 
     recovery_codes: list[str]
+    token: str
+
+
+class ElevatedResponse(BaseModel):
+    """A ceremony that RAISED the session's authentication state, and the token it was re-keyed to.
+
+    ``token`` is the caller's NEW bearer token (ASVS 7.2.4). The one the request carried no longer
+    authenticates, so a client MUST adopt this or it has just ended its own session. The responses
+    carrying this field are sent ``Cache-Control: no-store`` — a body holding a live session token
+    must not sit in a shared cache."""
+
+    detail: str
+    token: str
 
 
 class MfaStatusResponse(BaseModel):

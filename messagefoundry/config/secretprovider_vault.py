@@ -32,7 +32,10 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.secretprovider import SecretProviderError
-from messagefoundry.config.tls_policy import vault_client_verify_kwargs
+from messagefoundry.config.tls_policy import (
+    assert_hvac_tls_suites,
+    vault_client_verify_kwargs,
+)
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -40,6 +43,10 @@ if TYPE_CHECKING:
 #: The optional extra that carries ``hvac`` — named in every fail-closed message. Deliberately the SAME
 #: extra the store's Vault KeyProvider uses (no second Vault dependency).
 _EXTRA = "vault"
+
+#: Operator-recognisable label for this hop, carried into the TLS suite assertion's error so a refusal
+#: names the connection rather than the helper that raised it.
+_VAULT_KV_CONNECTOR = "Vault KV secret provider"
 
 # Vault connection config comes from the environment (never the config file): the address/token are
 # host-specific/secret. They fall back to hvac's own VAULT_ADDR/VAULT_TOKEN conventions when the MEFOR_*
@@ -105,11 +112,25 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # egress does. `token` rides as an `X-Vault-Token` header on every KV read, so a 3xx from an
     # on-path attacker (absent TLS integrity) or a spoofed Vault would otherwise relocate the
     # request carrying it. See store/keyprovider_vault.py's twin for the measurement.
-    # #1180 (ASVS 12.3.4): narrow the trust anchor when the operator named one. The keyword is OMITTED
-    # when they did not, so the stock construction is unchanged rather than passed an explicit default.
-    client: Any = hvac.Client(
-        url=addr, token=token, allow_redirects=False, **_vault_ca_kwargs(addr)
-    )
+    #
+    # ONE dict feeds both the assertion and the construction, deliberately. The LDAPS site had to
+    # grow a second test to prove its asserted arguments were the ones its bind used, because the two
+    # lived in different methods; here they cannot drift, because they are the same object.
+    #
+    # #1180 (ASVS 12.3.4) rides in the SAME dict: narrow the trust anchor when the operator named
+    # one, omitting the keyword when they did not so the stock construction is unchanged. Putting it
+    # here rather than at the call means the operator's CA is inside what the assertion below sees.
+    kwargs: dict[str, object] = {
+        "url": addr,
+        "token": token,
+        "allow_redirects": False,
+        **_vault_ca_kwargs(addr),
+    }
+    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180): hvac exposes no SSLContext, so this asserts the context
+    # urllib3 will build for this hop. Raises ValueError at construction — see the function's
+    # docstring for why a replica is the only instrument available here, and what pins it.
+    assert_hvac_tls_suites(kwargs, connector=_VAULT_KV_CONNECTOR)
+    client: Any = hvac.Client(**kwargs)
     return client
 
 
@@ -137,8 +158,13 @@ class VaultSecretProvider:
         mount = os.environ.get(_ENV_KV_MOUNT) or "secret"
         addr = os.environ.get(_ENV_ADDR)
         token = os.environ.get(_ENV_TOKEN)
+        # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
+        # ValueError, and the `except Exception` below would relabel it "could not read secret ...
+        # from Vault KV" — turning a configuration refusal into what reads as a connectivity failure,
+        # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
+        # both paths propagate and the subsystem refuses to come up.
+        client = _build_client(addr, token)
         try:
-            client = _build_client(addr, token)
             # read_secret_version returns {'data': {'data': {<field>: <value>, ...}, 'metadata': {...}}}.
             response: Any = client.secrets.kv.v2.read_secret_version(path=path, mount_point=mount)
             data = response["data"]["data"]
