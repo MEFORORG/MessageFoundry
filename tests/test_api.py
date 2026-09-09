@@ -34,6 +34,13 @@ ADT = (
     "PID|1||100^^^H^MR||DOE^JANE\r"
 )
 
+# A well-formed message id that no test seeds, and a malformed one. Since BACKLOG #1108 the two get
+# DIFFERENT answers, and both matter: an id the store has never seen is a 404, and a value that could
+# not be an id at all is refused (422) before any lookup runs. A single "missing" probe conflated
+# them, and would go on passing if the id rule were removed.
+ABSENT_ID = "0" * 32
+MALFORMED_ID = "missing"
+
 # A transformed outbound body, deliberately distinct from the raw inbound (different sending app + an
 # extra segment), so a test can prove the /outbound endpoint returns the *transformed* payload — not
 # the raw — and that it was decrypted at rest (#14).
@@ -175,7 +182,8 @@ async def test_message_detail_includes_body_and_records_audit_view(
     events = await engine.store.events_for(mid)
     assert any(e["event"] == "viewed" for e in events)
 
-    assert (await client.get("/messages/missing")).status_code == 404
+    assert (await client.get(f"/messages/{ABSENT_ID}")).status_code == 404
+    assert (await client.get(f"/messages/{MALFORMED_ID}")).status_code == 422
 
 
 async def test_message_outbound_returns_transformed_payload_and_audits(
@@ -199,7 +207,8 @@ async def test_message_outbound_returns_transformed_payload_and_audits(
     assert any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
     assert "outbound.read" in [a["action"] for a in await engine.store.list_audit()]
 
-    assert (await client.get("/messages/missing/outbound")).status_code == 404
+    assert (await client.get(f"/messages/{ABSENT_ID}/outbound")).status_code == 404
+    assert (await client.get(f"/messages/{MALFORMED_ID}/outbound")).status_code == 422
 
 
 async def test_message_outbound_no_deliveries_is_empty_and_unviewed(
@@ -251,7 +260,8 @@ async def test_replay_requeues(engine: Engine, client: httpx.AsyncClient) -> Non
     assert rows[0]["status"] == OutboxStatus.PENDING.value
     assert rows[0]["attempts"] == 0
 
-    assert (await client.post("/messages/missing/replay")).status_code == 404
+    assert (await client.post(f"/messages/{ABSENT_ID}/replay")).status_code == 404
+    assert (await client.post(f"/messages/{MALFORMED_ID}/replay")).status_code == 422
 
 
 async def test_replay_no_deliveries_is_409_and_preserves_error(
