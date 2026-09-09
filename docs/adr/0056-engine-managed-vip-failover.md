@@ -10,16 +10,16 @@
     Read "at least" literally: this is a pointer to what shipped, not a closed enumeration of every
     sentence in those subsections, and where a line there disagrees with the code the code is current.
     Two known divergences, both introduced by the build and recorded rather than left for a reader to
-    trip over: `503` also covers a drain the engine could not achieve (a lease row it could not write,
-    or a maintenance tick that did not yield inside the fence timeout), and the `400` gate keys on
-    whether clustering is ENABLED rather than on whether a promotable sibling exists (BACKLOG #1509).
-  - **STALE AND UNBUILT — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API —
-    planned failover" and is therefore not covered by the bullet above. It names `client.stepdown_node`,
-    `poll_client`, the `_request` challenge path and an off-thread `AsyncRunner` — all PySide6 desktop
-    console symbols that went with that console — and it tells the confirm dialog to promise the
-    operator that "the VIP will move", which the paused-VIP bullet below denies. Nothing there is built.
-    Do not build from it; the web console page is BACKLOG #1495. Its one durable point survives the
-    move: render the leaderless window honestly rather than as "no live leader".
+    trip over: `503` also covers two conditions this design did not name — a lease-expiring write whose
+    outcome the node cannot confirm, and a leadership lock still held at the fence timeout — and the
+    `400` gate keys on whether clustering is ENABLED rather than on whether a promotable sibling exists
+    (BACKLOG #1509).
+  - **STALE — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API — planned
+    failover" and is therefore not covered by the bullet above. **There is no cluster page and no
+    `client.stepdown_node`**, and the confirm dialog it specifies promises the operator that "the VIP
+    will move", which the paused-VIP bullet below denies. **Do not build from it**; the web console page
+    is BACKLOG #1495. Read the marker on the section itself for what is stale there and what is not —
+    the answer is not "all of it", and this bullet used to say it was.
   - **PROPOSED AND PAUSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release,
     the gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
     `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
@@ -31,10 +31,8 @@
     code-signing infrastructure to ship one with. **Read it at the standard it was given:** in session,
     to the session that built the control plane, with **no git ref or other artifact anchoring it** —
     these lines are the record, so a reader who needs it independently verified should ask the owner
-    rather than treat this page as the proof. It is written down because the alternative measured
-    worse: `docs/adr/README.md` asserted the ruling in its Status column with nothing behind it, while
-    BACKLOG #1494 said in the opposite direction that nobody had signed off, and no reader could tell
-    which was current. Stated once here; the index row and that item point at it rather than repeat it.
+    rather than treat this page as the proof. Stated once here; the index row in
+    [`README.md`](README.md) and BACKLOG #1494 point at it rather than repeat it.
   - **STALE — §"Console — High Availability page".** It targets the PySide6 desktop console
     (`console/shell.py`, `console/status.py`, `console/connections.py`), which was retired. The operator
     UI is the web console at `/ui`. The section is kept for its topology reasoning — the "no Viewing
@@ -546,12 +544,22 @@ promotion; this API contract is unchanged by it.
 
 ### Confirm / step-up posture (console)
 
-> **STALE — DO NOT BUILD FROM THIS SUBSECTION. Nothing here is built.** Every symbol it names
-> (`client.stepdown_node`, `poll_client`, `_request`, `AsyncRunner`) belonged to the retired PySide6
-> desktop console; the operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
+> **STALE — DO NOT BUILD FROM THIS SUBSECTION. There is no cluster page, and `client.stepdown_node`
+> does not exist.** The operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
 > below also has the dialog promise that "the VIP will move", which the engine does not do and is not
-> going to do until the paused VIP mechanism is decided. Kept for step 4's point, which does survive the
-> move to the web console: render the leaderless window honestly.
+> going to do until the paused VIP mechanism is decided.
+>
+> **What is stale is the SEAT, not the machinery, and an earlier version of this marker got that
+> wrong.** It asserted that every symbol named below belonged to the retired PySide6 desktop console.
+> Three of the four are alive, REHOMED rather than retired: `_request` in
+> `messagefoundry/apiclient/client.py` (ADR 0088 extracted the Qt-free engine client), `AsyncRunner` in
+> `harness/_async.py`, and `poll_client` in `harness/_console_widgets.py` (the harness reuses view
+> widgets moved out of the old console). Only `client.stepdown_node` is absent — which is the control
+> showing the check discriminates rather than matching everything.
+>
+> **So do not discard steps 3 and 4 with the rest.** Step 3's rule outlives the console it was written
+> for: carry the step-up / MFA challenge on the WRITING client, never on the read-only polling one, and
+> run the call off the UI thread. So does step 4's: render the leaderless window honestly.
 
 The failover button follows the established **privileged-write** pattern, not the read pattern:
 

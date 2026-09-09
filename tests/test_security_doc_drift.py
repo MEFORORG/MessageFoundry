@@ -23,11 +23,12 @@ non-input.
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 from pathlib import Path
 
 import pytest
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
 from messagefoundry.api.app import create_app
@@ -721,6 +722,45 @@ def test_route_count_parity() -> None:
         "paragraph and this constant in the same change (ASVS 8.1.1)."
     )
     assert len(create_app(expose_docs=True).routes) == _ROUTES_WITH_DOCS
+
+
+def test_the_counting_basis_per_module_split_matches_the_declaring_modules() -> None:
+    """The counting basis' per-module split is measured against the modules, not just asserted.
+
+    RULE: the two module counts must add to the total, and each must match the module that actually
+    declares those routes.
+
+    The totals were pinned from the day this file was written. **The split was not**, and it shipped
+    reading "68 declared in api/app.py (67 HTTP + 1 WebSocket) and 38 declared in api/auth_routes.py"
+    against a pinned total of 109 — an arithmetic claim that sums to 106, sitting three lines above a
+    number CI checks every run. Prose arithmetic beside a tested number is exactly the shape that
+    drifts unnoticed, so it is derived here instead of re-approved by eye.
+    """
+    routes = create_app().routes
+
+    def _module_of(route: object) -> str:
+        endpoint = getattr(route, "endpoint", None)
+        return getattr(inspect.getmodule(endpoint), "__name__", "") if endpoint is not None else ""
+
+    app_module, auth_module = "messagefoundry.api.app", "messagefoundry.api.auth_routes"
+    in_app = [r for r in routes if _module_of(r) == app_module]
+    in_auth = [r for r in routes if _module_of(r) == auth_module]
+    ws_in_app = [r for r in in_app if isinstance(r, APIWebSocketRoute)]
+    assert len(in_app) + len(in_auth) == _ROUTES_DEFAULT, (
+        f"{_ROUTES_DEFAULT - len(in_app) - len(in_auth)} route object(s) are declared somewhere other "
+        "than api/app.py and api/auth_routes.py, which the counting-basis paragraph says is nowhere. "
+        "Name the third module in the doc, or stop declaring routes there."
+    )
+    sentence = (
+        f"builds **{_ROUTES_DEFAULT} route objects** — {len(in_app)} declared in "
+        "[`api/app.py`](../messagefoundry/api/app.py) "
+        f"({len(in_app) - len(ws_in_app)} HTTP + {len(ws_in_app)} WebSocket) and {len(in_auth)} "
+        "declared in [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py)."
+    )
+    assert " ".join(sentence.split()) in " ".join(_doc_text().split()), (
+        "docs/SECURITY.md's counting-basis sentence no longer matches the measured split. It should "
+        f"read: {sentence}"
+    )
 
 
 def test_route_count_parity_with_the_console_mounted() -> None:
