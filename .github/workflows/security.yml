@@ -41,13 +41,16 @@ on:
   # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
   # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
   # enabled the queue is recorded nowhere.
+  #
+  # THIS ARM ALSO CARRIES THE FULLY-LOADED SCAN OF FORK-CONTRIBUTED CONTENT, which a post-merge
+  # `push: branches: [main]` arm used to carry until it was removed on 2026-09-08. `forbidden-content`
+  # degrades to a STRUCTURAL-ONLY scan on a fork pull request because MEFOR_FORBIDDEN_TOKENS is
+  # withheld from a fork by design. A merge_group run is a base-repo event: the secret is present and
+  # `github.event.pull_request` is null, so that job takes its secret-present branch over the tree the
+  # queue entry is about to merge. Same coverage as the post-merge arm, one step earlier -- and here a
+  # finding can still stop the merge, which after the merge it never could.
   merge_group:
   pull_request:
-  # Post-merge re-scan (main only). A fork PR is scanned STRUCTURAL-ONLY by design -- the secret is
-  # unavailable to it -- so without this arm no fully-loaded scan ever sees fork-contributed content.
-  # Scoped to main so branch pushes do not double-run alongside their own PR.
-  push:
-    branches: [main]
   schedule:
     # Daily, so a CVE freshly disclosed against an UNCHANGED pinned dep (no push/PR to trigger a scan)
     # is caught within ~24h instead of up to 7 days — a weekly cadence can't meet a 72h-class remediation
@@ -70,10 +73,30 @@ concurrency:
 permissions:
   contents: read
 
+# EVERY JOB BELOW CARRIES A `timeout-minutes`, AND THIS IS WHERE THE REASONING FOR ALL OF THEM LIVES.
+# The other twelve workflows capped in the same change carry the number and not this paragraph -- one
+# statement, per CLAUDE.md section 11 (SDS-3.5), rather than thirteen copies free to drift.
+#
+# GitHub's default is 360 MINUTES. This account has 20 concurrent runner slots against round-the-clock
+# demand for about 25, so a slot is the scarce resource and a hung job holds one for six hours while
+# reporting nothing -- there is no signal for "still running", only for finished. THIS FILE IS THE
+# WORST CASE: it owns SEVEN of the thirteen required contexts, so a hang here does not merely waste a
+# slot, it stops the merge queue behind a check that never reports.
+#
+# SIZED TO BOUND A HANG, NOT TO POLICE A SCHEDULE, and the asymmetry is deliberate: a too-generous cap
+# still fixes the six-hour case, while a too-tight one reds a REQUIRED context on a green scan. So
+# these are roughly 3x the observed steady state, rounded up, with a floor of 10 minutes -- the seven
+# required jobs here run 7 to 79 SECONDS each (pip-audit at 79s is the slowest), so 10 minutes is
+# already about eight times the worst of them. If one of these ever fires, the finding is a hang or a
+# hostile input, not a cap that needs raising; read the run before raising the number.
+#
+# The three heavier jobs are sized above the floor because they do real work rather than a scan of the
+# checked-out tree, and each says so at its own key.
 jobs:
   pip-audit:
     name: pip-audit (dependency vulnerabilities)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
     # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
     # accept a triaged advisory.
@@ -187,6 +210,7 @@ jobs:
   npm-audit:
     name: npm-audit (ide dependency vulnerabilities)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: the ide/ npm tree (the VS Code extension's build-time toolchain) audits clean today, so a
     # newly-disclosed advisory in a pinned npm dep now turns CI red — the same forcing function as
     # pip-audit, extended to the extension's supply chain (previously only pip + github-actions were
@@ -245,6 +269,9 @@ jobs:
   released-line-audit:
     name: released-line-audit (latest release's pinned runtime)
     runs-on: ubuntu-latest
+    # Above the floor: this one resolves and installs a PUBLISHED release's pinned runtime rather than
+    # auditing the checked-out lockfile, so it pays a network install the seven required jobs do not.
+    timeout-minutes: 15
     # WHAT THIS ANSWERS, and why the `pip-audit` job above does not. That job audits the CHECKED-OUT
     # tree, so on the daily cron it audits `main`. "Is what we would ship next current" is the right
     # question and it is a DIFFERENT question from "does the version we already shipped carry a known
@@ -389,6 +416,9 @@ jobs:
   sbom:
     name: SBOMs (CycloneDX, multi-ecosystem)
     runs-on: ubuntu-latest
+    # Above the floor: two full dependency-tree resolves (Python + npm) plus scoring and artifact
+    # upload. Advisory and schedule-only, so a cap that fires here costs a nightly, not a merge.
+    timeout-minutes: 20
     # Advisory (non-blocking): generate machine-readable, LICENSE-complete CycloneDX SBOMs for the two code
     # artifacts whose dependency trees pip-audit/npm-audit already watch — the Python engine (from the
     # hash-locked core runtime lock) and the VS Code extension (from its npm lockfile) — score their quality,
@@ -479,6 +509,10 @@ jobs:
   trivy:
     name: trivy (container image vulnerabilities)
     runs-on: ubuntu-latest
+    # The most generous cap in this file, because it BUILDS the engine image before scanning it and an
+    # image build is the one step here whose honest duration nobody has measured. Advisory and
+    # schedule-only. Err high: 30 minutes still bounds the six-hour case by an order of magnitude.
+    timeout-minutes: 30
     # ADVISORY for its first cycle (continue-on-error): scan the built engine image for OS-package and
     # Python CVEs — the supply-chain layer pip-audit (lockfile only) and bandit/semgrep (source only)
     # never see: the Debian base, system libs, and (on the -sqlserver variant) the msodbcsql18/unixODBC
@@ -549,6 +583,7 @@ jobs:
   bandit:
     name: bandit (Python SAST)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: the baseline is clean, so any NEW insecure pattern (that isn't a reviewed per-line
     # `# nosec`) fails the build instead of merging unnoticed.
     steps:
@@ -592,6 +627,7 @@ jobs:
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: a newly-introduced secret fails the build.
     #
     # THE SCOPE IS STATED ONCE, ON THE SCAN STEP BELOW, AND MUST NOT BE RESTATED HERE. This line read
@@ -679,6 +715,7 @@ jobs:
   semgrep:
     name: semgrep (project SAST rules)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: the first run was 0 findings; a new match for any rule now fails the build.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -756,6 +793,7 @@ jobs:
   crypto-inventory:
     name: crypto-inventory (ASVS 11.1.3 discovery gate)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING: enumerate every crypto call site (hashlib/secrets/hmac/ssl/argon2/cryptography) and diff
     # against the maintained inventory in scripts/security/crypto_inventory_check.py (machine-readable
     # companion to docs/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
@@ -772,6 +810,7 @@ jobs:
   forbidden-content:
     name: forbidden-content (customer/PHI leak guard)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # BLOCKING (required context): scan the WHOLE tracked tree for customer/PHI-adjacent strings --
     # partner/site names, the real production estate, routable host IPs, internal worktree slugs and
     # absolute home paths. These are not *secrets* (gitleaks will not flag them) but must never land on
