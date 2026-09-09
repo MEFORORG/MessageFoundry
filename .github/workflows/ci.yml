@@ -410,6 +410,20 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/workflow_local_action_check.py
 
+      # Stale vault repo slug. Mirrors the `stale-repo-slug` pre-commit hook, for the reason the
+      # control-bytes step above gives: the hook is the load-bearing half, and this step is the
+      # backstop for `git commit --no-verify` and for a fresh clone whose hooks are not installed
+      # until scripts/coord/install-git-hooks.ps1 runs. The hook shipped in this same pull request
+      # WITHOUT this step, which is the unmirrored state tests/test_gate_ci_mirror_parity.py exists
+      # to red on -- it did, and this is the repair rather than an exemption.
+      #
+      # DELIBERATELY NOT PATHS-FILTERED, the same argument the two steps above give: a stale slug
+      # lives in .md far more often than in code, so a docs-only pull request sets code=false and a
+      # filter would skip the gate on exactly the prose a repository rename leaves behind.
+      - name: Stale repo slug (pre-rename vault path)
+        if: runner.os == 'Linux'
+        run: python scripts/quality/stale_repo_slug_check.py
+
       # BACKLOG #1226. The screen shipped and NOTHING RAN IT, so it read as coverage and produced
       # none -- a username reaching a WHERE clause was found three times by accident and zero times
       # on purpose. --baseline is what makes this step able to FAIL without turning the screen into
