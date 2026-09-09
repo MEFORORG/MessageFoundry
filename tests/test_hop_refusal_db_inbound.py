@@ -493,7 +493,7 @@ def test_serve_prod_phi_refuses_cleartext_even_with_flag(
     assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
 
 
-def test_serve_dev_synthetic_honors_flag(
+def test_serve_dev_honors_flag_under_warn_enforcement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pytest.importorskip(
@@ -505,9 +505,11 @@ def test_serve_dev_synthetic_honors_flag(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic explicitly — this test proves the
-    # --allow-insecure-bind flag is honored on a synthetic instance (the PHI clamp is tested elsewhere).
+    # The flag is CLAMPED INERT while enforcing. That clamp used to need enforcing AND PHI, and
+    # this test escaped it by declaring the box synthetic; BACKLOG #1279 left the dial as the only
+    # key. This proves the flag is HONORED where it can be -- the clamp itself is tested elsewhere.
     (tmp_path / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"

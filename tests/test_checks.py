@@ -588,7 +588,10 @@ def test_posture_fails_custom_env_without_posture(tmp_path: Path) -> None:
     report = run_checks(cfg, run_lint=False)
     posture = next(r for r in report.results if r.name == "posture")
     assert posture.required and not posture.ok and not posture.skipped
-    assert "handles_real_patient_data" in posture.detail and "production_instance" in posture.detail
+    # The refusal named BOTH posture keys until BACKLOG #1279 removed the data class. A custom env
+    # still has to declare its production tier, and that is now the whole of what it must declare.
+    assert "production_instance" in posture.detail
+    assert "handles_real_patient_data" not in posture.detail
     assert report.ok is False  # a required check failed -> the gate fails
 
 

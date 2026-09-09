@@ -669,7 +669,7 @@ def test_serve_allows_non_loopback_bind_with_flag(
     # enforcing AND PHI, and this case escaped it by declaring the box synthetic; since BACKLOG #1279
     # the dial is the only key left, so the dial is what this fixture turns down.
     (tmp_path / "messagefoundry.toml").write_text(
-        'security.enforcement = "warn"' + chr(92) + "n"
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
@@ -779,14 +779,17 @@ def test_serve_auth_off_on_unexposed_loopback_still_starts(
 def test_serve_auth_on_behind_terminator_unaffected_by_arm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # BACKLOG #1013: the arm is inert under auth ON even when exposed. A synthetic loopback instance
-    # behind a declared terminator is instance_exposed True, but auth is on by default (require_mfa
-    # defaults on -> the MFA-at-exposure gate stays quiet; synthetic keeps the PHI gates quiet), so the
-    # auth-off arm must not fire.
+    # BACKLOG #1013: the arm is inert under auth ON even when exposed. A loopback instance behind a
+    # declared terminator is instance_exposed True, but auth is on by default (require_mfa defaults
+    # on -> the MFA-at-exposure gate stays quiet), so the auth-off arm must not fire.
+    #
+    # The dial is at warn because the terminator-without-an-external-origin refusal has NO loopback
+    # carve-out, and since BACKLOG #1279 no declaration exempts a dev box from it. Different subject.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
@@ -1027,11 +1030,17 @@ def test_serve_exposed_without_mfa_refuses_on_dev_too(
     assert "require_mfa" in err and "refusing to start" in err
 
 
-def test_serve_exposed_without_mfa_starts_on_the_per_gate_ack(
+def test_serve_exposed_without_mfa_is_permitted_by_the_per_gate_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # ...and the replacement for the retired declaration is the switch that names THIS gate, which
-    # leaves every other one live. That asymmetry is the whole argument for the removal.
+    # The replacement for the retired declaration is the switch that names THIS gate, and it leaves
+    # every other one live. That asymmetry is the whole argument for the removal, so it is what the
+    # assertion below actually measures.
+    #
+    # IT DOES NOT ASSERT A CLEAN START, deliberately. `_expose_toml` exposes via a declared
+    # terminator, and the terminator-without-an-external-origin refusal fires AFTER the MFA gate has
+    # already been satisfied -- so a zero exit would be measuring that later gate, not this ack.
+    # Gating on the exit code here is the instrument answering the adjacent question (SDS-3.8).
     monkeypatch.chdir(tmp_path)
     _expose_toml(
         tmp_path,
@@ -1039,11 +1048,14 @@ def test_serve_exposed_without_mfa_starts_on_the_per_gate_ack(
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
     captured = capsys.readouterr()
-    # Permitted, and audited -- never silent. The AUDIT line rides the logging path (stdout);
-    # the refusal it replaces printed to stderr, so this reads both rather than guessing.
-    assert "require_mfa" in captured.err + captured.out
+    both = captured.err + captured.out
+    # Permitted, and audited -- never silent. The AUDIT rides the logging path (stdout); the
+    # refusal it replaces printed to stderr, so this reads both rather than guessing.
+    assert "allow_single_factor_admin_when_exposed" in both
+    # ...and the MFA gate's own REFUSAL is gone, which is the half that proves the ack worked.
+    assert "with [security].require_mfa off; refusing to start" not in both
 
 
 def test_serve_exposed_with_mfa_on_starts_in_prod(
@@ -1226,10 +1238,13 @@ def test_serve_exposed_without_approvals_warns_on_dev_too(
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
         "alerts.security_notifications_required = false\n"
+        'security.enforcement = "warn"\n'
         "security.local_access_only = false\n"
         'security.listen_address = "0.0.0.0"\n',
         env="dev",
     )
+    # The dial is at warn because this fixture binds off-loopback with no TLS, and the cleartext
+    # bind clamp refuses before the approvals advisory is reached. The advisory is the subject.
     assert rc == 0
     err = capsys.readouterr().err
     assert "[approvals].enabled off" in err and "single caller's authority" in err
@@ -1437,11 +1452,13 @@ def test_serve_ui_upstream_with_public_origin_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The refusal's happy path: one config line satisfies it (the error message names it).
-    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet — the /ui
-    # ladder is the subject here.
+    # The /ui ladder is the subject here, so the gates around it are stood down by NAME. The dial
+    # goes to warn because a declared terminator under `enforce` dials the ASVS 12.1.1 TLS-floor
+    # probe at the origin below, and that probe is a different test's business.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
@@ -1476,14 +1493,12 @@ def test_serve_ui_warns_on_undeclared_proxy_signal(
 ) -> None:
     # public_origin set on an unprotected loopback instance = the undeclared-proxy heuristic:
     # WARN (cookie ships without Secure until the posture is declared) but still start.
-    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet.
+    # The undeclared-proxy heuristic is the subject; the gates around it are stood down by name.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
-        "security.allow_unencrypted_phi = true\n"
-        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "alerts.security_notifications_required = false\n"
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "https://mefor.example.org"\n',
     )
@@ -1855,14 +1870,14 @@ def test_serve_ui_default_on_offloopback_degrades_json_only(
     # ADR 0143: the console defaults ON for LOOPBACK binds only. A DEFAULT-on (not explicitly requested)
     # console on an off-loopback bind AUTO-DEGRADES to JSON-only rather than tripping the /ui exposure
     # refusal — so a previously-working off-loopback JSON serve is not turned into a start failure.
-    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet.
+    # The dial is at warn: a declared terminator under `enforce` refuses without an external origin,
+    # and since BACKLOG #1279 no declaration exempts a dev box from that. The /ui degrade is the
+    # subject here, so the gate around it is stood down by name rather than by a data label.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
+        'security.enforcement = "warn"\n'
         "security.block_unlisted_outbound = true\n"
-        "security.allow_unencrypted_phi = true\n"
-        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "alerts.security_notifications_required = false\n"
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 0
@@ -2162,8 +2177,13 @@ def test_serve_egress_flip_respects_an_explicit_opt_out_on_dev(
     assert captured["egress_settings"].deny_by_default is False  # type: ignore[attr-defined]
     # The flip did not run (it is presence-gated on the explicit value), and the opt-out is
     # AUDITED -- the flip's own notice is absent, the deliberate choice is not.
+    #
+    # The absence check names the FULL notice, not the phrase "defaulted ON". Since BACKLOG #1279 the
+    # retention auto-bound reaches every instance and its notice contains that phrase too, so the
+    # short form would be matching a different gate's output -- passing or failing for reasons that
+    # have nothing to do with egress (SDS-3.8).
     captured_out = capsys.readouterr()
-    assert "defaulted ON" not in captured_out.err
+    assert "[security].block_unlisted_outbound defaulted ON" not in captured_out.err
     assert "block_unlisted_outbound" in captured_out.err + captured_out.out
 
 

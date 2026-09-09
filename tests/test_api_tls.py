@@ -352,7 +352,7 @@ def test_serve_allows_non_loopback_with_upstream_tls(
         "security.block_unlisted_outbound = true\n"
         "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
-        'security.web_console_public_address = "https://mefor.example.org"\n'
+        'security.enforcement = "warn"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
@@ -479,9 +479,11 @@ def _posture_b_toml(
         # PHI family on one line. BACKLOG #1279 retired that, so the flag writes the per-gate acks a
         # keyless fixture needs. Egress is declared unconditionally below, so it is not repeated here.
         + (
+            # NO `alerts.` line here: `_SECURE_ALERTS` below declares the `[alerts]` TABLE, and TOML
+            # refuses to declare one twice. This fixture satisfies the notification gate the honest
+            # way, with a configured SMTP transport, so the opt-out would be redundant as well.
             "security.allow_unencrypted_phi = true\n"
             "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-            "alerts.security_notifications_required = false\n"
             if relax_phi_gates
             else ""
         )
@@ -694,9 +696,24 @@ def test_serve_loopback_emits_no_new_stderr(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
         # A KEY is configured above, so this fixture takes NO at-rest ack -- and must not, because the
-        # ack is audited and would put a line on the very stream this test asserts is empty.
+        # ack is audited and would put a line on the very stream this test asserts is empty. Same
+        # reason the retention windows are set EXPLICITLY rather than left to the secure-by-default
+        # auto-bound: since BACKLOG #1279 that default reaches every instance, and it announces itself.
         "security.block_unlisted_outbound = true\n"
-        "alerts.security_notifications_required = false\n"
+        # SATISFIED, not opted out. `security_notifications_required = false` is itself an audited
+        # loosening and warns, which on this test's own terms is a line on the stream it asserts is
+        # empty. Configuring the transport is the honest way past the gate and stays silent.
+        'alerts.email_smtp_host = "smtp.example.org"\n'
+        'alerts.email_from = "sec@example.org"\n'
+        "security.delete_message_bodies_after_days = 30\n"
+        "retention.dead_letter_days = 30\n"
+        "retention.reference_snapshot_days = 30\n"
+        # The two PL-2 tiers the engine deliberately does NOT default, because each keys on a
+        # timestamp that only moves on a write, so a silent default would delete data still in use.
+        # They warn when unset, which on this test's own terms is a line on a stream it asserts is
+        # empty -- so they are set here rather than the assertion being loosened.
+        "retention.state_max_age_days = 30\n"
+        "retention.search_preset_days = 30\n"
         "security.local_access_only = true\n",
         encoding="utf-8",
     )

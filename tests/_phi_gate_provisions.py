@@ -44,6 +44,17 @@ PHI_GATE_PROVISIONS_TOML = (
     "alerts.security_notifications_required = false\n"
 )
 
+#: The same, minus the `alerts.` line, for a fixture that declares its own `[alerts]` TABLE. TOML
+#: refuses to declare a table twice, and a dotted `alerts.x` key counts as declaring it -- so a
+#: fixture that configures a real SMTP transport must take this one and satisfy the notification gate
+#: the honest way. Splitting the constant rather than dropping the line from both keeps the
+#: distinction visible at the call site instead of leaving it to whoever debugs the TOML error.
+PHI_GATE_PROVISIONS_NO_ALERTS_TOML = (
+    "security.block_unlisted_outbound = true\n"
+    "security.allow_unencrypted_phi = true\n"
+    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+)
+
 #: The same four, as the environment variables the loader reads. Kept beside the TOML deliberately:
 #: two spellings of one list drift, and a fixture that sets three of four gets a refusal whose message
 #: names a gate the author was not thinking about.

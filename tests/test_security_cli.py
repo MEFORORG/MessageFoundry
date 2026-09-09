@@ -33,7 +33,10 @@ def test_show_defaults_when_absent(tmp_path: Path, capsys: pytest.CaptureFixture
     assert data["set"] == [] and data["loosenings"] == []
     assert data["values"]["require_mfa"] is True and data["values"]["local_access_only"] is True
     assert data["defaults"]["block_unlisted_outbound"] is True
-    assert data["values"]["handles_real_patient_data"] is None  # unset → derived from environment
+    #  sat beside this and is retired (BACKLOG #1279); the model no longer
+    # carries the field, so  cannot report it and must not invent it.
+    assert "handles_real_patient_data" not in data["values"]
+    assert data["values"]["production_instance"] is None  # unset → derived from environment
 
 
 def test_set_writes_security_and_preserves_other_sections(
