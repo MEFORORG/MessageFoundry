@@ -1,8 +1,12 @@
 # ADR 0041 — Load-path attestation & code-change attribution
 
-- **Status:** Proposed (2026-06-27) — drafted on the owner's go (insider-code-tampering review). The
-  **first slice (D1, the config fingerprint)** is built alongside this ADR on branch
-  `config-fingerprint`; D2/D3 are staged (BACKLOG #53, #54).
+- **Status:** Accepted (2026-06-27) — drafted on the owner's go (insider-code-tampering review).
+  **D1, D2 and D3 are all BUILT:** D1 alongside this ADR, then D2 (BACKLOG #53) and D3 (BACKLOG #54)
+  shipped in 0.2.9.
+- **Status as drafted, kept for history:** *"Proposed (2026-06-27) — ... The **first slice (D1, the
+  config fingerprint)** is built alongside this ADR on branch `config-fingerprint`; D2/D3 are staged
+  (BACKLOG #53, #54)."* That was true when written. It under-claims now: #53 and #54 both closed and
+  shipped in 0.2.9, so a reader planning off it would plan to build code that already exists.
 - **Decision in one line:** on top of [ADR 0036](0036-windows-config-source-trust.md)'s load-time
   *write-access* refusal, add the **attribution + integrity-binding** layer it does not cover — bind
   every reload/startup to a **content fingerprint** of what loaded (D1), require a **second approver**
@@ -102,7 +106,7 @@ behaviour with an unchanged fingerprint. **Implementation:**
 [`config/fingerprint.py`](../../messagefoundry/config/fingerprint.py) + a splat into the existing
 reload-audit detail; a fingerprint failure is logged and never blocks the audit.
 
-### D2 — Dual-control `config:deploy`  *(planned — BACKLOG #53)*
+### D2 — Dual-control `config:deploy`  *(BUILT — BACKLOG #53, shipped in 0.2.9; drafted as "planned")*
 
 Add `config:deploy` / `POST /config/reload` to the configurable dual-control `[approvals]` gated set, so a
 **distinct** second approver (server-enforced; the requester can never self-approve; both identities
@@ -110,7 +114,7 @@ audited) must release a reload. The maker-checker machinery already exists; relo
 This is the one *preventive* control that makes the code author and a second authorizer both required for a
 change to go live. **Opt-in / deny-by-default** — single-operator deployments are unchanged until enabled.
 
-### D3 — Startup self-attestation + enforced non-editable wheel  *(planned — BACKLOG #54)*
+### D3 — Startup self-attestation + enforced non-editable wheel  *(BUILT — BACKLOG #54, shipped in 0.2.9; drafted as "planned")*
 
 At startup (and on demand) hash the loaded `messagefoundry` module files against the wheel's
 `*.dist-info/RECORD` (a zero-new-artifact baseline already shipped in the wheel); on drift, **fail-closed
@@ -143,7 +147,10 @@ fingerprint+git-HEAD covers more cheaply for now.
 
 ## Acceptance Criteria
 
-> EARS form; each linked (`→`) to its test. D1's tests land in this change; D2/D3 are planned targets.
+> EARS form; each linked (`→`) to its test. D1's tests landed with this change; D2's and D3's landed
+> with BACKLOG #53 / #54 in 0.2.9. **The as-drafted "D2/D3 are planned targets" was true when written
+> and under-claims now** — all twelve ACs below have a test on disk. (AC-5 to AC-8 name
+> `tests/test_approvals.py`; those four tests live in `tests/test_dual_control_reload.py`.)
 
 - **AC-1** — WHEN `config_fingerprint(dir)` is called twice on an unchanged bundle, THE SYSTEM SHALL return
   the identical 64-hex SHA-256 (stable, order-independent).
@@ -162,7 +169,7 @@ fingerprint+git-HEAD covers more cheaply for now.
 - **AC-4** — WHEN an operator applies a non-dry-run `POST /config/reload`, THE SYSTEM SHALL include the
   config `fingerprint` in the `config_reload` audit detail, matching `config_fingerprint(dir)`.
   → `tests/test_api_reload.py::test_reload_audit_records_fingerprint`
-**D2 — dual-control `config:deploy`** *(planned — BACKLOG #53)*
+**D2 — dual-control `config:deploy`** *(BUILT — BACKLOG #53, shipped in 0.2.9)*
 
 - **AC-5** — WHERE `config_reload` is in `[approvals].operations` and `[approvals].enabled` is true, WHEN an
   operator applies a non-dry-run `POST /config/reload`, THE SYSTEM SHALL hold it as a pending request and
@@ -181,7 +188,7 @@ fingerprint+git-HEAD covers more cheaply for now.
   before — single-operator deployments are unchanged until dual-control is opted in.
   → `tests/test_approvals.py::test_config_reload_inline_when_not_gated`
 
-**D3 — startup self-attestation + enforced non-editable wheel** *(planned — BACKLOG #54)*
+**D3 — startup self-attestation + enforced non-editable wheel** *(BUILT — BACKLOG #54, shipped in 0.2.9)*
 
 - **AC-9** — WHEN the engine starts (and on demand) on a non-editable wheel install, THE SYSTEM SHALL hash
   every loaded `messagefoundry` module file and compare it against the wheel's `*.dist-info/RECORD` baseline.

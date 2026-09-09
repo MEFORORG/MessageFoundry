@@ -16864,6 +16864,117 @@ measurement from this row's subject and it is named here rather than performed.*
 
 ## 1278. run Routers and Handlers in the subprocess sandbox by default
 
+> **THE FLIP WAS BUILT AND MEASURED, THEN RULED AGAINST. `[sandbox].mode` STILL DEFAULTS TO `"off"`,
+> AND THIS ITEM STAYS OPEN.** Owner decision 2026-09-05 held the change out of the merge queue; owner
+> ruling 2026-09-09 returned the default to `"off"` and kept every other line of the machinery, so
+> `subprocess` remains available opt-in. Read this before the filing text below, which describes the
+> shipped state and is still accurate.
+>
+> **WHAT BLOCKS IT: [ADR 0052](adr/0052-enterprise-scale-target.md) AC-2** -- *"THE SYSTEM SHALL
+> support up to 1,500 concurrent connections without per-connection-worker exhaustion
+> (fd/socket/worker-task limits)."* At `mode=subprocess` each inbound that receives traffic costs one
+> child process, two parent daemon threads and three parent pipe fds, so the default flip puts that
+> acceptance criterion in question at scale. **Nobody has measured it.** The instrument exists --
+> `harness/load/connscale/` (B11) drives 500/1000/1500 inbound MLLP connections against an engine it
+> owns -- but no `mode=subprocess` arm has been run on it, and the A/B below covers 13 sample
+> connections, not 1,500. Two-arm connscale at N=1500, sandbox on versus off, is what would answer
+> the owner. Do not re-attempt the flip without it.
+>
+> **A stale pointer found while checking that, named by subject because it is not this row's to
+> fix:** ADR 0052's AC-2 evidence line still reads *"connection-scale test (to build; new BACKLOG
+> item)"* while `harness/load/connscale/` is in the tree. Anyone reading the ADR alone concludes the
+> instrument does not exist.
+>
+> **THE ROW'S NAMED EVIDENCE GAP IS CLOSED, and that part survives the reversal.** The capitalised
+> warning below -- *the shipped samples look compatible on inspection, and that is not the same as
+> having run them* -- was answered on 2026-09-04 by RUNNING them, in a paired A/B against a
+> `mode=off` control on the same tree. It says the flip is functionally sound on the sample estate;
+> it says nothing about 1,500 connections, which is the blocker above.
+>
+> | | `mode=subprocess` arm | `mode=off` control |
+> |---|---|---|
+> | inbounds listening | 9 of 13 (7 MLLP, 2 X12) | same 9 |
+> | MLLP ACKs | **7 of 7 `AA`** | same |
+> | X12 interchanges accepted | 2 of 2 | same |
+> | File pollers (`./in/fhir`, `./dev-inbox/pdf`) | both files **consumed** | same |
+> | end-to-end delivered to live receivers | `OB_ACME_ADT` 2, `OB_EPIC_STREAM_MDM` 1 | **identical** |
+> | `_sandbox_worker` children | **11**, one per inbound with traffic | **0** |
+> | `SandboxError` | **0** | 0 |
+>
+> So the instrument discriminates: same ACKs, same deliveries, isolation on or off. All 14 modules
+> under `samples/config/` loaded (13 inbound + 12 outbound connections constructed), and 11 inbounds
+> executed Router and Handler bodies inside a worker child. Not exercised: the DICOM C-STORE SCP
+> (needs an SCU) and the `IB_RTE_RESPONSE` loopback.
+>
+> **A counting trap, recorded WITH THE OBJECTION TO IT, because the two explanations are not
+> reconciled.** The raw process count was **22, not 11**. The 2026-09-04 run explained that as a
+> launcher artifact: on that box the `.venv` `Scripts` launcher re-executes with a byte-identical
+> command line, so every logical Python process appears **twice** in `Win32_Process` under the same
+> `CommandLine`, proven on the parent (one `serve` launch, two processes, identical command lines) --
+> concluding the figure is one worker per inbound, as filed.
+> **[ADR 0087](adr/0087-sandbox-subprocess-isolation.md)'s 2026-09-05 amendment says something else
+> about the same number:** each worker tree is *"**two** processes on Windows, per
+> `worker_tree_processes` in every result file"*. If that is right, 22 is the real tree size and the
+> launcher explanation is measuring something adjacent. **Nobody has run the discriminating test**
+> (read `worker_tree_processes` and the parent-child edges on the same run that produced the 22).
+> Do not cite either figure as settled per-worker footprint until someone does.
+>
+> **Two failures appeared in BOTH arms and are pre-existing, not sandbox-related.**
+> `OB_IMMUNIZATION_BODYCRED` and `OB_IMMUNIZATION_REGISTRY` fail to start because `environments/dev.toml`
+> carries none of the `registry_*` values; the engine isolates them and continues. The smoke also needs
+> `[security].handles_real_patient_data = false`, or `serve --env dev` refuses to start without a store
+> encryption key.
+>
+> **THE DOCUMENTATION HALF OF THIS ROW SHIPPED AND STANDS AT THE CURRENT DEFAULT.** The five findings
+> this row named are now written down, phrased for an opt-in mode rather than a default one. Finding 1
+> (the wall cap) is in `[sandbox]`'s docs and in `CONFIGURATION.md`, stated both ways round -- turning
+> the sandbox on stops a busy loop wedging intake, and makes a legitimately slow Handler dead-letter
+> where it used to finish. Finding 2's per-inbound multiplier and finding 3's one-message-is-not-one-
+> dispatch multiplier (3 for a single handler with an `accepts=` predicate, 1 + 2K for fan-out to K)
+> are both in the operator docs. Finding 5 was **decided rather than deferred**: the pre-deploy gate
+> does NOT learn the setting, and `dryrun.py` and `checks.py` now say so outright -- at
+> `mode=subprocess` a Handler calling `db_lookup`/`fhir_lookup` passes the gate green and then fails
+> closed at `serve`. Teaching `dry_run` to spawn a worker per inbound is its own change with its own
+> cost; `route_only` and `transform_one` already take `sandbox=`, so the seam is there when someone
+> wants it. Separately, `[pipeline].fuse_thread_hops` now carries the warning that the runner
+> hard-disables fusion underneath it whenever the sandbox is on -- an operator reads the knob they
+> set, not the other one.
+>
+> **ONE SCOPE FACT THAT WAS MISSING EVERYWHERE AND IS NOW STATED AT EVERY SITE THAT GIVES THE
+> INSTRUCTION.** The docs tell an operator to set `mode=off` for a Handler needing live enrichment.
+> `[sandbox]` is a single **engine-wide** section: `Engine.add_registry` renders ONE `SandboxPolicy`
+> for the whole graph and `config/models.py` carries no per-connection sandbox field (measured:
+> `grep -c -i sandbox messagefoundry/config/models.py` returns 0), so acting on that instruction takes
+> **every** Router and Handler in the process out of the sandbox, not the one that needed enrichment.
+> That sentence is now in `config/settings.py`, `pipeline/sandbox.py`, `checks.py` and
+> `docs/CONFIGURATION.md`. It is true at either default, which is why it stays.
+>
+> **`SandboxPolicy.mode` lost its `= SandboxMode.OFF`** -- a second default free to contradict the
+> first -- and all 12 construction sites already passed `mode=` explicitly, so requiring it was free.
+> That is kept: it is the half of this work that makes a future flip safe to make in one place.
+> `mode` is still read ONCE at engine construction, so `/config/reload` does not re-read it and
+> changing it needs a **restart**.
+>
+> **THREE COUPLED SITES THAT A FUTURE FLIP MUST MOVE WITH IT. All three are correct today and were
+> reverted with the default.** (a) [ADR 0144](adr/0144-security-lint-gate-over-admin-authored-router-handler-config.md)'s
+> rejected-alternatives rationale gives *"the sandbox is opt-in/off-by-default"* as one of two grounds
+> for refusing to rely on the sandbox alone. A flip deletes that ground. The rejection survives on the
+> other, which is sufficient by itself: an address-space boundary does not catch a Handler leaking PHI
+> into the store's own log or building SQL inside the sanctioned `db_lookup`, because neither crosses
+> an address space. (b) `docs/ASVS-ASSESSMENT-METHOD.md:115` uses this exact cell as its worked example
+> of rule 5, *"a working control that ships off"*. A flip expires that premise, and re-scoring the cell
+> is the tracking seat's act against the vault rather than a Builder's. (c) The 15.1.3 row in the
+> vault-only `docs/security/THREAT-MODEL.md`, and the `_DANGEROUS_ROW_KEYS` anchor
+> `"**In-process (default) or subprocess-isolated execution"` in `tests/test_threat_model_doc_drift.py`
+> that names it. No checkout can read that document, so nothing local will report either.
+> `docs/DANGEROUS-FUNCTIONALITY.md:57-63` is a fourth: it states the default off and tells the reader a
+> Handler needing live enrichment runs with the sandbox off, both of which a flip inverts. It is
+> **checked and correct at the current default** and was deliberately left alone.
+>
+> **On the re-scoring signal below: difficulty 3 was wrong.** The code change is one default, but the
+> coupled documentation sweep, the sample-estate A/B, and the ADR 0052 AC-2 question above are the
+> real work. Treat it as 5-6, and note that the AC-2 harness is a prerequisite this row does not own.
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The default is unchanged at config/settings.py:1294, so on the shipped default Router and Handler code runs in the engine's own address space alongside the store and every connection's in-flight data, while the isolation mode itself is built and exercised. Value 6 because the gap is real but an informed operator can already set [sandbox].mode=subprocess, an awkward rather than absent workaround (it costs a restart and fail-closed refusal of live enrichment); difficulty 3 because the change is one default plus a release note, but the samples and tests/test_sandbox.py must actually be RUN under the new default rather than inspected, and the flip changes behaviour on every config-dir serve path. _(previously unscored.)_
 >
 > **Filed 2026-08-16 - not started. THE ISOLATION MODE IS BUILT, EXERCISED, AND OFF.** `[sandbox].mode` is `Literal["off", "subprocess"]` defaulting to `"off"` ([`config/settings.py:1295`](../messagefoundry/config/settings.py); mirrored as `SandboxMode.OFF` at [`pipeline/sandbox.py:131-154`](../messagefoundry/pipeline/sandbox.py)). On the shipped default, Router and Handler code runs in the engine's own address space. **THE CHANGE: default `mode` to `"subprocess"`.**
@@ -27869,7 +27980,13 @@ connection-scaling guard.
 
 ## 1489. the log write guard prints its roll notice to stdout, so it lands inside captured CLI output and breaks --json readers
 
-> 🔢 **Filed 2026-09-08 -- not started.** `messagefoundry/logging_guard.py` (shipped by PR #883 at 07:24Z, commit `995fc2790`) writes `application log sink stdout was rolled after a write` to the **stdout sink**. A CLI command invoked with `--json` writes its payload to that same stream, so a reader doing `json.loads(...)` sees the notice first and raises `Extra data: line 1 column 5`. Six tests in `tests/test_checks.py` fail this way, and it has already failed one merge-queue build.
+> 🚧 **BUILT 2026-09-09, PR pending. The owner took option 1: a `--json` payload stops sharing a file descriptor with logging, and the logs move to stderr.** `messagefoundry/__main__.py` `main()` calls `configure_stderr_logging()` before it dispatches, whenever the parsed arguments carry `--json`. That subcommand's log sink is then stderr and stdout carries the payload alone. Three things it deliberately does NOT do. **`logging_guard.py` is untouched** -- its rollover notice still goes to the rolled sink, because the notice landing is what proves the replacement accepted a write, which is the whole stage-1/stage-2 split. **`tests/test_checks.py` keeps asserting `json.loads(capsys.readouterr().out)`** -- that assertion becomes sound rather than optimistic, which is why option 2 was rejected rather than adopted. **`serve`/`supervise` are unchanged** -- they take no `--json`, print no payload, and still log to the stdout NSSM captures, so `docs/SERVICE.md`'s file ownership table and the `service.out.log` runbook steps stay true. `configure_stderr_logging` is reused rather than rebuilt: it already existed for the ADR 0087 sandbox worker, whose stdout carries IPC frames, and it carries the PHI-redaction + control-char-scrub chain that the `logging.lastResort` a handler-less subcommand falls back to today does not.
+>
+> **The regression test is `tests/test_checks.py::test_check_json_payload_survives_a_log_record`.** It installs the guarded stdout sink `serve` installs, points its stream at a CLOSED object (what a capture teardown or a supervisor file-swap leaves behind), forces one record during `check --json`, and asserts stdout parses. Reverted to `main`'s `__main__.py` it fails with exactly the measured `json.decoder.JSONDecodeError: Extra data: line 1 column 5 (char 4)`, on stdout beginning `2026-09-09T...Z WARNING  messagefoundry.logging_guard: application log sink 'stdout' was rolled after a write`. **Forcing the record is what makes it deterministic**; the roll is timing-dependent otherwise, which is why five real failures read as flakes.
+>
+> **Cost, measured 2026-09-09 across every `ci.yml` run since 2026-09-08T20:00Z:** five occurrences on five different branches including a push to `main` itself, and three of 22 merge-queue batches (14 percent), each evicting a healthy pull request into a full re-merge cycle. PRs 885, 981 and 1003 were all evicted this way. **That census is ATTRIBUTED to the seat that dispatched this fix, not re-derived by the seat that built it** -- what was checked here is that the three pull requests exist and are now MERGED, which is consistent with an eviction followed by a re-merge but does not on its own establish the cause. The mechanism does not rest on the census: it is reproduced deterministically by the regression test above.
+>
+> **Filed 2026-09-08 -- not started.** `messagefoundry/logging_guard.py` (shipped by PR #883 at 07:24Z, commit `995fc2790`) writes `application log sink stdout was rolled after a write` to the **stdout sink**. A CLI command invoked with `--json` writes its payload to that same stream, so a reader doing `json.loads(...)` sees the notice first and raises `Extra data: line 1 column 5`. Six tests in `tests/test_checks.py` fail this way, and it has already failed one merge-queue build.
 >
 > **Scored 2026-09-08 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. Value 6 -- it makes `--json` output unreliable for any consumer, and it evicts merge-queue entries at random. Difficulty 3 -- the notice needs a stream that is not the machine-readable one.
 
@@ -28619,3 +28736,87 @@ ADR 0078's stated residuals were meant to land under ADR 0173, and ADR 0173's on
 **What did ship.** (b), the optional restore-token vintage cross-check, is built, and (c), the risk acceptance, is recorded. BACKLOG #223 closed on that, verified against `origin/main` 2026-07-28. That closure is correct for what it claims and is not what this row reopens.
 
 **What this row asks for.** One ruling: schedule (a), or accept the residual as permanent and say so in the ADR and the risk-acceptance register. Either answer closes this. What must not persist is a deferral pointed at an owner decision that no artifact ever surfaces.
+
+---
+
+## 1503. ADR 0075's AC-1 asserts a batched `mark_done` that does not exist, and cites a test name that does not exist
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **5/10** · Difficulty **3/10** · _fill-in_. Found by an adversarial over-claim hunt across 125 ADR build claims. The record is otherwise honest and the feature is real; the defect is that a counted acceptance criterion names a third hop that was never built, and anchors it to a test that does not exist. Value 5 because a cited-but-absent test reads as MORE verified than no citation at all. Difficulty 3: either build the third hop or correct the criterion, and the ADR's own open items already frame the choice.
+> Verdict: owner-ruling
+> Research: none -- the measurement is in the body
+> Closing-act: code
+
+**Cluster:** ADR record integrity / SQL Server store. **Priority:** P3. **Verdict:** decide batch-or-defer, then make AC-1 match.
+**Severity:** no deployment axis (sec. 0). The shipped batching is correct for the two hops it covers; nothing mis-executes. What is wrong is the record.
+
+**What AC-1 asserts.** [ADR 0075](adr/0075-per-hop-sql-statement-batching.md), inside its counted Acceptance Criteria block: *"WHEN `batch_handoff_statements=true` on a SQL Server store, THE SYSTEM SHALL emit, for each of `route_handoff` / `transform_handoff` / `mark_done`, the identical logical `(sql, params)` sequence as the unbatched path"* -- cited to `tests/test_adr0075_batch_golden_sql.py::test_batched_matches_unbatched_sequence`. The ADR is **Accepted** and the flag is **promoted default-ON**.
+
+**What the tree has.** Two of the three hops.
+
+| Hop | Batched method | Reads the flag |
+|---|---|---|
+| `route_handoff` | `_route_handoff_batched` | yes |
+| `transform_handoff` | `_transform_handoff_batched` | yes |
+| `mark_done` | **none** | **no** |
+
+`store/sqlserver.py` reads `_batch_handoff_statements` in exactly two places, both handoff dispatchers. `mark_done` never reads it, so the third hop is unreachable by construction rather than merely untested.
+
+**The cited test does not exist.** `tests/test_adr0075_batch_golden_sql.py` defines `test_route_batched_matches_unbatched_sequence` and `test_transform_batched_matches_unbatched_sequence`. Neither that file nor `tests/test_adr0075_rt_count_gate.py` contains the string `mark_done`.
+
+**The ADR already knows.** Its own open items carry an **unchecked** box: *"`mark_done` inclusion ... decide whether to batch it in v1 or defer it."* So a counted criterion asserts as delivered the exact thing the same document lists as undecided.
+
+**Scope, stated so nobody over-corrects.** The README index cell says only *"fold a multi-statement handoff BODY"*, which is accurate. The over-claim is in the ADR body, not the index row. The §Evidence round-trip table also prices `mark_done` at 11 to 7/8 round-trips, which the code does not do either.
+
+---
+
+## 1504. ADR 0133 D3 asserts content-triggered alerts are built, but a Handler cannot reach `content_match`
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **5/10** · Difficulty **4/10** · _fill-in_. Found by the same over-claim hunt. Two of the ADR's three capabilities are genuinely wired across all three backends; the third is a method with no reachable caller and no path from the authoring surface. `docs/BACKLOG.md:698` already records the capability as absent, so the ledger and the ADR disagree with each other. Value 5: an operator reading the ADR would plan a Handler they cannot write. Difficulty 4: either export an emitter onto the authoring surface or retract D3.
+> Verdict: owner-ruling
+> Research: none -- the measurement is in the body
+> Closing-act: code
+
+**Cluster:** alerting / ADR record integrity. **Priority:** P3. **Verdict:** build the seam or retract D3.
+**Severity:** no deployment axis (sec. 0). No mis-execution; a documented capability simply is not reachable.
+
+**What is genuinely built.** Do not let this row read as though ADR 0133 failed. D1 and D2 are complete:
+
+- **D1, escalation tiers** -- `EscalationTier` and `AlertRule.escalate` in `config/settings.py`, tier selection and occurrence counting in `pipeline/alert_sinks.py`, persisted monotonically on all three backends with each dialect's own idiom (`MAX` / `GREATEST` / `CASE`) and the DDL plus migration present in `store.py`, `postgres.py` and `sqlserver.py`.
+- **D2, schedule-aware thresholds** -- `AlertRule.schedule` plus the `is_active(now_dt)` gate in `alert_sinks.py`.
+
+**What D3 asserts.** [ADR 0133](adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md) status reads `Accepted (2026-07-18, built)`, and AC-3 is *"WHEN a Handler emits a `content_match`, THE SYSTEM SHALL emit a PHI-free event."* The README index row repeats that a Handler *"emits off the routing hot path"*.
+
+**Why a Handler cannot do that.** `content_match` exists only as `NotifierAlertSink.content_match` in `pipeline/alert_sinks.py`. It is:
+
+1. **absent from the `AlertSink` Protocol** in `pipeline/alerts.py` -- that protocol's methods do not include it;
+2. **absent from `LoggingAlertSink`**;
+3. **not exported** -- `messagefoundry/__init__.py`'s `__all__` carries no alert emitter;
+4. **unreachable from a `@handler`**, which receives only `msg` (`config/wiring.py`).
+
+Zero non-test callers exist in the engine.
+
+**The ledger already says so.** `docs/BACKLOG.md:698` records content-triggered alerting as not delivered. This row exists because the ADR does not, and the ADR is the document a reader trusts for build state.
+
+---
+
+## 1505. ADR 0089 claims a Phase A read-atom row that was never built, and names a `set_segment` the Message API lacks
+
+> 🔢 **Filed 2026-09-09 -- not started. Scored at filing.** Value **3/10** · Difficulty **3/10** · _fill-in_. Found by the same over-claim hunt, and one of only two findings in it that were not already written down somewhere in the repo. The bulk of Phase A shipped; the Status line claims the whole of it. Value 3: the affected rows render as opaque code in the Steps view rather than failing, so the cost is a wrong expectation, not a defect. Difficulty 3: either recognise the read atom or narrow the Status line and the Phase A table.
+> Verdict: build
+> Research: none -- the measurement is in the body, and it was measured by running the lens, not by grep
+> Closing-act: code
+
+**Cluster:** Steps view / lens. **Priority:** P3. **Verdict:** narrow the claim, or build the read row.
+**Severity:** no deployment axis (sec. 0). IDE authoring surface only, no engine path, no PHI.
+
+**What the Status line claims.** [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md): *"Phase A (native-idiom recognition) is built and adopted."* Phase A is titled *"native write/**read** atoms"*, and its table lists `x = msg.field("Y")` as a **Read Field to var** row (22 occurrences in its own estate scan) and names `set_segment`.
+
+**What the lens recognises.** `_recognize_native_method` in `messagefoundry/lens.py` handles `msg.set` (set_field), the `msg.set(dst, msg.field(src))` copy form, `msg.delete_segments` / `delete_segment`, plus `msg.add_segment` and `msg.add_repetition` (both tagged ADR 0106, so credited to a later ADR).
+
+**Why the read atom can never reach it.** The recogniser is invoked only inside an `isinstance(s, ast.Expr)` branch, and the comment there says so outright -- *"a mutating method call, so always a bare expression statement, never an assignment."* An assignment is structurally excluded. There is no `read_field` action anywhere in the product.
+
+**Measured, not inferred.** Running `messagefoundry.lens.parse_source` over a handler containing all four forms returns `{"kind": "code"}` for `x = msg.field("PID-5.1")`, while `msg.set`, `msg.delete_segments` and `msg.add_segment` in the same body return editable `action` rows with populated `literal_params`. So the 22 statements the ADR's own scan counted still render as opaque grey code rows.
+
+**`set_segment` does not exist.** `parsing/message.py` has `field` and `add_segment`; there is no `def set_segment` anywhere.
+
+**Scope, stated so nobody over-corrects.** The README index row is **honest** -- it names only `msg.set` / `msg.field`-copy / `msg.delete_segments` and the actions `set_field` / `copy_field` / `delete_segment`. `tests/test_lens_native.py` covers exactly the shipped forms, consistent with there being no read row. The over-claim is internal to the ADR file.
