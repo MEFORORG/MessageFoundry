@@ -28348,3 +28348,65 @@ pinned to. That is a **pre-existing** per-root defect, not one this change intro
 unfiled. Named here so it is not lost; it is not this row's scope.
 
 ---
+
+## 1493. a line-anchored zizmor suppression goes stale when an unrelated pull request inserts lines above it
+
+> 🔢 **Filed 2026-09-08, found while reading PR 928's red. The one-line re-anchor ships with this item; the GUARD is not built.** Value **4/10** · Difficulty **3/10**. Value 4 -- zizmor is ADVISORY here, so nothing was blocked and no merge was at risk; what it costs is a standing red on an advisory gate, which is how a gate stops being read. Difficulty 3 -- the re-anchor is one number; the guard has one real design question in it.
+
+**Cluster:** repository gates / suppression hygiene. **Priority:** P3. **Verdict:** build the guard.
+**Severity:** no deployment axis (sec. 0). A CI configuration anchor. No engine behaviour, no shipped artifact, no PHI.
+
+### The measured instance
+
+`.github/zizmor.yml` suppresses the `self-repository` finding on `cla.yml` by LINE NUMBER:
+
+```
+  self-repository:
+    ignore:
+      - cla.yml:102
+```
+
+PR #994 (`cb309b4e5`) added 20 lines to `.github/workflows/cla.yml` -- a job timeout cap, part of a
+sweep that bounded every uncapped job. It did not touch `.github/zizmor.yml`, and it had no reason to.
+
+The flagged `uses: ./.github/actions/cla-assistant-lite` line moved. Measured at both commits:
+
+```
+b3c1ddff7  main's last GREEN zizmor    the uses: line at 102   anchor 102   suppressed
+cb309b4e5  #994 as merged              the uses: line at 122   anchor 102   FIRES
+```
+
+Two other anchors were checked and are sound. `dependabot-lock-resync.yml:76` sits in a file #994 did
+not touch. `cla.yml:44` reads `types: [created]` both before and after #994, so #994 did not move it,
+and `archived-uses` does not appear in the failing run's output -- it is still suppressed. **One anchor
+of three broke, and only the one whose file gained lines above it.**
+
+### Nothing reported it, and the reason is worth keeping
+
+zizmor is **not a required context** -- 13 contexts gate `main` and zizmor is not among them -- and it
+does not run on `merge_group` at all. So #994 merged with its own zizmor already red, which is the
+correct behaviour for an advisory gate and is also why nobody looked.
+
+On `main` it runs on one daily `0 6 * * *` cron. #994 merged after that cron had already run, so at
+filing time `main` had **not yet** produced a red; the next scheduled run would have been the first to
+show it. On pull requests it runs only under `paths: [".github/**", "ci/locks/ci-scanners.lock"]`, so
+of the three pull requests open with a merged-in `main` at the time, only 928 touched `.github/` and
+only 928 surfaced it.
+
+**The workflow's own header already documents the mirror image of this shape** -- a zizmor VERSION bump
+touching only `pyproject.toml` and the lock never ran the gate pre-merge, and was "first adjudicated by
+the 06:00 cron, against main, after merge". The version case was foreseen and written down. The
+line-number case has the same structure and was not.
+
+### What ships here, and what does not
+
+This item ships the re-anchor only: `cla.yml:102` becomes `cla.yml:122`. That follows the convention the
+neighbouring entry already states in its own comment -- *"Re-anchor; do not broaden."* Broadening the
+ignore to the whole file would suppress a future, genuine `self-repository` finding elsewhere in
+`cla.yml`, so it is the wrong repair even though it would never go stale.
+
+**The guard is not built and is the actual work.** A test that asserts each anchor still names the line
+its audit fires on cannot simply check that the line is non-blank -- that passes on any shift that lands
+on other code, which is the common case. The design question is what to pin: the simplest honest form is
+to record the anchored line's TEXT beside the anchor and fail when the two disagree, which turns a silent
+drift into a named failure at commit time rather than a red a day later.
