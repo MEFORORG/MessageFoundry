@@ -28949,8 +28949,13 @@ disaster-recovery hook commands, which are a different mechanism.
   back at the same node, since that API still names it lease owner. Both coordinators now carry
   `_lease_release_owed` and force the write past that early return, and re-arm the claim pause on the
   retry so the successful release is not undone by the unfenced `owner = me` renew branch on the next
-  tick. Scoped to a release this node OWES: a stepdown addressed to a standby by mistake still sends
-  nothing and arms no pause, so it cannot delay the failover the caller is trying to perform.
+  tick. Scoped to a release this node OWES -- and read that scope exactly, because an earlier revision
+  of this line stated it absolutely and its own not-fixed list below then said the opposite.
+  `step_down_leadership` arms the pause on `self._is_leader or owed`, so a stepdown addressed by
+  mistake to a standby that owes NOTHING sends nothing and arms no pause, and cannot delay the
+  failover the caller is trying to perform. A standby that DOES owe a write is the other branch: it
+  re-sends that write and arms the pause on a node that is by then a follower, which is the stale-owed
+  subject in the not-fixed list.
 - **The lock's wait is bounded, and what the lock costs is written down.** Serializing against the tick
   puts the SYNCHRONOUS in-memory demotion behind a tick's DB round trip, so a drained node keeps
   answering `is_leader()` and keeps binding listeners while the call waits. Nothing bounded that wait:
@@ -29085,11 +29090,33 @@ says so; the section itself is kept for the reasoning.
 ### Corrections made while re-reading the shipped stepdown, 2026-09-09
 
 **The `503` no longer claims the node stopped serving, in the body or in `docs/CLUSTERING.md`.**
-The trace is in the write-failure bullet above. Both now say what is true -- the node cleared its
-leadership flag and STARTED tearing its graph down, teardown is not finished when the response is
-sent, its later phases are unbounded, and listen-type inbounds keep accepting until it completes --
-and both send the operator to `GET /cluster/nodes` plus the connection view for quiescence rather
-than to a status code.
+The trace is in the write-failure bullet above. Both now send the operator to `GET /cluster/nodes`
+plus the connection view for quiescence rather than to a status code.
+
+**CORRECTED 2026-09-09, same PR: the replacement sentence was false too, and in a way the first fix
+made easy to miss.** It said teardown's "later phases are unbounded, so this node's listeners keep
+accepting until it completes". The unbounded half is true and the consequence does not follow.
+`RegistryRunner._teardown_body` runs the source stop as the LAST of the three phases inside the
+demotion budget -- after `_quiesce_workers_demote` and `_quiesce_dispatchers_demote` -- and only then
+reaches the unbounded connector-close, executor-shutdown and sandbox-close phases. MLLP, TCP, HTTP
+and X12 each call `server.close()` in the synchronous prologue of their own `stop()`, so accept stops
+on the first loop pass of that phase, EARLIER than "until it completes" rather than later. The node
+is still not quiescent, for weaker reasons that are now what both texts say: an overrunning source is
+ABANDONED rather than cancelled, DICOM releases its port inside exactly the call that gets abandoned,
+established connections drain afterwards, and a message already in a handler finishes its commit and
+its ACK. **The general lesson is the one this item keeps paying for:** the first fix traced the
+mechanism it was thinking about -- unbounded phases -- and not the branch the sentence quantified
+over, which was every listener in a phase that runs before them.
+
+**CORRECTED 2026-09-09, same PR: the `503` body no longer says a teardown started ON THIS CALL.**
+It read "cleared its leadership flag and started tearing its graph down". `_fire_on_demote` runs only
+under `if was_leader` in `step_down_leadership`, which a retry of an owed write has already cleared,
+so on a repeat refusal no edge fires and no teardown starts. The direction is conservative -- it
+overstates disruption, not safety -- but it is still false on that branch. The body now describes the
+demotion teardown as a mechanism that runs on the graph supervisor rather than asserting one began
+here, and says what IS true on every branch reaching the raise: the node has cleared its leadership
+flag, and this call armed its claim pause (the pause is armed on `self._is_leader or owed`, the same
+condition under which the write is attempted at all).
 
 **Cancellation escaped the owed-write contract, and both coordinators now arm the flag before the
 write.** `_release_leadership` caught `Exception`, which cannot catch `asyncio.CancelledError` (it
@@ -29104,21 +29131,47 @@ BEFORE the write and clear it only on one that returned, so neither a raise nor 
 leave it clear.
 
 **"Expect the retry to answer `409`" is scoped to the claim pause.** It holds only for the two
-`heartbeat_seconds` a stepdown declines to claim. Past that, the `owner = me` renew branch -- which
-carries no expiry term, so it is not gated on the release -- puts the node back in on its own next
-tick and the retry answers `200`. The document contradicted itself: the bullet three lines above
-already described that re-arm. Now scoped in `docs/CLUSTERING.md` and in the endpoint docstring.
+`heartbeat_seconds` a stepdown declines to claim. The document contradicted itself: the bullet three
+lines above already described the post-pause re-arm. Now scoped in `docs/CLUSTERING.md` and in the
+endpoint docstring.
+
+**CORRECTED 2026-09-09, same PR: "past the pause expect `200`" was false on one of its two
+branches, and the branch it was false on is the dangerous one.** The claim statement has exactly two
+arms -- renew, `WHERE leader_lease.owner = $2`, carrying no expiry term, and take-over, gated on
+`leader_lease.lease_expires_at + $4 < clock_timestamp()`. If a standby takes over DURING the pause,
+`owner` is no longer the drained node and the lease is live, so NEITHER arm matches,
+`_claim_or_renew_lease` returns not-held, and the retry reports `was_leader=false` -- a `409`, not a
+`200`. The harm is that
+the `409`'s own documented remedy sends the operator to step down whichever node `GET /cluster/nodes`
+names as leader, which by then is the standby that took over CORRECTLY: on a first deployment an
+operator following the text would drain the healthy new leader. Both texts now split the two branches
+-- `200` when the row still names the drained node at the end of the pause (the write never
+committed, or committed with no standby taking the lease), `409` when a standby acquired -- and both
+say that the `409` there means the failover worked. The bullet above it already said, correctly, "if
+it committed, a standby acquires on its next heartbeat"; the two could not both stand.
 
 ### Found while making those corrections, recorded rather than fixed
 
 - The `cluster_stepdown` audit cannot tell a confirmed retry from a stepdown addressed to the wrong
   node: both write `was_leader: false` with a null `released_at`.
 - A stale `_lease_release_owed` on a node that is no longer leader would make the next stepdown arm
-  the claim pause on an innocent follower.
+  the claim pause on an innocent follower. **Reached through the documented remedy, not by operator
+  error:** a `503` tells the operator to retry, and a retry landing after a standby has taken over
+  arms the pause on a node that is by then a follower.
 - `stop()`'s comment enumerating what it and `step_down_leadership` share still lists only `_is_leader`
   and the owner-scoped `UPDATE`; it does not mention `_lease_release_owed`.
-- `docs/adr/README.md` says ADR 0056 has a stale "console section", singular, where the ADR now
-  carries two do-not-build-from markers.
+- The stepdown docstring's "every other True->False transition fires it" enumerates
+  `_maintain_leadership` and `_check_fence` and closes. `stop()` reaching `_release_leadership` is
+  also a True->False transition and fires no demotion edge, so the enumeration is closed over a set
+  that is missing a member.
+- **A THIRD undocumented `503` reaches this endpoint from outside it.** `RequestTimeoutMiddleware` is
+  registered unconditionally in `create_app` and answers `503` at `DEFAULT_REQUEST_TIMEOUT_SECONDS`
+  (120.0) with its own PHI-free body. It writes NEITHER a `cluster_stepdown` nor a
+  `cluster_stepdown_denied` row, and nothing in the endpoint's own status list names it -- so an
+  operator who hits it sees a `503` this document says is one of two conditions and finds no audit
+  row for either. It is also the cancellation path the owed-write flag was armed early to survive.
+- `docs/SECURITY.md`'s OIDC parenthetical says "the two `/ui/oidc/*` routes"; the same document names
+  three of them twice over (`GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`).
 
 ---
 

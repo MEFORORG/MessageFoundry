@@ -362,9 +362,10 @@ POST /cluster/stepdown        # body: {} — there are no options
   [BACKLOG #1509](BACKLOG.md); until then, read `GET /cluster/nodes` first.
 - **A `503` reading `lock-timeout` means nothing happened at all.** The node's leadership lock was still
   held when `leader_fence_timeout_seconds` ran out, so no lease row was read or written and nothing was
-  demoted. Leadership is exactly as you found it. This one says nothing about who leads: the endpoint
-  takes no leader check before the release, so it can come back from a node that leads nothing. Do not
-  start maintenance. Retry, and if it repeats, look at the store connection.
+  demoted. This one says nothing about who leads: the endpoint takes no leader check before the
+  release, so it can come back from a node that leads nothing — which is why it does not tell you
+  leadership is where you left it either. Do not start maintenance. Retry, and if it repeats, look at
+  the store connection.
 - **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
   genuinely unknown.** It cleared its leadership flag, stopped claiming for two `heartbeat_seconds`,
   and STARTED tearing its graph down. What it could not confirm is whether the write expiring its lease
@@ -372,11 +373,17 @@ POST /cluster/stepdown        # body: {} — there are no options
   `UPDATE` that never ran.
   - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
     demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
-    afterwards, and the phases after the source and dispatcher stop — connector close, executor
-    shutdown, sandbox close — are unbounded by design. Until the teardown reaches them, this node's
-    listen-type inbounds (MLLP, TCP, HTTP, DICOM, X12) are still bound to their own ports and still
-    accepting, because a listen source binds per node and ignores the leader gate. Confirm quiescence
-    with `GET /cluster/nodes` plus the connection view before you touch the node.
+    afterwards.
+  - **The listeners stop early in that teardown, not at the end of it.** The source stop is the last of
+    the three phases inside the bounded demotion budget, and MLLP, TCP, HTTP and X12 each close their
+    accept socket in the synchronous prologue of their own `stop()` — so they stop taking new
+    connections before the unbounded phases (connector close, executor shutdown, sandbox close) are
+    reached at all. **That buys less than it sounds like.** A source that overruns the budget is
+    abandoned rather than cancelled; DICOM releases its port inside exactly the call that gets
+    abandoned, so a DICOM listener can still hold its port; established connections drain in the
+    background; and a message already inside a handler still finishes its commit and its ACK, which
+    count-and-log requires. Confirm quiescence with `GET /cluster/nodes` plus the connection view
+    before you touch the node.
   - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
     normally, whatever the error page says.
   - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
@@ -384,11 +391,18 @@ POST /cluster/stepdown        # body: {} — there are no options
     pause ends — a partitioned pool during a stepdown is the way into that window.
   - **Retry the stepdown; a retry re-sends that write.** *Within the pause* — two `heartbeat_seconds`,
     20s at the shipped default — expect the retry to answer `409`, not `200`: the node demoted on the
-    first call, so the retry finds it already a standby. Past the pause expect `200` instead, for the
-    reason the bullet above gives: the release leaves `owner` naming that node, its renew branch is
-    not gated on the expiry, so it takes leadership back on its own next tick. Either way, read
-    `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status code, is what tells
-    you it is safe to start maintenance.
+    first call, so the retry finds it already a standby.
+  - **Past the pause the answer is `200` or `409`, decided by who the lease row names by then.** The
+    claim statement has two arms: renew, `owner = me`, which carries no expiry test, and take-over,
+    which needs an expired lease. If the row still names the drained node when the pause ends — the
+    write never committed, or it committed and no standby took the lease — the renew arm matches on
+    its next tick and a retry answers `200`. If a standby acquired instead, the row names the standby
+    and its lease is live, so neither arm matches, the drained node stays a follower, and a retry
+    answers `409`. **That `409` is the failover having worked, not a wrong-node answer.** Do not take
+    the generic `409` remedy here and step down whoever `GET /cluster/nodes` now names as leader: that
+    is the healthy successor, and draining it undoes the failover you just achieved.
+  - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
+    code, is what tells you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
   `{node_id, was_leader, released_at}` — cluster metadata only, never message content. The refusals the
   handler itself reaches (`400`, both `503`s) write `cluster_stepdown_denied` instead, carrying the

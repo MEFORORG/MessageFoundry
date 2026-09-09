@@ -310,9 +310,9 @@ async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
     tmp_path: Path,
 ) -> None:
     # The failure the coordinator can no longer hide. If the write did not land, the lease row is live
-    # and still owned by a node that has already demoted and STARTED tearing its graph down, so no
-    # standby can take it. Reporting 200/was_leader=true there would send an operator into a node
-    # that may still hold the lease, which is the whole point of asking.
+    # and still owned by a node that has already demoted, so no standby can take it. Reporting
+    # 200/was_leader=true there would send an operator into a node that may still hold the lease,
+    # which is the whole point of asking.
     #
     # 503, not 409 or 500: this is an ENVIRONMENT condition, the status the neighbouring DR endpoints
     # and ADR 0056's own contract already give those. 409 would be wrong in the other direction -- it
@@ -335,17 +335,27 @@ async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
         # ...and it says the two things an operator has to act on: a retry is what re-sends the write,
         # and the node is NOT quiescent yet.
         assert "retry" in detail_text.lower()
-        assert "started tearing its graph down" in detail_text
-        assert "Teardown is NOT finished" in detail_text and "unbounded" in detail_text
+        assert "cleared its leadership flag" in detail_text
+        assert "bounded demotion budget" in detail_text and "unbounded phases" in detail_text
         assert "never means the node is quiescent" in detail_text
 
-        # THE RETIRED CLAIM, pinned negatively because a previous body asserted it and this test
-        # asserted it back. "demoted itself and stopped serving" is false: Engine._on_demote_edge only
-        # sets _graph_wake and deliberately does not set the runner's _stop, the teardown runs later on
-        # the graph-supervisor task with its connector-close phases unbounded, and every listen-type
-        # inbound ignores leader_gate — so a node answering this 503 is still bound to its port and
-        # still ACKing. An operator who read "stopped serving" would begin maintenance on a live node.
+        # THREE RETIRED CLAIMS, pinned negatively because each shipped once and this test asserted two
+        # of them back. They are separate defects and must not be collapsed into one assertion.
+        #
+        # 1. "stopped serving" — Engine._on_demote_edge only sets _graph_wake and deliberately does not
+        #    set the runner's _stop, so a node answering this 503 is still bound to its port and still
+        #    ACKing. An operator who read it would begin maintenance on a live node.
         assert "stopped serving" not in detail_text
+        # 2. "listeners keep accepting until it completes" — the ordering refutes it.
+        #    RegistryRunner._teardown_body runs _stop_sources_demote LAST of the three phases inside
+        #    the demotion budget and only THEN reaches the unbounded connector-close, executor-shutdown
+        #    and sandbox-close phases; MLLP/TCP/HTTP/X12 each call server.close() in their stop()'s
+        #    synchronous prologue. Accept stops EARLIER than that sentence said, not later.
+        assert "keep accepting until" not in detail_text
+        # 3. "started tearing its graph down" — DbCoordinator.step_down_leadership fires the demotion
+        #    edge only under `if was_leader`, which a retry of an owed write has already cleared. On a
+        #    repeat refusal no edge fires and no teardown starts, so this body may not assert one did.
+        assert "started tearing its graph down" not in detail_text
 
         # No cluster_stepdown row: nothing was stepped down, and a row carrying was_leader would be
         # answering the wrong question. The denied row records what actually happened.

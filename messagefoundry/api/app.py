@@ -5483,13 +5483,20 @@ def create_app(
           was demoted. It fires before any leadership is consulted, so it can come back from a node that
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
-          itself, armed its claim pause and fired the demotion edge, so its graph has STARTED coming
-          down — the edge only wakes the supervisor (``Engine._on_demote_edge``), the teardown runs
-          on that other task, and the body says so rather than claiming the node stopped serving;
-          what it could not confirm is whether the write expiring its lease row committed. A lost
-          response to a committed ``UPDATE`` is indistinguishable from an ``UPDATE`` that never ran,
-          so the body is conditional: saying "it is still the leader" is right on one branch and, on
-          the other, sends an operator to fix a cluster that is already failing over correctly.
+          itself and **this call armed its claim pause** — both hold on every branch that reaches the
+          raise, because the pause is armed on ``self._is_leader or owed`` and the write is only
+          attempted under the same condition. What it could not confirm is whether the write expiring
+          its lease row committed. A lost response to a committed ``UPDATE`` is indistinguishable from
+          an ``UPDATE`` that never ran, so the body is conditional: saying "it is still the leader" is
+          right on one branch and, on the other, sends an operator to fix a cluster that is already
+          failing over correctly.
+
+          **What this branch must NOT say is that a teardown just started.** The demotion edge fires
+          under ``if was_leader`` (``DbCoordinator.step_down_leadership``), which a RETRY has already
+          cleared, so a repeat refusal signals nothing new and an earlier body claiming otherwise was
+          false on exactly that branch. The body therefore describes the demotion teardown as a
+          mechanism — it runs on the graph supervisor, not in this call — rather than asserting one
+          began here.
 
         Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
         endpoints and the ADR's own contract give that status.
@@ -5497,11 +5504,21 @@ def create_app(
         **A ``409`` after a ``release-unconfirmed`` ``503`` is the retry SUCCEEDING**, not a wrong-node
         answer — *while the claim pause holds*. The coordinator re-sends the owed write on the next
         stepdown; by then this node has already demoted, so it truthfully reports ``was_leader=false``.
-        That pause is two ``heartbeat_seconds`` (20s at the shipped default), and it is the whole scope
-        of the sentence: the release expires ``lease_expires_at`` but leaves ``owner`` naming this node,
-        and the claim SQL's ``owner = me`` renew branch carries no expiry term, so once the pause ends
-        the node's own next tick renews itself back in and a retry then answers ``200``. Either way the
-        confirmation is the lease moving in ``GET /cluster/nodes``, not the status code.
+        That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
+        of that sentence.
+
+        **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
+        — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
+        claim statement has exactly two arms: renew, ``WHERE leader_lease.owner = $2``, which carries
+        no expiry term; and take-over, which requires the lease to have expired. If the row still names
+        this node when the pause ends — the release write never committed, or it committed and no
+        standby took the lease — the renew arm matches on the next tick, this node leads again, and a
+        retry answers ``200``. If a standby acquired instead, the row names the standby and its lease
+        is live, so NEITHER arm matches, ``_claim_or_renew_lease`` reports not-held, this node stays a
+        follower, and a retry answers ``409``. **That ``409`` is the failover having worked.** Do not
+        take the ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now
+        names as leader: that is the healthy successor, and draining it undoes the failover. Either
+        way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
@@ -5560,20 +5577,33 @@ def create_app(
             # NOR does this body say the node "stopped serving", which an earlier one did. The
             # demotion edge is Engine._on_demote_edge, whose whole body is _graph_wake.set() and whose
             # docstring says it deliberately does NOT set the runner's _stop. The teardown runs later,
-            # on the graph supervisor task, via Engine._stop_graph — whose own comment pins the
-            # connector-close phases as unbounded. And every listen-type inbound ignores leader_gate by
-            # design (each of transports/ mllp, tcp, http_listener, dicom and x12 says so at its
-            # source's start()), so those keep accepting on their own ports until teardown reaches
-            # them. An operator told "stopped serving" would begin maintenance on a node still bound
-            # to its port and still ACKing.
+            # on the graph supervisor task, via Engine._stop_graph. An operator told "stopped serving"
+            # would begin maintenance on a node still bound to its port and still ACKing.
+            #
+            # NOR does it say the listeners keep accepting until teardown COMPLETES, which the
+            # replacement body said and which the ordering refutes. RegistryRunner._teardown_body runs
+            # the source stop LAST of the three phases inside the demotion budget
+            # (_quiesce_workers_demote, _quiesce_dispatchers_demote, _stop_sources_demote), and only
+            # then reaches the unbounded connector-close, executor-shutdown and sandbox-close phases.
+            # MLLP, TCP, HTTP and X12 each call server.close() in their stop()'s SYNCHRONOUS prologue,
+            # so accept stops on the first loop pass of that phase — earlier than "until it completes",
+            # not later. What survives is weaker and is what the body now says: the phase is bounded,
+            # an overrunning source is ABANDONED rather than cancelled, DICOM releases its port inside
+            # the call that gets abandoned, and established connections drain afterwards. So the node
+            # is still not quiescent — for different reasons than the sentence gave.
+            #
+            # And the body must not claim a teardown started ON THIS CALL: _fire_on_demote runs only
+            # under `if was_leader`, which a retry of an owed write has already cleared.
             await _denied("release-unconfirmed", exc)
             raise HTTPException(
                 503,
-                f"node {c.node_id} cleared its leadership flag and started tearing its graph down, "
-                "but could not confirm that its leadership lease was expired; it may still own a live "
-                "lease no standby can take. Teardown is NOT finished when this response is sent and "
-                "its later phases are unbounded, so this node's listeners keep accepting until it "
-                "completes. Re-run the stepdown — a retry re-sends that write — then confirm the "
+                f"node {c.node_id} has cleared its leadership flag, but could not confirm that its "
+                "leadership lease was expired; it may still own a live lease no standby can take. "
+                "Demotion tears the graph down on another task, not in this call: the listener stop "
+                "runs inside the bounded demotion budget, ahead of the unbounded phases (connector "
+                "close, executor shutdown, sandbox close), and a listener that overruns that budget "
+                "is abandoned rather than cancelled while its established connections drain in the "
+                "background. Re-run the stepdown — a retry re-sends that write — then confirm the "
                 "lease has moved in GET /cluster/nodes AND that this node's connections are quiet "
                 "before starting maintenance. This status code never means the node is quiescent.",
             ) from exc
