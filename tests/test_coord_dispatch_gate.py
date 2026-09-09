@@ -97,12 +97,83 @@ def test_the_wave_shape_is_advised_never_refused(gate: ModuleType) -> None:
         "the wave shape is workable; refusing it blocked shipped security work"
     )
     assert "NOT by the builder" in reason
-    assert "ASVS Tracker" in reason, "the advice must NAME who does the work act"
-    # A re-score is TWO acts with different owners, and naming only the first tells the reader the
-    # item finishes elsewhere when what it needs is a handoff message. BUILDER.md:253 forbids a
-    # builder concluding an item CLOSED; :148 gives the banner to the lander.
-    assert "LANDER" in reason, "the advice must also name who flips the banner"
+    # A re-score is TWO acts, and naming only the first tells the reader the item finishes there.
+    # BOTH ARE THE LANDER'S since the owner ruling of 2026-09-05, so the seat name no longer
+    # discriminates between them -- pin the two ACTS, which is what the reader must come away with.
+    # BUILDER.md forbids a builder concluding an item CLOSED and gives the banner to the lander;
+    # it is quoted rather than line-cited, because it lives in the vault (BACKLOG #1460).
+    assert "re-scores the cell in the vault" in reason, "the advice must name the work act"
+    assert "flips the banner" in reason, "the advice must also name the banner act"
+    assert "LANDER" in reason, "the advice must name the seat that performs both"
     assert "Two acts" in reason
+
+
+# The seven seats CLAUDE.md section 5 retires by name. Anchored as a word boundary because "PM" as
+# a bare substring matches inside ordinary words and would report a seat nobody wrote.
+_RETIRED_SEATS = (
+    "ASVS Tracker",
+    "Cleaner",
+    "Dispatcher",
+    "Liaison",
+    "PM",
+    "Process Improvement",
+    "Role Manager",
+)
+_RETIRED_RE = re.compile(r"\b(?:" + "|".join(re.escape(s) for s in _RETIRED_SEATS) + r")\b")
+
+
+def _seat_maps(gate: ModuleType) -> dict[str, dict[str, str]]:
+    """Every constant whose values name a seat and reach a reader through `judge()`.
+
+    BOTH, ALWAYS. `CLOSING_SEAT` and `GATED_VERDICTS` are independent sources of the same defect,
+    and a reader who sees one sentence naming a live seat has no reason to doubt the other beside
+    it. Repairing one alone is worse than repairing neither.
+    """
+    return {"CLOSING_SEAT": gate.CLOSING_SEAT, "GATED_VERDICTS": gate.GATED_VERDICTS}
+
+
+def test_no_seat_map_value_names_a_retired_seat(gate: ModuleType) -> None:
+    """BACKLOG #1460. Both constants named seats that no longer exist.
+
+    `CLOSING_SEAT` named the ASVS Tracker, the Liaison and the Dispatcher across three of its four
+    values; `GATED_VERDICTS` named the Liaison in both of its two, and the Dispatcher in one.
+
+    THESE MAPS ARE WHAT A DISPATCH PRINTS. Measured over `origin/main`'s 434 ledger rows by calling
+    `judge()` on each: ASVS Tracker on 97, LIAISON on 35, Dispatcher on 33 -- 132 distinct rows, 130
+    of them open. Being told an item belongs to a seat that cannot act on it is indistinguishable
+    from being told it is not your problem, and nothing anywhere reports the difference.
+
+    The matcher is exercised against a known-bad string first. A needle list that matched nothing
+    and a repaired map produce the same green, and only the control tells them apart.
+    """
+    assert _RETIRED_RE.search("the ASVS Tracker re-scores the cell"), (
+        "control: the matcher must fire on the exact string this test exists to forbid"
+    )
+
+    offenders = {
+        f"{name}[{key!r}]": _RETIRED_RE.findall(value)
+        for name, mapping in _seat_maps(gate).items()
+        for key, value in mapping.items()
+        if _RETIRED_RE.search(value)
+    }
+    assert not offenders, f"a seat map names retired seats: {offenders}"
+
+
+def test_every_seat_map_value_names_a_live_seat(gate: ModuleType) -> None:
+    """The maps must not go quiet instead of going stale -- an empty answer is also a wrong one.
+
+    Paired with the test above deliberately. Deleting a retired seat name and leaving the value
+    saying nothing passes that check, and a dispatcher then reads a value that names no performer
+    at all. Both assertions are needed; either alone is satisfiable by the other's failure.
+    """
+    # The KORUS roster of CLAUDE.md section 5. The OWNER is deliberately absent: the owner rules,
+    # but performs no closing act, so a value naming only them still names no performer.
+    live = ("BUILDER", "LANDER", "CONSOLE", "REGULATOR", "STEWARD")
+    for name, mapping in _seat_maps(gate).items():
+        for key, value in mapping.items():
+            assert any(seat in value.upper() for seat in live), (
+                f"{name}[{key!r}] names no seat in the current roster: {value!r}"
+            )
 
 
 def test_a_build_item_passes(gate: ModuleType) -> None:
@@ -244,7 +315,9 @@ def test_a_demand_gate_verdict_is_advised_not_green(gate: ModuleType) -> None:
     # The LEVEL alone is a weak assertion: an over-broad fix that advises every non-build verdict
     # would also produce it. The reason text is the only thing that tells a seat what gates the item.
     assert "DO NOT JUST BUILD IT" in reason
-    assert "LIAISON" in reason
+    # Was `"LIAISON" in reason`. Section 5 retired that seat AND the hop it named, so the assertion
+    # is on where an owner ruling actually goes now -- the CONSOLE (BACKLOG #1460).
+    assert "CONSOLE" in reason
 
 
 def test_a_demand_gate_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
@@ -271,7 +344,7 @@ def test_an_owner_ruling_verdict_is_advised_not_green(gate: ModuleType) -> None:
     assert level == "advise"
     assert "DO NOT JUST BUILD IT" in reason
     assert "owner" in reason.lower()
-    assert "LIAISON" in reason
+    assert "CONSOLE" in reason
 
 
 def test_an_owner_ruling_verdict_stays_advised_when_research_is_done(gate: ModuleType) -> None:
@@ -792,8 +865,9 @@ def test_must_be_read_outranks_advise(gate: ModuleType) -> None:
         body=_ALREADY_BUILT_BODY,
     )
     assert level == "read"
-    # Nothing is hidden by the ranking -- the advise reason still rides in the note.
-    assert "ASVS Tracker" in note
+    # Nothing is hidden by the ranking -- the advise reason still rides in the note. The needle is
+    # a fragment only CLOSING_SEAT produces, so it cannot be satisfied by the read note instead.
+    assert "re-scores the cell in the vault" in note
 
 
 def test_a_retirement_still_leads_a_must_be_read(gate: ModuleType) -> None:

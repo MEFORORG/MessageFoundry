@@ -512,6 +512,19 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/logging_setup.py": (
         r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=[^&\\s\\"\']+'""",
     ),
+    # BACKLOG #1478 -- the credential-label vocabulary. Unresolvable BY CONSTRUCTION and that is the
+    # point: each label alternation is spliced from the SAME word tuple its admission gate is built
+    # from, which is what makes gating provably non-narrowing. Writing the alternations out as
+    # literals would restore static scannability and lose that property. The shapes are bounded and
+    # non-catastrophic by inspection: one BOUNDED prefix repetition ``{0,6}`` (deliberately bounded --
+    # unbounded it is quadratic on attacker-influenceable log text), then a literal alternation, then
+    # a negated character class. No nested quantifier and no overlapping alternation.
+    "messagefoundry/secretscrub.py": (
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+'",
+        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+[\\'\\\\\"]?'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";&]+'",
+    ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3
     # ADR 0030 §4h: the site-code prefix is no longer a literal in the anonymizer — it is EXTERNALIZED
     # and loaded at runtime, so the detector is composed from the loaded value rather than written out.

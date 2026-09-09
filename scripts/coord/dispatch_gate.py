@@ -173,16 +173,26 @@ MIN_ITEMS = 50
 # a gated-verdict item carries a ``code`` closing act, which today's 31 do not (29 close by
 # owner-ruling, 2 by blocked). The self-test drives that case directly rather than waiting for the
 # ledger to produce one.
+# BOTH VALUES NAMED A RETIRED SEAT, AND THIS CONSTANT IS A SECOND, INDEPENDENT SOURCE OF THEM.
+# `CLOSING_SEAT` is the other. Repairing one leaves the other emitting a dead seat, which is worse
+# than repairing neither: a reader who sees the closing act named correctly has no reason to doubt
+# the verdict sentence beside it. Measured over `origin/main`'s ledger by calling `judge()` on all
+# 434 rows -- LIAISON on 35 and Dispatcher on 33, against ASVS Tracker's 97 from the other constant,
+# 132 distinct rows and 130 of them open. See BACKLOG #1460, filed and not yet on `main`.
+#
+# The routing itself changed, not just the seat's name. CLAUDE.md section 5 retired the Liaison AND
+# the rule that owner questions route through one: the CONSOLE is now the only seat the owner talks
+# to. So "via the LIAISON" cannot be repaired by substituting a name -- the hop it describes is gone.
 GATED_VERDICTS = {
     "demand-gate": (
         "the DEMAND is unproven, not the design -- nobody has ruled that this should exist. "
         "Scoping and research are legitimate. SHIPPING THE CODE IS NOT A COMPLETE OUTCOME here, "
-        "because the gate is lifted by an owner ruling via the LIAISON, never by a merge."
+        "because the gate is lifted by an owner ruling to the CONSOLE, never by a merge."
     ),
     "owner-ruling": (
         "the SCOPE question belongs to the owner and is routed as one. Do not build a candidate "
-        "before it is answered; the ruling comes via the LIAISON, and the Dispatcher or Lander "
-        "records it."
+        "before it is answered; the owner rules to the CONSOLE, and a builder writes the ruling "
+        "down for the LANDER to land."
     ),
 }
 

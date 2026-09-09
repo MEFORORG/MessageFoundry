@@ -32,7 +32,7 @@ from messagefoundry.config.wiring import (
     Send,
     WiringError,
 )
-from messagefoundry.logging_setup import ControlCharScrubFilter, RedactionFilter
+from messagefoundry.logging_setup import _install_phi_filters
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -359,8 +359,11 @@ PHI_ADT = (
 
 
 def _phi_capture() -> tuple[logging.Handler, list[tuple[int, str]]]:
-    """A capture handler wearing the PRODUCTION filter chain (RedactionFilter → ControlCharScrubFilter),
-    collecting each record's final formatted line so a test can assert no PHI survives to the log."""
+    """A capture handler wearing the PRODUCTION filter chain, collecting each record's final
+    formatted line so a test can assert no PHI survives to the log.
+
+    The chain is BUILT by ``_install_phi_filters`` rather than listed here: a listed chain went
+    stale the moment a fourth filter was installed (BACKLOG #1478), silently."""
     lines: list[tuple[int, str]] = []
 
     class _Cap(logging.Handler):
@@ -369,8 +372,7 @@ def _phi_capture() -> tuple[logging.Handler, list[tuple[int, str]]]:
 
     handler = _Cap(logging.DEBUG)
     handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    handler.addFilter(RedactionFilter())  # same order configure_logging installs them
-    handler.addFilter(ControlCharScrubFilter())
+    _install_phi_filters(handler)  # the same chain, in the same order, configure_logging uses
     return handler, lines
 
 
