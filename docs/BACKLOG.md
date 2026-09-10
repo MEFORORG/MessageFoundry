@@ -24706,6 +24706,8 @@ helper-per-class split and for why each hook carries a local copy), #1339 (a dif
 enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
 
 ## 1426. Nothing reads the code to ask whether an open item's subject already exists on main, so a re-score that predates the landing keeps the row open forever
+> **READING-PASS COVERAGE 2026-09-10, recorded so the next pass does not re-derive it.** Ran against `origin/main` at `8262ef11e`, over the 124 open rows whose `Closing-act` is `code`. **Closed 14** (13 in the parent commit, plus #1469). **Read and deliberately LEFT OPEN, with the residual each names:** #236, #321, #332, #1004, #1017, #1022, #1100, #1215, #1234, #1243, #1247, #1254, #1255, #1278, #1296, #1304, #1335, #1341, #1342, #1344, #1346, #1347, #1349, #1357, #1358, #1369, #1376, #1379, #1393, #1400, #1403, #1413, #1434, #1435, #1450, #1460, #1494, #99, #351. **THE SCREEN ALONE FINDS 6 OF THE 14 CLOSURES, and the gap is structural:** it resolves only subjects a row NAMES, so a row written before its own merge names no landing. The join that finds the rest is *banner claims unlanded work* against *commits on main citing `BACKLOG #N`*. **TWO INSTRUMENTS EACH MISLED ONCE, in opposite directions.** A commit SUBJECT is not a closure: #1234's says *"clears BACKLOG #1234"* while its body says it only made the subject exist on main, and #1243's says *"limb B"* while its body says limb B stays owner-blocked. A commit BODY is not one either: #1358's body disclaims nothing, and the row records that only the warn arm landed. **96 open rows close on `scorecard-rescore` and CANNOT be judged from an engine checkout at all** -- the vault is invisible here, so this pass did not look at them and no conclusion about them should be read into it.
+>
 
 > 🚧 **Filed 2026-09-03 -- the screen is BUILT and reports candidates; nothing yet flips a banner off it.** Every existing ledger gate reads the LEDGER. `scripts/docs/subject_exists_screen.py` is the first that reads the CODE: for each OPEN item it extracts the concrete code-side subjects the row names -- commit shas, merged pull requests, file paths and distinctive symbol names -- and asks git whether they are already on `origin/main`. **It reports candidates and flips nothing.** A wrongly-closed item is invisible forever, so the closing act stays a person reading each row.
 >
@@ -27024,8 +27026,9 @@ neither of which is this).
 **NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
 
 ## 1469. the dispatch gate does not read a row's DISPATCH FENCE, so the two fenced rows screen clean
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `1521446c2` (PR 962), verified with `git merge-base --is-ancestor`.** The gate reads a dated `DISPATCH FENCE` marker at a line start in the item's prose, and the commit body records the needle firing on 2 of 679 rows against 38 that merely carry the word. The row still read *"Filed 2026-09-06 -- not started"*; neither the commit nor the row names a residual. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
+> **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -30244,7 +30247,8 @@ Mutation 1 fails all three cases of `test_no_leader_is_derived_when_every_leader
 now has one copy to reach, in `members_from_node_rows`. Both forms of mutation 2 fail
 `test_force_with_a_live_sibling_reports_both_fields_true`. Mutation 3 on the real line and the control
 both fail `test_a_node_with_no_promotable_sibling_is_refused_before_the_release`.
-## 1525. citation_line_check and banner_sha_check ship as detectors wired to nothing, so 204 drifted anchors and two mis-attributed closing shas have never been seen by a gate
+
+## 1525. citation_line_check and banner_sha_check ship as detectors wired to nothing, so 204 drifted anchors and 30 mis-attributed closing shas have never been seen by a gate
 
 > 🔢 **Filed 2026-09-10. Both detectors are SHIPPED and neither has ever run against the real ledger.** Value **6/10** · Difficulty **2/10** · _quick win_. `scripts/docs/citation_line_check.py` (#1396) and `scripts/docs/banner_sha_check.py` (#1347) were each built, tested and closed as shipped. A repo-wide `git grep` over tracked files finds each named in exactly three places: `docs/BACKLOG.md`, its own `tests/test_*.py`, and `tests/tooling_manifest.txt`. **No workflow, hook or script invokes either one.** Run by hand here at `8262ef11e` they exit 1 apiece, on findings nothing has ever reported.
 > Verdict: build
@@ -30269,12 +30273,16 @@ both fail `test_a_node_with_no_promotable_sibling_is_refused_before_the_release`
 
 Two thirds of every anchor this repository can actually check points at the wrong line. That is CLAUDE.md section 5's *"line numbers are navigation aids and never evidence"* rule with a number attached, and the number was available to a gate the whole time.
 
-`banner_sha_check.py` reports two archived rows whose closing citation names a different item:
+`banner_sha_check.py` examines 151 closing-claim shas and reports **30** rows whose closing citation names a different item -- **28 in `docs/BACKLOG.md`** and **2 in the archive**. Two of the 30, one from each file:
 
 * **#1025** claims `e0482aea`, whose subject is *"fix(console): the /ui message editor gated on `messages:edit` alone (BACKLOG #324) (#203)"*.
-* **#1094** claims `befe997e`, whose subject is *"docs(CLAUDE.md): re-derive every section 12 pointer; 3 of 12 had rotted (BACKLOG #1073 R1/R2) (#271)"*.
+* **#234** claims `f01b991d9`, whose subject is *"docs(backlog): two ledger records that were only living in mail (BACKLOG #1136, #1474) (#958)"*.
 
 Each corrupts two items in opposite directions, exactly as the checker's own message says.
+
+**THE 30 IS NOT ALL DEFECT, AND WHOEVER WIRES THIS MUST SEPARATE THEM FIRST.** Narrowing 2 is a keyword heuristic: `_CLOSING_CLAIM` matches any banner line carrying SHIPPED, DONE, CLOSED, RETIRED, LANDED, FIXED or MERGED, and then reads every sha on that line. A row that cross-references another commit on such a line is indistinguishable from one offering its own closing evidence. Measured here: closing #1437 and #1489 added one finding each, and in both cases the flagged sha is a pre-existing CROSS-REFERENCE -- #1489's row names `995fc2790` as the commit that shipped the guard it is about, on a line containing the word "shipped". Both are false positives of the heuristic, not bad citations. **This number moved from 30 to 32 in the same change that files this row, entirely from that shape.**
+
+**THE FIRST READING OF THIS SAID "two", AND IT WAS A TRUNCATION ARTIFACT.** The checker prints its summary first and its findings after, and a `tail -8` of the run showed only the last two -- both archive rows. A count taken from the tail of a capped pipeline is not a census; this repository has that failure recorded already. The 30 is from `grep -c` over the whole run against `origin/main`'s two files.
 
 ### The shape, and why it is a class rather than two oversights
 
@@ -30287,6 +30295,6 @@ Naming the test module in `ci.yml` is not wiring the tool. `ci.yml` names `tests
 1. Wire both detectors into `quality-advisory.yml` alongside `dangling_citation_check.py` and `verdict_divergence_check.py`, advisory first, with `--advisory` if they grow the flag.
 2. Wire `subject_exists_screen.py` there too -- it is repaired but still runs nowhere.
 3. Give `citation_line_check` a baseline so 204 pre-existing drifts do not make the leg permanently red, and let the gate fail on a *new* one. The 30 "symbol not in the file" rows and the 1,200 absent paths need separating first: some are vaulted under `docs/security/`, which is gitignored here, and a vaulted path must not read as a defect.
-4. Fix the two mis-attributed closing shas in `docs/archive/backlog/BACKLOG-CLOSED.md`, or record why each citation stands.
+4. Triage the 30 banner-sha findings into genuine mis-citations and heuristic false positives, then either fix each genuine one or record why the citation stands. Tightening narrowing 2 -- so a sha is closing evidence only when the line's closing verb governs THAT sha -- is the alternative, and it is the one that stops the count growing every time a row is correctly closed.
 
 **Do not fix the 204 by hand without step 3.** Re-anchoring them all is a large edit that goes stale again on the next refactor; the gate is what makes the fix hold.
