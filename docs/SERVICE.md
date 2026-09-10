@@ -49,15 +49,19 @@ venv interpreter) and the per-connection firewall openings the service needs.
 ```
 
 `-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
-engine resolves and the instance's PHI posture. `serve` refuses to start without it (no silent
+engine resolves and the instance's production tier. `serve` refuses to start without it (no silent
 default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name.
 **A custom name must also declare its production tier** — `[security].production_instance` in the
 service config (`messagefoundry.toml`) — because a free-form environment name carries no tier to
 derive one from (only `dev`/`staging`/`prod` do). There is no second declaration to make: every
 instance carries patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). Without it, `serve` exits 2 with *"environment '\<name\>' has no built-in security posture"*, so the service
-registers fine and then dies on every start. (The pre-ADR-0118 spellings `[ai].data_class` /
-`[ai].production` are **rejected at config load** — see
-[ADR 0118](adr/0118-secure-by-default-security-configuration-section.md).)
+registers fine and then dies on every start. (Both `[ai]` spellings are **rejected at config load**,
+and they are rejected differently — the difference is the remedy. `[ai].production` was **relocated**
+by [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md), so its refusal carries a
+forwarding address: set `[security].production_instance` instead. `[ai].data_class` was **removed** by
+[ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
+together with `[security].handles_real_patient_data`, so there is nowhere to forward it and the
+refusal names the per-gate switches instead. Delete that line.)
 `messagefoundry service install` requires the same name via `--env` and passes it straight through.
 
 Defaults:

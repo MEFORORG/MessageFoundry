@@ -321,8 +321,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key, then drop the retired key. An undecryptable value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
-   start with no key on ANY PHI instance** — the refusal is gated on the resolved **`[ai].data_class ==
-   phi`**, *not* the environment label, so a custom-named dev/test box holding near-real PHI fails closed
+   start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the
+   environment label, so a custom-named dev/test box holding near-real PHI fails closed
    exactly like `prod`/`staging` (closing the EF-3 perception gap where non-prod only warned). Since
    [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 1) **all
    three built-in envs (`dev`/`staging`/`prod`) derive PHI**, so the default/CI path is key-required too — a
@@ -333,8 +333,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `require_encryption` wins over it) — and under **strict enforcement** (`[security].enforcement = enforce`,
    the default) keyless PHI additionally requires the second ack
    `[security].allow_unencrypted_phi_under_strict_enforcement = true` ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) / ADR 0148). The effective posture (encryption on/off, key **source**, key **fingerprint**,
-   `data_class`, per-backend column coverage) is surfaced at the authenticated, `MONITORING_READ`-gated
-   **`GET /security/posture`** route (M5) — never key bytes; every access is audited.
+   per-backend column coverage) is surfaced at the authenticated, `MONITORING_READ`-gated
+   **`GET /security/posture`** route (M5) — never key bytes; every access is audited. The view carried a
+   `data_class` field until ADR 0186 removed it with the declaration behind it.
 3. **Pluggable key sourcing — the KeyProvider seam `[BUILT]` (ASVS 13.3.3; ADR 0019 amended 2026-06-18,
    PR #377).** Where the DEK *comes from* is now routed through a pluggable **KeyProvider** seam
    ([store/keyprovider.py](../messagefoundry/store/keyprovider.py)) selected by the `[store].key_provider`

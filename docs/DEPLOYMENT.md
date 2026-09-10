@@ -556,8 +556,11 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
   listen type is now exposed-gated.
 - **The clamp, precisely** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
   ADR 0092 decision 2): all four inbound gates and the API gate honour `--allow-insecure-bind` only while
-  the instance is **not** (`enforcement = enforce` **and** PHI). Both halves are the default, so on a stock
-  instance the flag changes nothing — the recorded loosening is `[security].enforcement = warn`. These
+  the instance is **not enforcing**. That was a two-part test until
+  [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
+  removed the PHI conjunct — `wiring_runner.py` reads `return not posture.enforcing` — and `enforce` is
+  the default, so on a stock instance the flag changes nothing. The recorded loosening is
+  `[security].enforcement = warn`. These
   refusals also name `tls_hop_attested`, which the
   gates do read, but that field has no authoring surface on a connection today (see
   [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
@@ -579,11 +582,13 @@ bind-guard ladder above:
   (`[api].tls_cert_file`). Loopback binds and proxy-terminated binds never reach this and start
   unchanged.
 - **Outbound** — **seven** verifying outbound TLS hops are **refused at construction** (`messagefoundry
-  check` / dry-run / reload / the serve pre-flight) on an instance that is **PHI *and*
-  `enforcement = enforce`**, when the hop is off-loopback. That list is the **whole gated set, not a
+  check` / dry-run / reload / the serve pre-flight) on an instance under
+  **`enforcement = enforce`**, when the hop is off-loopback. That list is the **whole gated set, not a
   sample**: **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), SMTP/EMAIL, and the PostgreSQL store
-  hop** — the only cells that construct a `RevocationHopGuard`. A non-enforcing PHI instance **warns**
-  instead; a synthetic instance is unaffected (see *The ways across*, below).
+  hop** — the only cells that construct a `RevocationHopGuard`. A non-enforcing instance **warns**
+  instead, and that is the only dial left: declaring the instance synthetic used to exempt it and
+  [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
+  removed that (see *The ways across*, below).
 
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine
