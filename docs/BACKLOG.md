@@ -30123,6 +30123,8 @@ MSI question only when one appears.
 
 ## 1524. the stepdown suite does not pin the 412 status code, nor new_leader_eligible, nor the freshness conjunct in the leader pick
 
+> 🚧 **Built 2026-09-10 on branch `claude/stepdown-test-gaps-1524` (PR 1018); open until that merges, when the Lander flips this banner.** All four asks are answered, and the stepdown behaviour is unchanged. Ask 1 needed no change. `test_a_node_with_no_promotable_sibling_is_refused_before_the_release` already asserted `r.status_code == 412` before PR 1018. Mutation 3 below never ran, because its search text matches nothing in `app.py`. Ask 2 landed as `test_force_with_a_live_sibling_reports_both_fields_true`. Ask 3 landed as `test_no_leader_is_derived_when_every_leader_flag_is_stale`, which runs through `members_from_node_rows` and both DB coordinators. Ask 4 took the item's second remedy and deleted the duplicate. `DbCoordinator.cluster_members` now calls `members_from_node_rows`, which leaves one copy of the leader pick and its freshness check. The docstrings saying both DB coordinators call the helper are now true. The amendment at the end of this item has the re-run of every mutation.
+>
 > 🔢 **Filed 2026-09-10 by the Lander, from a pre-merge review of PR 1013 that reached the pull request 15 minutes before it merged. Not started.** Value **6/10** · Difficulty **2/10**. Value 6 -- these are the tests for a control plane that decides which node leads, and three separate properties they are named for are not pinned. Difficulty 2 -- every gap is one assertion or one fixture row, and the mutations that expose them are written out below.
 
 **Cluster:** clustering / test quality. **Priority:** P2. **Verdict:** build.
@@ -30198,3 +30200,34 @@ not hold them.
 
 **RELATED and deliberately kept apart:** #1521 is a *timing* failure in a different suite on the same
 runner label. This item is about assertions that cannot fail. Nothing here is a flake.
+
+**Amendment 2026-09-10 (builder, PR 1018). Mutation 3 never ran, and every mutation that did run is now
+caught.**
+
+The filed search text `raise HTTPException(412` matches nothing in `messagefoundry/api/app.py`. The code
+splits that call across two lines, `raise HTTPException(` and then `412,`. So the "16 passed" for
+mutation 3 ran against an unchanged file. The status code was already pinned before PR 1018:
+`test_a_node_with_no_promotable_sibling_is_refused_before_the_release` asserts `r.status_code == 412`.
+PR 1018 adds nothing for ask 1, because a second assertion of the same fact adds no strength. The defect
+was in this item's measurement. The test was sound.
+
+**RE-RUN 2026-09-10 at `0d41d3016`**, the branch head before this ledger edit. A script applied each
+mutation only when its search text matched exactly once. It ran both test files, restored the file, and
+checked the restore by SHA-256:
+
+```
+BASELINE    both files, no mutation                              84 passed
+
+MUTATION 1  delete  and fresh[r["node_id"]]  from the pick       3 failed, 81 passed   CAUGHT
+MUTATION 2  new_leader_eligible=not force                        1 failed, 83 passed   CAUGHT
+            force=not new_leader_eligible                        1 failed, 83 passed   CAUGHT
+MUTATION 3  as filed: raise HTTPException(412 -> (499            matched 0 times       NOT RUN
+            on the real line: 412, -> 499,                       1 failed, 83 passed   CAUGHT
+            on the real line: 412, -> 409,                       1 failed, 83 passed   CAUGHT
+CONTROL     if False and not new_leader_eligible and not force:  1 failed, 83 passed   CAUGHT
+```
+
+Mutation 1 fails all three cases of `test_no_leader_is_derived_when_every_leader_flag_is_stale`, and it
+now has one copy to reach, in `members_from_node_rows`. Both forms of mutation 2 fail
+`test_force_with_a_live_sibling_reports_both_fields_true`. Mutation 3 on the real line and the control
+both fail `test_a_node_with_no_promotable_sibling_is_refused_before_the_release`.

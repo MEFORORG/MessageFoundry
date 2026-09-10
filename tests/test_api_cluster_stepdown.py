@@ -450,6 +450,30 @@ async def test_force_drains_the_last_node_and_reports_no_eligible_successor(
         assert not await _rows(engine, "cluster_stepdown_denied")
 
 
+async def test_force_with_a_live_sibling_reports_both_fields_true(tmp_path: Path) -> None:
+    # The one 200 on which the two fields are not each other's negation (BACKLOG #1524). force=false
+    # reaches a 200 only with an eligible sibling, since eligible=false plus force=false is the 412, so
+    # every other 200 here has new_leader_eligible == (not force). A handler that reported either field
+    # as the negation of the other passed the whole file. force on a node that does have a live
+    # promotable sibling is allowed, and then both fields must read true.
+    coord = _StandinCoordinator()  # the default members carry node-b, fresh and promotable
+    async with _admin(tmp_path, coord) as (engine, c, boss):
+        r = await c.post("/cluster/stepdown", headers=_auth(boss), json={"force": True})
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "node_id": "node-a",
+            "was_leader": True,
+            "released_at": 1_700_000_000.5,
+            "new_leader_eligible": True,
+            "force": True,
+        }
+        assert coord.calls == ["cluster_members", "step_down_leadership"]
+        rows = await _rows(engine, "cluster_stepdown")
+        assert len(rows) == 1
+        assert json.loads(str(rows[0]["detail"])) == r.json()
+        assert not await _rows(engine, "cluster_stepdown_denied")
+
+
 async def test_force_does_not_turn_a_non_leader_into_a_success(tmp_path: Path) -> None:
     # force waives the no-sibling refusal and NOTHING else. On a node whose release reports it held no
     # leadership there is nothing to drain, so the answer is still 409, forced or not.

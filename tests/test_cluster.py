@@ -15,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import re
 import textwrap
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -235,6 +236,57 @@ def test_members_from_node_rows_derives_the_leader_and_fresh_from_one_verdict() 
     }
     assert [n for n, m in members.items() if m.is_leader] == ["leader"]
     assert has_promotable_sibling(members.values(), "leader") is True
+
+
+_Rows = list[dict[str, object]]
+
+
+async def _members_via_helper(rows: _Rows) -> list[ClusterMember]:
+    return members_from_node_rows(rows, time.time(), 30.0)
+
+
+async def _members_via_db_coordinator(rows: _Rows) -> list[ClusterMember]:
+    class _Pool:
+        async def fetch(self, sql: str, *args: object) -> _Rows:
+            assert "FROM nodes" in sql
+            return rows
+
+    return await DbCoordinator(_Pool(), "reader", node_timeout_seconds=30.0).cluster_members()
+
+
+async def _members_via_sqlserver_coordinator(rows: _Rows) -> list[ClusterMember]:
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    class _Store:
+        async def _fetchall(self, sql: str, params: object = None) -> _Rows:
+            assert "FROM nodes" in sql
+            return rows
+
+    coord = SqlServerCoordinator(_Store(), "reader", node_timeout_seconds=30.0)
+    return await coord.cluster_members()
+
+
+@pytest.mark.parametrize(
+    "read",
+    [_members_via_helper, _members_via_db_coordinator, _members_via_sqlserver_coordinator],
+    ids=["members_from_node_rows", "DbCoordinator", "SqlServerCoordinator"],
+)
+async def test_no_leader_is_derived_when_every_leader_flag_is_stale(
+    read: Callable[[_Rows], Awaitable[list[ClusterMember]]],
+) -> None:
+    # The freshness conjunct in the leader pick decides only when EVERY flagged row is stale (BACKLOG
+    # #1524). A fresh flagged row outranks a stale one on last_seen whatever the rule says, so the
+    # fixture above passes with the conjunct deleted. Each coordinator is run as well as the helper,
+    # because a coordinator that derives members on its own is a second copy of the conjunct.
+    now = time.time()
+    rows = [_nodes_row("crashed", now - 3600.0, is_leader=True), _nodes_row("standby", now)]
+    members = await read(rows)
+    assert {m.node_id: m.fresh for m in members} == {"crashed": False, "standby": True}
+    assert [m.node_id for m in members if m.is_leader] == []
+    # The positive control: the same path names a fresh flagged row, so the empty pick above is the
+    # rule deciding, not a reader that never names anyone.
+    live = [*rows, _nodes_row("leader", now, is_leader=True)]
+    assert [m.node_id for m in await read(live) if m.is_leader] == ["leader"]
 
 
 def test_null_coordinator_does_not_reclaim_inflight() -> None:

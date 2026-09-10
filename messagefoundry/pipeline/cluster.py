@@ -119,8 +119,8 @@ class ClusterMember:
     leadership: at most one member carries it — the single freshest node whose durable ``nodes.is_leader``
     heartbeat flag is set AND is fresh (``last_seen`` within ``node_timeout_seconds``). At most one
     leader is reported; that it is the *live* one holds only while node clocks agree (see
-    :meth:`cluster_members`). ``last_seen``/``started_at`` are epoch seconds, ``None`` only on the
-    :class:`NullCoordinator` synthetic self-entry (no DB)."""
+    :func:`members_from_node_rows`). ``last_seen``/``started_at`` are epoch seconds, ``None`` only
+    on the :class:`NullCoordinator` synthetic self-entry (no DB)."""
 
     node_id: str
     host: str | None
@@ -148,7 +148,7 @@ def heartbeat_is_fresh(last_seen: float | None, now: float, node_timeout_seconds
     The one freshness rule. It decides the derived leader and, since BACKLOG #1509, whether a stepdown
     is refused, so it is applied in one place, :func:`members_from_node_rows`, which both DB
     coordinators call. Upper bound only, so a row stamped by a fast clock stays fresh for longer;
-    :meth:`DbCoordinator.cluster_members` spells out what that costs."""
+    that function's docstring spells out what that costs."""
     return last_seen is not None and (now - last_seen) <= node_timeout_seconds
 
 
@@ -159,15 +159,40 @@ def members_from_node_rows(
 
     Shared for the reason :func:`stepdown_pause_seconds` is: the freshness verdict, the derived-leader
     pick that reads it and the published ``fresh`` field have to change together, and a per-class copy
-    is two files that can drift apart with nothing failing. The coordinators differ only in the SELECT
-    that fetches ``rows``; :meth:`DbCoordinator.cluster_members` explains the derivation. ``pid`` and
-    the two flags are coerced as the SQL Server copy already did, which changes nothing on Postgres."""
+    is two files that can drift apart with nothing failing. The coordinators differ only in how they
+    run the SELECT that fetches ``rows``. ``pid`` and the two flags are coerced, which changes
+    nothing on Postgres.
+
+    Leadership is DERIVED so that **at most one** node is ever reported as leader, and it is always a
+    *live* one:
+
+    * A freshness filter (``last_seen`` within ``node_timeout_seconds``) discards a fully-stale
+      crashed ex-leader's lingering ``is_leader=true`` flag outright.
+    * Among the rows that still carry ``is_leader=true`` AND are fresh, only the **single freshest**
+      (largest ``last_seen``) is reported as leader. During a failover window two rows can briefly
+      both be fresh-and-flagged — the crashed ex-leader whose ``last_seen`` is frozen at the crash
+      instant, and the newly-promoted leader whose ``last_seen`` keeps advancing. Picking the
+      freshest collapses that overlap to a single reported leader.
+
+    **This is a cross-node WALL-CLOCK comparison, and it is one-sided.** ``last_seen`` is stamped by
+    the beating node's ``time.time()`` and compared against the *reading* node's ``time.time()`` with
+    an upper bound only — there is no ``now - last_seen >= 0`` guard — so a row stamped by a node
+    whose clock runs ahead has a NEGATIVE age, trivially passes the freshness test, and (being the
+    largest ``last_seen``) wins the pick. A fast-clocked node therefore wins the derived-leader pick
+    for as long as it is alive, and keeps winning after it hard-crashes until the live successor's
+    advancing ``last_seen`` overtakes the frozen stamp (~the skew), while its row stays *eligible*
+    for skew + ``node_timeout_seconds``.
+
+    Two consequences a reader must not be surprised by. The derived ``is_leader`` can name a DEAD
+    node as leader while the sibling ``lease_owner`` on the same ``/cluster/nodes`` response
+    correctly names the live one — the lease, not this field, is authoritative for who processes.
+    And because the web console raises engine health to ``down``/"cluster has no leader" only when
+    the derived ``leader_node_id`` is ``None``, a skew-frozen row keeps that non-``None`` and can
+    mask a genuinely leaderless cluster for that same interval. Do not gate operational decisions on
+    the derived leader; gate them on the lease."""
     fresh = {
         r["node_id"]: heartbeat_is_fresh(r["last_seen"], now, node_timeout_seconds) for r in rows
     }
-    # The single derived leader is the freshest row that is both flagged and fresh: the one still
-    # heartbeating. A stale ex-leader's flag fails the freshness test, and a not-yet-cleared ex-leader
-    # that overlaps a new leader loses to the new leader's more recent last_seen.
     leader_node_id: str | None = None
     leader_last_seen: float = -1.0
     for r in rows:
@@ -900,33 +925,8 @@ class DbCoordinator:
 
     async def cluster_members(self) -> list[ClusterMember]:
         """Read the shared ``nodes`` table and return one :class:`ClusterMember` per node (Track B
-        Step 7). Leadership is DERIVED so that **at most one** node is ever reported as leader, and it is
-        always a *live* one:
-
-        * A freshness filter (``last_seen`` within ``node_timeout_seconds``) discards a fully-stale
-          crashed ex-leader's lingering ``is_leader=true`` flag outright.
-        * Among the rows that still carry ``is_leader=true`` AND are fresh, only the **single freshest**
-          (largest ``last_seen``) is reported as leader. During a failover window two rows can briefly
-          both be fresh-and-flagged — the crashed ex-leader whose ``last_seen`` is frozen at the crash
-          instant, and the newly-promoted leader whose ``last_seen`` keeps advancing. Picking the
-          freshest collapses that overlap to a single reported leader.
-
-        **This is a cross-node WALL-CLOCK comparison, and it is one-sided.** ``last_seen`` is stamped by
-        the beating node's ``time.time()`` and compared against the *reading* node's ``time.time()`` with
-        an upper bound only — there is no ``now - last_seen >= 0`` guard — so a row stamped by a node
-        whose clock runs ahead has a NEGATIVE age, trivially passes the freshness test, and (being the
-        largest ``last_seen``) wins the pick. A fast-clocked node therefore wins the derived-leader pick
-        for as long as it is alive, and keeps winning after it hard-crashes until the live successor's
-        advancing ``last_seen`` overtakes the frozen stamp (~the skew), while its row stays *eligible*
-        for skew + ``node_timeout_seconds``.
-
-        Two consequences a reader must not be surprised by. This field can name a DEAD node as leader
-        while the sibling ``lease_owner`` on the same ``/cluster/nodes`` response correctly names the
-        live one — the lease, not this field, is authoritative for who processes. And because the web
-        console raises engine health to ``down``/"cluster has no leader" only when the derived
-        ``leader_node_id`` is ``None``, a skew-frozen row keeps that non-``None`` and can mask a
-        genuinely leaderless cluster for that same interval. Do not gate operational decisions on the
-        derived leader; gate them on the lease.
+        Step 7). :func:`members_from_node_rows` builds them, and its docstring explains how the single
+        derived leader is picked and what node clock skew does to that pick.
 
         One DB read, returned ordered by ``node_id`` for a stable listing; off the message hot path
         (operator-driven)."""
@@ -934,42 +934,7 @@ class DbCoordinator:
             "SELECT node_id, host, pid, started_at, last_seen, status, is_leader, "
             "acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
         )
-        now = time.time()
-        # One freshness verdict per row, taken once, so the derived leader and the published ``fresh``
-        # flag cannot disagree about the same row.
-        fresh = {
-            r["node_id"]: heartbeat_is_fresh(r["last_seen"], now, self._node_timeout_seconds)
-            for r in rows
-        }
-        # First pass: which rows carry a *fresh* leader flag, and which of those is the freshest. The
-        # freshest fresh-flagged row is the single derived leader (it is the one still heartbeating).
-        leader_node_id: str | None = None
-        leader_last_seen: float = -1.0
-        for r in rows:
-            last_seen = r["last_seen"]
-            if r["is_leader"] and fresh[r["node_id"]] and last_seen > leader_last_seen:
-                leader_last_seen = last_seen
-                leader_node_id = r["node_id"]
-        members: list[ClusterMember] = []
-        for r in rows:
-            members.append(
-                ClusterMember(
-                    node_id=r["node_id"],
-                    host=r["host"],
-                    pid=r["pid"],
-                    started_at=r["started_at"],
-                    last_seen=r["last_seen"],
-                    status=r["status"],
-                    # Single derived leader: the freshest fresh-flagged node only. A stale ex-leader's
-                    # flag is filtered out (not fresh), and a not-yet-cleared ex-leader that overlaps a
-                    # new leader loses to the new leader's more recent last_seen.
-                    is_leader=(r["node_id"] == leader_node_id),
-                    acquire_delay_seconds=float(r["acquire_delay_seconds"]),
-                    promotable=bool(r["promotable"]),
-                    fresh=fresh[r["node_id"]],
-                )
-            )
-        return members
+        return members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
         """Read the single ``leader_lease`` row — (owner, DB-clock expiry) — for the observability API
