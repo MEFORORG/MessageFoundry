@@ -88,6 +88,7 @@ import argparse
 import importlib.util
 import json
 import re
+import secrets
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -770,6 +771,30 @@ def extractor_control() -> list[str]:
     return failures
 
 
+def absent_symbol() -> str:
+    """A symbol name that cannot be on the ref, generated fresh so it is never a literal here.
+
+    THE NEGATIVE ARM USED TO SEARCH FOR A STRING THAT LIVED IN THE SEARCH. `symbol_on_main` runs
+    `git grep` over the ref's file CONTENT, and this module is tracked, so a hard-coded sentinel
+    matched its own source line. The probe answered TRUE, the control read that as "the probe cannot
+    say no", and the screen exited 2 on every full clone -- which is every clone. Measured
+    2026-09-10 at `8262ef11e`: `git grep -F -e <the old sentinel> origin/main` returned this very
+    file. The screen has therefore never run against a real ledger, and the population it exists to
+    report went unread the whole time.
+
+    Nothing caught it because the only caller in CI is `tests/test_subject_exists_screen.py`, whose
+    `probe_control` cases drive a `FakeRepo`. A fake cannot contain the sentinel, so the fixture
+    passed precisely where the real repository failed -- the instrument-versus-test divergence
+    CLAUDE.md section 11 names as SDS-3.8.
+
+    Generating the name defeats both halves at once: a random 128-bit tail cannot be committed
+    anywhere on the ref, and the string cannot be re-inlined by a later edit because it does not
+    exist until the call runs. The `zzq_` prefix and the underscore keep it shaped like the
+    identifiers `subjects_in` extracts, so the probe is exercised on the input class it serves.
+    """
+    return f"zzq_absent_{secrets.token_hex(16)}"
+
+
 def probe_control(repo: RepoReader, ref_sha: str, *, probe_symbols: bool) -> list[str]:
     """Failures of the structural control over the git probes, positive AND negative arm each."""
     failures: list[str] = []
@@ -789,7 +814,7 @@ def probe_control(repo: RepoReader, ref_sha: str, *, probe_symbols: bool) -> lis
     if probe_symbols:
         if not repo.symbol_on_main("parse_items"):
             failures.append("symbol_on_main cannot find `parse_items`")
-        if repo.symbol_on_main("zzq_no_such_symbol_9d3f2b"):
+        if repo.symbol_on_main(absent_symbol()):
             failures.append("symbol_on_main found an invented symbol -- the probe cannot say no")
     return failures
 

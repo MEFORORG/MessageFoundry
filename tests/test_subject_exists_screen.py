@@ -2,11 +2,23 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """The subject-exists screen (BACKLOG #1426).
 
-EVERY TEST HERE RUNS AGAINST A FAKE REPOSITORY, and that is a decision rather than convenience. The
+MOST TESTS HERE RUN AGAINST A FAKE REPOSITORY, and that is a decision rather than convenience. The
 screen's job is to answer "is this subject on `origin/main`", so a test driving real git would assert
 facts about whichever clone happens to run it -- facts that change under every merge and vanish under
-a shallow fetch. The fake pins the SCREEN's behaviour; the live probes are pinned separately by the
-tool's own structural control, which runs on every invocation and has a negative arm.
+a shallow fetch. The fake pins the SCREEN's behaviour.
+
+THE SENTENCE THAT USED TO FOLLOW WAS A COMPENSATING CONTROL RESTING ON A FALSE PREMISE, and it cost
+this screen its entire working life. It read: "the live probes are pinned separately by the tool's
+own structural control, which runs on every invocation and has a negative arm." The control does run
+on every invocation -- and NOTHING INVOKES THE SCREEN. `ci.yml` names this test module; no workflow,
+hook or script runs `subject_exists_screen.py` against the real ledger. So "pinned separately" named
+a gate that was never armed, and under it the negative symbol arm grepped for a sentinel that was a
+literal in the screen's own tracked source, matched itself, and made the screen exit 2 on every real
+clone from the day it landed until 2026-09-10. These fixtures were green throughout, because a fake
+repository cannot contain the sentinel. Two tests at the foot of this file close that gap:
+`test_the_probe_control_passes_against_THIS_REPOSITORY_not_only_a_fake` and
+`test_the_absent_sentinel_is_never_a_literal_in_the_screens_own_source`. They are the only ones here
+that read real git, and each exists because a fake structurally could not see the defect.
 
 TWO CONTROL LAYERS ARE TESTED, NOT ONE. A screen that finds nothing must be distinguishable from a
 screen that is broken, so it is not enough that the controls pass on good code -- they must FAIL on
@@ -529,3 +541,62 @@ def test_the_live_ledger_still_parses_and_still_has_open_items() -> None:
         "the live ledger yielded almost no open items -- the reader is narrowing"
     )
     assert any(ses.subjects_in(i.body) for i in items), "no open row names any code-side subject"
+
+
+def _repo_reader_over_this_checkout() -> tuple[object, str]:
+    """`GitRepo` over the repository these tests live in, plus a ref that exists here.
+
+    `origin/main` is preferred because it is what the screen reads in use. A checkout without that
+    remote-tracking ref falls back to `HEAD`, which every git checkout has and which reproduces the
+    defect below identically -- the module is tracked at both. Falling back keeps the coverage; a
+    skip here would put the one test that can see this class of defect behind the condition most
+    likely to be true on a fresh clone.
+    """
+    root = Path(__file__).resolve().parents[1]
+    for ref in ("origin/main", "HEAD"):
+        candidate = ses.GitRepo(root, ref)
+        if candidate.is_commit(ref):
+            return candidate, ref
+    pytest.skip(f"no usable git ref in {root} -- not a checkout")
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def test_the_probe_control_passes_against_THIS_REPOSITORY_not_only_a_fake() -> None:
+    """The test that was missing, and the only shape that could have caught BACKLOG #1426's defect.
+
+    Every other `probe_control` case here drives a `FakeRepo`, and the file docstring above used to
+    argue that was sufficient because the live probes are pinned by the control "which runs on every
+    invocation". Nothing invoked it: CI names this test module, never the screen. So the negative
+    symbol arm searched `git grep` for a sentinel that was a literal in the screen's own tracked
+    source, matched itself, and the screen exited 2 -- broken -- on every real clone from the day it
+    landed until 2026-09-10, while these fixtures stayed green. A fake repository cannot contain the
+    sentinel, which is exactly why it could not see this.
+    """
+    repo, ref = _repo_reader_over_this_checkout()
+    ref_sha = repo._git("rev-parse", ref).stdout.strip()
+    assert ref_sha, f"could not resolve {ref}"
+    failures = ses.probe_control(repo, ref_sha, probe_symbols=True)
+    assert failures == [], (
+        f"the screen's structural control fails against the real repository at {ref}: {failures}. "
+        "The screen exits 2 and reports nothing while this is true."
+    )
+
+
+def test_the_absent_sentinel_is_never_a_literal_in_the_screens_own_source() -> None:
+    """Pins the property the fix rests on, so a later edit cannot re-inline a constant.
+
+    `symbol_on_main` greps the ref's file CONTENT and the screen is tracked, so any sentinel written
+    as a literal is found in the module that searches for it. Generating it is what makes the
+    negative arm able to say no.
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "docs" / "subject_exists_screen.py"
+    ).read_text(encoding="utf-8")
+    first = ses.absent_symbol()
+    second = ses.absent_symbol()
+    assert first != second, "the sentinel is fixed, so it can be committed and then found"
+    for sentinel in (first, second):
+        assert sentinel not in source, (
+            f"{sentinel!r} appears in the screen's own source -- git grep would match this file "
+            "and the control's negative arm could never say no"
+        )
