@@ -1279,9 +1279,11 @@ class DbCoordinator:
           LATER, never earlier. It changes nothing about the lease, the self-fence or the epoch token.
           **It is a claim predicate, not mutual exclusion**: it is evaluated before the claim's await,
           so it says nothing about a claim already in flight — that is the lock's job, above. It is
-          armed BEFORE the release rather than after it, so a cancellation landing inside the pool
-          write cannot skip it; that ordering buys nothing against either interleaving above and is
-          not credited with doing so.
+          armed TWICE, before the release AND again after it, taking whichever expiry is later. The
+          first arm is what a cancellation landing inside the pool write cannot skip; the second is
+          what keeps the write's own unbounded duration from being spent out of the pause, since the
+          lease row does not become takeable until that write commits. Neither arm buys anything
+          against either interleaving above and neither is credited with doing so.
 
         Deadlock, since the lock is new: it is taken in exactly two coroutines, neither of which calls
         the other, so there is no ordering to invert. A cancelled tick releases it on the way out
@@ -1324,7 +1326,11 @@ class DbCoordinator:
             # are _maintain_leadership, which is holding-lock-excluded, and _check_fence, which is
             # synchronous and therefore cannot run in that gap.
             owed = self._lease_release_owed
-            if self._is_leader or owed:
+            # Held across the await because the second arm below needs the SAME predicate, and
+            # `self._is_leader` is already False by then — _release_leadership clears it on its first
+            # line, so re-reading it there would silently arm nothing.
+            arming = self._is_leader or owed
+            if arming:
                 # Stand down long enough that every sibling has had a full tick at the expired lease.
                 # The retry needs this as much as the first call does: the release expires
                 # `lease_expires_at` but leaves `owner` naming us, so a successful retry with no pause
@@ -1333,6 +1339,26 @@ class DbCoordinator:
                     self._heartbeat_seconds
                 )
             was_leader, released_at, wrote = await self._release_leadership(force_write=owed)
+            if arming:
+                # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
+                # LATER. The arm above is measured from before the write, so the write's own duration
+                # comes out of the pause — and nothing bounds that duration from here: the pool
+                # acquire() carries no timeout and `[store].command_timeout` (30s by default) is the
+                # only ceiling on the statement, already longer than the 20s pause at the shipped
+                # heartbeat. The window that matters starts when the row becomes takeable, which is the
+                # commit, not the call: measuring from before it would hand a sibling (2 * heartbeat -
+                # write duration), which can reach zero, and the drained node's own queued tick — which
+                # waits on this lock for the whole call — would then fall straight through the pause
+                # gate and renew itself back in through the unfenced `owner = me` branch, milliseconds
+                # after the endpoint answered 200.
+                #
+                # max(), not a replacement: the pause may only ever move LATER. A real monotonic clock
+                # makes the second value the larger one by construction, but an injected or coarse
+                # clock must not be able to SHORTEN a pause this call already promised.
+                self._no_claim_until = max(
+                    self._no_claim_until,
+                    self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
+                )
             if was_leader:
                 self._fire_on_demote()
             # NOT nested under `was_leader`. A retry re-sending an owed write has already demoted, so it

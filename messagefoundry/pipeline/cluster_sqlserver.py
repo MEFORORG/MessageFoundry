@@ -555,8 +555,8 @@ class SqlServerCoordinator:
         :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its
         docstring for why the release is serialized against the maintenance tick, why the demotion
         edge fires, why this node pauses its own claim (and why the pause is not the exclusion), why the
-        pause is armed BEFORE the release, what the lock costs, why a retry re-sends an owed write, and
-        why an unconfirmed lease write raises
+        pause is armed BOTH before and after the release, what the lock costs, why a retry re-sends an
+        owed write, and why an unconfirmed lease write raises
         :class:`~messagefoundry.pipeline.cluster.StepdownReleaseUnconfirmed` here but not on
         :meth:`stop`."""
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
@@ -567,11 +567,20 @@ class SqlServerCoordinator:
             # copies: a per-class copy of a safety-relevant timing constant (or of the sentence an
             # operator acts on) is two files that can be retuned independently.
             owed = self._lease_release_owed
-            if self._is_leader or owed:
+            arming = self._is_leader or owed  # held across the await; _is_leader is False by then
+            if arming:
                 self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
                     self._heartbeat_seconds
                 )
             was_leader, released_at, wrote = await self._release_leadership(force_write=owed)
+            if arming:
+                # Armed a SECOND time from the instant the write returned, taking the later expiry, so
+                # the write's own unbounded duration is not spent out of the pause. DbCoordinator's
+                # step_down_leadership carries the full reasoning; keep the two in lockstep.
+                self._no_claim_until = max(
+                    self._no_claim_until,
+                    self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
+                )
             if was_leader:
                 self._fire_on_demote()
             if not wrote:  # NOT nested under was_leader — a retry has already demoted

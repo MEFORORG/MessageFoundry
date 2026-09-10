@@ -640,6 +640,52 @@ async def test_without_the_pause_the_drained_node_renews_itself_back_in() -> Non
     assert a.is_leader() is True  # re-armed itself; the planned failover did nothing
 
 
+async def test_a_slow_release_write_is_not_spent_out_of_the_claim_pause() -> None:
+    # THE PAUSE IS MEASURED FROM WHEN THE WRITE RETURNED, NOT FROM BEFORE IT. The lease row only
+    # becomes takeable at that write's commit, so a pause armed only ahead of it gives a sibling
+    # (2 * heartbeat - write duration), not two heartbeats. Nothing bounds that duration from the
+    # coordinator: the pool acquire() carries no timeout and [store].command_timeout — 30s by default —
+    # already outlasts the 20s pause at the shipped heartbeat, and the cancellation tests below rest on
+    # the same write reaching a 120s request deadline. Spend the pause inside the write and the drained
+    # node's own next tick falls through the gate at _claim_or_renew_lease, matches the unfenced
+    # `owner = me` renew branch over the row it just expired, and is leader again moments after the
+    # endpoint answered 200.
+    #
+    # Why no test above can see it: _Clock only moves when a test moves it, and none of them moves it
+    # across the release, so every other release here costs zero simulated time.
+    #
+    # VACUITY CONTROL, both legs MEASURED: delete the second arm (the `max(...)` after
+    # _release_leadership returns) from DbCoordinator.step_down_leadership and this fails at the pause
+    # (`20.0 == 45.0`); silence that leg as well and it fails at the behavioural one (`True is False`),
+    # the drained node having taken its own leadership back.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    def _slow_write() -> None:
+        # 25 simulated seconds pass INSIDE the write — past the 20.0 the first arm promised.
+        mono.t = db_clock.t = 25.0
+
+    pool.on_execute = _slow_write
+    await a.step_down_leadership()
+
+    assert a._no_claim_until == 45.0, "the release write was spent out of the claim pause"
+
+    # The consequence that number stands for: A's own next tick still declines, so the drain holds.
+    await a._maintain_leadership()
+    assert a.is_leader() is False, "the drained node renewed itself back in over a spent pause"
+    assert db.row is not None and db.row["owner"] == "A"  # row untouched, still expired
+    assert db.row["lease_expires_at"] == 0.0
+
+    # And the sibling still gets its tick at the expired lease, which is what the pause is sized for.
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
 async def test_step_down_fires_the_demotion_edge_and_leaves_the_node_running() -> None:
     # A stepdown is a demotion the node SURVIVES, so the engine must learn about it on the same edge
     # every other True->False transition uses (ADR 0157 Inc 5) rather than waiting out a reconcile
@@ -804,6 +850,49 @@ async def test_a_retry_re_sends_the_write_the_first_stepdown_could_not_confirm()
     # A sibling can now take it, which is the whole point of retrying.
     db_clock.t = 1.0  # the expired lease is only takeable once the DB clock is past it
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
+async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock() -> None:
+    # THE `or owed` DISJUNCT, which the two retry tests around this one cannot see. They assert
+    # `_no_claim_until == 20.0` after the retry and read that as evidence the retry re-armed the pause,
+    # but their monotonic clock never moves: 20.0 is already there from the FIRST, failed stepdown, so
+    # the assertion holds identically with the disjunct deleted. Deleting it leaves this whole file,
+    # test_cluster.py and test_api_cluster_stepdown.py passing. Advancing the clock past that first
+    # pause is what separates the two answers.
+    #
+    # What the disjunct holds up: the retry's write DOES land — force_write sends it past the
+    # not-a-leader early return — expiring `lease_expires_at` while leaving `owner` naming this node.
+    # Without a fresh pause the very next tick matches the unfenced `owner = me` renew branch and hands
+    # leadership back to the node the endpoint has already reported drained.
+    #
+    # VACUITY CONTROL, both legs MEASURED: delete `or owed` from `arming` in
+    # DbCoordinator.step_down_leadership and this fails at the pause (`20.0 == 120.0`); silence that
+    # leg as well and it fails at the behavioural one (`True is False`).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    pool = _FakeLeasePool(db)
+    mono = _Clock(0.0)
+    a = _coord(pool, mono, node="A", heartbeat=10.0)
+    await a._maintain_leadership()
+
+    pool.fail = True
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    assert a._no_claim_until == 20.0  # armed by the first call, on a clock still at 0.0
+
+    # PAST that first pause, which is the step no other retry test takes.
+    mono.t = db_clock.t = 100.0
+    pool.fail = False
+    assert await a.step_down_leadership() == (False, None)
+
+    assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
+    await a._maintain_leadership()
+    assert a.is_leader() is False, "the drained node re-armed itself as leader after the retry"
+
+    # And the sibling takes the lease the retry finally expired.
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
     await b._maintain_leadership()
     assert b.is_leader() is True
 
@@ -1178,3 +1267,64 @@ async def test_sqlserver_cancelled_release_still_owes_the_write() -> None:
     assert await a.step_down_leadership() == (False, None)
     assert db.row["lease_expires_at"] == 0.0, "the retry after a cancelled release sent no write"
     assert a._lease_release_owed is False
+
+
+async def test_sqlserver_a_slow_release_write_is_not_spent_out_of_the_claim_pause() -> None:
+    # The twin of test_a_slow_release_write_is_not_spent_out_of_the_claim_pause, here for the reason
+    # the module docstring gives: the pause is armed in this coordinator's own step_down_leadership,
+    # and the MERGE carries the identical unfenced `t.owner = ?` renew branch, so a pause spent inside
+    # the write re-promotes the drained node here too.
+    #
+    # VACUITY CONTROL, MEASURED: delete the second arm (the `max(...)` after _release_leadership
+    # returns) from SqlServerCoordinator.step_down_leadership and this fails at the pause
+    # (`20.0 == 45.0`); silence that leg too and it fails at the behavioural one (`True is False`).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    store = _FakeSqlLeaseStore(db)
+    mono = _Clock(0.0)
+    a = _sql_coord(store, "A", mono)
+    await a._maintain_leadership()
+
+    def _slow_write() -> None:
+        mono.t = db_clock.t = 25.0  # 25 simulated seconds INSIDE the write
+
+    store.on_execute = _slow_write
+    await a.step_down_leadership()
+
+    assert a._no_claim_until == 45.0, "the release write was spent out of the claim pause"
+    await a._maintain_leadership()
+    assert a.is_leader() is False, "the drained node renewed itself back in over a spent pause"
+    assert db.row is not None and db.row["lease_expires_at"] == 0.0
+
+    b = _sql_coord(_FakeSqlLeaseStore(db), "B")
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+
+
+async def test_sqlserver_the_retry_arms_a_fresh_pause_from_its_own_clock() -> None:
+    # The twin of test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock. The SQL Server
+    # retry test above asserts the row and the owed flag but never reads _no_claim_until at all, so the
+    # `or owed` disjunct is unguarded on this backend even once Postgres has a probe for it.
+    #
+    # VACUITY CONTROL, MEASURED: delete `or owed` from `arming` in
+    # SqlServerCoordinator.step_down_leadership and this fails at the pause (`20.0 == 120.0`); silence
+    # that leg too and it fails at the behavioural one (`True is False`).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    store = _FakeSqlLeaseStore(db)
+    mono = _Clock(0.0)
+    a = _sql_coord(store, "A", mono)
+    await a._maintain_leadership()
+
+    store.fail = True
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await a.step_down_leadership()
+    assert a._no_claim_until == 20.0
+
+    mono.t = db_clock.t = 100.0  # past the first call's pause
+    store.fail = False
+    assert await a.step_down_leadership() == (False, None)
+
+    assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
+    await a._maintain_leadership()
+    assert a.is_leader() is False, "the drained node re-armed itself as leader after the retry"
