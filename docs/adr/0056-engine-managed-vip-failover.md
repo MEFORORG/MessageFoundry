@@ -425,8 +425,8 @@ for context):**
    process holds the privilege; the least-privileged engine asks it to bind/release over a local IPC
    boundary that is itself the audit/trust point.
    - **Windows:** `mefor-net-helper.exe` with a `requireAdministrator` manifest, reached over a named
-     pipe (`\\.\pipe\MessageFoundryNetHelper`); the helper **authenticates the caller** (pipe ACL / token
-     / PID).
+     pipe (`\\.\pipe\mefor-net-helper`); the helper **authenticates the caller** (a pipe ACL, then a
+     check of the caller's own token). **Built 2026-09-10**; see §"The helper as built" below.
    - **Linux:** a `CAP_NET_ADMIN` systemd helper (or narrow suid) over a Unix socket with `SO_PEERCRED`
      caller authentication.
    - **Security requirement (not optional):** the helper is constrained to **bind/release only the single
@@ -453,6 +453,85 @@ In k8s a floating address is a **Service / cloud LB** (or MetalLB on bare-metal 
 secondary NIC address, and the hardened container drops `CAP_NET_ADMIN` by design. **Engine-managed VIP is
 a bare-metal / VM feature only**; containerized deployments keep delegating to the orchestration layer,
 exactly as today.
+
+### The helper as built (2026-09-10)
+
+The helper lives in `net-helper/`, and its [README](../../net-helper/README.md) is the
+operator's reference. This subsection resolves the "Helper packaging" item under *To resolve on
+acceptance*, and records what the engine-side controller must not re-derive.
+
+- **Wire contract.** Named pipe `\\.\pipe\mefor-net-helper`. One request per connection: a single
+  newline-terminated line of UTF-8 JSON with no byte order mark. The ops are `ping`, `bind`, `release` and
+  `arp`. A response is `{"ok":true}` (with `version` on `ping`) or `{"ok":false,"error":"<message>"}`,
+  and the message is a fixed phrase, never a stack trace. IPv4 only. `mask` is a dotted-decimal netmask.
+- **Scope.** At start the helper reads `address`, `interface`, `mask` and `client_account` from
+  `mefor-net-helper.conf` beside its executable. It refuses to start if any is missing or invalid. It
+  refuses a request naming any other address, interface or (for `bind`) mask, and never attempts it. The
+  values it passes to Windows come from that file, not from the request.
+- **Pipe ACL model.** The pipe's DACL denies `NT AUTHORITY\NETWORK`, so a remote logon cannot open it over
+  SMB. It allows read and write to the configured client account, which is the engine's service account,
+  and to `BUILTIN\Administrators`. It gives the helper's own account full control.
+- **The ACL is not trusted alone.** After reading a request, the helper impersonates the caller and reads
+  its token. It admits the configured account, or a token with an enabled Administrators membership.
+  Measured on 2026-09-10: an administrator's un-elevated token, where Administrators is deny-only, was
+  refused. Anonymous and network logons are refused first. `client_account` may not name a broad group
+  such as Everyone or Users.
+- **One pipe instance, one caller at a time.** The helper creates the pipe with
+  `FILE_FLAG_FIRST_PIPE_INSTANCE` and reuses that instance for every caller. If another process created the
+  name first, the helper refuses to start rather than serve under that process's ACL. **The cost falls on
+  the controller:** a request can wait behind another caller for up to 20 seconds with today's timeouts (a
+  5-second read, a 10-second netsh cap, a 5-second close). That is longer than the release budget, so the
+  controller must not overlap calls near a fence.
+- **Bind and release.** `netsh interface ipv4 add|delete address ... store=active`, run by full path. The
+  active store means a rebooted node does not come back holding the VIP. `bind` adds
+  `skipassource=true`, so the engine's own outbound connections, the lease heartbeat among them, never
+  take the VIP as their source. Both are idempotent. Neither has yet run against a real adapter.
+- **`arp` is not a sender-equals-target gratuitous ARP, and that is measured.** On Windows 11 on
+  2026-09-10, `SendARP` for the host's own address returned in about 1 ms with the host's MAC, while two
+  unused neighbours each took about 3.1 s and failed. The IP helper answers a local address without
+  transmitting. So `arp` sends an ARP request to the adapter's IPv4 gateway with the VIP as source. Under
+  RFC 826 that updates the gateway's entry and any host already caching the VIP. **Nobody has verified
+  that Windows puts the VIP in the sender field**; that needs a capture on a Windows Server node before
+  the controller relies on `arp`, and BACKLOG #1522 tracks it. The helper refuses to announce an address
+  the node does not hold.
+- **Runtime.** The helper targets .NET 10, the long-term support release serviced until November 2028. The
+  owner ruled on 2026-09-10 that it pin a supported .NET, and not .NET 8 or 9, which leave support in
+  November 2026. `dotnet publish` compiles it with NativeAOT into one native executable, so the server
+  installs no .NET runtime. Nothing unpacks into a temporary directory at launch, which is the escalation
+  route a self-extracting binary would open under an administrator's token. That property is why the helper
+  is C# and not a frozen Python script, so it must never ship as a self-extracting single file.
+- **Signing and versioning.** `.github/workflows/net-helper.yml` publishes on every change to the helper. On
+  `main` only, and only when the certificate secret is present, it signs with `signtool` and an RFC 3161
+  timestamp. Without the secret the build passes unsigned. The csproj `<Version>` is the one version
+  source, and `ping` reports it. The workflow is not a required check.
+
+### The helper ships beside the engine wheel, never inside it (2026-09-10)
+
+`pip install messagefoundry` does not install the helper, and bundling it into the wheel would be wrong.
+Four reasons, each checked against this tree:
+
+1. The engine wheel is pure Python. Its file name ends `py3-none-any`, so one wheel serves Windows, Linux
+   and macOS, and `[tool.hatch.build.targets.sdist]` in `pyproject.toml` keeps the sdist to the
+   `messagefoundry/` package and its metadata. A `win-x64` executable inside would force a
+   platform-tagged wheel, or ship a Windows binary to Linux and macOS users.
+2. `pip` cannot perform the install. The README's "Install it" steps run elevated: they register a
+   LocalSystem service, write the config that names the engine's service account for the pipe ACL, and
+   keep every file that service runs in a folder only administrators can write. Installing a wheel only
+   unpacks files as the user who runs `pip`. It runs none of the package's code, so it creates no service,
+   sets no ACL and elevates nothing.
+3. A `requireAdministrator` binary in `site-packages` would be an escalation route. Whoever can write the
+   virtual environment could replace a binary that later runs elevated. That is the flaw class the
+   Runtime bullet above rules out, and the reason the helper is C# and not a frozen Python script.
+4. Bundling buys no signature check. The Authenticode signature would survive inside a wheel, but `pip`
+   never verifies one.
+
+So the helper ships out of band as its own release artifact, and an administrator installs it into an
+administrator-only system folder (the README's "Install it"). `pip install messagefoundry` stays pure
+Python and cross-platform. The design already allows this split: the wire contract is the named pipe, so
+the engine-side controller will need no path to the binary and will import nothing from it.
+
+**No release job publishes the helper yet.** The `net-helper` workflow uploads only a short-lived build
+artifact, and that is not a release.
 
 ## Observability
 
@@ -657,6 +736,7 @@ The failover button follows the established **privileged-write** pattern, not th
   an **IPv4** gratuitous ARP. *(IPv6 NDP / unsolicited-NA is deferred for **all platforms** — a later
   cross-platform follow-up, not a Windows-specific limitation; see To resolve on acceptance.)*
   → `tests/test_cluster_vip.py::test_binds_on_promotion_before_listeners`
+  **Open: BACKLOG #1522 blocks the controller slice that builds this criterion.**
 - **AC-2** — WHEN a leader self-fences (lease not renewed within `leader_fence_timeout_seconds`), THE
   SYSTEM SHALL release the VIP locally (a non-DB action signalled synchronously from the fence) **within
   `leader_lease_ttl_seconds − leader_fence_timeout_seconds`** of the fence firing — i.e. before a standby
@@ -769,9 +849,11 @@ the build is greenlit:
   to, so console and engine agree on one mechanism.
 - [x] **`new_leader_eligible` in the stepdown result** — resolved 2026-09-10 (BACKLOG #1509) as a boolean from the one membership read the stepdown already takes: whether another promotable node had a fresh heartbeat. It names no successor, so the console still re-polls. The question was: derive the successor cheaply at stepdown time, or
   drop it and have the console re-poll `/cluster/nodes`.
-- [ ] **Helper packaging** — Windows code-signing + versioning/auditing of `mefor-net-helper.exe`, and the
+- [x] **Helper packaging** — Windows code-signing + versioning/auditing of `mefor-net-helper.exe`, and the
   named-pipe ACL model for caller authentication.
+  **Resolved 2026-09-10:** see §"The helper as built", under *Privilege & platform*.
 - [ ] **Published guarantee wording** — finalize the honest "CAN (no double-processing; healthy-process
   release within `ttl − fence_timeout`) / CANNOT (wedged-host VIP release); external VRRP recommended for
   the strictest posture; **Windows-only at v1**" statement for the user-facing docs
   ([CLUSTERING.md](../CLUSTERING.md), [DEPLOYMENT.md](../DEPLOYMENT.md)) when the feature ships.
+- [ ] **Gratuitous ARP sender field:** BACKLOG #1522, which blocks the controller slice.

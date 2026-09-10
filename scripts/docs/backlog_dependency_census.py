@@ -186,6 +186,7 @@ _BY_PREFIX: tuple[tuple[str, str], ...] = (
     ("messagefoundry/", "engine"),
     ("messagefoundry_webconsole/", "engine"),
     ("packaging/", "engine"),
+    ("net-helper/", "engine"),
     ("harness/", "engine"),
     ("ide/", "engine"),
     ("tee/", "engine"),
