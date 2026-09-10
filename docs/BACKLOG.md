@@ -30304,3 +30304,72 @@ Naming the test module in `ci.yml` is not wiring the tool. `ci.yml` names `tests
 4. Triage the 30 banner-sha findings into genuine mis-citations and heuristic false positives, then either fix each genuine one or record why the citation stands. Tightening narrowing 2 -- so a sha is closing evidence only when the line's closing verb governs THAT sha -- is the alternative, and it is the one that stops the count growing every time a row is correctly closed.
 
 **Do not fix the 204 by hand without step 3.** Re-anchoring them all is a large edit that goes stale again on the next refactor; the gate is what makes the fix hold.
+
+## 1526. dispatch_gate.py dies with UnicodeEncodeError partway through its own output on a stock Windows console, exiting non-zero in a way that reads as a refusal
+
+> 🔢 **Filed 2026-09-10. Reproducer is one item.** Value **5/10** · Difficulty **1/10** · _quick win_. `scripts/coord/dispatch_gate.py` prints each item's note with `print(f"  #{num}: {note}")` at :1122. A note quotes the row's own declaration, and a ledger row may carry a status glyph, so the glyph reaches stdout. On a stock Windows cp1252 console that raises `UnicodeEncodeError` and the process dies **partway through the listing**.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / development harness. **Priority:** P2. **Verdict:** fix.
+**Severity:** no deployment axis (sec. 0). Repository tooling only -- no engine behaviour, no shipped artifact, no PHI.
+
+### The reproducer, measured 2026-09-10 at `7c95ec3e8`
+
+```
+.venv\Scripts\python.exe scripts\coord\dispatch_gate.py 1022     -> exit 1
+PYTHONIOENCODING=utf-8 ... scripts\coord\dispatch_gate.py 1022     -> exit 0
+```
+
+#1022's note quotes its own row: `"⛔ **Already handled - do not rebuild"`. The traceback names `'⛔' in position 80`, and a scan of the gate's own output puts that glyph at **column 80** of the #1022 line. One item is enough; no wave is needed.
+
+### The dangerous half is the exit code, not the crash
+
+Run over 301 open rows it printed **11** items and then died. `--refuse` is **off by default** and the gate's own doctrine is *"NAMING, NOT REFUSING"*, so a non-zero exit from this tool should mean a dispatch fence was hit. Here it means the process fell over. **A caller that checks the exit code cannot tell those apart**, and a caller that reads the output gets a listing that stops without saying it stopped -- the same shape as a truncated census reading as a clean one.
+
+### What to build
+
+1. Write the listing through a UTF-8-wrapped stream, or replace un-encodable characters at the point of print. Do **not** strip glyphs from the ledger to suit the console -- the row is the record and the tool is the reader.
+2. Make a print failure exit differently from a fence, or catch it and report how many items were listed of how many requested.
+3. A test that drives the gate with a cp1252 stream over a row carrying a status glyph. Without one this returns the moment a new row quotes the banner alphabet.
+
+**Related, not duplicate:** CLAUDE.md §11 records the same cp1252 hazard for `scripts/**/*.py` **source**, and a gate covers that. This is different: the glyph is not in the source, it is **data read out of the ledger at run time**, so no source scan can see it.
+
+## 1527. a Verdict that defers to an owner decision records the CONDITION but never the RESOLUTION, so one ruling silently staled three artifacts and no gate could see any of them
+
+> 🔢 **Filed 2026-09-10 from three measured instances off ONE ruling.** Value **6/10** · Difficulty **4/10**. A row whose `Verdict` defers to an owner decision -- *"leave X gated on the owner's decision about Y"* -- records the CONDITION in the row and nothing anywhere records the RESOLUTION. Deciding leaves no mark, so the row still reads as waiting. **A row saying "gated on X" is indistinguishable, forever, from a row whose X was decided.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger hygiene / coordination. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact or PHI.
+
+### Three artifacts, one ruling, none of them caught by a gate
+
+The owner lifted the ADR 0056 privileged-helper pause on **2026-09-10**. Each of these then described a resolved condition as still pending:
+
+| Artifact | What it still said | Corrected |
+| --- | --- | --- |
+| [#1494](#1494) | Verdict: *"leave the VIP mechanism gated on the owner's privileged-helper decision"* | By the reading pass that filed this row, after **two** seats stopped on it independently |
+| [#1495](#1495) | *"that half of ADR 0056 is unbuilt and paused"* | `b8555c287`, **incidentally** -- a builder editing nearby |
+| [ADR 0056](adr/0056-engine-managed-vip-failover.md) | Status block *"PROPOSED AND PAUSED"* | `b8555c287`, the same commit, also incidentally |
+
+**Measured here, not inherited.** The #1495 wording is in `b8555c287~1` and gone at `b8555c287`; `PROPOSED AND PAUSED` is present in ADR 0056 at `a653e8920` and absent at `b8555c287`. **The two incidental fixes landed in PR 1014, not PR 1015** -- the seat that reported them attributed the ADR fix to 1015, and the tree says otherwise.
+
+### Why no instrument sees it, which is the point of the row
+
+Two screens ran over this population today and neither could have caught it. `subject_exists_screen.py` resolves only subjects a row NAMES, and a resolved conversational ruling names nothing. The commit-citation join reads `BACKLOG #N` in landed commits, and deciding produces no commit. **The resolution happens somewhere git cannot see**, so both instruments are structurally blind rather than merely missing it.
+
+The blast radius is also not one row: one ruling reached three artifacts, and **two of the three were repaired by accident** because a commit happened to be editing nearby. Nothing directed either fix.
+
+### What to build
+
+1. A dated **resolution marker** an owner ruling can leave, that a row's deferral can be checked against. The shape matters more than the mechanism: it has to be written where a gate can read it, which conversation is not.
+2. A screen reporting any open row whose `Verdict` defers to a condition, with the age of the deferral. That set is small and it is currently unenumerable.
+3. Decide whether `Verdict: owner-ruling` rows -- **33 open today** -- are the same population or a different one.
+
+**Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
+
+**Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
