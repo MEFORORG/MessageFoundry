@@ -587,6 +587,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # nothing user- or PHI-derived: it is an identifier in a log line.
     "scripts/asvs/anchor_report.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
+    # BACKLOG #1426: `secrets.token_hex` names a symbol that CANNOT be on the ref, for the negative
+    # arm of the subject-exists screen's own control. Unpredictability is not the property being
+    # bought -- absence is. It draws from the CSPRNG because a 128-bit tail is the cheapest way to be
+    # sure the name was never committed, and because generating it is what keeps it out of the file
+    # the probe greps: a hard-coded sentinel matched its own source line and made the screen exit 2
+    # on every clone. No secret, no key, no message authentication, nothing user- or PHI-derived: it
+    # is a string asserted to be absent.
+    "scripts/docs/subject_exists_screen.py": frozenset({"secrets"}),
     # BACKLOG #1220: SHA-256 over the DISCOVERED engine/console seam surface, truncated to 16 hex
     # characters, to give ENGINE_UI_SEAM an identity nobody chooses by hand. A CHANGE DETECTOR, not a
     # security control: no secret, no key, no message authentication, and nothing user- or PHI-derived
