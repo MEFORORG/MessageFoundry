@@ -29883,3 +29883,56 @@ accepted. Both change what an operator should expect. Whoever takes this should 
 that belongs in an operator-facing table row and how much belongs in `CONNECTIONS.md`, rather than
 translating the old sentence into the new vocabulary and leaving its shape intact.
 
+## 1521. the login-deadline invariance test fails on windows-2025 with one branch at exactly twice the budget, and it is 208,000x the normal spread
+
+> 🔢 **Filed 2026-09-10 by the Lander, after it evicted two unrelated pull requests from the merge queue. Not started.** Value **6/10** · Difficulty **4/10**. Value 6 -- this is the invariance guard for the sign-in seam, it gates the merge queue, and the failure shape says mechanism rather than jitter. Difficulty 4 -- it does not reproduce off the runner, so the work is instrumenting a `windows-2025` leg rather than reading code.
+
+**Cluster:** auth / test invariance. **Priority:** P2. **Verdict:** research.
+**Severity:** no deployment axis (sec. 0). Nothing is exposed. Either the shipped AD refusal path spends a whole extra deadline budget under some condition, or the test is measuring something it cannot hold; both are worth knowing and only one is a product defect.
+
+`tests/test_asvs_login_deadline.py::test_every_login_failure_branch_answers_at_one_deadline` drives five failing sign-in branches, records `deadline - start` for each, and asserts the spread is under 1 ms. It was added under **#1140** and verified by mutation there; the test itself is sound and the assertion is the right one.
+
+**MEASURED IN CI, twice, both on `windows-2025`:**
+
+```
+unknown_username    0.5000029
+wrong_password      0.5000029
+locked_account      0.5000018
+bootstrap_username  0.5000020
+ad_pathway_retired  1.0000043      <- the outlier
+```
+
+**MEASURED LOCALLY at `caba29190`, on this box, quiet:**
+
+```
+unknown_username    0.5000043
+wrong_password      0.5000026
+locked_account      0.5000019
+bootstrap_username  0.5000039
+ad_pathway_retired  0.5000032
+spread              2.4 microseconds       tolerance 1000 microseconds -> 416x headroom
+```
+
+**THE SHAPE IS WHY THIS IS FILED RATHER THAN RE-RUN.** The normal spread is **2.4 microseconds**. The failing spread is **500,000 microseconds**, or **208,000 times** the norm, while the other four branches stay within **1.1 microseconds** of each other. Jitter does not do that. And the excess is not an arbitrary number: `1.0000043 - 0.5000029 = 0.5000014`, which is one whole deadline budget. One branch's single recorded deadline landed exactly one budget later than the other four.
+
+Note the test asserts `len(recorder.deadlines) == 1` per branch **before** the spread assertion, and that assertion passed. So the AD branch did **not** pad twice. Its one deadline was computed from a base half a second after the call started, which means something on that path consumed a full budget of wall time before reaching the pad site.
+
+**DOES NOT REPRODUCE OFF THE RUNNER. Two arms, 14 runs, zero failures:**
+
+```
+quiet, 8 runs                                   8 passed, 0 failed
+under 8 concurrent CPU burners, 6 runs          6 passed, 0 failed
+```
+
+So the cause is **not** simple CPU contention, which was the obvious first hypothesis and is now refuted. Both CI observations are `windows-2025`; nobody has seen it on `windows-2022`, `ubuntu-latest`, or a developer box.
+
+**IT EVICTED TWO UNRELATED PULL REQUESTS.** Measured over every failed `CI` run created 2026-09-09 to 2026-09-10 (reported 40, walked 40, exact match): 22 failing `test (...)` jobs, of which this test is 2 -- PR 1004 and PR 1001. **PR 1001's entire diff is `.github/zizmor.yml` and `docs/BACKLOG.md`.** A pull request with no auth content at all fails it, which is what rules out the branch under test in both cases.
+
+**WHAT WOULD SETTLE IT.** Instrument the AD branch on a `windows-2025` leg and print the wall time from call entry to the pad site, alongside the deadline. Two outcomes, and they need different owners:
+
+* the path really does spend a budget before padding, on a condition that only arises there -- a product defect on the retired-AD refusal introduced by **#1137**, which retired directory password sign-in on 2026-08-22 *after* #1140's research was written; or
+* the pad site is reached late for an environmental reason the test cannot see, in which case the test is measuring "time to reach the pad plus budget" rather than "budget", and its invariance claim needs re-stating.
+
+**DO NOT "FIX" THIS BY WIDENING THE TOLERANCE.** The 1 ms bound has 416x headroom against the real spread and is not the problem. A tolerance wide enough to admit 500 ms would also admit the 49 ms branch spread that #1140 existed to close, which is the same defect that item was filed to fix.
+
+**RELATED, and deliberately kept apart:** this is not #1304. That is a `pwsh` launch that never returns on the `windows-2025` harness leg, reported as its own event; this is an assertion failing on a value. They share a runner label and nothing else.
