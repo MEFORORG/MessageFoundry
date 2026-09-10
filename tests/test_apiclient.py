@@ -605,3 +605,53 @@ def test_a_poll_client_never_writes_the_shared_token() -> None:
         assert poll._step_up_handler is None and poll._mfa_handler is None
     finally:
         client.close()
+
+
+# --- ADR 0056 / BACKLOG #1495: the planned-failover call ---------------------------------------------
+
+
+def test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result() -> None:
+    body = {
+        "node_id": "node-a",
+        "was_leader": True,
+        "released_at": 1.5,
+        "new_leader_eligible": False,
+        "force": True,
+    }
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=body, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        result = client.cluster_stepdown(force=True)
+    finally:
+        client.close()
+
+    assert [(r.method, r.url.path) for r in captured] == [("POST", "/cluster/stepdown")]
+    assert json.loads(captured[0].content) == {"force": True}
+    assert result.model_dump() == body
+    # The engine can hold the call for its fence timeout, so the client must not give up at its 5s
+    # default and report an unreachable engine for a release that may still commit.
+    assert captured[0].extensions["timeout"]["read"] == 120.0
+
+
+@pytest.mark.parametrize("status", [400, 403, 409, 412, 503])
+def test_cluster_stepdown_keeps_the_engine_status_for_the_caller_to_branch_on(status: int) -> None:
+    """A 412 and a 409 call for different next steps, so the status has to survive to the caller."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _refuse(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(status, json={"detail": f"engine says {status}"}, request=request)
+
+    client._http.send = _refuse  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ApiError) as caught:
+            client.cluster_stepdown()
+    finally:
+        client.close()
+    assert caught.value.status == status
+    assert f"engine says {status}" in str(caught.value)

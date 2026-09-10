@@ -49,6 +49,7 @@ from messagefoundry.api.models import (
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
+    ClusterStepdownResult,
     ConfigProvenance,
     ConnectionEventInfo,
     ConnectionRow,
@@ -850,6 +851,44 @@ class EngineClient:
     def cluster_nodes(self) -> ClusterNodeList:
         """Cluster membership + the derived live leader + lease state (MONITORING_READ)."""
         return _decode(self._get("/cluster/nodes"), ClusterNodeList)
+
+    def cluster_stepdown(self, *, force: bool = False) -> ClusterStepdownResult:
+        """Planned failover (ADR 0056): the engine this client is connected to releases its leadership
+        lease so a standby promotes. It steps down THAT node and no other, so resolve the leader with
+        :meth:`cluster_nodes` and connect to it first.
+
+        ``cluster:control`` behind step-up + MFA, so the step-up/MFA handlers may prompt before this
+        returns. Call it on the primary client, never on a :meth:`for_polling` clone, which carries
+        neither handler. Every refusal is an :class:`ApiError` whose ``status`` is the engine's, and
+        the statuses call for different next steps, so branch on ``status``:
+
+        * ``400`` — not clustered; there is no lease to release.
+        * ``403`` — missing ``cluster:control``, or step-up / MFA not satisfied.
+        * ``409`` — this node is not the leader. After a ``503`` reading ``release-unconfirmed`` it can
+          instead be the failover having worked, so read :meth:`cluster_nodes` before acting on it.
+        * ``412`` — no other promotable node has a fresh heartbeat, so nothing could take over and
+          nothing changed. NOT a wrong-node answer: do not go looking for another leader. Start a
+          promotable node, or pass ``force=True`` to drain this one anyway.
+        * ``503`` — a store read or the leadership lock did not answer. The engine's message says
+          which; one of them means this node already stood down, and retrying promptly delays it.
+
+        ``force`` waives the ``412`` and nothing else. The proof that the failover happened is the
+        lease owner moving in :meth:`cluster_nodes`, not this call's return.
+
+        The long timeout is deliberate. The engine waits up to its fence timeout for the leadership
+        lock, well past this client's 5s default, and a client that gave up first would report an
+        unreachable engine for a release that may still commit. 120s is the engine's own request
+        deadline (``DEFAULT_REQUEST_TIMEOUT_SECONDS``), duplicated rather than imported for the same
+        ADR 0088 reason as the length bounds above."""
+        return _decode(
+            self._request(
+                "POST",
+                "/cluster/stepdown",
+                json={"force": force},
+                timeout=httpx.Timeout(120.0),
+            ),
+            ClusterStepdownResult,
+        )
 
     def integrity_check(self) -> IntegrityResult:
         # The DB integrity scan (PRAGMA quick_check) is exactly the call that runs long on a large
