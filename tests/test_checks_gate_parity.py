@@ -20,7 +20,6 @@ from messagefoundry.__main__ import main
 from messagefoundry.checks import run_checks
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_NO_ALERTS_TOML,
-    PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML,
     PHI_GATE_PROVISIONS_TOML,
 )
 
@@ -124,15 +123,19 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         # Pre-clear egress/retention/alerts so the ONLY remaining refusal is the ADR-0140 keyless-prod
         # branch — exit 2 here discriminates that branch (deleting it would flip this row to ALLOW),
         # unlike a bare single-flag config whose exit 2 the later open-egress gate would also produce.
-        # The pre-clearing bundle must be the one WITHOUT the at-rest acks: the two that carry both
-        # acks would provision away the single-flag refusal this row exists to assert. Alerts are
-        # cleared by that bundle's opt-out line, so this row takes no `[alerts]` table (a dotted
-        # `alerts.x` key and an `[alerts]` header in one document is a TOML parse error).
+        #
+        # THIS ROW MUST NEVER TAKE A SHARED PROVISIONS BUNDLE, and no subtraction of one works either.
+        # Its whole scenario is a MISSING second ack, and both bundles carry
+        # `allow_unencrypted_phi_under_strict_enforcement` — the very flag whose absence is under test.
+        # Taking one provisions the refusal away, so the row would pass on whatever gate fired next, or
+        # on none. It once took `PHI_GATE_PROVISIONS_TOML` and duplicated the dotted
+        # `security.allow_unencrypted_phi` key, which made the TOML unparseable; `TOMLDecodeError`
+        # subclasses `ValueError`, the config load returns 2, and the row expected 2 — so it passed
+        # without ever reaching this gate. Spell the four lines out here.
         "keyless-prod-phi-single-flag-refuses",
         "security.allow_unencrypted_phi = true\n"
-        + PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML
-        + "security.delete_message_bodies_after_days = 30\n"
-        + _RETENTION_DL,
+        "security.block_unlisted_outbound = true\n"
+        "security.delete_message_bodies_after_days = 30\n" + _RETENTION_DL + _ALERTS,
         "prod",
         False,
         2,

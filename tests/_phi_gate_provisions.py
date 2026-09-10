@@ -59,11 +59,13 @@ PHI_GATE_PROVISIONS_TOML = _EGRESS + _AT_REST_ACKS + _ALERTS_OPT_OUT
 #: distinction visible at the call site instead of leaving it to whoever debugs the TOML error.
 PHI_GATE_PROVISIONS_NO_ALERTS_TOML = _EGRESS + _AT_REST_ACKS
 
-#: Egress and alerts only, for a fixture whose SUBJECT is the at-rest gate itself. The other two
-#: bundles hand over both acks, which would provision away the very refusal such a test is asserting
-#: -- it would then pass on whatever gate fired next, or on none at all. Take this one and add the
-#: exact at-rest flags the scenario is about.
-PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML = _EGRESS + _ALERTS_OPT_OUT
+# NO BUNDLE SUITS A TEST WHOSE SUBJECT IS THE AT-REST GATE, and none should be added. Both bundles
+# carry `allow_unencrypted_phi_under_strict_enforcement`, so a test asserting that a MISSING ack
+# refuses cannot take either -- it would provision away its own scenario and pass on whatever gate
+# fired next. A third "no acks" bundle looks like the fix and is not: such a test still has to spell
+# out the exact at-rest flags it is measuring, so the bundle saves nothing and invites the next author
+# to reach for a shared constant here when the point is that this file's constants do not apply. See
+# the `keyless-prod-phi-single-flag-refuses` row in tests/test_checks_gate_parity.py.
 
 #: The same four, as the environment variables the loader reads. Kept beside the TOML deliberately:
 #: two spellings of one list drift, and a fixture that sets three of four gets a refusal whose message
