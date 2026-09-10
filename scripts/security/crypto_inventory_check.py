@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate.
 
 Enumerate every cryptographic call site across the five first-party roots (:data:`WALK_ROOTS`) via

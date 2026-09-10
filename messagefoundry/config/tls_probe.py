@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Startup TLS-floor probe against the declared front door (ASVS 12.1.1).
 
 **This module is the cell.** Off-loopback the browser/API TLS is terminated at the operator's reverse

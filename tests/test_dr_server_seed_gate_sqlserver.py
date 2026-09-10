@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live SQL Server proof of the #102 server-DB DR seed gate (ADR 0048), reproducing the REAL deployment
 path. On a genuinely fresh/unrestored 'mefor' store whose audit_log is NON-EMPTY-but-has-no-dr_backup-row
 (the bootstrap+login signature) + attestation → REFUSED (the data-loss case the config-only archive and

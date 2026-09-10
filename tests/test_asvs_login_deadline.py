@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.8 — every FAILED challenge answers at a deadline fixed before dispatch (BACKLOG #1140).
 
 The verb asks that valid users not be deducible from failed authentication challenges, *including by

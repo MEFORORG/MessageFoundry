@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#200 (ADR 0092) apply-findings coverage: the LIVE serve/reload connector-build sites stamp the derived
 posture (so the raw/MLLP/HTTP hop guards actually decide against the real posture on ``serve`` — not the
 unstamped fail-closed/no-op default), and the strict verify-off cells (MLLP/FTPS ``tls_verify=false``,

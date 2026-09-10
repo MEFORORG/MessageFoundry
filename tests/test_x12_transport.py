@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Raw-TCP X12 transport (transports/x12.py) — ISA/IEA framing over a real socket.
 
 The headline test is the ADR 0012 **build-check**: prove a raw-TCP ``receive()`` populates a

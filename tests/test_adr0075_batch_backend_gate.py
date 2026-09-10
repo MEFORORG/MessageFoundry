@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0075 AC-4 — backend gate + byte-identical-when-OFF sentinel + fail-closed activation.
 
 * With the flag OFF, the handoffs NEVER touch the batching machinery (``_render_batch`` is never

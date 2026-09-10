@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``AuthService.authenticate_oidc`` — the federated login path (ADR 0142, BACKLOG #274).
 
 Hermetic: no network. The ``id_token`` is minted with the shipped ``CompactJwtSigner`` over a

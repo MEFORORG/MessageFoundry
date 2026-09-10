@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The per-argument value classifier of ADR 0076 Amendment E (BACKLOG #237).
 
 Amendment E makes `templated` mode WRITABLE, and that is the whole reason it needed an ADR: E.5

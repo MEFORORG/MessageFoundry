@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection names cannot escape a /ui path segment (ASVS 1.2.2, BACKLOG #1107 clause 2).
 
 The apiclient half of this item shipped with `_seg` and is pinned by `tests/test_apiclient.py`. The

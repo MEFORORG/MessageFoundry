@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Base64-PDF end-to-end through the real engine (SYNTHETIC-TEST-PLAN §1.1.4-1.1.6).
 
 Building on the ED-OBX fixtures (test_ed_documents.py / generators.documents), these drive a synthetic

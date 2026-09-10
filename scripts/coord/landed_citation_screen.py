@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Ask the TREE whether landed code cites a backlog row's number (BACKLOG #1398).
 
 **The failure this exists to catch, measured.** On 2026-08-29 a dispatcher screened row #1300 as

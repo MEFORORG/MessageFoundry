@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """connections.toml read path (ADR 0007) — data-authored connections merge into the registry the
 code-first inbound()/outbound() populate, sharing every factory + guard."""
 

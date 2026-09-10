@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``mount_ui(app, deps)`` — the single entrypoint ``create_app`` calls to graft the web console onto
 the engine's FastAPI app, same-origin (Option B, ADR 0065).
 

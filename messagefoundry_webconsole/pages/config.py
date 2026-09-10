@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Config-deploy page for the /ui ops dashboard (ADR 0065).
 
 STRICTLY within BACKLOG #26 (no visual/template authoring): the only action is to **reload** the

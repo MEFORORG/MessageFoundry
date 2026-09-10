@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale config generation (B11) — the N-inbound code-first graph + the reload-latency
 connections.toml generator. Both desugar through the SAME inbound()/outbound() factories into a flat
 endpoint list (no "channel" element)."""

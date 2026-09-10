@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0041 D2 — dual-control config:deploy / POST /config/reload (BACKLOG #53).
 
 WHERE ``config_reload`` is in ``[approvals].operations`` and ``[approvals].enabled``, a non-dry-run

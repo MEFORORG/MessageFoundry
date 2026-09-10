@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR cold-seed (#61, ADR 0048): activation restore-verifies a #60 .mfbak backup via run_restore_verify
 and FAILS CLOSED before any VIP step when the archive can't be verified or the DEK is unavailable at the
 DR site — both the in-archive decrypt failure / KEY_MISMATCH (AC-9) and the KeyProvider-unreachable case

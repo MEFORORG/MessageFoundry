@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0066 §8 pooled-mode MERGE RIDER — the end-to-end ``RegistryRunner``-through-pooled proofs.
 
 These are the merge oracle for ``claim_mode=pooled`` (default-OFF). Pooled mode's correctness can

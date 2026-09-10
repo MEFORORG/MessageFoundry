@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An API request body refuses an unknown key; an API response body still tolerates one.
 
 BACKLOG #1109, the API limb of ASVS 2.2.1. Pydantic's default is ``extra="ignore"``, so every API

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #323 layer 3 — the ``[alerts]`` SMTP hop AUTHENTICATES the relay.
 
 ``smtplib.starttls()`` takes no context by default and falls back to ``ssl._create_stdlib_context``,

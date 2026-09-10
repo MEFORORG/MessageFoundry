@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The eight pre-commit gates whose CI mirror nothing else compares (BACKLOG #1395).
 
 ``tests/test_lint_scope_parity.py`` already pins hook-versus-CI equivalence for ``ruff-format``,

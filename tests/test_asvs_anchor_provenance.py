@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Does the born-wrong detector actually separate the two populations it claims to?
 
 BACKLOG #1344. The tool exists to split anchors a current-tree check renders identically: one whose

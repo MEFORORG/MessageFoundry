@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A handoff pointer must not keep reading as true after the file it names moves on.
 
 ``seat.ps1 -Declare -Handoff <path>`` records path, bytes, sha256 and pointedAt, and sets

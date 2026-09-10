@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DATABASE connector **live smoke** against a real SQL Server (ADR 0003).
 
 The unit suite ([test_database_transport.py](test_database_transport.py)) fakes the pool, so it covers

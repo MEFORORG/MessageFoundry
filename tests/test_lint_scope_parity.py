@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The pre-commit hooks and the CI gates must be the SAME linter -- same files, same version.
 
 They did not, and the divergence was silent in the worst direction: the hooks were BROADER than CI.

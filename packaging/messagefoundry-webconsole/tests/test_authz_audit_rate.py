@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 16.3.2 (BACKLOG #1197) -- the audit-row RATE a polling console produces under audit_all.
 
 WHY. The all-decisions clause was traded against a "flooding the audit log" cost that ADR 0118

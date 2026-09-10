@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Spreadsheet formula-injection neutralization (CWE-1236 / ASVS 1.2.10) — the canonical rule.
 
 Excel/Sheets/LibreOffice re-parse a CSV cell on import and *execute* it when it begins with ``=``,

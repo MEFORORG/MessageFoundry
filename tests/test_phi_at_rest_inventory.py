@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Doc-vs-code drift guard for the ``docs/PHI.md`` at-rest inventory (ASVS 14.1.1 / 14.1.2 / 14.2.4).
 
 For these three requirements the **shipped document IS the control**: 14.1.1 wants every piece of

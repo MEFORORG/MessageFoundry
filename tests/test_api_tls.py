@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-13a — in-process API TLS (ADR 0002): the SSL-context builder, ApiSettings validation, and the
 serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is configured)."""
 

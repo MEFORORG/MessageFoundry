@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 14.3.1 — a session that ends must not leave PHI rendered in the tab.
 
 Explicit logout already revoked server-side and deleted the cookie, but nothing emitted
