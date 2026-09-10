@@ -29242,9 +29242,11 @@ it offers the control rather than offering it everywhere.
 
 ### What NOT to build here
 
-The VIP fields. `GET /cluster/status` has no `vip` member and the engine binds no address -- that half
-of ADR 0056 is unbuilt and paused (see #1494). A page that renders a VIP owner would be rendering a
-field that does not exist.
+The VIP fields. `GET /cluster/status` has no `vip` member, and the engine binds no address. That half
+of ADR 0056 is no longer on hold. Its `[cluster.vip]` settings block and load-time refusals are built,
+but nothing binds, releases or reports the address yet. So a page that renders a VIP owner would render
+a field that does not exist. The 2026-09-10 ruling that lifted the hold is recorded once, with what
+anchors it, in the status block of [ADR 0056](adr/0056-engine-managed-vip-failover.md).
 
 ---
 
