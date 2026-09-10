@@ -436,7 +436,13 @@ acceptance*, and records what the engine-side controller must not re-derive.
   RFC 826 that updates the gateway's entry and any host already caching the VIP. **Nobody has verified
   that Windows puts the VIP in the sender field**; that needs a capture on a Windows Server node before
   the controller relies on `arp`. The helper refuses to announce an address the node does not hold.
-- **Signing and versioning.** `.github/workflows/net-helper.yml` builds on every change to the helper. On
+- **Runtime.** The helper targets .NET 10, the long-term support release serviced until November 2028. The
+  owner ruled on 2026-09-10 that it pin a supported .NET, and not .NET 8 or 9, which leave support in
+  November 2026. `dotnet publish` compiles it with NativeAOT into one native executable, so the server
+  installs no .NET runtime. Nothing unpacks into a temporary directory at launch, which is the escalation
+  route a self-extracting binary would open under an administrator's token. That property is why the helper
+  is C# and not a frozen Python script, so it must never ship as a self-extracting single file.
+- **Signing and versioning.** `.github/workflows/net-helper.yml` publishes on every change to the helper. On
   `main` only, and only when the certificate secret is present, it signs with `signtool` and an RFC 3161
   timestamp. Without the secret the build passes unsigned. The csproj `<Version>` is the one version
   source, and `ping` reports it. The workflow is not a required check.
