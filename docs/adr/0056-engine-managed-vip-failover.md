@@ -503,6 +503,36 @@ acceptance*, and records what the engine-side controller must not re-derive.
   timestamp. Without the secret the build passes unsigned. The csproj `<Version>` is the one version
   source, and `ping` reports it. The workflow is not a required check.
 
+### The helper ships beside the engine wheel, never inside it (2026-09-10)
+
+`pip install messagefoundry` does not install the helper, and bundling it into the wheel would be wrong.
+Four reasons, each checked against this tree:
+
+1. The engine wheel is pure Python. Its file name ends `py3-none-any`, so one wheel serves Windows, Linux
+   and macOS. Hatchling packs only the `messagefoundry/` package, and the sdist's `only-include` in
+   `pyproject.toml` names that package and its metadata files. A `win-x64` executable inside would force
+   a platform-tagged wheel, or ship a Windows binary to Linux and macOS users.
+2. `pip` cannot perform the install. The README's steps run elevated: they register the helper as a
+   LocalSystem service, write a config file naming its address, interface, mask and the engine's service
+   account, and keep the install folder writable only by administrators. The helper builds its pipe ACL
+   from that account. `pip` unpacks files as the user who runs it. Installing a wheel runs none of the
+   package's code, so it creates no service, sets no ACL and elevates nothing.
+3. A `requireAdministrator` binary in `site-packages` would be an escalation route. Whoever can write the
+   virtual environment could replace a binary that later runs elevated. That is the flaw class that made
+   this helper C# and not a frozen Python script: an elevated process running code from a folder a
+   less-privileged account can write.
+4. Bundling buys no signature check. An Authenticode signature lives inside the executable, so it would
+   survive being zipped into a wheel. But `pip` verifies no Authenticode signature.
+
+So the helper ships out of band, as its own release artifact, and an administrator installs it into a
+system folder (the README uses `C:\Program Files\MessageFoundry\net-helper\`). `pip install
+messagefoundry` stays pure Python and cross-platform. The design already allows this split. The wire
+contract is the named pipe, so the engine-side controller will need no path to the binary and will import
+nothing from it.
+
+**No release job publishes the helper yet.** The `net-helper` workflow uploads a build artifact that it
+keeps for 14 days, and that is not a release.
+
 ## Observability
 
 Surface VIP ownership on the existing read-only cluster API ([ADR 0008](0008-cluster-observability-api.md)):
