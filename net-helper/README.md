@@ -4,7 +4,7 @@
 # mefor-net-helper
 
 `mefor-net-helper.exe` binds and releases one floating IPv4 address (a VIP) for a MessageFoundry cluster
-node. It is the privileged helper that [ADR 0056](../../docs/adr/0056-engine-managed-vip-failover.md)
+node. It is the privileged helper that [ADR 0056](../docs/adr/0056-engine-managed-vip-failover.md)
 specifies. The engine runs as a least-privileged account, and moving an address needs administrator
 rights. This small program holds those rights so the engine does not have to.
 
@@ -58,7 +58,7 @@ mask. The log records those fields, the caller's account and the outcome, and no
 You need Windows, the .NET 10 SDK, and the Visual Studio C++ build tools, which NativeAOT uses to link.
 
 ```powershell
-dotnet publish packaging/net-helper/MeforNetHelper.csproj --configuration Release --output packaging/net-helper/out
+dotnet publish net-helper/MeforNetHelper.csproj --configuration Release --output net-helper/out
 ```
 
 `dotnet publish` compiles the helper with NativeAOT into one native executable, so the server needs no .NET
@@ -75,7 +75,7 @@ command, then checks that the binary requires administrator and loads no DLL fro
 Run these steps in an elevated PowerShell on each cluster node.
 
 1. Install the engine's service first, so its account exists. By default that account is
-   `NT SERVICE\MessageFoundry` ([SERVICE.md](../../docs/SERVICE.md), DEPLOY-1).
+   `NT SERVICE\MessageFoundry` ([SERVICE.md](../docs/SERVICE.md), DEPLOY-1).
 2. Copy `mefor-net-helper.exe` and `mefor-net-helper.conf.example` from the build output to
    `C:\Program Files\MessageFoundry\net-helper\`. Only
    administrators can write there, and it must stay that way: anyone who can write that folder can replace

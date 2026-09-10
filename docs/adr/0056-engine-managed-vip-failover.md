@@ -455,7 +455,7 @@ exactly as today.
 
 ### The helper as built (2026-09-10)
 
-The helper lives in `packaging/net-helper/`, and its [README](../../packaging/net-helper/README.md) is the
+The helper lives in `net-helper/`, and its [README](../../net-helper/README.md) is the
 operator's reference. This subsection resolves the "Helper packaging" item under *To resolve on
 acceptance*, and records what the engine-side controller must not re-derive.
 

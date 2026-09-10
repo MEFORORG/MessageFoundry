@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 name: net-helper
 
-# Publishes mefor-net-helper.exe, the privileged helper ADR 0056 specifies (packaging/net-helper/), with
+# Publishes mefor-net-helper.exe, the privileged helper ADR 0056 specifies (net-helper/), with
 # NativeAOT, and signs it when a signing credential is configured. This is the repository's first compiled
 # artifact and first signing step, so each choice is written down here.
 #
@@ -29,14 +29,14 @@ name: net-helper
 on:
   pull_request:
     paths:
-      - "packaging/net-helper/**"
-      - "!packaging/net-helper/README.md"
+      - "net-helper/**"
+      - "!net-helper/README.md"
       - ".github/workflows/net-helper.yml"
   push:
     branches: [main]
     paths:
-      - "packaging/net-helper/**"
-      - "!packaging/net-helper/README.md"
+      - "net-helper/**"
+      - "!net-helper/README.md"
       - ".github/workflows/net-helper.yml"
   workflow_dispatch:
 
@@ -60,8 +60,8 @@ jobs:
       run:
         shell: pwsh
     env:
-      # packaging/net-helper/.gitignore ignores this directory, and the README's build command uses it too.
-      HELPER_OUT: packaging/net-helper/out
+      # net-helper/.gitignore ignores this directory, and the README's build command uses it too.
+      HELPER_OUT: net-helper/out
       # A step's `if:` cannot read the secrets context, so only whether the secret is set reaches this
       # variable, as "true" or "false". The secret itself does not.
       HAS_SIGNING_CREDENTIAL: ${{ secrets.NET_HELPER_SIGNING_PFX_BASE64 != '' }}
@@ -82,7 +82,7 @@ jobs:
         run: |
           # Publish, not build: only publish runs the NativeAOT compiler. Build output needs the .NET runtime
           # installed and is not the binary to ship.
-          dotnet publish packaging/net-helper/MeforNetHelper.csproj --configuration Release --output $env:HELPER_OUT
+          dotnet publish net-helper/MeforNetHelper.csproj --configuration Release --output $env:HELPER_OUT
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check the binary requires administrator
