@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# mefor-net-helper scope. Copy this file to mefor-net-helper.conf beside mefor-net-helper.exe and edit it.
+# The helper reads it once at start. It refuses to start if a key is missing, unknown, repeated or invalid,
+# and it refuses any request naming a different address, interface or mask. Keep this file where only
+# administrators can write.
+
+# The floating IPv4 address (the VIP), in dotted decimal.
+address = 192.0.2.50
+
+# This node's adapter, exactly as the Name column of Get-NetAdapter shows it. Matching is case-sensitive.
+interface = Ethernet0
+
+# The VIP's netmask, in dotted decimal. It must match the engine's [cluster.vip] setting.
+mask = 255.255.255.0
+
+# The engine's service account: the only account other than an elevated administrator that may connect.
+# An account name or a SID. The account must exist before the helper starts.
+client_account = NT SERVICE\MessageFoundry

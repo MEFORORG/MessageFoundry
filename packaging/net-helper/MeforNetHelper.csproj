@@ -1,0 +1,39 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      .NET Framework 4.8 is part of Windows Server 2022 and 2025, and Windows Update services it with
+      the OS. So the helper needs no runtime installed beside it, and it is an ordinary executable:
+      nothing unpacks into a temporary directory at launch, which is the escalation route a frozen or
+      self-extracting binary would open under an administrator's token.
+    -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>mefor-net-helper</AssemblyName>
+    <RootNamespace>MessageFoundry.NetHelper</RootNamespace>
+    <!-- The one version source. `ping` reports it, and the engine-side controller will check it. -->
+    <Version>0.1.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Company>MessageFoundry Organization</Company>
+    <Product>MessageFoundry</Product>
+    <Copyright>Copyright (C) 2026 MessageFoundry Organization and contributors</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- In-box JavaScriptSerializer, used only for request JSON. No NuGet packages. -->
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Every build output is an install bundle: the binary plus the configuration to copy and edit. -->
+    <None Update="mefor-net-helper.conf.example" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
