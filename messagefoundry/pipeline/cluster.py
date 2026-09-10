@@ -64,7 +64,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -134,6 +134,77 @@ class ClusterMember:
     # single-node self-entry) stay valid; the DB coordinators read the durable per-node columns.
     acquire_delay_seconds: float = 0.0
     promotable: bool = True
+    # Whether ``last_seen`` passed :func:`heartbeat_is_fresh` at the read: the same test the derived
+    # ``is_leader`` ANDs with the flag, published so "is this sibling alive" reuses it rather than
+    # picking a second window (BACKLOG #1509). Defaults to False so a coordinator that never sets it
+    # makes the stepdown refuse rather than count a node it did not check. The single-node self-entry
+    # leaves it False: no heartbeat was read, and the stepdown refuses that deployment earlier.
+    fresh: bool = False
+
+
+def heartbeat_is_fresh(last_seen: float | None, now: float, node_timeout_seconds: float) -> bool:
+    """Whether a ``nodes`` row heartbeated within ``node_timeout_seconds`` of ``now``.
+
+    The one freshness rule. It decides the derived leader and, since BACKLOG #1509, whether a stepdown
+    is refused, so it is applied in one place, :func:`members_from_node_rows`, which both DB
+    coordinators call. Upper bound only, so a row stamped by a fast clock stays fresh for longer;
+    :meth:`DbCoordinator.cluster_members` spells out what that costs."""
+    return last_seen is not None and (now - last_seen) <= node_timeout_seconds
+
+
+def members_from_node_rows(
+    rows: Sequence[Any], now: float, node_timeout_seconds: float
+) -> list[ClusterMember]:
+    """Turn ``nodes`` rows into :class:`ClusterMember` entries, for both DB coordinators.
+
+    Shared for the reason :func:`stepdown_pause_seconds` is: the freshness verdict, the derived-leader
+    pick that reads it and the published ``fresh`` field have to change together, and a per-class copy
+    is two files that can drift apart with nothing failing. The coordinators differ only in the SELECT
+    that fetches ``rows``; :meth:`DbCoordinator.cluster_members` explains the derivation. ``pid`` and
+    the two flags are coerced as the SQL Server copy already did, which changes nothing on Postgres."""
+    fresh = {
+        r["node_id"]: heartbeat_is_fresh(r["last_seen"], now, node_timeout_seconds) for r in rows
+    }
+    # The single derived leader is the freshest row that is both flagged and fresh: the one still
+    # heartbeating. A stale ex-leader's flag fails the freshness test, and a not-yet-cleared ex-leader
+    # that overlaps a new leader loses to the new leader's more recent last_seen.
+    leader_node_id: str | None = None
+    leader_last_seen: float = -1.0
+    for r in rows:
+        if bool(r["is_leader"]) and fresh[r["node_id"]] and r["last_seen"] > leader_last_seen:
+            leader_last_seen = r["last_seen"]
+            leader_node_id = r["node_id"]
+    return [
+        ClusterMember(
+            node_id=r["node_id"],
+            host=r["host"],
+            pid=int(r["pid"]) if r["pid"] is not None else None,
+            started_at=r["started_at"],
+            last_seen=r["last_seen"],
+            status=r["status"],
+            is_leader=(r["node_id"] == leader_node_id),
+            acquire_delay_seconds=float(r["acquire_delay_seconds"]),
+            promotable=bool(r["promotable"]),
+            fresh=fresh[r["node_id"]],
+        )
+        for r in rows
+    ]
+
+
+def has_promotable_sibling(members: Iterable[ClusterMember], node_id: str) -> bool:
+    """Whether some node other than ``node_id`` could take the lease if ``node_id`` stepped down.
+
+    The check behind the stepdown's no-promotable-sibling refusal (BACKLOG #1509), and the value its
+    ``new_leader_eligible`` reports. A member counts when it is another node, ``active`` (not a
+    clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096) and ``fresh``. No window is chosen
+    here: ``fresh`` is the rule :meth:`ClusterCoordinator.cluster_members` already applied.
+
+    **A point-in-time read, not a promise.** A sibling that dies after the read still counted, and
+    ``acquire_delay_seconds`` is not weighed, so a sibling handicapped past the stepdown pause counts
+    too and the drained node can win its own lease back (BACKLOG #1507)."""
+    return any(
+        m.node_id != node_id and m.status == "active" and m.promotable and m.fresh for m in members
+    )
 
 
 _DEMOTE_BUDGET_FRACTION = 0.5
@@ -864,14 +935,19 @@ class DbCoordinator:
             "acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
         )
         now = time.time()
+        # One freshness verdict per row, taken once, so the derived leader and the published ``fresh``
+        # flag cannot disagree about the same row.
+        fresh = {
+            r["node_id"]: heartbeat_is_fresh(r["last_seen"], now, self._node_timeout_seconds)
+            for r in rows
+        }
         # First pass: which rows carry a *fresh* leader flag, and which of those is the freshest. The
         # freshest fresh-flagged row is the single derived leader (it is the one still heartbeating).
         leader_node_id: str | None = None
         leader_last_seen: float = -1.0
         for r in rows:
             last_seen = r["last_seen"]
-            fresh = last_seen is not None and (now - last_seen) <= self._node_timeout_seconds
-            if r["is_leader"] and fresh and last_seen > leader_last_seen:
+            if r["is_leader"] and fresh[r["node_id"]] and last_seen > leader_last_seen:
                 leader_last_seen = last_seen
                 leader_node_id = r["node_id"]
         members: list[ClusterMember] = []
@@ -890,6 +966,7 @@ class DbCoordinator:
                     is_leader=(r["node_id"] == leader_node_id),
                     acquire_delay_seconds=float(r["acquire_delay_seconds"]),
                     promotable=bool(r["promotable"]),
+                    fresh=fresh[r["node_id"]],
                 )
             )
         return members

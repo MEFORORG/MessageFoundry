@@ -341,8 +341,9 @@ to standby: a standby acquires the expired lease on its next heartbeat and promo
 node you drained stays up, heartbeating, ready to take leadership back later.
 
 ```
-POST /cluster/stepdown        # body: {} — there are no options
-{ "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5 }
+POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last promotable node
+{ "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5,
+  "new_leader_eligible": true, "force": false }
 ```
 
 - **Permission:** `cluster:control`, a dedicated capability held by **Administrator only** and never
@@ -352,14 +353,30 @@ POST /cluster/stepdown        # body: {} — there are no options
   tick can move leadership in between, so a "was this node the leader?" check made first could report a
   failover that released nothing. The same returned value is what the audit row records.
 - **Statuses:** `400` when the deployment is **not clustered** — `[cluster]` disabled, or a store with no
-  cluster coordinator — so there is no lease to release; `409` when this node is not the leader — resolve
-  the leader from `GET /cluster/nodes` and call it there; `403` on a missing permission, a stale step-up
-  or an unsatisfied second factor; `503` when the engine is not started, or when the drain could not be
-  achieved (see the two `503` bullets below).
-- **`400` does not mean "one node".** The gate reads whether clustering is *enabled*, not how many nodes
-  are live, so a clustered install that happens to be running one node accepts the call and goes
-  leaderless for the pause. Keying the refusal on whether a promotable sibling actually exists is
-  [BACKLOG #1509](BACKLOG.md); until then, read `GET /cluster/nodes` first.
+  cluster coordinator — so there is no lease to release; `412` when no other node could take the lease
+  (next bullet); `409` when this node is not the leader — resolve the leader from `GET /cluster/nodes`
+  and call it there; `403` on a missing permission, a stale step-up or an unsatisfied second factor;
+  `503` when the engine is not started, when the membership read fails, or when the drain could not be
+  achieved (see the `503` bullets below).
+- **A `412` means nothing else could take over.** Before it touches leadership, the node reads cluster
+  membership once. It looks for another node that is `active`, `promotable`, and has heartbeated within
+  `node_timeout_seconds`, the same freshness test `GET /cluster/nodes` uses to name a leader and
+  reports for each node as `fresh`. If it
+  finds none, stepping down would leave no node able to take the lease, so it refuses and changes
+  nothing. That covers a clustered install running one node, and one whose only sibling is
+  `promotable = false` or has stopped heartbeating. The check is a snapshot: a sibling that dies just
+  after it still counted.
+- **`force` drains the node anyway, and waives nothing else.** Send `{"force": true}` to step down the
+  last promotable node on purpose. It does not turn a `400` or a `409` into a success. **It does not keep
+  the node drained, either.** If no other node takes the lease, the drained node renews it on its first
+  tick after the two-heartbeat pause described below. To keep leader work stopped for a whole
+  maintenance window, stop the service.
+- **`new_leader_eligible` is what that one membership read found:** whether another promotable node had
+  a fresh heartbeat. On a `200` it is `false` only when you sent `force`. It names no successor, because
+  at the moment of release no standby has taken the lease yet.
+- **A `503` reading `members-unreadable` means the membership read failed.** The node did not start the
+  stepdown, so nothing was released or demoted. `force` does not skip this read. Retry, and if it
+  repeats, look at the store connection.
 - **A `503` reading `lock-timeout` means nothing happened at all.** The node's leadership lock was still
   held when `leader_fence_timeout_seconds` ran out, so no lease row was read or written and nothing was
   demoted. This one says nothing about who leads: the endpoint takes no leader check before the
@@ -393,7 +410,9 @@ POST /cluster/stepdown        # body: {} — there are no options
   - **A retry re-sends the write, and answers `409` for as long as this node is not the leader.** The
     first call cleared this node's in-memory leader flag before it wrote, so every later call reports
     `was_leader=false`, which the endpoint turns into `409`. That holds whatever the lease row says:
-    the row is not what decides the status code here.
+    the row is not what decides the status code here. A retry reaches the write only after the
+    membership read and the `412` check let it through, so while the store is still failing it
+    answers `members-unreadable` and re-sends nothing.
   - **Only a maintenance tick can make this node leader again, and retrying prevents one.** The flag is
     set in exactly one place, when a tick's claim succeeds. A tick cannot claim while the stepdown
     pause holds — it returns not-held at the pause gate before touching the database — and **each retry
@@ -411,17 +430,21 @@ POST /cluster/stepdown        # body: {} — there are no options
   - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
     code, is what tells you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
-  `{node_id, was_leader, released_at}` — cluster metadata only, never message content. **Every call the
-  handler completes is audited under that name, the `409` included**, so count drains by `was_leader`
-  rather than by the action name. A `409` writes a row reading `was_leader: false, released_at: null`,
-  and that row IS the refusal — which is why the `409` needs no separate denied row. The refusals the
-  handler reaches before it can return (`400`, both `503`s) write `cluster_stepdown_denied` instead,
-  carrying the reason — `not-clustered`, `lock-timeout` or `release-unconfirmed` — so the two `503`s
-  never read as one condition. That denied row is best-effort: a `release-unconfirmed` comes from a
-  store that has just failed, so the endpoint keeps the `503` and its remedy rather than losing both to
-  an audit write that could not land either way.
-- **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
-  `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
+  `{node_id, was_leader, released_at, new_leader_eligible, force}` — cluster metadata only, never
+  message content. A forced drain of the last node therefore reads `force: true` with
+  `new_leader_eligible: false`. **Every call the handler completes is audited under that name, the
+  `409` included**, so count drains by `was_leader` rather than by the action name. A `409` writes a
+  row reading `was_leader: false, released_at: null`, and that row IS the refusal — which is why the
+  `409` needs no separate denied row. The refusals the handler reaches before it can return (`400`,
+  `412` and all three `503`s) write `cluster_stepdown_denied` instead, carrying the reason —
+  `not-clustered`, `no-promotable-sibling`, `members-unreadable`, `lock-timeout` or
+  `release-unconfirmed` — so no two of them read as one condition. That denied row is best-effort: a
+  `members-unreadable` or `release-unconfirmed` comes from a store that has just failed, so the endpoint
+  keeps the `503` and its remedy rather than losing both to an audit write that could not land either
+  way.
+- **Who leads next is not reported.** `new_leader_eligible` says only that some node could. At the
+  instant of release no standby has acquired yet, so poll `GET /cluster/nodes` and watch `lease_owner`
+  move rather than expecting the call to name a successor.
 
 **In-flight work is not drained first.** Stepdown releases leadership; it does not quiesce the graph.
 Rows already claimed on the old primary are recovered by the new one through the ordinary lease/reclaim
@@ -430,7 +453,7 @@ path, so plan the switchover the same way you plan a restart.
 **The drained node stands down briefly before it contends again.** For two `heartbeat_seconds` after a
 stepdown it declines to claim or renew, so a sibling wins the expired lease rather than the node you
 just drained renewing itself straight back. On a cluster with no other promotable node that window is
-leaderless, which is the honest consequence of asking the only eligible node to step down.
+leaderless, which is why such a call is refused with `412` unless you send `force`.
 
 **Two known limits, so you can plan around them rather than discover them.** A sibling whose
 `acquire_delay_seconds` is longer than two heartbeats is still handicapped out when the pause ends, and

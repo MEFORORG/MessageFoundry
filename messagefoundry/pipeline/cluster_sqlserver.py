@@ -58,6 +58,7 @@ from messagefoundry.pipeline.cluster import (
     acquire_leadership_lock,
     default_node_id,
     lease_release_unconfirmed,
+    members_from_node_rows,
     stepdown_pause_seconds,
 )
 from messagefoundry.redaction import safe_exc
@@ -266,35 +267,14 @@ class SqlServerCoordinator:
     # --- observability -------------------------------------------------------
 
     async def cluster_members(self) -> list[ClusterMember]:
-        """One :class:`ClusterMember` per node; ``is_leader`` derived as the single freshest fresh
-        ``is_leader``-flagged node (so a crashed ex-leader's stale flag is never the live leader)."""
+        """One :class:`ClusterMember` per node. Built by the shared ``members_from_node_rows``, so the
+        freshness verdict, the derived leader and ``fresh`` match ``DbCoordinator.cluster_members``
+        exactly: a crashed ex-leader's stale flag is never the live leader on either backend."""
         rows = await self._store._fetchall(
             "SELECT node_id, host, pid, started_at, last_seen, status, is_leader,"
             " acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
         )
-        now = time.time()
-        leader_node_id: str | None = None
-        leader_last_seen: float = -1.0
-        for r in rows:
-            last_seen = r["last_seen"]
-            fresh = last_seen is not None and (now - last_seen) <= self._node_timeout_seconds
-            if bool(r["is_leader"]) and fresh and last_seen > leader_last_seen:
-                leader_last_seen = last_seen
-                leader_node_id = r["node_id"]
-        return [
-            ClusterMember(
-                node_id=r["node_id"],
-                host=r["host"],
-                pid=int(r["pid"]) if r["pid"] is not None else None,
-                started_at=r["started_at"],
-                last_seen=r["last_seen"],
-                status=r["status"],
-                is_leader=(r["node_id"] == leader_node_id),
-                acquire_delay_seconds=float(r["acquire_delay_seconds"]),
-                promotable=bool(r["promotable"]),
-            )
-            for r in rows
-        ]
+        return members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
         """The authoritative lease state ``(owner, DB-clock expiry)`` for the observability API;

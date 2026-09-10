@@ -2038,6 +2038,9 @@ async def test_db_coordinator_cluster_members_freshness_filters_stale_leader(sto
         assert set(members) == {"node-fresh", "node-crashed"}
         # The stale ex-leader's is_leader flag is filtered out (not fresh) → it is NOT a reported leader.
         assert members["node-crashed"].is_leader is False
+        # ...and the same verdict is published, which the stepdown's sibling check reads (BACKLOG #1509).
+        assert members["node-crashed"].fresh is False
+        assert members["node-fresh"].fresh is True
     finally:
         await coord.stop()
         await _drop_nodes(store)
