@@ -8,8 +8,7 @@ node. It is the privileged helper that [ADR 0056](../docs/adr/0056-engine-manage
 specifies. The engine runs as a least-privileged account, and moving an address needs administrator
 rights. This small program holds those rights so the engine does not have to.
 
-Nothing in the engine calls the helper yet; the engine-side controller is a later slice. Engine-managed
-VIP is Windows-only.
+Nothing in the engine calls the helper yet; the engine-side controller is a later slice.
 
 ## It does four things, for one caller, for one address
 
@@ -30,6 +29,9 @@ phrase and never a stack trace. Addresses and masks are dotted decimal, such as 
 The pipe serves one caller at a time. A caller that tries to connect while another is being served is
 refused; it should wait with `WaitNamedPipe` and try again. Each caller has 5 seconds to send its request,
 and 5 seconds to close its end after reading the answer.
+
+A caller connects with the identification impersonation level. The helper needs to know who the caller
+is, but it never acts as the caller.
 
 ## Two properties are the reason this binary exists
 
@@ -72,65 +74,171 @@ command, then checks that the binary requires administrator and loads no DLL fro
 
 ## Install it
 
-Run these steps in an elevated PowerShell on each cluster node.
+These steps are what a Windows administrator would do once the engine calls the helper.
+
+### `pip install messagefoundry` does not install the helper
+
+The helper would ship as its own release artifact, beside the engine's wheel. An administrator would
+install it by hand.
+[ADR 0056](../docs/adr/0056-engine-managed-vip-failover.md#the-helper-ships-beside-the-engine-wheel-never-inside-it-2026-09-10)
+records why it never ships inside the wheel. No release publishes the helper yet, so for now
+[build it](#build-it) and install that output.
+
+### Only Windows nodes can use it
+
+Engine-managed VIP is Windows-only, and so is the helper. A Linux or containerized deployment keeps an
+external floating VIP or load balancer in front of the cluster instead. That path stays fully supported,
+and [CLUSTERING.md](../docs/CLUSTERING.md#client-reconnect--a-floating-vip--lb-health-check-is-required)
+describes it.
+
+### Keep the helper's files where only administrators can write
+
+The steps below run the helper as LocalSystem. Anyone who can replace its binary, its configuration or
+the `nssm.exe` that starts it would gain those rights. That is also why the helper never goes into a
+Python `site-packages` folder, as
+[ADR 0056](../docs/adr/0056-engine-managed-vip-failover.md#the-helper-ships-beside-the-engine-wheel-never-inside-it-2026-09-10)
+explains.
+
+So put the binary, its configuration, `nssm.exe` and the log in
+`C:\Program Files\MessageFoundry\net-helper\`. By default an unprivileged account cannot write under
+Program Files, and a new folder inherits that. The per-node steps check it.
+
+Keep them out of `C:\ProgramData\MessageFoundry`. The engine's installer gives the engine's account
+modify rights on that folder and everything in it, including `bin` and `logs`. `Set-SecureDataDirAcl` in
+[install-service.ps1](../scripts/service/install-service.ps1) grants them. So the engine's account could
+rewrite a log or replace an `nssm.exe` kept there.
+
+### Prepare the files once, on any machine
+
+1. [Build the helper](#build-it).
+2. Download the NSSM archive that `$NssmUrl` names in
+   [install-service.ps1](../scripts/service/install-service.ps1). That script's `Resolve-Nssm` uses the
+   same archive.
+3. Check it: `(Get-FileHash <archive>).Hash -eq '<the $NssmSha256 value>'` must print `True`.
+4. Extract the `nssm.exe` under `win64` from the archive into the build output folder.
+5. In the build output folder, copy `mefor-net-helper.conf.example` to `mefor-net-helper.conf`.
+6. Set `address` and `mask` in it, as
+   [the configuration section](#the-configuration-file-fixes-the-address-interface-and-mask) describes.
+   Both are the same on every node.
+
+### Then run these steps in an elevated PowerShell on each cluster node
 
 1. Install the engine's service first, so its account exists. By default that account is
-   `NT SERVICE\MessageFoundry` ([SERVICE.md](../docs/SERVICE.md), DEPLOY-1).
-2. Copy `mefor-net-helper.exe` and `mefor-net-helper.conf.example` from the build output to
-   `C:\Program Files\MessageFoundry\net-helper\`. Only
-   administrators can write there, and it must stay that way: anyone who can write that folder can replace
-   the binary or its configuration.
-3. In that folder, rename `mefor-net-helper.conf.example` to `mefor-net-helper.conf`.
-4. Set `address` and `mask` to the same values as the engine's `[cluster.vip]` settings.
-5. Set `interface` to the adapter name exactly as the `Name` column of `Get-NetAdapter` shows it. The
-   match is case-sensitive.
-6. Set `client_account` as described in the next section.
-7. Do not add the VIP to the adapter yourself, and never as a persistent address. The helper adds it to the
-   active store only, so a node that reboots does not hold the VIP until it wins leadership again.
-8. Install the helper as a service that runs as LocalSystem. With NSSM:
+   `NT SERVICE\MessageFoundry` ([SERVICE.md](../docs/SERVICE.md#run-as-a-least-privilege-account-deploy-1)).
+2. Create the helper's folder, and keep its path in `$dir`:
 
    ```powershell
-   nssm install MessageFoundryNetHelper "C:\Program Files\MessageFoundry\net-helper\mefor-net-helper.exe"
-   nssm set MessageFoundryNetHelper AppStdout "C:\ProgramData\MessageFoundry\logs\net-helper.log"
-   nssm set MessageFoundryNetHelper AppStderr "C:\ProgramData\MessageFoundry\logs\net-helper.log"
-   nssm set MessageFoundryNetHelper Start SERVICE_AUTO_START
-   nssm start MessageFoundryNetHelper
+   $dir = "C:\Program Files\MessageFoundry\net-helper"
+   New-Item -ItemType Directory $dir
    ```
 
-9. Read the log. A good start ends with `listening on \\.\pipe\mefor-net-helper`. A line starting
-   `startup refused` names what to fix.
-10. Check that the pipe answers:
+3. Copy `mefor-net-helper.exe`, `mefor-net-helper.conf` and `nssm.exe` from the prepared build output into
+   `$dir`.
+4. Check the access list: `icacls $dir /T`. Only administrators, `SYSTEM`, `TrustedInstaller` and
+   `CREATOR OWNER` may hold write rights: `(F)`, `(M)` or `(W)`. `BUILTIN\Users` should show `(RX)`.
+5. In `$dir\mefor-net-helper.conf`, set `interface` and `client_account` for this node.
+6. Register the helper as a service with that `nssm.exe`, logging beside the binary:
 
-    ```powershell
-    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'mefor-net-helper', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None, [System.Security.Principal.TokenImpersonationLevel]::Identification)
-    $pipe.Connect(5000)
-    $request = [System.Text.Encoding]::UTF8.GetBytes("{`"op`":`"ping`"}`n")
-    $pipe.Write($request, 0, $request.Length)
-    [System.IO.StreamReader]::new($pipe).ReadLine()
-    $pipe.Dispose()
-    ```
+   ```powershell
+   & "$dir\nssm.exe" install MessageFoundryNetHelper "$dir\mefor-net-helper.exe"
+   & "$dir\nssm.exe" set MessageFoundryNetHelper AppStdout "$dir\net-helper.log"
+   & "$dir\nssm.exe" set MessageFoundryNetHelper AppStderr "$dir\net-helper.log"
+   & "$dir\nssm.exe" set MessageFoundryNetHelper Start SERVICE_AUTO_START
+   ```
 
-    It prints `{"ok":true,"version":"0.1.0"}`.
+7. Confirm the service would start that copy of NSSM.
+   `(Get-CimInstance Win32_Service -Filter "Name='MessageFoundryNetHelper'").PathName` must name
+   `$dir\nssm.exe`.
+8. Start it: `& "$dir\nssm.exe" start MessageFoundryNetHelper`.
+9. Run [the ping check](#a-ping-proves-the-helper-is-up-but-not-that-a-bind-would-work).
+10. Read `$dir\net-helper.log`. A good start shows `listening on \\.\pipe\mefor-net-helper`, followed by
+    the ping check's line. A line with `startup refused` names what to fix. The helper then exits 2 if it
+    refused its configuration, or 3 if another process holds the pipe name.
+
+Do not add the VIP to the adapter yourself, and never as a persistent address. The helper adds it to the
+active store only, so a node that reboots would not hold the VIP until it wins leadership again.
 
 The helper's manifest requires administrator rights. Started by an account without them, it fails at once
 with `ERROR_ELEVATION_REQUIRED` (740).
 
-## Make the pipe reachable by the engine's service account
+### The configuration file fixes the address, interface and mask
 
-The engine can reach the helper only when `client_account` names the account the engine service runs as.
+At start, the helper reads `mefor-net-helper.conf` from the folder that holds `mefor-net-helper.exe`. It
+reads the file once, so restart the helper after every edit. No request can change these values.
+[Two properties are the reason this binary exists](#two-properties-are-the-reason-this-binary-exists)
+explains why.
 
-1. Find that account: `(Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'").StartName`.
+| Key | Set it to | The helper refuses to start when it is |
+|---|---|---|
+| `address` | The engine's `[cluster.vip].address`, such as `192.0.2.50`. | Not plain dotted decimal, or an address that can never be a VIP, such as loopback. |
+| `interface` | The engine's `[cluster.vip].interface`. It must match the `Name` column of `Get-NetAdapter` exactly, including case. | Empty, over 256 characters, or holding a double quote, a backslash or a control character. |
+| `mask` | The engine's `[cluster.vip].netmask`, or its `prefix` written as a netmask: `prefix = 24` is `255.255.255.0`. | Not a contiguous dotted-decimal netmask, or `0.0.0.0`. |
+| `client_account` | The account the engine service runs as, by name or SID. The next section says how to find it. | A name no account has, a malformed SID, or a broad group such as Everyone or Users. |
+
+The format is plain:
+
+- Each line holds one `key = value`. Spaces around the key and the value do not matter.
+- A line that starts with `#` is a comment, and blank lines are skipped.
+- A comment cannot follow a value on the same line, because everything after `=` is the value.
+- Each key appears exactly once. A missing, unknown or repeated key stops the helper from starting.
+
+### `client_account` must name the engine service's own account
+
+A group that account belongs to does not count.
+
+1. Find that account. For the default service name, run
+   `(Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'").StartName`.
 2. Put it in `client_account`. A virtual account looks like `NT SERVICE\MessageFoundry`, and a gMSA looks
-   like `CORP\mefor-svc$`. A SID string also works.
-3. Restart the helper. It looks the account up at start and refuses to start if the account does not
-   exist.
-4. Have the engine connect with the identification impersonation level. The helper needs to know who the
-   caller is, but it never acts as the caller.
+   like `CORP\mefor-svc$`.
+3. If the helper is already running, restart it.
 
-`client_account` cannot be a broad group such as Everyone, Authenticated Users or Users. The helper refuses
-to start with one, because every member of that group could then move the VIP.
+If this is wrong, the engine cannot use the helper at all. What the engine would see depends on what the
+key names:
+
+| `client_account` names | What happens to a call from the engine's account |
+|---|---|
+| Some other account | Windows refuses the connection at the pipe's access list, before the helper sees it. The helper logs nothing. |
+| A group the engine's account belongs to | The access list lets it in, and the helper refuses it. It answers `{"ok":false,"error":"caller is not authorized"}`, and logs the caller by SID with `outcome=refused`. |
+
+To turn a logged SID into a name, run
+`([System.Security.Principal.SecurityIdentifier]'<SID>').Translate([System.Security.Principal.NTAccount])`.
 
 The pipe refuses network logons, so the engine must run on the same machine as its helper.
+
+### A ping proves the helper is up, but not that a bind would work
+
+Run this on the node, in an elevated PowerShell:
+
+```powershell
+$pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'mefor-net-helper', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None, [System.Security.Principal.TokenImpersonationLevel]::Identification)
+$pipe.Connect(5000)
+$request = [System.Text.Encoding]::UTF8.GetBytes("{`"op`":`"ping`"}`n")
+$pipe.Write($request, 0, $request.Length)
+[System.IO.StreamReader]::new($pipe).ReadLine()
+$pipe.Dispose()
+```
+
+A healthy helper prints one line: the `ping` answer from
+[the request table](#it-does-four-things-for-one-caller-for-one-address), with its own version. Its log
+gains a line with `op=ping`, your account's SID and `outcome=ok`. From a PowerShell that is not elevated,
+`Connect` fails with access denied.
+
+A good answer proves the helper started, accepted its configuration and serves the pipe. It does not prove
+two things:
+
+- That the engine's account can connect. An elevated administrator passes both caller checks, whatever
+  `client_account` names.
+- That `interface` is right. The helper looks for the adapter only when asked to act, and a wrong name
+  then fails with `interface not found`.
+
+### Every build is unsigned until the project has a certificate
+
+[Signing](#signing) says when the workflow would sign a build. Until then:
+
+- `(Get-AuthenticodeSignature "C:\Program Files\MessageFoundry\net-helper\mefor-net-helper.exe").Status`
+  reads `NotSigned`.
+- A service start needs no approval. If an administrator starts the helper by hand and Windows asks to
+  approve it, the prompt names an unknown publisher.
 
 ## Signing
 

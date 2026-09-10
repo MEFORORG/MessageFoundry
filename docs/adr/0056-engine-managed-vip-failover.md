@@ -516,8 +516,9 @@ Four reasons, each checked against this tree:
    platform-tagged wheel, or ship a Windows binary to Linux and macOS users.
 2. `pip` cannot perform the install. The README's "Install it" steps run elevated: they register a
    LocalSystem service, write the config that names the engine's service account for the pipe ACL, and
-   lock the install folder to administrators. Installing a wheel only unpacks files as the user who runs
-   `pip`. It runs none of the package's code, so it creates no service, sets no ACL and elevates nothing.
+   keep every file that service runs in a folder only administrators can write. Installing a wheel only
+   unpacks files as the user who runs `pip`. It runs none of the package's code, so it creates no service,
+   sets no ACL and elevates nothing.
 3. A `requireAdministrator` binary in `site-packages` would be an escalation route. Whoever can write the
    virtual environment could replace a binary that later runs elevated. That is the flaw class the
    Runtime bullet above rules out, and the reason the helper is C# and not a frozen Python script.
