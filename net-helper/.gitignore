@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# dotnet build output. The repository root ignores none of these directories.
+bin/
+obj/
+out/
