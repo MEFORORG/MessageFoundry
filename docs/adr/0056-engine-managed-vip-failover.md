@@ -491,7 +491,8 @@ acceptance*, and records what the engine-side controller must not re-derive.
   transmitting. So `arp` sends an ARP request to the adapter's IPv4 gateway with the VIP as source. Under
   RFC 826 that updates the gateway's entry and any host already caching the VIP. **Nobody has verified
   that Windows puts the VIP in the sender field**; that needs a capture on a Windows Server node before
-  the controller relies on `arp`. The helper refuses to announce an address the node does not hold.
+  the controller relies on `arp`, and BACKLOG #1522 tracks it. The helper refuses to announce an address
+  the node does not hold.
 - **Runtime.** The helper targets .NET 10, the long-term support release serviced until November 2028. The
   owner ruled on 2026-09-10 that it pin a supported .NET, and not .NET 8 or 9, which leave support in
   November 2026. `dotnet publish` compiles it with NativeAOT into one native executable, so the server
@@ -735,6 +736,8 @@ The failover button follows the established **privileged-write** pattern, not th
   an **IPv4** gratuitous ARP. *(IPv6 NDP / unsolicited-NA is deferred for **all platforms** — a later
   cross-platform follow-up, not a Windows-specific limitation; see To resolve on acceptance.)*
   → `tests/test_cluster_vip.py::test_binds_on_promotion_before_listeners`
+  **Open, and it blocks the controller slice that builds this criterion: BACKLOG #1522.** Nobody has
+  captured the frame the helper's `arp` op sends, so whether its sender address is the VIP is unknown.
 - **AC-2** — WHEN a leader self-fences (lease not renewed within `leader_fence_timeout_seconds`), THE
   SYSTEM SHALL release the VIP locally (a non-DB action signalled synchronously from the fence) **within
   `leader_lease_ttl_seconds − leader_fence_timeout_seconds`** of the fence firing — i.e. before a standby

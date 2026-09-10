@@ -150,7 +150,7 @@ key cannot be exported.
   one of its own addresses, so the helper sends an ARP request to the adapter's IPv4 gateway, with the VIP
   as the source. ADR 0056, "The helper as built", records the measurement. Before the engine relies on
   `arp`, capture ARP on a Windows Server node (for example with `pktmon` or Wireshark, run elevated) and
-  confirm that the request's sender address is the VIP.
+  confirm that the request's sender address is the VIP. BACKLOG #1522 tracks this.
 - **`arp` needs an IPv4 gateway on the adapter.** Without one, it returns an error.
 - **`bind` and `release` have not yet run against a real adapter.** The netsh commands they run are in
   `NetOps.cs`.

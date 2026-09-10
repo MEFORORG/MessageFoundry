@@ -29938,3 +29938,57 @@ So the cause is **not** simple CPU contention, which was the obvious first hypot
 **DO NOT "FIX" THIS BY WIDENING THE TOLERANCE.** The 1 ms bound has 416x headroom against the real spread and is not the problem. A tolerance wide enough to admit 500 ms would also admit the 49 ms branch spread that #1140 existed to close, which is the same defect that item was filed to fix.
 
 **RELATED, and deliberately kept apart:** this is not #1304. That is a `pwsh` launch that never returns on the `windows-2025` harness leg, reported as its own event; this is an assertion failing on a value. They share a runner label and nothing else.
+
+## 1522. Nobody has captured the ARP frame the net-helper sends, so whether its sender address is the VIP is unknown
+
+> 🔢 **Filed 2026-09-10 from PR 1015, which built the helper and recorded this gap. Not started. It BLOCKS the AC-1 controller slice (owner ruling, below).** Value **7/10** · Difficulty **3/10**. Value 7 -- AC-1's gratuitous ARP is how peers learn the VIP moved, and the one op meant to send it has never been seen on the wire. Difficulty 3 -- one packet capture; the work is the lab box, not the code.
+
+**Cluster:** active-passive HA / engine-managed VIP (ADR 0056). **Priority:** P2. **Verdict:** research.
+**Severity:** no deployment axis (sec. 0). There are zero deployments, and nothing in the engine calls the
+helper yet. If the sender field is wrong, a first deployment's failover would move the VIP while peers kept
+sending to the old host.
+
+### What is unverified
+
+ADR 0056 AC-1 says a node that wins leadership SHALL emit an IPv4 gratuitous ARP. That frame carries the
+VIP as its sender protocol address, so hosts that cache the VIP update the entry to the new owner's MAC.
+
+The helper cannot send the usual form. `SendARP` with the host's own address as target returned in about
+1 ms with the host's MAC and put nothing on the wire. That was measured on Windows 11 on 2026-09-10 and is
+recorded in ADR 0056, "The helper as built". So `Announce` in `net-helper/NetOps.cs` calls
+`SendARP(gateway, vip)`: an ARP request to the adapter's IPv4 gateway, with the VIP passed as the source.
+
+**Nobody has read the frame that call emits.** Windows may put the VIP in the sender protocol address, or
+it may put something else there. Until someone captures the frame, both are possible.
+
+### Why it matters
+
+A gratuitous ARP on promotion exists so peers refresh their ARP caches and traffic follows the VIP. If the
+sender field is not the VIP, the frame refreshes nothing for it. Failover would still move the address: the
+new leader would hold it and the old one would have released it. But the gateway and clients would keep
+sending to the old host's MAC until their entries aged out, on a timer each peer sets for itself.
+
+### What would settle it
+
+A packet capture on a two-NIC Windows box, reading the sender protocol address of the frame the helper
+actually emits.
+
+1. Bind a test VIP with the helper's own `bind`, so the address carries `skipassource=true` as it would in
+   use. That flag changes which addresses Windows picks as a source, and nobody has measured whether it
+   reaches ARP, so a hand-added address does not test the same thing.
+2. Start an elevated ARP capture on that adapter, with `pktmon` or Wireshark.
+3. Call the helper's `arp` op.
+4. Read the sender protocol address of the emitted frame. It must equal the VIP.
+
+Run it on Windows Server, the platform the feature targets, and record the OS build beside the capture.
+If the sender is wrong, choosing another way to send the frame is its own decision, and it is not made here.
+
+The same box can also run `bind` and `release` against a real adapter, which has not happened either
+(`net-helper/README.md`, "Known limits"). That gap is not filed here.
+
+### It BLOCKS the AC-1 controller slice
+
+**Owner ruling, 2026-09-10:** this must be filed, and it blocks the engine-side controller slice that builds
+AC-1. The ruling reached PR 1015's Builder in a brief that is not in git, so read it at that standard. That
+slice has no item of its own yet, so it is named here by subject, not by number. ADR 0056 cross-references
+this item beside AC-1.
