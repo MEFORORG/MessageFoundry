@@ -29280,9 +29280,10 @@ built and why. This section keeps only what outlives the PR.
   the seam digest.
 - **The control acts only on the node serving the console**, because `POST /cluster/stepdown` steps down
   the node that receives it.
-- **Two follow-ups were blocked by the collision gate, not declined**, while the entity rename (PR 1020)
-  held both files. Raise `EngineClient.cluster_stepdown`'s timeout from 120s to past the engine's own
-  120s request deadline. Add `/ui/cluster` to `_REPRESENTATIVE_ROUTES` in `tests/test_webconsole_mount.py`.
+- **`EngineClient.cluster_stepdown` must wait longer than the engine's request deadline.** An equal
+  timeout lets a working stepdown read as a failure to the caller. The reason sits beside the timeout
+  in `messagefoundry/apiclient/client.py`, and `tests/test_apiclient.py` pins the ordering against the
+  engine constant. The mount smoke test now covers `/ui/cluster`.
 - **The Status page's cluster and node tables now overlap this page's.** Not reworked here.
 
 ---
