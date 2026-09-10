@@ -510,29 +510,26 @@ acceptance*, and records what the engine-side controller must not re-derive.
 Four reasons, each checked against this tree:
 
 1. The engine wheel is pure Python. Its file name ends `py3-none-any`, so one wheel serves Windows, Linux
-   and macOS. Hatchling packs only the `messagefoundry/` package, and the sdist's `only-include` in
-   `pyproject.toml` names that package and its metadata files. A `win-x64` executable inside would force
-   a platform-tagged wheel, or ship a Windows binary to Linux and macOS users.
-2. `pip` cannot perform the install. The README's steps run elevated: they register the helper as a
-   LocalSystem service, write a config file naming its address, interface, mask and the engine's service
-   account, and keep the install folder writable only by administrators. The helper builds its pipe ACL
-   from that account. `pip` unpacks files as the user who runs it. Installing a wheel runs none of the
-   package's code, so it creates no service, sets no ACL and elevates nothing.
+   and macOS, and `[tool.hatch.build.targets.sdist]` in `pyproject.toml` keeps the sdist to the
+   `messagefoundry/` package and its metadata. A `win-x64` executable inside would force a
+   platform-tagged wheel, or ship a Windows binary to Linux and macOS users.
+2. `pip` cannot perform the install. The README's "Install it" steps run elevated: they register a
+   LocalSystem service, write the config that names the engine's service account for the pipe ACL, and
+   lock the install folder to administrators. Installing a wheel only unpacks files as the user who runs
+   `pip`. It runs none of the package's code, so it creates no service, sets no ACL and elevates nothing.
 3. A `requireAdministrator` binary in `site-packages` would be an escalation route. Whoever can write the
-   virtual environment could replace a binary that later runs elevated. That is the flaw class that made
-   this helper C# and not a frozen Python script: an elevated process running code from a folder a
-   less-privileged account can write.
-4. Bundling buys no signature check. An Authenticode signature lives inside the executable, so it would
-   survive being zipped into a wheel. But `pip` verifies no Authenticode signature.
+   virtual environment could replace a binary that later runs elevated. That is the flaw class the
+   Runtime bullet above rules out, and the reason the helper is C# and not a frozen Python script.
+4. Bundling buys no signature check. The Authenticode signature would survive inside a wheel, but `pip`
+   never verifies one.
 
-So the helper ships out of band, as its own release artifact, and an administrator installs it into a
-system folder (the README uses `C:\Program Files\MessageFoundry\net-helper\`). `pip install
-messagefoundry` stays pure Python and cross-platform. The design already allows this split. The wire
-contract is the named pipe, so the engine-side controller will need no path to the binary and will import
-nothing from it.
+So the helper ships out of band as its own release artifact, and an administrator installs it into an
+administrator-only system folder (the README's "Install it"). `pip install messagefoundry` stays pure
+Python and cross-platform. The design already allows this split: the wire contract is the named pipe, so
+the engine-side controller will need no path to the binary and will import nothing from it.
 
-**No release job publishes the helper yet.** The `net-helper` workflow uploads a build artifact that it
-keeps for 14 days, and that is not a release.
+**No release job publishes the helper yet.** The `net-helper` workflow uploads only a short-lived build
+artifact, and that is not a release.
 
 ## Observability
 
@@ -736,8 +733,7 @@ The failover button follows the established **privileged-write** pattern, not th
   an **IPv4** gratuitous ARP. *(IPv6 NDP / unsolicited-NA is deferred for **all platforms** — a later
   cross-platform follow-up, not a Windows-specific limitation; see To resolve on acceptance.)*
   → `tests/test_cluster_vip.py::test_binds_on_promotion_before_listeners`
-  **Open, and it blocks the controller slice that builds this criterion: BACKLOG #1522.** Nobody has
-  captured the frame the helper's `arp` op sends, so whether its sender address is the VIP is unknown.
+  **Open: BACKLOG #1522 blocks the controller slice that builds this criterion.**
 - **AC-2** — WHEN a leader self-fences (lease not renewed within `leader_fence_timeout_seconds`), THE
   SYSTEM SHALL release the VIP locally (a non-DB action signalled synchronously from the fence) **within
   `leader_lease_ttl_seconds − leader_fence_timeout_seconds`** of the fence firing — i.e. before a standby
@@ -852,3 +848,4 @@ the build is greenlit:
   release within `ttl − fence_timeout`) / CANNOT (wedged-host VIP release); external VRRP recommended for
   the strictest posture; **Windows-only at v1**" statement for the user-facing docs
   ([CLUSTERING.md](../CLUSTERING.md), [DEPLOYMENT.md](../DEPLOYMENT.md)) when the feature ships.
+- [ ] **Gratuitous ARP sender field:** BACKLOG #1522, which blocks the controller slice.

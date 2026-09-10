@@ -28,16 +28,13 @@ name: net-helper
 # Repository secrets read here: NET_HELPER_SIGNING_PFX_BASE64 and NET_HELPER_SIGNING_PFX_PASSWORD.
 on:
   pull_request:
-    paths:
+    paths: &helper_paths
       - "net-helper/**"
       - "!net-helper/README.md"
       - ".github/workflows/net-helper.yml"
   push:
     branches: [main]
-    paths:
-      - "net-helper/**"
-      - "!net-helper/README.md"
-      - ".github/workflows/net-helper.yml"
+    paths: *helper_paths
   workflow_dispatch:
 
 concurrency:

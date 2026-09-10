@@ -29945,21 +29945,20 @@ So the cause is **not** simple CPU contention, which was the obvious first hypot
 
 **Cluster:** active-passive HA / engine-managed VIP (ADR 0056). **Priority:** P2. **Verdict:** research.
 **Severity:** no deployment axis (sec. 0). There are zero deployments, and nothing in the engine calls the
-helper yet. If the sender field is wrong, a first deployment's failover would move the VIP while peers kept
-sending to the old host.
+helper yet.
 
 ### What is unverified
 
-ADR 0056 AC-1 says a node that wins leadership SHALL emit an IPv4 gratuitous ARP. That frame carries the
-VIP as its sender protocol address, so hosts that cache the VIP update the entry to the new owner's MAC.
+ADR 0056 AC-1 says a node that wins leadership SHALL emit an IPv4 gratuitous ARP, a frame that carries the
+VIP as its sender protocol address.
 
 The helper cannot send the usual form. `SendARP` with the host's own address as target returned in about
 1 ms with the host's MAC and put nothing on the wire. That was measured on Windows 11 on 2026-09-10 and is
 recorded in ADR 0056, "The helper as built". So `Announce` in `net-helper/NetOps.cs` calls
 `SendARP(gateway, vip)`: an ARP request to the adapter's IPv4 gateway, with the VIP passed as the source.
 
-**Nobody has read the frame that call emits.** Windows may put the VIP in the sender protocol address, or
-it may put something else there. Until someone captures the frame, both are possible.
+**Nobody has read the frame that call emits,** so nobody knows whether Windows puts the VIP in its sender
+protocol address.
 
 ### Why it matters
 
@@ -29970,8 +29969,8 @@ sending to the old host's MAC until their entries aged out, on a timer each peer
 
 ### What would settle it
 
-A packet capture on a two-NIC Windows box, reading the sender protocol address of the frame the helper
-actually emits.
+Capture the frame on a two-NIC Windows Server box, the platform the feature targets, and record the OS
+build beside the capture.
 
 1. Bind a test VIP with the helper's own `bind`, so the address carries `skipassource=true` as it would in
    use. That flag changes which addresses Windows picks as a source, and nobody has measured whether it
@@ -29980,7 +29979,6 @@ actually emits.
 3. Call the helper's `arp` op.
 4. Read the sender protocol address of the emitted frame. It must equal the VIP.
 
-Run it on Windows Server, the platform the feature targets, and record the OS build beside the capture.
 If the sender is wrong, choosing another way to send the frame is its own decision, and it is not made here.
 
 The same box can also run `bind` and `release` against a real adapter, which has not happened either
@@ -29988,7 +29986,5 @@ The same box can also run `bind` and `release` against a real adapter, which has
 
 ### It BLOCKS the AC-1 controller slice
 
-**Owner ruling, 2026-09-10:** this must be filed, and it blocks the engine-side controller slice that builds
-AC-1. The ruling reached PR 1015's Builder in a brief that is not in git, so read it at that standard. That
-slice has no item of its own yet, so it is named here by subject, not by number. ADR 0056 cross-references
-this item beside AC-1.
+**Owner ruling, 2026-09-10.** It reached PR 1015's Builder in a brief that is not in git, so read it at that
+standard. The slice has no item of its own yet, so it is named here by subject, not by number.

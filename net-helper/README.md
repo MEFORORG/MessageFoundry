@@ -148,9 +148,9 @@ key cannot be exported.
 
 - **The `arp` announcement is not verified on the wire.** Windows does not transmit when asked to resolve
   one of its own addresses, so the helper sends an ARP request to the adapter's IPv4 gateway, with the VIP
-  as the source. ADR 0056, "The helper as built", records the measurement. Before the engine relies on
-  `arp`, capture ARP on a Windows Server node (for example with `pktmon` or Wireshark, run elevated) and
-  confirm that the request's sender address is the VIP. BACKLOG #1522 tracks this.
+  as the source. ADR 0056, "The helper as built", records the measurement. Nobody has confirmed that the
+  request's sender address is the VIP, and the engine must not rely on `arp` until someone does.
+  BACKLOG #1522 has the capture steps.
 - **`arp` needs an IPv4 gateway on the adapter.** Without one, it returns an error.
 - **`bind` and `release` have not yet run against a real adapter.** The netsh commands they run are in
   `NetOps.cs`.
