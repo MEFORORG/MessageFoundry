@@ -297,6 +297,10 @@ fixed node — so a failover is transparent to senders (modulo a reconnect):
 > on **Linux/containerized** deployments, which it does **not** cover — use the external floating VIP / LB
 > described here, which stays the **cross-platform** default and the recommended posture for the strictest
 > split-brain guarantee.
+>
+> **What HAS shipped from that ADR is only the control plane** — `POST /cluster/stepdown` (below), which
+> moves *leadership*. It moves no address: with the external VIP / LB the address follows on its own,
+> because the health check stops passing on the node that just released the lease.
 
 - **MLLP / TCP inbound (per listener).** Use a VIP per inbound port whose health check is a **TCP
   connect to that port**. Because only the **primary** binds the port (the active-passive graph gating),
@@ -314,8 +318,9 @@ fixed node — so a failover is transparent to senders (modulo a reconnect):
 There is a promotion window, as in Rhapsody (minutes-class) — quantify it from the Workstream-D failover
 benchmark, don't assume zero-downtime:
 
-- **Clean stop** (graceful shutdown / planned switchover): the leaving primary **expires its lease**, so a
-  standby acquires on its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`).
+- **Clean stop** (graceful shutdown): the leaving primary **expires its lease**, so a standby acquires on
+  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A **planned switchover** that
+  leaves the node running takes the same path, without the shutdown — see `POST /cluster/stepdown` below.
 - **Crash / partition**: the primary's lease **ages out**, so a standby acquires after up to
   `leader_lease_ttl_seconds`. A partitioned old primary **self-fences** within
   `leader_fence_timeout_seconds` (< the TTL), so it stops *reporting itself* leader before the standby
@@ -327,6 +332,115 @@ benchmark, don't assume zero-downtime:
   dead primary's in-flight rows promptly (and the ordinary FIFO claim reclaims a stranded lane head, so
   order survives). At-least-once delivery + idempotent re-runs mean a row interrupted mid-delivery is
   re-delivered after its lease expires (so downstream connections must stay idempotent).
+
+### Planned failover — `POST /cluster/stepdown`
+
+Ask the current primary to hand over on purpose, before you patch or reboot it, instead of pulling the
+service out from under a live feed. The node **releases its leadership lease and keeps running**, demoted
+to standby: a standby acquires the expired lease on its next heartbeat and promotes its graph, and the
+node you drained stays up, heartbeating, ready to take leadership back later.
+
+```
+POST /cluster/stepdown        # body: {} — there are no options
+{ "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5 }
+```
+
+- **Permission:** `cluster:control`, a dedicated capability held by **Administrator only** and never
+  assignable to a custom role. Behind `require_step_up`, so the caller also passes the per-actor
+  admin-write pacing floor, the TOTP MFA gate and the credential-recency window.
+- **`was_leader` is what the release returned**, not a reading taken before it. A fence or a lost-lease
+  tick can move leadership in between, so a "was this node the leader?" check made first could report a
+  failover that released nothing. The same returned value is what the audit row records.
+- **Statuses:** `400` when the deployment is **not clustered** — `[cluster]` disabled, or a store with no
+  cluster coordinator — so there is no lease to release; `409` when this node is not the leader — resolve
+  the leader from `GET /cluster/nodes` and call it there; `403` on a missing permission, a stale step-up
+  or an unsatisfied second factor; `503` when the engine is not started, or when the drain could not be
+  achieved (see the two `503` bullets below).
+- **`400` does not mean "one node".** The gate reads whether clustering is *enabled*, not how many nodes
+  are live, so a clustered install that happens to be running one node accepts the call and goes
+  leaderless for the pause. Keying the refusal on whether a promotable sibling actually exists is
+  [BACKLOG #1509](BACKLOG.md); until then, read `GET /cluster/nodes` first.
+- **A `503` reading `lock-timeout` means nothing happened at all.** The node's leadership lock was still
+  held when `leader_fence_timeout_seconds` ran out, so no lease row was read or written and nothing was
+  demoted. This one says nothing about who leads: the endpoint takes no leader check before the
+  release, so it can come back from a node that leads nothing — which is why it does not tell you
+  leadership is where you left it either. Do not start maintenance. Retry, and if it repeats, look at
+  the store connection.
+- **A `503` reading `release-unconfirmed` means the node HAS already stood down — and the outcome is
+  genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for two
+  `heartbeat_seconds`. What it could not confirm is whether the write expiring its lease row
+  committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
+  `UPDATE` that never ran. **It does not tell you a teardown just started**: a retry of an owed write
+  finds the node already demoted, and the demotion edge fires only on the call that demotes it.
+  - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
+    demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
+    afterwards.
+  - **The listeners stop early in that teardown, not at the end of it.** The source stop is the last of
+    the three BOUNDED demote phases — each takes its own share of the demotion budget, so the shares
+    are bounded and their sum is not the budget — and MLLP, TCP, HTTP and X12 each close their accept
+    socket in the synchronous prologue of their own `stop()`, so they stop taking new connections
+    before the unbounded phases (connector close, executor shutdown, sandbox close) are reached at
+    all. **That buys less than it sounds like.** A source that overruns its share is abandoned rather
+    than cancelled; DICOM releases its port inside exactly the call that gets abandoned, so a DICOM
+    listener can still hold its port; established connections drain in the background; and a message
+    already inside a handler still finishes its commit and its ACK, which count-and-log requires.
+    Confirm quiescence with `GET /cluster/nodes` plus the connection view before you touch the node.
+  - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
+    normally, whatever the error page says.
+  - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
+    so on a first deployment nothing carries the feeds until that node renews itself back in when its
+    pause ends — a partitioned pool during a stepdown is the way into that window.
+  - **A retry re-sends the write, and answers `409` for as long as this node is not the leader.** The
+    first call cleared this node's in-memory leader flag before it wrote, so every later call reports
+    `was_leader=false`, which the endpoint turns into `409`. That holds whatever the lease row says:
+    the row is not what decides the status code here.
+  - **Only a maintenance tick can make this node leader again, and retrying prevents one.** The flag is
+    set in exactly one place, when a tick's claim succeeds. A tick cannot claim while the stepdown
+    pause holds — it returns not-held at the pause gate before touching the database — and **each retry
+    that re-sends an owed write re-arms that pause for another two `heartbeat_seconds`**. So retrying
+    promptly holds this node in `409` indefinitely, by never letting a tick through. **The remedy is to
+    wait, not to retry.**
+  - **Once the pause lapses, the next tick settles it.** If the lease row still names the drained node,
+    the renew arm — `owner = me`, which carries no expiry test — matches, the node becomes leader
+    again, and a stepdown issued *after that* answers `200`. If a standby acquired instead, the row
+    names the standby and its lease is live, so the renew arm cannot match and the take-over arm needs
+    an expiry that has not passed; the drained node stays a follower and `409` is permanent.
+    **That `409` is the failover having worked, not a wrong-node answer.** Do not take the generic
+    `409` remedy here and step down whoever `GET /cluster/nodes` now names as leader: that is the
+    healthy successor, and draining it undoes the failover you just achieved.
+  - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
+    code, is what tells you it is safe to start maintenance.
+- **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
+  `{node_id, was_leader, released_at}` — cluster metadata only, never message content. **Every call the
+  handler completes is audited under that name, the `409` included**, so count drains by `was_leader`
+  rather than by the action name. A `409` writes a row reading `was_leader: false, released_at: null`,
+  and that row IS the refusal — which is why the `409` needs no separate denied row. The refusals the
+  handler reaches before it can return (`400`, both `503`s) write `cluster_stepdown_denied` instead,
+  carrying the reason — `not-clustered`, `lock-timeout` or `release-unconfirmed` — so the two `503`s
+  never read as one condition. That denied row is best-effort: a `release-unconfirmed` comes from a
+  store that has just failed, so the endpoint keeps the `503` and its remedy rather than losing both to
+  an audit write that could not land either way.
+- **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
+  `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
+
+**In-flight work is not drained first.** Stepdown releases leadership; it does not quiesce the graph.
+Rows already claimed on the old primary are recovered by the new one through the ordinary lease/reclaim
+path, so plan the switchover the same way you plan a restart.
+
+**The drained node stands down briefly before it contends again.** For two `heartbeat_seconds` after a
+stepdown it declines to claim or renew, so a sibling wins the expired lease rather than the node you
+just drained renewing itself straight back. On a cluster with no other promotable node that window is
+leaderless, which is the honest consequence of asking the only eligible node to step down.
+
+**Two known limits, so you can plan around them rather than discover them.** A sibling whose
+`acquire_delay_seconds` is longer than two heartbeats is still handicapped out when the pause ends, and
+the node you drained then reclaims its own lease ([BACKLOG #1507](BACKLOG.md)). And a node that has
+already **self-fenced** cannot be drained at all: it holds no leadership to release, so the call answers
+`409` while `GET /cluster/nodes` still shows it as the lease owner until the lease ages out
+([BACKLOG #1508](BACKLOG.md)). In that state the node has given up leadership, but do not read that as
+quiet: fencing sets a flag and wakes the graph teardown, which then runs on another task, so expect the
+same brief overlap a crash failover gets (above). Wait out `leader_lease_ttl_seconds` rather than
+retrying the stepdown.
 
 ### Tune the lease timings to your network
 

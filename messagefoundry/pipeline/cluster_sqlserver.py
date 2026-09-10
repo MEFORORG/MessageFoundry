@@ -52,7 +52,14 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.cluster import ClusterMember, default_node_id
+from messagefoundry.pipeline.cluster import (
+    ClusterMember,
+    StepdownReleaseUnconfirmed,
+    acquire_leadership_lock,
+    default_node_id,
+    lease_release_unconfirmed,
+    stepdown_pause_seconds,
+)
 from messagefoundry.redaction import safe_exc
 
 log = logging.getLogger(__name__)
@@ -122,6 +129,19 @@ class SqlServerCoordinator:
         # Default (0.0, True) = byte-identical. Mirrors DbCoordinator.
         self._acquire_delay = acquire_delay_seconds
         self._promotable = promotable
+        # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
+        # step_down_leadership(). Mirrors DbCoordinator._no_claim_until — read its comment there.
+        self._no_claim_until: float = 0.0
+        # ADR 0056 slice 1: an owed lease-expiring write. Mirrors DbCoordinator._lease_release_owed —
+        # read its comment there for why a retry needs it.
+        self._lease_release_owed = False
+        # ADR 0056 slice 1: mutual exclusion between _maintain_leadership and the stepdown's release.
+        # Mirrors DbCoordinator._leadership_lock — read its comment there for why the pause alone cannot
+        # close the window. The MERGE below carries the identical unfenced `t.owner = ?` renew branch,
+        # so the interleaving and its consequence are the same on this backend, and worse in one
+        # respect: only the three FIFO claim paths are epoch-fenced here (current_epoch()), so a
+        # re-promoted ex-leader is not fenced out of claim_ready or any terminal resolve.
+        self._leadership_lock = asyncio.Lock()
         self._monotonic = monotonic
         # Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two
         # deployments sharing one database via different schemas don't contend / co-elect.
@@ -170,7 +190,8 @@ class SqlServerCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
-        # expire the lease row so a standby can take over immediately on a clean shutdown.
+        # expire the lease row so a standby can take over immediately on a clean shutdown. Deliberately
+        # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
         await self._release_leadership()
         try:
             await self._store._execute(
@@ -424,19 +445,25 @@ class SqlServerCoordinator:
                 continue
 
     async def _maintain_leadership(self) -> None:
-        held = await self._claim_or_renew_lease()
-        if held:
-            self._last_renew_ok = self._monotonic()  # stamp for the fence watchdog
-            if not self._is_leader:
-                self._is_leader = True
-                log.info("cluster: node %s acquired leadership (lease)", self.node_id)
-                self._alert_leadership_acquired()  # #145 (lockstep with DbCoordinator)
-        elif self._is_leader:
-            self._is_leader = False
-            self._leader_epoch = None  # no longer a fenced leader (H1)
-            log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
-            self._alert_leadership_lost("lease taken or expired")  # #145 (inverse → auto-resolves)
-            self._fire_on_demote()  # ADR 0157 Inc 5
+        # The claim AND the bookkeeping that reads its result run under the lock: the promotion decision
+        # is made on a value that crossed an await, so a stepdown interleaving here would be undone by
+        # this tick's own stale result. Mirrors DbCoordinator._maintain_leadership.
+        async with self._leadership_lock:
+            held = await self._claim_or_renew_lease()
+            if held:
+                self._last_renew_ok = self._monotonic()  # stamp for the fence watchdog
+                if not self._is_leader:
+                    self._is_leader = True
+                    log.info("cluster: node %s acquired leadership (lease)", self.node_id)
+                    self._alert_leadership_acquired()  # #145 (lockstep with DbCoordinator)
+            elif self._is_leader:
+                self._is_leader = False
+                self._leader_epoch = None  # no longer a fenced leader (H1)
+                log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
+                self._alert_leadership_lost(
+                    "lease taken or expired"
+                )  # #145 (inverse → auto-resolves)
+                self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
@@ -459,6 +486,11 @@ class SqlServerCoordinator:
         if not self._promotable:
             # NON-PROMOTABLE: never acquire or renew, so this node can never become/remain leader. Touch no
             # DB row — _maintain_leadership demotes a somehow-already-leader node; the fence is the backstop.
+            return False
+        if self._monotonic() < self._no_claim_until:
+            # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
+            # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
+            # branch. Mirrors DbCoordinator._claim_or_renew_lease — read its comment there.
             return False
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
@@ -518,14 +550,67 @@ class SqlServerCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def _release_leadership(self) -> None:
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
+        :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its
+        docstring for why the release is serialized against the maintenance tick, why the demotion
+        edge fires, why this node pauses its own claim (and why the pause is not the exclusion), why the
+        pause is armed BOTH before and after the release, what the lock costs, why a retry re-sends an
+        owed write, and why an unconfirmed lease write raises
+        :class:`~messagefoundry.pipeline.cluster.StepdownReleaseUnconfirmed` here but not on
+        :meth:`stop`."""
+        await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
+        try:
+            # Armed before the release's await so a cancellation inside the pool write cannot skip it,
+            # and armed on a retry too, which needs the pause as much as the first call does. The pause
+            # length, the lock's bound and the refusal text are all the SHARED module-level policy, not
+            # copies: a per-class copy of a safety-relevant timing constant (or of the sentence an
+            # operator acts on) is two files that can be retuned independently.
+            owed = self._lease_release_owed
+            arming = self._is_leader or owed  # held across the await; _is_leader is False by then
+            if arming:
+                self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
+                    self._heartbeat_seconds
+                )
+            was_leader, released_at, wrote = await self._release_leadership(force_write=owed)
+            if arming:
+                # Armed a SECOND time from the instant the write returned, taking the later expiry, so
+                # the write's own unbounded duration is not spent out of the pause. DbCoordinator's
+                # step_down_leadership carries the full reasoning; keep the two in lockstep.
+                self._no_claim_until = max(
+                    self._no_claim_until,
+                    self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
+                )
+            if was_leader:
+                self._fire_on_demote()
+            if not wrote:  # NOT nested under was_leader — a retry has already demoted
+                raise StepdownReleaseUnconfirmed(lease_release_unconfirmed(self.node_id))
+        finally:
+            self._leadership_lock.release()
+        return (was_leader, released_at)
+
+    async def _release_leadership(
+        self, *, force_write: bool = False
+    ) -> tuple[bool, float | None, bool]:
+        """``(was_leader, released_at, wrote)`` — mirrors ``DbCoordinator._release_leadership``,
+        including the demote-the-cached-gate-before-the-DB ordering, the stamp taken at the in-memory
+        demotion, the ``wrote`` flag its two callers read in opposite directions, ``force_write``,
+        which re-sends an owed ``UPDATE`` past the not-a-leader early return, and the arm-before-the-
+        write ordering that keeps a CANCELLED write from unwinding with nothing owed."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
         self._leader_epoch = None  # released: no longer a fenced leader (H1)
-        if not was_leader:
-            return
-        self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
+        if not was_leader and not force_write:
+            return (False, None, True)
+        released_at = time.time() if was_leader else None
+        # #145: clean step-down (inverse -> auto-resolves), guarded exactly as DbCoordinator guards it.
+        if was_leader:
+            self._alert_leadership_lost("released")
+        # Armed before the write, cleared only on one that returned — `except Exception` cannot catch
+        # asyncio.CancelledError, so an owed flag set in the arm below would leak on cancellation.
+        # DbCoordinator._release_leadership carries the full reasoning; keep the two in lockstep.
+        self._lease_release_owed = True
         try:
             await self._store._execute(
                 "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
@@ -538,6 +623,9 @@ class SqlServerCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
+            return (was_leader, released_at, False)
+        self._lease_release_owed = False
+        return (was_leader, released_at, True)
 
     # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
 

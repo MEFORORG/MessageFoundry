@@ -23,11 +23,12 @@ non-input.
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 from pathlib import Path
 
 import pytest
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
 from messagefoundry.api.app import create_app
@@ -61,9 +62,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #1184 (ASVS 14.2.1) added three JSON routes -- POST /messages/search, POST /messages/export
 # and POST /uploads/{file_id}/messages/search -- and two /ui routes, POST /ui/messages/search/run and
 # POST /ui/uploaded-logs/file/{file_id}/filter, so the needle can travel in a body instead of a URL.
-_ROUTES_DEFAULT = 108
-_ROUTES_WITH_DOCS = 112
-_ROUTES_WITH_UI = 209
+# BACKLOG #1494 (ADR 0056 slice 1) added one JSON route -- POST /cluster/stepdown, the planned-failover
+# control plane -- so each basis moved by one.
+_ROUTES_DEFAULT = 109
+_ROUTES_WITH_DOCS = 113
+_ROUTES_WITH_UI = 210
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -721,11 +724,50 @@ def test_route_count_parity() -> None:
     assert len(create_app(expose_docs=True).routes) == _ROUTES_WITH_DOCS
 
 
+def test_the_counting_basis_per_module_split_matches_the_declaring_modules() -> None:
+    """The counting basis' per-module split is measured against the modules, not just asserted.
+
+    RULE: the two module counts must add to the total, and each must match the module that actually
+    declares those routes.
+
+    The totals were pinned from the day this file was written. **The split was not**, and it shipped
+    reading "68 declared in api/app.py (67 HTTP + 1 WebSocket) and 38 declared in api/auth_routes.py"
+    against a pinned total of 109 — an arithmetic claim that sums to 106, sitting three lines above a
+    number CI checks every run. Prose arithmetic beside a tested number is exactly the shape that
+    drifts unnoticed, so it is derived here instead of re-approved by eye.
+    """
+    routes = create_app().routes
+
+    def _module_of(route: object) -> str:
+        endpoint = getattr(route, "endpoint", None)
+        return getattr(inspect.getmodule(endpoint), "__name__", "") if endpoint is not None else ""
+
+    app_module, auth_module = "messagefoundry.api.app", "messagefoundry.api.auth_routes"
+    in_app = [r for r in routes if _module_of(r) == app_module]
+    in_auth = [r for r in routes if _module_of(r) == auth_module]
+    ws_in_app = [r for r in in_app if isinstance(r, APIWebSocketRoute)]
+    assert len(in_app) + len(in_auth) == _ROUTES_DEFAULT, (
+        f"{_ROUTES_DEFAULT - len(in_app) - len(in_auth)} route object(s) are declared somewhere other "
+        "than api/app.py and api/auth_routes.py, which the counting-basis paragraph says is nowhere. "
+        "Name the third module in the doc, or stop declaring routes there."
+    )
+    sentence = (
+        f"builds **{_ROUTES_DEFAULT} route objects** — {len(in_app)} declared in "
+        "[`api/app.py`](../messagefoundry/api/app.py) "
+        f"({len(in_app) - len(ws_in_app)} HTTP + {len(ws_in_app)} WebSocket) and {len(in_auth)} "
+        "declared in [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py)."
+    )
+    assert " ".join(sentence.split()) in " ".join(_doc_text().split()), (
+        "docs/SECURITY.md's counting-basis sentence no longer matches the measured split. It should "
+        f"read: {sentence}"
+    )
+
+
 def test_route_count_parity_with_the_console_mounted() -> None:
     pytest.importorskip("messagefoundry_webconsole")
     assert len(create_app(serve_ui=True).routes) == _ROUTES_WITH_UI, (
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
-        "'94 routes + one /ui/static mount' statement in the same change."
+        "'100 routes + one /ui/static mount' statement in the same change."
     )
 
 
@@ -875,8 +917,9 @@ def _ui_route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
 
 
 def test_every_ui_route_appears_in_the_ui_route_map() -> None:
-    """The console plane is 96 of the 201 served functions and the SOLE operator UI in the deployed
-    posture, so 8.1.1's "every function" includes it.
+    """The console plane is 100 of the 210 route objects a ``serve_ui=True`` app serves — 209 endpoint
+    functions plus the one ``/ui/static`` mount — and the SOLE operator UI in the deployed posture, so
+    8.1.1's "every function" includes it.
 
     RULE: a ``/ui`` route needs a row stating its permission and its wrapper, in both directions.
     ~20 of them have no JSON counterpart from which the authorization could be inferred.
@@ -1074,8 +1117,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     gated = [r for r in rows if r[2]]
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
-    assert len(gated) == 90, (
-        f"{len(gated)} permission-gated routes, not 90 — update the doc's totals."
+    # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
+    assert len(gated) == 91, (
+        f"{len(gated)} permission-gated routes, not 91 — update the doc's totals."
     )
 
 

@@ -979,6 +979,34 @@ class ClusterNodeList(BaseModel):
     lease_expires_at: float | None
 
 
+class ClusterStepdownRequest(RequestModel):
+    """The body of ``POST /cluster/stepdown`` (ADR 0056 slice 1) — deliberately EMPTY.
+
+    ADR 0056 sketched a ``force`` flag and then deferred it: v1 ships a clean lease release only, and
+    ``409`` is the normative answer on a node that is not the leader. Because this is a
+    :class:`~messagefoundry.api.request_model.RequestModel`, a client that sends ``{"force": true}``
+    anyway is refused with 422 rather than silently getting the un-forced behaviour it did not ask for.
+    The model exists (instead of no body at all) so that flag has one obvious place to land when it is
+    built, without changing the route's shape."""
+
+
+class ClusterStepdownResult(BaseModel):
+    """The result of a planned failover (ADR 0056 slice 1). ``node_id`` is the node the call was made
+    against. ``was_leader`` and ``released_at`` are what the coordinator's ``step_down_leadership()``
+    RETURNED, never a prior ``is_leader()`` read: a fence or a lost-lease tick can flip leadership
+    between the read and the release, so a pre-read could report a failover that released nothing.
+    ``released_at`` is the epoch-seconds instant this node was demoted, ``None`` when it held no
+    leadership. Cluster metadata only — no PHI.
+
+    The successor is deliberately NOT reported. ADR 0056 left ``new_leader_eligible`` unresolved, and
+    deriving it here would be a guess: at the instant of release no standby has acquired yet, so the
+    honest answer is for the caller to re-poll ``GET /cluster/nodes`` and watch the lease move."""
+
+    node_id: str
+    was_leader: bool
+    released_at: float | None
+
+
 class DrStatus(BaseModel):
     """Third-tier DR standby posture (#61, ADR 0048). ``enabled`` = this deployment is a DR box at all
     (``[dr].enabled``); ``active`` = it is currently serving under the DR run-profile (the priority feeds

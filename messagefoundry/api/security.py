@@ -118,6 +118,7 @@ _GRANT_AUDIT_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.CONNECTIONS_CONTROL,
         Permission.CONNECTIONS_TEST,
         Permission.DR_OPERATE,
+        Permission.CLUSTER_CONTROL,  # ADR 0056: a planned failover moves the active-passive primary
         Permission.CONFIG_DEPLOY,
         Permission.CONFIG_VALIDATE,
         Permission.CODE_EDIT,

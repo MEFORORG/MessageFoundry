@@ -104,6 +104,12 @@ class _NotLeaderCoordinator:
         # suite. Present so this stand-in still structurally satisfies the ClusterCoordinator protocol.
         return (None, None)
 
+    async def step_down_leadership(self) -> tuple[bool, float | None]:
+        # A follower holds no leadership to release (ADR 0056 slice 1), so the honest answer is the
+        # same one NullCoordinator gives. Present so this stand-in still structurally satisfies the
+        # ClusterCoordinator protocol.
+        return (False, None)
+
 
 # --- NullCoordinator (the byte-identical default) ---------------------------
 
@@ -1093,3 +1099,60 @@ def test_sqlserver_coordinator_stores_leader_preference_knobs() -> None:
 
     coord = SqlServerCoordinator(_Store(), "N", acquire_delay_seconds=5.0, promotable=False)
     assert coord._acquire_delay == 5.0 and coord._promotable is False
+
+
+# --- ADR 0056 slice 1: the planned-failover seam (backend-agnostic units) ----
+
+
+async def test_null_coordinator_step_down_releases_nothing() -> None:
+    # Single-node holds no lease and has no standby, so the seam reports (False, None) rather than
+    # pretending a failover happened. POST /cluster/stepdown never reaches here (it refuses a
+    # single-node caller with 400 first), but the Protocol answer must still be truthful.
+    c = NullCoordinator("solo")
+    assert await c.step_down_leadership() == (False, None)
+    assert c.is_leader() is True  # and single-node stays leader, byte-identically
+
+
+async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
+    # The SQL Server coordinator is the DbCoordinator's lockstep sibling, so the seam must behave the
+    # same: expire the lease we own, report (True, released_at), demote the cached gate, drop the H1
+    # token, fire the demotion edge, and pause this node's own claim so it cannot renew itself back in.
+    # (The DbCoordinator half is proven against the fake lease pool in tests/test_cluster_lease.py.)
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    class _Settings:
+        db_schema = None
+
+    class _Store:
+        _settings = _Settings()
+
+        def __init__(self) -> None:
+            self.executed: list[str] = []
+
+        async def _execute(self, sql: str, params: object = None) -> None:
+            self.executed.append(sql)
+
+        async def _fetchone(self, *a: object, **k: object) -> object:
+            raise AssertionError("a paused node must not query the store to claim")
+
+    store = _Store()
+    coord = SqlServerCoordinator(store, "N", heartbeat_seconds=10.0, monotonic=lambda: 0.0)
+    fired: list[int] = []
+    coord.set_on_demote(lambda: fired.append(1))
+    coord._is_leader = True
+    coord._last_renew_ok = 0.0
+    coord._leader_epoch = 3
+
+    was_leader, released_at = await coord.step_down_leadership()
+
+    assert was_leader is True and released_at is not None
+    assert coord.is_leader() is False and coord.current_epoch() is None
+    assert any("UPDATE leader_lease" in sql for sql in store.executed)
+    assert fired == [1]
+    assert coord._no_claim_until == 20.0  # two heartbeats
+    # Inside the pause the claim short-circuits before touching the store (_fetchone would raise).
+    assert await coord._claim_or_renew_lease() is False
+    # A second stepdown releases nothing and issues no further write.
+    writes = len(store.executed)
+    assert await coord.step_down_leadership() == (False, None)
+    assert len(store.executed) == writes

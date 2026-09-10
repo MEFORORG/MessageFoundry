@@ -1,9 +1,43 @@
 # ADR 0056 — Engine-managed virtual IP (VIP) failover
 
-- **Status:** Proposed (2026-06-27) — drafted on the owner's go. **No code**; this is a **design**
-  decision to record the seam, the correctness argument, the privilege cost, and the operator surface
-  before any build. There is **no engine-managed-VIP code today** — every reference below to a bind/
-  release/`/cluster/stepdown`/VIP-owner field is **proposed**, not built.
+- **Status:** Partly accepted (2026-06-27; control plane built 2026-09-09, BACKLOG #1494). Read the two
+  halves separately, because they are at different build states and conflating them is how a reader ends
+  up designing for an address the engine does not move:
+  - **BUILT — the planned-failover control plane.** `POST /cluster/stepdown`, the `CLUSTER_CONTROL`
+    (`cluster:control`) permission, and the coordinator's public `step_down_leadership()` seam — the
+    three subsections §"Proposed endpoint", §"Coordinator seam" and §"RBAC & audit" below, **less at
+    least** the `force` flag and `new_leader_eligible`, which that section defers on its own terms.
+    Read "at least" literally: this is a pointer to what shipped, not a closed enumeration of every
+    sentence in those subsections, and where a line there disagrees with the code the code is current.
+    Two known divergences, both introduced by the build and recorded rather than left for a reader to
+    trip over: `503` also covers two conditions this design did not name — a lease-expiring write whose
+    outcome the node cannot confirm, and a leadership lock still held at the fence timeout — and the
+    `400` gate keys on whether clustering is ENABLED rather than on whether a promotable sibling exists
+    (BACKLOG #1509).
+  - **STALE — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API — planned
+    failover" and is therefore not covered by the bullet above. **There is no cluster page and no
+    `client.stepdown_node`**, and the confirm dialog it specifies promises the operator that "the VIP
+    will move", which the paused-VIP bullet below denies. **Do not build from it**; the web console page
+    is BACKLOG #1495. Read the marker on the section itself for what is stale there and what is not —
+    the answer is not "all of it", and this bullet used to say it was.
+  - **PROPOSED AND PAUSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release,
+    the gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
+    `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
+    bind/release or a VIP-owner field is proposed, not built.
+
+    **The ruling and what backs it, recorded here because this page is the decision record.** On
+    **2026-09-09** the owner ruled the VIP mechanism **paused, pending a code-signing decision**: it
+    needs a `requireAdministrator` helper binary (`mefor-net-helper.exe`) and this repository has no
+    code-signing infrastructure to ship one with. **Read it at the standard it was given:** in session,
+    to the session that built the control plane, with **no git ref or other artifact anchoring it** —
+    these lines are the record, so a reader who needs it independently verified should ask the owner
+    rather than treat this page as the proof. Stated once here; the index row in
+    [`README.md`](README.md) and BACKLOG #1494 point at it rather than repeat it.
+  - **STALE — §"Console — High Availability page".** It targets the PySide6 desktop console
+    (`console/shell.py`, `console/status.py`, `console/connections.py`), which was retired. The operator
+    UI is the web console at `/ui`. The section is kept for its topology reasoning — the "no Viewing
+    toggle" argument and the read-mostly layout still hold — but its construction notes name files that
+    no longer exist. Do not build from them.
   - **ADR number:** first drafted as `0047`; that slot was reassigned on `origin/main` (to the cloud/k8s
     HA deployment-packaging ADR), so this was renumbered to `0056` — the next free number on `main`, which
     now carries through 0055. Parallel worktrees can race the number, so confirm `0056` is still free
@@ -509,6 +543,25 @@ promotion; this API contract is unchanged by it.
   to node identifiers.
 
 ### Confirm / step-up posture (console)
+
+> **STALE — DO NOT BUILD FROM THIS SUBSECTION. There is no cluster page, and `client.stepdown_node`
+> does not exist.** The operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
+> below also has the dialog promise that "the VIP will move", which the engine does not do and is not
+> going to do until the paused VIP mechanism is decided.
+>
+> **What is stale is the SEAT, not the machinery, and an earlier version of this marker got that
+> wrong.** It asserted that every symbol it named belonged to the retired PySide6 desktop console.
+> ("Named below" was also the wrong scope, and is corrected here: three of the four are named in step
+> 3 below, but `AsyncRunner` is named further up, in the High Availability page section.)
+> Three of the four are alive, REHOMED rather than retired: `_request` in
+> `messagefoundry/apiclient/client.py` (ADR 0088 extracted the Qt-free engine client), `AsyncRunner` in
+> `harness/_async.py`, and `poll_client` in `harness/_console_widgets.py` (the harness reuses view
+> widgets moved out of the old console). Only `client.stepdown_node` is absent — which is the control
+> showing the check discriminates rather than matching everything.
+>
+> **So do not discard steps 3 and 4 with the rest.** Step 3's rule outlives the console it was written
+> for: carry the step-up / MFA challenge on the WRITING client, never on the read-only polling one, and
+> run the call off the UI thread. So does step 4's: render the leaderless window honestly.
 
 The failover button follows the established **privileged-write** pattern, not the read pattern:
 
