@@ -814,6 +814,8 @@ async def test_cluster_nodes_single_node(client: httpx.AsyncClient) -> None:
     # ADR 0096: single-node is unhandicapped + promotable (surfaced in /cluster/nodes).
     assert node["acquire_delay_seconds"] == 0.0
     assert node["promotable"] is True
+    # BACKLOG #1509: the freshness verdict is published; the synthetic entry has no heartbeat.
+    assert node["fresh"] is False
 
 
 async def test_connections_includes_registry_connections(

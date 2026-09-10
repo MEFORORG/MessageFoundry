@@ -30,6 +30,9 @@ from messagefoundry.pipeline.cluster import (
     NullCoordinator,
     build_coordinator,
     default_node_id,
+    has_promotable_sibling,
+    heartbeat_is_fresh,
+    members_from_node_rows,
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.engine import Engine
@@ -136,6 +139,102 @@ async def test_null_coordinator_cluster_members_is_single_self_leader() -> None:
     assert m.is_leader is True
     assert m.status == "active"
     assert m.started_at is None and m.last_seen is None
+
+
+# --- BACKLOG #1509: the freshness rule and the promotable-sibling check -------
+
+
+def test_heartbeat_is_fresh_is_inclusive_at_the_timeout() -> None:
+    # The one freshness rule both DB coordinators share. The boundary is inclusive, as the inline
+    # expression it replaced was, and a row with no heartbeat is never fresh.
+    assert heartbeat_is_fresh(100.0, 130.0, 30.0) is True
+    assert heartbeat_is_fresh(100.0, 130.001, 30.0) is False
+    assert heartbeat_is_fresh(None, 130.0, 30.0) is False
+
+
+def _sibling(
+    node_id: str, *, status: str = "active", promotable: bool = True, fresh: bool = True
+) -> ClusterMember:
+    return ClusterMember(
+        node_id=node_id,
+        host=None,
+        pid=None,
+        started_at=None,
+        last_seen=None,
+        status=status,
+        is_leader=False,
+        promotable=promotable,
+        fresh=fresh,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sibling", "counts"),
+    [
+        (_sibling("b"), True),  # the positive control: live, promotable and active
+        (_sibling("b", promotable=False), False),  # ADR 0096: may never lead
+        (_sibling("b", fresh=False), False),  # no heartbeat inside node_timeout_seconds
+        (_sibling("b", status="left"), False),  # a clean-shutdown tombstone, still briefly fresh
+    ],
+)
+def test_has_promotable_sibling_needs_all_three(sibling: ClusterMember, counts: bool) -> None:
+    assert has_promotable_sibling([_sibling("a"), sibling], "a") is counts
+
+
+def test_has_promotable_sibling_never_counts_the_node_itself() -> None:
+    # The #1509 defect in one line: a lone clustered node is live, promotable and active, and it still
+    # must not count as its own successor.
+    assert has_promotable_sibling([_sibling("a")], "a") is False
+    assert has_promotable_sibling([], "a") is False
+
+
+def test_a_member_nobody_marked_fresh_does_not_count() -> None:
+    # Fail closed. A coordinator that never publishes freshness makes the stepdown refuse, rather than
+    # count a node whose heartbeat it did not check.
+    m = ClusterMember(
+        node_id="b",
+        host=None,
+        pid=None,
+        started_at=None,
+        last_seen=None,
+        status="active",
+        is_leader=False,
+    )
+    assert m.fresh is False
+    assert has_promotable_sibling([m], "a") is False
+
+
+def _nodes_row(node_id: str, last_seen: float, *, is_leader: bool = False) -> dict[str, object]:
+    return {
+        "node_id": node_id,
+        "host": "h",
+        "pid": 1,
+        "started_at": 1.0,
+        "last_seen": last_seen,
+        "status": "active",
+        "is_leader": is_leader,
+        "acquire_delay_seconds": 0.0,
+        "promotable": True,
+    }
+
+
+def test_members_from_node_rows_derives_the_leader_and_fresh_from_one_verdict() -> None:
+    # Both DB coordinators build their members here, so this is the one place the leader pick and the
+    # published flag could disagree. "crashed" still carries its leader flag, which is exactly the row
+    # a second freshness rule could get wrong: it must be neither the derived leader nor a fresh member.
+    rows = [
+        _nodes_row("crashed", 1.0, is_leader=True),
+        _nodes_row("leader", 999.0, is_leader=True),
+        _nodes_row("standby", 998.0),
+    ]
+    members = {m.node_id: m for m in members_from_node_rows(rows, 1000.0, 30.0)}
+    assert {n: m.fresh for n, m in members.items()} == {
+        "crashed": False,
+        "leader": True,
+        "standby": True,
+    }
+    assert [n for n, m in members.items() if m.is_leader] == ["leader"]
+    assert has_promotable_sibling(members.values(), "leader") is True
 
 
 def test_null_coordinator_does_not_reclaim_inflight() -> None:
