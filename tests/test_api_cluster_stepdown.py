@@ -20,6 +20,7 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -384,6 +385,52 @@ async def test_an_unconfirmed_release_is_503_and_is_not_audited_as_a_stepdown(
         detail = json.loads(str(denied[0]["detail"]))
         assert detail["node_id"] == "node-a" and detail["reason"] == "release-unconfirmed"
         assert denied[0]["actor"] == "boss"
+
+
+async def test_a_refusal_survives_an_audit_write_that_fails_with_the_store(tmp_path: Path) -> None:
+    # THE REFUSAL'S OWN AUDIT ROW GOES THROUGH THE STORE THAT PRODUCED THE REFUSAL. A
+    # `release-unconfirmed` is raised only when the lease-expiring write did not return, and on
+    # Postgres build_coordinator hands the coordinator `store._pool` -- the same pool record_audit
+    # borrows. So the arm most likely to reach this write is exactly the one whose store is sick.
+    #
+    # Unguarded, that raise unwound past the handler's own `raise HTTPException(503, ...)` and the
+    # app's catch-all (`@app.exception_handler(Exception)`) answered a bare 500 "internal error": no
+    # reason, no remedy text, and no row either, on a node that has already cleared its leadership flag
+    # and may still own a live lease no standby can take. The row is unwritable on both paths, so the
+    # guard trades nothing for it.
+    #
+    # VACUITY CONTROL, MEASURED: remove the try/except around record_audit in the handler's `_denied`
+    # and this fails -- but NOT at the status assertion, and the difference is worth knowing before you
+    # read a failure here. The measured failure is the RuntimeError propagating out of the POST itself:
+    # Starlette routes a handler registered for Exception through ServerErrorMiddleware, which sends
+    # the 500 and then RE-RAISES so a server can log it, and httpx.ASGITransport surfaces that raise
+    # rather than the response. A real client over uvicorn gets the 500; this harness gets the
+    # exception. Either way the composed refusal is gone, which is what the assertions below pin.
+    coord = _StandinCoordinator(
+        raises=StepdownReleaseUnconfirmed("the lease-expiring write did not return")
+    )
+    async with _admin(tmp_path, coord) as (engine, c, boss):
+        real = engine.store.record_audit
+
+        async def _sick_store(action: str, **kwargs: Any) -> None:
+            # Only the denied row fails, so this stands in for a store that broke during the release
+            # rather than one that was never usable -- the auth rows written earlier still landed.
+            if action == "cluster_stepdown_denied":
+                raise RuntimeError("the audit write went to the pool that had already failed")
+            await real(action, **kwargs)
+
+        engine.store.record_audit = _sick_store  # type: ignore[method-assign]
+        r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
+
+        # The composed refusal survives intact: the status a caller branches on, and the remedy.
+        assert r.status_code == 503, "a failed audit write replaced the refusal with a bare 500"
+        detail_text = r.json()["detail"]
+        assert "could not confirm" in detail_text and "retry" in detail_text.lower()
+
+        # And the row really is gone. The guard keeps the answer; it does not rescue the row, and the
+        # handler's docstring says so rather than leaving a reader to infer the row always lands.
+        engine.store.record_audit = real  # type: ignore[method-assign]
+        assert not await _rows(engine, "cluster_stepdown_denied")
 
 
 async def test_a_lock_timeout_is_its_own_503_and_asserts_no_leadership(tmp_path: Path) -> None:

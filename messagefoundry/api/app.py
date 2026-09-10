@@ -5477,10 +5477,19 @@ def create_app(
         **The ``503`` list above is "at least", not an enumeration, and the difference is load-bearing
         for anyone reading a `503` off a real deployment.** ``RequestTimeoutMiddleware`` is registered
         unconditionally on this app and answers ``503`` from OUTSIDE this handler at
-        ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, with a body naming no route. It writes neither a
-        ``cluster_stepdown`` nor a ``cluster_stepdown_denied`` row, so a ``503`` with no audit row of
-        either kind is that one and not either drain condition. Recorded on BACKLOG #1494; the two
-        below are the only ones this handler itself raises.
+        ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, with a body naming no route. Recorded on BACKLOG #1494;
+        the two below are the only ones this handler itself raises.
+
+        **An absent audit row RULES OUT the drain conditions; it does not identify the timeout.** Both
+        drain arms call ``_denied`` before they raise, so a ``503`` carrying no ``cluster_stepdown_denied``
+        row is neither of them. The converse does not follow, and an earlier revision of this docstring
+        asserted it. At least three other causes share that same empty trail: the ``engine not started``
+        and ``authentication is not configured`` ``503``s named above are raised by the DEPENDENCIES
+        (``_get_engine``, ``require_step_up``), so this body never runs and neither writes a row of
+        either kind; and ``_denied`` is deliberately best-effort, so a store too sick to take the row
+        leaves a drain refusal looking exactly like one that never reached the handler. Diagnose from
+        the response body, which differs on every one of them, and read the audit trail as
+        corroboration rather than as the discriminator.
 
         **The two ``503``s are different answers and must not share a sentence.** An earlier build gave
         both raise sites one body ("could not release leadership; it is still the leader") and one audit
@@ -5542,17 +5551,40 @@ def create_app(
         async def _denied(reason: str, exc: Exception | None = None) -> None:
             """One shape for every refusal this handler records, so the three cannot drift apart field
             by field. The DISCRIMINATOR stays at the call site: each refusal supplies its own reason
-            and raises its own body, because that is exactly the distinction a shared arm lost once."""
+            and raises its own body, because that is exactly the distinction a shared arm lost once.
+
+            **The audit write is best-effort here, and the refusal is not, because on one arm THE
+            STORE IS WHAT FAILED.** ``release-unconfirmed`` is raised only when the lease-expiring
+            write did not return, and on Postgres ``build_coordinator`` hands the coordinator the
+            store's own pool — the same pool ``record_audit`` borrows — so that arm issues its audit
+            round trip against the connection whose failure produced the refusal. Letting it raise
+            would unwind past the ``raise HTTPException(503)`` below and hand the caller the
+            catch-all's bare ``500 internal error``: no status the caller can act on, no reason, and
+            none of the remedy text, on a node that has already cleared its leadership flag and may
+            still own a live lease no standby can take. The row is lost either way — a store that
+            cannot take it on this path cannot take it on that one — so the guard trades nothing for
+            the composed answer. A failed write is logged with its reason rather than dropped
+            silently, and ``CancelledError`` is not an ``Exception``, so a request deadline still
+            unwinds this handler as before."""
             detail = {"node_id": c.node_id, "reason": reason}
             if exc is not None:
                 detail["error"] = safe_exc(exc)
-            await engine.store.record_audit(
-                "cluster_stepdown_denied",
-                actor=identity.username,
-                channel_id=None,
-                detail=json.dumps(detail),
-                client=client_ip(request),
-            )
+            try:
+                await engine.store.record_audit(
+                    "cluster_stepdown_denied",
+                    actor=identity.username,
+                    channel_id=None,
+                    detail=json.dumps(detail),
+                    client=client_ip(request),
+                )
+            except Exception as audit_exc:
+                _log.warning(
+                    "cluster: node %s refused a stepdown (%s) but could not record the "
+                    "cluster_stepdown_denied audit row: %s",
+                    c.node_id,
+                    reason,
+                    safe_exc(audit_exc),
+                )
 
         if not c.is_clustered():
             # Single-node: no lease to release, no standby to take over. Gated here, before the
