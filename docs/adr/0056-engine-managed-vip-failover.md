@@ -16,11 +16,12 @@
     check. That check refuses with `412`, a status this design did not name either. And `force` is a
     clean lease release that waives only that `412`, not the immediate fence first sketched here.
   - **STALE — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API — planned
-    failover" and is therefore not covered by the bullet above. **There is no cluster page and no
-    `client.stepdown_node`**, and the confirm dialog it specifies promises the operator that "the VIP
-    will move", which the PROPOSED VIP bullet below denies. **Do not build from it**; the web console page
-    is BACKLOG #1495. Read the marker on the section itself for what is stale there and what is not —
-    the answer is not "all of it", and this bullet used to say it was.
+    failover" and is therefore not covered by the bullet above. **`client.stepdown_node` does not
+    exist**, and the confirm dialog it specifies promises the operator that "the VIP will move", which
+    the PROPOSED VIP bullet below denies. **Do not build from it**; the web console page is BACKLOG
+    #1495, built at `/ui/cluster` from the web console's own conventions. Read the marker on the section
+    itself for what is stale there and what is not — the answer is not "all of it", and this bullet used
+    to say it was.
   - **BUILT — the `[cluster.vip]` settings block and its load-time refusals (AC-8).** §"D2 — The config
     seam" lists what the engine checks. It is configuration only: switching it on moves no address, and
     the engine logs a WARNING at load saying so.
@@ -684,8 +685,9 @@ promotion; this API contract is unchanged by it.
 
 ### Confirm / step-up posture (console)
 
-> **STALE — DO NOT BUILD FROM THIS SUBSECTION. There is no cluster page, and `client.stepdown_node`
-> does not exist.** The operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
+> **STALE — DO NOT BUILD FROM THIS SUBSECTION. `client.stepdown_node` does not exist.** The operator
+> UI is the web console at `/ui`, and its High Availability page is BACKLOG #1495, built at `/ui/cluster`
+> with steps 3 and 4 below carried over and steps 1 and 2 replaced. Step 2
 > below also has the dialog promise that "the VIP will move", which the engine does not do and is not
 > going to do until the VIP controller is built.
 >
