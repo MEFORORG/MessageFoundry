@@ -223,7 +223,7 @@ VIP can never land on a node the lease says is not primary.
 A new optional block under `[cluster]`, **`[cluster.vip]`**, turns the feature on and carries the
 address and interface. `ClusterVipSettings` in
 [`config/settings.py`](../../messagefoundry/config/settings.py) parses and checks it at load. Nothing
-acts on it yet: with `enabled = true` the engine logs a WARNING that no code moves the address.
+acts on it yet: when `enabled` is on, the engine logs a WARNING that no code moves the address.
 
 ```toml
 [cluster.vip]
