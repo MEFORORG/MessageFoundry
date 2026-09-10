@@ -29198,7 +29198,9 @@ it committed, a standby acquires on its next heartbeat"; the two could not both 
 
 ## 1495. ADR 0056's High Availability page is specified against the retired PySide6 console, so the web console has no cluster page at all
 
-> 🔢 **Filed 2026-09-09, found while building #1494's control plane. The number was allocated then and cited from the ADR index before this item existed, which is the defect the item below records first.** Value **4/10** · Difficulty **4/10**. Value 4 -- an operator can already read `GET /cluster/nodes` and `GET /cluster/status` and can already drive `POST /cluster/stepdown` over the API, so the gap is that nothing renders them, not that the data is missing. Difficulty 4 -- one read-mostly page over three endpoints that already exist, plus the step-up confirm flow the stepdown control needs.
+> 🚧 **IN PROGRESS 2026-09-10 -- built on branch `claude/webconsole-ha-1495`, PR 1021, awaiting review and land.** Not a closure: the Lander flips this banner on merge.
+>
+> **Filed 2026-09-09, found while building #1494's control plane. The number was allocated then and cited from the ADR index before this item existed, which is the defect the item below records first.** Value **4/10** · Difficulty **4/10**. Value 4 -- an operator can already read `GET /cluster/nodes` and `GET /cluster/status` and can already drive `POST /cluster/stepdown` over the API, so the gap is that nothing renders them, not that the data is missing. Difficulty 4 -- one read-mostly page over three endpoints that already exist, plus the step-up confirm flow the stepdown control needs.
 
 **Cluster:** web console / active-passive HA operator surface. **Priority:** P3.
 **Severity:** no deployment axis (sec. 0). A missing view over shipped endpoints, not a defect in
@@ -29247,6 +29249,21 @@ of ADR 0056 is no longer on hold. Its `[cluster.vip]` settings block and load-ti
 but nothing binds, releases or reports the address yet. So a page that renders a VIP owner would render
 a field that does not exist. The 2026-09-10 ruling that lifted the hold is recorded once, with what
 anchors it, in the status block of [ADR 0056](adr/0056-engine-managed-vip-failover.md).
+
+### What PR 1021 builds, and what it leaves
+
+PR 1021 adds the page at `/ui/cluster` and `EngineClient.cluster_stepdown`. Its body records what was
+built and why. This section keeps only what outlives the PR.
+
+- **The console reaches the stepdown through the `UiDeps` seam, not `apiclient`.** The web console calls
+  engine handlers in-process, so the page needed a `CoreHandlers.cluster_stepdown` field, which moved
+  the seam digest.
+- **The control acts only on the node serving the console**, because `POST /cluster/stepdown` steps down
+  the node that receives it.
+- **Two follow-ups were blocked by the collision gate, not declined**, while the entity rename (PR 1020)
+  held both files. Raise `EngineClient.cluster_stepdown`'s timeout from 120s to past the engine's own
+  120s request deadline. Add `/ui/cluster` to `_REPRESENTATIVE_ROUTES` in `tests/test_webconsole_mount.py`.
+- **The Status page's cluster and node tables now overlap this page's.** Not reworked here.
 
 ---
 
