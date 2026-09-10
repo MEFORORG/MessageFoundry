@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 name: net-helper
 
-# Builds mefor-net-helper.exe, the privileged helper ADR 0056 specifies (packaging/net-helper/), and signs
-# it when a signing credential is configured. This is the repository's first compiled artifact and first
-# signing step, so each choice is written down here.
+# Publishes mefor-net-helper.exe, the privileged helper ADR 0056 specifies (packaging/net-helper/), with
+# NativeAOT, and signs it when a signing credential is configured. This is the repository's first compiled
+# artifact and first signing step, so each choice is written down here.
 #
 # NOT A REQUIRED CHECK, AND IT CANNOT BE ONE AS WRITTEN. It is paths-filtered, so it does not report on a
 # pull request that touches neither the helper nor this file. A required context that never reports wedges
@@ -52,7 +52,8 @@ permissions:
 jobs:
   build:
     name: net-helper build
-    # Windows because signtool is Windows-only, and the build should run where the binary will.
+    # Windows because signtool is Windows-only, and NativeAOT compiles a Windows binary only on Windows. The
+    # image's Visual Studio C++ tools supply the linker NativeAOT calls.
     runs-on: windows-2025
     timeout-minutes: 15
     defaults:
@@ -74,24 +75,59 @@ jobs:
 
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          # The SDK only compiles. The helper runs on .NET Framework 4.8, which Windows provides.
+          # The csproj targets .NET 10 and publishes with NativeAOT; its comments record why.
           dotnet-version: "10.0.x"
 
-      - name: Build (Release)
+      - name: Publish (Release, NativeAOT)
         run: |
-          dotnet build packaging/net-helper/MeforNetHelper.csproj --configuration Release --output $env:HELPER_OUT
+          # Publish, not build: only publish runs the NativeAOT compiler. Build output needs the .NET runtime
+          # installed and is not the binary to ship.
+          dotnet publish packaging/net-helper/MeforNetHelper.csproj --configuration Release --output $env:HELPER_OUT
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check the binary requires administrator
         run: |
-          # The manifest is embedded verbatim as a resource. If a build change dropped it, the helper would
-          # start without administrator rights and fail each operation later instead of refusing to launch.
+          # Without its manifest the helper would start without administrator rights and fail each operation
+          # later, instead of refusing to launch. Windows reads only the Win32 manifest resource, ID 1, so this
+          # extracts that resource: a text search would also pass on a copy Windows ignores.
           $exe = Join-Path $env:HELPER_OUT 'mefor-net-helper.exe'
-          $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($exe))
-          if (-not $text.Contains('level="requireAdministrator"')) {
-            throw 'mefor-net-helper.exe does not embed the requireAdministrator manifest'
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" |
+            Where-Object { $_.Directory.Parent.Name -as [version] } |
+            Sort-Object { [version]$_.Directory.Parent.Name } |
+            Select-Object -Last 1
+          if (-not $mt) { throw 'mt.exe was not found in the Windows SDK' }
+          $manifest = Join-Path $env:RUNNER_TEMP 'mefor-net-helper.manifest'
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw "mt.exe could not read manifest resource 1: exit code $LASTEXITCODE" }
+          $level = (Select-Xml -Path $manifest -XPath "//*[local-name()='requestedExecutionLevel']").Node.level
+          if ($level -ne 'requireAdministrator') {
+            throw "mefor-net-helper.exe requests execution level '$level', not requireAdministrator"
           }
-          Write-Host 'requireAdministrator manifest is embedded'
+          Write-Host 'the Win32 manifest requires administrator'
+
+      - name: Check a DLL planted beside the binary is not loaded
+        run: |
+          # NativeAOT binds SendARP and other Windows APIs when it links, so the loader resolves IPHLPAPI.DLL at
+          # start-up. The csproj's /DEPENDENTLOADFLAG confines that search to System32. Here a copy of the binary
+          # runs beside a planted IPHLPAPI.DLL that exports no SendARP. Hosted runners run as an administrator
+          # with UAC off, so the manifest does not stop the launch. With the flag, the helper starts and exits 2
+          # for its missing configuration. Without it, the load fails with STATUS_ENTRYPOINT_NOT_FOUND.
+          $dir = Join-Path $env:RUNNER_TEMP 'planted-dll'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item (Join-Path $env:HELPER_OUT 'mefor-net-helper.exe') $dir
+          Copy-Item (Join-Path $env:SystemRoot 'System32\version.dll') (Join-Path $dir 'IPHLPAPI.DLL')
+          $copy = Join-Path $dir 'mefor-net-helper.exe'
+          $helper = Start-Process -FilePath $copy -WorkingDirectory $dir -NoNewWindow -PassThru
+          # Reading Handle keeps the process handle open, so ExitCode is still readable after the process exits.
+          $null = $helper.Handle
+          if (-not $helper.WaitForExit(30000)) {
+            $helper.Kill()
+            throw 'the helper did not exit within 30 seconds'
+          }
+          if ($helper.ExitCode -ne 2) {
+            throw ('the helper exited 0x{0:X8}, not 2, so a planted DLL may have loaded' -f $helper.ExitCode)
+          }
+          Write-Host 'a DLL planted beside the binary was not loaded'
 
       - name: Sign (signtool, RFC 3161 timestamp)
         id: sign
