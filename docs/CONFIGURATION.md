@@ -1395,6 +1395,59 @@ nodes automatically:
 | `acquire_delay_seconds` | num | 0 | **leader-preference handicap** (ADR 0096, per-node). Seconds this node waits PAST the lease-expiry time before it may take over an **expired** lease, so a preferred (`0`) node wins the routine take-over race. NEVER delays a renewal by the current leader, and only ever makes a node claim later — so it can't open a two-leader window. Governs take-over of an expired lease only (the first election on an empty table is a plain race). Must be `>= 0`. Surfaced per-node in `/cluster/nodes` |
 | `promotable` | bool | true | **non-promotable standby** flag (ADR 0096, per-node). `false` = this node may never become leader (never inserts/takes-over/renews the lease); a node that somehow already leads steps down cleanly. Use for a warm, passive DR engine. **At least one promotable node must exist** or no node ever acquires the lease. `[dr].activate` cannot be combined with `[cluster].enabled` (a warm DR node is a non-promotable member, not a `[dr]` box). Surfaced per-node in `/cluster/nodes` |
 
+#### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
+
+**Windows-only.** Engine-managed VIP is a Windows feature at v1, and IPv4 only; IPv6 is deferred on every
+platform. Linux and container deployments keep the external floating VIP or load balancer described in
+[CLUSTERING.md](CLUSTERING.md) §"Client reconnect". The settings themselves load on any platform.
+
+**The engine checks this block at load and does nothing else with it yet.** No code in this build binds,
+releases or announces the address. That controller is a later change, so the engine logs a WARNING at
+load when `enabled` is on. Keep the external floating VIP or load balancer in front of the cluster until
+then. The design, including what it can and cannot promise about split-brain on the wire, is
+[ADR 0056](adr/0056-engine-managed-vip-failover.md).
+
+Leaving the block out, or switching `enabled` off, changes nothing. A switched-off block is never
+refused for the values it holds, but unknown keys in it are still refused, as in every section. The
+block is file-only. There is no `MEFOR_CLUSTER_VIP_*` environment override, and such a variable is
+dropped like any other unrecognized env key.
+
+With `enabled = true` the engine **refuses to load** when:
+
+- `[cluster].enabled` is not `true`, or `[store].backend` is not `postgres` or `sqlserver`;
+- both `prefix` and `netmask` are set, or neither is;
+- `address` is missing, is not IPv4, or is unspecified, loopback, link-local, multicast, reserved, or the
+  network or broadcast address of its own subnet;
+- `interface` is missing or blank, or has leading or trailing spaces, a double quote, or a non-printable
+  character;
+- `release_grace_seconds` is below 0, or is not below `[cluster].leader_fence_timeout_seconds`.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | turn engine-managed VIP on. Needs `[cluster].enabled = true` on a `postgres` or `sqlserver` store |
+| `address` | str | _unset_ | the floating IPv4 address. Required when enabled |
+| `interface` | str | _unset_ | this node's Windows connection name, for example `Ethernet0`. Required when enabled, and matched exactly |
+| `prefix` | int | _unset_ | subnet prefix length, 1 to 32. Set this or `netmask`, not both |
+| `netmask` | str | _unset_ | subnet mask in canonical dotted-decimal form, for example `255.255.255.0`. Must be contiguous; a hostmask such as `0.0.0.255` is refused. Set this or `prefix`, not both |
+| `gratuitous_arp` | bool | `true` | announce the address with an IPv4 gratuitous ARP after binding it |
+| `release_grace_seconds` | num | 2 | how long a newly promoted leader waits before it binds and announces the address, so an old leader that just fenced has time to let go of it. Must be `>= 0` and below `[cluster].leader_fence_timeout_seconds`. The default is held to that rule too, so a fence timeout of 2 or less needs a smaller explicit value |
+
+Either mask form reaches the privileged helper (`mefor-net-helper`) as one dotted-decimal string, the
+`mask` field of its `bind` request.
+
+```toml
+[cluster]
+enabled = true          # [cluster.vip] is refused at load without this
+
+[cluster.vip]
+enabled   = true        # off by default; see the refusal list above
+address   = "10.20.0.50"
+interface = "Ethernet0"
+prefix    = 24          # or netmask = "255.255.255.0", never both
+# gratuitous_arp        = true    (the default)
+# release_grace_seconds = 2.0     (the default; keep it below leader_fence_timeout_seconds)
+```
+
 ### `[backup]` — scheduled DR backup / restore-verify
 Engine-managed **scheduled + on-demand DR backup** of the config bundle and the SQLite store, written as
 one AES-256-GCM `.mfbak` archive to a local/UNC destination (#60,

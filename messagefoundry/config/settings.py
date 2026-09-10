@@ -38,7 +38,7 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
@@ -109,6 +109,7 @@ __all__ = [
     "AlertsSettings",
     "SecretsSettings",
     "ClusterSettings",
+    "ClusterVipSettings",
     "ApprovalsSettings",
     "IntegritySettings",
     "BackupSettings",
@@ -3234,6 +3235,115 @@ class SecretsSettings(_Section):
     provider: str = "none"
 
 
+def _vip_address_problems(address: str | None, mask: str | None) -> list[str]:
+    if address is None:
+        return ["address is required"]
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except ValueError:
+        return [f"address must be an IPv4 address (IPv6 is deferred), got {address!r}"]
+    if ip.is_unspecified or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+        return [
+            f"address {address!r} cannot float between nodes: it is unspecified, loopback, "
+            "link-local, multicast or reserved"
+        ]
+    if mask is not None:
+        net = ipaddress.IPv4Network(f"{address}/{mask}", strict=False)
+        # A /31 or /32 has no network or broadcast address; every address in it is a host.
+        if net.prefixlen <= 30 and ip in (net.network_address, net.broadcast_address):
+            return [f"address {address!r} is the network or broadcast address of {net}"]
+    return []
+
+
+def _vip_interface_problems(interface: str | None) -> list[str]:
+    if interface is None or not interface.strip():
+        return ["interface is required (this node's Windows connection name, e.g. 'Ethernet0')"]
+    if interface != interface.strip():
+        # Refused rather than trimmed: the address is scoped to one exact interface name, and a
+        # silently trimmed name is a second spelling of it.
+        return [f"interface {interface!r} has leading or trailing whitespace"]
+    if '"' in interface or not interface.isprintable():
+        # The name ends up as a command-line argument on the elevated side (ADR 0056 "Platform
+        # mechanics"). Refusing a quote or a control character here is cheaper than trusting every
+        # quoting layer between the file and that argument.
+        return [f"interface {interface!r} contains a double quote or a non-printable character"]
+    return []
+
+
+class ClusterVipSettings(_Section):
+    """``[cluster.vip]`` — the engine-managed virtual IP (ADR 0056), a sub-table of ``[cluster]``.
+
+    **Configuration and load-time checks only.** Nothing in this build binds, releases or announces the
+    address; the controller is a later change, so :func:`load_settings` logs a WARNING when this is on.
+    **Windows-only** at v1, and IPv4 only.
+
+    ``enabled = false`` (the default) is a complete no-op: every check is gated on it, so a switched-off
+    block is never refused for what it holds (AC-6). The checks that need ``[cluster]`` live on
+    :meth:`ClusterSettings._vip_fits_the_cluster`. File-only: the env layer is one level deep, so there
+    is no ``MEFOR_CLUSTER_VIP_*`` override (docs/CONFIGURATION.md)."""
+
+    enabled: bool = False
+    # The floating address. IPv4 only (IPv6 is deferred on every platform, ADR 0056).
+    address: str | None = None
+    # This node's adapter, by its Windows connection name (e.g. "Ethernet0").
+    interface: str | None = None
+    # Exactly one of these two when enabled; both resolve to `mask` below.
+    prefix: int | None = None
+    netmask: str | None = None
+    # Announce the address with an IPv4 gratuitous ARP once it is bound.
+    gratuitous_arp: bool = True
+    # How long a newly promoted leader waits before it binds and announces the address. Must be >= 0 and
+    # < [cluster].leader_fence_timeout_seconds; ADR 0056 D2 says why 2.0, and why that bound.
+    release_grace_seconds: float = 2.0
+
+    @property
+    def mask(self) -> str | None:
+        """The dotted-decimal IPv4 netmask the helper's ``bind`` request carries (ADR 0056 D2), e.g.
+        ``"255.255.255.0"`` from either ``prefix = 24`` or ``netmask = "255.255.255.0"``. ``None``
+        unless exactly one form is set and valid, which a loaded, enabled block always satisfies."""
+        if (self.prefix is None) == (self.netmask is None):
+            return None
+        spelled = self.netmask if self.netmask is not None else str(self.prefix)
+        try:
+            net = ipaddress.IPv4Network(f"0.0.0.0/{spelled}")
+        except ValueError:
+            return None
+        # A netmask must round-trip unchanged: ipaddress also reads "0.0.0.255" as a HOSTMASK and "24" as
+        # a prefix, and either would otherwise load as a mask nobody wrote.
+        if net.prefixlen < 1 or (self.netmask is not None and str(net.netmask) != self.netmask):
+            return None
+        return str(net.netmask)
+
+    @model_validator(mode="after")
+    def _enabled_block_is_usable(self) -> ClusterVipSettings:
+        """Refuse, at load rather than at the first bind, a switched-on block the helper could not act
+        on. Every problem is reported in one pass, not one restart per typo."""
+        if not self.enabled:
+            return self
+        mask = self.mask
+        problems = [
+            *_vip_address_problems(self.address, mask),
+            *_vip_interface_problems(self.interface),
+        ]
+        if self.prefix is not None and self.netmask is not None:
+            problems.append("set prefix or netmask, not both")
+        elif self.prefix is None and self.netmask is None:
+            problems.append("set one of prefix or netmask")
+        elif mask is None and self.prefix is not None:
+            problems.append(f"prefix must be 1-32, got {self.prefix}")
+        elif mask is None:
+            problems.append(
+                "netmask must be a contiguous dotted-decimal IPv4 netmask such as '255.255.255.0', "
+                f"got {self.netmask!r}"
+            )
+        # Written as a positive test so a NaN fails it too.
+        if not self.release_grace_seconds >= 0:
+            problems.append(f"release_grace_seconds must be >= 0, got {self.release_grace_seconds}")
+        if problems:
+            raise ValueError("[cluster.vip] is enabled but cannot be used: " + "; ".join(problems))
+        return self
+
+
 class ClusterSettings(_Section):
     """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
@@ -3311,6 +3421,9 @@ class ClusterSettings(_Section):
     # least ONE promotable node MUST exist in the cluster, or no node ever acquires the lease and the graph
     # never drains — an all-non-promotable cluster is a misconfiguration (documented, not guarded here).
     promotable: bool = True
+    # Engine-managed virtual IP (ADR 0056): the [cluster.vip] sub-table. Off by default, and a no-op
+    # while off. See ClusterVipSettings.
+    vip: ClusterVipSettings = Field(default_factory=ClusterVipSettings)
 
     @field_validator(
         "heartbeat_seconds",
@@ -3368,6 +3481,32 @@ class ClusterSettings(_Section):
                 f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
                 f"leader_lease_ttl_seconds={self.leader_lease_ttl_seconds}) — the leader must renew "
                 "faster than it fences, and fence before the lease can expire and a standby acquire it"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _vip_fits_the_cluster(self) -> ClusterSettings:
+        """``[cluster.vip]`` needs clustering on, and its grace must end inside the leadership term that
+        started it, the rule :meth:`ServiceSettings._warm_pool_timeout_under_fence` applies to a pool
+        warm-up. Unlike that rule this one binds the default too; ADR 0056 D2 says why. The server-DB
+        half of AC-8 needs no check here: :meth:`ServiceSettings._cluster_requires_server_db` already
+        refuses any clustered node without one."""
+        if not self.vip.enabled:
+            return self
+        if not self.enabled:
+            raise ValueError(
+                "[cluster.vip].enabled requires [cluster].enabled = true: the address follows the "
+                "leadership lease, and only a clustered node holds one"
+            )
+        grace = self.vip.release_grace_seconds
+        # Written as a positive test so a NaN fails it too.
+        if not grace < self.leader_fence_timeout_seconds:
+            raise ValueError(
+                "[cluster.vip].release_grace_seconds must be < [cluster].leader_fence_timeout_seconds "
+                f"(got release_grace_seconds={grace}, "
+                f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}); a newly promoted "
+                "leader's bind must come due before its own fence could fire. Set a smaller "
+                "release_grace_seconds explicitly when you shorten the fence timeout."
             )
         return self
 
@@ -4347,6 +4486,24 @@ def _unknown_key_report(items: Sequence[tuple[str, str, str | None]]) -> str:
     )
 
 
+def _unknown_keys(
+    table: str, model: type[BaseModel], values: Mapping[str, Any]
+) -> Iterator[tuple[str, str, str | None]]:
+    """Each key in ``values`` that ``model`` does not define, as ``(table, key, suggestion)``, descending
+    into a sub-table whose field is itself a :class:`_Section` and naming it by its dotted path
+    (``[cluster.vip]``). Only ``_Section`` sub-models: their ``extra="ignore"`` leaves unknown-key
+    refusal to this loader, so a typo one level down would otherwise drop silently."""
+    fields = model.model_fields
+    for key, value in values.items():
+        field = fields.get(key)
+        if field is None:
+            yield table, key, _near_field(model, key)
+            continue
+        sub = field.annotation
+        if isinstance(value, dict) and isinstance(sub, type) and issubclass(sub, _Section):
+            yield from _unknown_keys(f"{table}.{key}", sub, value)
+
+
 def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the config FILE sets a key its section does not define.
 
@@ -4368,11 +4525,7 @@ def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
         model = models.get(section)
         if model is None or not isinstance(values, dict):
             continue  # unknown SECTION (tolerated) or a non-table value (pydantic reports the type)
-        allowed = set(model.model_fields)
-        for key in values:
-            if key in allowed:
-                continue
-            offenders.append((section, key, _near_field(model, key)))
+        offenders.extend(_unknown_keys(section, model, values))
     if offenders:
         raise ValueError(
             f"unrecognized config key(s): {_unknown_key_report(offenders)}. An unrecognized key is "
@@ -4973,4 +5126,14 @@ def load_settings(
     if cli:
         _merge(data, cli)
 
-    return ServiceSettings.model_validate(data)
+    settings = ServiceSettings.model_validate(data)
+    if settings.cluster.vip.enabled:
+        # Configuration only in this build (ADR 0056). Say so, or an operator who switched it on finds
+        # out at the first failover that the address never moved.
+        _log.warning(
+            "[cluster.vip].enabled is true, but this build has no engine-managed VIP controller: nothing "
+            "binds, releases or announces %s. Keep the external floating VIP or load balancer in front "
+            "of the cluster (ADR 0056).",
+            settings.cluster.vip.address,
+        )
+    return settings
