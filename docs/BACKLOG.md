@@ -30231,3 +30231,91 @@ Mutation 1 fails all three cases of `test_no_leader_is_derived_when_every_leader
 now has one copy to reach, in `members_from_node_rows`. Both forms of mutation 2 fail
 `test_force_with_a_live_sibling_reports_both_fields_true`. Mutation 3 on the real line and the control
 both fail `test_a_node_with_no_promotable_sibling_is_refused_before_the_release`.
+
+## 1528. the repository's copyright and CLA entity renames to MessageFoundry Foundation, LLC, per the owner's 2026-09-10 ruling
+
+> 🚧 **Built 2026-09-10 on branch `claude/entity-rename-llc` (PR 1020); open until that merges, when the Lander flips this banner.** Commit `cabcb3e5c` replaces "MessageFoundry Organization" with "MessageFoundry Foundation, LLC" in 1,530 files, one line for one line. It changes no licence, no year and no code path. Value **5/10** · Difficulty **2/10**. Value 5: a code-signing certificate would name the registered entity, and no file in the source named it. Difficulty 2: the change is one exact substitution plus one line fixed by hand, and a script re-checks its shape. Its only real cost is width, because nearly every tracked file changes and every open branch conflicts with it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** licensing / project identity. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). There are zero deployments and no signed release yet. Before
+this change, the first signed build would have named one legal entity on its certificate and a different
+one in every source header.
+
+### The ruling reached this item through a brief, and git held no earlier record of it
+
+The owner registered MessageFoundry Foundation, LLC. On 2026-09-10 the owner ruled that the repository's
+copyright holder and its Contributor License Agreement (CLA) entity align to that name. The Builder that
+filed this item read the ruling in the Console's brief. It did not witness the ruling, and nothing in git
+recorded it before this item did.
+
+So this item is the first git record of a change of copyright holder, and it rests on a relayed ruling.
+Before citing it for anything a later commit cannot undo, confirm the ruling with the owner.
+
+### A code-signing certificate would name an entity the source never mentioned
+
+The trigger was a code-signing certificate that would name the registered legal entity. Every file that
+named a holder named "MessageFoundry Organization" instead: the source headers, both `NOTICE` files,
+`CLA.md` and the package metadata.
+
+### One substitution, measured against base `3c406f41d`
+
+The commit replaces the exact string byte for byte, so encodings, line endings and final newlines do not
+change. Measured by the Builder that made the commit:
+
+| Measure | Value |
+|---|---|
+| Files changed | 1,530 |
+| Changed files that differ from base in any other way | 0 |
+| Files that held the old name and were left unchanged | 0 |
+| Occurrences replaced | 1,536 |
+| Lines added / deleted | 1,536 / 1,536 |
+
+Most sites are the one-line copyright header. The rest are both `NOTICE` files, `CLA.md`,
+`COMMERCIAL-LICENSE.md`, `README.md`, `CONTRIBUTING.md`, the `authors` field in the harness and web
+console `pyproject.toml` files, `net-helper/MeforNetHelper.csproj` and
+`security/vex/messagefoundry.openvex.json`. PR 1020's body lists every form found and holds the script
+that re-checks the shape.
+
+`CONTRIBUTING.md` splits the name across a line break, where an exact-string grep cannot see it, so that
+site was edited by hand. That is why `git grep -l "MessageFoundry Foundation, LLC"` finds 1,529 files and
+not 1,530. Spot-checked again when this item was filed: at `cabcb3e5c`, 0 files hold the old name and
+1,529 hold the new one on a single line.
+
+### Nothing but the holder's name changes
+
+- The licence stays AGPL-3.0-or-later. `LICENSE` names no holder, so it is untouched.
+- Every year stays 2026.
+- No code path changes. Two generated outputs do carry the new name. `messagefoundry import corepoint`
+  writes it in the header of each module it generates, from a string literal in
+  `messagefoundry/corepoint_import.py`. The harness and web console wheels carry it in their `Author`
+  metadata.
+
+### One question is left for the owner: the comma inside `authors`
+
+The harness and web console `pyproject.toml` files keep the exact legal name, comma included, in
+`authors`. Measured by the Builder that made the commit: a probe wheel built with hatchling wrote
+`Author: MessageFoundry Foundation, LLC and contributors`, and `packaging`'s metadata validator accepted
+it. But hatchling joins several author names with ", " into that one field, so a reader that splits
+`Author` on commas would see two names.
+
+The pyproject specification may also forbid a comma in an author `name`. That is recalled, not re-read:
+no session on PR 1020 could fetch the specification, so treat it as unverified.
+
+Each way out changes something the owner owns. One drops the comma from those two fields, which alters
+the legal name there. The other drops `authors`, as the engine's own `pyproject.toml` already does.
+
+### Branches cut before this merges add the old name and still land green
+
+The licence-header gate, `scripts/quality/licence_header_check.py`, checks only the SPDX identifier and
+never the holder. So a new file carrying the old header passes it. After this merges, find stragglers
+with:
+
+```
+git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive/backlog/"
+```
+
+The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
+and will move to the archive when it closes.
