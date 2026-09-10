@@ -30,6 +30,7 @@ from .routes import (
     account,
     admin,
     audit,
+    cluster,
     config,
     connection_writes,
     core,
@@ -55,6 +56,8 @@ _REGISTRARS = (
     uploaded_logs,
     monitoring,
     status,
+    # BACKLOG #1495. Literal paths only, with no {param} sibling to shadow or be shadowed by.
+    cluster,
     monitoring_writes,
     connection_writes,
     config,

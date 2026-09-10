@@ -74,14 +74,16 @@ _SHIPPED_POLL_INTERVALS_MS: dict[str, int] = {
     "/ui/session-status": 30_000,  # static/app.js PROBE_MS -- the watchdog heartbeat, every page
     "/ui/connections": 5_000,  # pages/connections.py data_poll_ms -- connections dashboard only
     "/ui/monitoring/live": 5_000,  # pages/monitoring.py data_fragment_ms -- flow page only
+    "/ui/cluster/live": 5_000,  # pages/cluster.py data_fragment_ms -- high availability page only
 }
 
 # What one tab polls, by the page it is parked on. Every page carries the nav poll and the session
-# watchdog; the two live pages add their own fragment.
+# watchdog; the three live pages add their own fragment.
 _TAB_PROFILES: dict[str, tuple[str, ...]] = {
     "any page (nav + watchdog)": ("/ui/nav-status", "/ui/session-status"),
     "connections dashboard": ("/ui/nav-status", "/ui/session-status", "/ui/connections"),
     "flow / monitoring page": ("/ui/nav-status", "/ui/session-status", "/ui/monitoring/live"),
+    "high availability page": ("/ui/nav-status", "/ui/session-status", "/ui/cluster/live"),
 }
 
 
@@ -262,12 +264,14 @@ def test_shipped_poll_intervals_match_the_console_source() -> None:
     app_js = (_CONSOLE_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     connections = (_CONSOLE_ROOT / "pages" / "connections.py").read_text(encoding="utf-8")
     monitoring = (_CONSOLE_ROOT / "pages" / "monitoring.py").read_text(encoding="utf-8")
+    cluster = (_CONSOLE_ROOT / "pages" / "cluster.py").read_text(encoding="utf-8")
 
     derived = {
         "/ui/nav-status": _find(r"setInterval\(poll,\s*(\d+)\)", app_js, "nav-status poll"),
         "/ui/session-status": _find(r"PROBE_MS\s*=\s*(\d+)", app_js, "session-status probe"),
         "/ui/connections": _find(r'data_poll_ms="(\d+)"', connections, "connections fragment"),
         "/ui/monitoring/live": _find(r'data_fragment_ms="(\d+)"', monitoring, "flow fragment"),
+        "/ui/cluster/live": _find(r'data_fragment_ms="(\d+)"', cluster, "cluster fragment"),
     }
     assert {k: int(v) for k, v in derived.items()} == _SHIPPED_POLL_INTERVALS_MS
 
@@ -275,6 +279,7 @@ def test_shipped_poll_intervals_match_the_console_source() -> None:
     # otherwise leave the interval right and the target wrong.
     assert 'data_poll="/ui/connections"' in connections
     assert 'data_fragment_url="/ui/monitoring/live"' in monitoring
+    assert 'data_fragment_url="/ui/cluster/live"' in cluster
 
 
 def test_console_has_no_grant_audit_call_anywhere() -> None:
