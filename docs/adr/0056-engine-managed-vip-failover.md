@@ -242,15 +242,16 @@ parses `MEFOR_<SECTION>_<KEY>` one level deep, so there is no `MEFOR_CLUSTER_VIP
 switched-off block is a no-op and is never refused for its values (AC-6); unknown keys in it are still
 refused, as in every section. With `enabled = true`, the engine refuses to load:
 
-- without `[cluster].enabled`, or on a store other than `postgres` or `sqlserver`
-  (`ServiceSettings._vip_requires_clustered_server_db`, reported under `[cluster.vip]`);
+- without `[cluster].enabled` (`ClusterSettings._vip_fits_the_cluster`), or on a store other than
+  `postgres` or `sqlserver`. The store half is the existing `[cluster]` gate,
+  `ServiceSettings._cluster_requires_server_db`, which any clustered node on SQLite already fails;
 - with both `prefix` and `netmask`, or with neither;
 - with an `address` that is not IPv4, or is unspecified, loopback, link-local, multicast, reserved, or
   the network or broadcast address of its own subnet;
 - with a missing or blank `interface`, or one with surrounding whitespace, a double quote, or a
   non-printable character;
 - with `release_grace_seconds` below zero, or not below `[cluster].leader_fence_timeout_seconds`
-  (`ClusterSettings._vip_grace_inside_fence`).
+  (`ClusterSettings._vip_fits_the_cluster`).
 
 There is no platform check at load. Engine-managed VIP is Windows-only, but a Linux box running
 `messagefoundry check` against a Windows node's config must still be able to validate it. Refusing to
