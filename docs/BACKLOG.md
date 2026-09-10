@@ -29993,7 +29993,7 @@ standard. The slice has no item of its own yet, so it is named here by subject, 
 
 ## 1523. Install script for mefor-net-helper, the ADR 0056 VIP helper
 
-> 🔢 **Filed 2026-09-10. Not started. BLOCKED until PR 1015 puts the helper on `main`.** Value **4/10** · Difficulty **4/10**. Value 4: engine-managed VIP is opt-in and nothing in the engine calls the helper yet, but a hand install has two slips that matter, and a script can check both. Difficulty 4: the steps are known and `install-service.ps1` already holds most of the parts. The open work is reading `[cluster.vip]` from PowerShell without a second parser, and testing a script that must run elevated.
+> 🔢 **Filed 2026-09-10. Not started. Nothing blocks it: PR 1015 put the helper on `main` the same day.** Value **4/10** · Difficulty **4/10**. Value 4: engine-managed VIP is opt-in and nothing in the engine calls the helper yet, but a hand install has two slips that matter, and a script can check both. Difficulty 4: the steps are known and `install-service.ps1` already holds most of the parts. The open work is reading `[cluster.vip]` from PowerShell without a second parser, and testing a script that must run elevated.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -30003,18 +30003,16 @@ standard. The slice has no item of its own yet, so it is named here by subject, 
 helper yet. This is a missing capability, not a defect in shipped code. A first site that turned on
 engine-managed VIP would install the helper by hand, and two slips in that procedure would matter. An
 install folder an unprivileged account can write would give that account administrator rights. A
-`client_account` that does not match the engine's service account would make the helper refuse the engine,
-and that would surface when the engine first asks it to move the address, not at install.
+`client_account` that does not name the engine's service account would lock the engine out of the helper.
+That would surface when the engine first asks it to move the address, not at install.
 
-### It is blocked on PR 1015, not on the controller
+### Nothing blocks it now that PR 1015 has merged
 
-PR 1015 adds the helper, its build workflow and its README. It was open at head `1360e8e8c` when this was
-filed, and none of it is on `main`, so there is nothing to install yet. Its source has already moved once,
-from `packaging/net-helper/` to `net-helper/`. Re-read the paths below when you pick this up.
+PR 1015 merged on 2026-09-10 as `8262ef11e`. It put the helper, its build workflow and its
+[README](../net-helper/README.md) on `main`, in `net-helper/`.
 
-The engine-side controller does not block this. Once PR 1015 lands, the script can be built and checked
-with the helper's `ping`. The helper does nothing useful until that controller exists, which is why this is
-P3.
+The engine-side controller does not block this either. The script can be built now and checked with the
+helper's `ping`. The helper does nothing useful until that controller exists, which is why this is P3.
 
 ### How this was found
 
@@ -30026,9 +30024,10 @@ The tray already ships inside the wheel as `messagefoundry.tray`, the `messagefo
 ### The helper is the kind of artifact pip cannot install
 
 The helper is a compiled Windows binary. It runs as a LocalSystem service, and an administrator has to
-install it. PR 1015's workflow header calls it the repository's first compiled artifact. PR 1015 also adds
-a section to ADR 0056, "The helper ships beside the engine wheel, never inside it", which gives four
-reasons pip cannot install it. That section is the record, so this item does not repeat them.
+install it. The header of `.github/workflows/net-helper.yml` calls it the repository's first compiled
+artifact.
+[ADR 0056, "The helper ships beside the engine wheel, never inside it"](adr/0056-engine-managed-vip-failover.md#the-helper-ships-beside-the-engine-wheel-never-inside-it-2026-09-10)
+gives four reasons pip cannot install it. That section is the record, so this item does not repeat them.
 
 This is what separates it from item 39. Item 39's installer carried the desktop console, which was Python
 and which pip already delivered. That is why item 39's demand gate never fired.
@@ -30043,9 +30042,10 @@ least these for the engine:
 - checks a group managed service account before use, and grants it "Log on as a service";
 - locks the config folder's access list when `-LockConfigDir` is passed.
 
-PR 1015's `net-helper/README.md`, section "Install it", gives the helper install as manual elevated steps.
-In short: copy the binary and an example config into `C:\Program Files\MessageFoundry\net-helper\`, edit
-the config, register a LocalSystem service with NSSM, and check the pipe with `ping`.
+The helper's [README](../net-helper/README.md), section "Install it", writes the install out as manual
+elevated steps. Those steps are the record, so the script should perform them rather than restate them.
+The bullets below are what the script adds, or must get right. No release publishes the helper yet, so for
+now those steps install the output of `dotnet publish`.
 
 ### What the script should do
 
@@ -30057,21 +30057,23 @@ Add `install-net-helper.ps1` and `uninstall-net-helper.ps1` beside `install-serv
   will put a privileged binary on any box is a worse default than no script. The same read can also refuse
   when the address, interface or mask passed in differ from `[cluster.vip]`, because the helper refuses
   every request outside its configured scope.
-- Copy the binary into a folder an unprivileged account cannot write, and check that folder's access list
-  rather than assume it. Anything that can replace the binary inherits administrator rights. The config
-  file sits in the same folder and is the helper's trusted source for its scope, so the same rule covers it.
+- Check the helper folder's access list, rather than assume it. The README's "Keep the helper's files where
+  only administrators can write" names the folder, the files it must hold and the folder to avoid.
 - Write `mefor-net-helper.conf` from parameters for `address`, `interface`, `mask` and `client_account`.
-- Default `client_account` to the account the engine service runs as, which is the value
-  `install-service.ps1` set. With that script's defaults it is `NT SERVICE\MessageFoundry`. Reading it from
-  the installed service, as the README does, also covers a `-ServiceAccount` override, so the helper's
-  caller check cannot silently mismatch.
-- Register the helper to run, as the README does with NSSM. Share `install-service.ps1`'s `Resolve-Nssm`
-  rather than copying its pinned URL and SHA-256, so the two copies cannot drift apart.
+  The README's configuration table maps each key to its `[cluster.vip]` setting.
+- Default `client_account` to the account the engine service runs as. Read it from the installed service,
+  as the README's `client_account` section does, so a `-ServiceAccount` override is covered too. That
+  section lists what the engine would see if the value were wrong. Question 2 below is a case where the
+  value read that way does not work.
+- Reuse `install-service.ps1`'s pinned `$NssmUrl` and `$NssmSha256` rather than copying them, so the two
+  cannot drift apart. **Do not reuse its `Resolve-Nssm`.** That function returns an `nssm.exe` from `PATH`,
+  or a copy it caches in `<DataDir>\bin`, which is `C:\ProgramData\MessageFoundry\bin` by default. The
+  README keeps the helper's own `nssm.exe` out of that folder, because the engine's account can modify it.
 - Report plainly when the binary is unsigned, rather than hiding it. Print its Authenticode status and its
   SHA-256, so an operator can compare the hash with the build's job summary.
-- Verify the install by calling the helper's `ping` and printing the answer. Know what that proves. The
-  script runs elevated, and the helper admits an elevated administrator, so a good `ping` shows the pipe
-  answers. It does not show that the engine's account is admitted.
+- Verify the install with the README's ping check, and print the answer. Report no more than a good answer
+  proves. The README's "A ping proves the helper is up, but not that a bind would work" lists what it does
+  not prove.
 - The uninstall script stops and removes the service and deletes the folder.
 
 At least `tests/test_service_install_manifest.py` and `tests/test_crashdump_suppression.py` already
@@ -30083,7 +30085,13 @@ reference `install-service.ps1`. Start there for how the existing script is test
    parser that applies ADR 0056's load-time refusals, so a second parser would be a second definition of
    the block.
 2. What `client_account` should be when the engine runs as LocalSystem (`-AllowLocalSystem`). The service
-   manager reports that account as `LocalSystem`, and nobody has checked that the helper resolves the name.
+   manager reports that account as `LocalSystem`, and that name does not resolve. Measured 2026-09-10 on
+   Windows 11 Pro, in PowerShell 7.6.5 on .NET 10.0.11: `NTAccount('LocalSystem').Translate()` threw, and
+   `NT AUTHORITY\SYSTEM` resolved to `S-1-5-18`. `ParseClient` in `net-helper/HelperConfig.cs` makes that
+   call for any value not starting `S-1-`, and the README says a name no account has stops the helper at
+   start. So on a LocalSystem engine, the README's `client_account` step would stop the helper. Nobody has
+   run that against the helper binary. The helper also accepts a SID, and `S-1-5-18` is not one of the
+   broad groups it refuses.
 3. Whether uninstall asks the helper to `release` the address first. On the node that holds the VIP, that
    would drop the address.
 
@@ -30102,7 +30110,7 @@ the third has started to change:
 |---|---|
 | Zero uptake. | Still holds. There are zero deployments (sec. 0). |
 | The no-Python, no-IT demand gate never fired, because adopters use pip and have IT support. | Still holds. Engine-managed VIP also requires a clustered engine on PostgreSQL or SQL Server (ADR 0056, section D2). |
-| The signing certificate was never provisioned, so it only ever shipped unsigned. | Still holds for now. PR 1015 adds a signing step, but its workflow header says the certificate is still being procured, so an MSI would ship unsigned too. |
+| The signing certificate was never provisioned, so it only ever shipped unsigned. | Still holds for now. The `net-helper` workflow has a signing step, but its header says the owner is still procuring the certificate. Until then every helper build is unsigned, so an MSI would ship unsigned too. |
 
 The larger version, an installer that also installs the engine, is wrong for a separate reason.
 [ADR 0017](adr/0017-consumer-deployment-model.md) makes the engine a read-only pinned wheel beside an

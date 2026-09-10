@@ -435,7 +435,6 @@ for context):**
      helper is a *sharper* local-privilege-escalation primitive than the engine it protects; scoping it to
      the one configured VIP keeps the DEPLOY-1 story intact (segregated **and narrow** privilege).
    - Cost: two binaries to version/sign/audit per platform.
-   - Install: BACKLOG #1523 files the administrator install script and records why it is not an MSI.
 3. **Install-time OS capability grant (Windows-domain-only, partial).** Grant
    `SeNetworkConfigOperatorPrivilege` to the service account via Group/Local Policy — narrower than full
    Admin, but domain/policy-dependent, not portable, not one-pass-scriptable, and has no Linux/k8s analogue.
@@ -533,6 +532,9 @@ the engine-side controller will need no path to the binary and will import nothi
 
 **No release job publishes the helper yet.** The `net-helper` workflow uploads only a short-lived build
 artifact, and that is not a release.
+
+**No install script exists yet either.** BACKLOG #1523 files one for the README's "Install it" steps, and
+records why it is not an MSI.
 
 ## Observability
 
