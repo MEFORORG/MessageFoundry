@@ -11,6 +11,7 @@ and confirms the ``checks.py`` commit/CI mirror fails-closed on an unresolved po
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.checks import run_checks
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_NO_ALERTS_TOML,
+    PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML,
     PHI_GATE_PROVISIONS_TOML,
 )
 
@@ -122,12 +124,15 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         # Pre-clear egress/retention/alerts so the ONLY remaining refusal is the ADR-0140 keyless-prod
         # branch — exit 2 here discriminates that branch (deleting it would flip this row to ALLOW),
         # unlike a bare single-flag config whose exit 2 the later open-egress gate would also produce.
+        # The pre-clearing bundle must be the one WITHOUT the at-rest acks: the two that carry both
+        # acks would provision away the single-flag refusal this row exists to assert. Alerts are
+        # cleared by that bundle's opt-out line, so this row takes no `[alerts]` table (a dotted
+        # `alerts.x` key and an `[alerts]` header in one document is a TOML parse error).
         "keyless-prod-phi-single-flag-refuses",
         "security.allow_unencrypted_phi = true\n"
-        + PHI_GATE_PROVISIONS_TOML
+        + PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML
         + "security.delete_message_bodies_after_days = 30\n"
-        + _RETENTION_DL
-        + _ALERTS,
+        + _RETENTION_DL,
         "prod",
         False,
         2,
@@ -282,6 +287,23 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         0,
     ),
 ]
+
+
+@pytest.mark.parametrize("label,toml,env,key,expected", _MATRIX, ids=[m[0] for m in _MATRIX])
+def test_every_matrix_row_is_valid_toml(
+    label: str, toml: str, env: str, key: bool, expected: int
+) -> None:
+    """A row that does not PARSE still exits 2, so a REFUSE row passes without reaching its gate.
+
+    `__main__` catches `ValueError` from the config load and returns 2, and `TOMLDecodeError`
+    subclasses `ValueError`. That makes a malformed row indistinguishable from the refusal it claims
+    to measure. One row concatenated a bundle that already carried the same dotted key and sat green
+    for the life of the matrix; 19 of 20 rows parsed and the 20th passed anyway.
+
+    This control is cheap because it does not start anything -- it only asserts the fixture is the
+    document the row's author thought they wrote.
+    """
+    tomllib.loads(toml)
 
 
 @pytest.mark.parametrize("label,toml,env,key,expected", _MATRIX, ids=[m[0] for m in _MATRIX])

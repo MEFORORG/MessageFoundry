@@ -18,6 +18,11 @@ for at most the one it needs.
 
 Use :data:`PHI_GATE_PROVISIONS_TOML` when the fixture writes a `messagefoundry.toml`, and
 :func:`setenv_phi_gate_provisions` when it drives the same settings through the environment.
+
+The bundles below are COMPOSED from the per-gate parts rather than written out one by one. Three
+near-identical string literals is the drift this module exists to prevent: an edit lands in one, the
+others keep the old line, and the difference between two bundles stops being the difference their
+names claim.
 """
 
 from __future__ import annotations
@@ -27,33 +32,38 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pytest
 
-#: Dotted keys throughout, so a fixture can concatenate this and still add its own `[section]`
-#: headers without TOML redefining a table.
-#:
-#: * ``block_unlisted_outbound`` -- satisfies the unrestricted-egress refusal (declaring deny-by-default
-#:   rather than an allowlist, since a fixture's destinations are usually assigned at run time).
-#: * ``allow_unencrypted_phi`` + ``..._under_strict_enforcement`` -- the at-rest gate's audited opt-out,
-#:   BOTH acks, because under the shipped ``enforcement = enforce`` keyless PHI is deliberately never one
-#:   flag away (ADR 0140). A fixture that can just as easily set a key should do that instead.
-#: * ``alerts.security_notifications_required`` -- accepts the pull-only security-event feed, so the
-#:   fixture does not have to stand up an SMTP transport it never reads.
-PHI_GATE_PROVISIONS_TOML = (
-    "security.block_unlisted_outbound = true\n"
+#: Satisfies the unrestricted-egress refusal by declaring deny-by-default rather than an allowlist,
+#: since a fixture's destinations are usually assigned at run time.
+_EGRESS = "security.block_unlisted_outbound = true\n"
+
+#: The at-rest gate's audited opt-out, BOTH acks, because under the shipped ``enforcement = enforce``
+#: keyless PHI is deliberately never one flag away (ADR 0140). A fixture that can just as easily set a
+#: store key should do that instead.
+_AT_REST_ACKS = (
     "security.allow_unencrypted_phi = true\n"
     "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-    "alerts.security_notifications_required = false\n"
 )
+
+#: Accepts the pull-only security-event feed, so a fixture does not have to stand up an SMTP transport
+#: it never reads.
+_ALERTS_OPT_OUT = "alerts.security_notifications_required = false\n"
+
+#: Dotted keys throughout, so a fixture can concatenate this and still add its own `[section]`
+#: headers without TOML redefining a table.
+PHI_GATE_PROVISIONS_TOML = _EGRESS + _AT_REST_ACKS + _ALERTS_OPT_OUT
 
 #: The same, minus the `alerts.` line, for a fixture that declares its own `[alerts]` TABLE. TOML
 #: refuses to declare a table twice, and a dotted `alerts.x` key counts as declaring it -- so a
 #: fixture that configures a real SMTP transport must take this one and satisfy the notification gate
 #: the honest way. Splitting the constant rather than dropping the line from both keeps the
 #: distinction visible at the call site instead of leaving it to whoever debugs the TOML error.
-PHI_GATE_PROVISIONS_NO_ALERTS_TOML = (
-    "security.block_unlisted_outbound = true\n"
-    "security.allow_unencrypted_phi = true\n"
-    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-)
+PHI_GATE_PROVISIONS_NO_ALERTS_TOML = _EGRESS + _AT_REST_ACKS
+
+#: Egress and alerts only, for a fixture whose SUBJECT is the at-rest gate itself. The other two
+#: bundles hand over both acks, which would provision away the very refusal such a test is asserting
+#: -- it would then pass on whatever gate fired next, or on none at all. Take this one and add the
+#: exact at-rest flags the scenario is about.
+PHI_GATE_PROVISIONS_NO_AT_REST_ACKS_TOML = _EGRESS + _ALERTS_OPT_OUT
 
 #: The same four, as the environment variables the loader reads. Kept beside the TOML deliberately:
 #: two spellings of one list drift, and a fixture that sets three of four gets a refusal whose message
