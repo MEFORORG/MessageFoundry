@@ -55,16 +55,20 @@ mask. The log records those fields, the caller's account and the outcome, and no
 
 ## Build it
 
-You need Windows and a .NET SDK. The helper targets .NET Framework 4.8, which ships with Windows Server
-2022 and 2025, so the server needs nothing extra installed.
+You need Windows, the .NET 10 SDK, and the Visual Studio C++ build tools, which NativeAOT uses to link.
 
 ```powershell
-dotnet build packaging/net-helper/MeforNetHelper.csproj --configuration Release --output packaging/net-helper/out
+dotnet publish packaging/net-helper/MeforNetHelper.csproj --configuration Release --output packaging/net-helper/out
 ```
 
-The output folder holds `mefor-net-helper.exe`, `mefor-net-helper.exe.config` and
-`mefor-net-helper.conf.example`. The project references no NuGet packages. The `net-helper` workflow runs
-the same command, then checks that the `requireAdministrator` manifest is embedded in the binary.
+`dotnet publish` compiles the helper with NativeAOT into one native executable, so the server needs no .NET
+runtime installed. ADR 0056, "The helper as built", records why. Install only `dotnet publish` output:
+`dotnet build` output needs the .NET 10 runtime.
+
+The output folder holds `mefor-net-helper.exe`, its debug symbols in `mefor-net-helper.pdb`, and
+`mefor-net-helper.conf.example`. The project references no NuGet packages. Publishing downloads only the
+NativeAOT compiler and runtime pack that the SDK itself names. The `net-helper` workflow runs the same
+command, then checks that the binary requires administrator and loads no DLL from its own folder.
 
 ## Install it
 
@@ -72,7 +76,8 @@ Run these steps in an elevated PowerShell on each cluster node.
 
 1. Install the engine's service first, so its account exists. By default that account is
    `NT SERVICE\MessageFoundry` ([SERVICE.md](../../docs/SERVICE.md), DEPLOY-1).
-2. Copy the three files from the build output to `C:\Program Files\MessageFoundry\net-helper\`. Only
+2. Copy `mefor-net-helper.exe` and `mefor-net-helper.conf.example` from the build output to
+   `C:\Program Files\MessageFoundry\net-helper\`. Only
    administrators can write there, and it must stay that way: anyone who can write that folder can replace
    the binary or its configuration.
 3. In that folder, rename `mefor-net-helper.conf.example` to `mefor-net-helper.conf`.

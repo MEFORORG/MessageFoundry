@@ -2,10 +2,12 @@
 // Copyright (C) 2026 MessageFoundry Organization and contributors
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
 using System.Text;
-using System.Web.Script.Serialization;
+using System.Text.Json;
+using System.Text.Unicode;
 
 namespace MessageFoundry.NetHelper
 {
@@ -18,6 +20,10 @@ namespace MessageFoundry.NetHelper
 
         internal static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
 
+        // A request is a flat object of strings. Depth 2 lets a value nested one level parse far enough to be
+        // refused as a non-string; anything deeper is refused as invalid JSON.
+        private static readonly JsonDocumentOptions ParseOptions = new JsonDocumentOptions { MaxDepth = 2 };
+
         // Parses a request and checks it against the configured scope. Only the op name leaves this method,
         // so no value a caller sent can reach anything downstream, the OS included.
         internal static string TryParse(byte[] line, HelperConfig config, out string op)
@@ -28,43 +34,43 @@ namespace MessageFoundry.NetHelper
                 return "request must be UTF-8 without a byte order mark";
             }
 
-            string text;
-            try
-            {
-                text = StrictUtf8.GetString(line);
-            }
-            catch (DecoderFallbackException)
+            if (!Utf8.IsValid(line))
             {
                 return "request is not valid UTF-8";
             }
 
-            object parsed;
+            // JsonDocument maps the JSON onto no type, so no caller can name a type for this process to build, and
+            // nothing here needs the reflection NativeAOT does not provide. A repeated name keeps its last value.
+            // A value that is not a string is kept as null, which no JSON string produces. System.Text.Json refuses
+            // to decode an escaped lone surrogate: GetString and Name throw InvalidOperationException for one.
+            var fields = new Dictionary<string, string>(StringComparer.Ordinal);
             try
             {
-                // DeserializeObject with no type resolver yields only dictionaries, arrays and primitives, so
-                // no caller can name a type for this process to build.
-                parsed = new JavaScriptSerializer { RecursionLimit = 2 }.DeserializeObject(text);
+                using (JsonDocument document = JsonDocument.Parse(line, ParseOptions))
+                {
+                    if (document.RootElement.ValueKind != JsonValueKind.Object)
+                    {
+                        return "request must be a JSON object";
+                    }
+
+                    foreach (JsonProperty property in document.RootElement.EnumerateObject())
+                    {
+                        fields[property.Name] =
+                            property.Value.ValueKind == JsonValueKind.String ? property.Value.GetString() : null;
+                    }
+                }
             }
-            catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException || ex is FormatException || ex is OverflowException)
+            catch (Exception ex) when (ex is JsonException || ex is InvalidOperationException)
             {
                 return "request is not valid JSON";
             }
 
-            var fields = parsed as IDictionary<string, object>;
-            if (fields == null)
+            if (fields.ContainsValue(null))
             {
-                return "request must be a JSON object";
+                return "every request field must be a string";
             }
 
-            foreach (object value in fields.Values)
-            {
-                if (!(value is string))
-                {
-                    return "every request field must be a string";
-                }
-            }
-
-            string name = Field(fields, "op");
+            string name = fields.GetValueOrDefault("op");
             string[] expected;
             switch (name)
             {
@@ -100,20 +106,35 @@ namespace MessageFoundry.NetHelper
 
         internal static string Pong(string version)
         {
-            return new JavaScriptSerializer().Serialize(new Dictionary<string, object> { { "ok", true }, { "version", version } });
+            return Response(true, "version", version);
         }
 
         internal static string Failure(string error)
         {
-            return new JavaScriptSerializer().Serialize(new Dictionary<string, object> { { "ok", false }, { "error", error } });
+            return Response(false, "error", error);
+        }
+
+        // Utf8JsonWriter escapes the value as JSON requires and uses no reflection, so NativeAOT compiles it.
+        private static string Response(bool ok, string name, string value)
+        {
+            var buffer = new ArrayBufferWriter<byte>();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                writer.WriteBoolean("ok", ok);
+                writer.WriteString(name, value);
+                writer.WriteEndObject();
+            }
+
+            return StrictUtf8.GetString(buffer.WrittenSpan);
         }
 
         // The scope check ADR 0056 makes non-optional: a request must name exactly the configured address,
         // interface and (for bind) mask. Anything else is refused and never attempted.
-        private static string CheckScope(IDictionary<string, object> fields, bool hasMask, HelperConfig config)
+        private static string CheckScope(Dictionary<string, string> fields, bool hasMask, HelperConfig config)
         {
             IPAddress address;
-            if (!Ipv4.TryParseStrict(Field(fields, "address"), out address))
+            if (!Ipv4.TryParseStrict(fields["address"], out address))
             {
                 return "address must be dotted-decimal IPv4";
             }
@@ -123,7 +144,7 @@ namespace MessageFoundry.NetHelper
                 return "address is outside this helper's scope";
             }
 
-            if (!string.Equals(Field(fields, "interface"), config.Interface, StringComparison.Ordinal))
+            if (!string.Equals(fields["interface"], config.Interface, StringComparison.Ordinal))
             {
                 return "interface is outside this helper's scope";
             }
@@ -131,7 +152,7 @@ namespace MessageFoundry.NetHelper
             if (hasMask)
             {
                 IPAddress mask;
-                if (!Ipv4.TryParseStrict(Field(fields, "mask"), out mask))
+                if (!Ipv4.TryParseStrict(fields["mask"], out mask))
                 {
                     return "mask must be dotted-decimal IPv4";
                 }
@@ -143,12 +164,6 @@ namespace MessageFoundry.NetHelper
             }
 
             return null;
-        }
-
-        private static string Field(IDictionary<string, object> fields, string key)
-        {
-            object value;
-            return fields.TryGetValue(key, out value) ? value as string : null;
         }
     }
 }

@@ -34,15 +34,16 @@ namespace MessageFoundry.NetHelper
         // Returns only when the pipe cannot be created. Otherwise it serves until the process is stopped.
         internal static int Run(HelperConfig config)
         {
-            // maxNumberOfServerInstances = 1 makes the constructor pass FILE_FLAG_FIRST_PIPE_INSTANCE: start-up
-            // FAILS if another process already holds this pipe name, instead of joining an instance whose ACL
-            // that process chose. This one instance then serves every caller in turn, so the name is never
-            // free for another process to take while the helper runs.
+            // FirstPipeInstance (FILE_FLAG_FIRST_PIPE_INSTANCE) makes start-up FAIL if another process already
+            // holds this pipe name, instead of joining an instance whose ACL that process chose. This one instance
+            // then serves every caller in turn, so the name is never free for another process to take while the
+            // helper runs.
             NamedPipeServerStream pipe;
             try
             {
-                pipe = new NamedPipeServerStream(
-                    PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous,
+                pipe = NamedPipeServerStreamAcl.Create(
+                    PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
                     MaxRequestBytes, MaxRequestBytes, BuildAcl(config.ClientSid));
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)

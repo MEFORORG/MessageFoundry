@@ -142,7 +142,9 @@ namespace MessageFoundry.NetHelper
             return BitConverter.ToUInt32(address.GetAddressBytes(), 0);
         }
 
-        // System32 only: an iphlpapi.dll planted beside the executable must never load into this process.
+        // System32 only: an iphlpapi.dll planted beside the executable must never load into this process. This
+        // attribute covers an import bound at run time. NativeAOT binds this one when it links, so the csproj's
+        // /DEPENDENTLOADFLAG is what enforces it in the published binary.
         [DllImport("iphlpapi.dll", ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern int SendARP(uint destIp, uint srcIp, byte[] macAddress, ref int macAddressLength);
