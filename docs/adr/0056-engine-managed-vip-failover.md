@@ -435,6 +435,7 @@ for context):**
      helper is a *sharper* local-privilege-escalation primitive than the engine it protects; scoping it to
      the one configured VIP keeps the DEPLOY-1 story intact (segregated **and narrow** privilege).
    - Cost: two binaries to version/sign/audit per platform.
+   - Install: BACKLOG #1523 files the administrator install script and records why it is not an MSI.
 3. **Install-time OS capability grant (Windows-domain-only, partial).** Grant
    `SeNetworkConfigOperatorPrivilege` to the service account via Group/Local Policy — narrower than full
    Admin, but domain/policy-dependent, not portable, not one-pass-scriptable, and has no Linux/k8s analogue.

@@ -29940,3 +29940,125 @@ So the cause is **not** simple CPU contention, which was the obvious first hypot
 **DO NOT "FIX" THIS BY WIDENING THE TOLERANCE.** The 1 ms bound has 416x headroom against the real spread and is not the problem. A tolerance wide enough to admit 500 ms would also admit the 49 ms branch spread that #1140 existed to close, which is the same defect that item was filed to fix.
 
 **RELATED, and deliberately kept apart:** this is not #1304. That is a `pwsh` launch that never returns on the `windows-2025` harness leg, reported as its own event; this is an assertion failing on a value. They share a runner label and nothing else.
+
+## 1523. Install script for mefor-net-helper, the ADR 0056 VIP helper
+
+> 🔢 **Filed 2026-09-10. Not started. BLOCKED until PR 1015 puts the helper on `main`.** Value **4/10** · Difficulty **4/10**. Value 4: engine-managed VIP is opt-in and nothing in the engine calls the helper yet, but a hand install has two slips that matter, and a script can check both. Difficulty 4: the steps are known and `install-service.ps1` already holds most of the parts. The open work is reading `[cluster.vip]` from PowerShell without a second parser, and testing a script that must run elevated.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** active-passive HA / engine-managed VIP (ADR 0056). **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). There are zero deployments, and nothing in the engine calls the
+helper yet. This is a missing capability, not a defect in shipped code. A first site that turned on
+engine-managed VIP would install the helper by hand, and two slips in that procedure would matter. An
+install folder an unprivileged account can write would give that account administrator rights. A
+`client_account` that does not match the engine's service account would make the helper refuse the engine,
+and that would surface when the engine first asks it to move the address, not at install.
+
+### It is blocked on PR 1015, not on the controller
+
+PR 1015 adds the helper, its build workflow and its README. It was open at head `1360e8e8c` when this was
+filed, and none of it is on `main`, so there is nothing to install yet. Its source has already moved once,
+from `packaging/net-helper/` to `net-helper/`. Re-read the paths below when you pick this up.
+
+The engine-side controller does not block this. Once PR 1015 lands, the script can be built and checked
+with the helper's `ping`. The helper does nothing useful until that controller exists, which is why this is
+P3.
+
+### How this was found
+
+The owner asked on 2026-09-10 whether a Windows installer should bundle the tray with the VIP helper. The
+answer given was no. Both reached this item in a brief that is not in git, so read them at that standard.
+The tray already ships inside the wheel as `messagefoundry.tray`, the `messagefoundry-tray` gui-script in
+`pyproject.toml` (ADR 0113), so it needs no installer. Scoping that question turned up the gap below.
+
+### The helper is the kind of artifact pip cannot install
+
+The helper is a compiled Windows binary. It runs as a LocalSystem service, and an administrator has to
+install it. PR 1015's workflow header calls it the repository's first compiled artifact. PR 1015 also adds
+a section to ADR 0056, "The helper ships beside the engine wheel, never inside it", which gives four
+reasons pip cannot install it. That section is the record, so this item does not repeat them.
+
+This is what separates it from item 39. Item 39's installer carried the desktop console, which was Python
+and which pip already delivered. That is why item 39's demand gate never fired.
+
+### Most of the parts already exist
+
+[`install-service.ps1`](../scripts/service/install-service.ps1), 582 lines on 2026-09-10, already does at
+least these for the engine:
+
+- registers it as a service with NSSM, and downloads a pinned, hash-checked NSSM when none is present;
+- runs it as the least-privilege virtual account `NT SERVICE\<ServiceName>` by default;
+- checks a group managed service account before use, and grants it "Log on as a service";
+- locks the config folder's access list when `-LockConfigDir` is passed.
+
+PR 1015's `net-helper/README.md`, section "Install it", gives the helper install as manual elevated steps.
+In short: copy the binary and an example config into `C:\Program Files\MessageFoundry\net-helper\`, edit
+the config, register a LocalSystem service with NSSM, and check the pipe with `ping`.
+
+### What the script should do
+
+Add `install-net-helper.ps1` and `uninstall-net-helper.ps1` beside `install-service.ps1` and
+`uninstall-service.ps1`. The names are a suggestion.
+
+- **Refuse to run when engine-managed VIP is not enabled in the engine's settings.** `[cluster.vip].enabled`
+  is off by default (ADR 0056, section D2), so most sites should never install this binary. A script that
+  will put a privileged binary on any box is a worse default than no script. The same read can also refuse
+  when the address, interface or mask passed in differ from `[cluster.vip]`, because the helper refuses
+  every request outside its configured scope.
+- Copy the binary into a folder an unprivileged account cannot write, and check that folder's access list
+  rather than assume it. Anything that can replace the binary inherits administrator rights. The config
+  file sits in the same folder and is the helper's trusted source for its scope, so the same rule covers it.
+- Write `mefor-net-helper.conf` from parameters for `address`, `interface`, `mask` and `client_account`.
+- Default `client_account` to the account the engine service runs as, which is the value
+  `install-service.ps1` set. With that script's defaults it is `NT SERVICE\MessageFoundry`. Reading it from
+  the installed service, as the README does, also covers a `-ServiceAccount` override, so the helper's
+  caller check cannot silently mismatch.
+- Register the helper to run, as the README does with NSSM. Share `install-service.ps1`'s `Resolve-Nssm`
+  rather than copying its pinned URL and SHA-256, so the two copies cannot drift apart.
+- Report plainly when the binary is unsigned, rather than hiding it. Print its Authenticode status and its
+  SHA-256, so an operator can compare the hash with the build's job summary.
+- Verify the install by calling the helper's `ping` and printing the answer. Know what that proves. The
+  script runs elevated, and the helper admits an elevated administrator, so a good `ping` shows the pipe
+  answers. It does not show that the engine's account is admitted.
+- The uninstall script stops and removes the service and deletes the folder.
+
+At least `tests/test_service_install_manifest.py` and `tests/test_crashdump_suppression.py` already
+reference `install-service.ps1`. Start there for how the existing script is tested.
+
+### Three questions are left for the builder
+
+1. How the script reads `[cluster.vip]`. PowerShell has no TOML reader. The engine's `load_settings` is the
+   parser that applies ADR 0056's load-time refusals, so a second parser would be a second definition of
+   the block.
+2. What `client_account` should be when the engine runs as LocalSystem (`-AllowLocalSystem`). The service
+   manager reports that account as `LocalSystem`, and nobody has checked that the helper resolves the name.
+3. Whether uninstall asks the helper to `release` the address first. On the node that holds the VIP, that
+   would drop the address.
+
+### An MSI is out of scope for this item
+
+An MSI would buy a setup wizard and an Add/Remove Programs entry. It would cost a new build toolchain, a
+second file to sign, and a release job that must stay green. Item 39's release job did not stay green: it
+failed on every tag release from v0.2.11 to v0.2.14.
+
+Item 39, in [`BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md), is the precedent. It built a frozen,
+zero-Python console installer under ADR 0032 Phase B, accepted 2026-06-28, and deleted it on 2026-07-01.
+Its retirement note gives three reasons. Checked against the tree on 2026-09-10, all three still hold, and
+the third has started to change:
+
+| Item 39's reason | On 2026-09-10 |
+|---|---|
+| Zero uptake. | Still holds. There are zero deployments (sec. 0). |
+| The no-Python, no-IT demand gate never fired, because adopters use pip and have IT support. | Still holds. Engine-managed VIP also requires a clustered engine on PostgreSQL or SQL Server (ADR 0056, section D2). |
+| The signing certificate was never provisioned, so it only ever shipped unsigned. | Still holds for now. PR 1015 adds a signing step, but its workflow header says the certificate is still being procured, so an MSI would ship unsigned too. |
+
+The larger version, an installer that also installs the engine, is wrong for a separate reason.
+[ADR 0017](adr/0017-consumer-deployment-model.md) makes the engine a read-only pinned wheel beside an
+org-owned config repo, and its 2026-06-27 amendment makes the non-editable wheel the enforced production
+default. An installer that installed the engine would work against that model. It would also have to carry
+a Python 3.14 runtime, since `pyproject.toml` sets `requires-python = ">=3.14"`.
+
+**Re-entry condition**, from item 39 itself: a genuine site with no Python and no IT support. Reopen the
+MSI question only when one appears.
