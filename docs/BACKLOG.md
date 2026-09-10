@@ -29941,6 +29941,56 @@ So the cause is **not** simple CPU contention, which was the obvious first hypot
 
 **RELATED, and deliberately kept apart:** this is not #1304. That is a `pwsh` launch that never returns on the `windows-2025` harness leg, reported as its own event; this is an assertion failing on a value. They share a runner label and nothing else.
 
+## 1522. Nobody has captured the ARP frame the net-helper sends, so whether its sender address is the VIP is unknown
+
+> 🔢 **Filed 2026-09-10 from PR 1015, which built the helper and recorded this gap. Not started. It BLOCKS the AC-1 controller slice (owner ruling, below).** Value **7/10** · Difficulty **3/10**. Value 7 -- AC-1's gratuitous ARP is how peers learn the VIP moved, and the one op meant to send it has never been seen on the wire. Difficulty 3 -- one packet capture; the work is the lab box, not the code.
+
+**Cluster:** active-passive HA / engine-managed VIP (ADR 0056). **Priority:** P2. **Verdict:** research.
+**Severity:** no deployment axis (sec. 0). There are zero deployments, and nothing in the engine calls the
+helper yet.
+
+### What is unverified
+
+ADR 0056 AC-1 says a node that wins leadership SHALL emit an IPv4 gratuitous ARP, a frame that carries the
+VIP as its sender protocol address.
+
+The helper cannot send the usual form. `SendARP` with the host's own address as target returned in about
+1 ms with the host's MAC and put nothing on the wire. That was measured on Windows 11 on 2026-09-10 and is
+recorded in ADR 0056, "The helper as built". So `Announce` in `net-helper/NetOps.cs` calls
+`SendARP(gateway, vip)`: an ARP request to the adapter's IPv4 gateway, with the VIP passed as the source.
+
+**Nobody has read the frame that call emits,** so nobody knows whether Windows puts the VIP in its sender
+protocol address.
+
+### Why it matters
+
+A gratuitous ARP on promotion exists so peers refresh their ARP caches and traffic follows the VIP. If the
+sender field is not the VIP, the frame refreshes nothing for it. Failover would still move the address: the
+new leader would hold it and the old one would have released it. But the gateway and clients would keep
+sending to the old host's MAC until their entries aged out, on a timer each peer sets for itself.
+
+### What would settle it
+
+Capture the frame on a two-NIC Windows Server box, the platform the feature targets, and record the OS
+build beside the capture.
+
+1. Bind a test VIP with the helper's own `bind`, so the address carries `skipassource=true` as it would in
+   use. That flag changes which addresses Windows picks as a source, and nobody has measured whether it
+   reaches ARP, so a hand-added address does not test the same thing.
+2. Start an elevated ARP capture on that adapter, with `pktmon` or Wireshark.
+3. Call the helper's `arp` op.
+4. Read the sender protocol address of the emitted frame. It must equal the VIP.
+
+If the sender is wrong, choosing another way to send the frame is its own decision, and it is not made here.
+
+The same box can also run `bind` and `release` against a real adapter, which has not happened either
+(`net-helper/README.md`, "Known limits"). That gap is not filed here.
+
+### It BLOCKS the AC-1 controller slice
+
+**Owner ruling, 2026-09-10.** It reached PR 1015's Builder in a brief that is not in git, so read it at that
+standard. The slice has no item of its own yet, so it is named here by subject, not by number.
+
 ## 1523. Install script for mefor-net-helper, the ADR 0056 VIP helper
 
 > 🔢 **Filed 2026-09-10. Not started. BLOCKED until PR 1015 puts the helper on `main`.** Value **4/10** · Difficulty **4/10**. Value 4: engine-managed VIP is opt-in and nothing in the engine calls the helper yet, but a hand install has two slips that matter, and a script can check both. Difficulty 4: the steps are known and `install-service.ps1` already holds most of the parts. The open work is reading `[cluster.vip]` from PowerShell without a second parser, and testing a script that must run elevated.
@@ -30062,3 +30112,81 @@ a Python 3.14 runtime, since `pyproject.toml` sets `requires-python = ">=3.14"`.
 
 **Re-entry condition**, from item 39 itself: a genuine site with no Python and no IT support. Reopen the
 MSI question only when one appears.
+
+## 1524. the stepdown suite does not pin the 412 status code, nor new_leader_eligible, nor the freshness conjunct in the leader pick
+
+> 🔢 **Filed 2026-09-10 by the Lander, from a pre-merge review of PR 1013 that reached the pull request 15 minutes before it merged. Not started.** Value **6/10** · Difficulty **2/10**. Value 6 -- these are the tests for a control plane that decides which node leads, and three separate properties they are named for are not pinned. Difficulty 2 -- every gap is one assertion or one fixture row, and the mutations that expose them are written out below.
+
+**Cluster:** clustering / test quality. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing is exposed and no shipped behaviour is wrong today. The defect is that three properties a reader would believe are guarded are not, so the next change to any of them lands green.
+
+PR 1013 added the `412` refusal, the `force` waiver and `new_leader_eligible` to `POST /cluster/stepdown`. The **behaviour is correct** -- a five-lens review found no two-leaders window and confirmed `force` waives exactly the `412` and nothing else. What follows is only about what the tests hold.
+
+**MEASURED AT `1c8e73b37`, four mutations, each restored before the next:**
+
+```
+BASELINE  tests/test_cluster.py + tests/test_api_cluster_stepdown.py     80 passed
+
+1. delete `and fresh[r["node_id"]]` from the leader pick, cluster.py:174
+   -> tests/test_cluster.py                                             64 passed   NOT CAUGHT
+
+2. new_leader_eligible=new_leader_eligible  ->  =not force, app.py:5719
+   -> tests/test_api_cluster_stepdown.py                                16 passed   NOT CAUGHT
+
+3. raise HTTPException(412  ->  raise HTTPException(499
+   -> tests/test_api_cluster_stepdown.py                                16 passed   NOT CAUGHT
+
+CONTROL. neuter the guard: `if False and not new_leader_eligible and not force:`
+   -> tests/test_api_cluster_stepdown.py                     1 failed, 15 passed   CAUGHT
+```
+
+**The control is what makes the other three mean anything.** It fires on
+`test_a_node_with_no_promotable_sibling_is_refused_before_the_release`, so the suite runs, reaches the
+endpoint and can fail. The three survivors are therefore real gaps rather than a suite that is inert.
+
+**MUTATION 3 IS THE ONE THAT WAS NOT IN THE REVIEW, AND IT IS THE WORST OF THE THREE.** I ran it as a
+control expecting it to be caught, and it was not. **The test that exists to prove the refusal happens
+does not assert which status code the refusal returns.** `412` is the contract: `docs/adr/0056` names
+it in the Errors row, `docs/CLUSTERING.md` sends operators to it, and an operator's tooling branches on
+it against the `409` and the `400`. A future change that answered `409` there would pass.
+
+**Mutation 2** works because `new_leader_eligible` and `force` are never observed to differ. Every
+request reaching a `200` with `force=false` must have an eligible sibling, since `eligible=false` plus
+`force=false` raises the `412`, so all three body assertions satisfy `new_leader_eligible == (not
+force)`. The missing case is the one `docs/CLUSTERING.md:374` explicitly allows: **force true on a node
+that does have a live promotable sibling**, which must answer `200` with *both* fields true. The
+symmetric mutation `force=not new_leader_eligible` also survives.
+
+**Mutation 1** works because the fixture at `tests/test_cluster.py:221-237` cannot separate the arms.
+Rows are `crashed(1.0, flagged)`, `leader(999.0, flagged)`, `standby(998.0)` at `now=1000.0` against a
+30-second timeout, so the fresh leader row wins on `last_seen` ordering whatever the freshness rule
+says. The conjunct only bites when **every** leader-flagged row is stale, and no fixture against this
+helper has that shape.
+
+**A SECOND THING MUTATION 1 EXPOSED, worth its own line.** The conjunct occurs **twice** in
+`cluster.py`: at `:174` in `members_from_node_rows` and again at `:950` in
+`DbCoordinator.cluster_members`. The helper's own docstrings at `:149` and `:158` say it is what "both
+DB coordinators call" and that it builds members "for both DB coordinators". Only
+`SqlServerCoordinator` calls it, at `cluster_sqlserver.py:277`. The Postgres path keeps its own copy of
+the derived-leader pick and the `fresh` publication -- and `fresh` is exactly what
+`has_promotable_sibling` reads for the new `412`. The freshness *rule* is single-sourced
+(`heartbeat_is_fresh`, called from both), so this is narrower than it looks, but **nothing pins parity
+between the two copies**: a rule added to the shared helper alone would silently skip the Postgres path
+with every test green. `tests/test_cluster.py:222` repeats the false "both DB coordinators" statement
+in a test that exercises only the helper.
+
+**WHAT TO BUILD.** Four assertions and one fixture row, none of them large:
+
+1. assert the refusal's **status code**, not merely that it refused;
+2. a test with `force=true` **and** a live promotable sibling, asserting `new_leader_eligible` and
+   `force` are both true in the body;
+3. a fixture in which every leader-flagged row is stale, so the freshness conjunct decides the pick;
+4. a parity assertion between `members_from_node_rows` and `DbCoordinator.cluster_members`, or delete
+   the duplicate and make the docstrings true.
+
+**Re-run each mutation above after building, and require it to be CAUGHT.** A test added without that
+step is the same defect one layer out; this item exists because three tests named for properties did
+not hold them.
+
+**RELATED and deliberately kept apart:** #1521 is a *timing* failure in a different suite on the same
+runner label. This item is about assertions that cannot fail. Nothing here is a flake.

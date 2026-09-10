@@ -1,0 +1,53 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- The -windows target carries the pipe ACL, access token and network interface APIs the helper calls. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <!--
+      .NET 10 is a long-term support release, serviced until November 2028. `dotnet publish` compiles the
+      helper with NativeAOT into one native executable: no .NET runtime is installed beside it, and nothing
+      unpacks into a temporary directory at launch, which is the escalation route a frozen or self-extracting
+      binary would open under an administrator's token. So never publish it as a self-extracting single file.
+      ADR 0056, "The helper as built", records the decision.
+    -->
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- Only Microsoft.NETCore.App is referenced, so restore skips the ASP.NET Core and desktop runtime packs. -->
+    <DisableTransitiveFrameworkReferenceDownloads>true</DisableTransitiveFrameworkReferenceDownloads>
+    <!--
+      The native binary carries its own runtime, so its exploit mitigations are this build's to set. Control
+      Flow Guard checks indirect calls in a process that runs as LocalSystem and parses untrusted requests.
+    -->
+    <ControlFlowGuard>Guard</ControlFlowGuard>
+    <AssemblyName>mefor-net-helper</AssemblyName>
+    <RootNamespace>MessageFoundry.NetHelper</RootNamespace>
+    <!-- The one version source. `ping` reports it, and the engine-side controller will check it. -->
+    <Version>0.1.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Company>MessageFoundry Organization</Company>
+    <Product>MessageFoundry</Product>
+    <Copyright>Copyright (C) 2026 MessageFoundry Organization and contributors</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      NativeAOT binds Windows API imports, SendARP among them, when it links. The loader resolves those at
+      start-up, where [DefaultDllImportSearchPaths] has no effect, and looks beside the executable first.
+      Measured 2026-09-10: without this flag, a planted IPHLPAPI.DLL loaded into the helper. 0x800 is
+      LOAD_LIBRARY_SEARCH_SYSTEM32, so every DLL this executable imports at load comes from System32. The
+      net-helper workflow checks it.
+    -->
+    <LinkerArg Include="/DEPENDENTLOADFLAG:0x800" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Every build output is an install bundle: the binary plus the configuration to copy and edit. -->
+    <None Update="mefor-net-helper.conf.example" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

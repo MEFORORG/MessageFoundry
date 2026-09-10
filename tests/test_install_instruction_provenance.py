@@ -233,7 +233,8 @@ def test_a_new_distribution_must_be_classified() -> None:
         f"packaged distribution(s) classified as neither unpublished nor published: {unclassified}. "
         f"Add each to _UNPUBLISHED_DISTRIBUTIONS (and keep docs on a path install) until its name is "
         f"registered, then move it to _PUBLISHED_DISTRIBUTIONS. An unclaimed name that shipped docs "
-        f"reference by name is the dependency-confusion window (ASVS 15.2.4)."
+        f"reference by name is the dependency-confusion window (ASVS 15.2.4). A tree that is not "
+        f"a Python distribution does not belong under packaging/: move it out, as net-helper/ was."
     )
 
 
