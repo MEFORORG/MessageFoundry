@@ -5677,6 +5677,7 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
 
 ## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `be4965246` (PR 788), verified with `git merge-base --is-ancestor`.** The gate fix was re-verified at HEAD and closure proposed in that very commit; the row then stayed open behind its own *"banner stays open for the archive pass"* note. This is that pass. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 > **FIXED 2026-08-26. The banner stays open for the archive pass, as with #1026 and #1361.**
 > *(Two sibling rows written the same night are deliberately NOT cited here: their numbers are
 > allocated but their ROWS live on branches that have not landed, so a citation to them DANGLES
@@ -5786,7 +5787,7 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 > **The archive pass is still the only thing outstanding**, and closure is still PROPOSED rather than
 > taken: the banner belongs to the Lander (`scripts/docs/backlog_status_check.py`).
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
+> **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The defect is intact: worktree_gate.ps1:319 takes the -C value and the cd resolution at :321-330 is the else branch, so a relative -C behind a cd prefix resolves against the session cwd and the deny names the wrong repository. Value 6 is rung 6 -- a live false deny on developer tooling whose only workaround is a human overriding a message that actively misinforms. Difficulty 4, not 5, because the change is hoisting the existing cd computation above the -C branch and joining a relative -C to it inside one function, and the deny-text assertion the scorer priced as extra cost is already a shipped test capability. _(was 6/10 · 4/10.)_
 >
 > **Filed 2026-08-07 — not started. ⛔ THIS IS LIVE ON THE INSTALLED GATE and is the ONLY confirmed false deny remaining after #1082 withdrew the other one.** `Get-GitTargetCandidatesRaw` prefers `-C` and **discards** a `cd` prefix, but a real shell resolves a relative `-C` against the **post-`cd`** directory. So from a governed primary, `cd ../Unrelated && git -C . config core.hooksPath /dev/null` **DENIES, naming the primary**, while the command actually configures the ungoverned `../Unrelated`.
 > Verdict: build
@@ -15828,6 +15829,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 **Provenance.** Diagnosed by the lane whose own commit tripped it: seven tests in one file failed in a full run and **passed in isolation, twice**. It reported the negative control alongside the fix -- restoring the bare import reproduced exactly those seven failures -- which is what makes the green meaningful. Recorded here rather than left in session mail because the collision outlives the commit that revealed it. It is the same shape as the rest of this cluster: **the name resolved to the neighbouring module, and nothing said so.**
 
 ## 1256. the federated binding guards account-continuity but never subject-exclusivity, so two accounts can bind one identity
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `4d12e5a1b` (PR 640), verified with `git merge-base --is-ancestor`.** Both halves are done -- the behavioural half was already closed in shipped code and the atomicity half landed here. The row stayed open behind a *"banner left open for the archive pass"* note. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 > **THE ATOMICITY HALF IS BUILT 2026-08-27; banner left open for the archive pass.** A partial/filtered
 > unique index `ux_users_federated_subject` on `(oidc_issuer, oidc_subject)` now exists on all three
 > backends, and the race loser is rendered as the SAME `federated_subject_already_bound` outcome the
@@ -15858,7 +15860,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > user in the table. A reader who learned the rule from the SQLite file would delete it as redundant.
 >
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The behavioural half is closed in shipped code -- auth/service.py:1219-1232 refuses a second account binding one (issuer, subject), with the lookup on all three backends and a sequential test at tests/test_auth_oidc_service.py:456 -- so the remainder is only the database constraint that makes the read-then-write at :1219/:1232 atomic, which is worth a 5 as auth hardening with the app guard covering every non-concurrent case. Difficulty drops to 4 because the amendment moved the design half (refuse rather than re-point) into shipped code and comment, leaving a well-precedented seam: all three backends already declare unique indexes (ux_webauthn_label, ux_search_presets_owner_name), so the novel cost is one first-of-kind SQL Server ALTER COLUMN off NVARCHAR(MAX) (store/sqlserver.py:1358; the file contains zero ALTER COLUMN today), a filtered index for SQL Server NULL semantics, and a CI-only concurrent-bind test on the two server backends. _(was 7/10 · 5/10.)_
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The behavioural half is closed in shipped code -- auth/service.py:1219-1232 refuses a second account binding one (issuer, subject), with the lookup on all three backends and a sequential test at tests/test_auth_oidc_service.py:456 -- so the remainder is only the database constraint that makes the read-then-write at :1219/:1232 atomic, which is worth a 5 as auth hardening with the app guard covering every non-concurrent case. Difficulty drops to 4 because the amendment moved the design half (refuse rather than re-point) into shipped code and comment, leaving a well-precedented seam: all three backends already declare unique indexes (ux_webauthn_label, ux_search_presets_owner_name), so the novel cost is one first-of-kind SQL Server ALTER COLUMN off NVARCHAR(MAX) (store/sqlserver.py:1358; the file contains zero ALTER COLUMN today), a filtered index for SQL Server NULL semantics, and a CI-only concurrent-bind test on the two server backends. _(was 7/10 · 5/10.)_
 >
 > **Filed 2026-08-14 - not started. SEPARATED FROM #1143 DELIBERATELY: that item asks which binding CEREMONY is defensible; this one is that no ceremony can help, because the guard asks the wrong direction of the question.** The federated-login path enforces **account continuity** -- *"is THIS ACCOUNT now presenting a different subject?"* -- and never enforces **subject exclusivity** -- *"is this SUBJECT already bound to a DIFFERENT account?"*
 > **MEASURED at `origin/main`.** `auth/service.py:1109-1114` compares `user.oidc_subject` against the presented `federated_subject` and refuses on mismatch, then binds at `:1119-1120`. The comparison is keyed on the **user**, so it is structurally incapable of seeing a second account carrying the same `(issuer, subject)`. And nothing below it closes the gap: a scan for a `UNIQUE` constraint mentioning the federated columns returns **0** on **all three** backends (`store/store.py`, `store/postgres.py`, `store/sqlserver.py`). There is no database-level exclusivity either.
@@ -20486,6 +20488,10 @@ writer refuses any ref that is not its branch's tip.
 **Cluster:** Security / ASVS remediation research. **Priority:** P2. **Verdict:** research.
 **Severity:** on a first deployment, a partner feed carrying a crafted SVG attachment would be stored and served to an operator's browser. Whether that is inert depends entirely on controls whose coverage is unmeasured, which is a different claim from the control being absent.
 
+> **PARAPHRASE NOTED 2026-09-10, by the same standard [#1351](#1351) already applies to itself.** **This row's "The pinned verb" line below is a PARAPHRASE, not the pinned corpus text**, and `docs/ASVS-ASSESSMENT-METHOD.md:36` defines reasoning from a paraphrased verb as exactly what `unverified` means. Its line reads *"whether attacker-influenced content a browser will treat as ACTIVE is neutralised before it reaches a user agent"*, which is a general active-content claim. The corpus text of **V1.3.4** (V1 Sanitization, L2) is narrower: **"Verify that user-supplied Scalable Vector Graphics (SVG) scriptable content is validated or sanitized to contain only tags and attributes (such as draw graphics) that are safe for the application, e.g., do not contain scripts and foreignObject."** **The MAPPING IS UNAFFECTED** -- this row's body is about SVG and belongs on 1.3.4, confirmed independently by two readers -- but a re-score driven by the verb line alone would grade a wider requirement than the standard states.
+>
+> **WHY THIS NOTE EXISTS RATHER THAN A SILENT FIX.** #1351 carries a dated correction for this identical defect and this row carried none, and that ASYMMETRY IS WORSE THAN EITHER STATE ALONE: a reader who finds the corrected row reasonably infers the others were checked, so the record implied a sweep that had not happened. Found by the BACKLOG #1426 reading pass; the paraphrase itself is left standing, as #1351's is, because the note is the correction.
+
 **The pinned verb.** The cell grades whether attacker-influenced content a browser will treat as ACTIVE is neutralised before it reaches a user agent.
 
 **What holds it short today.** An `image/svg+xml` OBX-5.2 attachment IS accepted, stored and served from the download route, so the prior not-applicable rationale -- that the engine neither accepts nor renders SVG -- is FALSE on the accepts conjunct. What is NOT missing is a control. `api/app.py` classifies browser-active MIME by SUBSTRING TOKEN (`html`, `xml`, `script`, `svg`, plus a `multipart` top-type rule), serves `default-src 'none'; sandbox` on attachments, forces `Content-Disposition: attachment` unconditionally, and sets `nosniff` globally. The substring form is deliberate and the code says why: the comment records that the browser-active types it lists would each slip past an equality or suffix check.
@@ -21381,11 +21387,12 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 **PROVENANCE:** diagnosed by the cleaner on 2026-08-24 and routed to the dispatcher seat. The board tool was fixed; `fleet.ps1` was not; and no ledger item existed -- a grep over both ledger files returned zero against a working control of 4 hits for `fleet.ps1`. **It fell out because nothing tracked it.**
 
 ## 1375. install-gate.ps1 REPLACES the machine-wide gate allowlist on every run rather than merging, with no backup and no warning, and a dropped root fails open silently
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `725597a58` (PR 795), verified with `git merge-base --is-ancestor`.** The allowlist merge, the backup, the warning and the review the build commit disclaimed all landed. The banner still read *"BUILT AND PROPOSED, not landed"* and *"main still carried the defect"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
+> **Filed 2026-08-28 (lander) - third version of this item; the two earlier framings were refuted before filing and one is recorded below.**
 >
 > **Scored 2026-09-03 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Not started, and every mechanism claim holds at HEAD: scripts/worktree/install-gate.ps1:495 writes the allowlist with a bare Set-Content, the install branch defaults to exactly one root at :424, the only Get-Content of that file sits in the -Status branch at :300 which returns first, and the param block at :48-70 offers no -Add or -Merge. No backup exists, and two places assert one does -- install-gate.ps1:441 says the allowlist writer has done this since #1375 and tests/test_install_gate_records_the_install.py:16 repeats it, while the only Copy-Item backups cover settings.json at :164 and the gate script at :449. The precondition is live: the machine allowlist at ~/.claude/hooks/worktree-gate.repos.txt carries both MessageFoundry and MessageFoundry-vault, so a bare run from either drops the other. Correcting one anchor, since the silence has a different cause than filed -- a bare run writes ONE root, so the zero-root kill switch at scripts/hooks/worktree_gate.ps1:1259 never fires; the dropped root is simply absent from the roots list, matches no rule, and the gate exits 0 at :2447 and :2784 with no line printed. Left to build: read-and-merge, a .bak beside the allowlist, a warning naming any root the run is about to drop, and a deliberate way to still narrow scope; the workaround is awkward because -Repo is [string[]] at :50 so every governed root must be re-named on every run and docs/WORKTREE-GATE.md:157-158 reads additive, and the cost is a small additive change to one script plus a test on the region-extraction seam tests/test_install_gate_records_the_install.py already establishes.
-> 🚧 **Status 2026-09-03 -- BUILT AND PROPOSED, not landed.** The scoring line above read "not started" correctly against `main`, and separately against the work: this was built 2026-08-29 under a usage stop, never proposed to anyone, and sat on a local branch pushed only to a rescue remote, so `main` still carried the defect while the row was re-scored as unbuilt. The two #1375 commits are now cherry-picked onto a fresh branch off `main` (two unrelated commits on that branch were left behind) and are in a PR. **All four parts the row asks for are present:** read-and-merge, a `.bak` beside the allowlist, a warning naming every root a run is about to drop (`Show-AllowlistResult -Narrowed`, plus a louder one when the last root goes), and `-Uninstall -Repo "<path>"` to narrow scope on purpose. Landing it also makes `install-gate.ps1`'s own forward reference true -- the line the scoring note flags as asserting a backup that did not exist.
+> **Status 2026-09-03 -- BUILT AND PROPOSED, not landed.** The scoring line above read "not started" correctly against `main`, and separately against the work: this was built 2026-08-29 under a usage stop, never proposed to anyone, and sat on a local branch pushed only to a rescue remote, so `main` still carried the defect while the row was re-scored as unbuilt. The two #1375 commits are now cherry-picked onto a fresh branch off `main` (two unrelated commits on that branch were left behind) and are in a PR. **All four parts the row asks for are present:** read-and-merge, a `.bak` beside the allowlist, a warning naming every root a run is about to drop (`Show-AllowlistResult -Narrowed`, plus a louder one when the last root goes), and `-Uninstall -Repo "<path>"` to narrow scope on purpose. Landing it also makes `install-gate.ps1`'s own forward reference true -- the line the scoring note flags as asserting a backup that did not exist.
 >
 > **THE REVIEW THE BUILD COMMIT DISCLAIMED IS NOW DONE.** Its message said the work was "NOT YET REVIEWED BY ME", that "the review and test run are still owed", and "Do not land it on this basis". **The 634-line test file had never been run.** It was run: **46 passed** across `tests/test_install_gate_allowlist_merge.py` + `tests/test_install_gate_wiring.py`. **The anti-vacuity arm was re-measured rather than inherited**, each mutation on a scratch mirror against that same 46-passed control: feeding the install call site `@($resolved)` instead of `$result.Lines` gives **3 failed / 43 passed**; making the merge ignore `$Existing` gives **8 failed / 38 passed**; deleting the `.bak` gives **1 failed / 45 passed**. One mutant SURVIVED at 45 passed / 0 failed -- the **narrowing** call site (`-Uninstall -Repo`) had no coverage at all, so writing back the lines it just read left every test green while the named root stayed governed and the operator was told it had been removed. A test now kills it (**1 failed / 45 passed**), and the control moved 45 -> 46 to include it.
 >
@@ -21397,7 +21404,7 @@ site_prefixes   1      2       50.0%   <- would FAIL a flat 80% rule
 > Verdict: build
 > Closing-act: code
 >
-> 🚧 **Status 2026-09-03 (builder) - THIS ITEM IS NOT "not started". It was built on 2026-08-29, the work is committed and pushed to the rescue remote, and it has never been proposed to anyone.**
+> **Status 2026-09-03 (builder) - THIS ITEM IS NOT "not started". It was built on 2026-08-29, the work is committed and pushed to the rescue remote, and it has never been proposed to anyone.**
 >
 > **The finding that matters, because two documents above still say the opposite.** Two commits implement this item on the local branch `b1-1375-install-gate-merge`: `7af7bb9b6` (the merge, the backup and the warning; 960 insertions across install-gate.ps1 and a new tests/test_install_gate_allowlist_merge.py) and `34f29c4f8` ("cover the install path, so the #1375 defect cannot come back green"). Measured 2026-09-03: neither is an ancestor of `origin/main`, `gh pr list --search 1375` returns only two ledger PRs and none carrying this work, and the only remote holding the branch is the `private` rescue remote at `b5f2b7401`. So it is built, unreviewed and unproposed -- not started is false, and shipped is equally false.
 >
@@ -24703,6 +24710,8 @@ helper-per-class split and for why each hook carries a local copy), #1339 (a dif
 enumerating every hook that writes text an agent acts on rather than only the ones #1040 named.
 
 ## 1426. Nothing reads the code to ask whether an open item's subject already exists on main, so a re-score that predates the landing keeps the row open forever
+> **READING-PASS COVERAGE 2026-09-10, recorded so the next pass does not re-derive it.** Ran against `origin/main` at `8262ef11e`, over the 124 open rows whose `Closing-act` is `code`. **Closed 16** (13 in the parent commit, plus #1469, #1494 by owner ruling on its scope, and #1524 -- which went stale DURING this pass, PR 1018 having merged mid-sweep with nobody flipping its banner). **Read and deliberately LEFT OPEN, with the residual each names:** #236, #321, #332, #1004, #1017, #1022, #1100, #1215, #1234, #1243, #1247, #1254, #1255, #1278, #1296, #1304, #1335, #1341, #1342, #1344, #1346, #1347, #1349, #1357, #1358, #1369, #1376, #1379, #1393, #1400, #1403, #1413, #1434, #1435, #1450, #1460, #99, #351. **THE SCREEN ALONE FINDS 6 OF THE 14 CLOSURES, and the gap is structural:** it resolves only subjects a row NAMES, so a row written before its own merge names no landing. The join that finds the rest is *banner claims unlanded work* against *commits on main citing `BACKLOG #N`*. **TWO INSTRUMENTS EACH MISLED ONCE, in opposite directions.** A commit SUBJECT is not a closure: #1234's says *"clears BACKLOG #1234"* while its body says it only made the subject exist on main, and #1243's says *"limb B"* while its body says limb B stays owner-blocked. A commit BODY is not one either: #1358's body disclaims nothing, and the row records that only the warn arm landed. **96 open rows close on `scorecard-rescore` and CANNOT be judged from an engine checkout at all** -- the vault is invisible here, so this pass did not look at them and no conclusion about them should be read into it.
+>
 
 > 🚧 **Filed 2026-09-03 -- the screen is BUILT and reports candidates; nothing yet flips a banner off it.** Every existing ledger gate reads the LEDGER. `scripts/docs/subject_exists_screen.py` is the first that reads the CODE: for each OPEN item it extracts the concrete code-side subjects the row names -- commit shas, merged pull requests, file paths and distinctive symbol names -- and asks git whether they are already on `origin/main`. **It reports candidates and flips nothing.** A wrongly-closed item is invisible forever, so the closing act stays a person reading each row.
 >
@@ -25572,8 +25581,9 @@ The band-6 shape in this ledger is an instrument whose silence looks like succes
 
 ---
 ## 1456. a merge commit allocates nothing, but the ledger gate policed it as a fresh allocation
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `c4f3f8803` (PR 905), verified with `git merge-base --is-ancestor`.** Both arms landed -- PR 902 folded in `MERGE_HEAD` and this commit added `HEAD`, which is the shape a Lander actually resolves. The banner still read *"built on this branch"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-09-05. The fix and both arms are built on this branch.** Value **5/10** · Difficulty **2/10** · _quick win_. Two correct controls composed into a duty nobody could discharge: `scripts/hooks/ledger_check.py` keys number ownership on the worktree that ran the allocator, and a MERGE carries another branch's numbers without allocating anything -- so a merge resolved by anyone but the item's author was refused for carrying that author's number.
+> **Filed 2026-09-05. The fix and both arms are built on this branch.** Value **5/10** · Difficulty **2/10** · _quick win_. Two correct controls composed into a duty nobody could discharge: `scripts/hooks/ledger_check.py` keys number ownership on the worktree that ran the allocator, and a MERGE carries another branch's numbers without allocating anything -- so a merge resolved by anyone but the item's author was refused for carrying that author's number.
 
 **Cluster:** repository gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). A commit-time gate over this repository's own records. No engine behaviour, no shipped artifact, no PHI.
@@ -25691,8 +25701,9 @@ The round-number rows are dead on an assumption worth naming: **that an estate c
 **No concrete six-digit value appears in this item, deliberately.** Writing one is the trap **#322** documents: a placeholder built from a loaded prefix is a real hit in tracked content, and nothing warns you before the hook fires.
 
 ## 1437. redact() is quadratic on a delimiter-free run and its linear-scan test cannot see it
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `ada61c766` (PR 833), verified with `git merge-base --is-ancestor`.** The linear field-run scan and a test input that can actually fail both landed. The banner still read *"FIXED IN THE SAME CHANGE, NOT YET ON MAIN"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Filed 2026-09-03. FIXED IN THE SAME CHANGE, NOT YET ON MAIN.** Found while fixing the sibling defect under #1385. `tests/test_redaction.py`'s `test_redact_free_text_heuristic_is_linear` asserted that `redact` scans in linear time. **Two things were wrong and they compound.** The arm timed `"A " * 5000`, whose longest delimiter-free token is ONE character, against a bare `< 1.0` literal from a single sample -- an input on which every candidate pattern, guarded or not, is trivially linear. And the property it named is false: `_HL7_FIELD_RUN` is quadratic on a long delimiter-free run, so the arm passed green over the defect it existed to catch, from `2a6693f33` (2026-08-13) until this change.
+> **Filed 2026-09-03. FIXED IN THE SAME CHANGE, NOT YET ON MAIN.** Found while fixing the sibling defect under #1385. `tests/test_redaction.py`'s `test_redact_free_text_heuristic_is_linear` asserted that `redact` scans in linear time. **Two things were wrong and they compound.** The arm timed `"A " * 5000`, whose longest delimiter-free token is ONE character, against a bare `< 1.0` literal from a single sample -- an input on which every candidate pattern, guarded or not, is trivially linear. And the property it named is false: `_HL7_FIELD_RUN` is quadratic on a long delimiter-free run, so the arm passed green over the defect it existed to catch, from `2a6693f33` (2026-08-13) until this change.
 >
 > **Scored 2026-09-03 -> P1.** Value **7/10** · Difficulty **2/10** · _quick win_. Value 7: `redact` is the PHI chokepoint on the exception and logging path and runs synchronously on the asyncio event loop, its input is attacker-influenceable and is not length-bounded, and a 20,000-character run cost 1.05 s. Not higher, because section 0 applies -- zero instances run, so nothing is stalling today. Difficulty 2: the fix is one lookbehind, and the equivalence that makes it safe is machine-checkable.
 > Verdict: fix
@@ -25754,8 +25765,9 @@ The mutation removes the `(?<![^\s|^~&])` lookbehind, restoring the pattern that
 - **`safe_text` redacts before it truncates, and that ordering is unchanged.** It is the safe ordering for PHI -- truncating first could cut a span mid-match -- and with the scan linear the cost argument for reversing it is gone. Recorded so the next reader does not re-derive the question.
 
 ## 1438. Fail closed when the bundled breach corpus is unusable, instead of silently disabling password screening
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `64c5d3369` (PR 845), verified with `git merge-base --is-ancestor`.** The fail-closed corpus check landed. The banner still read *"committed on a feature branch, not merged"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Filed 2026-09-03. Implemented and committed on a feature branch, not merged.** `_common_passwords()` read `messagefoundry/auth/data/common_passwords.txt` and returned a `frozenset` of its lines. An empty or truncated file produced an **empty set**, `PasswordPolicy.violations` stopped emitting the `"not be a common or breached password"` clause, and breach screening became a no-op. Nothing logged. `password_check_breached` ships `true`, so the shipped configuration would assert a check that was not running.
+> **Filed 2026-09-03. Implemented and committed on a feature branch, not merged.** `_common_passwords()` read `messagefoundry/auth/data/common_passwords.txt` and returned a `frozenset` of its lines. An empty or truncated file produced an **empty set**, `PasswordPolicy.violations` stopped emitting the `"not be a common or breached password"` clause, and breach screening became a no-op. Nothing logged. `password_check_breached` ships `true`, so the shipped configuration would assert a check that was not running.
 >
 > **Severity is conditional (sec. 0).** Zero instances run, so nothing is unscreened today. The defect is in the shipped code: a **first** deployment whose corpus file had been truncated, emptied or replaced would accept every weak password that cleared the length clause, and no log line, metric or audit row would say so.
 
@@ -25870,8 +25882,9 @@ A guard against a silent failure needs a reading that would have proved it absen
 **Source:** reported 2026-09-04 by the seat that ran the 2026-09-03 scoring pass, one day after that pass closed the gap to zero. Re-measured here with `parse_items` rather than a hand-rolled scan, against that seat's figures, and both the count and the exact five item numbers agreed.
 
 ## 1445. The web console package still speaks the retired integer-seam vocabulary in the sites #1443 deferred
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `2261bb46b` (PR 859), verified with `git merge-base --is-ancestor`.** The retired integer-seam vocabulary was removed from the web console package. The banner still read *"FIXED IN THIS COMMIT, not yet landed"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found by the audit #1443 ran while rewriting the seam-refresh procedure, which named these sites in its own closing paragraph and deliberately left them out so a documentation rewrite stayed separately reviewable. LIMB 3 is why one more site than that paragraph named is fixed here.
+> **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found by the audit #1443 ran while rewriting the seam-refresh procedure, which named these sites in its own closing paragraph and deliberately left them out so a documentation rewrite stayed separately reviewable. LIMB 3 is why one more site than that paragraph named is fixed here.
 > **Scored at filing 2026-09-04.** Value **2/10** · Difficulty **1/10** · _fill-in_. Value sits below #1443 on purpose: #1443 removed a procedure that manufactured a false green, and this removes the vocabulary left behind after it. No engine, PHI or deployment axis; the population is developers reading the console package. It is not a 1 because LIMB 1 is a comment that cannot be read to completion at all, which costs a reader more than a stale word. Difficulty 1 prices the remainder: five prose spans across four files, no code path, no test, no CI leg.
 
 **Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
@@ -26229,8 +26242,9 @@ git rev-parse HEAD:<corpus>               -> 4482f231   the committed blob id
 4. **A record on an unmerged branch states a precondition that is false.** `reference/1134-corpus-provenance-do-not-merge` records `sha256 136e7bcf` in `common_passwords.NOTICE` over raw on-disk bytes and asserts the corpus "is pinned `-text` in `.gitattributes`". That is false on `main` -- `git check-attr text eol` returns unspecified, the measurement this row started from -- and it becomes wrong in its specifics under `text=auto eol=lf` while staying right in substance. The branch is marked do-not-merge, so a NOTICE-only cherry-pick is the likely path and the likely place to miss it. Whoever lands that provenance work owns the sentence.
 
 ## 1443. WEBCONSOLE-PACKAGE.md's seam-refresh procedure teaches three steps #1220 retired, one of which corrupts the golden
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `ca4e85e5d` (PR 837), verified with `git merge-base --is-ancestor`.** The seam-refresh procedure was rewritten onto the derived digest. The banner still read *"FIXED IN THIS COMMIT, not yet landed"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found 2026-09-03 while building #1439, which deliberately left it alone so a `sys.path` fix and a documentation rewrite stayed separately reviewable. The wider census in LIMB 4 is why the fix is not confined to the three steps the finding named.
+> **Filed 2026-09-04 - FIXED IN THIS COMMIT, not yet landed.** Found 2026-09-03 while building #1439, which deliberately left it alone so a `sys.path` fix and a documentation rewrite stayed separately reviewable. The wider census in LIMB 4 is why the fix is not confined to the three steps the finding named.
 > **Scored at filing 2026-09-04.** Value **3/10** · Difficulty **2/10** · _fill-in_. Scored here rather than left for a later pass, because nothing in CI requires a score at filing and an item that enters unranked stays unranked until a pass reaches it -- five items filed since 2026-09-03 already carry none. Value is above the bottom of the table but not by much: there is no engine, PHI or deployment axis, and the whole population is developers changing the console contract, which is rare. It is not a 1 because the defect is not cosmetic staleness -- LIMB 2 measures the old procedure walking a reader into a state where the headline gate PASSES on a fabricated seam, and a procedure that manufactures a false green is worth more to remove than one that merely fails. Difficulty 2 prices the REMAINDER, which is what this table prices and nothing else: a section rewrite in one page, a docstring and its duplicate in the generator, one line in the package release checklist, and this row -- four small prose edits on existing seams, no code path, no test, no CI leg, which is where #1381 sits at the same digit for five citation rewrites plus an ADR amendment. **The measurement that made the prose honest is deliberately NOT priced here.** An earlier draft of this line did price it, and that was a rubric error worth recording rather than silently fixing: investigation already done is not remainder, and counting it would make a well-investigated item cost more than a careless one, inverting the scale. What the controls bought belongs in LIMB 2, which carries it. Correction raised by a peer session on 2026-09-04 and verified against the table's own rule at docs/BACKLOG.md:203, "the scores below price only the remainder".
 
 **Cluster:** repository tooling. **Priority:** P3. **Verdict:** build.
@@ -26363,8 +26377,9 @@ This item was opened to assess exactly that. The assessment is negative, for rea
 `tests/test_required_contexts.py` lines 114 to 118 say the pin "GOES STALE IN THE DIRECTION THAT LOOKS FINE" and that "a count that only ever fails when someone edits the FILE cannot notice the server moving underneath it". **Both sentences are still literally true of that test** and should stay. What has changed is the implication a reader draws from them, which is that nothing notices. Something does. The paragraph needs one clause naming it, not a rewrite.
 
 ## 1453. adopt the three hook patterns the orchestration survey found genuinely missing: a context-budget guard, a gh-run-watch denial, and a PreCompact re-prime
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `a702fd084` (PR 894), verified with `git merge-base --is-ancestor`.** All three hooks landed, together with the correction that two of the survey's top-ranked gaps were already closed. The banner still read *"built, tested and wired on this branch"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
+> **Filed 2026-09-05. Three hooks are built, tested and wired on this branch. The survey that motivated them ALSO found that two of its top-ranked gaps were already closed, and that correction is the more useful half of this item.** A survey of ten agent-orchestration repositories ranked eight Claude Code hook and skill patterns for adoption. Measured against the INSTALLED configuration rather than against `CLAUDE.md` prose, three of the eight were genuinely absent, two were already built, and three are structural changes to how seats spawn that are deliberately not in this change.
 
 **Cluster:** CI gates / development harness. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). These are repository-side developer hooks. No engine behaviour, no shipped artifact, and no configuration a deploying site would meet.
@@ -27015,8 +27030,9 @@ neither of which is this).
 **NOT PROPOSED HERE:** which shape the widening takes. A `-Restore` verb, an automatic exemption when the number is found in history, and a recorded one-off override are all defensible and have different failure modes. This item is the requirement, not the design.
 
 ## 1469. the dispatch gate does not read a row's DISPATCH FENCE, so the two fenced rows screen clean
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `1521446c2` (PR 962), verified with `git merge-base --is-ancestor`.** The gate reads a dated `DISPATCH FENCE` marker at a line start in the item's prose, and the commit body records the needle firing on 2 of 679 rows against 38 that merely carry the word. The row still read *"Filed 2026-09-06 -- not started"*; neither the commit nor the row names a residual. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🔢 **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
+> **Filed 2026-09-06 -- not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two rows carry a dispatch fence written in the imperative -- "Do not dispatch it to a builder" -- and `scripts/coord/dispatch_gate.py` has no concept of a fence at all: a case-insensitive grep for "fence" over it returns zero. Both fenced rows come back `ok` with a note byte-identical to an ordinary build item's, and `--refuse` exits 0 on both. The gate is not broken; on the same run it correctly raised MUST BE READ on two other rows from landed-code citations. A fence was simply not one of its inputs.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -27440,8 +27456,9 @@ identified the merge route and holds standing authority on the engine repo. The 
 `744a7a434` and in nine or more branches predating the deletion.
 
 ## 1479. Scope the required gitleaks scan to the ref under test; today any pushed branch can red main and freeze the queue
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `a1f3232a1` (PR 977), verified with `git merge-base --is-ancestor`.** The gitleaks scan is scoped to the ref under test, so the freeze the row describes in the present tense is over. The row names the closing act: *"the banner flip on merge is the LANDER's"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> **Filed 2026-09-07 -- the code fix ships in this PR. THE GATE IS RED AS THIS IS WRITTEN, on TWO unmerged branches at once, so this is a live freeze and not a post-mortem.** Value **9/10** · Difficulty **2/10** · _quick win_. The `gitleaks (secret scan)` job ran with no `--log-opts`, so it walked every ref the `fetch-depth: 0` checkout had fetched. Branch protection reads its answer as a statement about the ref under test; the job was answering it about the whole repository. On 2026-09-06 an unmerged branch's synthetic fixture reddened `main` and the merge queue with it, freezing merging for over four hours and evicting five entries. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -28103,8 +28120,9 @@ Against cell 13.3.4, whose single absence claim had genuinely closed -- the engi
 No fix is proposed in this row. The obvious shapes -- emit an empty `absence` key, or order the retirement check before the key-set check -- both touch an invariant that exists because a truncating repair once cut one cell 15 -> 10 and another 17 -> 1 **with the verifier green throughout**. Whoever builds this must not weaken that guard to reach the retirement path; the two need to be ordered, not traded. The writer is `scripts/asvs/apply.py` in this repository, which is the ORIGINAL -- the vault carries a mirror, and mirror drift is a separate, separately-tracked condition.
 
 ## 1485. docs/SECURITY.md files the built gitleaks and SBOM jobs under Planned CI additions
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `561995255` (PR 982), verified with `git merge-base --is-ancestor`.** The gitleaks and SBOM bullets moved out of *"Planned CI additions"*, with the three further stale claims beside them. The banner still read *"the doc fix ships in this PR"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
+> **Filed 2026-09-07 -- the doc fix ships in this PR.** Value **4/10** · Difficulty **1/10** · _quick win_. The "Supply-chain & CI security" section listed the `gitleaks` secret scan and the CycloneDX SBOM build under **Planned CI additions**. Both are built, and `gitleaks (secret scan)` is a required context. The same two bullets carried three further stale claims, each independently checkable and each corrected here. Per `CLOSING_SEAT["code"]` the banner flip on merge is the LANDER's.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -28251,8 +28269,9 @@ stands and is unaffected by this retraction: skipping them would stop the evicti
 connection-scaling guard.
 
 ## 1489. the log write guard prints its roll notice to stdout, so it lands inside captured CLI output and breaks --json readers
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `2dad6a763` (PR 1005), verified with `git merge-base --is-ancestor`.** A `--json` payload no longer shares a file descriptor with the log. The banner still read *"BUILT 2026-09-09, PR pending"*. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **BUILT 2026-09-09, PR pending. The owner took option 1: a `--json` payload stops sharing a file descriptor with logging, and the logs move to stderr.** `messagefoundry/__main__.py` `main()` calls `configure_stderr_logging()` before it dispatches, whenever the parsed arguments carry `--json`. That subcommand's log sink is then stderr and stdout carries the payload alone. Three things it deliberately does NOT do. **`logging_guard.py` is untouched** -- its rollover notice still goes to the rolled sink, because the notice landing is what proves the replacement accepted a write, which is the whole stage-1/stage-2 split. **`tests/test_checks.py` keeps asserting `json.loads(capsys.readouterr().out)`** -- that assertion becomes sound rather than optimistic, which is why option 2 was rejected rather than adopted. **`serve`/`supervise` are unchanged** -- they take no `--json`, print no payload, and still log to the stdout NSSM captures, so `docs/SERVICE.md`'s file ownership table and the `service.out.log` runbook steps stay true. `configure_stderr_logging` is reused rather than rebuilt: it already existed for the ADR 0087 sandbox worker, whose stdout carries IPC frames, and it carries the PHI-redaction + control-char-scrub chain that the `logging.lastResort` a handler-less subcommand falls back to today does not.
+> **BUILT 2026-09-09, PR pending. The owner took option 1: a `--json` payload stops sharing a file descriptor with logging, and the logs move to stderr.** `messagefoundry/__main__.py` `main()` calls `configure_stderr_logging()` before it dispatches, whenever the parsed arguments carry `--json`. That subcommand's log sink is then stderr and stdout carries the payload alone. Three things it deliberately does NOT do. **`logging_guard.py` is untouched** -- its rollover notice still goes to the rolled sink, because the notice landing is what proves the replacement accepted a write, which is the whole stage-1/stage-2 split. **`tests/test_checks.py` keeps asserting `json.loads(capsys.readouterr().out)`** -- that assertion becomes sound rather than optimistic, which is why option 2 was rejected rather than adopted. **`serve`/`supervise` are unchanged** -- they take no `--json`, print no payload, and still log to the stdout NSSM captures, so `docs/SERVICE.md`'s file ownership table and the `service.out.log` runbook steps stay true. `configure_stderr_logging` is reused rather than rebuilt: it already existed for the ADR 0087 sandbox worker, whose stdout carries IPC frames, and it carries the PHI-redaction + control-char-scrub chain that the `logging.lastResort` a handler-less subcommand falls back to today does not.
 >
 > **The regression test is `tests/test_checks.py::test_check_json_payload_survives_a_log_record`.** It installs the guarded stdout sink `serve` installs, points its stream at a CLOSED object (what a capture teardown or a supervisor file-swap leaves behind), forces one record during `check --json`, and asserts stdout parses. Reverted to `main`'s `__main__.py` it fails with exactly the measured `json.decoder.JSONDecodeError: Extra data: line 1 column 5 (char 4)`, on stdout beginning `2026-09-09T...Z WARNING  messagefoundry.logging_guard: application log sink 'stdout' was rolled after a write`. **Forcing the record is what makes it deterministic**; the roll is timing-dependent otherwise, which is why five real failures read as flakes.
 >
@@ -28885,8 +28904,9 @@ drift into a named failure at commit time rather than a red a day later.
 ---
 
 ## 1494. ADR 0056's planned-failover control plane is unbuilt, so a maintenance switchover means stopping the primary service
+> ✅ **CLOSED 2026-09-10 on an owner ruling. Slice 1 -- the control plane -- landed on `main` via `a653e8920` (PR 1004), ancestry tested.** **THE ROW DEFINES ITS OWN SCOPE and the reading is its own words:** the banner says *"Slice 1 -- the control plane -- ships with this item; the VIP mechanism does NOT"*, and the Verdict says *"build slice 1; leave the VIP mechanism gated on the owner's privileged-helper decision"*. Slice 1 shipped, and **that deferral has no pending condition left**: the owner lifted the ADR 0056 VIP pause on 2026-09-10 and the privileged helper merged the same day. **THE HELPER'S PR IS NOT THIS ROW'S CLOSING ACT** -- it built the thing this row explicitly excludes, and matters only because it resolved the condition the Verdict waited on. Cite `a653e8920`. **The excluded VIP work is tracked, not restated here (SDS-3.5):** [ADR 0056](adr/0056-engine-managed-vip-failover.md), [#1522](#1522) for the unverified gratuitous ARP, [#1495](#1495) for the console page, and [#1523](#1523) for the helper's install script. #1509 was the stepdown residual and is closed; #1524 carries the test gaps. **MY OWN FIRST CLOSING LINE CALLED THIS "a scope question with no reading that settles it" AND THAT WAS WRONG** -- the row settles it, as the quotes above show. What was missing was the second fact, that the Verdict's deferral condition had resolved, and **the ledger records that nowhere**: a row whose verdict waits on an owner decision goes stale silently when the decision is made, because the deciding leaves no mark on the row. That is the #1448 family, and it is the reason two readers stopped here rather than one. Found by the BACKLOG #1426 reading pass.
 
-> 🚧 **Filed 2026-09-09. Slice 1 -- the control plane -- ships with this item; the VIP mechanism does NOT.** Value **6/10** · Difficulty **4/10**. Value 6 -- it turns "reboot the primary and hope" into a first-class, audited operator action, and it is the piece of ADR 0056 that needs no privileged helper. Difficulty 4 -- the release logic already existed and was private; the work is the seam, the RBAC, and one race the ADR did not consider.
+> **Filed 2026-09-09. Slice 1 -- the control plane -- ships with this item; the VIP mechanism does NOT.** Value **6/10** · Difficulty **4/10**. Value 6 -- it turns "reboot the primary and hope" into a first-class, audited operator action, and it is the piece of ADR 0056 that needs no privileged helper. Difficulty 4 -- the release logic already existed and was private; the work is the seam, the RBAC, and one race the ADR did not consider.
 
 **Cluster:** active-passive HA / operator control surface. **Priority:** P2. **Verdict:** build slice 1;
 leave the VIP mechanism gated on the owner's privileged-helper decision.
@@ -29561,10 +29581,11 @@ release should act on). They diverge exactly in the self-fence window. Options, 
 Pair with #1507: both are the pause and the fence disagreeing with the lease row.
 
 ## 1509. The stepdown 400 gate asks whether clustering is enabled, not whether anything can take over
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `1c8e73b37` (PR 1013), verified with `git merge-base --is-ancestor`.** The 412 refusal, `force` and `new_leader_eligible` landed. The banner said it outright: *"open until that merges, when the Lander flips this banner"*. Residual test gaps are #1524, filed separately. Found by the BACKLOG #1426 reading pass; nothing below is workable.
 
-> 🚧 **Built 2026-09-10 on branch `claude/vip-stepdown-1509`; open until that merges, when the Lander flips this banner.** `POST /cluster/stepdown` now reads cluster membership once, before the release and outside the coordinator's leadership lock, and refuses with `412` (audit reason `no-promotable-sibling`) unless another node is `active`, `promotable` and fresh by the heartbeat rule `cluster_members()` already applies. `412` rather than `400` or a second `409`: the request is well formed, and the node addressed may be exactly the right one. The `force` flag ships with it (owner ruling 2026-09-10, reversing ADR 0056's deferral) and waives that one refusal only, never the `400` or the `409`. The result gains `new_leader_eligible` from the same read, and a read that raises is a `503` reading `members-unreadable`. The `400` stays and now means only that no lease exists.
+> **Built 2026-09-10 on branch `claude/vip-stepdown-1509`; open until that merges, when the Lander flips this banner.** `POST /cluster/stepdown` now reads cluster membership once, before the release and outside the coordinator's leadership lock, and refuses with `412` (audit reason `no-promotable-sibling`) unless another node is `active`, `promotable` and fresh by the heartbeat rule `cluster_members()` already applies. `412` rather than `400` or a second `409`: the request is well formed, and the node addressed may be exactly the right one. The `force` flag ships with it (owner ruling 2026-09-10, reversing ADR 0056's deferral) and waives that one refusal only, never the `400` or the `409`. The result gains `new_leader_eligible` from the same read, and a read that raises is a `503` reading `members-unreadable`. The `400` stays and now means only that no lease exists.
 >
-> 🔢 **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there.** Value **4/10** · Difficulty **2/10**. Value 4 -- the refusal it is meant to give exists to stop an operator making the cluster leaderless, and it does not give it. Difficulty 2 -- the data is already exposed; the work is one predicate plus deciding how stale a sibling may be.
+> **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there.** Value **4/10** · Difficulty **2/10**. Value 4 -- the refusal it is meant to give exists to stop an operator making the cluster leaderless, and it does not give it. Difficulty 2 -- the data is already exposed; the work is one predicate plus deciding how stale a sibling may be.
 
 **Cluster:** active-passive HA / planned failover. **Priority:** P3.
 **Severity:** no deployment axis (sec. 0). Zero deployments. A first deployment running one clustered
@@ -30122,10 +30143,11 @@ a Python 3.14 runtime, since `pyproject.toml` sets `requires-python = ">=3.14"`.
 MSI question only when one appears.
 
 ## 1524. the stepdown suite does not pin the 412 status code, nor new_leader_eligible, nor the freshness conjunct in the leader pick
+> ✅ **CLOSED 2026-09-10 -- landed on `main` via `3c406f41d` (PR 1018).** The row named its own closing act -- *"open until that merges, when the Lander flips this banner"* -- and the merge happened at 18:31:29Z. **NOBODY FLIPPED IT, and this row is therefore its own best evidence:** it went stale inside the same hour as the BACKLOG #1426 reading pass that closed fourteen rows of exactly this shape, so the rate is not historical. **The flip's owner is NOT ESTABLISHED and is deliberately not guessed at here.** Every session pushes under one git identity, so `mergedBy` cannot distinguish them; the Lander seat that reviewed both pull requests states it declined to merge and merged nothing. That is a limit of the record, not a finding about any seat. **No residual:** the row's own PR-1018 amendment below reports all four asks answered, and its one `NOT RUN` line is mutation 3's FILED search text, which matched nothing because the call is split across two lines -- the amendment re-ran it against the real line and records it CAUGHT. Closed by the #1426 sweep because the row met its bar and no seat had claimed the flip 40 minutes after the merge.
 
-> 🚧 **Built 2026-09-10 on branch `claude/stepdown-test-gaps-1524` (PR 1018); open until that merges, when the Lander flips this banner.** All four asks are answered, and the stepdown behaviour is unchanged. Ask 1 needed no change. `test_a_node_with_no_promotable_sibling_is_refused_before_the_release` already asserted `r.status_code == 412` before PR 1018. Mutation 3 below never ran, because its search text matches nothing in `app.py`. Ask 2 landed as `test_force_with_a_live_sibling_reports_both_fields_true`. Ask 3 landed as `test_no_leader_is_derived_when_every_leader_flag_is_stale`, which runs through `members_from_node_rows` and both DB coordinators. Ask 4 took the item's second remedy and deleted the duplicate. `DbCoordinator.cluster_members` now calls `members_from_node_rows`, which leaves one copy of the leader pick and its freshness check. The docstrings saying both DB coordinators call the helper are now true. The amendment at the end of this item has the re-run of every mutation.
+> **Built 2026-09-10 on branch `claude/stepdown-test-gaps-1524` (PR 1018); open until that merges, when the Lander flips this banner.** All four asks are answered, and the stepdown behaviour is unchanged. Ask 1 needed no change. `test_a_node_with_no_promotable_sibling_is_refused_before_the_release` already asserted `r.status_code == 412` before PR 1018. Mutation 3 below never ran, because its search text matches nothing in `app.py`. Ask 2 landed as `test_force_with_a_live_sibling_reports_both_fields_true`. Ask 3 landed as `test_no_leader_is_derived_when_every_leader_flag_is_stale`, which runs through `members_from_node_rows` and both DB coordinators. Ask 4 took the item's second remedy and deleted the duplicate. `DbCoordinator.cluster_members` now calls `members_from_node_rows`, which leaves one copy of the leader pick and its freshness check. The docstrings saying both DB coordinators call the helper are now true. The amendment at the end of this item has the re-run of every mutation.
 >
-> 🔢 **Filed 2026-09-10 by the Lander, from a pre-merge review of PR 1013 that reached the pull request 15 minutes before it merged. Not started.** Value **6/10** · Difficulty **2/10**. Value 6 -- these are the tests for a control plane that decides which node leads, and three separate properties they are named for are not pinned. Difficulty 2 -- every gap is one assertion or one fixture row, and the mutations that expose them are written out below.
+> **Filed 2026-09-10 by the Lander, from a pre-merge review of PR 1013 that reached the pull request 15 minutes before it merged. Not started.** Value **6/10** · Difficulty **2/10**. Value 6 -- these are the tests for a control plane that decides which node leads, and three separate properties they are named for are not pinned. Difficulty 2 -- every gap is one assertion or one fixture row, and the mutations that expose them are written out below.
 
 **Cluster:** clustering / test quality. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). Nothing is exposed and no shipped behaviour is wrong today. The defect is that three properties a reader would believe are guarded are not, so the next change to any of them lands green.
@@ -30231,6 +30253,126 @@ Mutation 1 fails all three cases of `test_no_leader_is_derived_when_every_leader
 now has one copy to reach, in `members_from_node_rows`. Both forms of mutation 2 fail
 `test_force_with_a_live_sibling_reports_both_fields_true`. Mutation 3 on the real line and the control
 both fail `test_a_node_with_no_promotable_sibling_is_refused_before_the_release`.
+
+## 1525. citation_line_check and banner_sha_check ship as detectors wired to nothing, so 204 drifted anchors and 30 mis-attributed closing shas have never been seen by a gate
+
+> 🔢 **Filed 2026-09-10. Both detectors are SHIPPED and neither has ever run against the real ledger.** Value **6/10** · Difficulty **2/10** · _quick win_. `scripts/docs/citation_line_check.py` (#1396) and `scripts/docs/banner_sha_check.py` (#1347) were each built, tested and closed as shipped. A repo-wide `git grep` over tracked files finds each named in exactly three places: `docs/BACKLOG.md`, its own `tests/test_*.py`, and `tests/tooling_manifest.txt`. **No workflow, hook or script invokes either one.** Run by hand here at `8262ef11e` they exit 1 apiece, on findings nothing has ever reported.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / ledger hygiene. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact or PHI. The cost is to this repository's own record.
+
+### What each one reports today, measured rather than estimated
+
+`citation_line_check.py --max-report 0`, over 4,157 `path:line` citations:
+
+| Outcome | Count |
+| --- | --- |
+| carried a named symbol and were checked | 309 |
+| of those, **DRIFTED** -- the symbol is in the file, at a different line | **204** |
+| of those, agree | 75 |
+| of those, name a symbol not in the file | 30 |
+| REFUSED as bare filenames, unresolvable to one file | 1,222 |
+| cited path absent from the tree | 1,200 |
+
+Two thirds of every anchor this repository can actually check points at the wrong line. That is CLAUDE.md section 5's *"line numbers are navigation aids and never evidence"* rule with a number attached, and the number was available to a gate the whole time.
+
+`banner_sha_check.py` examines 151 closing-claim shas and reports **30** rows whose closing citation names a different item -- **28 in `docs/BACKLOG.md`** and **2 in the archive**. Two of the 30, one from each file:
+
+* **#1025** claims `e0482aea`, whose subject is *"fix(console): the /ui message editor gated on `messages:edit` alone (BACKLOG #324) (#203)"*.
+* **#234** claims `f01b991d9`, whose subject is *"docs(backlog): two ledger records that were only living in mail (BACKLOG #1136, #1474) (#958)"*.
+
+Each corrupts two items in opposite directions, exactly as the checker's own message says.
+
+**THE 30 IS NOT ALL DEFECT, AND WHOEVER WIRES THIS MUST SEPARATE THEM FIRST.** Narrowing 2 is a keyword heuristic: `_CLOSING_CLAIM` matches any banner line carrying SHIPPED, DONE, CLOSED, RETIRED, LANDED, FIXED or MERGED, and then reads every sha on that line. A row that cross-references another commit on such a line is indistinguishable from one offering its own closing evidence. Measured here: closing #1437 and #1489 added one finding each, and in both cases the flagged sha is a pre-existing CROSS-REFERENCE -- #1489's row names `995fc2790` as the commit that shipped the guard it is about, on a line containing the word "shipped". Both are false positives of the heuristic, not bad citations. **This number moved from 30 to 32 in the same change that files this row, entirely from that shape.**
+
+**THE FIRST READING OF THIS SAID "two", AND IT WAS A TRUNCATION ARTIFACT.** The checker prints its summary first and its findings after, and a `tail -8` of the run showed only the last two -- both archive rows. A count taken from the tail of a capped pipeline is not a census; this repository has that failure recorded already. The 30 is from `grep -c` over the whole run against `origin/main`'s two files.
+
+### The shape, and why it is a class rather than two oversights
+
+`tests/test_dangling_citation_advisory.py` opens by recording that its own detector *"was a working detector that ran nowhere"*. That was fixed for one tool by wiring it into `quality-advisory.yml`. Three more shipped into the same state, and the third -- `subject_exists_screen.py`, BACKLOG #1426 -- was additionally **broken**: its negative control grepped for a sentinel that was a literal in its own tracked source, so it exited 2 on every real clone from the day it landed. That half is fixed in the same change that files this row; **this item is the wiring**, which is the part that would have caught it.
+
+Naming the test module in `ci.yml` is not wiring the tool. `ci.yml` names `tests/test_subject_exists_screen.py`, and every `probe_control` case there drives a `FakeRepo` -- a fixture that structurally cannot hold the defect. That is SDS-3.8: the instrument answered a question adjacent to the one being asked.
+
+### What to build
+
+1. Wire both detectors into `quality-advisory.yml` alongside `dangling_citation_check.py` and `verdict_divergence_check.py`, advisory first, with `--advisory` if they grow the flag.
+2. Wire `subject_exists_screen.py` there too -- it is repaired but still runs nowhere.
+3. Give `citation_line_check` a baseline so 204 pre-existing drifts do not make the leg permanently red, and let the gate fail on a *new* one. The 30 "symbol not in the file" rows and the 1,200 absent paths need separating first: some are vaulted under `docs/security/`, which is gitignored here, and a vaulted path must not read as a defect.
+4. Triage the 30 banner-sha findings into genuine mis-citations and heuristic false positives, then either fix each genuine one or record why the citation stands. Tightening narrowing 2 -- so a sha is closing evidence only when the line's closing verb governs THAT sha -- is the alternative, and it is the one that stops the count growing every time a row is correctly closed.
+
+**Do not fix the 204 by hand without step 3.** Re-anchoring them all is a large edit that goes stale again on the next refactor; the gate is what makes the fix hold.
+
+## 1526. dispatch_gate.py dies with UnicodeEncodeError partway through its own output on a stock Windows console, exiting non-zero in a way that reads as a refusal
+
+> 🔢 **Filed 2026-09-10. Reproducer is one item.** Value **5/10** · Difficulty **1/10** · _quick win_. `scripts/coord/dispatch_gate.py` prints each item's note with `print(f"  #{num}: {note}")` at :1122. A note quotes the row's own declaration, and a ledger row may carry a status glyph, so the glyph reaches stdout. On a stock Windows cp1252 console that raises `UnicodeEncodeError` and the process dies **partway through the listing**.
+> Verdict: fix
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / development harness. **Priority:** P2. **Verdict:** fix.
+**Severity:** no deployment axis (sec. 0). Repository tooling only -- no engine behaviour, no shipped artifact, no PHI.
+
+### The reproducer, measured 2026-09-10 at `7c95ec3e8`
+
+```
+.venv\Scripts\python.exe scripts\coord\dispatch_gate.py 1022     -> exit 1
+PYTHONIOENCODING=utf-8 ... scripts\coord\dispatch_gate.py 1022     -> exit 0
+```
+
+#1022's note quotes its own row: `"⛔ **Already handled - do not rebuild"`. The traceback names `'⛔' in position 80`, and a scan of the gate's own output puts that glyph at **column 80** of the #1022 line. One item is enough; no wave is needed.
+
+### The dangerous half is the exit code, not the crash
+
+Run over 301 open rows it printed **11** items and then died. `--refuse` is **off by default** and the gate's own doctrine is *"NAMING, NOT REFUSING"*, so a non-zero exit from this tool should mean a dispatch fence was hit. Here it means the process fell over. **A caller that checks the exit code cannot tell those apart**, and a caller that reads the output gets a listing that stops without saying it stopped -- the same shape as a truncated census reading as a clean one.
+
+### What to build
+
+1. Write the listing through a UTF-8-wrapped stream, or replace un-encodable characters at the point of print. Do **not** strip glyphs from the ledger to suit the console -- the row is the record and the tool is the reader.
+2. Make a print failure exit differently from a fence, or catch it and report how many items were listed of how many requested.
+3. A test that drives the gate with a cp1252 stream over a row carrying a status glyph. Without one this returns the moment a new row quotes the banner alphabet.
+
+**Related, not duplicate:** CLAUDE.md §11 records the same cp1252 hazard for `scripts/**/*.py` **source**, and a gate covers that. This is different: the glyph is not in the source, it is **data read out of the ledger at run time**, so no source scan can see it.
+
+## 1527. a Verdict that defers to an owner decision records the CONDITION but never the RESOLUTION, so one ruling silently staled three artifacts and no gate could see any of them
+
+> 🔢 **Filed 2026-09-10 from three measured instances off ONE ruling.** Value **6/10** · Difficulty **4/10**. A row whose `Verdict` defers to an owner decision -- *"leave X gated on the owner's decision about Y"* -- records the CONDITION in the row and nothing anywhere records the RESOLUTION. Deciding leaves no mark, so the row still reads as waiting. **A row saying "gated on X" is indistinguishable, forever, from a row whose X was decided.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger hygiene / coordination. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact or PHI.
+
+### Three artifacts, one ruling, none of them caught by a gate
+
+The owner lifted the ADR 0056 privileged-helper pause on **2026-09-10**. Each of these then described a resolved condition as still pending:
+
+| Artifact | What it still said | Corrected |
+| --- | --- | --- |
+| [#1494](#1494) | Verdict: *"leave the VIP mechanism gated on the owner's privileged-helper decision"* | By the reading pass that filed this row, after **two** seats stopped on it independently |
+| [#1495](#1495) | *"that half of ADR 0056 is unbuilt and paused"* | `b8555c287`, **incidentally** -- a builder editing nearby |
+| [ADR 0056](adr/0056-engine-managed-vip-failover.md) | Status block *"PROPOSED AND PAUSED"* | `b8555c287`, the same commit, also incidentally |
+
+**Measured here, not inherited.** The #1495 wording is in `b8555c287~1` and gone at `b8555c287`; `PROPOSED AND PAUSED` is present in ADR 0056 at `a653e8920` and absent at `b8555c287`. **The two incidental fixes landed in PR 1014, not PR 1015** -- the seat that reported them attributed the ADR fix to 1015, and the tree says otherwise.
+
+### Why no instrument sees it, which is the point of the row
+
+Two screens ran over this population today and neither could have caught it. `subject_exists_screen.py` resolves only subjects a row NAMES, and a resolved conversational ruling names nothing. The commit-citation join reads `BACKLOG #N` in landed commits, and deciding produces no commit. **The resolution happens somewhere git cannot see**, so both instruments are structurally blind rather than merely missing it.
+
+The blast radius is also not one row: one ruling reached three artifacts, and **two of the three were repaired by accident** because a commit happened to be editing nearby. Nothing directed either fix.
+
+### What to build
+
+1. A dated **resolution marker** an owner ruling can leave, that a row's deferral can be checked against. The shape matters more than the mechanism: it has to be written where a gate can read it, which conversation is not.
+2. A screen reporting any open row whose `Verdict` defers to a condition, with the age of the deferral. That set is small and it is currently unenumerable.
+3. Decide whether `Verdict: owner-ruling` rows -- **33 open today** -- are the same population or a different one.
+
+**Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
+
+**Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
 
 ## 1528. the repository's copyright and CLA entity renames to MessageFoundry Foundation, LLC, per the owner's 2026-09-10 ruling
 
