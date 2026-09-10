@@ -61,8 +61,7 @@ section reference.
 | | `allow_keeping_phi_indefinitely` | `false` |
 | | `audit_all_authorization_decisions` | `true` (see note) |
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
-| Posture lever | `handles_real_patient_data` | *derived from environment* |
-| | `production_instance` | *derived from environment* |
+| Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
@@ -96,11 +95,18 @@ escape-clamp key, defaulting to `enforce` (byte-identical to the former producti
 **decoupled** from `production_instance` — a PHI *staging* box is now strict by default too. `enforcement`
 gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud, audited warnings.
 
-`handles_real_patient_data` / `production_instance` default to the value **derived from the active
-environment name** (ADR 0148 GIVEN 1: **`dev` → PHI/non-prod**, `staging` → PHI/non-prod, `prod` → PHI/prod);
-a custom-named environment must declare them or `serve` fails closed. `handles_real_patient_data` is the
-*master data-class lever* — the PHI-only gates below key on it — and now defaults to PHI on every built-in
-env (a genuinely-synthetic box must set it `false` explicitly; see its deviation below).
+`production_instance` defaults to the value **derived from the active environment name** (`dev` →
+non-prod, `staging` → non-prod, `prod` → prod); a custom-named environment must declare it or `serve`
+fails closed. It is the production **tier** — it drives the AI data-scope ceiling and the DEBUG-log
+refusal, not the serve-gate dial.
+
+**There is no data-class lever on this page any more.** `handles_real_patient_data` sat beside it and
+was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md): **every instance carries patient data**, and the PHI gates apply
+unconditionally. It is refused at load. Each gate it used to relax now has to be reached by its own
+switch, which is the point — the retired lever reached all nineteen without naming any of them, and
+`security_loosenings()` never named it either, so the serve-time warning that fires for every
+deviation on this page did not fire for the widest one the product shipped. **Not all nineteen have a
+heading below**; the retired lever's own section names the two that do not, and where to reach them.
 
 `audit_all_authorization_decisions` **changed sides on 2026-09-02** (BACKLOG #1277). It used to default
 `false` and this page called that "a deliberate secure-and-usable default, not a loosening", on the
@@ -332,25 +338,32 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   **AUDIT** line + posture view keep the deviation visible.
 - **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
   an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
-  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`): silencing
-  a PHI cleartext hop *entirely* is only reachable by declaring the box synthetic
-  (`handles_real_patient_data = false`), never by the dial ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
+  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`), and **nothing silences a
+  cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+  removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
+  per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
 
-### `handles_real_patient_data = false` — declare a genuinely-synthetic (no-ePHI) instance
-- **What you lose (nothing — it is an honest scope declaration):** the instance asserts it carries **no real
-  patient data**, so the ePHI-specific gates (at-rest-encryption requirement, deny-by-default egress, bounded
-  PHI retention, the PHI transport-hop refusals) relax to their synthetic posture — a no-op on data that is
-  not PHI. Since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1
-  the built-in `dev` / `staging` / `prod` envs all derive **PHI**, so a genuinely-throwaway CI / dev box must
-  set this **explicitly** — it is no longer the `dev` default.
-- **When acceptable:** a CI runner, a local dev box, or a demo that only ever processes synthetic / sample
-  HL7. **Never** on an instance that touches real patient data — a false declaration silently disables the
-  ePHI safeguards.
-- **Compensating controls:** it is a **loud, audited opt-out** — named by `security_loosenings()`, surfaced in
-  `GET /security/posture`, and warned at `serve`. Keep it out of any config a PHI instance could inherit.
-- **Still refused:** `[store].require_encryption = true` still forces a key even on synthetic; and this is a
-  **data-class** declaration, **orthogonal to `enforcement`** — it does not lower the AI data-scope ceiling or
-  re-enable DEBUG-with-PHI logging (both keyed on the retained `production` tier fact, not on `data_class`).
+### `handles_real_patient_data = false` — RETIRED, and refused at load
+This section is kept rather than deleted, because the claim it used to make is the reason the lever went.
+- **It said:** *"it is a loud, audited opt-out — named by `security_loosenings()`, surfaced in
+  `GET /security/posture`, and warned at `serve`"*. **Measured, the first and third were false.**
+  `security_loosenings()` contained no reference to it, and the serve-time loosening warning reads that
+  registry — so the widest relaxation the product shipped produced no warning line. The posture view did
+  carry it, in a separate field the console rendered one style-class quieter than a real loosening.
+- **What replaced it:** nothing, deliberately. Relax the one you mean — `allow_unencrypted_phi`,
+  `block_unlisted_outbound`, `allow_keeping_phi_indefinitely`,
+  `allow_single_factor_admin_when_exposed`, `allow_unverified_alert_smtp_tls`, a per-connection
+  `cleartext_accepted`, or the `enforcement` dial. **That list is at least, not every:** the retired
+  lever reached nineteen gates and this page does not carry a heading for each of them. Two it reached
+  are named here because they have no heading of their own —
+  `[alerts].security_notifications_required` accepts the pull-only security-event feed instead of a
+  configured channel, and revocation is attested **process-wide** with the environment variable
+  `MEFOR_TLS_REVOCATION_ATTESTED`. **There is no per-connection revocation lever.**
+  `tls_revocation_attested` exists on the outbound model and the connectors read it, but it has no
+  factory parameter and no `connections.toml` key, so nothing can author it — and
+  [DEPLOYMENT.md](DEPLOYMENT.md)'s own maintenance rule names that field and forbids offering it as an
+  operator lever. This page offered it until [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) prompted a re-read.
+- **Setting it now fails the start**, with a message naming those switches. See [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 
 ### `[store].aad_bind = false` — at-rest values are no longer bound to their cell
 - **What you lose:** the per-value GCM tag stops covering the `(table, column, row)` cell the value lives
@@ -589,7 +602,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `block_unlisted_outbound` | V14 Data Protection | **AC-4** Information Flow Enforcement · **SC-7(5)** Deny by Default — Allow by Exception | §164.312(e)(1) Transmission Security |
 | `delete_message_bodies_after_days`, `allow_keeping_phi_indefinitely` | V14 Data Protection | **SI-12** Information Management and Retention | §164.316(b)(2) documentation retention · data-minimization (§164.502(b)) |
 | `audit_all_authorization_decisions` | V16 Security Logging and Error Handling | **AU-2** Event Logging · **AU-3** Content of Audit Records | §164.312(b) Audit Controls |
-| `handles_real_patient_data`, `production_instance` (posture lever) | V13 Configuration (risk-based) | **RA-2** Security Categorization · **AC-6** Least Privilege (risk-based tailoring) | §164.308(a)(1) Risk Analysis / Management |
+| `production_instance` (production tier) | V13 Configuration (risk-based) | **RA-2** Security Categorization | §164.308(a)(1) Risk Analysis / Management |
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
@@ -598,11 +611,11 @@ carried from that drive-to-pass, not re-derived here.**
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 
-> The synthetic-vs-PHI relaxation (a synthetic instance keeps the PHI-only gates relaxed) is **risk-based
-> tailoring** keyed on `handles_real_patient_data`: an instance carrying no ePHI is out of scope for the
-> ePHI-specific safeguards, which 800-53r5 supports via security categorization (RA-2) and the least-
-> privilege / need-to-apply principle (AC-6). The posture view **states** the relaxation so it is never
-> silent (ADR 0118 AC-6).
+> **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
+> `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific
+> safeguards, which 800-53r5 supports via RA-2 and AC-6. The tailoring was sound in principle; what did
+> not hold was the control that made it visible. [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the declaration, so every instance
+> is categorized as carrying ePHI and each safeguard is relaxed individually or not at all.
 
 ### Sources
 

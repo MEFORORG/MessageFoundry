@@ -36,6 +36,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline.alert_sinks import EmailTransport
 from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_NO_ALERTS_TOML
 
 
 class _RecordingSMTP:
@@ -305,9 +306,12 @@ def _prod_phi_toml(*, alerts_lines: str = "", security_lines: str = "") -> str:
     for the wrong reason. Extra `[security]` lines are spliced in as dotted keys BEFORE the first table
     header: appended after `[alerts]` they would land IN `[alerts]`, load clean, and silently do
     nothing."""
+    # The NO_ALERTS variant, because this builder declares the `[alerts]` TABLE below and TOML
+    # refuses to declare one twice -- a dotted `alerts.x` key counts as declaring it. The
+    # notification gate is satisfied here by a real transport rather than by the opt-out.
     return (
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n"
+        PHI_GATE_PROVISIONS_NO_ALERTS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
         + security_lines
         + "[retention]\ndead_letter_days = 30\n"
         + '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
@@ -373,19 +377,36 @@ def test_the_acknowledgment_permits_the_start_and_audits_it(
     assert "warning:" in capsys.readouterr().err
 
 
-def test_a_synthetic_instance_is_not_gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # No PHI, no refusal — the gate is keyed on data_class, like every sibling in the ladder.
+def test_a_dev_instance_is_gated_exactly_as_prod_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE INVERSE OF THE TEST THIS REPLACES (BACKLOG #1279). It asserted that a box declared
+    # synthetic was NOT gated, on the reasoning that the gate keys on data_class like every sibling
+    # in the ladder. The data class is gone, so the whole ladder keys on exposure and the
+    # enforcement dial -- and an unverified SMTP hop refuses on `dev` exactly as it does on `prod`.
     #
-    # The posture is declared EXPLICITLY rather than inferred from `--env dev`. Measured: the samples
-    # config resolves `dev` to data_class=phi, so an env-name-based version of this test failed with
-    # rc=2 — and had the gate been (wrongly) keyed on the env NAME instead of the derived data_class,
-    # that version would have passed while proving nothing.
+    # The env name is still varied deliberately: it was never what the gate read, and pinning that
+    # it STILL is not what the gate reads is the half of the original test worth keeping.
+    rc = _serve(
+        tmp_path,
+        monkeypatch,
+        _prod_phi_toml(alerts_lines="email_tls_verify = false\n"),
+        env="dev",
+    )
+    assert rc == 2
+
+
+def test_the_dial_is_what_stands_the_smtp_gate_down_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ...and with the data class gone, the two ways past it are the per-gate ack (covered above)
+    # and the enforcement dial. Neither is silent: both are named by `security_loosenings()`.
     rc = _serve(
         tmp_path,
         monkeypatch,
         _prod_phi_toml(
             alerts_lines="email_tls_verify = false\n",
-            security_lines="security.handles_real_patient_data = false\n",
+            security_lines='security.enforcement = "warn"\n',
         ),
         env="dev",
     )

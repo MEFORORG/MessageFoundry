@@ -57,10 +57,8 @@ def _rsa_pem() -> str:
 # ADR 0153: the data label no longer relaxes a cleartext hop, so the permissive posture for these
 # PROXY-behaviour tests is the non-enforcing dial (which still WARNs, never refuses). Renamed from
 # _SYNTHETIC so nothing here reads as if the label were still doing the work.
-_WARN_DIAL = HopPosture(is_phi=False, enforcing=False)
-_PROD = HopPosture(
-    is_phi=True, enforcing=True
-)  # production PHI → the cleartext-proxy-hop guard bites
+_WARN_DIAL = HopPosture(enforcing=False)
+_PROD = HopPosture(enforcing=True)  # enforcing → the cleartext-proxy-hop guard bites
 
 PROXY = "http://proxy.example.com:3128"
 LOOPBACK_PROXY = "http://127.0.0.1:3128"  # a local auth proxy (cntlm) — allowed under any posture

@@ -16,9 +16,15 @@ A central operator governs how much AI coding assistance is permitted across a s
 The instance's **production** posture flag imposes a ceiling on ``data_scope`` so the same config
 behaves conservatively on a non-production instance and only reaches ``phi`` on a production instance
 under a BAA mode. ``mode`` itself is never clamped — a central ``off`` is honored everywhere. Posture
-is **decoupled from the environment *name*** (ADR 0017): an instance is ``production`` (and/or
-PHI-carrying, see :class:`DataClass`) regardless of whether it is literally named ``prod`` — so an
-org can name instances ``poc``/``test``/… while choosing posture explicitly.
+is **decoupled from the environment *name*** (ADR 0017): an instance is ``production`` regardless of
+whether it is literally named ``prod`` — so an org can name instances ``poc``/``test``/… while
+choosing posture explicitly.
+
+**Every instance carries patient data (BACKLOG #1279).** There is no longer a data-class axis: the
+``[security].handles_real_patient_data`` lever and its ``DataClass`` enum are gone, and the PHI
+gates apply unconditionally. ``data_scope`` below is a *different* axis — it bounds what context an
+AI request may carry, not what the instance holds — so its ``synthetic`` member is unrelated and
+stays.
 
 This module is **pure** (no I/O) and imports nothing from :mod:`messagefoundry.config.settings`
 (the dependency is one-way: settings imports these enums, not the reverse, to avoid a cycle). It is
@@ -63,18 +69,6 @@ class AiDataScope(str, Enum):  # noqa: UP042
     PHI = "phi"  # real message bodies (only over a BAA + zero-retention provider)
 
 
-class DataClass(str, Enum):  # noqa: UP042
-    """Whether an instance handles real PHI, **independent of its (free-form) environment name**.
-
-    Drives the at-rest-encryption + open-egress startup advisories (a synthetic instance stays quiet;
-    a ``phi`` instance is warned). The AI data-scope ceiling keys off the separate ``production`` flag,
-    not this. Decoupling the data class from the environment name (ADR 0017) lets an org name instances
-    freely (``poc``/``test``/…) while choosing posture explicitly. The value is the wire string."""
-
-    SYNTHETIC = "synthetic"  # synthetic/sample data only — relaxed at-rest/egress posture
-    PHI = "phi"  # carries real PHI — encryption + egress advisories apply
-
-
 class SecurityEnforcement(str, Enum):  # noqa: UP042
     """How the serve-gate REFUSE/WARN dial + the ADR 0092 escape-clamp behave, **decoupled** from the
     instance's production *tier* fact (ADR 0017 / this refactor).
@@ -110,7 +104,7 @@ class EffectivePolicy:
     ``reason`` is a human-readable, ``"; "``-joined note of every clamp applied (``None`` when the
     requested policy passed through unchanged) — surfaced in the API/CLI so an operator can see *why*
     the effective scope differs from what was configured. The environment *name* and the posture
-    (``data_class``/``production``) are carried by the caller's wire model, not here.
+    (``production``) is carried by the caller's wire model, not here.
     """
 
     mode: AiMode

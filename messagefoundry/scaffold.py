@@ -109,15 +109,16 @@ port = 8765
 # next two lines together (TLS is then required) — listen_address alone is refused as contradictory:
 # local_access_only = false
 # listen_address = "0.0.0.0"
-# handles_real_patient_data = true    # does this instance carry REAL PHI? (drives at-rest + egress advisories)
 # production_instance = true          # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
+# EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
+# retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
 # block_unlisted_outbound = true      # lock outbound destinations down (recommended for Test/Prod)
 
 [ai]
 # The active-environment NAME — REQUIRED (also passable as `serve --env <name>`). Free-form: name
-# instances dev/staging/test/prod/poc/... Built-in names dev/staging/prod carry a default posture; a
-# CUSTOM name MUST also set handles_real_patient_data + production_instance in [security] above
-# (posture is never inferred from the name).
+# instances dev/staging/test/prod/poc/... Built-in names dev/staging/prod carry a default production
+# tier; a CUSTOM name MUST also set production_instance in [security] above (the tier is never
+# inferred from the name). That is the only posture declaration there is.
 environment = "dev"
 
 [environments]
@@ -337,10 +338,12 @@ hardening steps (recommended for any PHI-handling adopter):
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…
-Built-in names `dev`/`staging`/`prod` carry a default security posture; a **custom** name must set
-`[security].handles_real_patient_data` (does this instance carry REAL PHI?) and
+Built-in names `dev`/`staging`/`prod` carry a default production tier; a **custom** name must set
 `[security].production_instance` in `messagefoundry.toml` -- the `[ai]` spellings these replaced are
-REFUSED by the loader (ADR 0118), as the generated config file itself says. One reviewed config
+REFUSED by the loader (ADR 0118), as the generated config file itself says. There is no second
+declaration to make: **every instance carries patient data** and the PHI gates apply unconditionally
+(ADR 0186). The retired data-class lever is refused at load too; relax the individual gate you mean
+instead. One reviewed config
 commit is deployed to every instance; each instance picks its environment at runtime (`--env` or
 `[ai].environment`), so a Test instance never resolves Prod values.
 

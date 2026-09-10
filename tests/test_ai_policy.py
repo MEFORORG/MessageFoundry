@@ -4,7 +4,7 @@
 
 ``resolve_effective_policy`` is pure, so the bulk here is a direct truth-table + an exhaustive sweep
 over every (mode x scope x production) asserting the invariants. The posture (``production`` /
-``data_class``) is **decoupled from the environment name** (ADR 0017), so the settings tests also cover
+``production``) is **decoupled from the environment name** (ADR 0017), so the settings tests also cover
 free-form names, known-name posture derivation, and the fail-closed custom-name path. The endpoint test
 mirrors the existing API patterns (httpx ASGI transport, ``allow_no_auth`` for the system identity, an
 ``AuthService`` + login for the token-bearing / tokenless cases)."""
@@ -25,7 +25,6 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
-    DataClass,
     EffectivePolicy,
     resolve_effective_policy,
 )
@@ -195,8 +194,9 @@ def test_ai_settings_defaults() -> None:
     assert ai.mode is AiMode.BYO
     assert ai.data_scope is AiDataScope.CODE_ONLY
     assert ai.environment is None  # no default — serve requires it (no silent PROD)
-    assert ai.data_class is None
     assert ai.production is None
+    # There is no `data_class` to default: every instance carries patient data (BACKLOG #1279).
+    assert not hasattr(ai, "data_class")
     # `provider` is READ (it addresses the broker and is recorded in the per-use audit) but never
     # dispatched on; `model`/`baa_attested`/`endpoint` are forward-compat. See #95.
     assert ai.provider == "claude"
@@ -217,38 +217,36 @@ def test_ai_settings_default_on_service_settings(
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [
-        ("dev", (DataClass.PHI, False)),
-        ("staging", (DataClass.PHI, False)),
-        ("prod", (DataClass.PHI, True)),
-    ],
+    [("dev", False), ("staging", False), ("prod", True)],
 )
-def test_known_name_posture_derived(name: str, expected: tuple[DataClass, bool]) -> None:
-    # GIVEN 1 (ADR 0148): the built-in names now all derive PHI when data_class is unset (dev is
-    # PHI-by-default too); only the production tier still differs (prod alone is production=True).
+def test_known_name_posture_derived(name: str, expected: bool) -> None:
+    # Only the production TIER is derived from the name. The data class went with BACKLOG #1279 --
+    # ADR 0148 GIVEN 1 had already made all three names derive PHI, and now nothing can vary it.
     ai = AiSettings(environment=name)
-    assert ai.derived_posture() == expected
-    assert ai.require_posture() == expected
+    assert ai.derived_posture() is expected
+    assert ai.require_posture() is expected
 
 
 def test_custom_name_requires_explicit_posture() -> None:
     # A custom env name has no built-in posture: derived_posture leaves it unresolved, and the
     # fail-closed require_posture raises so a custom instance never defaults permissive (ADR 0017).
     ai = AiSettings(environment="poc")
-    assert ai.derived_posture() == (None, None)
+    assert ai.derived_posture() is None
     with pytest.raises(ValueError, match="no built-in security posture"):
         ai.require_posture()
 
 
 def test_custom_name_with_explicit_posture_resolves() -> None:
-    ai = AiSettings(environment="poc", data_class=DataClass.PHI, production=False)
-    assert ai.require_posture() == (DataClass.PHI, False)
+    ai = AiSettings(environment="poc", production=False)
+    assert ai.require_posture() is False
 
 
 def test_explicit_posture_overrides_known_name() -> None:
-    # Explicit fields win over the built-in derivation (a 'prod'-named but synthetic/non-prod box).
-    ai = AiSettings(environment="prod", data_class=DataClass.SYNTHETIC, production=False)
-    assert ai.require_posture() == (DataClass.SYNTHETIC, False)
+    # The explicit tier wins over the built-in derivation (a 'prod'-named but non-prod box). The
+    # data class has no such escape any more: a 'prod'-named box cannot declare itself synthetic,
+    # and neither can any other (BACKLOG #1279).
+    ai = AiSettings(environment="prod", production=False)
+    assert ai.require_posture() is False
 
 
 def test_environment_name_must_be_a_safe_token() -> None:
@@ -266,8 +264,9 @@ def test_ai_env_vars_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
             "MEFOR_AI_MODE": "managed_claude_baa",
             "MEFOR_AI_DATA_SCOPE": "phi",
             "MEFOR_AI_ENVIRONMENT": "test",  # a custom name parses fine
-            # Posture moved to [security] (ADR 0118); env keys desugar into ai.data_class/ai.production.
-            "MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA": "true",
+            # The tier moved to [security] (ADR 0118) and desugars into ai.production. Its
+            # data-class sibling is retired and now REFUSED at load (BACKLOG #1279) -- see
+            # tests/test_security_config.py for that arm.
             "MEFOR_SECURITY_PRODUCTION_INSTANCE": "true",
             "MEFOR_AI_BAA_ATTESTED": "true",
             "MEFOR_AI_ENDPOINT": "https://broker.example/internal",
@@ -276,9 +275,8 @@ def test_ai_env_vars_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert s.ai.mode is AiMode.MANAGED_CLAUDE_BAA
     assert s.ai.data_scope is AiDataScope.PHI
     assert s.ai.environment == "test"
-    assert s.ai.data_class is DataClass.PHI  # str -> enum coercion
     assert s.ai.production is True  # str -> bool coercion
-    assert s.ai.require_posture() == (DataClass.PHI, True)
+    assert s.ai.require_posture() is True
     assert s.ai.baa_attested is True
     assert s.ai.endpoint == "https://broker.example/internal"
 
@@ -293,7 +291,7 @@ def test_ai_settings_from_toml(tmp_path: Path) -> None:
     assert s.ai.mode is AiMode.OFF
     assert s.ai.data_scope is AiDataScope.SYNTHETIC
     assert s.ai.environment == "staging"  # a free-form string, not an enum
-    assert s.ai.require_posture() == (DataClass.PHI, False)  # derived from the built-in name
+    assert s.ai.require_posture() is False  # tier derived from the built-in name
 
 
 # --- GET /ai/policy endpoint -------------------------------------------------
@@ -315,8 +313,7 @@ def _client(app: object) -> httpx.AsyncClient:
 
 async def test_ai_policy_open_app_reflects_settings_and_grants_assist(engine: Engine) -> None:
     # allow_no_auth -> the system identity holds every permission, so assist_permitted is True, and
-    # the policy reflects the attached [ai] settings (a non-production 'dev' instance). GIVEN 1
-    # (ADR 0148): dev now derives data_class=phi (PHI-by-default), while production stays False.
+    # the policy reflects the attached [ai] settings (a non-production 'dev' instance).
     ai = AiSettings(mode=AiMode.BYO, data_scope=AiDataScope.SYNTHETIC, environment="dev")
     app = create_app(engine, ai_settings=ai, allow_no_auth=True)
     async with _client(app) as c:
@@ -324,8 +321,8 @@ async def test_ai_policy_open_app_reflects_settings_and_grants_assist(engine: En
     assert body["mode"] == "byo"
     assert body["data_scope"] == "synthetic"
     assert body["environment"] == "dev"
-    assert body["data_class"] == "phi"
     assert body["production"] is False
+    assert "data_class" not in body  # retired with the declaration (BACKLOG #1279)
     assert body["assist_permitted"] is True
     assert body["reason"] is None
 

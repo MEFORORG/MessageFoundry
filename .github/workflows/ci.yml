@@ -2587,33 +2587,35 @@ jobs:
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
           MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
-          # DECLARE THE DATA CLASS HONESTLY (ADR 0148 GIVEN 1 + docs/SECURITY-LOOSENING.md
-          # "`handles_real_patient_data = false`"). This leg processes harness-GENERATED synthetic HL7 on
-          # a throwaway service container; asserting PHI was a false declaration about the instance, and
-          # the register names exactly this case as acceptable: "a CI runner ... that only ever processes
-          # synthetic / sample HL7". Since GIVEN 1 the built-in `dev` env derives PHI, so a genuinely
-          # throwaway CI box must now set this EXPLICITLY — it is no longer the `dev` default.
+          # THE DATA-CLASS DECLARATION THIS LEG USED TO CARRY IS GONE (BACKLOG #1279). Every instance
+          # carries patient data now, so `handles_real_patient_data = false` no longer exists and this
+          # leg names the ONE gate it actually needs relaxed instead.
           #
-          # It is also what makes the leg run at all. This job was RED for four consecutive nights
-          # (2026-07-27..30) on:
+          # THE GATE, and why it is the enforcement dial and not something narrower. This job was RED
+          # for four consecutive nights (2026-07-27..30) on:
           #     ValueError: SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false)
-          # Under enforcing-PHI the `MEFOR_ALLOW_INSECURE_TLS` escape above is clamped INERT by design
-          # (#200 / ADR 0092 decision 2 — `weakened_tls_escape_permitted`), so a self-signed container
-          # can never be trusted from a PHI instance. The previous comment here said this leg "validates
-          # PHI+enforce green, not a synthetic opt-out" — an intent that is UNREACHABLE with a
-          # `services:` container: GitHub starts it before any step runs, so a cert generated in a step
-          # cannot be mounted into it. Whoever set that provisioned the PHI posture's retention and
-          # egress requirements but not its TLS one.
+          # `weakened_tls_escape_permitted` clamps `MEFOR_ALLOW_INSECURE_TLS` INERT while the instance
+          # is enforcing (#200 / ADR 0092 decision 2), so the escape above does nothing under the
+          # shipped `enforce`. The clamp used to require enforcing AND PHI, and declaring the box
+          # synthetic was how this leg escaped it; with every instance PHI the only key left is the
+          # enforcement dial. `warn` honors the escape and keeps every gate reporting.
           #
-          # WHAT THIS GIVES UP, stated plainly: the leg no longer exercises the PHI+enforce path. Its
+          # It is what makes the leg run at all, and the reason a narrower fix does not exist here: the
+          # container's certificate is self-signed and GitHub starts a `services:` container before any
+          # step runs, so a cert generated in a step cannot be mounted into it. There is no per-hop
+          # attestation for the store hop to carry instead.
+          #
+          # WHAT THIS GIVES UP, stated plainly: the leg no longer exercises the enforcing path. Its
           # actual job is a load/throughput smoke of the SQL Server store, and `sqlserver-store` carries
-          # the functional coverage. Restoring PHI+enforce here needs a REAL certificate — the job moved
+          # the functional coverage. Restoring `enforce` here needs a REAL certificate — the job moved
           # off `services:` onto a `docker run` with a generated cert mounted and trusted — which is
-          # worth doing deliberately, not as a side effect of unbreaking a nightly.
+          # worth doing deliberately, not as a side effect of unbreaking a nightly. Note this is now a
+          # NARROWER relaxation than the one it replaces: the retired declaration silenced nineteen
+          # gates, `enforcement: warn` downgrades them to warnings and silences none.
           #
-          # The PHI-shaped provisions below are KEPT even though synthetic does not require them: they
-          # cost nothing and keep the leg measuring a realistic configuration.
-          MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA: "false"
+          # The provisions below are now REQUIRED rather than courtesy: under the PHI posture a keyless
+          # start, an unbounded retention window and an unlisted egress each have their own gate.
+          MEFOR_SECURITY_ENFORCEMENT: "warn"
           # Bounded PHI-body retention windows + a locked-down egress allowlisting the loopback sink.
           # The store key is minted at runtime below. The security-notification gate is skipped because
           # auth is off (no accounts to notify).

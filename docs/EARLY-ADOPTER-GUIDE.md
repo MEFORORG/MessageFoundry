@@ -250,19 +250,25 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 
 > ⚠️ **The active environment is required.** `serve` refuses to start (exit 2) without `--env <name>`
 > (or `[ai].environment`) — there is no silent `prod` default, so a missing env can never resolve
-> another environment's values/secrets. Built-in names `dev`/`staging`/`prod` carry a default posture;
-> a custom name (e.g. `test`, `poc`) also needs `[ai].data_class` + `[ai].production`. The active
+> another environment's values/secrets. Built-in names `dev`/`staging`/`prod` carry a default tier;
+> a custom name (e.g. `test`, `poc`) must declare `[security].production_instance`. There is nothing
+> else to declare beside it — every instance carries patient data
+> ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)),
+> and both `[ai].data_class` and `[security].handles_real_patient_data` are refused at load. The active
 > environment is logged at startup.
 
-> 🔑 **`dev` now carries the PHI posture ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — provide a store key or declare synthetic.**
-> Since ADR 0148 (GIVEN 1) the built-in `dev` env derives the **PHI** data-class, so your first run exercises
+> 🔑 **`dev` now carries the PHI posture ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — provide a store key, or take the audited keyless acks.**
+> Since ADR 0148 (GIVEN 1) the built-in `dev` env carries patient data like every other, so your first run exercises
 > the same at-rest-encryption path production uses (rather than first meeting it in prod). `serve --env dev`
 > therefore **refuses to start (exit 2) without a store encryption key**. Two ways forward for a local run:
 > - **Recommended — mint a throwaway dev key** (exercises the real encryption path): run `messagefoundry
 >   gen-key` and set the printed base64 value as `MEFOR_STORE_ENCRYPTION_KEY` (a dev key is fine; **never
 >   commit it**).
-> - **Genuinely no-PHI box** — declare it synthetic: set `[security].handles_real_patient_data = false` (a
->   loud, audited opt-out) to run **key-free**, for a dev/CI box that only ever processes synthetic HL7.
+> - **Run key-free anyway** — set `[security].allow_unencrypted_phi = true`, plus
+>   `allow_unencrypted_phi_under_strict_enforcement = true` under the shipped `enforcement = enforce`
+>   (ADR 0140: keyless PHI under strict enforcement is never one flag away). Both are audited at every
+>   start. There is no longer a way to declare a box synthetic and skip this — every instance carries
+>   patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 >
 > The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
 > `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind you hit only the

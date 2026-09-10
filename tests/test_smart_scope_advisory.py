@@ -34,7 +34,9 @@ backend = "sqlite"
 environment = "dev"
 
 [security]
-handles_real_patient_data = false
+block_unlisted_outbound = true
+allow_unencrypted_phi = true
+allow_unencrypted_phi_under_strict_enforcement = true
 """
 
 #: Every shape the check has an opinion about, plus every shape it must stay quiet on, in one graph.

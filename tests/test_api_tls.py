@@ -175,7 +175,10 @@ def test_serve_allows_non_loopback_bind_with_tls(
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet — the
     # TLS bind-guard is the subject here.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\n',
@@ -203,7 +206,10 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the mTLS shim wiring is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
@@ -231,7 +237,10 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the stock-protocol path is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f"security.handles_real_patient_data = false\n"
+        f"security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n',
@@ -251,7 +260,11 @@ def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
+        "security.local_access_only = true\n",
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -332,12 +345,16 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the upstream-TLS exposed-gate
-    # is the subject here.
+    # The upstream-TLS exposed gate is the subject here, so everything around it is pre-satisfied
+    # per-gate. Since BACKLOG #1279 a dev box cannot declare its way past the Posture-B attestations
+    # either, and an undeclared one would refuse before this gate is reached.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
+        'security.enforcement = "warn"\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -356,7 +373,11 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
+        "security.local_access_only = true\n",
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -427,7 +448,7 @@ def _posture_b_toml(
     intra: str = "none",
     floor: str | None = None,
     enforcement: str | None = None,
-    synthetic: bool = False,
+    relax_phi_gates: bool = False,
     loopback: bool = False,
     public_origin: str | None = "https://mefor.example.org",
 ) -> None:
@@ -454,7 +475,18 @@ def _posture_b_toml(
     # there, which is exactly why the attestation gate had to move onto the declaration.
     body = (
         (f'security.enforcement = "{enforcement}"\n' if enforcement else "")
-        + ("security.handles_real_patient_data = false\n" if synthetic else "")
+        # `synthetic=True` used to write `handles_real_patient_data = false` here and relax the whole
+        # PHI family on one line. BACKLOG #1279 retired that, so the flag writes the per-gate acks a
+        # keyless fixture needs. Egress is declared unconditionally below, so it is not repeated here.
+        + (
+            # NO `alerts.` line here: `_SECURE_ALERTS` below declares the `[alerts]` TABLE, and TOML
+            # refuses to declare one twice. This fixture satisfies the notification gate the honest
+            # way, with a configured SMTP transport, so the opt-out would be redundant as well.
+            "security.allow_unencrypted_phi = true\n"
+            "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+            if relax_phi_gates
+            else ""
+        )
         + (
             ""
             if loopback
@@ -588,25 +620,27 @@ def test_serve_still_refuses_posture_b_off_loopback_after_the_loopback_widening(
     assert "refusing to serve on a production PHI" in capsys.readouterr().err
 
 
-def test_serve_posture_b_loopback_synthetic_is_quiet(
+def test_serve_posture_b_loopback_warns_rather_than_staying_silent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The widening must not make a synthetic loopback dev box noisy — byte-identical, as for the
-    # keyless/MFA gates.
-    _posture_b_toml(tmp_path, intra="none", floor=None, synthetic=True, loopback=True)
+    # This asserted BYTE-IDENTICAL SILENCE for a loopback dev box that declared itself synthetic.
+    # BACKLOG #1279 retired the declaration, so the Posture-B attestation gate now reaches it --
+    # and on the LOOPBACK arm it warns rather than refusing, which is the property that matters:
+    # the recommended proxy-in-front topology still starts.
+    _posture_b_toml(tmp_path, intra="none", floor=None, relax_phi_gates=True, loopback=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
-    assert "proxy_intra_service_auth" not in capsys.readouterr().err
+    assert "proxy_intra_service_auth" in capsys.readouterr().err
 
 
-def test_serve_posture_b_synthetic_is_quiet(
+def test_serve_posture_b_offloopback_refuses_on_dev_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A synthetic instance (dev) stays quiet on the Posture-B posture (byte-identical — parity with the
-    # keyless / MFA gates), even with both attestations undeclared. GIVEN 1 (ADR 0148): dev derives PHI
-    # now, so declare the synthetic opt-out explicitly.
-    _posture_b_toml(tmp_path, intra="none", floor=None, synthetic=True)
-    assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
-    assert "proxy_intra_service_auth" not in capsys.readouterr().err
+    # THE INVERSE, and the pair with the loopback case above is the useful part: OFF-loopback the
+    # same undeclared attestations now REFUSE on a dev box, where they used to be silent. Exposure
+    # decides the severity; the environment name never did and the data class no longer can.
+    _posture_b_toml(tmp_path, intra="none", floor=None, relax_phi_gates=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 2
+    assert "proxy_intra_service_auth" in capsys.readouterr().err
 
 
 # --- BACKLOG #1181 (ASVS 12.3.5): the one attestation the engine can check against its own config --
@@ -638,13 +672,17 @@ def test_serve_says_nothing_about_client_certs_when_the_declaration_is_not_mtls(
     assert "verifies no client certificate" not in capsys.readouterr().err
 
 
-def test_serve_mtls_coherence_warning_is_quiet_on_a_synthetic_instance(
+def test_serve_mtls_coherence_warning_now_reaches_a_dev_instance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Byte-identical on a synthetic box, exactly like the two attestation arms above."""
-    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", synthetic=True)
+    """The diagnostic used to skip a box declared synthetic; BACKLOG #1279 removed the label.
+
+    It is a pure coherence check -- the declaration says the proxy presents a client certificate
+    and this engine verifies none -- so a data class was never a reason to suppress it. It still
+    WARNS and never refuses, because a sidecar can legitimately terminate the mTLS in front."""
+    _posture_b_toml(tmp_path, intra="mtls", floor="1.2", relax_phi_gates=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
-    assert "verifies no client certificate" not in capsys.readouterr().err
+    assert "verifies no client certificate" in capsys.readouterr().err
 
 
 def test_serve_loopback_emits_no_new_stderr(
@@ -657,7 +695,26 @@ def test_serve_loopback_emits_no_new_stderr(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        # A KEY is configured above, so this fixture takes NO at-rest ack -- and must not, because the
+        # ack is audited and would put a line on the very stream this test asserts is empty. Same
+        # reason the retention windows are set EXPLICITLY rather than left to the secure-by-default
+        # auto-bound: since BACKLOG #1279 that default reaches every instance, and it announces itself.
+        "security.block_unlisted_outbound = true\n"
+        # SATISFIED, not opted out. `security_notifications_required = false` is itself an audited
+        # loosening and warns, which on this test's own terms is a line on the stream it asserts is
+        # empty. Configuring the transport is the honest way past the gate and stays silent.
+        'alerts.email_smtp_host = "smtp.example.org"\n'
+        'alerts.email_from = "sec@example.org"\n'
+        "security.delete_message_bodies_after_days = 30\n"
+        "retention.dead_letter_days = 30\n"
+        "retention.reference_snapshot_days = 30\n"
+        # The two PL-2 tiers the engine deliberately does NOT default, because each keys on a
+        # timestamp that only moves on a write, so a silent default would delete data still in use.
+        # They warn when unset, which on this test's own terms is a line on a stream it asserts is
+        # empty -- so they are set here rather than the assertion being loosened.
+        "retention.state_max_age_days = 30\n"
+        "retention.search_preset_days = 30\n"
+        "security.local_access_only = true\n",
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -1684,7 +1741,12 @@ def test_no_value_of_the_declaration_changes_the_listener(tmp_path: Path) -> Non
 
 
 def _posture_probe_toml(
-    tmp_path: Path, *, public_origin: str | None, serve_ui: bool, synthetic: bool = False
+    tmp_path: Path,
+    *,
+    public_origin: str | None,
+    serve_ui: bool,
+    enforcement: str = "enforce",
+    relax_phi_gates: bool = False,
 ) -> None:
     """The declared-terminator PHI posture under `enforce`, with the console and `public_origin`
     varied independently -- which is the pair the defect coupled."""
@@ -1692,8 +1754,8 @@ def _posture_probe_toml(
         tmp_path,
         intra="mtls",
         floor="1.2",
-        enforcement="enforce",
-        synthetic=synthetic,
+        enforcement=enforcement,
+        relax_phi_gates=relax_phi_gates,
         public_origin=public_origin,
     )
     path = tmp_path / "messagefoundry.toml"
@@ -1738,13 +1800,18 @@ def test_the_refusal_does_not_depend_on_the_console(
     assert "web_console_public_address" in capsys.readouterr().err
 
 
-def test_a_non_phi_instance_is_not_refused(
+def test_a_non_enforcing_instance_is_not_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """POSITIVE CONTROL, and the one that stops this becoming a blanket refusal: the scope is the
-    posture the requirement is about. A synthetic-data instance must still start with no
-    `public_origin`, or the refusal is measuring something other than its own posture."""
-    _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False, synthetic=True)
+    posture the requirement is about, so SOME posture must still start with no `public_origin`.
+
+    That used to be a synthetic-data instance. BACKLOG #1279 removed the data class, so the scope
+    narrowing this control exercises is now the enforcement dial -- which is the only one left, and
+    therefore the only thing that can prove the refusal is scoped at all."""
+    _posture_probe_toml(
+        tmp_path, public_origin=None, serve_ui=False, enforcement="warn", relax_phi_gates=True
+    )
     rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
     assert rc != 2 or "public_origin" not in capsys.readouterr().err
 

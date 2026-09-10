@@ -304,7 +304,7 @@ def test_dicomweb_cleartext_http_nonloopback_allowed_when_accepted(
     # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
     # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+    with active_hop_posture(HopPosture(enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",

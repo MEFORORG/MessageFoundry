@@ -252,8 +252,7 @@ def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
         "block_unlisted_outbound = true\n"
         "serve_web_console = true\n"
         "local_access_only = true\n"
-        "delete_message_bodies_after_days = 30\n"
-        "handles_real_patient_data = false\n",
+        "delete_message_bodies_after_days = 30\n",
     )
     s = load_settings(
         config_path=cfg,

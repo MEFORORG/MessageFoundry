@@ -1819,9 +1819,17 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     assert ServiceSettings().security.enforcement is SecurityEnforcement.ENFORCE, (
         "[security].enforcement no longer defaults to ENFORCE; the refuse/warn wording is stale."
     )
-    assert _KNOWN_ENV_POSTURE["staging"][1] is False and _KNOWN_ENV_POSTURE["dev"][1] is False, (
+    # _KNOWN_ENV_POSTURE became a plain name -> production-tier map when BACKLOG #1279 removed the
+    # data class; it used to be a (DataClass, bool) tuple, hence the retired [1] subscript.
+    assert _KNOWN_ENV_POSTURE["staging"] is False and _KNOWN_ENV_POSTURE["dev"] is False, (
         "dev/staging are no longer non-production; the 'includes dev and staging' clause is stale."
     )
-    assert all(_KNOWN_ENV_POSTURE[env][0].value == "phi" for env in ("dev", "staging")), (
-        "dev/staging no longer derive PHI; the refusing-arms row's clause is stale."
+    # The clause this used to check -- "dev/staging derive PHI" -- is no longer derivable, because it
+    # is no longer derived: BACKLOG #1279 made EVERY instance carry patient data, so there is nothing
+    # in `_KNOWN_ENV_POSTURE` to read it off. What the doc's refusing-arms row now depends on is that
+    # no data-class axis exists to exempt anything, so that is what is asserted.
+    from messagefoundry.config.settings import SecuritySettings as _Sec
+
+    assert "handles_real_patient_data" not in _Sec.model_fields, (
+        "the data-class lever is back; the refusing-arms row's 'every instance' clause is stale."
     )

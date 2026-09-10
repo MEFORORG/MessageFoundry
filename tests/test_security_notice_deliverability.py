@@ -25,7 +25,6 @@ from messagefoundry.api.app import _assert_security_notice_is_deliverable
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
-    AiSettings,
     AlertsSettings,
     AuthSettings,
     SecurityEnforcement,
@@ -33,7 +32,6 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.store.store import MessageStore
 
-_PHI = AiSettings(data_class="phi")
 _ENFORCE = SecuritySettings(enforcement=SecurityEnforcement.ENFORCE)
 _WARN = SecuritySettings(enforcement=SecurityEnforcement.WARN)
 
@@ -79,15 +77,15 @@ async def _call(
     store: MessageStore,
     *,
     security: SecuritySettings = _ENFORCE,
-    ai: AiSettings = _PHI,
     auth: AuthSettings | None = None,
     alerts: AlertsSettings | None = None,
 ) -> None:
+    # The `ai` argument went with BACKLOG #1279: the gate used to skip an instance declared
+    # synthetic, and there is no such instance now. Its preconditions are down to two.
     await _assert_security_notice_is_deliverable(
         store,
         auth_settings=auth or AuthSettings(notify_security_events=True),
         alerts_settings=alerts or AlertsSettings(security_notifications_required=True),
-        ai_settings=ai,
         security_settings=security,
     )
 
@@ -185,7 +183,6 @@ async def test_warn_enforcement_does_not_refuse() -> None:
 @pytest.mark.parametrize(
     ("label", "kwargs"),
     [
-        ("not a PHI instance", {"ai": AiSettings(data_class="synthetic")}),
         (
             "notices switched off",
             {"auth": AuthSettings(notify_security_events=False)},
@@ -196,7 +193,7 @@ async def test_warn_enforcement_does_not_refuse() -> None:
         ),
     ],
 )
-async def test_the_gate_is_silent_outside_its_three_preconditions(
+async def test_the_gate_is_silent_outside_its_two_preconditions(
     label: str, kwargs: dict[str, object]
 ) -> None:
     # Each precondition is a separate reason the question does not arise. Asserted individually
@@ -223,7 +220,6 @@ def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
             email_smtp_host="smtp.example.test",
             email_from="alerts@example.test",
         ),
-        ai_settings=_PHI,
         security_settings=security,
     )
 

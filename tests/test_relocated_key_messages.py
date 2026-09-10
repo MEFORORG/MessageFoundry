@@ -23,7 +23,7 @@ import ast
 import collections
 import pathlib
 
-from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
 
 _ENGINE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
 
@@ -31,7 +31,9 @@ _ENGINE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
 # equality so a fix that REMOVES one does not red the test -- PR 593 removes two from __main__.py.
 _BUDGET: dict[tuple[str, str], int] = {
     # Describe the posture that triggered a refusal; the remediation is elsewhere or absent.
-    ("messagefoundry/__main__.py", "[ai].data_class"): 2,
+    # The ([ai].data_class, 2) row that sat here is GONE with BACKLOG #1279: the key left the
+    # relocation map (it was removed, not relocated) and both sites in __main__.py went with it, so
+    # the row could never be read again -- a budget entry for a spelling the scanner no longer knows.
     ("messagefoundry/__main__.py", "[ai].production"): 2,
     ("messagefoundry/__main__.py", "[api].host"): 3,
     ("messagefoundry/__main__.py", "[api].public_origin"): 6,
@@ -186,3 +188,18 @@ def test_the_two_fixed_refusals_name_the_key_the_loader_accepts() -> None:
                 f"the scaffolded README tells a new operator to set [{section}].{key}, which the loader "
                 f"REFUSES; the config file it generates alongside says so. Name [security].{replacement}."
             )
+
+    # BACKLOG #1279: the loop above reads the RELOCATED map, so it is blind to a key that was
+    # REMOVED -- and a removed key is worse to scaffold, because the refusal cannot name a
+    # replacement spelling to redirect the operator to.
+    #
+    # It matches the BARE key, not the `[section].key` form the loop above uses, because the
+    # scaffolder emits a `messagefoundry.toml` as well as a README: a commented
+    # `# handles_real_patient_data = true` line under a `[security]` header is an instruction, and
+    # uncommenting it fails the next start. That is how two such lines survived the first pass.
+    for _section, removed_key in _REMOVED_KEYS:
+        assert removed_key not in scaffold_src, (
+            f"the scaffolder emits {removed_key!r}, which the loader REFUSES outright. It was removed "
+            "rather than relocated, so there is no replacement spelling to point at -- say what the "
+            "operator should do instead."
+        )

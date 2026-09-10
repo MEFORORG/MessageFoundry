@@ -20,7 +20,6 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AiSettings,
     AuthSettings,
-    DataClass,
     SecuritySettings,
     StoreSettings,
 )
@@ -87,16 +86,11 @@ async def _token(c: httpx.AsyncClient, username: str) -> dict[str, str]:
 async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -> None:
     service = await _service(engine)
     await _add_viewer(service, "vw")
-    # A synthetic instance with two protections deliberately loosened. GIVEN 1 (ADR 0148): dev now
-    # derives PHI, so a synthetic instance declares the opt-out explicitly (handles_real_patient_data
-    # =False, which desugars to [ai].data_class=synthetic) — this is the path that reports the synthetic
-    # relaxation + loosenings. This test builds the app directly (no _desugar_security), so the synthetic
-    # posture is set on BOTH the AiSettings (drives the relaxation notice) and the SecuritySettings
-    # (reported in the posture's security dict).
-    ai = AiSettings(environment="dev", data_class=DataClass.SYNTHETIC)
-    security = SecuritySettings(
-        require_mfa=False, block_unlisted_outbound=False, handles_real_patient_data=False
-    )
+    # An instance with two protections deliberately loosened. There is no third, instance-wide
+    # declaration to make any more (BACKLOG #1279): a relaxed control is a named switch, and this
+    # route reports each one individually or not at all.
+    ai = AiSettings(environment="dev")
+    security = SecuritySettings(require_mfa=False, block_unlisted_outbound=False)
     app, client = _app_and_client(engine, service, ai_settings=ai, security_settings=security)
 
     async with client as c:
@@ -108,7 +102,7 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
     assert (
         sec["require_sign_in"] is True and sec["local_access_only"] is True
     )  # secure defaults kept
-    assert sec["handles_real_patient_data"] is False  # explicit synthetic opt-out (GIVEN 1)
+    assert "handles_real_patient_data" not in sec  # retired (BACKLOG #1279)
 
     # ...the active loosenings each name the risk (AC-4/AC-5)...
     loosen = {row["switch"]: row["risk"] for row in body["loosenings"]}
@@ -118,9 +112,11 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
         and "any destination" in loosen["block_unlisted_outbound"]
     )
 
-    # ...and the synthetic-relaxation notice is stated (AC-6): the PHI-only gates are relaxed on synthetic.
-    assert body["synthetic_relaxation"] is not None
-    assert "synthetic" in body["synthetic_relaxation"] and "relaxed" in body["synthetic_relaxation"]
+    # ...and NOTHING reports an instance-wide relaxation, because none can exist. The field that
+    # used to say the PHI gates were relaxed wholesale went with the declaration (BACKLOG #1279),
+    # so `loosenings` above is the complete account of what this instance gave up.
+    assert "synthetic_relaxation" not in body
+    assert "data_class" not in body
 
     # AC-5: NO endpoint writes a security setting — every /security route is read-only (GET/HEAD/OPTIONS).
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
@@ -133,17 +129,17 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
             )
 
 
-async def test_posture_phi_instance_has_no_relaxation_and_no_loosenings(engine: Engine) -> None:
-    # A PHI instance with all-secure defaults: no synthetic relaxation, no loosenings reported.
+async def test_posture_on_secure_defaults_reports_no_loosenings(engine: Engine) -> None:
+    # All-secure defaults: nothing reported. Every instance carries patient data (BACKLOG #1279),
+    # so this is now the ONLY quiet posture -- there is no second, quieter one a declaration buys.
     service = await _service(engine)
     await _add_viewer(service, "vw")
-    ai = AiSettings(environment="prod")  # prod → phi
+    ai = AiSettings(environment="prod")
     _app, client = _app_and_client(
         engine, service, ai_settings=ai, security_settings=SecuritySettings()
     )
     async with client as c:
         body = (await c.get("/security/posture", headers=await _token(c, "vw"))).json()
-    assert body["synthetic_relaxation"] is None
     assert body["loosenings"] == []
 
 
@@ -167,7 +163,7 @@ async def test_posture_reports_production_ack_switches(engine: Engine) -> None:
     loosen = {row["switch"] for row in body["loosenings"]}
     assert "allow_single_factor_admin_when_exposed" in loosen
     assert "allow_unencrypted_phi_under_strict_enforcement" in loosen
-    assert body["data_class"] == "phi" and body["production"] is True
+    assert body["production"] is True
 
 
 async def test_posture_surfaces_enforcement_level(engine: Engine) -> None:

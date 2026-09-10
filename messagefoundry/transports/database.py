@@ -124,7 +124,7 @@ def _audit_attested_weakened_tls(cell: str) -> None:
     refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
     non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
     posture = current_hop_posture()
-    if posture is not None and posture.is_phi and posture.enforcing:
+    if posture is not None and posture.enforcing:
         logger.warning(
             "%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
             "instance (operator attests the hop is secure by other means)",

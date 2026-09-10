@@ -266,9 +266,9 @@ async def test_cleartext_send_path_when_escaped(monkeypatch: pytest.MonkeyPatch)
 # cross an ENFORCING production-PHI cleartext hop, and the body is decided by the same
 # InsecureHopGuard gradient raw-TCP / X12 / plaintext-DIMSE / anonymous-FTP consume.
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, dial at warn
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)  # PHI, dial at warn
+SYNTHETIC = HopPosture(enforcing=True)  # not is_phi → always ALLOW
 
 
 def _cleartext_dest(
@@ -597,7 +597,7 @@ def test_tls_verify_false_refused_on_enforcing_phi_even_with_escape(
     # weakened_tls_escape_permitted_here() and not the raw insecure_tls_allowed().
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with (
-        active_hop_posture(HopPosture(enforcing=True, is_phi=True)),
+        active_hop_posture(HopPosture(enforcing=True)),
         pytest.raises(ValueError, match="tls_verify=false"),
     ):
         EmailDestination(_dest(tls_verify=False))

@@ -42,10 +42,10 @@ from messagefoundry.transports.x12 import X12Destination
 
 # The three postures. Only `enforcing` reaches the cleartext authority now (ADR 0153) — `is_phi` is
 # retained on HopPosture for the revocation / inbound-bind / verify-off gates, which still read it.
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
 # Pre-0153 this was the blanket carve-out ("not is_phi → ALLOW"). It is enforcing, so it now REFUSES.
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)
+SYNTHETIC = HopPosture(enforcing=True)
 
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as remote/off-box)
 LOOPBACK = "127.0.0.1"

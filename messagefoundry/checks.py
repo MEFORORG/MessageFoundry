@@ -36,8 +36,8 @@ checks). Two checks are **required** (they can block a commit):
 
 A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
 (searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
-environment is set whose security posture is unresolved (a *custom* name with no ``[ai].data_class``
-/ ``[ai].production``) — it FAILS, mirroring ``serve``'s fail-closed ``require_posture()`` so the
+environment is set whose production tier is unresolved (a *custom* name with no
+``[security].production_instance``) — it FAILS, mirroring ``serve``'s fail-closed ``require_posture()`` so the
 foot-gun is caught at commit/CI time instead of at runtime. No ``messagefoundry.toml`` → SKIP.
 
 A fourth required check, ``build-check``, runs the **posture-stamped** ``build_check_registry`` that
@@ -1280,7 +1280,7 @@ def _check_posture(
     suppress_search: bool = False,
 ) -> CheckResult:
     """Catch the ADR-0017 foot-gun at commit/CI time: a CUSTOM active-environment name (not
-    dev/staging/prod) with no explicit ``[ai].data_class`` / ``[ai].production`` makes ``serve`` fail
+    dev/staging/prod) with no explicit ``[security].production_instance`` makes ``serve`` fail
     closed at runtime (``settings.ai.require_posture()``). Mirror that fail-closed check here.
 
     Service-toml resolution (ADR 0050 AC-6): an explicit ``service_config`` is used as-is; otherwise,
@@ -1328,19 +1328,18 @@ def _check_posture(
             "posture", ok=True, required=True, skipped=True, detail="no active environment set"
         )
     try:
-        data_class, production = settings.ai.require_posture()
+        production = settings.ai.require_posture()
     except ValueError as exc:
-        # A custom env name with no explicit posture: serve refuses to start. Fail the gate now,
-        # naming the missing keys exactly as serve's error does.
+        # A custom env name with no explicit tier: serve refuses to start. Fail the gate now,
+        # naming the missing key exactly as serve's error does.
         return CheckResult("posture", ok=False, required=True, detail=str(exc))
+    # No data class is reported because there is no longer one to resolve: every instance carries
+    # patient data (BACKLOG #1279), so the PHI gates apply to whatever this config describes.
     return CheckResult(
         "posture",
         ok=True,
         required=True,
-        detail=(
-            f"environment {settings.ai.environment!r}: "
-            f"data_class={data_class.value}, production={production}"
-        ),
+        detail=(f"environment {settings.ai.environment!r}: production={production}"),
     )
 
 

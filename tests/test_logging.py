@@ -158,7 +158,14 @@ def test_serve_applies_log_level(monkeypatch: pytest.MonkeyPatch, tmp_path: Any)
 
     # serve imports these lazily, so patch them at the source (looked up at call time).
     # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic (env opt-out) to keep PHI gates quiet.
-    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
+    # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the one-line
+    # synthetic declaration these tests used to lean on: egress declared, and the at-rest gate
+    # acknowledged twice (ADR 0140 -- keyless PHI under `enforce` is never one flag away). Keeps
+    # this module focused on path resolution with no PHI-gate noise, as it always was.
+    monkeypatch.setenv("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
+    monkeypatch.setenv("MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED", "false")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(kw))
 
@@ -584,7 +591,14 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     monkeypatch.chdir(tmp_path)
     # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the
+        # one-line synthetic declaration these fixtures leaned on. Each names the gate it
+        # relaxes; together they are the quiet start this module wants while it probes
+        # something else entirely.
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         '[logging]\nforward_enabled = true\nforward_host = "127.0.0.1"\nforward_port = 5514\n'
         'forward_protocol = "udp"\nforward_format = "text"\n',
         encoding="utf-8",
@@ -1398,10 +1412,17 @@ def test_query_sntp_offset_timeout_propagates(monkeypatch: pytest.MonkeyPatch) -
 
 
 def _write_timesync_toml(tmp_path: Any, *, fail_closed: bool) -> None:
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet — these
-    # tests probe the clock-sync gate, not the security posture.
+    # These tests probe the clock-sync gate, not the security posture, so the PHI gates are
+    # satisfied per-gate below rather than declared away (BACKLOG #1279 retired that option).
     body = (
-        "security.handles_real_patient_data = false\n"
+        # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the
+        # one-line synthetic declaration these fixtures leaned on. Each names the gate it
+        # relaxes; together they are the quiet start this module wants while it probes
+        # something else entirely.
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.example.test"\n'
         "time_sync_max_skew_seconds = 1.0\n"
     )

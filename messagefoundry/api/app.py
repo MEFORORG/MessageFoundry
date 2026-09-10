@@ -226,7 +226,6 @@ from messagefoundry.auth.trust_anchors import (
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
-    DataClass,
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
@@ -1631,8 +1630,8 @@ def create_app(
         ``assist_permitted`` carries the identity-dependent bit (``None`` = RBAC not evaluable, i.e.
         no/invalid token under enabled auth). Policy reads are not audited in this MVP."""
         ai = getattr(request.app.state, "ai", None) or AiSettings()
-        data_class, prod = ai.derived_posture()
-        production = True if prod is None else prod  # unresolved posture -> strictest ceiling
+        prod = ai.derived_posture()
+        production = True if prod is None else prod  # unresolved tier -> strictest ceiling
         eff = resolve_effective_policy(
             mode=ai.mode, data_scope=ai.data_scope, production=production
         )
@@ -1641,7 +1640,6 @@ def create_app(
             mode=eff.mode,
             data_scope=eff.data_scope,
             environment=ai.environment,
-            data_class=data_class,
             production=production,
             assist_permitted=permitted,
             reason=eff.reason,
@@ -1666,8 +1664,8 @@ def create_app(
         Every use is audited on the EXISTING hash-chained ``audit_log`` with **PHI-safe metadata only** —
         never the prompt, the reply, or the provider key."""
         ai = getattr(request.app.state, "ai", None) or AiSettings()
-        _data_class, prod = ai.derived_posture()
-        production = True if prod is None else prod  # unresolved posture -> strictest ceiling
+        prod = ai.derived_posture()
+        production = True if prod is None else prod  # unresolved tier -> strictest ceiling
         # RE-RESOLVE server-side. NEVER trust the IDE-claimed mode/scope — the policy comes from [ai].
         eff = resolve_effective_policy(
             mode=ai.mode, data_scope=ai.data_scope, production=production
@@ -1755,11 +1753,12 @@ def create_app(
         # (the lifespan/managed-app stashes the resolved StoreSettings); fall back to defaults if absent.
         store = getattr(request.app.state, "store_settings", None) or StoreSettings()
         ai = getattr(request.app.state, "ai", None) or AiSettings()
-        data_class, production = ai.derived_posture()
+        production = ai.derived_posture()
         backend = store.backend.value
-        # ADR 0118: the effective [security] switch values + active loosenings + the synthetic-relaxation
-        # notice. security is the resolved SecuritySettings the serve path stashed (defaults on the
-        # test/embedding path). No secret material — these are booleans/ints only.
+        # ADR 0118: the effective [security] switch values + active loosenings. security is the
+        # resolved SecuritySettings the serve path stashed (defaults on the test/embedding path). No
+        # secret material — these are booleans/ints only. The synthetic-relaxation notice this route
+        # used to carry went with the declaration it described (BACKLOG #1279).
         security = getattr(request.app.state, "security", None) or SecuritySettings()
         # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
         # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
@@ -1824,13 +1823,6 @@ def create_app(
                 detail=store_privilege.detail,
             )
         )
-        synthetic_relaxation = (
-            "strict PHI-only controls (at-rest-encryption refusal, deny-by-default egress, bounded "
-            "retention) are relaxed: this instance is marked synthetic "
-            "(handles_real_patient_data=false), so it carries no ePHI"
-            if data_class is not None and data_class is not DataClass.PHI
-            else None
-        )
         # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):
         # metadata (a boolean + version string), never key material, never enforced.
         fips_mode, openssl_version = fips_attestation()
@@ -1861,7 +1853,6 @@ def create_app(
             client=client_ip(request),
         )
         return SecurityPosture(
-            data_class=data_class,
             production=production,
             enforcement=security.enforcement,
             environment=ai.environment,
@@ -1876,7 +1867,6 @@ def create_app(
             loosenings=loosenings,
             loosenings_scope=loosenings_scope,
             store_privilege=store_privilege_view,
-            synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
@@ -6076,10 +6066,12 @@ async def _assert_security_notice_is_deliverable(
     *,
     auth_settings: AuthSettings | None,
     alerts_settings: AlertsSettings | None,
-    ai_settings: AiSettings | None,
     security_settings: SecuritySettings | None,
 ) -> None:
-    """BACKLOG #1020: refuse to serve a PHI instance whose security notices reach NOBODY.
+    """BACKLOG #1020: refuse to serve an instance whose security notices reach NOBODY.
+
+    It used to skip a box declared synthetic; that declaration is retired and every instance carries
+    patient data (BACKLOG #1279), so the check now runs wherever notices are configured at all.
 
     The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
     but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
@@ -6119,9 +6111,6 @@ async def _assert_security_notice_is_deliverable(
     alerts = alerts_settings or AlertsSettings()
     if not alerts.security_notifications_required:
         return  # the audited, in-writing opt-out -- the pull-only feed is accepted
-    data_class, _production = (ai_settings or AiSettings()).derived_posture()
-    if data_class is not DataClass.PHI:
-        return
     for user in await store.list_users():
         if user.disabled or not user.notify_email:
             continue
@@ -6754,7 +6743,6 @@ def create_managed_app(
                     store,
                     auth_settings=auth_settings,
                     alerts_settings=alerts_settings,
-                    ai_settings=ai_settings,
                     security_settings=security_settings,
                 )
                 if not auth.webauthn_available() and await store.any_webauthn_credentials():

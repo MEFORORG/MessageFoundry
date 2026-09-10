@@ -238,7 +238,14 @@ def _serve_capturing_store_path(
     path resolution, with no PHI-gate noise."""
     import messagefoundry.api as api_mod
 
-    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
+    # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the one-line
+    # synthetic declaration these tests used to lean on: egress declared, and the at-rest gate
+    # acknowledged twice (ADR 0140 -- keyless PHI under `enforce` is never one flag away). Keeps
+    # this module focused on path resolution with no PHI-gate noise, as it always was.
+    monkeypatch.setenv("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
+    monkeypatch.setenv("MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED", "false")
     captured: dict[str, object] = {}
 
     def _fake_app(*, store_settings: object, **_kw: object) -> object:
@@ -354,7 +361,14 @@ def _run_serve_stubbed(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
     anchoring diagnostics, not the security posture."""
     import messagefoundry.api as api_mod
 
-    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
+    # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the one-line
+    # synthetic declaration these tests used to lean on: egress declared, and the at-rest gate
+    # acknowledged twice (ADR 0140 -- keyless PHI under `enforce` is never one flag away). Keeps
+    # this module focused on path resolution with no PHI-gate noise, as it always was.
+    monkeypatch.setenv("MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
+    monkeypatch.setenv("MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED", "false")
     monkeypatch.setattr(api_mod, "create_managed_app", lambda **_kw: object())
     import uvicorn
 

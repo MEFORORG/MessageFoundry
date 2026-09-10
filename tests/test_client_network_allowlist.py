@@ -719,12 +719,19 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, *, env: s
 
 
 _EXPOSED = (
-    "security.handles_real_patient_data = false\n"
+    "security.block_unlisted_outbound = true\n"
+    "security.allow_unencrypted_phi = true\n"
+    "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+    "alerts.security_notifications_required = false\n"
     "security.local_access_only = false\n"
     'security.listen_address = "0.0.0.0"\n'
-    "security.block_unlisted_outbound = true\n"
     "security.delete_message_bodies_after_days = 30\n"
+    # The Posture-B attestations. A box declared synthetic used to skip this gate; BACKLOG
+    # #1279 retired the declaration, so a declared terminator needs both or the start refuses,
+    # before these tests reach the allow-list they are about.
+    'security.enforcement = "warn"\n'
     '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 
 
@@ -756,8 +763,10 @@ def test_default_loopback_serve_emits_nothing_new(
 ) -> None:
     """Byte-identity at the default: the shipped loopback posture gains no warning from this feature."""
     toml = (
-        "security.handles_real_patient_data = false\n"
         "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         "security.delete_message_bodies_after_days = 30\n"
     )
     assert _serve(tmp_path, monkeypatch, toml, env="dev") == 0

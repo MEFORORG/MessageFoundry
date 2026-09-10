@@ -487,9 +487,11 @@ def test_global_limit_trip_does_not_deny_authenticated_peer() -> None:
 
 # --- D7: the posture-keyed peer-control gate ----------------------------------------------------
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, but the dial is at warn
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # no real PHI
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)  # PHI, but the dial is at warn
+# Pre-#1279 this was the synthetic carve-out. It is ENFORCING, so it now refuses like PROD_PHI --
+# named for what it was so the arm below reads as the tightening it is.
+SYNTHETIC_NOW_ENFORCING = HopPosture(enforcing=True)
 
 
 def _http_source(**settings: Any) -> Source:
@@ -506,9 +508,12 @@ def test_offloopback_without_effective_peer_control_refused_by_posture() -> None
     with pytest.raises(WiringError, match="no effective peer control"):
         check_http_intake_auth(exposed, "IB_HTTP", posture=PROD_PHI)
 
-    # Warn, don't refuse, outside an enforcing PHI posture — and never crash the engine.
+    # Warn, don't refuse, outside an enforcing posture — and never crash the engine.
     check_http_intake_auth(exposed, "IB_HTTP", posture=STAGING_PHI)
-    check_http_intake_auth(exposed, "IB_HTTP", posture=SYNTHETIC)
+    # The synthetic arm that sat here went with BACKLOG #1279: that posture is enforcing, so it now
+    # takes the same refusal PROD_PHI takes above rather than warning past it.
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(exposed, "IB_HTTP", posture=SYNTHETIC_NOW_ENFORCING)
     # posture=None is a direct/embedding call: a NEW refusal must not start firing for those.
     check_http_intake_auth(exposed, "IB_HTTP", posture=None)
 

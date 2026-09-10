@@ -32,13 +32,22 @@ import warnings
 
 import pytest
 
-from messagefoundry.config.settings import _RELOCATED_TO_SECURITY
+from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
+
+#: Every key the loader refuses, whichever way it got there. BACKLOG #1279 added the second
+#: table: a REMOVED key fails at load exactly like a relocated one, and its message cannot name a
+#: replacement spelling, so a doc that presents one is strictly worse to copy from.
+_REFUSED_KEYS: tuple[tuple[str, str], ...] = tuple(_RELOCATED_TO_SECURITY) + tuple(_REMOVED_KEYS)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 DOCS = REPO / "docs"
 
 # A line is exempt when it is talking ABOUT the refusal rather than instructing the reader.
-_DISCLAIMS = re.compile(r"refus|relocat|moved to|no longer|rejected|\[security\]", re.IGNORECASE)
+# `removed|retired` joined the list with BACKLOG #1279: a key that went away is documented in the
+# past tense, and those are the two words that tense reaches for.
+_DISCLAIMS = re.compile(
+    r"refus|relocat|moved to|no longer|rejected|removed|retired|\[security\]", re.IGNORECASE
+)
 # TOML values only: quoted string, LOWERCASE bool, or bare number. Capitalised True is Python.
 _VALUE = r'("[^"]*"|true|false|\d+)(?![\w])'
 
@@ -49,7 +58,7 @@ def _citations(text: str) -> list[tuple[int, str, str]]:
     for lineno, line in enumerate(text.splitlines(), 1):
         if _DISCLAIMS.search(line):
             continue
-        for section, key in _RELOCATED_TO_SECURITY:
+        for section, key in _REFUSED_KEYS:
             match = re.search(rf"(?<![\w.]){re.escape(key)}\s*=\s*{_VALUE}", line)
             if match:
                 hits.append((lineno, f"[{section}].{key}", match.group(0)))
@@ -62,7 +71,12 @@ def test_the_relocated_table_is_populated() -> None:
     Without this, deleting or renaming _RELOCATED_TO_SECURITY makes every test below pass
     vacuously -- a green suite over nothing, which is the failure this whole item is about.
     """
-    assert len(_RELOCATED_TO_SECURITY) >= 15, _RELOCATED_TO_SECURITY
+    # 15 until BACKLOG #1279 moved ([ai], data_class) out of the relocation table and into
+    # _REMOVED_KEYS -- it relocated to nothing. The COMBINED floor is what the scan depends on, so
+    # that is what is asserted; both tables are required to be non-empty so neither can vanish.
+    assert len(_RELOCATED_TO_SECURITY) >= 14, _RELOCATED_TO_SECURITY
+    assert len(_REMOVED_KEYS) >= 2, _REMOVED_KEYS
+    assert len(_REFUSED_KEYS) >= 16, _REFUSED_KEYS
 
 
 def test_the_scanner_catches_a_deliberately_bad_line() -> None:
@@ -76,7 +90,7 @@ def test_the_scanner_catches_a_deliberately_bad_line() -> None:
 def test_the_scanner_does_not_flag_a_line_documenting_the_refusal() -> None:
     """NEGATIVE CONTROL, and it is the one that has already burned somebody. Flagging this
     line would send a builder to 'fix' the only place the doc states the rule correctly."""
-    section, key = next(iter(_RELOCATED_TO_SECURITY))
+    section, key = next(iter(_REFUSED_KEYS))
     documented = f"The `[{section}].{key} = true` TOML spelling is refused at load.\n"
     assert not _citations(documented)
 
@@ -101,6 +115,14 @@ def test_the_scanner_does_not_flag_a_python_keyword_argument() -> None:
 # IT SELF-PRUNES, WHICH IS WHAT KEEPS A BASELINE FROM ROTTING INTO A SUPPRESSION LIST: fixing a
 # file below its number FAILS until you lower the number, and fixing it entirely FAILS until you
 # delete the row. The list can only shrink, and it cannot silently stop matching reality.
+#
+# BACKLOG #1279 WIDENED THE SCAN to `_REMOVED_KEYS` and the count went UP, which is the ratchet
+# working rather than failing. The rows it added are all HISTORICAL: an accepted ADR that records
+# what a since-removed key did, and closed ledger rows quoting the same. Those cannot be rewritten
+# to a live spelling, because there is no live spelling -- the key relocated to nothing. A ratchet
+# whose only remedy is to delete a decision record is the wrong instrument, so they are baselined.
+# What the widening DOES catch is the case it was added for: a NEW doc telling a reader to write
+# one, which fails immediately, at zero, like any other new citation.
 _BASELINE: dict[str, int] = {
     "docs/adr/0014-alerting-rules-engine.md": 1,
     "docs/adr/0022-fhir-resource-codec-rest-client.md": 1,
@@ -108,14 +130,23 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0049-turnkey-dr-backup-restore-verify.md": 1,
     "docs/adr/0056-engine-managed-vip-failover.md": 1,
     "docs/adr/0096-cluster-leader-preference-and-non-promotable-standby.md": 1,
+    # #1279: was 2. The three added are the retired posture lever, quoted in this ADR's own
+    # amendment banner and in the two config blocks that show what the section looked like.
+    "docs/adr/0118-secure-by-default-security-configuration-section.md": 5,
+    # #1279 rows below: each records what the removed key did, in a decision record.
     "docs/adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md": 1,
-    "docs/adr/0118-secure-by-default-security-configuration-section.md": 2,
+    "docs/adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md": 2,
+    "docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md": 2,
+    # The owner's ruling, quoted verbatim in the status line. CLAUDE.md forbids rewriting a
+    # quotation, and the sentence retiring the key necessarily contains the key.
+    "docs/adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md": 1,
     "docs/adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md": 1,
     "docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md": 2,
     "docs/adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md": 1,
-    "docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md": 2,
     "docs/archive/backlog/BACKLOG-CLOSED.md": 2,
-    "docs/BACKLOG.md": 2,
+    # #1279: was 2. The two added are in item 1279 itself -- the row that ASKED for the removal,
+    # naming the key it wanted gone, and the closing banner recording that it went.
+    "docs/BACKLOG.md": 4,
     "docs/CLOUD-PHI-HIPAA.md": 1,
     "docs/CLUSTERING.md": 1,
     "docs/CONFIGURATION.md": 3,

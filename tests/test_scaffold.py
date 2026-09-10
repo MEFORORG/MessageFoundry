@@ -50,7 +50,12 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # real guard is the round trip in test_the_config_init_writes_is_accepted_by_the_loader_that_reads_it.
     toml = (repo / "messagefoundry.toml").read_text()
     assert 'environment = "dev"' in toml
-    assert "handles_real_patient_data" in toml and "production_instance" in toml
+    # `handles_real_patient_data` sat beside `production_instance` here until BACKLOG #1279 retired it.
+    # The ABSENCE is now the assertion, and it is the same class of bug as the comment above records:
+    # asserting the presence of a name the loader refuses keeps a test green while `init` emits an
+    # unloadable config. tests/test_relocated_key_messages.py carries the general form of this guard.
+    assert "production_instance" in toml
+    assert "handles_real_patient_data" not in toml
     # D11: the .gitignore must ignore the one-time bootstrap admin credential the engine writes next
     # to the store, so it is never committed
     gitignore = (repo / ".gitignore").read_text()

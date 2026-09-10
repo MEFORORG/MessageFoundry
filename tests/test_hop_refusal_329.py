@@ -40,9 +40,9 @@ from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_brok
 from messagefoundry.transports.remotefile import _SftpClient
 
 # Mirror tests/test_hop_refusal_serve_clamp.py so the two suites decide against the same postures.
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # dev / synthetic instance (no PHI)
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
+SYNTHETIC = HopPosture(enforcing=False)  # dev / synthetic instance (no PHI)
 
 
 @pytest.fixture

@@ -9,6 +9,15 @@
 
 ---
 
+> **Amended by [ADR 0186](0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) (2026-09-09):** GIVEN 1's explicit synthetic
+> opt-out (`[security].handles_real_patient_data = false`) is **REMOVED**. GIVEN 1's direction is kept
+> and completed -- all three built-in env names derived PHI, and now nothing can derive anything else:
+> the data-class axis is gone entirely, along with `DataClass` and `HopPosture.is_phi`. **GIVEN 2
+> (`[security].enforcement`) is unchanged and is now the sole refuse/warn key**, as is the retained
+> informational `production` tier. Read every `data_class` mention below as historical.
+
+---
+
 ## Context
 
 The engine keys its secure-by-default serve-gate ladder and the ADR 0092 transport-hop authority on **two

@@ -34,12 +34,12 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.sqlserver import connection_string
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # dev / synthetic instance (no PHI)
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
+SYNTHETIC = HopPosture(enforcing=False)  # dev / synthetic instance (no PHI)
 # ADR 0153: an ENFORCING instance that merely carries a synthetic label. Pre-0153 the label alone
 # allowed every cleartext hop; now only `enforcing` reaches the authority, so this one refuses.
-SYNTHETIC_ENFORCING = HopPosture(is_phi=False, enforcing=True)
+SYNTHETIC_ENFORCING = HopPosture(enforcing=True)
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as off-box)
 
 

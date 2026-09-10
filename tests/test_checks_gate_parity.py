@@ -11,12 +11,17 @@ and confirms the ``checks.py`` commit/CI mirror fails-closed on an unresolved po
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.checks import run_checks
+from tests._phi_gate_provisions import (
+    PHI_GATE_PROVISIONS_NO_ALERTS_TOML,
+    PHI_GATE_PROVISIONS_TOML,
+)
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -85,20 +90,21 @@ def _serve(
 #: pre-refactor gate that must still fire through [security]; each ALLOW (0) must still start. No entry
 #: uses a legacy key — the whole point is that the new keys reproduce the old decisions.
 _MATRIX: list[tuple[str, str, str, bool, int]] = [
-    # keyless refusals (data_class-gated) — sourced from handles_real_patient_data / the env name.
+    # keyless refusals. These were data_class-gated; since BACKLOG #1279 every instance is in scope,
+    # so the only thing that varies is whether the per-gate ack is present.
     ("keyless-prod-phi-refuses", "", "prod", False, 2),
     ("keyless-staging-phi-refuses", "", "staging", False, 2),
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so a synthetic dev box declares the opt-out explicitly.
+    # A dev box declares no data class; it takes the per-gate acks like any other (BACKLOG #1279).
     (
-        "keyless-synthetic-dev-allows",
-        "security.handles_real_patient_data = false\n",
+        "keyless-dev-with-acks-allows",
+        PHI_GATE_PROVISIONS_TOML,
         "dev",
         False,
         0,
     ),
     (
         "keyless-declared-phi-on-dev-refuses",
-        "security.handles_real_patient_data = true\n",
+        "",
         "dev",
         False,
         2,
@@ -117,6 +123,15 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         # Pre-clear egress/retention/alerts so the ONLY remaining refusal is the ADR-0140 keyless-prod
         # branch — exit 2 here discriminates that branch (deleting it would flip this row to ALLOW),
         # unlike a bare single-flag config whose exit 2 the later open-egress gate would also produce.
+        #
+        # THIS ROW MUST NEVER TAKE A SHARED PROVISIONS BUNDLE, and no subtraction of one works either.
+        # Its whole scenario is a MISSING second ack, and both bundles carry
+        # `allow_unencrypted_phi_under_strict_enforcement` — the very flag whose absence is under test.
+        # Taking one provisions the refusal away, so the row would pass on whatever gate fired next, or
+        # on none. It once took `PHI_GATE_PROVISIONS_TOML` and duplicated the dotted
+        # `security.allow_unencrypted_phi` key, which made the TOML unparseable; `TOMLDecodeError`
+        # subclasses `ValueError`, the config load returns 2, and the row expected 2 — so it passed
+        # without ever reaching this gate. Spell the four lines out here.
         "keyless-prod-phi-single-flag-refuses",
         "security.allow_unencrypted_phi = true\n"
         "security.block_unlisted_outbound = true\n"
@@ -127,10 +142,10 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     ),
     (
         "keyless-prod-phi-both-acks-allows",
-        "security.allow_unencrypted_phi = true\n"
-        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n" + _RETENTION_DL + _ALERTS,
+        PHI_GATE_PROVISIONS_NO_ALERTS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
+        + _RETENTION_DL
+        + _ALERTS,
         "prod",
         False,
         0,
@@ -139,8 +154,8 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         "mfa-off-exposed-prod-phi-single-factor-ack-allows",
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\nsecurity.allow_single_factor_admin_when_exposed = true\n"
-        "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n"
+        + PHI_GATE_PROVISIONS_NO_ALERTS_TOML
+        + "security.delete_message_bodies_after_days = 30\n"
         + _MEMORY_ENCRYPTION
         + _PUBLIC_ADDRESS
         + _PROXY
@@ -175,12 +190,13 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         2,
     ),
     (
-        # GIVEN 1 (ADR 0148): dev derives PHI now; declare synthetic so this stays the non-PHI escape
-        # path (a PHI cleartext off-loopback bind is clamped-refused under enforce — the prod-clamp row
-        # below covers that).
-        "cleartext-offloopback-dev-escape-allows",
-        "security.handles_real_patient_data = false\n"
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        # The escape is CLAMPED INERT while enforcing. That clamp used to need enforcing AND PHI, and
+        # this row escaped it by declaring the box synthetic; BACKLOG #1279 left the dial as the only
+        # key, so the dial is what opens this path. The prod-clamp row below still covers the refusal.
+        "cleartext-offloopback-warn-escape-allows",
+        'security.enforcement = "warn"\n'
+        + PHI_GATE_PROVISIONS_TOML
+        + 'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_encryption_for_remote = false\n",
         "dev",
         True,
@@ -268,12 +284,29 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     # dev derives PHI now, so the synthetic posture is declared explicitly.
     (
         "synthetic-loopback-default-allows",
-        "security.handles_real_patient_data = false\n",
+        PHI_GATE_PROVISIONS_TOML,
         "dev",
         True,
         0,
     ),
 ]
+
+
+@pytest.mark.parametrize("label,toml,env,key,expected", _MATRIX, ids=[m[0] for m in _MATRIX])
+def test_every_matrix_row_is_valid_toml(
+    label: str, toml: str, env: str, key: bool, expected: int
+) -> None:
+    """A row that does not PARSE still exits 2, so a REFUSE row passes without reaching its gate.
+
+    `__main__` catches `ValueError` from the config load and returns 2, and `TOMLDecodeError`
+    subclasses `ValueError`. That makes a malformed row indistinguishable from the refusal it claims
+    to measure. One row concatenated a bundle that already carried the same dotted key and sat green
+    for the life of the matrix; 19 of 20 rows parsed and the 20th passed anyway.
+
+    This control is cheap because it does not start anything -- it only asserts the fixture is the
+    document the row's author thought they wrote.
+    """
+    tomllib.loads(toml)
 
 
 @pytest.mark.parametrize("label,toml,env,key,expected", _MATRIX, ids=[m[0] for m in _MATRIX])
@@ -317,13 +350,17 @@ def test_checks_mirror_posture_parity_through_security_keys(tmp_path: Path) -> N
     # exactly the fail-closed require_posture() that serve refuses on.
     fail = _posture(_config_repo(tmp_path / "a", '[ai]\nenvironment = "poc"\n'))
     assert fail.required and not fail.ok and not fail.skipped  # type: ignore[attr-defined]
-    assert "handles_real_patient_data" in fail.detail  # type: ignore[attr-defined]
+    # It named BOTH posture keys until BACKLOG #1279 removed the data class. Asserting the ABSENCE of
+    # the retired one matters as much as the presence of the survivor: a remediation naming a key the
+    # loader refuses costs an operator a restart cycle to discover, and reads as authoritative.
+    assert "production_instance" in fail.detail  # type: ignore[attr-defined]
+    assert "handles_real_patient_data" not in fail.detail  # type: ignore[attr-defined]
 
     # The SAME custom env with the posture set via [security] resolves — the mirror passes.
     ok = _posture(
         _config_repo(
             tmp_path / "b",
-            "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+            "security.block_unlisted_outbound = true\nsecurity.production_instance = false\n"
             '[ai]\nenvironment = "poc"\n',
         )
     )

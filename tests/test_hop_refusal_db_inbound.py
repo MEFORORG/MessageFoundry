@@ -51,9 +51,9 @@ from messagefoundry.transports.database import (
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
-PROD_PHI = HopPosture(is_phi=True, enforcing=True)
-STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-DEV = HopPosture(is_phi=False, enforcing=False)
+PROD_PHI = HopPosture(enforcing=True)
+STAGING_PHI = HopPosture(enforcing=False)
+DEV = HopPosture(enforcing=False)
 
 _WEAK_DB = {"server": "s", "database": "d", "encrypt": False}
 
@@ -247,7 +247,7 @@ def test_generic_refused_on_an_enforcing_synthetic_instance() -> None:
     # ADR 0153 removed is_phi from the authority, so the refusal keys on the enforcement dial alone --
     # an enforcing instance refuses this hop whether or not it declares itself PHI-carrying.
     with (
-        active_hop_posture(HopPosture(is_phi=False, enforcing=True)),
+        active_hop_posture(HopPosture(enforcing=True)),
         pytest.raises(InsecureHopRefused),
     ):
         DatabaseDestination(_generic_dest())
@@ -493,7 +493,7 @@ def test_serve_prod_phi_refuses_cleartext_even_with_flag(
     assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
 
 
-def test_serve_dev_synthetic_honors_flag(
+def test_serve_dev_honors_flag_under_warn_enforcement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pytest.importorskip(
@@ -505,10 +505,15 @@ def test_serve_dev_synthetic_honors_flag(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic explicitly — this test proves the
-    # --allow-insecure-bind flag is honored on a synthetic instance (the PHI clamp is tested elsewhere).
+    # The flag is CLAMPED INERT while enforcing. That clamp used to need enforcing AND PHI, and
+    # this test escaped it by declaring the box synthetic; BACKLOG #1279 left the dial as the only
+    # key. This proves the flag is HONORED where it can be -- the clamp itself is tested elsewhere.
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.handles_real_patient_data = false\n"
+        'security.enforcement = "warn"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
         encoding="utf-8",
     )
