@@ -29560,6 +29560,8 @@ Pair with #1507: both are the pause and the fence disagreeing with the lease row
 
 ## 1509. The stepdown 400 gate asks whether clustering is enabled, not whether anything can take over
 
+> 🚧 **Built 2026-09-10 on branch `claude/vip-stepdown-1509`; open until that merges, when the Lander flips this banner.** `POST /cluster/stepdown` now reads cluster membership once, before the release and outside the coordinator's leadership lock, and refuses with `412` (audit reason `no-promotable-sibling`) unless another node is `active`, `promotable` and fresh by the heartbeat rule `cluster_members()` already applies. `412` rather than `400` or a second `409`: the request is well formed, and the node addressed may be exactly the right one. The `force` flag ships with it (owner ruling 2026-09-10, reversing ADR 0056's deferral) and waives that one refusal only, never the `400` or the `409`. The result gains `new_leader_eligible` from the same read, and a read that raises is a `503` reading `members-unreadable`. The `400` stays and now means only that no lease exists.
+>
 > 🔢 **Filed 2026-09-09, found while building #1494's control plane and deliberately not fixed there.** Value **4/10** · Difficulty **2/10**. Value 4 -- the refusal it is meant to give exists to stop an operator making the cluster leaderless, and it does not give it. Difficulty 2 -- the data is already exposed; the work is one predicate plus deciding how stale a sibling may be.
 
 **Cluster:** active-passive HA / planned failover. **Priority:** P3.
