@@ -533,6 +533,9 @@ the engine-side controller will need no path to the binary and will import nothi
 **No release job publishes the helper yet.** The `net-helper` workflow uploads only a short-lived build
 artifact, and that is not a release.
 
+**No install script exists yet either.** BACKLOG #1523 files one for the README's "Install it" steps, and
+records why it is not an MSI.
+
 ## Observability
 
 Surface VIP ownership on the existing read-only cluster API ([ADR 0008](0008-cluster-observability-api.md)):
