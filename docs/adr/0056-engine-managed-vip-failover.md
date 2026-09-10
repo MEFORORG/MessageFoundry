@@ -17,21 +17,27 @@
   - **STALE — §"Confirm / step-up posture (console)"**, which sits INSIDE §"Control API — planned
     failover" and is therefore not covered by the bullet above. **There is no cluster page and no
     `client.stepdown_node`**, and the confirm dialog it specifies promises the operator that "the VIP
-    will move", which the paused-VIP bullet below denies. **Do not build from it**; the web console page
+    will move", which the PROPOSED VIP bullet below denies. **Do not build from it**; the web console page
     is BACKLOG #1495. Read the marker on the section itself for what is stale there and what is not —
     the answer is not "all of it", and this bullet used to say it was.
-  - **PROPOSED AND PAUSED — the VIP mechanism itself.** The `[cluster.vip]` config block, bind/release,
-    the gratuitous ARP, the self-fence release path, `mefor-net-helper.exe`, and the `vip` field on
-    `GET /cluster/status`. **There is no engine-managed-VIP code today**; every reference below to a
-    bind/release or a VIP-owner field is proposed, not built.
+  - **BUILT — the `[cluster.vip]` settings block and its load-time refusals (AC-8).** §"D2 — The config
+    seam" lists what the engine checks. It is configuration only: switching it on moves no address, and
+    the engine logs a WARNING at load saying so.
+  - **PROPOSED — the VIP mechanism, apart from its settings block.** Bind/release, the gratuitous ARP,
+    the self-fence release path, and the `vip` field on `GET /cluster/status`. **No engine code binds,
+    releases or announces the address**, so every reference below to a bind/release or a VIP-owner
+    field is proposed, not built. The privileged helper, `mefor-net-helper.exe`, is its own change, and
+    §"Privilege & platform" records its state; this bullet does not track it.
 
-    **The ruling and what backs it, recorded here because this page is the decision record.** On
-    **2026-09-09** the owner ruled the VIP mechanism **paused, pending a code-signing decision**: it
-    needs a `requireAdministrator` helper binary (`mefor-net-helper.exe`) and this repository has no
-    code-signing infrastructure to ship one with. **Read it at the standard it was given:** in session,
-    to the session that built the control plane, with **no git ref or other artifact anchoring it** —
-    these lines are the record, so a reader who needs it independently verified should ask the owner
-    rather than treat this page as the proof. Stated once here; the index row in
+    **The rulings and what backs them, recorded here because this page is the decision record.** On
+    **2026-09-09** the owner held the VIP mechanism back pending a code-signing decision: it needs a
+    `requireAdministrator` helper binary (`mefor-net-helper.exe`), and this repository had no
+    code-signing infrastructure to ship one with. On **2026-09-10** the owner lifted that hold and ruled
+    that the helper be built as specified and signed. **Read both at the standard they were given:** in
+    session, with **no git ref or other artifact anchoring either**. The first went to the session that
+    built the control plane; the second went to the Builders of this work in briefs that are not in
+    git. These lines are the record, so a reader who needs either independently verified should ask the
+    owner rather than treat this page as the proof. Stated once here; the index row in
     [`README.md`](README.md) and BACKLOG #1494 point at it rather than repeat it.
   - **STALE — §"Console — High Availability page".** It targets the PySide6 desktop console
     (`console/shell.py`, `console/status.py`, `console/connections.py`), which was retired. The operator
@@ -212,27 +218,77 @@ The move is **driven by the lease, never by an independent probe.** This is the 
 the address follows the same `is_leader()` predicate that already gates every listener and worker, so the
 VIP can never land on a node the lease says is not primary.
 
-### D2 — The config seam (named, not implemented)
+### D2 — The config seam (built: settings and load-time refusals only)
 
-A new optional block under `[cluster]` — **`[cluster.vip]`** — turns the feature on and carries the
-address/interface knobs. Exactly **one** of `prefix` / `netmask` is accepted (mutually exclusive,
-validated at load):
+A new optional block under `[cluster]`, **`[cluster.vip]`**, turns the feature on and carries the
+address and interface. `ClusterVipSettings` in
+[`config/settings.py`](../../messagefoundry/config/settings.py) parses and checks it at load. Nothing
+acts on it yet: when `enabled` is on, the engine logs a WARNING that no code moves the address.
 
 ```toml
 [cluster.vip]
 enabled               = true            # OFF by default; single-node & external-VIP path unchanged
-address               = "10.20.0.50"    # the floating address
-interface             = "Ethernet0"     # this node's NIC: Windows adapter name (Linux deferred)
-prefix                = 24              # XOR netmask = "255.255.255.0" — exactly one, validated at load
+address               = "10.20.0.50"    # the floating IPv4 address
+interface             = "Ethernet0"     # this node's NIC: Windows connection name (Linux deferred)
+prefix                = 24              # XOR netmask = "255.255.255.0"; exactly one, checked at load
 gratuitous_arp        = true            # announce on bind (default true)
-release_grace_seconds = 2.0            # new-leader bind/ARP delay (see Correctness); preserves
-                                        #   release(old) < bind(new)
+release_grace_seconds = 2.0             # new-leader bind/ARP delay (default 2.0); must be < fence timeout
 ```
 
-It validates at config load alongside `_fence_ordering`, and **refuses to load** unless
-`[cluster].enabled` and a server-DB backend are set (the same gate as the rest of clustering). It is **a
-single address that follows the primary**, not a graph element: it adds a *value*, not a "channel"/
-"route" object — the *no-grouping-unit* rule is intact.
+**The key names are ratified as shown (2026-09-10).** The block is file-only: the environment layer
+parses `MEFOR_<SECTION>_<KEY>` one level deep, so there is no `MEFOR_CLUSTER_VIP_*` override.
+
+**What refuses to load.** AC-8 says "set", and the build reads that as `enabled = true`. An absent or
+switched-off block is a no-op and is never refused for its values (AC-6); unknown keys in it are still
+refused, as in every section. With `enabled = true`, the engine refuses to load:
+
+- without `[cluster].enabled` (`ClusterSettings._vip_fits_the_cluster`), or on a store other than
+  `postgres` or `sqlserver`. The store half is the existing `[cluster]` gate,
+  `ServiceSettings._cluster_requires_server_db`, which any clustered node on SQLite already fails;
+- with both `prefix` and `netmask`, or with neither;
+- with an `address` that is not IPv4, or is unspecified, loopback, link-local, multicast, reserved, or
+  the network or broadcast address of its own subnet;
+- with a missing or blank `interface`, or one with surrounding whitespace, a double quote, or a
+  non-printable character;
+- with `release_grace_seconds` below zero, or not below `[cluster].leader_fence_timeout_seconds`
+  (`ClusterSettings._vip_fits_the_cluster`).
+
+There is no platform check at load. Engine-managed VIP is Windows-only, but a Linux box running
+`messagefoundry check` against a Windows node's config must still be able to validate it. Refusing to
+start on the wrong platform is the controller's job.
+
+**The mask on the wire is dotted-decimal.** Both spellings resolve to one canonical string, such as
+`"255.255.255.0"`, and that string is the `mask` field of the helper's `bind` request
+(`ClusterVipSettings.mask`). The wire field is named `mask`, so a prefix length there would be a second
+spelling of `prefix`. A `netmask` value must round-trip unchanged, because Python's `ipaddress` also
+reads `"0.0.0.255"` as a hostmask for /24 and `"24"` as a prefix; either would otherwise load as a mask
+nobody wrote.
+
+**`release_grace_seconds` defaults to 2.0 seconds.** The grace is for the self-fence case. The old
+leader's release budget is nominally `ttl − fence_timeout`, and the correction under §"The release time
+budget" puts the usable remainder near 8s rather than 10s on the shipped 10/20/30. The renew round trip
+and up to one fence tick come out of it, and `fence_tick_seconds` is 1.0s at a 20s fence. Two seconds,
+twice that tick, hands the shortfall back. The To-resolve note suggested about twice the fence
+*timeout*. Read literally, that is 40s: longer than the 30s lease TTL, refused by the bound below, and 40
+more seconds on every failover with nobody answering for the address. So the build reads it as the tick.
+
+The upper bound, `release_grace_seconds < leader_fence_timeout_seconds`, is the rule
+`_warm_pool_timeout_under_fence` already applies to a pool warm-up: work started on promotion must end
+inside the term that started it. A node that promotes and then loses its database fences after the fence
+timeout. With a shorter grace, its bind comes due before its own fence can fire. With a longer one, a
+bind timer could fire on a node that has already fenced and released nothing, leaving the address bound
+beside the next leader's. The rule binds the default too, so a fence timeout of 2s or less needs a
+smaller explicit grace.
+
+**The grace does not cover a planned stepdown or a clean stop.** On both, the lease expires at once, so
+a standby can acquire within about one heartbeat while the old node is still tearing its graph down. On
+a stepdown, `demote_stop_budget` caps only the source and dispatcher phases of that teardown, at 4.5s on
+the shipped timings. D1 already accepts that window as a connectivity flip. Whether the controller
+should release the address before expiring the lease, instead of growing this default, is the
+controller change's call.
+
+It is **a single address that follows the primary**, not a graph element: it adds a *value*, not a
+"channel"/"route" object — the *no-grouping-unit* rule is intact.
 
 ### D3 — What this must not break
 
@@ -597,7 +653,7 @@ promotion; this API contract is unchanged by it.
 > **STALE — DO NOT BUILD FROM THIS SUBSECTION. There is no cluster page, and `client.stepdown_node`
 > does not exist.** The operator UI is the web console at `/ui`, and the page is BACKLOG #1495. Step 2
 > below also has the dialog promise that "the VIP will move", which the engine does not do and is not
-> going to do until the paused VIP mechanism is decided.
+> going to do until the VIP controller is built.
 >
 > **What is stale is the SEAT, not the machinery, and an earlier version of this marker got that
 > wrong.** It asserted that every symbol it named belonged to the retired PySide6 desktop console.
@@ -746,10 +802,12 @@ platform, privileged helper, alert+force-close on release failure, admin-only st
 IPv6 deferred, dedicated console page, `force` deferred). What remains is build-time detail, to settle when
 the build is greenlit:
 
-- [ ] **Seam keys, confirmed at build** — ratify the `[cluster.vip]` key names (`address`, `interface`,
-  `prefix` XOR `netmask`, `gratuitous_arp`, `release_grace_seconds`); OFF-by-default is decided.
-- [ ] **`release_grace_seconds` default** — pick the value (e.g. tie to ~2× the old fence timeout) so the
-  new leader does not gratuitous-ARP while a just-fenced binding might still answer.
+- [x] **Seam keys, confirmed at build** — ratified 2026-09-10 as `enabled`, `address`, `interface`,
+  `prefix` XOR `netmask`, `gratuitous_arp`, `release_grace_seconds`; OFF by default. The helper's `bind`
+  request carries the mask in dotted-decimal form. See §D2.
+- [x] **`release_grace_seconds` default** — 2.0s, and it must stay below
+  `leader_fence_timeout_seconds`. §D2 has the reasoning, including why "~2× the old fence timeout" was
+  read as the fence tick rather than the 20s timeout.
 - [ ] **`vip.held` field shape** — fix the exact `GET /cluster/status` field the per-node card/banner bind
   to, so console and engine agree on one mechanism.
 - [ ] **`new_leader_eligible` in the stepdown result** — derive the successor cheaply at stepdown time, or

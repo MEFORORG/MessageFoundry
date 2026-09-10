@@ -1232,6 +1232,181 @@ def test_cluster_acquire_delay_must_be_non_negative(tmp_path: Path) -> None:
         load_settings(config_path=cfg, environ={})
 
 
+# --- [cluster.vip] engine-managed virtual IP (ADR 0056) ---------------------
+
+_VIP_PG = '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+_VIP_ON = _VIP_PG + "[cluster]\nenabled = true\n[cluster.vip]\nenabled = true\n"
+_VIP_USABLE = 'address = "192.0.2.50"\ninterface = "Ethernet0"\n'
+
+
+def test_vip_absent_section_is_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # No [cluster.vip] at all: the block is off and resolves no mask, so nothing downstream has
+    # anything to act on (AC-6).
+    monkeypatch.chdir(tmp_path)
+    vip = load_settings(environ={}).cluster.vip
+    assert vip.enabled is False
+    assert (vip.address, vip.interface, vip.prefix, vip.netmask, vip.mask) == (None,) * 5
+    assert vip.gratuitous_arp is True
+    assert vip.release_grace_seconds == 2.0
+
+
+@pytest.mark.parametrize(
+    ("body", "refusal"),
+    [
+        pytest.param(
+            "[cluster.vip]\nenabled = true\n" + _VIP_USABLE + "prefix = 24\n",
+            r"\[cluster\.vip\]\.enabled requires",
+            id="not-clustered-sqlite",
+        ),
+        pytest.param(
+            _VIP_PG + "[cluster.vip]\nenabled = true\n" + _VIP_USABLE + "prefix = 24\n",
+            r"\[cluster\.vip\]\.enabled requires",
+            id="not-clustered-postgres",
+        ),
+        pytest.param(
+            '[store]\nbackend = "sqlite"\n[cluster]\nenabled = true\n[cluster.vip]\nenabled = true\n'
+            + _VIP_USABLE
+            + "prefix = 24\n",
+            # The existing [cluster] gate refuses this; the VIP block adds no second check for it.
+            r"\[cluster\]\.enabled requires \[store\]\.backend",
+            id="clustered-on-sqlite",
+        ),
+        pytest.param(
+            _VIP_ON + _VIP_USABLE + 'prefix = 24\nnetmask = "255.255.255.0"\n',
+            "not both",
+            id="both-mask-forms",
+        ),
+        pytest.param(_VIP_ON + _VIP_USABLE, "one of prefix or netmask", id="no-mask-form"),
+    ],
+)
+def test_vip_requires_clustered_server_db_and_one_mask_form(
+    tmp_path: Path, body: str, refusal: str
+) -> None:
+    # ADR 0056 AC-8: refuse to LOAD, not fail at the first bind.
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
+    with pytest.raises(ValidationError, match=refusal):
+        load_settings(config_path=cfg, environ={})
+
+
+@pytest.mark.parametrize(
+    ("mask_lines", "wire_mask"),
+    [
+        ("prefix = 24\n", "255.255.255.0"),
+        ('netmask = "255.255.255.0"\n', "255.255.255.0"),
+        ("prefix = 32\n", "255.255.255.255"),  # a /32 has no network or broadcast address to refuse
+    ],
+)
+def test_vip_on_a_clustered_server_db_loads_with_one_wire_mask(
+    tmp_path: Path, mask_lines: str, wire_mask: str
+) -> None:
+    # The positive control for the refusals above, and the pin on the wire form: either mask spelling
+    # resolves to the one dotted-decimal string the helper's bind request carries.
+    cfg = _write(tmp_path / "messagefoundry.toml", _VIP_ON + _VIP_USABLE + mask_lines)
+    vip = load_settings(config_path=cfg, environ={}).cluster.vip
+    assert vip.enabled is True
+    assert (vip.address, vip.interface) == ("192.0.2.50", "Ethernet0")
+    assert vip.mask == wire_mask
+
+
+def test_vip_switched_off_block_is_a_no_op(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # enabled = false is a complete no-op (AC-6): not clustered, SQLite, both mask forms and garbage
+    # values still load, and nothing is logged about the VIP.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[cluster.vip]\nenabled = false\naddress = "not-an-address"\ninterface = ""\n'
+        'prefix = 99\nnetmask = "0.0.0.255"\nrelease_grace_seconds = -5\n',
+    )
+    with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
+        s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.vip.enabled is False and s.cluster.enabled is False
+    assert not any("[cluster.vip]" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("lines", "refusal"),
+    [
+        ('interface = "Ethernet0"\nprefix = 24\n', "address is required"),
+        ('address = "192.0.2"\ninterface = "Ethernet0"\nprefix = 24\n', "IPv4 address"),
+        ('address = "2001:db8::50"\ninterface = "Ethernet0"\nprefix = 24\n', "IPv4 address"),
+        ('address = "127.0.0.1"\ninterface = "Ethernet0"\nprefix = 24\n', "cannot float"),
+        ('address = "169.254.10.10"\ninterface = "Ethernet0"\nprefix = 24\n', "cannot float"),
+        ('address = "224.0.0.251"\ninterface = "Ethernet0"\nprefix = 24\n', "cannot float"),
+        ('address = "255.255.255.255"\ninterface = "Ethernet0"\nprefix = 24\n', "cannot float"),
+        ('address = "192.0.2.0"\ninterface = "Ethernet0"\nprefix = 24\n', "network or broadcast"),
+        ('address = "192.0.2.255"\ninterface = "Ethernet0"\nprefix = 24\n', "network or broadcast"),
+        (_VIP_USABLE + "prefix = 0\n", "prefix must be 1-32"),
+        (_VIP_USABLE + "prefix = 33\n", "prefix must be 1-32"),
+        (_VIP_USABLE + 'netmask = "255.0.255.0"\n', "netmask must be"),  # not contiguous
+        (_VIP_USABLE + 'netmask = "0.0.0.255"\n', "netmask must be"),  # a hostmask, read as /24
+        (_VIP_USABLE + 'netmask = "24"\n', "netmask must be"),  # a prefix in the netmask key
+        ('address = "192.0.2.50"\nprefix = 24\n', "interface is required"),
+        ('address = "192.0.2.50"\ninterface = "   "\nprefix = 24\n', "interface is required"),
+        ('address = "192.0.2.50"\ninterface = " Ethernet0"\nprefix = 24\n', "whitespace"),
+        ('address = "192.0.2.50"\ninterface = "Ether\\"net0"\nprefix = 24\n', "double quote"),
+        ('address = "192.0.2.50"\ninterface = "Ether\\tnet0"\nprefix = 24\n', "non-printable"),
+        (
+            _VIP_USABLE + "prefix = 24\nrelease_grace_seconds = -1\n",
+            r"release_grace_seconds must be >= 0",
+        ),
+    ],
+)
+def test_vip_enabled_block_refuses_what_could_not_be_bound(
+    tmp_path: Path, lines: str, refusal: str
+) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", _VIP_ON + lines)
+    with pytest.raises(ValidationError, match=refusal):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_vip_release_grace_must_end_inside_the_fence_timeout(tmp_path: Path) -> None:
+    # A grace at the fence timeout (20s by default) could outlast the promoting node's own term.
+    base = _VIP_ON + _VIP_USABLE + "prefix = 24\n"
+    at_fence = _write(tmp_path / "at.toml", base + "release_grace_seconds = 20\n")
+    with pytest.raises(ValidationError, match="release_grace_seconds"):
+        load_settings(config_path=at_fence, environ={})
+    # Zero is allowed: announce as soon as the node leads.
+    zero = _write(tmp_path / "zero.toml", base + "release_grace_seconds = 0\n")
+    assert load_settings(config_path=zero, environ={}).cluster.vip.release_grace_seconds == 0.0
+
+
+def test_vip_default_grace_is_held_to_the_same_bound(tmp_path: Path) -> None:
+    # The bound applies to the DEFAULT as well. The block is new and opt-in, so no existing config can
+    # break, and a silently accepted default would be the one value nobody chose.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        _VIP_PG
+        + "[cluster]\nenabled = true\nheartbeat_seconds = 1\nleader_fence_timeout_seconds = 2\n"
+        + "leader_lease_ttl_seconds = 3\n[cluster.vip]\nenabled = true\n"
+        + _VIP_USABLE
+        + "prefix = 24\n",
+    )
+    with pytest.raises(ValidationError, match="release_grace_seconds"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_vip_unknown_key_is_refused_by_its_dotted_table(tmp_path: Path) -> None:
+    # The loader's unknown-key refusal descends into [cluster.vip]; a typo there would otherwise drop
+    # silently. It applies to a switched-off block too, as it does in every section.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml", '[cluster.vip]\nenabled = false\nadress = "192.0.2.50"\n'
+    )
+    with pytest.raises(ValueError, match=r"\[cluster\.vip\]\.adress \(did you mean 'address'\?\)"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_vip_enabled_warns_that_nothing_moves_the_address(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Configuration only in this build: an operator who switches it on must be told the address will
+    # not move, rather than find out at the first failover.
+    cfg = _write(tmp_path / "messagefoundry.toml", _VIP_ON + _VIP_USABLE + "prefix = 24\n")
+    with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
+        load_settings(config_path=cfg, environ={})
+    assert any("[cluster.vip]" in r.getMessage() for r in caplog.records)
+
+
 # --- [dr].activate + [cluster] mutual-exclusion guard (ADR 0096 rider) ------
 
 
