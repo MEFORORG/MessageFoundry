@@ -209,10 +209,11 @@ its `MEFOR_*` environment. Two things every instance must state:
 
 - **`[ai].environment`** — a free-form name (`test`, `prod`, `poc`, …) that selects
   `environments/<name>.toml`.
-- **Security posture, explicit and decoupled from the name:** `[ai].data_class` (`synthetic` | `phi` —
-  does this instance carry *real* PHI?) and `[ai].production` (is this a production tier?). Built-in names
-  `dev`/`staging`/`prod` derive a sensible default posture; **any custom name must state posture
-  explicitly** — the engine fails closed rather than guess.
+- **Production tier, explicit and decoupled from the name:** `[security].production_instance` (`true` |
+  `false` — is this a production tier?). Built-in names `dev`/`staging`/`prod` derive a sensible
+  default; **any custom name must state it explicitly** — the engine fails closed rather than guess.
+  There is no second declaration: **every instance carries patient data** and the PHI gates apply
+  unconditionally ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 
 Secrets and host-specific overrides come from the environment, e.g. `MEFOR_VALUE_<KEY>` for values used
 by `env("…")` in the graph, and `MEFOR_<SECTION>_<KEY>` for service settings. Precedence is **CLI flag >
@@ -282,7 +283,7 @@ instance.** You do **not** maintain per-environment branches. Each host differs 
         ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
         │  TEST host    │  │  PROD host    │  │  POC host     │
         │ env=test      │  │ env=prod      │  │ env=poc       │
-        │ data_class=…  │  │ data_class=phi│  │ production=f  │
+        │ production=f  │  │ production=t  │  │ production=f  │
         │ MEFOR_* (test)│  │ MEFOR_* (prod)│  │ MEFOR_* (poc) │
         └───────────────┘  └───────────────┘  └───────────────┘
        engine 0.1.0 wheel  engine 0.1.0 wheel  engine 0.1.0 wheel  (pinned, identical)
