@@ -304,6 +304,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
     build_coordinator,
+    has_promotable_sibling,
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
@@ -5427,6 +5428,7 @@ def create_app(
                 is_leader=m.is_leader,
                 acquire_delay_seconds=m.acquire_delay_seconds,
                 promotable=m.promotable,
+                fresh=m.fresh,
             )
             for m in members
         ]
@@ -5446,7 +5448,7 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.CLUSTER_CONTROL)),
-        _body: ClusterStepdownRequest | None = Body(default=None),
+        body: ClusterStepdownRequest | None = Body(default=None),
     ) -> ClusterStepdownResult:
         """**Planned failover**: make this node release its leadership lease so a standby promotes
         (maintenance drain, ADR 0056). The node keeps running and heartbeating, demoted to standby —
@@ -5459,29 +5461,51 @@ def create_app(
         (``config:deploy``, ``messages:replay``, ``messages:purge``) sit behind the same wrapper.
 
         Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
-        and no standby); ``409`` this node is not the leader — the caller resolves the leader from
+        and no standby, and ``force`` does not change that); ``412`` no other promotable node has a
+        fresh heartbeat, so nothing could take the lease (BACKLOG #1509) — the ONLY refusal ``force``
+        overrides; ``409`` this node is not the leader — the caller resolves the leader from
         ``GET /cluster/nodes`` first, and see the note below on the one case where a ``409`` IS the
         successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
-        authentication not configured, or one of the two drain conditions below.
+        authentication not configured, a membership read that raised, or one of the two drain
+        conditions below.
+
+        **Why ``412`` and not a second ``409``.** ``409`` already says "you addressed the wrong node",
+        and after a ``release-unconfirmed`` it can even be the failover succeeding. A no-sibling refusal
+        is neither: the node addressed may be exactly the right one, and the remedy is to start a
+        promotable node or send ``force``. A caller that branches on the status must not be sent off to
+        find another leader. ``400`` and ``422`` say the request was malformed, which it is not, and
+        this handler keeps ``503`` for a store or a lock that did not answer. RFC 9110 writes ``412``
+        for conditions carried in request headers; here the precondition is the cluster's, and
+        ``force`` is how a caller waives it.
+
+        **The membership read runs before the release and outside the coordinator's leadership lock.**
+        So it adds a round trip to the request but never lengthens the critical section
+        ``acquire_leadership_lock`` bounds at the fence timeout. It is ONE read: the ``412`` decision
+        and ``new_leader_eligible`` both come from it, and it is taken even under ``force`` because that
+        answer is still reported. If the read raises, the reply is a ``503`` reading
+        ``members-unreadable`` that changed nothing, whatever ``force`` says. A read that hangs instead
+        is cut off by ``RequestTimeoutMiddleware``, like any other request. The check is point-in-time:
+        a sibling that dies after the read still counted.
 
         **The ``503`` list above is "at least", not an enumeration, and the difference is load-bearing
         for anyone reading a `503` off a real deployment.** ``RequestTimeoutMiddleware`` is registered
         unconditionally on this app and answers ``503`` from OUTSIDE this handler at
         ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, with a body naming no route. Recorded on BACKLOG #1494;
-        the two below are the only ones this handler itself raises.
+        the membership read and the two drain conditions below are the only three this handler itself
+        raises.
 
-        **An absent audit row RULES OUT the drain conditions; it does not identify the timeout.** Both
-        drain arms call ``_denied`` before they raise, so a ``503`` carrying no ``cluster_stepdown_denied``
-        row is neither of them. The converse does not follow, and an earlier revision of this docstring
-        asserted it. At least three other causes share that same empty trail: the ``engine not started``
-        and ``authentication is not configured`` ``503``s named above are raised by the DEPENDENCIES
-        (``_get_engine``, ``require_step_up``), so this body never runs and neither writes a row of
-        either kind; and ``_denied`` is deliberately best-effort, so a store too sick to take the row
-        leaves a drain refusal looking exactly like one that never reached the handler. Diagnose from
-        the response body, which differs on every one of them, and read the audit trail as
-        corroboration rather than as the discriminator.
+        **An absent audit row RULES OUT this handler's own ``503``s; it does not identify the timeout.**
+        All three of its ``503`` arms call ``_denied`` before they raise, so a ``503`` carrying no
+        ``cluster_stepdown_denied`` row is none of them. The converse does not follow, and an earlier
+        revision of this docstring asserted it. At least three other causes share that same empty
+        trail: the ``engine not started`` and ``authentication is not configured`` ``503``s named above
+        are raised by the DEPENDENCIES (``_get_engine``, ``require_step_up``), so this body never runs
+        and neither writes a row of either kind; and ``_denied`` is deliberately best-effort, so a store
+        too sick to take the row leaves one of those refusals looking exactly like one that never
+        reached the handler. Diagnose from the response body, which differs on every one of them, and
+        read the audit trail as corroboration rather than as the discriminator.
 
-        **The two ``503``s are different answers and must not share a sentence.** An earlier build gave
+        **The two drain ``503``s are different answers and must not share a sentence.** An earlier build gave
         both raise sites one body ("could not release leadership; it is still the leader") and one audit
         reason, which was false of each in a different way.
 
@@ -5512,7 +5536,9 @@ def create_app(
         answer — *while the claim pause holds*. The coordinator re-sends the owed write on the next
         stepdown; by then this node has already demoted, so it truthfully reports ``was_leader=false``.
         That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
-        of that sentence.
+        of that sentence. A retry reaches that write only once the membership read and the ``412``
+        check above let it through, so while the store is still failing it answers
+        ``members-unreadable`` and re-sends nothing.
 
         **Retrying promptly is the slow path, and can be an indefinite one.** The pause is armed on
         ``self._is_leader or owed``, so a retry that re-sends an owed write RE-ARMS it for another two
@@ -5541,13 +5567,13 @@ def create_app(
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400`` and the two
-        ``503``s, which nothing else would record.
+        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400``, the
+        no-sibling ``412`` and the three ``503``s, which nothing else would record.
         """
         c = engine.coordinator
 
         async def _denied(reason: str, exc: Exception | None = None) -> None:
-            """One shape for every refusal this handler records, so the three cannot drift apart field
+            """One shape for every refusal this handler records, so they cannot drift apart field
             by field. The DISCRIMINATOR stays at the call site: each refusal supplies its own reason
             and raises its own body, because that is exactly the distinction a shared arm lost once.
 
@@ -5585,11 +5611,48 @@ def create_app(
                 )
 
         if not c.is_clustered():
-            # Single-node: no lease to release, no standby to take over. Gated here, before the
-            # coordinator, so the answer never depends on a NullCoordinator's no-op.
+            # Single-node: no lease to release, no standby to take over, so nothing for force to
+            # override. Gated here, before the coordinator, so the answer never depends on a
+            # NullCoordinator's no-op. is_clustered() can answer "is there a lease at all"; whether
+            # anything could TAKE the lease is the membership read below (BACKLOG #1509).
             await _denied("not-clustered")
             raise HTTPException(
                 400, f"node {c.node_id} is not clustered; there is no lease to release"
+            )
+        try:
+            members = await c.cluster_members()
+        except Exception as exc:
+            # As broad as the coordinators' own pool handling, for their reason: both read through the
+            # store's pool, whose driver exceptions are not importable here without the optional
+            # extras. CancelledError is not an Exception, so a request deadline still unwinds. Nothing
+            # has been attempted yet, so this arm, like lock-timeout, asserts nothing about who leads.
+            _log.warning(
+                "cluster: node %s could not read cluster membership for a stepdown: %s",
+                c.node_id,
+                safe_exc(exc),
+            )
+            await _denied("members-unreadable", exc)
+            raise HTTPException(
+                503,
+                f"node {c.node_id} could not read cluster membership to check for a promotable "
+                "sibling, so it did not start the stepdown: nothing was released or demoted and "
+                "this call changed nothing. Retry, and if it repeats, look at the store connection.",
+            ) from exc
+        new_leader_eligible = has_promotable_sibling(members, c.node_id)
+        force = body.force if body is not None else False
+        if not new_leader_eligible and not force:
+            # The drain would leave nothing able to take the lease. force waives this refusal and no
+            # other: the 400 above has no lease to release, and the 409 below still comes from what
+            # the release returned.
+            await _denied("no-promotable-sibling")
+            raise HTTPException(
+                412,
+                f"node {c.node_id} has no other promotable node with a fresh heartbeat, so stepping "
+                "it down would leave nothing able to take the lease; this call changed nothing. "
+                "Start a promotable node and retry once GET /cluster/nodes shows it fresh, or send "
+                '{"force": true} to drain this node anyway. A forced drain does not stay drained: '
+                "if no other node takes the lease, this node renews it on its first tick after "
+                "the two-heartbeat stepdown pause.",
             )
         # Deliberately NO is_leader() pre-read. The release itself reports whether this node held
         # leadership, and that returned value is the only thing audited or reported: a fence or a
@@ -5650,7 +5713,11 @@ def create_app(
                 "before starting maintenance. This status code never means the node is quiescent.",
             ) from exc
         result = ClusterStepdownResult(
-            node_id=c.node_id, was_leader=was_leader, released_at=released_at
+            node_id=c.node_id,
+            was_leader=was_leader,
+            released_at=released_at,
+            new_leader_eligible=new_leader_eligible,
+            force=force,
         )
         # The audit detail IS the response body, so the two cannot drift apart field by field.
         await engine.store.record_audit(

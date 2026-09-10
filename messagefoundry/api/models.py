@@ -961,6 +961,11 @@ class ClusterNode(BaseModel):
     # standby). Defaulted so single-node / older clients stay valid.
     acquire_delay_seconds: float = 0.0
     promotable: bool = True
+    # Whether ``last_seen`` was inside ``node_timeout_seconds`` at the read: the engine's own verdict,
+    # the one the stepdown's promotable-sibling check uses (BACKLOG #1509), published so a client never
+    # re-derives freshness from ``last_seen`` with a threshold of its own. False on the single-node
+    # synthetic self-entry, which has no heartbeat.
+    fresh: bool = False
 
 
 class ClusterNodeList(BaseModel):
@@ -979,31 +984,39 @@ class ClusterNodeList(BaseModel):
 
 
 class ClusterStepdownRequest(RequestModel):
-    """The body of ``POST /cluster/stepdown`` (ADR 0056 slice 1) — deliberately EMPTY.
+    """The body of ``POST /cluster/stepdown`` (ADR 0056). No body, or ``{}``, means ``force=false``.
 
-    ADR 0056 sketched a ``force`` flag and then deferred it: v1 ships a clean lease release only, and
-    ``409`` is the normative answer on a node that is not the leader. Because this is a
-    :class:`~messagefoundry.api.request_model.RequestModel`, a client that sends ``{"force": true}``
-    anyway is refused with 422 rather than silently getting the un-forced behaviour it did not ask for.
-    The model exists (instead of no body at all) so that flag has one obvious place to land when it is
-    built, without changing the route's shape."""
+    ``force`` overrides exactly one refusal: the ``412`` a stepdown gets when no other promotable node
+    has a fresh heartbeat (BACKLOG #1509), so an operator can drain the last such node on purpose. It
+    does NOT override the ``400`` on a deployment that is not clustered, where no lease exists, nor
+    the ``409`` on a node that is not the leader, where there is nothing to drain. A forced stepdown
+    is the same clean lease release, not the immediate fence ADR 0056 first sketched. Because this is
+    a :class:`~messagefoundry.api.request_model.RequestModel`, an unknown field is refused with 422
+    rather than silently ignored."""
+
+    force: bool = False
 
 
 class ClusterStepdownResult(BaseModel):
-    """The result of a planned failover (ADR 0056 slice 1). ``node_id`` is the node the call was made
-    against. ``was_leader`` and ``released_at`` are what the coordinator's ``step_down_leadership()``
-    RETURNED, never a prior ``is_leader()`` read: a fence or a lost-lease tick can flip leadership
-    between the read and the release, so a pre-read could report a failover that released nothing.
+    """The result of a planned failover (ADR 0056). ``node_id`` is the node the call was made against.
+    ``was_leader`` and ``released_at`` are what the coordinator's ``step_down_leadership()`` RETURNED,
+    never a prior ``is_leader()`` read: a fence or a lost-lease tick can flip leadership between the
+    read and the release, so a pre-read could report a failover that released nothing.
     ``released_at`` is the epoch-seconds instant this node was demoted, ``None`` when it held no
     leadership. Cluster metadata only — no PHI.
 
-    The successor is deliberately NOT reported. ADR 0056 left ``new_leader_eligible`` unresolved, and
-    deriving it here would be a guess: at the instant of release no standby has acquired yet, so the
-    honest answer is for the caller to re-poll ``GET /cluster/nodes`` and watch the lease move."""
+    ``new_leader_eligible`` says whether another promotable node had a fresh heartbeat in the
+    membership read taken before the release, the same read the ``412`` refusal checks. It names no
+    successor: at the instant of release no standby has acquired yet, so the caller still re-polls
+    ``GET /cluster/nodes`` and watches the lease move. On a ``200`` it is false only when ``force`` was
+    set, and ``force`` is echoed because the audit row IS this body, so the record shows the
+    override."""
 
     node_id: str
     was_leader: bool
     released_at: float | None
+    new_leader_eligible: bool
+    force: bool
 
 
 class DrStatus(BaseModel):
