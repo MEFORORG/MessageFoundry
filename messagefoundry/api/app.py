@@ -6043,6 +6043,7 @@ def create_app(
                 security_posture=security_posture,
                 cluster_status=cluster_status,
                 cluster_nodes=cluster_nodes,
+                cluster_stepdown=cluster_stepdown,
                 dr_status=dr_status,
                 service_status=service_status,
                 ack_alert=ack_alert,

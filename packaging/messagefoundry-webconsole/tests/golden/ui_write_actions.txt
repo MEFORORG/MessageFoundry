@@ -6,6 +6,8 @@
 ^/ui/account/webauthn/[^/?#]+/delete$	webauthn_delete	step_up=1,auto_retry=1,unlock=0
 ^/ui/account/webauthn/enroll$	webauthn_enroll	step_up=0,auto_retry=1,unlock=0
 ^/ui/ad-groups$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/cluster/force-stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/cluster/stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/config/reload$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/connections/[^/?#]+/purge/(top|all)$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/connections/purge-confirm$	-	step_up=1,auto_retry=0,unlock=1
