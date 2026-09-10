@@ -390,18 +390,24 @@ POST /cluster/stepdown        # body: {} — there are no options
   - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
     so on a first deployment nothing carries the feeds until that node renews itself back in when its
     pause ends — a partitioned pool during a stepdown is the way into that window.
-  - **Retry the stepdown; a retry re-sends that write.** *Within the pause* — two `heartbeat_seconds`,
-    20s at the shipped default — expect the retry to answer `409`, not `200`: the node demoted on the
-    first call, so the retry finds it already a standby.
-  - **Past the pause the answer is `200` or `409`, decided by who the lease row names by then.** The
-    claim statement has two arms: renew, `owner = me`, which carries no expiry test, and take-over,
-    which needs an expired lease. If the row still names the drained node when the pause ends — the
-    write never committed, or it committed and no standby took the lease — the renew arm matches on
-    its next tick and a retry answers `200`. If a standby acquired instead, the row names the standby
-    and its lease is live, so neither arm matches, the drained node stays a follower, and a retry
-    answers `409`. **That `409` is the failover having worked, not a wrong-node answer.** Do not take
-    the generic `409` remedy here and step down whoever `GET /cluster/nodes` now names as leader: that
-    is the healthy successor, and draining it undoes the failover you just achieved.
+  - **A retry re-sends the write, and answers `409` for as long as this node is not the leader.** The
+    first call cleared this node's in-memory leader flag before it wrote, so every later call reports
+    `was_leader=false`, which the endpoint turns into `409`. That holds whatever the lease row says:
+    the row is not what decides the status code here.
+  - **Only a maintenance tick can make this node leader again, and retrying prevents one.** The flag is
+    set in exactly one place, when a tick's claim succeeds. A tick cannot claim while the stepdown
+    pause holds — it returns not-held at the pause gate before touching the database — and **each retry
+    that re-sends an owed write re-arms that pause for another two `heartbeat_seconds`**. So retrying
+    promptly holds this node in `409` indefinitely, by never letting a tick through. **The remedy is to
+    wait, not to retry.**
+  - **Once the pause lapses, the next tick settles it.** If the lease row still names the drained node,
+    the renew arm — `owner = me`, which carries no expiry test — matches, the node becomes leader
+    again, and a stepdown issued *after that* answers `200`. If a standby acquired instead, the row
+    names the standby and its lease is live, so the renew arm cannot match and the take-over arm needs
+    an expiry that has not passed; the drained node stays a follower and `409` is permanent.
+    **That `409` is the failover having worked, not a wrong-node answer.** Do not take the generic
+    `409` remedy here and step down whoever `GET /cluster/nodes` now names as leader: that is the
+    healthy successor, and draining it undoes the failover you just achieved.
   - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
     code, is what tells you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and

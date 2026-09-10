@@ -5524,6 +5524,14 @@ def create_app(
         That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
         of that sentence.
 
+        **Retrying promptly is the slow path, and can be an indefinite one.** The pause is armed on
+        ``self._is_leader or owed``, so a retry that re-sends an owed write RE-ARMS it for another two
+        ``heartbeat_seconds``. Nothing promotes this node except ``_maintain_leadership`` setting the
+        flag when its claim succeeds, and that claim returns not-held at the pause gate before it
+        touches the database. So an operator who retries faster than the pause expires never lets a
+        tick through and holds themselves in ``409``. The remedy for a ``release-unconfirmed`` ``503``
+        is to WAIT and read ``GET /cluster/nodes``, not to retry in a loop.
+
         **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
         — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
         claim statement has exactly two arms: renew, gated on this node still OWNING the row
