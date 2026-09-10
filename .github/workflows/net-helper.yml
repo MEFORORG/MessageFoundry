@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+name: net-helper
+
+# Builds mefor-net-helper.exe, the privileged helper ADR 0056 specifies (packaging/net-helper/), and signs
+# it when a signing credential is configured. This is the repository's first compiled artifact and first
+# signing step, so each choice is written down here.
+#
+# NOT A REQUIRED CHECK, AND IT CANNOT BE ONE AS WRITTEN. It is paths-filtered, so it does not report on a
+# pull request that touches neither the helper nor this file. A required context that never reports wedges
+# every such pull request (docs/CI.md, the required-but-absent trap; .github/required-contexts.txt).
+# Nothing in the engine calls the helper yet. When a release ships the binary, gate this build through
+# ci.yml's `CI gate` roll-up rather than requiring this job directly.
+#
+# SIGNING RUNS ONLY FOR CODE ON MAIN. The certificate signs a push to main or a manual dispatch on main,
+# never a pull request, because a signature says the code was reviewed and merged. A fork pull request has
+# no secrets anyway. When the secret is absent the signing step SKIPS and the job still passes, producing an
+# unsigned development build: the owner is procuring the certificate separately, and the build must not
+# wait on it. No credential lives in this repository.
+#
+# THE CREDENTIAL SHAPE IS A BASE64 PFX, AND THAT MAY NOT FIT THE CERTIFICATE THAT ARRIVES. The CA/Browser
+# Forum code-signing baseline requirements have required hardware-protected private keys for publicly
+# trusted code-signing certificates issued since June 2023, so such a key cannot be exported as a PFX. A
+# certificate from an internal CA can be. If the key lives in a cloud HSM, replace the certificate import
+# in the signing step with that provider's signtool integration, and keep the rest: the secret-gated skip,
+# the RFC 3161 timestamp, and the signature check.
+#
+# Repository secrets read here: NET_HELPER_SIGNING_PFX_BASE64 and NET_HELPER_SIGNING_PFX_PASSWORD.
+on:
+  pull_request:
+    paths:
+      - "packaging/net-helper/**"
+      - "!packaging/net-helper/README.md"
+      - ".github/workflows/net-helper.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packaging/net-helper/**"
+      - "!packaging/net-helper/README.md"
+      - ".github/workflows/net-helper.yml"
+  workflow_dispatch:
+
+concurrency:
+  # zizmor.yml's pattern: a re-push supersedes its own pull request run; push and dispatch runs are never
+  # cancelled, because each one is the only build of its commit.
+  group: net-helper-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: net-helper build
+    # Windows because signtool is Windows-only, and the build should run where the binary will.
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # packaging/net-helper/.gitignore ignores this directory, and the README's build command uses it too.
+      HELPER_OUT: packaging/net-helper/out
+      # A step's `if:` cannot read the secrets context, so only whether the secret is set reaches this
+      # variable, as "true" or "false". The secret itself does not.
+      HAS_SIGNING_CREDENTIAL: ${{ secrets.NET_HELPER_SIGNING_PFX_BASE64 != '' }}
+      # RFC 3161 responses are themselves signed, so plain HTTP is the norm for timestamp servers.
+      TIMESTAMP_URL: http://timestamp.digicert.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, so the token is not kept on disk (zizmor: artipacked).
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # The SDK only compiles. The helper runs on .NET Framework 4.8, which Windows provides.
+          dotnet-version: "10.0.x"
+
+      - name: Build (Release)
+        run: |
+          dotnet build packaging/net-helper/MeforNetHelper.csproj --configuration Release --output $env:HELPER_OUT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check the binary requires administrator
+        run: |
+          # The manifest is embedded verbatim as a resource. If a build change dropped it, the helper would
+          # start without administrator rights and fail each operation later instead of refusing to launch.
+          $exe = Join-Path $env:HELPER_OUT 'mefor-net-helper.exe'
+          $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($exe))
+          if (-not $text.Contains('level="requireAdministrator"')) {
+            throw 'mefor-net-helper.exe does not embed the requireAdministrator manifest'
+          }
+          Write-Host 'requireAdministrator manifest is embedded'
+
+      - name: Sign (signtool, RFC 3161 timestamp)
+        id: sign
+        # A pull request's ref is refs/pull/<n>/merge, so this never signs pull request code.
+        if: env.HAS_SIGNING_CREDENTIAL == 'true' && github.ref == 'refs/heads/main'
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.NET_HELPER_SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.NET_HELPER_SIGNING_PFX_PASSWORD }}
+        run: |
+          $exe = Join-Path $env:HELPER_OUT 'mefor-net-helper.exe'
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Where-Object { $_.Directory.Parent.Name -as [version] } |
+            Sort-Object { [version]$_.Directory.Parent.Name } |
+            Select-Object -Last 1
+          if (-not $signtool) { throw 'signtool.exe was not found in the Windows SDK' }
+
+          $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet, UserKeySet'
+          $pfx = [System.Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
+          $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:SIGNING_PFX_PASSWORD, $flags)
+          # signtool needs neither secret, so both leave this process's environment before it starts.
+          Remove-Item Env:SIGNING_PFX_BASE64, Env:SIGNING_PFX_PASSWORD
+
+          # The certificate sits in the user store only while signtool runs, and is selected by thumbprint,
+          # so the password never appears on a command line.
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
+          $store.Open('ReadWrite')
+          try {
+            $store.Add($cert)
+            # /tr and /td ask for an RFC 3161 timestamp, so the signature stays valid after the certificate expires.
+            & $signtool.FullName sign /sha1 $cert.Thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 $exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+          } finally {
+            $store.Remove($cert)
+            $store.Close()
+          }
+
+          # Checked without chain trust: a certificate from an internal CA is not trusted by this runner, and
+          # whether to trust it is the deploying site's decision. Signed and timestamped is what is asserted.
+          $signature = Get-AuthenticodeSignature -FilePath $exe
+          if (-not $signature.SignerCertificate -or -not $signature.TimeStamperCertificate) {
+            throw 'the binary is not both signed and timestamped'
+          }
+          Write-Host "signed by $($signature.SignerCertificate.Subject); timestamped by $($signature.TimeStamperCertificate.Subject)"
+
+      - name: Record the SHA-256
+        env:
+          SIGNED: ${{ steps.sign.outcome == 'success' }}
+        run: |
+          $exe = Join-Path $env:HELPER_OUT 'mefor-net-helper.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
+          $state = if ($env:SIGNED -eq 'true') { 'signed' } else { 'UNSIGNED development build' }
+          "mefor-net-helper.exe: $state, SHA-256 $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mefor-net-helper
+          path: ${{ env.HELPER_OUT }}/
+          if-no-files-found: error
+          retention-days: 14
