@@ -875,17 +875,20 @@ class EngineClient:
         ``force`` waives the ``412`` and nothing else. The proof that the failover happened is the
         lease owner moving in :meth:`cluster_nodes`, not this call's return.
 
-        The long timeout is deliberate. The engine waits up to its fence timeout for the leadership
-        lock, well past this client's 5s default, and a client that gave up first would report an
-        unreachable engine for a release that may still commit. 120s is the engine's own request
-        deadline (``DEFAULT_REQUEST_TIMEOUT_SECONDS``), duplicated rather than imported for the same
-        ADR 0088 reason as the length bounds above."""
+        The call can block far past this client's 5s default, because the engine may hold it for its
+        fence timeout while it waits for the leadership lock."""
+        # The client must OUTLIVE the engine's request deadline, never equal it. At that deadline
+        # the engine sends its own 503, which still has a network hop to cross, so a client that
+        # gives up first reports an unreachable engine for a stepdown that may still be working.
+        # The deadline is ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, duplicated rather than imported
+        # (ADR 0088); ``test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result`` pins
+        # the ordering.
         return _decode(
             self._request(
                 "POST",
                 "/cluster/stepdown",
                 json={"force": force},
-                timeout=httpx.Timeout(120.0),
+                timeout=httpx.Timeout(150.0),
             ),
             ClusterStepdownResult,
         )

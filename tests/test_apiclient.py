@@ -611,6 +611,8 @@ def test_a_poll_client_never_writes_the_shared_token() -> None:
 
 
 def test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result() -> None:
+    from messagefoundry.api.request_timeout import DEFAULT_REQUEST_TIMEOUT_SECONDS
+
     body = {
         "node_id": "node-a",
         "was_leader": True,
@@ -634,9 +636,10 @@ def test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result() -> No
     assert [(r.method, r.url.path) for r in captured] == [("POST", "/cluster/stepdown")]
     assert json.loads(captured[0].content) == {"force": True}
     assert result.model_dump() == body
-    # The engine can hold the call for its fence timeout, so the client must not give up at its 5s
-    # default and report an unreachable engine for a release that may still commit.
-    assert captured[0].extensions["timeout"]["read"] == 120.0
+    # RED when the client's wait drops to or below the engine's request deadline; the comment in
+    # EngineClient.cluster_stepdown says why. It compares against the engine constant, not a
+    # literal, so raising the engine deadline alone also reds here.
+    assert captured[0].extensions["timeout"]["read"] > DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize("status", [400, 403, 409, 412, 503])
