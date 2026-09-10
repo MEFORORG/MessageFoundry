@@ -4012,10 +4012,16 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted / tls_revocation_attested, or the [security].enforcement dial. Each of those
-    # is separately named, separately audited and separately reported; the retired lever was none of
-    # those things, and it silenced nineteen gates at once. Setting it is now REFUSED at load with a
-    # message naming this decision (see `_REMOVED_KEYS`).
+    # cleartext_accepted, the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement
+    # dial. Each of those is separately named, separately audited and separately reported; the retired
+    # lever was none of those things, and it silenced nineteen gates at once. Setting it is now REFUSED
+    # at load with a message naming this decision (see `_REMOVED_KEYS`).
+    #
+    # NOT `tls_revocation_attested`, which this comment offered beside cleartext_accepted until it was
+    # re-read. The field exists on the outbound model and the connectors consume it, but it has no
+    # factory parameter and no connections.toml key, so an operator cannot author it — and
+    # docs/DEPLOYMENT.md's maintenance rule names that exact field and forbids offering it as a lever.
+    # The blanket env var is the only revocation attestation that can actually be set.
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
     # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
@@ -4416,8 +4422,9 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted / "
-        "tls_revocation_attested, or the [security].enforcement dial. Relax the one you mean, or "
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted, the "
+        "process-wide MEFOR_TLS_REVOCATION_ATTESTED (there is no per-connection revocation lever an "
+        "operator can author), or the [security].enforcement dial. Relax the one you mean, or "
         "delete this line"
     ),
     ("ai", "data_class"): (
