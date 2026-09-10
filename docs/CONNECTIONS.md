@@ -1371,7 +1371,9 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
   [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) leaving it
   empty does **not** mean "unrestricted". With no `[egress]` allowlist at all, `serve` refuses to start;
   with any other list set, it flips `[security].block_unlisted_outbound` on and an empty `allowed_http`
-  then refuses *every* HTTP destination. Empty-means-unrestricted survives only on a synthetic instance.
+  then refuses *every* HTTP destination. Empty-means-unrestricted survives only where an operator
+  writes `[security].block_unlisted_outbound = false` — the explicit, audited opt-out. No instance can
+  declare its way out of the flip any more ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the flip does not read `[security].enforcement` either.
   See [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) for the full behaviour table.
 - **`ws_timestamp_ttl_seconds` must be ≥ the worst-case retry backoff.** The timestamp is re-stamped on
   each `send()`, but a held FIFO lane plus a short TTL can fail the peer's `Expires` check.
@@ -1480,8 +1482,10 @@ config load/reload. On a **PHI** instance (every built-in env name by default,
 [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) an **empty**
 `allowed_smtp` does **not** mean "unrestricted": with no counted `[egress]` allowlist `serve` refuses to
 start, and with one set it flips `[security].block_unlisted_outbound` on, so an empty
-`allowed_smtp` refuses *every* SMTP destination. Empty-means-unrestricted survives only on a synthetic
-instance — see [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). (The key is
+`allowed_smtp` refuses *every* SMTP destination. Empty-means-unrestricted survives only where an
+operator writes `[security].block_unlisted_outbound = false` — the explicit, audited opt-out. No
+instance can declare its way out of the flip any more ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the flip does not read
+`[security].enforcement` either — see [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). (The key is
 `[security].block_unlisted_outbound`; `[egress].deny_by_default` moved there under ADR 0118 and is
 **rejected at config load**.)
 

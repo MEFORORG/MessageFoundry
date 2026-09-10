@@ -102,10 +102,11 @@ refusal, not the serve-gate dial.
 
 **There is no data-class lever on this page any more.** `handles_real_patient_data` sat beside it and
 was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md): **every instance carries patient data**, and the PHI gates apply
-unconditionally. It is refused at load. Each gate it used to relax as a group is listed individually
-below, which is the point — the retired lever reached all nineteen without naming any of them, and
+unconditionally. It is refused at load. Each gate it used to relax now has to be reached by its own
+switch, which is the point — the retired lever reached all nineteen without naming any of them, and
 `security_loosenings()` never named it either, so the serve-time warning that fires for every
-deviation on this page did not fire for the widest one the product shipped.
+deviation on this page did not fire for the widest one the product shipped. **Not all nineteen have a
+heading below**; the retired lever's own section names the two that do not, and where to reach them.
 
 `audit_all_authorization_decisions` **changed sides on 2026-09-02** (BACKLOG #1277). It used to default
 `false` and this page called that "a deliberate secure-and-usable default, not a loosening", on the
@@ -349,11 +350,19 @@ This section is kept rather than deleted, because the claim it used to make is t
   `security_loosenings()` contained no reference to it, and the serve-time loosening warning reads that
   registry — so the widest relaxation the product shipped produced no warning line. The posture view did
   carry it, in a separate field the console rendered one style-class quieter than a real loosening.
-- **What replaced it:** nothing, deliberately. Every gate it relaxed has its own entry on this page.
-  Relax the one you mean — `allow_unencrypted_phi`, `block_unlisted_outbound`,
-  `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`,
-  `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection
-  `cleartext_accepted` / `tls_revocation_attested`, or the `enforcement` dial.
+- **What replaced it:** nothing, deliberately. Relax the one you mean — `allow_unencrypted_phi`,
+  `block_unlisted_outbound`, `allow_keeping_phi_indefinitely`,
+  `allow_single_factor_admin_when_exposed`, `allow_unverified_alert_smtp_tls`, a per-connection
+  `cleartext_accepted`, or the `enforcement` dial. **That list is at least, not every:** the retired
+  lever reached nineteen gates and this page does not carry a heading for each of them. Two it reached
+  are named here because they have no heading of their own —
+  `[alerts].security_notifications_required` accepts the pull-only security-event feed instead of a
+  configured channel, and revocation is attested **process-wide** with the environment variable
+  `MEFOR_TLS_REVOCATION_ATTESTED`. **There is no per-connection revocation lever.**
+  `tls_revocation_attested` exists on the outbound model and the connectors read it, but it has no
+  factory parameter and no `connections.toml` key, so nothing can author it — and
+  [DEPLOYMENT.md](DEPLOYMENT.md)'s own maintenance rule names that field and forbids offering it as an
+  operator lever. This page offered it until [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) prompted a re-read.
 - **Setting it now fails the start**, with a message naming those switches. See [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 
 ### `[store].aad_bind = false` — at-rest values are no longer bound to their cell
