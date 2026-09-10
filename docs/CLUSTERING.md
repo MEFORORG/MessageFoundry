@@ -405,10 +405,15 @@ POST /cluster/stepdown        # body: {} — there are no options
   - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
     code, is what tells you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
-  `{node_id, was_leader, released_at}` — cluster metadata only, never message content. The refusals the
-  handler itself reaches (`400`, both `503`s) write `cluster_stepdown_denied` instead, carrying the
-  reason — `not-clustered`, `lock-timeout` or `release-unconfirmed` — so a failed drain is never
-  recorded as a drain and the two `503`s never read as one condition.
+  `{node_id, was_leader, released_at}` — cluster metadata only, never message content. **Every call the
+  handler completes is audited under that name, the `409` included**, so count drains by `was_leader`
+  rather than by the action name. A `409` writes a row reading `was_leader: false, released_at: null`,
+  and that row IS the refusal — which is why the `409` needs no separate denied row. The refusals the
+  handler reaches before it can return (`400`, both `503`s) write `cluster_stepdown_denied` instead,
+  carrying the reason — `not-clustered`, `lock-timeout` or `release-unconfirmed` — so the two `503`s
+  never read as one condition. That denied row is best-effort: a `release-unconfirmed` comes from a
+  store that has just failed, so the endpoint keeps the `503` and its remedy rather than losing both to
+  an audit write that could not land either way.
 - **Who leads next is not reported.** At the instant of release no standby has acquired yet, so poll
   `GET /cluster/nodes` and watch `lease_owner` move rather than expecting the call to name a successor.
 
@@ -426,8 +431,10 @@ leaderless, which is the honest consequence of asking the only eligible node to 
 the node you drained then reclaims its own lease ([BACKLOG #1507](BACKLOG.md)). And a node that has
 already **self-fenced** cannot be drained at all: it holds no leadership to release, so the call answers
 `409` while `GET /cluster/nodes` still shows it as the lease owner until the lease ages out
-([BACKLOG #1508](BACKLOG.md)). In that state the node is already not doing leader work; wait out
-`leader_lease_ttl_seconds` rather than retrying the stepdown.
+([BACKLOG #1508](BACKLOG.md)). In that state the node has given up leadership, but do not read that as
+quiet: fencing sets a flag and wakes the graph teardown, which then runs on another task, so expect the
+same brief overlap a crash failover gets (above). Wait out `leader_lease_ttl_seconds` rather than
+retrying the stepdown.
 
 ### Tune the lease timings to your network
 
