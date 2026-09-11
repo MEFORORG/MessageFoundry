@@ -30479,3 +30479,74 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1537. Scope the net-helper signing secrets to a protected GitHub Environment
+
+> 🚧 **Filed and built 2026-09-11 by a Builder. Open until the owner protects the environment: a merge alone does NOT close it.** The code half is a `net-helper sign` job that names the `net-helper-signing` environment. The owner half is a repository setting that admits only `main` to that environment, with both secrets kept there and nowhere else. No certificate exists yet, so nothing can leak today. Value **8/10** · Difficulty **2/10**. Value 8: once a key exists, any account that can push a branch could otherwise read it and sign binaries as the Foundation. Difficulty 2: one workflow split and one repository setting.
+> Verdict: build
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** CI / release signing. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no signing certificate exists. If a key were configured
+without the owner half, any account that can push a branch could read it.
+
+### A guard inside a workflow cannot bind a branch's own copy of that workflow
+
+Measured at `7f86243b4`:
+
+- `.github/workflows/net-helper.yml` has an unrestricted `workflow_dispatch:` trigger.
+- Its sign step's only gate is `if: env.HAS_SIGNING_CREDENTIAL == 'true' && github.ref == 'refs/heads/main'`.
+- No job names an `environment:`, so both signing secrets could only be repository or organization secrets.
+- `gh api repos/MEFORORG/MessageFoundry/environments` returned no environments on 2026-09-11.
+- The sign step was `skipped` in main's last run of the workflow, run 34563466891, so no signing secret was
+  visible to it then.
+
+A push to a branch, a pull request from one, or a manual dispatch on one would run that branch's own copy of
+the workflow, with the guard deleted if it chose. The workflow header's paragraph "THE ENVIRONMENT PROTECTS
+THE KEY" gives the mechanism.
+
+### Two halves, and only the owner's closes it
+
+| Half | Who | State at filing |
+|---|---|---|
+| A `sign` job that names `net-helper-signing`, runs only on `main`, and holds the only secret references, pinned by `tests/test_net_helper_signing_scope.py` | Builder, in code | Built in the pull request that files this row |
+| Protect `net-helper-signing` so it admits only `main`, and keep both secrets in it and nowhere else | Owner, as a repository setting | Not done |
+
+The code half changes nothing about who can read a repository secret. A run that names a missing
+environment creates it with no rule, so the merge configures nothing.
+
+**Closing this row narrows the exposure; it does not end it.** The rule admits whatever is merged to `main`,
+and on 2026-09-11 branch protection on `main` required no approving review. A pull request that edits the
+workflow could still reach the key once it merges, but as a commit on `main` rather than an unrecorded branch
+run. Whether to add required reviewers to the environment is the owner's decision.
+
+### Decided and recorded, so nobody re-opens them as new
+
+- **A separate job.** Once the rule admits only `main`, a job that names the environment fails on any other
+  ref, and the build runs for pull requests.
+- **Permissions.** The `build` job keeps `contents: read` for its checkout. The `sign` job drops to none,
+  because `download-artifact` at the pinned SHA calls the GitHub API only when given a token. That was read
+  in its source, not measured in a run.
+- **Action pins.** Every `uses:` was already pinned by commit SHA. The new `actions/download-artifact` pin
+  equals the `v8.0.1` tag.
+- **A tripwire, not built.** The build job could fail whenever a signing secret is visible outside the
+  environment. That needs a secret reference in a job with no environment, the pattern this change removes.
+  zizmor's `secrets-outside-env` audit flags that pattern only under the auditor persona, which the zizmor
+  gate does not use. In the one state it detects, the tripwire would also hand the key to the build runner.
+
+### Related, outside this row, and not allocated
+
+A review pass on 2026-09-11 reported these. Only the in-repository facts were re-read by the Builder.
+
+- `release.yml` publishes to PyPI with `id-token: write`, has a `workflow_dispatch:` trigger, and names no
+  `environment:`. The pass reported that PyPI's trusted-publisher check accepts any ref when the publisher
+  names no environment. That PyPI half was not verified here.
+- Nothing re-checks the environment's branch rule after this row closes.
+- `MEFOR_FORBIDDEN_TOKENS` is a repository secret, and the scanners that read it must run on refs other
+  than `main`, so an environment cannot hold it.
+
+### How the Lander confirms the owner half before flipping this banner
+
+Run the read-only commands in `net-helper/README.md`, under "Protect the environment before either secret
+exists". The row closes when every one prints what its comment says.
