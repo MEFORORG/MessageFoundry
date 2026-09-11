@@ -30786,3 +30786,42 @@ CANCELLED again. Over the whole `pull_request_target` population the success rat
 enough a coin flip -- and with 13 live sessions in this repository the arrival rate is what sets it.
 That is worse for the operator than "clears up on retry" implies: the workaround is unreliable in
 exactly the conditions that cause the problem.
+
+### A cancelled `cla` is not confined to stale or conflicting pull requests
+
+Every pull request in the 11-PR table above was `BEHIND` or `DIRTY` -- nine and two. That leaves a
+confound a reader can point at: perhaps something about a stale or conflicting state caused the
+cancellation rather than the shared group. It did not, and two `MERGEABLE` cases settle it.
+
+The first is this item's own pull request. PR 1046 read `mergeable=MERGEABLE mergeStateStatus=BLOCKED`
+with `cla=CANCELLED` and every other required context either pending on a fresh run or green. Nothing
+stale, nothing conflicting. The second was reported by another session on PR 1030 at head `e520ad2f3`,
+also `MERGEABLE` with `cla` cancelled, 28 check runs otherwise progressing.
+
+That is the whole claim: the cancellation does not need a stale or conflicting pull request. It says
+nothing about merge-blocking, which stays INFERRED for the reason given above.
+
+**The fix could not protect its own pull request, and that is expected rather than a failure.**
+`pull_request_target` workflows run from the DEFAULT branch, so PR 1046's `cla` check executes `main`'s
+copy of this workflow, not the corrected one in the diff. It takes effect on merge.
+
+### `gh run rerun` restarts the check without a push, and prints nothing while doing it
+
+The remedy that does not re-fire the whole suite:
+
+```
+gh run rerun <cla run id> --repo MEFORORG/MessageFoundry
+```
+
+An empty commit also works and is worse -- it re-runs every leg and re-enters the same race.
+
+**Verify it took, because the command is silent on success.** It printed no output at all, which is
+indistinguishable from a swallowed failure. Reading the run back is the check: `run_attempt=2` with a
+fresh `status`. Measured on run 34569960533 for this pull request, and independently by another session
+on PR 1030.
+
+**"Re-running clears it" is NOT established, and should not be written as if it were.** What is measured
+is that the re-run STARTS without a push. Whether it finishes is a separate question, and the answer so
+far is sometimes: one session's re-run of run 34568093043 came back CANCELLED again after 1m36s. A
+re-run re-enters the same shared group, so it faces the same arrival rate that caused the problem --
+35 successes in 69 runs across the population.
