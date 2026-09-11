@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Diagnostic helpers (ADR 0106) — redact-by-default (§9) + never-raise."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``messagefoundry check`` commit/CI gate — one callable for the git hook and the IDE.
 
 ``run_checks`` runs the project's checks against a config directory and reports a clear pass/fail,

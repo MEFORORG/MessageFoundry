@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Receipt for the ``tooling`` CI job: prove the harness tier actually EXECUTED.
 
 **The failure this exists for is a green job that ran nothing.** The tier is selected by a pytest

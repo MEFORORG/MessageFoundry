@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine-side contract for the mounted web console (Option B, ADR 0065).
 
 This is a **leaf** module: it imports NO engine core and NO console package, so

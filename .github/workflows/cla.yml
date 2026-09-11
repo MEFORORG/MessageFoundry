@@ -55,22 +55,78 @@ on:
     types: [opened, synchronize]
 
 concurrency:
-  # security.yml's pattern, and its note there is the reasoning -- but keyed on `pull_request_target`,
-  # NOT `pull_request`, because that is the PR trigger this workflow actually declares. Copying the
-  # sibling expression verbatim would make this whole block a no-op: `github.event_name` is never
-  # `pull_request` here, so every run would take the `run_id` arm and nothing would ever group.
+  # KEYED ON THE PULL REQUEST NUMBER, NOT ON `github.ref` -- BACKLOG #1533.
+  # Under `pull_request_target` github.ref is `refs/heads/<DEFAULT branch>`, not
+  # `refs/pull/<n>/merge`, so the previous key put EVERY open pull request into ONE group named
+  # `cla-refs/heads/main`. With this arm cancellable, a push to ANY pull request cancelled the
+  # in-flight `cla` run of an UNRELATED one. `cla` is a REQUIRED context and a cancelled run is not
+  # a success, so the victim cannot merge until something re-runs it -- and what it waits on reports
+  # `conclusion: cancelled` with `steps: 0` and no downloadable log (measured on run 34560869543; a
+  # healthy run has 5 steps), so it renders in the fail column with NOTHING TO READ. That is why the
+  # cause sat unattributed: the evidence is not in the victim's own run, it is in the start time of a
+  # run on somebody else's branch. Measured 2026-09-11 over this workflow's last 100 runs, with
+  # security.yml as a paired control; numbers and method in BACKLOG #1533.
   #
-  # ONLY THE PR ARM IS CANCELLABLE, AND THE OTHER TWO EVENTS ARE DELIBERATELY EXCLUDED:
-  #   * `merge_group` -- `cla` is a REQUIRED context and branch protection evaluates it on the
-  #     merge-group commit. A cancelled run reports a cancelled context, which is the same wedge the
-  #     `on:` note above records for an ABSENT one. It gets a unique group and cannot be cancelled.
-  #   * `issue_comment` -- this is the signing path: a contributor's sign comment is processed by
-  #     that run. Grouping those by ref would put EVERY comment in the repository into one group
-  #     (an issue_comment event's ref is the default branch), so a second comment anywhere would
-  #     cancel the run recording someone's signature. Unique group, never cancelled.
-  # The saving is the re-push path only: a rapid sequence of pushes to one PR now supersedes itself
-  # instead of leaving every earlier run alive competing for a runner slot.
-  group: cla-${{ github.event_name == 'pull_request_target' && github.ref || github.run_id }}
+  # DEFAULT BRANCH, NOT BASE BRANCH, AND THE DIFFERENCE IS MEASURED RATHER THAN READ OFF A PAGE.
+  # GitHub documents this inconsistently: the variables page says a `pull_request_target` run takes
+  # "the `ref` from the base branch", while the events page says "Default branch" for github.com. On
+  # a pull request based on `main` the two readings coincide, so no amount of measuring main-based
+  # pull requests can separate them. A STACKED pull request does separate them, and one settled it
+  # here on 2026-09-11: PR 1048 (head `claude/reconciler-rekey-stack`, base
+  # `claude/ad-immutable-id-1471`, NOT main) had its `cla` run 34568093043 cancelled at 06:17:07,
+  # one second after run 34569280155 on a `main`-based pull request was created at 06:17:06. Under
+  # the base-branch reading those two keys differ and neither can touch the other. They shared a
+  # group, so the ref is the DEFAULT branch.
+  #
+  # That makes the defect broader than the base-branch reading implies -- every open pull request
+  # collapses into one group no matter what it targets, stacked pull requests included -- and it does
+  # not change this fix, because a pull request number separates them under either reading. The
+  # distinction is recorded because a reader who repairs a future variant from the base-branch
+  # sentence will build a per-base key and think it is per-pull-request.
+  #
+  # DO NOT "RESTORE" THE SIBLING SPELLING. security.yml, codeql.yml, net-helper.yml, zizmor.yml and
+  # quality-advisory.yml all write `github.event_name == 'pull_request' && github.ref`, and they are
+  # CORRECT because they declare `pull_request`, where github.ref IS per-pull-request. This workflow
+  # declares `pull_request_target`, where that same expression is wrong twice over: the condition
+  # never matches, and the ref it would select is shared across every open pull request anyway.
+  # dependabot-auto-merge.yml and dependabot-lock-resync.yml already key on the payload number,
+  # which is the pattern used here.
+  #
+  # ONLY THE PULL-REQUEST ARM IS CANCELLABLE; THE OTHER TWO EVENTS KEEP `github.run_id` ON PURPOSE:
+  #   * `merge_group` -- `cla` is required and branch protection evaluates it on the merge-group
+  #     commit. A cancelled run reports a cancelled context, the same wedge the `on:` note above
+  #     records for an ABSENT one. One group per run, so nothing can cancel it.
+  #   * `issue_comment` -- a signing path: a contributor's sign comment is processed by that run.
+  #     Keying it on the pull request would be unsafe EVEN AT `cancel-in-progress: false`, because
+  #     GitHub cancels a run already PENDING in a group when a newer one queues. Two sign comments
+  #     in quick succession on one pull request would then discard the first instead of queueing it.
+  #     One group per run: never cancelled, never pending behind a sibling.
+  #
+  #     THAT PENDING-CANCEL IS THE `queue: single` DEFAULT, NOT A LAW, and the escape is closed here
+  #     for a different reason -- said explicitly so nobody date-checks the paragraph above, finds
+  #     `queue: max` (up to 100 runs may wait instead of being replaced), and adopts it as the fix.
+  #     Per GitHub's own syntax reference `queue: max` beside `cancel-in-progress: true` is a
+  #     WORKFLOW VALIDATION ERROR, and this block's cancel-in-progress is an expression that is true
+  #     on the pull_request_target arm. Whether GitHub applies that validation statically to an
+  #     expression-valued flag is NOT established here, so treat it as a validation RISK rather than
+  #     a certainty -- and note what the risk costs: an invalid workflow produces no runs, `cla` is a
+  #     required context, and the `on:` note above records what an absent `cla` does. Keying by run
+  #     needs no `queue:` key at all, which is why it is the safe answer rather than the lazy one.
+  #
+  # DO NOT HOIST THE NUMBER OUT OF THE CONDITION. `github.event.pull_request.number` is populated on
+  # `pull_request_target` but is EMPTY on `issue_comment`, whose payload carries no top-level
+  # `pull_request` object at all (the pull request number is `github.event.issue.number` there) and
+  # empty on `merge_group`, whose payload carries no pull request number in any form. An
+  # unconditional `cla-${{ github.event.pull_request.number }}` would therefore give EVERY
+  # issue_comment and merge_group run the single key `cla-`, which is this same defect rebuilt on the
+  # signing path. The condition is what keeps those two events on their own keys.
+  #
+  # THE FALLBACK ARM ALSO FAILS SAFE. If the payload ever carried no number, `A && B || C` yields C,
+  # so the group degrades to unique-per-run and cancels nothing; it cannot degrade back into a key
+  # shared between pull requests. The saving this block exists for is unchanged -- a rapid sequence
+  # of pushes to ONE pull request supersedes itself, which is what the previous key was trying and
+  # failing to express.
+  group: cla-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 permissions:

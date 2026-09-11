@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fail-closed outbound/egress allowlist (WP-11c, ASVS 13.2.4/13.2.5/14.2.3): a destination not on the
 [egress] allowlist is refused at config build_check; an empty list = unrestricted."""
 

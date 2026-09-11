@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Did a cell get re-scored AFTER its item's banner was last touched?
 
 BACKLOG #1328, remaining limb. A research-verdict item closes by TWO acts in different seats: a

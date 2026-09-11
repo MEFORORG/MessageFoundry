@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A pid whose DEADNESS HOLDS -- BACKLOG #1360.
 
 THE DEFECT THIS REPLACES. Three test files each carried their own copy of::

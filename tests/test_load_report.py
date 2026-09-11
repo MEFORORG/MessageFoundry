@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Report assembly: no-loss reconciliation, SLO verdict, JSON/CSV shape (no PHI), baseline compare.
 
 Pure — feeds synthetic counters/histograms/engine-samples, so no engine or sockets. Also checks the

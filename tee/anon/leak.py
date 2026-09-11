@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Leak-check for the standalone tee (ADR 0030 §5) — a thin front-end over the publish-guard authority.
 
 The token tables (customer/partner names + estate-vendor tokens) are the owner-managed

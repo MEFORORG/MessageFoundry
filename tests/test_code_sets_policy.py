@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Declared per-code-set unmapped-value policy + re-run-safe capture (BACKLOG #162, ADR 0033 amendment).
 
 Covers: policy application on a miss (default/passthrough/flag/none), backward-compat (no policy ==

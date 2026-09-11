@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """AuthService-level WebAuthn passkey tests (WP-14b, ADR 0068) — real ceremonies throughout.
 
 Every registration/assertion here drives py_webauthn's REAL ``verify_*`` functions via the

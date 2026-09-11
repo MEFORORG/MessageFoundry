@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0041 D3 — startup self-attestation of the installed engine wheel (BACKLOG #54).
 
 The engine hashes its loaded ``messagefoundry`` module files against the installed wheel's

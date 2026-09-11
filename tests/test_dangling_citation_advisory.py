@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin that the dangling-citation scan REPORTS and cannot GATE (BACKLOG #1431).
 
 ``scripts/docs/dangling_citation_check.py`` was a working detector that ran nowhere: measured at

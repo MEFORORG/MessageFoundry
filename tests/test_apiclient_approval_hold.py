@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine client answers a dual-control hold as a hold (ASVS 2.3.5, BACKLOG #1113).
 
 Three approval-gated operations reach the engine through

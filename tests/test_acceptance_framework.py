@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the acceptance harness framework — JUnit aggregation, runner mapping, reporting.
 
 These never nest pytest: the suite-execution seam is injected (a fake ``pytest_runner``), so the

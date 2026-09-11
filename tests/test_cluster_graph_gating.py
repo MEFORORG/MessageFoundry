@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Active-passive graph gating (Workstream A1/A3/A4) — the always-run unit tests (no DB needed).
 
 These prove the engine runs the wired graph **only while this node holds leadership**: a clustered

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Negative control for the PHI-at-rest assertion FORM itself (BACKLOG #347 follow-up).
 
 **Why this file exists.** The at-rest tests assert that a stored body is ciphertext by checking the

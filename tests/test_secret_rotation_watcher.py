@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.3.4 (BACKLOG #282) — the rotation watcher widened beyond the DEK: keyed-MAC fingerprints +
 tracked-since stamps in store meta, auto-detected rotation, and the ENFORCE escalation arm
 (pipeline/secret_rotation.py + store/crypto.py + store/store.py).

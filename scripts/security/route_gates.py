@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The SINGLE derivation of a route's authorization gate, read from the LIVE app.
 
 THE DEFECT THIS EXISTS FOR. A hand-kept route -> permission list goes stale the day a route lands, so

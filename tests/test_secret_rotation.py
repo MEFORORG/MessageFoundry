@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the secret-rotation reminder (pipeline/secret_rotation.py, #195b / ADR 0019 §5).
 
 Mirrors tests/test_cert_expiry.py: a fixed instant + an injected clock + a recording sink drive the

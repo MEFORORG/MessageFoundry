@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``POST /cluster/stepdown`` — the planned-failover control plane (ADR 0056 slice 1, BACKLOG #1494).
 
 ADR 0056 AC-9 names this file. It covers the whole status table (200 / 400 / 403 / 409 / 412 / 422 /

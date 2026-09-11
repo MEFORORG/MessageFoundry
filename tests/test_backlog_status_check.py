@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the backlog status-hygiene gate (``scripts/docs/backlog_status_check.py``).
 
 The last test is the one that matters operationally: it runs the checker against the **real**

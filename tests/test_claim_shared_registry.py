@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1346 -- the claim gate must be SATISFIABLE from a second repository that shares the registry.
 
 ``scripts/hooks/claim_check.py`` runs as a commit-msg hook in more than one repository: this engine

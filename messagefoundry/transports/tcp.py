@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Raw-TCP transport with **configurable delimiter framing** — source + destination.
 
 Built to relay **X12 (and other non-HL7) feeds over custom-framed TCP** opaquely: the payload

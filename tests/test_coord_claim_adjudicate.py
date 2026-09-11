@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A stranded claim is released only when something DURABLE on origin/main has replaced it.
 
 ``claim-reconcile.ps1`` asks whether the BRANCH a claim names has landed. Measured 2026-08-18 on the

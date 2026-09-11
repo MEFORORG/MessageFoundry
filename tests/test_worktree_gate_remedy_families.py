@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Rule 3d's deny must name a remedy that can actually reach the worktree it refused (BACKLOG #1057).
 
 The refusal itself is not in question here and none of these tests touch it. What is in question is the

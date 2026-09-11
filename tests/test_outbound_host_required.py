@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One pre-defined rule, applied the same way by every outbound network connector: a destination that
 dials a peer requires a ``host``, and refuses to invent one.
 

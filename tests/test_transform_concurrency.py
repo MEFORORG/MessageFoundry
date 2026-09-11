@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #214 — intra-message concurrent transform of a message's routed rows.
 
 A message that routes to N handlers produces N ``routed``-stage rows. Today they transform

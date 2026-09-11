@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0058 — worker-level batch-claim cases (T5 byte-identity, T7 in-batch head-of-line) over SQLite.
 
 These drive the RegistryRunner's router/transform workers directly (a controlled inbound + router +

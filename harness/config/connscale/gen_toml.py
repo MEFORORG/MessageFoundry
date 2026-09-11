@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Generate an N-entry ``connections.toml`` config dir for the reload-latency path (B11 wall #5).
 
 Config-reload latency is O(connections); the cleanest way to measure it is to **grow the connection
@@ -26,7 +26,7 @@ from pathlib import Path
 # The shared code-first module the TOML's inbounds bind by name. ROUTING/TRANSFORM LOGIC STAYS
 # CODE-FIRST (ADR 0007) — only the per-connection transport config lives in the generated TOML.
 _SHARED_MODULE = '''# SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared code-first router/handler/outbound for the connection-scale reload-latency TOML graph (B11).
 
 A normal config module (loaded directly), so the ``@router``/``@handler``/``outbound()`` register the

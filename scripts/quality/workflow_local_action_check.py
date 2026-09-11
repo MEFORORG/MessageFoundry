@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a workflow that calls a local action the tree does not contain.
 
 A remote ``uses: owner/repo@sha`` is fetched by the runner and needs no working copy. A LOCAL

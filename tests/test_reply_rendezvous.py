@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The in-process reply rendezvous (ADR 0154 D3) — the race matrix, tested where it is deterministic.
 
 The rendezvous carries no information: every signal is a latency hint and the woken turn re-reads the

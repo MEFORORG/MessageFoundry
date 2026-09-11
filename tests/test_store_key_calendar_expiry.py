@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.3.4 / BACKLOG #1004 — the store DEK's CALENDAR expiry now REFUSES, with a loud opt-out.
 
 The key has two expiry axes and, before this, only one of them stopped anything. The **usage** axis

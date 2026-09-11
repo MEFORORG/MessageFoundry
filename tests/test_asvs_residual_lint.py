@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the forward-only residual citation lint (``scripts/docs/asvs_residual_lint.py``).
 
 The record this lint polices lives in the assessment repo, not here, so these run against

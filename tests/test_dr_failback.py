@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR fail-back (#61, ADR 0048 AC-11): POST /dr/release is drain-then-hand-back — it releases the VIP,
 unbinds all inbound listeners, and drains the staged queue to completion before returning success (no
 dual-accept window). Within the DR store at-least-once + idempotency are preserved across the hand-back

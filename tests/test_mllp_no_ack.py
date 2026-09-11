@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #117 / ADR 0124 — outbound MLLP fire-and-forward (``no_ack``).
 
 When ``no_ack=true`` the MLLP destination writes + drains and confirms delivery **on the TCP write** —

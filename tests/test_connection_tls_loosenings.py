@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The two per-connection TLS deviations reaching the surfaces an operator actually reads (#333).
 
 Both were invisible to the loosening registry. ``tls_allow_expired`` appeared in NONE of

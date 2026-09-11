@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The connection-scale report — the 6 walls keyed by connection count (B11).
 
 A curve-shaped report (vs the throughput-shaped :class:`~harness.load.report.RunReport`): one

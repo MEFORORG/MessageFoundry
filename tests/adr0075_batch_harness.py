@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared offline (no-DB) harness for the ADR 0075 per-hop statement-batching tests.
 
 Drives the REAL shipped SQL Server handoff methods (``route_handoff`` / ``transform_handoff`` and their
