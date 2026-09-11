@@ -2267,14 +2267,28 @@ class AuthService:
         calls down, and refuses outright when it exists with a different id -- so the login path
         reaches this method only with ``held=None``, and the collision branch below is reachable from
         the **reconciler alone**, which probes an account it has already identified and has no such
-        guard. (The store's own ``UPDATE`` is guarded too, so a row claiming the name between this
-        check and that write is a no-op rather than an integrity error.)
+        guard.
+
+        **THE CHECK-THEN-ACT RACE IS REAL AND IS ABSORBED BELOW, NOT PREVENTED BY THE STORE.** This
+        docstring used to say the store's in-statement guard made "a row claiming the name between
+        this check and that write a no-op rather than an integrity error". Measured false on live
+        PostgreSQL 16: under READ COMMITTED the guard's subquery cannot see a concurrent UNCOMMITTED
+        claim, so it passes and the write then raises when the other transaction commits. The store
+        guard still earns its place -- it makes the SEQUENTIAL taken-name case a clean no-op, which is
+        the common one -- but it is not a concurrency control and must not be described as one.
+
+        So this method absorbs the residual itself, by MRO name, exactly as the ADR 0068 section 4
+        duplicate-label race and the BACKLOG #1256 federated-subject bind do. That matters more here
+        than at either of those: the caller is a background reconciler pass, so an unabsorbed
+        integrity error would take down the whole pass and with it every OTHER account's revocation in
+        it -- turning a cosmetic label collision into a missed directory disable.
 
         The account keeps its ``user_id``, its sessions, its roles and everything keyed to them. Only
         the label moves, which is what makes this the end of the revocation cycle rather than a
         gentler version of it.
         """
-        if held is not None and held.id != user_id:
+
+        async def _refuse(held_by: str | None, detected: str) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
             # write is the only safe move, and it is audited rather than logged-and-forgotten because
             # an operator has to resolve it. The likely cause is a stale row for a departed operator
@@ -2284,21 +2298,55 @@ class AuthService:
             # This costs the renamed person nothing: they were identified by their immutable id, so
             # their sessions and roles are untouched and they keep signing in. Only the cached label
             # stays stale, which is a display defect rather than a lockout.
+            #
+            # ``detected`` separates the two ways one condition arrives -- the pre-check saw the
+            # holder, or the write lost a race to it. The OUTCOME is deliberately identical, which is
+            # the whole point of absorbing the race; the discriminator is recorded because an operator
+            # reading a run of these wants to know whether they are looking at one stale row or at
+            # concurrent writers, and those want different fixes.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=old_username,
                 detail=_json(
-                    {"user_id": user_id, "held_by_user_id": held.id, "source": "directory"}
+                    {
+                        "user_id": user_id,
+                        "held_by_user_id": held_by,
+                        "detected": detected,
+                        "source": "directory",
+                    }
                 ),
                 client=client,
             )
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account; the stored name is left as-is (BACKLOG #1532)",
+                "another account (%s); the stored name is left as-is (BACKLOG #1532)",
                 old_username,
+                detected,
             )
+
+        if held is not None and held.id != user_id:
+            await _refuse(held.id, "pre_check")
             return
-        await self._store.set_user_username(user_id, new_username)
+        try:
+            await self._store.set_user_username(user_id, new_username)
+        except Exception as exc:
+            # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
+            # (see this method's docstring and the measured note in `store/postgres.py`).
+            #
+            # MRO BY NAME, matching the BACKLOG #1256 federated-subject bind and the ADR 0068 section 4
+            # duplicate-label race: each backend raises its own integrity class -- sqlite3
+            # IntegrityError, asyncpg's UniqueViolationError, pyodbc's IntegrityError -- and naming
+            # them here would make this module import-aware of every driver and silently stop covering
+            # a backend added later. Anything that is NOT an integrity violation re-raises untouched,
+            # so a genuine store fault still reaches the caller.
+            mro = "".join(t.__name__ for t in type(exc).__mro__)
+            if "Integrity" not in mro and "UniqueViolation" not in mro:
+                raise
+            # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
+            # audit row naming the holder is what makes the collision actionable.
+            winner = await self._store.get_user_by_username(new_username)
+            await _refuse(winner.id if winner is not None else None, "write_race")
+            return
         await self._audit(
             "auth.ad_username_refreshed",
             actor=new_username,

@@ -17,6 +17,8 @@ All directory data here is synthetic.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -861,5 +863,103 @@ async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name
         # And the rename still landed on this same pass.
         after = await store.get_user(before.id)
         assert after is not None and after.username == "jdoe-married"
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1532: the residual race the store's in-statement guard cannot close ------------------
+
+
+async def test_a_lost_username_race_is_absorbed_and_does_not_kill_the_pass() -> None:
+    """The store guard NARROWS the check-then-act window; it does not close it, so this absorbs it.
+
+    **Measured on live PostgreSQL 16 by another session, not reasoned about here.** Under READ
+    COMMITTED the guard's ``NOT EXISTS`` subquery evaluates against the snapshot at its own statement
+    start, so it cannot see a concurrent UNCOMMITTED claim on the same name: the guard passes, the
+    write blocks on ``UNIQUE(username)``, and it raises the moment the other transaction commits. An
+    earlier version of this code claimed a single statement made that impossible, in five separate
+    comments. It does not -- a statement is atomic against COMMITTED data, which is weaker.
+
+    **Why absorbing it matters more here than at the two sibling sites.** ADR 0068 section 4's
+    duplicate-label race and BACKLOG #1256's federated-subject bind each cost ONE request a 500. This
+    caller is the reconciler's apply loop, so an unabsorbed integrity error aborts the whole pass --
+    and every OTHER account's revocation in it. A cosmetic label collision would become a missed
+    directory disable, which is the security control this subsystem exists to provide.
+
+    The raise is a REAL ``sqlite3.IntegrityError``, so the MRO-by-name test in the handler is
+    exercised against a genuine integrity class rather than a stand-in that happens to match.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+
+        # THE INTERLEAVE, modelled where it actually happens: the holder must NOT exist when the
+        # caller's pre-check runs, and must exist by the time the write lands. Creating it up front
+        # instead makes the pre-check fire and the write path is never reached -- which is how the
+        # first draft of this test passed for the wrong reason.
+        async def _raise_integrity(*a: object, **kw: object) -> None:
+            await store.create_user(user_id="winner", username="jbloggs", auth_provider="ad")
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+        store.set_user_username = _raise_integrity  # type: ignore[method-assign]
+
+        ldap.present = {"jbloggs": _principal("jbloggs", object_id=_object_id_for("jdoe"))}
+        plan = await service.reconcile_directory_sessions()
+
+        # THE PASS SURVIVED. This is the assertion the whole absorb exists for.
+        assert plan.aborted is None
+        assert plan.revocations == ()
+        assert [(r.old_username, r.new_username) for r in plan.renames] == [("jdoe", "jbloggs")]
+
+        # The renamed account is untouched: same row, same session, stale label only.
+        still = await store.get_user(jdoe.id)
+        assert still is not None and still.username == "jdoe"
+        assert await service.identity_for_token(token) is not None
+
+        # Audited as the SAME outcome the pre-check produces, with the discriminator recorded.
+        rows = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert len(rows) == 1
+        detail = json.loads(rows[0]["detail"])
+        assert detail["detected"] == "write_race"
+        assert detail["held_by_user_id"] == "winner", "the audit did not name the race winner"
+    finally:
+        await store.close()
+
+
+async def test_a_store_fault_that_is_not_an_integrity_violation_still_propagates() -> None:
+    """THE NEGATIVE CONTROL on the absorb, and without it the handler is a bare except.
+
+    Swallowing every exception from the write would turn a real store fault -- a closed connection, a
+    disk error, a driver bug -- into a silent no-op that audits `refresh_conflict` and reports a
+    healthy pass. The MRO test is what keeps the absorb narrow, and this is the arm that fails if
+    someone widens it.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+
+        async def _raise_other(*a: object, **kw: object) -> None:
+            raise RuntimeError("synthetic: the store connection died")
+
+        store.set_user_username = _raise_other  # type: ignore[method-assign]
+
+        ldap.present = {
+            "jdoe-married": _principal("jdoe-married", object_id=_object_id_for("jdoe"))
+        }
+        with pytest.raises(RuntimeError, match="the store connection died"):
+            await service.reconcile_directory_sessions()
     finally:
         await store.close()

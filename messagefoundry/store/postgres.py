@@ -6454,9 +6454,20 @@ class PostgresStore:
         self, user_id: str, username: str, *, now: float | None = None
     ) -> None:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
-        # The NOT EXISTS clause makes a taken name a no-op rather than the UniqueViolationError that
-        # UNIQUE(username) would raise on a background pass. One statement, so the guard and the write
-        # are evaluated together and a concurrent claim cannot slip between them.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the
+        # UniqueViolationError that UNIQUE(username) would raise on a background pass.
+        #
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT. An earlier version of this comment said
+        # "one statement, so the guard and the write are evaluated together and a concurrent claim
+        # cannot slip between them". Measured false on live PostgreSQL 16: under READ COMMITTED a
+        # single statement is atomic with respect to COMMITTED data, which is not the same as atomic
+        # against a concurrent UNCOMMITTED claim. With two connections, B's subquery evaluates
+        # against the snapshot at its own statement start, cannot see A's uncommitted row, passes
+        # the guard, blocks on the unique index, and raises the moment A commits.
+        #
+        # The residual is absorbed at the call site (`_refresh_cached_username`), by MRO name, the
+        # way the ADR 0068 section 4 duplicate-label race and the BACKLOG #1256 federated-subject
+        # bind already are. Do not restore the stronger claim here.
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET username=$1, updated_at=$2 WHERE id=$3 AND NOT EXISTS "

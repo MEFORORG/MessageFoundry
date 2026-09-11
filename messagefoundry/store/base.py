@@ -1644,9 +1644,23 @@ class AuthStore(Protocol):
         all three backends, so a plain ``UPDATE`` to a taken name raises a backend-specific integrity
         error -- three different exception types for one condition, on a path whose caller is a
         background loop. Each implementation therefore guards the write inside the statement, so the
-        collision leaves the row alone and the caller's pass continues. The caller checks first and
-        audits what it found; this guard is what keeps the race between that check and this write from
-        surfacing as a 500.
+        collision leaves the row alone and the caller's pass continues.
+
+        **THE GUARD NARROWS THE RACE; IT DOES NOT CLOSE IT, AND THIS DOCSTRING USED TO SAY OTHERWISE.**
+        It claimed the in-statement guard "keeps the race between that check and this write from
+        surfacing as a 500". Measured false on live PostgreSQL 16: under READ COMMITTED the subquery
+        evaluates against the snapshot at its own statement start, so it cannot see a concurrent
+        UNCOMMITTED claim on the same name -- the guard passes, the write blocks on the unique index,
+        and it raises when the other transaction commits. A single statement is atomic against
+        COMMITTED data, which is a weaker property than the one asserted here.
+
+        That mattered because this is the contract every backend is written against, and a promise of
+        concurrency safety made at the protocol level is the kind of false premise a later caller
+        relies on. **The residual is absorbed at the call site**
+        (``AuthService._refresh_cached_username``) by MRO name, the way the ADR 0068 section 4
+        duplicate-label race and the BACKLOG #1256 federated-subject bind already are. An
+        implementation may therefore still raise its own integrity class; it must not be relied on not
+        to.
 
         Local accounts are out of scope by construction -- nothing routes a local row here -- and the
         engine has no other writer of this column after ``create_user``.

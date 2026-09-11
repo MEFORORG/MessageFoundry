@@ -8175,9 +8175,14 @@ class MessageStore:
         self, user_id: str, username: str, *, now: float | None = None
     ) -> None:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
-        # The NOT EXISTS clause is what makes a taken name a no-op instead of the IntegrityError that
-        # UNIQUE(username) would otherwise raise on a background pass. One statement, so the guard and
-        # the write are evaluated together and a concurrent claim cannot slip between them.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op instead of the IntegrityError
+        # that UNIQUE(username) would otherwise raise on a background pass.
+        #
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the measured note in postgres.py's copy.
+        # This backend serialises its writes behind `self._lock`, so the interleave measured on
+        # PostgreSQL is not reachable through THIS store; that is a property of the lock, not of the
+        # statement, and it would be lost the moment a second process shared the file. The residual
+        # is absorbed at the call site (`_refresh_cached_username`) for every backend alike.
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(

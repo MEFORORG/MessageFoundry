@@ -9968,9 +9968,13 @@ class SqlServerStore:
         self, user_id: str, username: str, *, now: float | None = None
     ) -> None:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
-        # The NOT EXISTS clause makes a taken name a no-op rather than the pyodbc IntegrityError that
-        # UNIQUE(username) would raise on a background pass. One statement, so the guard and the write
-        # are evaluated together and a concurrent claim cannot slip between them.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the pyodbc
+        # IntegrityError that UNIQUE(username) would raise on a background pass.
+        #
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the measured note in postgres.py's copy.
+        # This backend takes READ COMMITTED with locking rather than MVCC, so its interleave differs
+        # in shape from PostgreSQL's; it is not measured here, and the residual is absorbed at the
+        # call site (`_refresh_cached_username`) by MRO name, which covers whichever class surfaces.
         #
         # As with get_user_by_directory_object_id above, the name comparison is the DATABASE's and
         # this column carries no explicit COLLATE: under a case-insensitive server default this guard
