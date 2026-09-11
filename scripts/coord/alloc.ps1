@@ -21,10 +21,15 @@
 
     The floor is the max over: the numbers on origin/main, the numbers on EVERY local and remote ref, and
     every existing allocation. The all-refs term closes the "registry wiped -> re-issue a number that only
-    exists on an unpushed branch" hole. BOTH kinds sweep those refs in a fixed handful of `git`
-    processes, never one PROCESS per ref -- a per-ref sweep is fine at a few hundred refs and unusable
-    at several thousand, and it does not announce the crossing. Get-Floor's adr branch carries that
-    measurement (BACKLOG #1534). The cost is per allocation, not per edit.
+    exists on an unpushed branch" hole. NEITHER KIND SPAWNS A PROCESS PER REF -- a per-ref sweep is
+    fine at a few hundred refs and unusable at several thousand, and it does not announce the crossing
+    (BACKLOG #1534, measured in Get-Floor's adr branch). What each costs now, stated exactly rather
+    than as "a fixed handful", because the two are no longer the same shape:
+      adr      TWO `git` processes, whatever the ref count.
+      backlog  TWO, plus one `git grep` per 128 DISTINCT ledger blobs -- 12 more on this clone
+               (BACKLOG #1535). It scales with distinct blobs, not with refs, and a clone would need
+               about 6,000 of them before that mattered.
+    The cost is per allocation, not per edit.
 
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
@@ -246,21 +251,92 @@ function Get-Floor {
             if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
         }
 
-        # MULTILINE IS LOAD-BEARING, and its absence was a silent hole. `[regex]'^...'` anchors at the
-        # start of the STRING, not of each line. The all-refs term below feeds it one line at a time
-        # (cat-file output through the pipeline), so it matched there and looked correct -- but the
-        # working-tree term feeds it `Get-Content -Raw`, one string starting "# Backlog", where `^`
-        # could never match. Measured on this tree: 0 of 277 headings found without Multiline, 277
-        # with. So the term that exists to catch a number written but committed NOWHERE has been
-        # finding nothing since it was written, and the all-refs term hid it by covering every number
-        # that had been committed somewhere -- i.e. every case except the one this term is for.
-        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+        # GIT FILTERS; POWERSHELL DOES NOT (BACKLOG #1535). Stage 1 above is already batched, so this
+        # branch never had the adr branch's one-process-per-ref defect. Its cost was BYTE VOLUME: the
+        # 1,518 distinct blobs average ~2.8 MB, so feeding them through `cat-file --batch` shipped
+        # ~4.2 GB and 24.5 MILLION pipeline objects into PowerShell to keep ~500 thousand lines. Only
+        # ~13s of a ~111s stage was git. `git grep` applies the pattern in C and emits the headings
+        # only: 526,162 lines, 4.3 MB, a 46x drop in objects and a 984x drop in bytes.
+        #
+        # PROVEN BY SET EQUALITY, NOT BY A STOPWATCH. Both spellings were run over the same 1,518 oids
+        # on this clone: 855 distinct numbers, max 1535, SubFloorMax 354, `Compare-Object` empty in
+        # BOTH directions. Re-verify that way, never by comparing floors -- the printed floor is the
+        # union max and the REGISTRY term carries it, so this whole stage can return nothing and the
+        # floor will not move. Measured: registry max 1537 against all-refs max 1536, and 61 numbers
+        # live on refs and nowhere else.
+        #
+        # EVERY FLAG BELOW IS A SILENT-ZERO GUARD, and each was reproduced rather than assumed:
+        #   -h      without it git prefixes `<oid>:` and the anchored extraction matches 0 of 314 lines
+        #   -o      emits the heading alone: same line count, 4.3 MB instead of 55.1 MB
+        #   -a      git otherwise prints `Binary file <oid> matches` and drops the lines. 0 of 1,518
+        #           blobs trip it today, and `cat-file` had no such gate, so this is a failure mode the
+        #           port INTRODUCES -- one NUL from a bad merge would zero a blob's contribution
+        #   --no-color --no-line-number --no-column
+        #           `color.ui=always`, `grep.lineNumber` and `grep.column` each prefix every line and
+        #           each takes the extraction to 0. This stage reads git config that `cat-file` never
+        #           did; these three neutralise it
+        #   -E -e   `grep.patternType=fixed` turns the pattern into a literal without an explicit -E
+        #
+        # `[0-9]`, NEVER `\d`. Git's POSIX ERE HAS NO `\d`: the pattern matches ZERO lines corpus-wide
+        # and exits 1, which reads as "no numbers on any ref" and frees every one of them. That is the
+        # #240-#247 shape this term exists to prevent, and transcribing the .NET regex below is all it
+        # takes to get there.
+        $chunk = 128
         if ($oids.Count -gt 0) {
-            foreach ($line in (($oids -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
-                $m = $rx.Match("$line")
-                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            $rxGrep = [regex]::new('^#{2,3} ([0-9]+)\.$')
+            $oidList = @($oids)
+            for ($i = 0; $i -lt $oidList.Count; $i += $chunk) {
+                $slice = @($oidList[$i..([Math]::Min($i + $chunk - 1, $oidList.Count - 1))])
+
+                # BOTH RESETS ARE LOAD-BEARING. An over-long argument list is not a non-zero exit: git
+                # never starts, `$LASTEXITCODE` keeps its PREVIOUS value and `$out` keeps the PREVIOUS
+                # slice's output, so an unguarded loop re-adds the last slice and skips this one with
+                # no error. `$?` is the only reliable witness. Measured ceiling on this clone: 795 oids
+                # (32,736 chars) pass and 796 (32,777) fail against Windows' 32,767-char CreateProcess
+                # limit -- and the message it fails with names StandardOutputEncoding, not the length.
+                # 128 leaves room for a repo path ~2,700 chars longer than this one; the 12 extra
+                # processes are free against a stage that used to stream 4.2 GB.
+                $out = $null
+                $global:LASTEXITCODE = -1
+                $out = & git -C $repo grep -h -o -a --no-color --no-line-number --no-column -E -e '^#{2,3} [0-9]+\.' @slice 2>$null
+                if (-not $?) { throw "git grep did not run over backlog blobs $i..$($i + $slice.Count - 1). An over-long argument list reports a StandardOutputEncoding error rather than the real cause; lower `$chunk` before believing anything else." }
+                # 0 = matched, 1 = no match (legitimate, though no ledger blob here lacks a heading),
+                # 128 = fatal. A single unparseable tree-ish aborts the WHOLE slice and returns zero
+                # lines, so up to 128 blobs' numbers vanish at once. Stage 1 admits only `blob` oids so
+                # it should not fire; it is checked because the loss is total and otherwise silent.
+                if ($LASTEXITCODE -gt 1) { throw "git grep exited $LASTEXITCODE over backlog blobs $i..$($i + $slice.Count - 1); the whole slice returned nothing." }
+
+                foreach ($line in $out) {
+                    $m = $rxGrep.Match("$line")
+                    # THROW, DO NOT SKIP. `$` anchors the whole emitted line, so a non-match means git
+                    # emitted something we did not ask for -- a prefix from config, an ANSI escape, a
+                    # binary notice. Skipping turns each of those into a number-free blob reported as
+                    # clean; throwing turns a silent zero into a loud failure.
+                    if (-not $m.Success) { throw "git grep emitted a line that is not a bare heading: [$line]" }
+                    $seen.Add([int]$m.Groups[1].Value)
+                }
             }
         }
+        # MULTILINE IS LOAD-BEARING HERE, and its absence was a silent hole. `[regex]'^...'` anchors at
+        # the start of the STRING, not of each line. The all-refs term above feeds one line at a time,
+        # so `^` matched there and looked correct -- but this term feeds `Get-Content -Raw`, one string
+        # starting "# Backlog", where `^` could never match. Measured on this tree: 0 of 277 headings
+        # found without Multiline, 277 with. So the term that exists to catch a number written but
+        # committed NOWHERE was finding nothing, and the all-refs term hid it by covering every number
+        # committed somewhere -- i.e. every case except the one this term is for.
+        #
+        # ITS OWN VARIABLE, deliberately. The two regexes used to be one `$rx`, and that sharing is a
+        # trap now that the grep path visibly does not need Multiline: tidying the flag away because
+        # the loop above works fine without it returns THIS term to 0 of 749.
+        #
+        # THE TWO SPELLINGS DIVERGE ON PURPOSE AND THE ASYMMETRY IS SAFE. Git has no `\d` so the grep
+        # pattern must say `[0-9]`; .NET `\d` also matches non-ASCII Unicode digits. Census over all
+        # 1,518 blobs with PCRE, whose `\d` IS Unicode-aware: exactly 0 headings differ. Kept as `\d`
+        # so this file still agrees character-for-character with ledger_check.py and
+        # alloc_strand_sweep.py, which police the same headings in Python. Note that a heading with
+        # non-ASCII digits would throw in `[int]::Parse` below, so `\d` is a latent crash rather than a
+        # capability -- if that ever fires, narrow all four to `[0-9]` together, not this one alone.
+        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
         # Working-tree term: catches a number written to a file but committed nowhere. Both paths, for
         # the same reason -- an item drafted straight into the archive is still a claim on its number.
         foreach ($p in $backlogPaths) {

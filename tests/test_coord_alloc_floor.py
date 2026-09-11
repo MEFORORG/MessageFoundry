@@ -153,9 +153,17 @@ def test_the_sweep_does_not_spawn_a_git_process_per_ref(
 
     Both arms were run on this fixture before the bound was chosen, which is the only way to know it
     discriminates: the pre-fix script made **206** invocations (202 of them ``ls-tree``) for 200 refs,
-    and the batched one made **6**, none of them ``ls-tree``. Six is what BOTH kinds cost, and the
-    count is fixed whatever the ref count, so the bound below is a constant and the 200 refs are
-    there only to make a per-ref sweep unmistakable.
+    and the batched one made **6**, none of them ``ls-tree``. The 200 refs are there only to make a
+    per-ref sweep unmistakable.
+
+    **WHAT THIS CASE CANNOT SEE, stated because the bound looks more general than it is.** All 200
+    refs here point at ONE commit, so the fixture holds exactly ONE distinct ledger blob. Since
+    BACKLOG #1535 the backlog sweep runs one ``git grep`` per 128 distinct BLOBS, so on this fixture
+    it is one grep whatever the chunk size -- and an implementation that never chunked at all, and
+    therefore dies on a real clone's 1,500 blobs against the Windows argv limit, would stay green
+    right here. The count is fixed against the REF count, which is what this case pins; it is not
+    fixed against the blob count. ``test_the_backlog_sweep_chunks_over_distinct_blobs`` is the case
+    that sees the other axis.
 
     The cat-file assertion is the POSITIVE CONTROL. An empty or unwritten trace file would satisfy
     the bound while measuring nothing at all, and a guard that cannot fail is worse than no guard.
@@ -191,3 +199,148 @@ def test_the_sweep_does_not_spawn_a_git_process_per_ref(
         f"{len(invocations)} git invocations for 200 refs -- the sweep scales with the ref count:\n"
         + "\n".join(invocations[:20])
     )
+
+
+# Chunk size in alloc.ps1's backlog branch. 200 distinct blobs is deliberately more than one chunk
+# and less than two full ones, so a sweep that silently stops after the first chunk loses the planted
+# maximum instead of merely running slower.
+_GREP_CHUNK = 128
+_BLOBS = 200
+
+
+def _many_distinct_ledger_blobs(repo: Path, count: int) -> int:
+    """Give the repo ``count`` DISTINCT docs/BACKLOG.md blobs, one per ref, and return the maximum.
+
+    ``git fast-import`` because the alternative is ``count`` commits at roughly 40ms of process
+    startup each. One process builds the whole object graph.
+
+    Every blob differs in content, which is what makes them distinct objects -- 200 refs pointing at
+    one commit is one blob, and that is precisely the shape the sibling case above cannot see past.
+    The maximum is planted in the LAST blob alone, so it falls in the final chunk: an implementation
+    that processes only the first chunk still finds 199 numbers and the wrong answer.
+    """
+    lines = []
+    for i in range(count):
+        number = 100 + i
+        body = f"# Backlog\n\n## {number}. item on ref {i}\n"
+        payload = body.encode()
+        lines.append(f"blob\nmark :{i + 1}\ndata {len(payload)}\n{body}")
+        lines.append(
+            f"commit refs/heads/blob{i}\n"
+            f"author t <t@e.com> 0 +0000\n"
+            f"committer t <t@e.com> 0 +0000\n"
+            "data 0\n"
+            f"M 100644 :{i + 1} docs/BACKLOG.md\n"
+        )
+    subprocess.run(
+        ["git", "fast-import", "--quiet", "--force"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        input="".join(lines).encode(),
+    )
+    return 100 + count - 1
+
+
+def test_the_backlog_sweep_chunks_over_distinct_blobs(tmp_path: Path) -> None:
+    """BACKLOG #1535. The axis the ref-count case is blind to.
+
+    The backlog sweep does not read blob bodies any more -- ``git grep`` filters them in C and emits
+    only the headings. That trades a byte-volume problem for an ARGUMENT-LENGTH one: every distinct
+    blob oid goes on a command line, and Windows' CreateProcess refuses past 32,767 characters. On
+    this clone, 795 oids pass and 796 fail. So the sweep must chunk, and this case is what proves it
+    does.
+
+    **The planted maximum is the instrument.** It lives on a ref and NOWHERE else -- not in the
+    working tree, not in the registry -- so it can only be found by the term under test. Every way
+    this stage fails silently produces the same observable, a floor that is merely lower: a dropped
+    chunk, an over-long argv, ``\\d`` in a POSIX ERE that has no ``\\d``, a missing ``-h``, a binary
+    blob suppressed, a hostile ``grep.lineNumber``. All of them miss 299 and this assertion catches
+    all of them.
+
+    Asserting the floor is only safe here BECAUSE the fixture is built so the floor cannot come from
+    anywhere else. On the real clone it would prove nothing: there, the registry term carries the
+    maximum, so the whole stage can return nothing without moving the printed floor.
+    """
+    repo = _checkout(tmp_path / "blobs", {"0001-first.md": "# First\n"})
+    planted = _many_distinct_ledger_blobs(repo, _BLOBS)
+
+    blobs = {
+        _git("rev-parse", f"refs/heads/blob{i}:docs/BACKLOG.md", cwd=repo).strip()
+        for i in range(_BLOBS)
+    }
+    assert len(blobs) == _BLOBS, (
+        f"fixture is not exercising chunking: {len(blobs)} distinct blobs, expected {_BLOBS}"
+    )
+    assert planted > 77, "the planted maximum must beat the working-tree term's 77"
+    assert f"## {planted}." not in (repo / "docs" / "BACKLOG.md").read_text(encoding="utf-8")
+
+    trace = tmp_path / "git-trace-chunk.log"
+    env = {**os.environ, "GIT_TRACE": str(trace)}
+    assert _floor(repo, kind="backlog", env=env) == planted
+
+    invocations = [
+        line
+        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        if "built-in: git " in line
+    ]
+    greps = [line for line in invocations if "built-in: git grep" in line]
+    expected_greps = -(-_BLOBS // _GREP_CHUNK)  # ceil
+    assert len(greps) == expected_greps, (
+        f"{len(greps)} git grep invocations for {_BLOBS} distinct blobs; expected "
+        f"{expected_greps} at a chunk size of {_GREP_CHUNK}. Either the chunk size moved (update "
+        f"_GREP_CHUNK here in the same commit) or the sweep stopped chunking."
+    )
+    # The count must track BLOBS, not refs, and must stay far below one-process-per-blob.
+    assert len(invocations) <= 15, (
+        f"{len(invocations)} git invocations for {_BLOBS} distinct blobs:\n"
+        + "\n".join(invocations[:20])
+    )
+
+
+def test_the_backlog_sweep_survives_a_hostile_grep_config(tmp_path: Path) -> None:
+    """BACKLOG #1535. The sweep reads git config that the old one never did.
+
+    Moving stage 2 to ``git grep`` gave three ordinary config settings the power to silently zero the
+    all-refs term. ``grep.lineNumber`` prefixes ``1302:``, ``grep.column`` prefixes ``1:``, and
+    ``color.ui=always`` injects ANSI escapes -- and each one makes the anchored extraction match
+    nothing at all, with a zero exit code and no error. ``git cat-file`` read none of them, so this is
+    a failure mode the rewrite INTRODUCED, which is why it gets its own case rather than a comment.
+
+    ``--no-line-number``, ``--no-column`` and ``--no-color`` neutralise all three. None of them is set
+    on any machine here today, which is exactly why nobody would notice the day one is: this fixture
+    sets all three deliberately so the flags are exercised rather than merely present.
+
+    The assertion is again the planted maximum, which lives only on a ref. If any flag is dropped the
+    sweep either finds nothing (floor falls to the working tree's 77) or throws on the malformed line.
+    Both are failures here; both are silent on a fixture that does not set the config.
+
+    **WHAT THESE CASES DO NOT REACH, measured rather than guessed.** Nine mutations of the shipped
+    sweep were run against this file; seven are refused -- the ``\\d`` dialect, a missing ``-h``, no
+    chunking, a dropped chunk, and each of ``--no-line-number`` / ``--no-color`` / ``-E``. Two are
+    NOT caught, and both are defence-in-depth for a state no fixture here can produce:
+
+    * removing ``-a`` -- no ledger blob in any fixture (or on the real clone) trips git's binary
+      detection, so nothing exercises it. It stays in because the day one does, the lines vanish
+      silently and a live number gets re-issued;
+    * replacing the non-conforming-line ``throw`` with a skip -- with every neutralising flag present,
+      no non-conforming line is ever emitted. It only fires once another guard has already failed,
+      and its job is to make that failure loud instead of a silent zero.
+
+    Neither gap is a reason to drop the flag or the throw. Both are a reason not to read a green run
+    here as proof that every guard is live.
+    """
+    repo = _checkout(tmp_path / "hostile", {"0001-first.md": "# First\n"})
+    planted = _many_distinct_ledger_blobs(repo, _BLOBS)
+
+    _git("config", "grep.lineNumber", "true", cwd=repo)
+    _git("config", "grep.column", "true", cwd=repo)
+    _git("config", "color.ui", "always", cwd=repo)
+    _git("config", "grep.patternType", "fixed", cwd=repo)
+    # Prove the config is live, so a silently-ignored setting cannot make this pass vacuously.
+    noisy = _git("grep", "-h", "-e", "## 100.", "refs/heads/blob0", cwd=repo)
+    assert not noisy.startswith("## 100."), (
+        f"fixture config is not reaching git grep; got a clean line: {noisy!r}"
+    )
+
+    assert _floor(repo, kind="backlog") == planted
