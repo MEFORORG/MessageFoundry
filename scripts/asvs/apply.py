@@ -22,12 +22,30 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+# The sibling verifier, imported by PATH rather than as a package: `scripts/asvs` has no
+# `__init__.py`, and the vault runs these tools as bare scripts from its own working directory.
+# Inserting this file's own directory is what makes `import scorecard` resolve there as well as
+# here -- the same line, for the same reason, as `anchor_provenance.py` and `anchor_report.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from scorecard import repo_stamp  # noqa: E402
+
 VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
+
+#: How many cells one payload may write WITHOUT naming them in `--scope` (BACKLOG #1476).
+#:
+#: A POLICY NUMBER RATHER THAN A MEASUREMENT, and saying so beats inventing a derivation for it.
+#: What it is for is the gap between what a write SAYS and what it DOES: the incident behind #1476
+#: announced one cell in its subject and changed most of the record. The exact rung matters far less
+#: than the property -- a write big enough to hide a revert cannot happen until somebody types the
+#: ids. A legitimate whole-file re-verify is still available; it just has to say so.
+_SCOPE_CEILING = 10
 
 #: The banner alphabet and the general emoji planes. CLAUDE.md section 11 bans these in prose; the
 #: only sanctioned holdout is docs/BACKLOG.md, which this file is not. Fail closed rather than
@@ -287,12 +305,96 @@ def main(argv: list[str] | None = None) -> int:
             "stated purpose was mechanical."
         ),
     )
+    ap.add_argument(
+        "--allow-stale-clone",
+        action="store_true",
+        help=(
+            "write even though the clone holding --scorecard reads BEHIND or DIVERGED. Refused by "
+            "default: a write from a stale base re-renders every cell landed since that base back "
+            "to its old value, and the payload cannot show you that."
+        ),
+    )
+    ap.add_argument(
+        "--scope",
+        default=None,
+        help=(
+            "comma-separated cell ids this run is allowed to write. The payload's ids must match "
+            "EXACTLY: an id the payload writes and the scope does not name is refused, and so is "
+            f"one the scope names and the payload does not carry. Required above {_SCOPE_CEILING} "
+            "cells, which is how a whole-file re-render says it is one."
+        ),
+    )
     args = ap.parse_args(argv)
     allow_verdict_change = args.allow_verdict_change
     allow_retirement = args.allow_retirement
     SCORECARD = args.scorecard
     payload = json.loads(args.payload.read_text(encoding="utf-8"))
     dry = not args.apply
+
+    # WHERE THE RECORD IS, NOT ONLY WHAT THE PAYLOAD SAYS (BACKLOG #1476). A targeted edit written
+    # from a clone whose base predates other sessions' landed cells re-renders those cells back to
+    # their old values. It has fired: a vault commit whose subject named one cell reverted an
+    # owner-approved repair on an unrelated one, byte-identically to the pre-repair state, and stood
+    # three days. No guard in this file could see it, because nothing was wrong with the payload --
+    # the writer faithfully rendered a value it should never have been holding. So ask the clone.
+    #
+    # MEASURED, AND NEVER SILENT WHEN IT CANNOT MEASURE. `repo_stamp` is a pure local read -- no
+    # fetch, no network -- so a clone that has not fetched in a week can read CURRENT and still be
+    # stale. That is exactly why `remote-knowledge` is printed beside the verdict instead of being
+    # left out: BEHIND 0 from a six-hour-old fetch and from a one-minute-old fetch are different
+    # claims. The two states refused are the two that carry the defect; every other state --
+    # NO-GIT, NO-UPSTREAM, UNRESOLVED -- is REPORTED and allowed, because a guard that refuses on
+    # states that were never the problem is a guard someone disables, and this file already says so
+    # about the verdict-move refusal.
+    stamp = repo_stamp(SCORECARD)
+    where = (
+        f"{SCORECARD} is at {stamp.ref()}: freshness={stamp.freshness} "
+        f"upstream={stamp.upstream} remote-knowledge={stamp.remote_knowledge}"
+    )
+    if (
+        stamp.freshness.startswith("BEHIND ") or stamp.freshness == "DIVERGED"
+    ) and not args.allow_stale_clone:
+        # REFUSED ON A DRY RUN TOO. A dry run from a stale clone reports a clean, plausible,
+        # wrong plan -- the cells it would revert are not in the payload and so are not in the
+        # report -- and that report is what an operator reads before reaching for --apply.
+        print(f"REFUSING: {where}")
+        print(
+            "  A write from this base would re-render every cell landed since it back to its old "
+            "value. Pull the clone, rebuild the payload from the current record, and re-run. "
+            "--allow-stale-clone overrides."
+        )
+        return 1
+    print(f"  note: {where}")
+
+    # STATED SCOPE AGAINST CELLS WRITTEN (BACKLOG #1476). This writer only ever edits the spans of
+    # the cells the payload names, so comparing "named" against "changed" INSIDE it is vacuous --
+    # they are the same set by construction. The gap that is not vacuous is between the operator's
+    # intent and the payload they were handed: a generator that emits 298 cells under a one-cell
+    # heading produces a payload this tool has no reason to doubt. `--scope` is the independent
+    # channel that states the intent, so the two can disagree out loud.
+    payload_ids = [str(c.get("id")) for c in payload]
+    if args.scope is not None:
+        declared = {s.strip() for s in args.scope.split(",") if s.strip()}
+        written = set(payload_ids)
+        unscoped, unwritten = sorted(written - declared), sorted(declared - written)
+        if unscoped or unwritten:
+            print("REFUSING: the payload's cells do not match the declared scope.")
+            # BOTH DIRECTIONS, NAMED SEPARATELY. Writing a cell nobody declared is the #1476 shape;
+            # declaring one the payload does not carry means the payload is not what its author
+            # thinks it is, which is the same mistake one step earlier.
+            if unscoped:
+                print(f"  written but NOT in --scope: {unscoped}")
+            if unwritten:
+                print(f"  in --scope but NOT written: {unwritten}")
+            return 1
+    elif len(payload_ids) > _SCOPE_CEILING:
+        print(
+            f"REFUSING: this payload writes {len(payload_ids)} cells and states no scope "
+            f"(the unstated ceiling is {_SCOPE_CEILING}). A write this size must name its cells: "
+            "re-run with --scope <id>,<id>,... A whole-file re-verify is allowed and this is how "
+            "it says so."
+        )
+        return 1
 
     live_text = SCORECARD.read_text(encoding="utf-8")
     live_cells = {x["id"]: x for x in tomllib.loads(live_text)["cell"]}
