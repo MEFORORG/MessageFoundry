@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DRIVER-ONLY connscale tool (WS-C, option #2) — drive + sink physically OFF the engine box.
 
 Where :func:`~harness.load.connscale.runner.run_connscale` OWNS (spawns) the engine subprocess per

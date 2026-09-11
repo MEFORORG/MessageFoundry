@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read-only Windows-service state for the engine's own host (L6a, ADR 0065, BACKLOG #75).
 
 The engine can optionally report the run state of the NSSM service that hosts it (``[service]``), so

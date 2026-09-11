@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cluster coordination seam (Track B Step 3) — the always-run unit tests (no DB needed).
 
 These prove the **no-op safety layer**: the :class:`NullCoordinator` default makes every gate True

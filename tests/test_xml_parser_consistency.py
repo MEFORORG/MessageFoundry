@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 1.5.3 — every XML parse surface, held to ONE hostile corpus.
 
 XML is the one data type this codebase parses with several libraries: **defusedxml** (inbound

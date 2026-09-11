@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every `[vault]` client refuses redirects (BACKLOG #1042, ASVS 15.3.2 / 1.3.6).
 
 Every other shipped HTTP egress routes through a no-redirect opener (`transports/rest.py`'s

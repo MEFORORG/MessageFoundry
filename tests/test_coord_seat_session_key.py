@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A CLI ``-Declare`` must land on the SAME record the hooks write, not beside it.
 
 ``seat.ps1`` keys one record per (worktree, session). The two hooks read ``session_id`` off their

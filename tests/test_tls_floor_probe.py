@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 12.1.1 — the startup TLS-floor probe, exercised against REAL handshakes.
 
 These tests stand up an actual TLS server on loopback with a throwaway self-signed cert and point the

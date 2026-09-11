@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``new.ps1``'s cleanup advice must be runnable as written (BACKLOG #1078).
 
 THE DEFECT. ``new.ps1`` anchors on ``$PSScriptRoot``, so run from a linked worktree it creates the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Request/response capture (ADR 0013 Increment 1).
 
 Covers the store seam (the atomic ``complete_with_response`` XOR ``mark_done``, the immutable

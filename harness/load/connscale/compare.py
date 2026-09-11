@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The pipeline-claim-mode A/B comparison (ADR 0066) — per_lane vs pooled, per connection count.
 
 The claim-storm collapse is an ENGINE-SIDE phenomenon, so the primary differentiator counters already

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The pass-through (PT) re-ingress SUT graph (``harness/config/passthrough``).
 
 Verifies the §7 S7.4/S7.5 shape: an external MLLP entry hub whose handler ``Send``\\ s every message

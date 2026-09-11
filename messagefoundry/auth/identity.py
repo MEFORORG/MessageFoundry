@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The resolved identity of an authenticated caller, plus the auth-provider enum.
 
 An :class:`Identity` is built once per request from the session's user and carries the roles already

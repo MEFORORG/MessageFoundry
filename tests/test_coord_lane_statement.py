@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``lane.ps1``'s only-ever-advances guard must not fire on a stamp it wrote itself.
 
 THE GUARD IS CORRECT AND ITS COMPARISON WAS NOT. ``statedUtc`` is written as

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 //
 // The trust boundary at every webview `message` receiver in this extension: what each receiver
 // checks, what evidence each check rests on, and what it still does not cover. Stated once so the

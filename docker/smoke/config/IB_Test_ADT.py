@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Minimal self-contained smoke config for the container CI leg: receive ADT over MLLP, archive to file.
 
 Deliberately tiny and dependency-free — no code sets, no env() refs, no optional extras (fhir/dicom) —

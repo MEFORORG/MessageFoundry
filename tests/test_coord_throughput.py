@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the throughput counter — the gauge that reports items CLOSED.
 
 **What these pin, and why each one exists.** This counter was written because a 30-item wave closed

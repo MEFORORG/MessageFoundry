@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """L1b: read-only engine status page (engine/store metrics, security posture, cluster + DR state).
 
 Also serves ``GET /ui/nav-status`` — the metadata-only health rollup polled by the nav's engine-health

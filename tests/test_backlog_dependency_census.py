@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The `docs/BACKLOG.md` dependency census (BACKLOG #1250).
 
 TWO ARMS, AND NEITHER ONE ALONE IS A TEST. A detector that matches nothing passes every must-not-fire

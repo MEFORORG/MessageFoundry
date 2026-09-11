@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The bash probe rejected a working interpreter when coreutils was absent from PATH (BACKLOG #1373).
 
 ``bash_sees`` runs ``cat mf_bash_probe.txt`` and returns a bare bool. Under a PATH without the

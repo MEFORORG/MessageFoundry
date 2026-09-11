@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Option B (ADR 0065): the engine imports, boots, and serves the JSON API with the web console (the
 ``messagefoundry_webconsole`` package) ABSENT, while ``serve_ui`` still fails LOUD at construction with
 a clear ``RuntimeError``.

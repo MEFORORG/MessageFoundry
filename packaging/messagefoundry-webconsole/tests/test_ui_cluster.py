@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The High Availability page and its stepdown control (ADR 0056, BACKLOG #1495).
 
 Two halves. The page builders are pure, so the control's enable rule, the leaderless-window wording and

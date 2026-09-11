@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Remote-file transport: SFTP / FTP / FTPS — directory destination + directory-polling source.
 
 A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting the wire protocol:

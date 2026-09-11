@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The installer must MERGE the worktree gate's allowlist, never overwrite it (BACKLOG #1375).
 
 THE DEFECT. install-gate.ps1 wrote the allowlist with a bare Set-Content of only THIS run's resolved

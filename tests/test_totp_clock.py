@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The step-boundary guard behind :mod:`tests._totp_clock`.
 
 These pin the property the auth tests depend on: a code handed out by :func:`fresh_totp` is still in

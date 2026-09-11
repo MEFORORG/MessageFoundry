@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-backend store contract for ``rotate_session`` (ASVS 7.2.4).
 
 Deliberately **extra-free**, on the ``_webauthn_store_contract`` precedent: this module imports

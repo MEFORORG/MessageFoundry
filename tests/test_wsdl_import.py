@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WSDL 1.1 import — pure SOAP operation/message type-tree + validate-against-WSDL (BACKLOG #69, ADR 0122).
 
 Exercises the parse (operation/message tree + soapAction + resolved body-element QNames), envelope

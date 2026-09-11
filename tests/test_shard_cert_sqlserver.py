@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """N-active engine-shard CERTIFICATION under load against a REAL SQL Server (ADR 0073) — the live
 proof that N ``serve --shard`` processes on ONE unified server store are SAFE.
 

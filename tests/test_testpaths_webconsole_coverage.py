@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The default pytest gate must collect the web console package, not silently exclude it.
 
 BACKLOG #1027: `testpaths = ["tests"]` made a bare `pytest -q` from the repo root skip the

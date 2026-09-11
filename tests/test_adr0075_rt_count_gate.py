@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0075 AC-5 — living statement/round-trip-count gate for per-hop statement batching.
 
 Drives the REAL shipped handoffs through the recording cursors and pins BOTH:

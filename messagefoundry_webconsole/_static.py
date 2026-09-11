@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Extension-allowlisting static file serving for ``/ui/static`` (ASVS 13.4.7).
 
 Starlette's :class:`~starlette.staticfiles.StaticFiles` serves **any regular file** under its

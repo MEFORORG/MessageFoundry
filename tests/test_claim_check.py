@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The claim gate (BACKLOG #309): two sessions must not build the same backlog item in parallel.
 
 Each test drives the REAL hook as a subprocess against a REAL throwaway git repo, with real staged files

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the destructive worktree pruner (``scripts/worktree/prune-merged.ps1``).
 
 This script once removed a worktree another live session was working in: ``git worktree remove

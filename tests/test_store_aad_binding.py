@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.3.3 — cell-bound at-rest AAD, end-to-end through the SQLite store (ADR 0019).
 
 The crypto core (``cell_aad`` + the v2 writer) is unit-tested in ``test_store_encryption.py``. This

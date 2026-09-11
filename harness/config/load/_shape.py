@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared shape parameters + helpers for the load system-under-test graph.
 
 Loader skips ``_*`` modules, so this file is *imported* by :mod:`graph` rather than loaded as config.

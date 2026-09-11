@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the run-scoped context provider registry (ADR 0009).
 
 The four built-in providers (code_sets/reference/state/environment) are exercised end-to-end by the
