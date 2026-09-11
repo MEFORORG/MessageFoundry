@@ -2271,11 +2271,12 @@ class AuthService:
 
         **THE CHECK-THEN-ACT RACE IS REAL AND IS ABSORBED BELOW, NOT PREVENTED BY THE STORE.** This
         docstring used to say the store's in-statement guard made "a row claiming the name between
-        this check and that write a no-op rather than an integrity error". Measured false on live
-        PostgreSQL 16: under READ COMMITTED the guard's subquery cannot see a concurrent UNCOMMITTED
-        claim, so it passes and the write then raises when the other transaction commits. The store
-        guard still earns its place -- it makes the SEQUENTIAL taken-name case a clean no-op, which is
-        the common one -- but it is not a concurrency control and must not be described as one.
+        this check and that write a no-op rather than an integrity error". That is false: measured on
+        live PostgreSQL 16, in the autocommit shape the store actually uses, **about 60% of contended
+        pairs raise** (counts and caveats: ``store/postgres.py``). The store guard still earns its
+        place -- it makes the SEQUENTIAL taken-name case a clean no-op, which is the common one, and
+        it never lost a row or double-renamed across that whole run -- but it is not a concurrency
+        control and must not be described as one.
 
         So this method absorbs the residual itself, by MRO name, exactly as the ADR 0068 section 4
         duplicate-label race and the BACKLOG #1256 federated-subject bind do. That matters more here

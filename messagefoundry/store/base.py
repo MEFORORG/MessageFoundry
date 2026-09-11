@@ -1648,19 +1648,17 @@ class AuthStore(Protocol):
 
         **THE GUARD NARROWS THE RACE; IT DOES NOT CLOSE IT, AND THIS DOCSTRING USED TO SAY OTHERWISE.**
         It claimed the in-statement guard "keeps the race between that check and this write from
-        surfacing as a 500". Measured false on live PostgreSQL 16: under READ COMMITTED the subquery
-        evaluates against the snapshot at its own statement start, so it cannot see a concurrent
-        UNCOMMITTED claim on the same name -- the guard passes, the write blocks on the unique index,
-        and it raises when the other transaction commits. A single statement is atomic against
-        COMMITTED data, which is a weaker property than the one asserted here.
+        surfacing as a 500". That is false. Measured on live PostgreSQL 16 in this method's own
+        autocommit shape, **about 60% of contended pairs raise** -- the mechanism, the counts and
+        their caveats live once, beside the statement, in ``store/postgres.py``'s copy of this method.
 
-        That mattered because this is the contract every backend is written against, and a promise of
+        It mattered because this is the contract every backend is written against, and a promise of
         concurrency safety made at the protocol level is the kind of false premise a later caller
-        relies on. **The residual is absorbed at the call site**
+        builds on. **So the contract is the weaker one: a collision is a no-op SEQUENTIALLY, and an
+        implementation MAY still raise its own integrity class under concurrency.** It must not be
+        relied on not to. The residual is absorbed at the call site
         (``AuthService._refresh_cached_username``) by MRO name, the way the ADR 0068 section 4
-        duplicate-label race and the BACKLOG #1256 federated-subject bind already are. An
-        implementation may therefore still raise its own integrity class; it must not be relied on not
-        to.
+        duplicate-label race and the BACKLOG #1256 federated-subject bind already are.
 
         Local accounts are out of scope by construction -- nothing routes a local row here -- and the
         engine has no other writer of this column after ``create_user``.
