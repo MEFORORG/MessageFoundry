@@ -110,6 +110,15 @@ def seats_dir(repo: Path) -> Path:
     return Path(common) / "mefor-coord" / "seats"
 
 
+def handoffs_dir(repo: Path) -> Path:
+    """Where `seat.ps1` falls back to when `-Handoff` is a bare filename.
+
+    Derived the way the script derives it -- the sibling of the seats directory -- so a test cannot
+    pass by agreeing with a hard-coded path the script no longer uses.
+    """
+    return seats_dir(repo).parent / "handoffs"
+
+
 def records(repo: Path) -> dict[str, dict]:
     return {
         p.stem: json.loads(p.read_text(encoding="utf-8"))
@@ -342,3 +351,67 @@ class TestFleetRecomputesRatherThanTrustingTheRecord:
         assert out["receipt"]["handoffPointersDangling"] == 0
         assert out["receipt"]["handoffPointersDrifted"] == 0
         assert not [s for s in out["receipt"]["stopConditions"] if "handoffPointers" in s]
+
+
+class TestDeclareResolvesAndRecordsItsOwnFailures:
+    """The two halves of BACKLOG #1372 that shipped WITHOUT a test, pinned here.
+
+    Both were verified by driving the script and then left unpinned, which the item says outright:
+    all twelve tests above hand `-Handoff` an ABSOLUTE path and none of them reads
+    `.writer-errors.txt`, so reverting either half left the suite green. These two close that.
+    """
+
+    def test_a_bare_handoff_filename_resolves_through_the_handoffs_directory(
+        self, repo: Path
+    ) -> None:
+        """HALF ONE. A bare filename is what callers actually pass, and it could never resolve.
+
+        `Test-Path` on a relative path resolves against the CALLER's cwd, which is a worktree and
+        never the handoffs directory, so the pointer stored `unresolved: true` while the command
+        exited 0 looking like it worked. Four seats dangled inside twenty minutes on 2026-08-24 this
+        way, each having read the skill line that warns about it.
+
+        THE FILE EXISTS ONLY IN THE HANDOFFS DIRECTORY, never under the cwd, so the fallback is the
+        only path that can produce a resolving pointer here.
+        """
+        ho = handoffs_dir(repo)
+        ho.mkdir(parents=True, exist_ok=True)
+        doc = ho / "bare-name.md"
+        doc.write_text("handoff body", encoding="utf-8")
+        assert not (repo / "bare-name.md").exists(), "the cwd must NOT be able to answer this"
+
+        seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", "bare-name.md")
+
+        h = pointer(repo)
+        recorded = Path(h["path"])
+        assert recorded.is_absolute(), f"the bare name was stored as given: {h['path']}"
+        assert recorded.samefile(doc), f"{recorded} is not the handoffs-directory file"
+        assert h["bytes"] == doc.stat().st_size
+        assert h["sha256"], "a resolved pointer must carry a hash"
+        assert h["state"] == "resolves", h
+        assert "unresolved" not in h, h
+
+    def test_the_writer_error_log_carries_real_tabs(self, repo: Path) -> None:
+        """HALF TWO. The log looks like a TSV and was not one.
+
+        The line was built with a SINGLE-QUOTED PowerShell format string, where `` `t `` is two
+        literal characters rather than an escape. Measured on the live file before the fix: 0 real
+        tab bytes and 51 backtick-t sequences across 17 lines. LATENT, NOT LIVE -- `fleet.ps1` counts
+        lines and never splits fields -- so only a test that reads the BYTES can hold it.
+
+        A bare name that exists nowhere takes the fallback AND misses, which is the one shape that
+        reaches `Write-WriterError` without any other setup.
+        """
+        seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", "no-such-file.md")
+
+        log = seats_dir(repo) / ".writer-errors.txt"
+        assert log.exists(), "the declare miss must be recorded"
+        raw = log.read_bytes()
+        assert b"`t" not in raw, f"backtick-t survived into the log: {raw!r}"
+
+        lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert lines, raw
+        for line in lines:
+            fields = line.split("\t")
+            assert len(fields) == 4, f"expected 4 tab-separated fields, got {len(fields)}: {line!r}"
+        assert any("handoff-pointer" in ln for ln in lines), lines
