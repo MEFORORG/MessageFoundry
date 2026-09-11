@@ -30824,29 +30824,42 @@ on PR 1030.
 is that the re-run STARTS without a push. Whether it FINISHES is a separate question, and a re-run
 re-enters the same shared group, so it faces the same arrival rate that caused the cancellation.
 
-**DO NOT QUOTE A RATE FOR THE RE-RUN, and do not read the population rate as one.** The whole-population
-figure is 63 successes in 95 first-attempt runs. Attempt-2+ runs are a separate and tiny sample, and one
-of the four is misattributed if taken at face value:
+**DO NOT QUOTE A RATE FOR THE RE-RUN, and do not read the population rate as one.** The
+whole-population figure is 63 successes in 95 first-attempt runs. Attempt-2+ runs are four, and putting
+each through the SAME conservative attribution rule used above -- credit the collapse only when no run
+on its own branch started within 5s of the kill -- leaves exactly ONE attributable to this defect:
 
-| run | conclusion | attempt lifetime | note |
-|---|---|---|---|
-| 34499682853 | success | 14s | got a runner immediately |
-| 34568093043 | cancelled | 102s | |
-| 34569715633 | cancelled | 95s | |
-| 34569960533 | cancelled | 110s | **excluded** -- killed by its own branch's next push, not by the bug |
+| run | conclusion | verdict under the rule |
+|---|---|---|
+| 34499682853 | success | n/a |
+| 34568093043 | cancelled | **CROSS-BRANCH** -- attributable; the run created 1s before the kill was on another branch |
+| 34569715633 | cancelled | **UNATTRIBUTED** -- no cla run created within 5s either way |
+| 34569960533 | cancelled | **self-supersession** -- its own branch's next push, 1s before the kill |
 
-So the workaround's own record is one success and two cancellations. **n=3 is not a rate**, and computing
-1/4 = 25% from the table above would be wrong twice: the sample is too small, and the fourth row is
-ordinary self-supersession.
+So the measured count of this defect killing a re-run is **one**. An earlier revision of this item said
+"one success and two cancellations", which counted the unattributed row as though it were the defect.
+That was the rule applied unevenly: it was run on the one re-run belonging to this branch and not on the
+other two. n=1 is not a rate in either direction.
 
-**THE "RE-RUNS ARE SYSTEMATICALLY DISADVANTAGED" READING IS NOT SUPPORTED EITHER.** It was proposed on
-the grounds that a re-run must wait for a runner before doing its ~13s of work. The one successful
-re-run ran 14 seconds, so a re-run is not inherently made to wait. What the rows actually show is the
-SAME duration mechanism recorded above, applying to re-runs exactly as to first attempts: the fast one
-lived, the slow ones died. That is one finding, not two.
+**THE "RE-RUNS ARE SYSTEMATICALLY DISADVANTAGED BY QUEUEING" READING IS REFUTED AT THE RUN LEVEL.** It
+was offered on a measurement of 7m13s "queued" for run 34569715633, and on a 318s figure this item
+briefly carried for another. Both come from `created_at`, which for a multi-attempt run is the FIRST
+attempt's creation -- so the span covers attempt 1, plus the idle gap before anybody requested the
+re-run, plus any real queueing. The per-attempt endpoint
+(`/actions/runs/<id>/attempts/<n>`) separates them, and the answer is that these re-runs did not queue:
 
-**TIMING A RE-RUN NEEDS `run_started_at`, NOT `created_at`.** For an attempt-2+ run, `created_at` is the
-ORIGINAL run's creation, so `updated_at - created_at` spans the first attempt plus the idle gap plus the
-re-run -- it reported 428-1040s for attempts that actually lived 95-110s. The 95s figure above was
-measured independently by another session on its own pull request and matches this corpus exactly, which
-is what establishes the corrected field is the right one.
+| run | attempt | created | started | queued | ran |
+|---|---|---|---|---|---|
+| 34569715633 | 2 | 06:30:42 | 06:30:41 | ~0s | 95s |
+| 34569960533 | 2 | 06:32:14 | 06:32:13 | ~0s | 110s |
+
+**WHERE THE WAITING ACTUALLY IS, and it is not visible in any run-level timestamp.** A cancelled run
+reports `steps: 0` -- no step ever started -- while the run itself shows as having started minutes
+earlier. So the wait is the JOB waiting for a runner, which `run_started_at` does not measure: it records
+when the RUN was accepted. The `steps: 0` observation recorded earlier on this item is the evidence for
+the exposure window; neither `created_at` nor `run_started_at` is.
+
+**READ A RE-RUN WITH THE PER-ATTEMPT ENDPOINT.** Two sessions independently drew wrong quantities from
+the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
+median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
+confirmation. They were the same artifact.
