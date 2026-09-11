@@ -31108,3 +31108,148 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+## 1546. Pin the PEP 517 build backend: hatchling floats unpinned in every build-system table, so a release resolves it from PyPI inside the publishing job
+
+> 🚧 **Built 2026-09-11; open until its pull request merges, when the Lander flips this banner.** `hatchling==1.32.0` in every `[build-system]` table, plus two tests in `tests/test_packaging.py`. Value **7/10**, Difficulty **2/10**. Value 7: the release jobs ran a build backend nobody pinned, inside the jobs that publish to PyPI. Difficulty 2: the edit is three lines. The measurement and the `--no-isolation` evaluation were the work.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** supply chain / release pipeline. **Verdict:** build.
+**Severity:** zero deployments (sec. 0), but these three distributions are published to PyPI and reach
+real installers. Nothing below says a compromise happened. It says what a compromised hatchling release
+would have done.
+
+### Every build-system table named the backend with no version
+
+Before this change, `pyproject.toml`, `packaging/messagefoundry-webconsole/pyproject.toml` and
+`packaging/messagefoundry-harness/pyproject.toml` each said `requires = ["hatchling"]`. Measured at
+`origin/main` `cbb63ad28`, each search with a control that proves it could see a hit:
+
+| Search | Hits | Control |
+|---|---|---|
+| `--no-isolation` or `--no-build-isolation` anywhere | 0 | the same search found all five `python -m build` lines |
+| `hatchling` in any lock file | 0 | the same tool found `release-tools` inside `uv.lock` |
+
+So PEP 517 build isolation installed whatever hatchling PyPI served, on every build. A control build of
+all three on the unchanged tree logged `Installing packages in isolated environment: - hatchling` four
+times: the engine sdist, the engine wheel built from it, and the two wheel-only builds.
+
+### The unpinned backend ran inside the jobs that publish
+
+`python -m build` imports the backend and runs it inside the calling job. In
+`.github/workflows/release.yml` those jobs hold:
+
+| Job | Builds | Permissions |
+|---|---|---|
+| `release` | engine sdist and wheel | `contents: write`, `id-token: write`, `attestations: write` |
+| `release-webconsole` | web console wheel | `contents: write`, `id-token: write` |
+| `release-harness` | harness wheel | `contents: write`, `id-token: write` |
+
+`id-token: write` is the GitHub OIDC identity that PyPI Trusted Publishing accepts. The `release` job's
+own Sigstore step comment states what that means for any code running in the job: a backdoored wheel
+produced there carries a valid Sigstore bundle and valid SLSA provenance. So a compromised hatchling
+release would have run with the publishing identity on the next tag. The engine job would then have
+signed and attested whatever it emitted.
+
+### Why it read as already fixed
+
+A read-only security audit, run by another Manager session, found it. That audit saw that the work
+pinning the PEP 517 frontend, `build`, left the backend unpinned. The dispatching Manager verified it
+independently and added the permissions leg above. This Builder re-measured both at `origin/main`
+before changing anything.
+
+One correction to that framing, measured 2026-09-11: PR 1039, which hash-locks `build` through the
+`release-tools` group, is **open and not merged**. `main` carries an inline `build==1.5.0` pin. Both
+forms cover the frontend only. `build` installs the backend in a second, separate fetch that neither
+one touches.
+
+**The recurrence shape.** A fix that closes the visible half of a problem makes the remaining half read
+as closed, because the item and the PR title both say the problem was addressed. "Pin `build`" reads as
+"the build is pinned". It was not: the frontend and the backend are two installs, and only one was named.
+
+### The fix
+
+1. `requires = ["hatchling==1.32.0"]` in all three tables. 1.32.0 is the newest release on PyPI,
+   uploaded 2026-08-11. That is 31 days before this change and past `dependabot.yml`'s 5-day cooldown.
+   Its `requires_python` is `>=3.10`.
+2. The reason is stated once, above the root table. The two packaging tables point to it.
+3. `tests/test_packaging.py` gains two tests. The first asserts every `[build-system].requires` entry is
+   an exact `==` pin, that the backend's own distribution is among them, and that every table agrees.
+   It discovers `packaging/*/pyproject.toml` rather than listing files, with a floor of three so an
+   empty glob cannot pass. The second feeds the check the pre-fix bare name and five near-misses, and
+   asserts it flags each one.
+
+`.github/workflows/release.yml` is **not** edited. `build` reads the table, so the pin reaches all three
+build steps with no workflow change. PR 1039 is rewriting those exact step bodies, so touching them here
+would collide for nothing.
+
+### Every build invocation, and what each needed
+
+| Invocation | Needs more? |
+|---|---|
+| `release.yml` job `release`: `python -m build` | No. It reads the root table. |
+| `release.yml` job `release-webconsole`: `python -m build --wheel ./packaging/messagefoundry-webconsole` | No. It reads that table. |
+| `release.yml` job `release-harness`: `python -m build --wheel ./packaging/messagefoundry-harness` | No. It reads that table. |
+| `docker/Dockerfile` stage `builder-base`: `python -m build --wheel` | Not for the backend. The stage copies `pyproject.toml` before it builds, so it gets the pin. Its **frontend** install, `python -m pip install build`, has no version. That image is built by `ci.yml`'s `docker-smoke` job and `security.yml`'s image scan, and no workflow pushes it. Recorded here, not fixed: it is the frontend, not this item. |
+| `packaging/messagefoundry-webconsole/RELEASE.md` | No. It documents a command and runs nothing. |
+| `pip install -e ".[dev]"` in `ci.yml`, `freethread-smoke.yml` and `scripts/worktree/new.ps1` | No. pip builds the editable install through the same table, so these get the pin too. |
+
+### Measured after the change
+
+| Check | Result |
+|---|---|
+| Isolated builds, all three | exit 0; each isolated env installed `hatchling==1.32.0` |
+| `WHEEL` metadata of each wheel | `Generator: hatchling 1.32.0` |
+| `--no-isolation`, env with no hatchling | exit 1, `Backend 'hatchling.build' is not available` |
+| `--no-isolation`, env with hatchling 1.31.0 | exit 1, `ERROR Missing dependencies: hatchling==1.32.0` |
+| `--no-isolation`, env holding the hash-locked closure | exit 0 for all three |
+| Wheel sha256, isolated build against `--no-isolation` build | byte-identical for all three (prefixes `196e4523182fb326`, `2b893a2fef0b8f42`, `84e99544a04424a9`) |
+| `uv lock --check` (local uv 0.11.25; CI pins 0.12.0) | exit 0 before and after |
+
+### What the pin does not close
+
+1. **The fetch still happens.** An `==` pin selects one release, and PyPI does not let a release's files
+   be replaced. That is a real gain. But nothing checks a hash, so the build still trusts PyPI to serve
+   those bytes.
+2. **hatchling's own dependencies still float.** It requires `packaging>=24.2`, `pathspec>=0.10.1`,
+   `pluggy>=1.0.0`, `tomlkit>=0.11.1` and `trove-classifiers`. Pinning the top package leaves those
+   resolved fresh. `release.yml`'s Sigstore comment names the same shape for `sigstore`.
+3. **Nothing is known to bump the table.** Whether Dependabot's `uv` ecosystem proposes updates to
+   `[build-system].requires` has not been observed. Until it is, a bump is manual.
+4. **A published sdist now carries the exact pin.** Anyone rebuilding from that sdist fetches hatchling
+   1.32.0, or has to skip the dependency check. That is the intended trade: two builds of one tag
+   resolve the same backend.
+
+### Recommendation: adopt `--no-isolation` against a hash-locked backend, as its own change after PR 1039
+
+It closes residuals 1 and 2 above, and the measurements say it costs little:
+
+- **The closure is small.** `uv pip compile --generate-hashes` for `hatchling==1.32.0` on Python 3.14
+  gives six packages: hatchling, packaging 26.3, pathspec 1.1.1, pluggy 1.6.0, tomlkit 0.15.1 and
+  trove-classifiers 2026.6.1.19.
+- **The output does not change.** It built byte-identical wheels to the isolated build, for all three.
+- **It fails closed, and it enforces this pin.** A missing backend and a wrong version both stop the
+  build, so the table pin becomes the contract a `--no-isolation` build checks.
+
+It must build in a **dedicated venv, never the job's own interpreter.** hatchling loads plugins from the
+`hatch` entry-point group (`load_setuptools_entrypoints("hatch")` in `hatchling/plugin/manager.py`). A
+build without isolation therefore sees every package installed beside it. Once PR 1039 lands, the job
+interpreter holds the whole `release-tools` lock, so building there would widen what can inject a build
+hook.
+
+What it would take:
+
+1. A hash-locked home for the six-package closure. `release-tools` is the obvious one, and PR 1039 is
+   rewriting that group now. A separate group instead adds an artifact to the DEP-1 export and
+   byte-diff set in `security.yml`, the resync list in `dependabot-lock-resync.yml`, the audit step, and
+   the lockstep test.
+2. In each of the three build steps: make a throwaway venv, install the frontend and that lock with
+   `--require-hashes`, and run `python -m build --no-isolation`.
+3. A test that pins `--no-isolation` on all three steps and holds the lock's hatchling version equal
+   to the tables'.
+
+That touches `uv.lock`, `security.yml`, `dependabot-lock-resync.yml`, the three `release.yml` build
+steps and their tests, which are the files PR 1039 changes. That overlap is why it is recommended here
+and not built.
