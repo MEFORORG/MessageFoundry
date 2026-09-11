@@ -18477,6 +18477,20 @@ never collected, which is the exact failure this row's own CI change was made to
 **Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
 
+### AMENDED: only the ENGINE-LEDGER half is reachable, and the other half is already refused
+
+**THE SECURITY-RECORD HALF CANNOT BE CLOSED FROM AN ENGINE CHECKOUT AND MUST NOT READ AS CLOSED.** That record lives in the separate `MessageFoundry-vault` clone, `docs/security/` is gitignored here so `git ls-files docs/security` returns zero, and `CLAUDE.md` section 5 gives vault authority to the Lander alone. Its prescribed fix -- bulk promotion into gated anchors -- is **already on record as costed and REFUSED**, at commit `6559a58dc`. Reversing a refusal is an owner or Lander ruling, not a Builder's. This row's ownership line splits the two halves cleanly and that split still holds; what changes is that the vault half now has a recorded refusal in front of it rather than an open path.
+
+### The engine-ledger half: a diff-scoped gate is BUILT on branch `claude/bld-detectors`
+
+`scripts/docs/prose_anchor_check.py` refuses a `path:line` citation a change ADDS to `docs/BACKLOG.md` unless the sentence names a symbol or pins a base commit. It grades rather than bans, which is this row's own criterion: `settings.py` cited beside a backticked `require_time_sync` locates itself; the same citation alone does not. The convention is written once in `CLAUDE.md` section 11 and covers commit messages, which this row identifies as where it binds hardest.
+
+**ITS OWN JOB, NOT A STEP IN THE REQUIRED ONE, AND THAT IS A DELIBERATE LIMIT ON A BUILDER'S REACH.** The `banner-on-implementation` job's name IS a required status-check context, so a step added there blocks merges the moment it lands. Making a check RUN is a Builder's call and making one BLOCK is the owner's. So `prose-anchor` reports as its own context, goes red on a finding with no `continue-on-error`, and is deliberately absent from `.github/required-contexts.txt` -- promotion stays available and untaken.
+
+**THE CENSUS, STATED IN OCCURRENCES because this row records that the unit is where seats disagree:** 3,767 `path:line` citation occurrences in `docs/BACKLOG.md`, of which 3,001 carry neither a symbol nor a pinned commit. **The 2,065-citation retrofit of rows 1107 to 1199 was NOT attempted.** It touches 93 item spans in the most-edited file in this repository, three other lanes were writing to that file during this change, and this row's own measurement is that those citations are unverifiable rather than rotten -- 16 of 1,196 distinct pairs had decayed. The gate is what makes the convention hold; the rewrite is not what makes it true.
+
+**PROVED IT CAN GO RED, rather than assumed.** Driven end to end through a throwaway repository whose base commit already carries a naked citation: a change adding a bare `path:line` exits 1 naming it, the same change adding a backticked symbol beside it exits 0, and a change touching an unrelated line exits 0 while the inherited naked citation sits untouched in the same file. Without that last arm, "the gate passed" and "the gate only looks at added lines" would be indistinguishable.
+
 ## 1319. the demote-teardown source-phase timing assertion is wall-clock and fails on a loaded ubuntu runner
 
 > ✅ **SHIPPED -- verified on main 2026-08-23.** The wall-clock bound is gone: the test asserts `width == _N_SOURCES` and the file has no `import time` at all. **Filed 2026-08-22, recovered from a session cut off mid-measurement when its account was cancelled.** Value **5/10** -- Difficulty **2/10** -- _quick win_. [`tests/test_adr0157_demote_teardown.py:106`](../tests/test_adr0157_demote_teardown.py) asserts `elapsed < 1.5` on a wall clock. It failed on `main` at `2d1c89e6` -- CI run `32580332076`, leg `test (ubuntu-latest, py3.14)` -- reporting `source phase took 1.92s`. **That commit was docs-only (#515), so nothing in the tree under test could have moved the number.** **THE CHANGE: assert the CONCURRENCY WIDTH the test is actually about, not the elapsed time it currently infers it from.**
@@ -20230,6 +20244,36 @@ in the 34, carrying `#1319, #1322, #1323, #1331`.
 
 **Expiry:** this stops being right if the house form changes, or if screens are replaced by content
 checks (`git log -S` on a symbol the fix must touch) rather than citation greps.
+
+### LIMB A IS BUILT on branch `claude/bld-detectors`. Shape B is untouched and is not a Builder's call
+
+`banner_sha_check`'s extractor is now `cited_items`, which reuses the parenthetical-scoped rule
+already in `claim-adjudicate.ps1` and `backlog-hygiene.yml` rather than inventing the third rule this
+row is about. The deliberate bare-hash pin in `tests/test_banner_sha_check.py` stays green, and the
+house four-item subject has an arm of its own: a banner citing `#1323`, the third number in
+`(BACKLOG #1319, #1322, #1323, #1331)`, now reads as agreeing.
+
+**THE COUNT WENT UP, NOT DOWN, AND THAT IS THE RESULT RATHER THAN A REGRESSION.** Measured over 175
+examined shas at `817db9651`: agreed 69 to 76, undecidable 74 to 62, findings 32 to 37. Three sibling
+false alarms went away, including this row's own control `df8acc95`. Eight arrived, every one a
+subject that was previously UNDECIDABLE and now decides -- and they share a shape: `backlog:` used as
+a conventional-commit TYPE, as in `backlog: close #1091 -- ...`. The token governs the numbers after
+it, so those subjects name items instead of naming nothing, and a banner citing one as its own
+closing evidence reports as the disagreement it is. Triaging them belongs to `#1525`'s fourth arm.
+
+**THE RESIDUAL IS NAMED RATHER THAN QUIETLY ACCEPTED.** In a `backlog:`-typed subject with no
+parenthetical, a trailing pull-request number would now read as an item -- the ambiguity narrowing 3
+exists to avoid, reachable again through the commit type. It is left standing because both existing
+copies of the rule have it and this row's whole finding is that a third, silently different rule is
+the defect. The two copies are membership tests asking about one known number, so the shape rarely
+surfaces there; enumerating is what exposes it. Pinned as a test row so the next reader meets it as a
+decision, not a surprise.
+
+**SHAPE B IS NOT CLOSED AND WAS NOT ATTEMPTED.** Whether a bare-number subject carrying no `BACKLOG`
+token should be REFUSED at commit time is a repository-wide commit-message policy change affecting
+every commit anyone makes. A Builder cannot ask and wait for that ruling, so it is carried to the
+pull request as a question rather than guessed at. `claim_check.py` may want the same widening; it
+was NOT touched here because another lane owns that file this wave.
 
 ## 1348. claim.ps1 reads directory existence as occupancy, so a worktree that outlives its session holds claims no sanctioned verb can move
 
@@ -30322,6 +30366,20 @@ Naming the test module in `ci.yml` is not wiring the tool. `ci.yml` names `tests
 4. Triage the 30 banner-sha findings into genuine mis-citations and heuristic false positives, then either fix each genuine one or record why the citation stands. Tightening narrowing 2 -- so a sha is closing evidence only when the line's closing verb governs THAT sha -- is the alternative, and it is the one that stops the count growing every time a row is correctly closed.
 
 **Do not fix the 204 by hand without step 3.** Re-anchoring them all is a large edit that goes stale again on the next refactor; the gate is what makes the fix hold.
+
+### Arms 1 and 2 are BUILT, on branch `claude/bld-detectors`. Arms 3 and 4 are not, and they are the bulk
+
+**All three detectors now run**, as three jobs in `quality-advisory.yml`, cron and dispatch only, each advisory by the same four properties the `dangling-citations` job lists. `tests/test_ledger_detector_advisory.py` pins the three a repository test can see, per job.
+
+**THE DIFFICULTY OF 2/10 COVERED THE WIRING AND NOTHING ELSE.** Arm 3's separation of about 1,200 absent paths and 30 unresolved symbols from real drift, and arm 4's triage of the banner-sha hits, are a separate scoped pass. The baseline is what buys the time to do it properly: `scripts/docs/citation_line_baseline.txt` records today's population as 187 distinct keys over 204 drifts, so the leg fails on a NEW drift rather than on all of them forever. A key deliberately omits the actual line and the ledger file -- the first moves on every refactor and the second changes when an item is archived, so either would retire entries wholesale and re-report the same drift as new.
+
+**PROVED IT CAN SEE A REAL HIT, rather than assumed.** A synthetic drifted citation against the shipped baseline exits 1; with `--advisory` it exits 0; an unreadable baseline exits 2 with or without the flag, because the flag downgrades a FINDING and never a MALFUNCTION.
+
+**TWO DEAD-GATE TRAPS WERE LIVE AND ARE CLOSED.** `banner_sha_check` resolves each sha with `git log` and `subject_exists_screen` probes `origin/main`; on the default shallow checkout the first reports every sha unresolvable and prints a clean summary, and the second cannot resolve the ref. Both jobs take `fetch-depth: 0`, the banner-sha step warns on an `examined 0` run, and the citation-line job stays shallow because its tool asks git nothing -- which is also the control proving the depth assertion is about the tools rather than about every checkout in the file.
+
+**ONE FINDING THE ROW DID NOT HAVE, AND IT IS THE SHAPE THE ROW IS ABOUT.** `subject_exists_screen`'s two known-true ledger controls, items 1229 and 1040, have BOTH retired -- neither is an open row any more -- so the screen prints "RETIRED as a control, not evidence either way" for each and still exits 0. It is plainly firing (131 candidates over 303 open rows), but no run now PROVES it can still find a known-true row. Choosing replacements is a judgement over the live ledger and belongs with arms 3 and 4; until then the job emits a warning when no control fires, so the gap is visible instead of silent.
+
+**THE SUBJECT-EXISTS SCREEN IS WIRED WITHOUT `--advisory`, DELIBERATELY.** Its candidates already exit 0. Every non-zero exit it can produce is the screen malfunctioning -- a broken extractor or probe control, an unresolvable ref, an unreadable ledger, or a control that did not fire -- which is exactly what item 1426 was. A flag able to downgrade those would reinstate that defect under the word "advisory". Its absence also fails loudly: argparse rejects an unknown option with exit 2, so adding the flag reddens the step rather than quietly gating nothing.
 
 ## 1526. dispatch_gate.py dies with UnicodeEncodeError partway through its own output on a stock Windows console, exiting non-zero in a way that reads as a refusal
 
