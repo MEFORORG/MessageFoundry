@@ -2354,8 +2354,19 @@ class AuthService:
             # belt-and-braces rather than redundancy: either term alone covers it, both together mean
             # a rename of one asyncpg class cannot silently drop the backend.
             #
-            # THIS APPLIES TO THE TWO SIBLING SITES TOO -- they use the same two strings, so anyone
-            # "fixing" the predicate here should not fix it there either.
+            # THIS APPLIES TO THE TWO SIBLING SITES TOO. Censused rather than assumed: `__mro__`
+            # appears exactly three times in the engine, all in this module, all using this substring
+            # form. So anyone "fixing" the predicate here should not fix it there either.
+            #
+            # THE COST OF A NAME TEST, NAMED ONCE: it matches on a string, so an unrelated class whose
+            # name happens to contain "Integrity" would be swallowed here. The engine HAS one --
+            # `messagefoundry.integrity.IntegrityError`, the startup attestation's fail-closed drift
+            # error -- and this predicate does absorb it. It is NOT reachable today: its only raise
+            # site is inside `run_startup_attestation`, which runs before any listener binds, and
+            # neither `store/` nor `auth/` imports the module. Recorded because the day something
+            # raises it from a store or auth path, all three of these handlers would silently report a
+            # username conflict instead of a refused attestation -- a fail-closed control absorbed by
+            # a fail-open one. If that class ever moves, test on identity here, not on a name.
             mro = "".join(t.__name__ for t in type(exc).__mro__)
             if "Integrity" not in mro and "UniqueViolation" not in mro:
                 raise
