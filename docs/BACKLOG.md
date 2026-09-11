@@ -30519,3 +30519,61 @@ The batched set was compared against a per-tree `ls-tree` sweep of all 434 trees
 1. **The backlog branch is now slow too, for the same reason its comment predicted.** A `-Kind backlog` allocation took 1m59s on 2026-09-11. Its ref resolution is already batched, so the cost has moved to reading the distinct `BACKLOG.md` blobs -- a much bigger file, and many more distinct versions at 7,196 refs than at 550. That is a different fix in the same function and is not attempted here.
 2. **The ADR branch has no working-tree term.** The backlog branch reads both of its paths off disk to catch "a number written to a file but committed nowhere"; the ADR branch has never done so, so a hand-created `docs/adr/NNNN-*.md` that no registry claim covers is invisible to the floor. Pre-existing, unchanged by this row, and deliberately left alone rather than widened into a speed fix.
 
+Item 1 above is now filed as **#1535**, on the failure mode rather than on the timing.
+
+## 1535. The backlog floor sweep sits near the 120s default timeout, and its failure is silent
+
+> 🚧 **Filed 2026-09-11.** Value **5/10** · Difficulty **3/10**. A real `alloc.ps1 -Kind backlog` allocation ran into a 120-second foreground ceiling in another worktree, was killed, and left NO claim file -- so it looked like the script had done nothing. Backgrounded, the same command completed and issued its number. The sweep's own cost lands within a few seconds of that ceiling, which is the worst place for it: it passes on a quiet machine and fails on a busy one, so the latency problem presents as flakiness. **The failure is safe, not corrupting** -- see the probe below -- so this row is about a silent coin flip and a wasted number, not about a broken ledger.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger allocator. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is to this repository's own sessions, and it falls on the kind most of them call: backlog numbers run to #1535 where ADR numbers run to #187.
+
+This is the follow-up to [#1534](#1534-batch-the-adr-branch-of-allocps1-so-it-stops-spawning-one-git-ls-tree-per-ref), which fixed the ADR branch only. **It is a different defect needing a different technique.** The backlog branch's ref resolution is already batched; #1534's per-ref process defect is not present here.
+
+### Read the timings as a range, and know why there is no clean number
+
+**Every wall-clock figure below was taken on a machine carrying up to thirteen live sessions, several of them sweeping the same 7,196 refs.** Two sessions measuring this concurrently discovered they had been inflating each other: `Get-Process pwsh,git` showed two heavy sweeps started twelve seconds apart, carrying 122.6 and 109.7 CPU-seconds. One session retracted its figures on that basis; the readings here are recorded with the same caveat rather than presented as constants.
+
+| reading | condition |
+|---|---|
+| 1m37.7s | a real allocation, both known concurrent sweeps stopped -- the quietest reading taken |
+| 1m59s | a real allocation, under load |
+| 150.5s, 283.6s | `-ShowFloor`, back to back, under load |
+| 179.6s | `-ShowFloor`, under load |
+| over 120s, killed | a real allocation against a foreground ceiling |
+| "well inside one call" | a real allocation in a third worktree, no stopwatch |
+
+So: **minutes, varying by at least twofold, with the quietest reading about 98 seconds against a 120-second ceiling.** Anyone re-scoping this should re-measure with the machine to themselves rather than trusting a row of this table.
+
+### The cause is a byte volume, which contention cannot distort
+
+The sweep resolves `<ref>:docs/BACKLOG.md` and the archive path for every ref, then reads each distinct blob. Measured on this clone: 7,206 refs resolve to **1,516 distinct blobs**, averaging about 2.8 MB, so stage 2 streams roughly **4.2 GB** through PowerShell's per-line object pipeline. Of the ~111s that took in one profiled run, only about **13s was git** -- the rest was PowerShell building one pipeline object per line and running a regex on each. The batching comment beside that code records ~190 distinct blobs at ~550 refs when it was written, so the object count has grown about eightfold and each object is far larger.
+
+Deduping harder does not rescue this: the 1,516 blobs are already distinct. **The fix is to stop shipping blob bodies to PowerShell at all** and let git do the filtering -- a batched `git grep -h -E '^#{2,3} [0-9]+\.' <commits> -- docs/BACKLOG.md docs/archive/backlog/BACKLOG-CLOSED.md`, chunked to stay under the 8,191-byte Windows command-line limit. One profiled attempt did the whole sweep in about 21s across 30 processes and returned the same maximum. A `StreamReader`/`ReadToEnd` rewrite does **not** work: it needs a 4.2 GB string and deadlocks against stdin.
+
+### The failure is silent, and it is safe -- both halves were checked
+
+The alarming reading was tested rather than assumed, and it came back benign. A hard kill is not an exception, so it can land in the narrow window after `CreateNew` takes the number and before the JSON is written, leaving a claim file that exists and is **zero bytes**. Probed against a throwaway checkout:
+
+| question | result |
+|---|---|
+| is the number still treated as taken? | **yes** -- floor rose to it; the registry term parses the FILENAME, not the contents |
+| does the next allocation re-issue it? | **no** -- it issued the next number up |
+| does `-List` break on it? | no -- it skips the file silently, so the orphan is invisible rather than fatal |
+
+So neither kill window can re-issue a live number. The cost is a permanently orphaned number, which this script's own doctrine calls the cheap outcome: *"holes are free, collisions are not."* **Do not write this row up as a ledger-corruption risk.** What it actually is: a caller on a default timeout gets a kill with no output and no claim file, concludes nothing happened, and re-runs -- paying a second full sweep and burning a number.
+
+### What a build is
+
+Two independent parts, either useful alone:
+
+1. **Cut the sweep cost** with the git-side filtering above, so the path is not sitting on a timeout boundary at all. This is the part that makes the rest moot.
+2. **Make the failure legible.** The sweep prints nothing while it runs, so a killed caller cannot tell a slow sweep from a hung one. Progress on stderr, or a printed elapsed time, would turn a silent kill into a diagnosable one.
+
+### Not done here
+
+No profiling was run with the machine quiet, and the `git grep` figure comes from one attempt under the same contention as everything else -- it is evidence that a different technique is much cheaper, not a calibrated target. Nobody has checked whether `scripts/coord/alloc_strand_sweep.py`, which carries a second implementation of the same sweep in Python, has the same cost shape.
+
