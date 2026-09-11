@@ -15813,8 +15813,20 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > (`import _totp_clock`, `from adr0075_batch_harness import ...`), which work today only because
 > prepend puts the test root ITSELF on `sys.path`. importlib puts nothing there.
 > **AND THE FAILING SET IS ORDER-DEPENDENT, WHICH IS WHY THE REPORTED NUMBER IS NOT THE REAL ONE.**
-> pytest reported 10 errored files; an AST census finds **38 files across 13 helper modules**. The
-> 28-file gap is not pytest truncating -- `tests/test_ci_tooling_gate.py:36` calls
+> pytest reported 10 errored files; an AST census finds **34 module-level importers across 12
+> helper modules** -- plus 4 files that import a helper only inside a FUNCTION BODY, so they
+> cannot produce a collection error at all and would break later, at test-call time. Those 4 are
+> `tests/test_step_up.py` (`_totp_clock`), `tests/test_audit_offbox_tee.py` (`_cipher_registry`),
+> `tests/test_install_gate_wiring.py` (`test_gate_installed_parity`) and
+> `packaging/messagefoundry-webconsole/tests/test_webui.py` (`_soft_webauthn` -- the 13th helper,
+> which appears in no module-level import anywhere). **An earlier draft of this row said 38 and
+> attributed the whole gap to collection order. That was wrong, and the correction STRENGTHENS
+> the verdict rather than weakening it:** `tests/test_audit_offbox_tee.py` sorts EARLY, ahead of
+> the rescuer named below, and still did not error -- which only the module-level/nested split
+> explains. **34 is also what makes the observed 10 fall out exactly:** of the 34, precisely
+> those sorting before the rescuer are the 10 pytest reported -- set-equal, nothing unexplained
+> on either side. The 24-file gap is not pytest truncating -- `tests/test_ci_tooling_gate.py:36`
+> calls
 > `sys.path.insert(0, <the tests dir>)` at import time, collection is alphabetical, that file sorts
 > immediately after the last failure, and **every consumer collected after it accidentally works off
 > another module's global side effect.** Proven two-armed: `tests/test_mfa.py` alone under importlib
@@ -15822,13 +15834,34 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > prepend it collects 17. Same file, same flag, opposite verdict. **CI runs `-n 4 --dist loadfile`,
 > so per-worker order would decide which files break -- a per-run, per-worker failing set is
 > strictly worse than the latent collision this row was filed for.**
-> **DO NOT RE-RUN THIS. THIS ROW IS THE RECORD** -- every figure above is stated here once, and the
-> guard's module docstring carries only the DECISION and cites this number for the evidence (SDS-3.5;
-> a second copy of a measurement rots silently because nothing points at it). Two tests pin the
+> **WHAT THIS CLOSE RESTS ON, STATED PRECISELY SO THE RESIDUAL IS VISIBLE RATHER THAN RETIRED.**
+> It rests on COMPLETE `--collect-only` runs over BOTH testpaths in one process, in both arms,
+> plus the landed guard. It does NOT rest on an executed full-suite run: that was started and
+> stopped at 23 percent with zero failures, killed because it was serial (no xdist in that venv,
+> roughly three hours projected) and its port-binding tests would have collided with sibling
+> sessions. Collection is the right instrument for THIS question -- import binding happens at
+> collection, which is where the defect lives and reported -- but it is not the same evidence as
+> a green suite, and this row does not claim it is. **If you hold that a close needs the executed
+> run, RE-RUN IT** -- `pytest -q` over both testpaths, ideally with `-n auto --dist loadfile`.
+> That is a cheap confirmation and it is welcome. What should NOT be repeated is the importlib
+> measurement itself, which is recorded here once precisely so nobody re-derives it (SDS-3.5; the
+> guard's module docstring carries only the DECISION and cites this row for the evidence, because
+> a second copy of a measurement rots silently when nothing points at it). Two tests pin the
 > premises instead of prose: `test_every_pytest_ini_key_is_a_registered_option`, which asks the live
 > pytest config about every key in the block and so covers `import_mode` and `import-mode` as well as
 > the one misspelling above; and `test_the_sibling_bare_imports_that_rule_out_importlib_are_still_present`,
-> which reds if that 38-file population ever empties -- the one event that would make importlib
+> which reds if that sibling-import population ever empties -- the one event that would make importlib
+> **A THIRD DEFECT WAS FOUND AND FIXED IN THE GUARD ITSELF, and it is the same shape this module
+> exists to prevent.** The perf pass that folded the two AST walks into one left `_scan` filtering
+> the heads INLINE while the positive controls exercised only the tree-level wrappers, so the
+> production path and its controls had come apart: mistyping the literal (`"confest"`) or dropping
+> the `head in local` filter would have left EVERY control green over a guard that had stopped
+> detecting -- *a dead detector reads exactly like a clean tree*, this module's own rule, turned
+> on the module. Both callers now share `conftest_hits` / `sibling_hits`. **Proven by mutation
+> rather than asserted:** unmutated, 0 controls fail; mistyping the literal reds
+> `test_the_detector_trips_on_a_planted_bare_import`; dropping the filter reds
+> `test_the_sibling_detector_separates_the_two_import_shapes`. The unmutated arm is what makes
+> the other two mean anything.
 > re-priceable. **Emptying it is the RECOMMENDED direction of travel, not a regression:** migrating
 > `import _totp_clock` to `from tests._totp_clock import ...` is the house idiom, and whoever
 > finishes that job should re-price this row rather than read the red as a defect.

@@ -38,9 +38,11 @@ placeholder for one** -- that is what closed BACKLOG #1255 on 2026-09-10:
   across processes.
 
 **The full measurement -- both-testpaths counts, the two-armed control, the ini-key trap, and every
-figure quoted above -- is recorded ONCE, in the closing record of BACKLOG #1255. Read it there.**
-This docstring carries the DECISION and what would re-open it; the row carries the evidence. Do not
-copy the numbers back here, and do not re-run the measurement (the row says so too).
+figure behind the summary above -- is recorded ONCE, in the closing record of BACKLOG #1255. Read it
+there.** This docstring carries the DECISION and what would re-open it; the row carries the evidence,
+and repeating the numbers here would give them a second copy to rot in. **That is not a bar on
+re-measuring:** the row says plainly what its close rests on (complete ``--collect-only`` runs over
+both testpaths, not an executed suite) and invites anyone who wants the executed run to go take it.
 
 So the cheap, correct move is to keep the module name unreachable. That is already the house idiom
 -- shared helpers live in named modules imported package-qualified (``tests/_workflow_contexts.py``,
@@ -145,15 +147,32 @@ def absolute_import_heads(tree: ast.Module) -> list[tuple[int, str, str]]:
     return _heads_of(_import_statements(tree))
 
 
+# THE TWO PREDICATES BELOW TAKE HEADS, NOT A TREE, AND THAT IS WHAT KEEPS THE CONTROLS HONEST.
+# `_scan` cannot afford a per-detector walk, so for one commit it filtered the heads INLINE while
+# the positive controls exercised only the tree-level wrappers. That decoupled them: mistyping the
+# literal (`"confest"`) or dropping the `head in local` filter inside `_scan` left every control
+# GREEN over a guard that had stopped detecting. Both callers now share these, so a broken predicate
+# reds a control -- this module's own rule ("a dead detector reads exactly like a clean tree")
+# applied to itself. Proven by mutation, not asserted: see BACKLOG #1255's closing record.
+
+
+def conftest_hits(heads: list[tuple[int, str, str]]) -> list[tuple[int, str]]:
+    """``(lineno, rendered)`` for the heads that bind the top-level name ``conftest``."""
+    return [(lineno, what) for lineno, head, what in heads if head == "conftest"]
+
+
+def sibling_hits(heads: list[tuple[int, str, str]], local: frozenset[str]) -> list[str]:
+    """The heads naming a module importable only because the test root itself is on ``sys.path``."""
+    return [head for _, head, _ in heads if head in local]
+
+
 def bare_conftest_imports(tree: ast.Module) -> list[tuple[int, str]]:
     """Return ``(lineno, rendered)`` for every import binding the top-level name ``conftest``.
 
     ``from tests.conftest import ...`` binds ``tests``, not ``conftest``, so it is not a finding --
     package-qualified is exactly the shape this guard steers to.
     """
-    return [
-        (lineno, what) for lineno, head, what in absolute_import_heads(tree) if head == "conftest"
-    ]
+    return conftest_hits(absolute_import_heads(tree))
 
 
 def _root_local_module_names(root: Path) -> frozenset[str]:
@@ -173,7 +192,7 @@ def sibling_bare_imports(tree: ast.Module, local: frozenset[str]) -> list[str]:
     ``conftest`` is not special-cased out: a bare ``import conftest`` is genuinely one of the imports
     importlib would break, and the dedicated guard above reds on it separately anyway.
     """
-    return [head for _, head, _ in absolute_import_heads(tree) if head in local]
+    return sibling_hits(absolute_import_heads(tree), local)
 
 
 def _parse(path: Path) -> ast.Module:
@@ -202,10 +221,10 @@ def _scan() -> _Scan:
             nodes = _import_statements(_parse(py))
             import_statements += len(nodes)
             heads = _heads_of(nodes)
-            findings += [
-                f"{rel}:{lineno}: {what}" for lineno, head, what in heads if head == "conftest"
-            ]
-            sibling_imports |= {(rel, head) for _, head, _ in heads if head in local}
+            # Through the SHARED predicates, never an inline copy -- see the comment above
+            # `conftest_hits`. This is what puts the production path under the positive controls.
+            findings += [f"{rel}:{lineno}: {what}" for lineno, what in conftest_hits(heads)]
+            sibling_imports |= {(rel, head) for head in sibling_hits(heads, local)}
         files_by_root.append((root.relative_to(ROOT).as_posix(), count))
     return _Scan(
         tuple(findings), tuple(files_by_root), import_statements, tuple(sorted(sibling_imports))
