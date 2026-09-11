@@ -27089,7 +27089,8 @@ I did not survey how the fence came to be written, or whether any dispatcher has
 
 ## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
 
-> ✅ **CLOSED 2026-09-10 -- built on branch `claude/ad-immutable-id-1471`.** `users.directory_object_id`
+> ✅ **CLOSED 2026-09-10 -- built on branch `claude/ad-immutable-id-1471` (PR 1045), open until that
+> merges.** `users.directory_object_id`
 > ships on all three backends, in-place-upgraded the way the neighbouring `oidc_*` columns are;
 > `AdPrincipal` carries the normalised `objectGUID`; and `_upsert_ad_user` resolves an AD login by that
 > id through the new `get_user_by_directory_object_id`. **The row's own acceptance test is the closing
