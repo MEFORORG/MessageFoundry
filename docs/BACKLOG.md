@@ -28846,6 +28846,23 @@ unfiled. Named here so it is not lost; it is not this row's scope.
 **Cluster:** repository gates / suppression hygiene. **Priority:** P3. **Verdict:** build the guard.
 **Severity:** no deployment axis (sec. 0). A CI configuration anchor. No engine behaviour, no shipped artifact, no PHI.
 
+**AMENDMENT 2026-09-11 -- IT HAS NOW FIRED TWICE, which is the evidence the "guard not built"
+decision was taken without.** BACKLOG #1533 added 28 comment lines to `.github/workflows/cla.yml`,
+moving the same `uses:` line from 122 to 150 and staling the same anchor -- the entry had already been
+re-anchored once from `102` to `122` by this item. Same file, same anchor, same shape, three months of
+line numbers. Recorded here rather than only on #1533 because a reader deciding whether to build the
+guard needs the recurrence count, and a citation that points only one way does not carry it.
+
+Two details from that occurrence bear on the guard's design. First, the re-anchor is not reliably a
+one-line edit: #1533's own fix moved the line a second time in the same branch, so the number has to be
+derived from the workflow file at fix time rather than copied from the zizmor report. Second, the
+mis-reasoning is as reusable as the defect -- #1533 first reported the red as PRE-EXISTING on the
+grounds that the flagged line's content was byte-identical on `main` and the diff did not touch it.
+Both were true and neither was the question, because the anchor keys on the line NUMBER. **Inserting
+lines ABOVE a line is how a line-anchored control breaks without the line being touched**, so "my diff
+does not touch it" is the specific sentence that conceals this class, and a guard that only compares
+line content would reproduce the same blind spot.
+
 ### The measured instance
 
 `.github/zizmor.yml` suppresses the `self-repository` finding on `cla.yml` by LINE NUMBER:
