@@ -493,6 +493,11 @@ async def test_a_stepdown_through_the_console_reaches_the_engine_and_redirects(
         assert cross.status_code == 403
         assert coord.step_down_calls == 0
 
+        # The other half of the operator test: each route offers the control when the caller holds
+        # cluster:control, or the fragment would take it away on the page's first 5-second refresh.
+        for path in ("/ui/cluster", "/ui/cluster/live"):
+            assert _offers((await c.get(path)).text, CONFIRM), path
+
         confirm = await c.get(CONFIRM)
         assert confirm.status_code == 200
         assert _offers(confirm.text, "/ui/cluster/stepdown")
