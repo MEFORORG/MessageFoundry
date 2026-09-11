@@ -68,11 +68,15 @@ _NEEDS_FULL_HISTORY = ("banner-sha-agreement", "subject-exists")
 #: The four measurement jobs the liveness meta-gate rules on. None of these three may join them.
 _LIVENESS_MEASUREMENT_JOBS = {"complexity", "clone", "coverage", "mutation"}
 
+#: Parsed ONCE. `jobs_of` re-parses an 83 KB workflow on every call and this module asks five
+#: questions of it, several under a parametrize; nothing here mutates the result.
+_JOBS = jobs_of(_WORKFLOW_NAME)
+
 
 def _analysis_step(job_key: str) -> dict:
     """The one step in ``job_key`` that invokes its checker."""
     script = _DETECTORS[job_key]
-    jobs = jobs_of(_WORKFLOW_NAME)
+    jobs = _JOBS
     assert job_key in jobs, (
         f"{_WORKFLOW_NAME} has no {job_key!r} job -- re-point this guard rather than letting it pass"
     )
@@ -190,19 +194,20 @@ def test_the_subject_exists_screen_is_not_given_an_advisory_flag() -> None:
     )
 
 
-@pytest.mark.parametrize("job_key", sorted(_DETECTORS))
-def test_the_job_cannot_redden_the_liveness_meta_gate(job_key: str) -> None:
+def test_no_detector_job_can_redden_the_liveness_meta_gate() -> None:
     """`liveness` is the one job in this workflow built to go red. Adding one of these to its
-    `needs` would route a ledger finding into the only failing surface the file has."""
-    needs = set(jobs_of(_WORKFLOW_NAME)["liveness"]["needs"])
+    `needs` would route a ledger finding into the only failing surface the file has.
+
+    NOT PARAMETRIZED: the assertion is over the whole `needs` list, so per-job arms would re-run one
+    identical check three times and read as three guarantees where there is one."""
+    needs = set(_JOBS["liveness"]["needs"])
     assert needs == _LIVENESS_MEASUREMENT_JOBS, (
         f"liveness needs {sorted(needs)}; expected {sorted(_LIVENESS_MEASUREMENT_JOBS)}"
     )
-    assert job_key not in needs
+    assert needs.isdisjoint(_DETECTORS)
 
 
-@pytest.mark.parametrize("job_key", sorted(_DETECTORS))
-def test_no_job_in_this_workflow_is_a_claimed_required_context(job_key: str) -> None:
+def test_no_job_in_this_workflow_is_a_claimed_required_context() -> None:
     """The repository's checked-in claim about what gates a merge must not name this workflow.
 
     HONEST LIMIT: branch protection lives on the server and this asserts the CLAIM, not the server.
@@ -214,9 +219,10 @@ def test_no_job_in_this_workflow_is_a_claimed_required_context(job_key: str) -> 
         f"positive control failed: required_contexts() returned {len(required)} entries and did not "
         "include the known-required 'cla', so its absence findings prove nothing"
     )
-    jobs = jobs_of(_WORKFLOW_NAME)
-    assert job_key in jobs, f"{_WORKFLOW_NAME} no longer declares {job_key!r}"
-    declared = {context_of(key, job) for key, job in jobs.items()}
+    assert set(_DETECTORS) <= _JOBS.keys(), (
+        f"{_WORKFLOW_NAME} no longer declares {sorted(set(_DETECTORS) - _JOBS.keys())}"
+    )
+    declared = {context_of(key, job) for key, job in _JOBS.items()}
     assert not (declared & set(required)), (
         f"{_WORKFLOW_NAME} is advisory by design and must never be promoted, but "
         f"{sorted(declared & set(required))} appears in .github/required-contexts.txt"
@@ -237,7 +243,7 @@ def test_the_git_reading_jobs_check_out_full_history(job_key: str) -> None:
     is the third job: citation-line-drift asks git nothing and legitimately runs shallow, so a
     blanket "every checkout is deep" rule would be satisfied by a file where depth means nothing.
     """
-    steps = jobs_of(_WORKFLOW_NAME)[job_key]["steps"]
+    steps = _JOBS[job_key]["steps"]
     checkout = next(step for step in steps if "checkout" in (step.get("uses") or ""))
     assert checkout.get("with", {}).get("fetch-depth") == 0, (
         f"{job_key} reads git history and must check out with fetch-depth: 0; on a shallow clone it "
@@ -249,7 +255,7 @@ def test_the_file_reading_job_is_not_forced_deep_by_a_blanket_rule() -> None:
     """The control for the arm above. `citation_line_check.py` reads files and asks git nothing, so
     its job is the one place a depth assertion must NOT hold -- which is what proves the assertion
     above is about the tools' needs rather than about every checkout in the file."""
-    steps = jobs_of(_WORKFLOW_NAME)["citation-line-drift"]["steps"]
+    steps = _JOBS["citation-line-drift"]["steps"]
     checkout = next(step for step in steps if "checkout" in (step.get("uses") or ""))
     assert checkout.get("with", {}).get("fetch-depth") is None
 
@@ -269,4 +275,82 @@ def test_the_citation_baseline_the_workflow_relies_on_is_in_the_tree() -> None:
     spec.loader.exec_module(module)
     assert module.DEFAULT_BASELINE.is_file(), (
         f"{module.DEFAULT_BASELINE} is missing; the citation-line job invokes --baseline bare"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# The two dead-gate warnings are coupled to prose the TOOLS own, and nothing pinned that.
+# --------------------------------------------------------------------------------------------
+
+#: job key -> (the needle its step greps for, the tool source that must still produce it).
+#: Both needles are ENGLISH SUMMARY PROSE. Reword either line in its tool and the warning stops
+#: firing while the job stays green -- a silent loss of exactly the dead-gate control these two
+#: jobs were given. The two are pinned DIFFERENTLY because only one is a literal in its source; see
+#: the arms below, and do not merge them back into one parametrized check.
+_CONTROL_NEEDLES = {
+    "banner-sha-agreement": ("examined 0 closing-claim sha", "scripts/docs/banner_sha_check.py"),
+    "subject-exists": ("FIRED as expected", "scripts/docs/subject_exists_screen.py"),
+}
+
+
+@pytest.mark.parametrize("job_key", sorted(_CONTROL_NEEDLES))
+def test_the_dead_gate_warning_still_greps_for_the_needle_this_suite_tracks(job_key: str) -> None:
+    """Reads the needle out of the WORKFLOW, so the arms below cannot pass by agreeing with a copy."""
+    needle = _CONTROL_NEEDLES[job_key][0]
+    body = _analysis_step(job_key)["run"]
+    assert f'grep -q "{needle}"' in body, (
+        f"{job_key} no longer greps for {needle!r}. Update _CONTROL_NEEDLES and this suite together, "
+        "or the dead-gate warning is guarding a string nobody emits."
+    )
+
+
+def test_the_subject_exists_dead_gate_needle_is_a_literal_its_tool_still_holds() -> None:
+    """A SOURCE-SUBSTRING CHECK, AND ONLY BECAUSE THIS NEEDLE IS A LITERAL (SDS-3.8).
+
+    `FIRED as expected` is written verbatim in the screen, so its presence there answers the question
+    being asked. Its sibling needle is NOT, and applying the same check to it would be an instrument
+    answering an adjacent question: `examined 0 closing-claim sha` is assembled by an f-string and
+    appears nowhere in that file, which is exactly how this arm first failed. That one is pinned by
+    driving real stdout instead, below.
+
+    Only the ledger-control path can produce this line, and BOTH of its controls have retired today
+    (BACKLOG #1525), so a real run cannot currently print it -- which is why this is the literal
+    check and not a stdout one.
+    """
+    needle, source = _CONTROL_NEEDLES["subject-exists"]
+    assert needle in (_ROOT / source).read_text(encoding="utf-8"), (
+        f"{source} no longer contains the literal {needle!r}, so the subject-exists dead-gate "
+        "warning can never fire and a screen with no live control would render as a clean run."
+    )
+
+
+def test_the_banner_sha_dead_gate_needle_matches_REAL_STDOUT(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """THE STRONGER HALF, because a needle present in the SOURCE can still never reach STDOUT.
+
+    Drives the tool's `main` over a ledger whose only cited sha is unresolvable -- which is what a
+    shallow checkout produces for EVERY sha -- and greps the captured output the way the workflow
+    greps the file it redirected. Nothing here restates the tool's format string: a test that
+    rebuilt the summary line itself would agree with a copy rather than with the tool.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_banner_sha_for_needle", _ROOT / _DETECTORS["banner-sha-agreement"]
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ledger = tmp_path / "LEDGER.md"
+    ledger.write_text(
+        # The closed-status banner glyph, quoted as a token per CLAUDE.md section 11.
+        "## 1. a row\n\n> \u2705 **SHIPPED in `deadbeef1234`.**\n\nprose\n",
+        encoding="utf-8",
+    )
+    rc = module.main([str(ledger), "--repo", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0, "an unresolvable sha is not a finding; only the coverage line reports it"
+    needle = _CONTROL_NEEDLES["banner-sha-agreement"][0]
+    assert needle in out, (
+        f"the shallow-checkout case no longer prints {needle!r}, so the workflow's grep is dead and "
+        f"a run that examined nothing would render as a clean one. Got: {out!r}"
     )

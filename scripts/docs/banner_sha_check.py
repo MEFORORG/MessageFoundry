@@ -145,13 +145,31 @@ def cited_items(subject: str) -> list[str]:
     after the token returned 1319 alone, so a sibling's correct closing banner read as citing a
     different item -- a visible false alarm on work that landed months ago.
 
-    THE RULE IS REUSED, NOT INVENTED. It already exists twice in this repository and both copies
-    carry the measurement: scripts/coord/claim-adjudicate.ps1 (``Get-Citations``) and
-    .github/workflows/backlog-hygiene.yml (the ``items=`` pipeline, which splits on ``)`` to get the
-    same scope without a regex). An unscoped "every ``#N`` after the token" rule inflates by about
-    17x -- 641 subjects called multi-item against 38 of 1070 -- because a squash-merge APPENDS the
-    pull-request number as a trailing group, and ``(BACKLOG #1040) (#547)`` is one item and one pull
-    request. A third, silently different rule is what this item exists to stop.
+    THE SCOPING IDEA IS TAKEN FROM THE TWO COPIES ALREADY HERE; THE BOUNDARY IS TIGHTER THAN EITHER,
+    AND SAYING SO IS THE POINT. Both carry the measurement and the reasoning:
+    scripts/coord/claim-adjudicate.ps1 (``Get-Citations``) and .github/workflows/backlog-hygiene.yml
+    (the ``items=`` pipeline, which splits on ``)`` to get its scope without a regex). An unscoped
+    "every ``#N`` after the token" rule inflates by about 17x -- 641 subjects called multi-item
+    against 38 of 1070 -- because a squash-merge APPENDS the pull-request number as a trailing group,
+    and ``(BACKLOG #1040) (#547)`` is one item and one pull request.
+
+    **THE THREE DO NOT AGREE EVERYWHERE, AND CLAIMING THEY DID WOULD BE THE DEFECT #1347 IS ABOUT.**
+    Each draws the boundary differently, and both existing copies over-reach where this one does not.
+    Executed, not reasoned about::
+
+        "fix: see #547 and (BACKLOG #1040)"
+            the YAML pipeline  -> ['547', '1040']   its chunk runs from the line START to the ')'
+            this function      -> ['1040']
+
+        "(BACKLOG #1040) #547"
+            the PowerShell     -> TRUE for 547      its `[^(]*?` crosses the ')'
+            this function      -> ['1040']
+
+    Stopping at the nearest parenthesis on EITHER side is the tightest of the three and is the one
+    that holds narrowing 3's promise, so it is what this uses. Making all four implementations
+    (``scripts/hooks/claim_check.py`` is a fourth) agree is real work in three languages and is not
+    this item: the affordable shape is a shared conformance corpus of subjects plus one test per
+    language, which would have caught both rows above. Filed as a subject, not a number.
 
     THE SCOPE IS EXPRESSED AS "UP TO THE NEAREST PARENTHESIS", which covers both shapes in one pass:
 
@@ -186,10 +204,9 @@ def cited_items(subject: str) -> list[str]:
     different rule is the defect. The two copies are membership tests asking about one known number,
     so the shape rarely surfaces there; enumerating is what exposes it.
     """
-    found: list[str] = []
-    for run in _BACKLOG_RUN.finditer(subject):
-        found.extend(_HASH_N.findall(run.group(0)))
-    return list(dict.fromkeys(found))
+    return list(
+        dict.fromkeys(n for run in _BACKLOG_RUN.findall(subject) for n in _HASH_N.findall(run))
+    )
 
 
 def _load_parser():  # type: ignore[no-untyped-def]

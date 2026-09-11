@@ -229,6 +229,9 @@ def test_the_squash_suffix_of_a_multi_item_commit_is_not_read_as_an_item(
         ("feat(console): step-up UX (WP-L3-16, ASVS 7.5.3) (#319)", []),
         ("chore: bare token BACKLOG #71, #72 with no parenthetical", ["71", "72"]),
         ("backlog: close #1307 and #1320 -- both writers landed (#581)", ["1307", "1320"]),
+        # The two subjects where the existing copies of this rule OVER-REACH and this one does not.
+        ("fix: see #547 and (BACKLOG #1040)", ["1040"]),
+        ("(BACKLOG #1040) #547", ["1040"]),
     ],
 )
 def test_the_citation_extractor_matches_the_two_rules_already_in_the_repo(
@@ -241,9 +244,16 @@ def test_the_citation_extractor_matches_the_two_rules_already_in_the_repo(
     with `re.I` in play, so a rule that did not stop at the parenthesis would start its run on the
     wrong token.
 
-    THE LAST ROW PINS A DECISION RATHER THAN AN ACCIDENT. `backlog:` as a conventional-commit TYPE
-    opens a governing run, so those numbers are read as items -- which is why the real-ledger finding
-    count moved 32 to 37 rather than down. Both existing copies of this rule behave the same way, and
-    #1347's finding is that a third, silently different rule is the defect. Recorded here so that a
-    later reader meets it as a pinned property instead of rediscovering it as a surprise."""
+    THE `backlog:` ROW PINS A DECISION RATHER THAN AN ACCIDENT. That conventional-commit TYPE opens a
+    governing run, so those numbers are read as items -- which is why the real-ledger finding count
+    moved 32 to 37 rather than down. Both existing copies of this rule behave the same way. Recorded
+    here so a later reader meets it as a pinned property instead of rediscovering it as a surprise.
+
+    THE LAST TWO ROWS ARE WHERE THE THREE IMPLEMENTATIONS DISAGREE, executed rather than assumed.
+    `fix: see #547 and (BACKLOG #1040)` returns both numbers under backlog-hygiene.yml's pipeline,
+    whose chunk runs from the line start to the `)`; and `(BACKLOG #1040) #547` answers TRUE for 547
+    under claim-adjudicate.ps1, whose `[^(]*?` crosses the `)`. This function refuses both, because
+    stopping at the nearest parenthesis on EITHER side is the only one of the three boundaries that
+    keeps narrowing 3's promise. Pinning them here is what stops a later "harmonisation" quietly
+    adopting one of the looser forms."""
     assert _load().cited_items(subject) == expected

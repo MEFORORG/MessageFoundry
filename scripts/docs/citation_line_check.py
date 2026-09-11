@@ -156,7 +156,13 @@ class Drift(NamedTuple):
 
 def load_baseline(path: Path) -> set[str]:
     """Read judged keys. Raises rather than defaulting to empty: a baseline that cannot be read and
-    one that is genuinely empty have opposite meanings, and the caller turns the first into exit 2."""
+    one that is genuinely empty have opposite meanings, and the caller turns the first into exit 2.
+
+    The same six lines exist in ``scripts/quality/username_access_key_screen.py``, whose baseline
+    this one is modelled on, and the duplication is deliberate: ``scripts/`` is not a package, so
+    there is no import path between them and a shared helper would mean a seventh bespoke module
+    loader. Named here rather than left to be rediscovered.
+    """
     keys: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -178,6 +184,10 @@ class Report(NamedTuple):
 def scan(ledgers: list[Path], root: Path) -> Report:
     total = refused = unreadable = checkable = agreed = unresolved = 0
     drifted: list[Drift] = []
+    # One read per cited FILE, not per citation. Measured on the real ledgers: 311 checkable
+    # citations resolve to 127 distinct files, `settings.py` alone 25 times. It was never the
+    # bottleneck at hand-run scale; it becomes repeated work now that a nightly job runs this.
+    source: dict[Path, list[str]] = {}
 
     for ledger in ledgers:
         text = ledger.read_text(encoding="utf-8", errors="replace")
@@ -202,7 +212,10 @@ def scan(ledgers: list[Path], root: Path) -> Report:
                 continue  # no symbol named: nothing to check against, and that is most citations
 
             checkable += 1
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            if (lines := source.get(target)) is None:
+                lines = source[target] = target.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
             span_lo = max(1, start - _SPAN_SLACK)
             span_hi = min(len(lines), (int(end) if end else start) + _SPAN_SLACK)
             span = "\n".join(lines[span_lo - 1 : span_hi])
@@ -278,11 +291,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {d.path}:{d.cited} names `{d.symbol}` -- which is at :{d.actual_line}")
         if len(shown) < len(r.drifted):
             print(f"  ... and {len(r.drifted) - len(shown)} more (--max-report 0 for all)")
-    elif args.baseline is None:
-        print("citation-line: OK -- every checkable citation points at the symbol its prose names")
 
     if args.baseline is None:
-        return 0 if (args.advisory or not r.drifted) else 1
+        if not r.drifted:
+            print(
+                "citation-line: OK -- every checkable citation points at the symbol its prose names"
+            )
+            return 0
+        return 0 if args.advisory else 1
 
     try:
         judged = load_baseline(args.baseline)
@@ -296,9 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     new = sorted(seen - judged)
     retired = sorted(judged - seen)
 
-    # STATED EVEN WHEN EMPTY, for the reason username_access_key_screen.py gives: a retired key is
-    # either a fixed citation or a screen that stopped seeing it, and printing the count is what lets
-    # a reader notice the second one.
+    # STATED EVEN WHEN EMPTY: a retired key is either a fixed citation or a screen that stopped
+    # seeing it, and printing the count is what lets a reader notice the second one.
     print("")
     print(
         f"citation-line: baseline {args.baseline.name} -- {len(judged)} judged, {len(seen)} seen, "

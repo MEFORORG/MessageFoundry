@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._workflow_contexts import context_of, jobs_of, required_contexts
+
 _ROOT = Path(__file__).resolve().parents[1]
 _CHECK = _ROOT / "scripts" / "docs" / "prose_anchor_check.py"
 
@@ -103,9 +105,19 @@ def test_the_scope_limits_findings_to_the_lines_a_change_added() -> None:
 # ------------------------------------------------------------------------------------------------
 
 
+#: Identity supplied per invocation rather than by two `git config` subprocesses per fixture. It is
+#: inert for every command that is not a commit, and it removes two of the five spawns each of these
+#: throwaway repositories costs.
+_IDENTITY = ("-c", "user.email=t@example.invalid", "-c", "user.name=t")
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, timeout=60
+        ["git", "-C", str(repo), *_IDENTITY, *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
     ).stdout
 
 
@@ -119,8 +131,6 @@ def repo(tmp_path: Path) -> Path:
     r = tmp_path / "r"
     (r / "docs").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
-    _git(r, "config", "user.email", "t@example.invalid")
-    _git(r, "config", "user.name", "t")
     (r / "docs" / "BACKLOG.md").write_text(
         "## 1. a row\n\nInherited `pkg/old.py:11` with nothing to find it by.\n", encoding="utf-8"
     )
@@ -224,8 +234,6 @@ _SCRIPT = "scripts/docs/prose_anchor_check.py"
 def test_the_checker_is_actually_invoked_by_a_workflow() -> None:
     """Naming a tool's TEST in ci.yml is not wiring the TOOL -- the distinction BACKLOG #1525 is
     about. Assert the `run:` line, in the job, not the string anywhere in the file."""
-    from tests._workflow_contexts import jobs_of  # noqa: PLC0415
-
     jobs = jobs_of(_WORKFLOW)
     assert _JOB in jobs, f"{_WORKFLOW} has no {_JOB!r} job"
     invocations = [
@@ -246,8 +254,6 @@ def test_the_job_reports_its_own_context_and_does_not_ride_the_required_one() ->
     context, so a step added there blocks a merge the moment it lands -- and making a check BLOCK is
     the owner's call, not a Builder's. Keep this in its own job with its own context.
     """
-    from tests._workflow_contexts import context_of, jobs_of, required_contexts  # noqa: PLC0415
-
     jobs = jobs_of(_WORKFLOW)
     required = set(required_contexts())
     assert "a PR that implements BACKLOG #N must update BACKLOG.md" in required, (
@@ -272,8 +278,6 @@ def test_the_job_can_actually_go_red() -> None:
     """A finding here is actionable by the author in the diff under review -- name a symbol or pin a
     commit -- which is what separates a check worth reddening from one that must be advisory. A
     `continue-on-error` or a `|| true` would leave a job that reports success whatever it finds."""
-    from tests._workflow_contexts import jobs_of  # noqa: PLC0415
-
     for step in jobs_of(_WORKFLOW)[_JOB]["steps"]:
         assert step.get("continue-on-error") is not True, f"{step.get('name')!r} cannot fail"
         assert "|| true" not in (step.get("run") or ""), f"{step.get('name')!r} swallows its status"

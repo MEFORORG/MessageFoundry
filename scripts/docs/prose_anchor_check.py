@@ -64,6 +64,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from bisect import bisect_right
+from itertools import accumulate
 from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple
@@ -116,40 +118,23 @@ def scan_text(text: str, scope: set[int] | None = None) -> tuple[int, list[Naked
     examined = 0
     naked: list[Naked] = []
 
-    # Line offsets, so a match position becomes a line number without splitting the text twice. The
-    # ledger's rows are single lines of tens of kilobytes, so this stays the cheap way round.
-    starts = [0]
-    for raw in text.splitlines(keepends=True):
-        starts.append(starts[-1] + len(raw))
+    # Offset of each line's start, so a match position becomes a line number by bisection rather
+    # than by counting newlines per citation. The ledger's rows are single lines of tens of
+    # kilobytes and there are thousands of citations, so the table is built once and read many times.
+    starts = list(accumulate(map(len, text.splitlines(keepends=True)), initial=0))
 
     for match in citation_check._CITE.finditer(text):
-        lineno = _line_of(match.start(), starts)
+        lineno = bisect_right(starts, match.start())
         if scope is not None and lineno not in scope:
             continue
         examined += 1
         window = _window(text, match, citation_check._PROSE_WINDOW)
         if banner_check._SHA.search(window):
             continue  # a pinned base commit: the WHEN half
-        symbols = [
-            token
-            for token in citation_check._SYM.findall(window)
-            if citation_check._is_symbol(token)
-        ]
-        if symbols:
+        if any(citation_check._is_symbol(t) for t in citation_check._SYM.findall(window)):
             continue  # a named symbol: the WHERE half
         naked.append(Naked(lineno, match.group(0), window.strip()))
     return examined, naked
-
-
-def _line_of(offset: int, starts: list[int]) -> int:
-    lo, hi = 0, len(starts) - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if starts[mid] <= offset:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo + 1
 
 
 def _window(text: str, match, width: int) -> str:  # type: ignore[no-untyped-def]
@@ -158,7 +143,7 @@ def _window(text: str, match, width: int) -> str:  # type: ignore[no-untyped-def
     A wider window here than there would let a citation satisfy this gate with a symbol the drift
     detector will not associate with it, which is two tools disagreeing about one sentence.
     """
-    return text[max(0, match.start() - width) : min(len(text), match.end() + width)]
+    return text[max(0, match.start() - width) : match.end() + width]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,7 +159,6 @@ def main(argv: list[str] | None = None) -> int:
         print("prose-anchor: --base and --head must be given together", file=sys.stderr)
         return 2
 
-    citation_module = _sibling("backlog_citation_check")
     root: Path = args.root.resolve()
     ledger = root / LEDGER
 
@@ -199,6 +183,10 @@ def main(argv: list[str] | None = None) -> int:
     # backlog_citation_check._read_at states: on a pull_request event the checkout is the MERGE ref
     # while the line numbers are computed against HEAD, so content and line numbers must come from
     # the same revision or the instrument answers an adjacent question.
+    #
+    # Loaded HERE rather than beside the other siblings: the census branch above never calls it, and
+    # executing a whole module to reach a branch that does not use it is work nobody asked for.
+    citation_module = _sibling("backlog_citation_check")
     added = citation_module.added_lines(root, args.base, args.head).get(LEDGER, set())
     if not added:
         print(f"prose-anchor: this change added no line to {LEDGER} -- nothing in scope.")
