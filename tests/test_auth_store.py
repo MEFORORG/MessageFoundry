@@ -10,6 +10,14 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.store.store import MessageStore
+from tests._directory_identity_store_contract import (
+    BOUND_GUID,
+    CASE_GUID,
+    OTHER_GUID,
+    _assert_directory_id_compare_is_byte_exact,
+    _assert_directory_identity_contract,
+    _assert_the_binding_column_is_unconstrained_and_username_is_not,
+)
 
 
 async def _store() -> MessageStore:
@@ -257,3 +265,105 @@ async def test_the_schema_upgrade_seeds_the_new_column_on_a_pre_split_database(
         assert bob is not None and bob.notify_email is None  # nothing to seed from
     finally:
         await store.close()
+
+
+# --- directory-immutable identity binding (BACKLOG #1471) ---------------------
+
+
+async def test_the_directory_id_lookup_finds_a_bound_row_and_never_an_unbound_one() -> None:
+    """``get_user_by_directory_object_id`` on the SQLite backend.
+
+    The shared body is what the PostgreSQL and SQL Server suites also run, so a backend that drifts
+    from the other two fails against the same assertions rather than against its own wording.
+    """
+    store = await _store()
+    try:
+        await _assert_directory_identity_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_the_directory_id_comparison_is_byte_exact_on_sqlite() -> None:
+    """SQLite compares the column under its default BINARY collation, so case is significant.
+
+    PostgreSQL agrees. SQL Server takes the database's collation instead and pins its own behaviour
+    in its own suite -- a real cross-backend divergence, recorded at ``store/sqlserver.py``.
+    """
+    store = await _store()
+    try:
+        await _assert_directory_id_compare_is_byte_exact(store)
+    finally:
+        await store.close()
+
+
+async def test_the_binding_column_is_unconstrained_and_username_is_not_on_sqlite() -> None:
+    """The layer under the lookup: ``directory_object_id`` has no uniqueness constraint, and
+    ``UNIQUE(username)`` is the control the schema comments name as the reason it needs none."""
+    store = await _store()
+    try:
+        await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
+    finally:
+        await store.close()
+
+
+async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_clean(
+    tmp_path: Path,
+) -> None:
+    """A database opened before BACKLOG #1471 has no ``directory_object_id``, and the ALTER that
+    adds it deliberately seeds NOTHING: nothing in the store has ever held the directory's
+    identifier, so the only value on that schema to backfill from is the recyclable username --
+    which is the adoption the item exists to refuse.
+
+    Driven against a REAL pre-binding table rather than a fresh open, which runs the CREATE TABLE
+    that already carries the column and would exercise the guarded ALTER not at all. The later
+    opens are the idempotence arm: ``_migrate`` runs on EVERY open, so a guard that stopped
+    skipping a present column would raise ``duplicate column name`` on the next start of every
+    upgraded engine.
+    """
+    db = tmp_path / "pre-binding.db"
+    store = await MessageStore.open(str(db))
+    try:
+        await store.create_user(
+            user_id="u1",
+            username="jsmith",
+            auth_provider="ad",
+            directory_object_id=BOUND_GUID,
+        )
+    finally:
+        await store.close()
+    # Drop the column to reproduce the pre-#1471 shape (SQLite supports DROP COLUMN since 3.35).
+    with sqlite3.connect(db) as raw:
+        raw.execute("ALTER TABLE users DROP COLUMN directory_object_id")
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(users)")}
+        assert "directory_object_id" not in cols  # positive control: the column really is gone
+
+    store = await MessageStore.open(str(db))
+    try:
+        # The ALTER ran: the row survives and the column is back, holding NULL.
+        row = await store.get_user("u1")
+        assert row is not None and row.username == "jsmith"
+        assert row.directory_object_id is None
+        # An upgraded-but-unbound row is not adopted by the id it used to carry.
+        assert await store.get_user_by_directory_object_id(BOUND_GUID) is None
+    finally:
+        await store.close()
+
+    # Re-opening twice more must neither error nor undo the column, and a freshly-bound account has
+    # to resolve through the ALTER-ed column afterwards -- otherwise "idempotent" would be
+    # satisfied by a migration that quietly stopped working.
+    for pass_no, guid in enumerate((OTHER_GUID, CASE_GUID)):
+        store = await MessageStore.open(str(db))
+        try:
+            await store.create_user(
+                user_id=f"u-rebind-{pass_no}",
+                username=f"rebound{pass_no}",
+                auth_provider="ad",
+                directory_object_id=guid,
+            )
+            found = await store.get_user_by_directory_object_id(guid)
+            assert found is not None and found.id == f"u-rebind-{pass_no}"
+            # The earlier pass's binding is still readable, so each open preserved the column
+            # rather than re-adding an empty one.
+            assert (await store.get_user("u1")).directory_object_id is None
+        finally:
+            await store.close()
