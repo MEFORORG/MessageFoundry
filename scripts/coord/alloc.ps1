@@ -21,15 +21,19 @@
 
     The floor is the max over: the numbers on origin/main, the numbers on EVERY local and remote ref, and
     every existing allocation. The all-refs term closes the "registry wiped -> re-issue a number that only
-    exists on an unpushed branch" hole. NEITHER KIND SPAWNS A PROCESS PER REF -- a per-ref sweep is
-    fine at a few hundred refs and unusable at several thousand, and it does not announce the crossing
-    (BACKLOG #1534, measured in Get-Floor's adr branch). What each costs now, stated exactly rather
-    than as "a fixed handful", because the two are no longer the same shape:
-      adr      TWO `git` processes, whatever the ref count.
-      backlog  TWO, plus one `git grep` per 128 DISTINCT ledger blobs -- 12 more on this clone
-               (BACKLOG #1535). It scales with distinct blobs, not with refs, and a clone would need
-               about 6,000 of them before that mattered.
-    The cost is per allocation, not per edit.
+    exists on an unpushed branch" hole. NEITHER KIND SPAWNS A PROCESS PER REF, which is the property
+    that matters: a per-ref sweep is fine at a few hundred refs and unusable at several thousand, and
+    it does not announce the crossing (BACKLOG #1534). What each costs instead, COUNTED with GIT_TRACE
+    on this clone on 2026-09-11 rather than reasoned about, and dated because both are live properties
+    that drift:
+      adr      440 git processes for the whole -ShowFloor run -- ref enumeration, one
+               `cat-file --batch-check`, then one `ls-tree` per DISTINCT docs/adr tree, 434 here.
+               It scales with distinct TREES, not with refs.
+      backlog  18 -- ref enumeration, one `cat-file --batch-check`, then one `git grep` per 128
+               DISTINCT ledger blobs, 13 here at 1,538 blobs (BACKLOG #1535). Scales with blobs.
+    An earlier version of these lines said "TWO git processes" for each and was wrong twice over: it
+    omitted the ref enumeration both branches run, and it described an adr stage 2 that has since been
+    reverted. The cost is per allocation, not per edit.
 
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
@@ -177,32 +181,41 @@ function Get-Floor {
         # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
         # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
         #
-        # A TREE, NOT A BLOB, is the only difference from the backlog branch. A directory has no fixed
-        # path to hand `--batch-check`, so stage 2 reads the raw tree OBJECTS and scans their entry
-        # headers instead of file contents.
+        # A TREE, NOT A BLOB, is the difference from the backlog branch. A directory has no fixed path
+        # to hand `--batch-check`, so the dedupe collapses to distinct TREE ids and each distinct tree
+        # is listed once. The refs are what exploded; the trees never were.
         #
-        # `git rev-list --objects` prints the same listing as text and was REJECTED. It dedupes by
-        # OBJECT, so two ADR files with byte-identical content lose one of their two names -- and a
-        # name that never prints is a number that reads as FREE. Measured directly, not inferred:
-        # `0150-alpha.md` and `0151-beta.md` sharing one blob printed ONE name, which would re-issue
-        # 0151 over a live ADR. That is the exact collision this script exists to prevent, so a faster
-        # stage 2 does not buy it. tests/test_coord_alloc_floor.py holds that case.
+        # THE SAVING IS THE DEDUPE, NOT A CLEVERER READER. 7,199 specs collapse to 434 trees, which is
+        # a 16x cut in processes and the whole of the fix. Two spellings of stage 2 that tried to go
+        # further were BUILT, MEASURED AND REVERTED, and both failed the same way -- silently, by
+        # losing a name, which is a number that then reads as FREE:
         #
-        # ANCHORING ON THE MODE IS WHAT MAKES A TEXT SCAN SAFE OVER BINARY. A tree entry is the mode,
-        # a space, the name, a NUL, then 20 RAW BYTES of object id -- so raw ids are in this stream.
-        # PowerShell splits it on 0x0A and decodes it, and neither can damage `100644 ` followed by
-        # four digits: no byte of that literal is >= 0x80, so no multi-byte decode can swallow it (a
-        # continuation byte is 0x80-0xBF and `1` is 0x31), and it carries no newline for a split to
-        # land inside. A false POSITIVE needs those twelve bytes to fall inside an object id. The whole
-        # set was compared against a per-tree `ls-tree` sweep of all 434 trees: identical, 181 numbers,
-        # max 0187.
+        #   `git rev-list --objects` dedupes by OBJECT, so two ADR files with byte-identical content
+        #   print ONE of their two names. Measured: `0150-alpha.md` and `0151-beta.md` sharing a blob
+        #   printed one name, which would re-issue 0151 over a live ADR.
         #
-        # A SECOND DEFINITION OF "WHICH ADR NUMBERS EXIST ON A REF" LIVES NEXT DOOR, in Python:
-        # `numbers_on_refs` in scripts/coord/alloc_strand_sweep.py. It builds the same specs and the
-        # same batch-check, then reads each distinct tree with one `ls-tree` per tree -- the 434
-        # processes this branch batches away. Two implementations of one question drift; change one
-        # and read the other. They already differ observably: the mode literal above admits regular
-        # files only, where `ls-tree` reports any mode.
+        #   Scanning the RAW TREE BYTES through the pipeline, anchored on `(?:100644|100755) `, broke
+        #   TWICE. (a) A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native
+        #   output with [Console]::OutputEncoding -- the OEM console code page on Windows. Under a
+        #   DBCS page a lead byte at the end of one entry's id CONSUMES the `1` that starts the next
+        #   entry's `100644`, and that entry vanishes. Measured on this clone: cp932 lost 7 of 181
+        #   numbers, cp936/949/950 lost 17, while utf-8 and cp1252 lost none. End to end on a fixture
+        #   with `chcp` set before pwsh started, the floor fell from 999 to 100 and the next
+        #   allocation would have landed on a live ADR. The comment that shipped it argued no
+        #   multi-byte decode could swallow an ASCII byte; that is true of UTF-8 and false of DBCS.
+        #   (b) The mode literal admitted regular files only, where `ls-tree` reports EVERY mode, so
+        #   an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to
+        #   its replacement (120000) became invisible.
+        #
+        # SO STAGE 2 IS `ls-tree` PER DISTINCT TREE, and it is the boring spelling on purpose. It
+        # emits TEXT that git already decoded, so no console code page can touch it, and it reports
+        # every mode, so no entry shape can hide from it. It costs 434 processes here instead of one
+        # -- about 40s against the 5s the byte scan managed and the 359.7s this branch started at.
+        # That trade is deliberate: the failures it buys out are both SILENT, and this script exists
+        # to prevent exactly the collision they cause.
+        #
+        # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
+        # Two implementations of one question drift; change one and read the other.
         $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
         $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
 
@@ -212,10 +225,13 @@ function Get-Floor {
             if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
         }
 
-        $rx = [regex]::new('(?:100644|100755) (\d{4})-')
-        if ($trees.Count -gt 0) {
-            foreach ($line in (($trees -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
-                foreach ($m in $rx.Matches("$line")) { $seen.Add([int]$m.Groups[1].Value) }
+        # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+        # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
+        $rx = [regex]::new('^(\d{4})-')
+        foreach ($t in $trees) {
+            foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
+                $m = $rx.Match("$n")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
             }
         }
     } else {
@@ -291,19 +307,32 @@ function Get-Floor {
                 # BOTH RESETS ARE LOAD-BEARING. An over-long argument list is not a non-zero exit: git
                 # never starts, `$LASTEXITCODE` keeps its PREVIOUS value and `$out` keeps the PREVIOUS
                 # slice's output, so an unguarded loop re-adds the last slice and skips this one with
-                # no error. `$?` is the only reliable witness. Measured ceiling on this clone: 795 oids
-                # (32,736 chars) pass and 796 (32,777) fail against Windows' 32,767-char CreateProcess
-                # limit -- and the message it fails with names StandardOutputEncoding, not the length.
-                # 128 leaves room for a repo path ~2,700 chars longer than this one; the 12 extra
-                # processes are free against a stage that used to stream 4.2 GB.
+                # no error.
+                #
+                # Ceiling bisected on this clone 2026-09-11, with a 72-char repo path: 794 oids run
+                # and 795 does not, at roughly 32,710 chars against Windows' 32,767-char CreateProcess
+                # limit. The message it fails with names StandardOutputEncoding, not the length, so
+                # the argv cause is not discoverable from the error. A chunk of 128 leaves 666 spare
+                # oids, about 27,300 characters of slack for a longer repo path, and the extra
+                # processes are free against a stage that used to stream 4.2 GB. Both figures move
+                # with the repo path, so re-bisect rather than trusting them elsewhere.
                 $out = $null
                 $global:LASTEXITCODE = -1
                 $out = & git -C $repo grep -h -o -a --no-color --no-line-number --no-column -E -e '^#{2,3} [0-9]+\.' @slice 2>$null
-                if (-not $?) { throw "git grep did not run over backlog blobs $i..$($i + $slice.Count - 1). An over-long argument list reports a StandardOutputEncoding error rather than the real cause; lower `$chunk` before believing anything else." }
-                # 0 = matched, 1 = no match (legitimate, though no ledger blob here lacks a heading),
-                # 128 = fatal. A single unparseable tree-ish aborts the WHOLE slice and returns zero
-                # lines, so up to 128 blobs' numbers vanish at once. Stage 1 admits only `blob` oids so
-                # it should not fire; it is checked because the loss is total and otherwise silent.
+                # THE EXIT CODE IS THE WITNESS, AND `$?` IS NOT. For a native command PowerShell sets
+                # `$?` from the exit code, so `if (-not $?)` is true for git grep's exit 1 as well as
+                # for a fatal -- and exit 1 means "no match", which is LEGITIMATE. Measured: a blob
+                # with no numbered heading exits 1 with `$?` False. An earlier spelling threw there,
+                # which made a repository whose ledger blobs carry no heading yet -- a fresh clone of
+                # this tooling -- unable to allocate a backlog number AT ALL, and left the accurate
+                # exit-code message below as dead code that could never print.
+                #
+                # -1 is the sentinel from the reset above and means git NEVER RAN: an over-long
+                # argument list does not set an exit code, and without the sentinel the stale value
+                # from the previous slice reads as success while `$out` still holds that slice's
+                # output. 0 = matched, 1 = no match, 128 = fatal -- and a fatal aborts the WHOLE slice
+                # for zero lines, so up to 128 blobs' numbers vanish at once.
+                if ($LASTEXITCODE -lt 0) { throw "git grep never ran over backlog blobs $i..$($i + $slice.Count - 1). An over-long argument list reports a StandardOutputEncoding error rather than the real cause; lower `$chunk` before believing anything else." }
                 if ($LASTEXITCODE -gt 1) { throw "git grep exited $LASTEXITCODE over backlog blobs $i..$($i + $slice.Count - 1); the whole slice returned nothing." }
 
                 foreach ($line in $out) {

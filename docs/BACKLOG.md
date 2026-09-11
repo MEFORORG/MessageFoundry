@@ -30482,7 +30482,7 @@ and will move to the archive when it closes.
 
 ## 1534. Batch the adr branch of alloc.ps1 so it stops spawning one git ls-tree per ref
 
-> 🚧 **Filed 2026-09-11 -- the code fix ships in this PR.** Value **6/10** · Difficulty **2/10** · _quick win_. `Get-Floor`'s ADR branch swept `docs/adr/` with one `git ls-tree` per ref, which is one PROCESS per ref, and this clone carries 7,196 of them. A single ADR allocation measured 322.4s and 359.7s here; the session that reported it lost over 17 minutes and two tool timeouts before its number came back. The backlog branch of the same function had already been batched for exactly this reason, and its own comment records the cost it was avoiding at a tenth the ref count. The ADR branch never received that fix. Batched, the same sweep takes 5.3s and returns the same floor and the same next number.
+> 🚧 **Filed 2026-09-11 -- the code fix ships in this PR.** Value **6/10** · Difficulty **2/10** · _quick win_. `Get-Floor`'s ADR branch swept `docs/adr/` with one `git ls-tree` per ref, which is one PROCESS per ref, and this clone carries 7,196 of them. A single ADR allocation measured 322.4s and 359.7s here; the session that reported it lost over 17 minutes and two tool timeouts before its number came back. The backlog branch of the same function had already been batched for exactly this reason, and its own comment records the cost it was avoiding at a tenth the ref count. The ADR branch never received that fix. Deduping the refs to their 434 distinct `docs/adr` trees and listing each once takes **17s** and returns the same floor and the same next number. **The 5.3s figure this row carried until 2026-09-11 belonged to a stage 2 that has since been REVERTED** -- it scanned raw tree bytes through the PowerShell pipeline, and adversarial review measured it losing 7 ADR numbers under console code page 932 and 17 under 936/950, plus every ADR not stored as a regular file. See the comment in `Get-Floor`'s adr branch; the saving was always the dedupe, never the reader.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -30502,13 +30502,21 @@ Both arms are `-ShowFloor -Kind adr`, which computes the identical floor without
 |---|---|---|---|
 | before, first run | 359.7s | 187 | 188 |
 | before, paired run | 322.4s | 187 | 188 |
-| after, paired run | 5.3s | 187 | 188 |
+| after, paired run (byte scan, REVERTED) | 5.3s | 187 | 188 |
+| after, shipped (ls-tree per distinct tree) | 17s | 187 | 188 |
 
 `alloc.ps1 -List` reported the same holdings before and after, and the registry kept its 34 ADR records and its `.floor-highwater` of 186 across every run above. Allocation stays a test-and-set on an exclusive `CreateNew`; this row changed only how the floor is READ.
 
-### What the batching is, and the one shape that was rejected
+### What the batching is, and the TWO shapes that were rejected
 
-Two `git` processes, whatever the ref count. One `cat-file --batch-check` resolves every `<ref>:docs/adr` spec at once -- 7,199 specs collapse to **434 distinct trees** -- and one `cat-file --batch` reads each of those trees once.
+**The saving is the dedupe, not the reader.** One `cat-file --batch-check` resolves every `<ref>:docs/adr` spec at once and 7,199 specs collapse to **434 distinct trees**, a 16x cut in processes. Each distinct tree is then listed with `git ls-tree --name-only` -- the same spelling the pre-fix code used, just no longer once per ref.
+
+Two faster stage-2 spellings were built, measured and reverted, and **both failed the same way: silently, by losing a name, which is a number that then reads as free.**
+
+1. **`git rev-list --objects`** dedupes by OBJECT, so two ADR files with byte-identical content print one of their two names. `0150-alpha.md` and `0151-beta.md` sharing a blob printed one name.
+2. **Scanning raw tree bytes** through the pipeline, anchored on `(?:100644|100755) `, broke twice over. A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native output with `[Console]::OutputEncoding` -- the OEM console code page on Windows. Under a DBCS page a lead byte ending one entry's id consumes the `1` that starts the next entry's `100644`. Measured on this clone: **cp932 lost 7 of 181 numbers, cp936/949/950 lost 17**, while utf-8 and cp1252 lost none. End to end on a fixture with `chcp` set before pwsh started, the floor fell from 999 to 100. Separately, the mode literal admitted regular files only, so an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to its replacement became invisible.
+
+The comment that shipped the byte scan argued that no multi-byte decode could swallow an ASCII byte. That is true of UTF-8 and false of DBCS, and no test disagreed because every runner here is cp437 or UTF-8.
 
 **`git rev-list --objects` over those trees was measured and rejected.** It produces the same listing as text in one process, but it dedupes by OBJECT: a tree holding `0150-alpha.md` and `0151-beta.md` with byte-identical content printed ONE name, so 0151 read as free. Re-issuing a number that is already on disk is the single failure this allocator exists to prevent. `tests/test_coord_alloc_floor.py` holds that case, the side-branch case, and a `GIT_TRACE` process count that fails if the sweep starts scaling with the ref count again.
 

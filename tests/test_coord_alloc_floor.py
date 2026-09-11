@@ -253,10 +253,18 @@ def test_the_backlog_sweep_chunks_over_distinct_blobs(tmp_path: Path) -> None:
 
     **The planted maximum is the instrument.** It lives on a ref and NOWHERE else -- not in the
     working tree, not in the registry -- so it can only be found by the term under test. Every way
-    this stage fails silently produces the same observable, a floor that is merely lower: a dropped
-    chunk, an over-long argv, ``\\d`` in a POSIX ERE that has no ``\\d``, a missing ``-h``, a binary
-    blob suppressed, a hostile ``grep.lineNumber``. All of them miss 299 and this assertion catches
+    this stage fails silently produces the same observable, a floor that is merely lower: an
+    over-long argv, ``\\d`` in a POSIX ERE that has no ``\\d``, a missing ``-h``, a binary blob
+    suppressed, a hostile ``grep.lineNumber``. All of them miss 299 and the floor assertion catches
     all of them.
+
+    **A DROPPED CHUNK IS CAUGHT BY THE GREP COUNT, NOT BY THE FLOOR, and an earlier version of this
+    docstring had that wrong.** It reasoned that the maximum lands in the last chunk because it is
+    written to the last ref created. Processing order is not creation order: stage 1 walks
+    ``for-each-ref``, which sorts refnames LEXICOGRAPHICALLY, so ``blob199`` is the 112th ref and the
+    maximum falls in chunk 0. Keeping only the first chunk therefore still finds 299, and it is the
+    ``expected_greps`` assertion below that refuses it. Both assertions are load-bearing and they
+    catch disjoint failures; do not drop either as redundant.
 
     Asserting the floor is only safe here BECAUSE the fixture is built so the floor cannot come from
     anywhere else. On the real clone it would prove nothing: there, the registry term carries the
@@ -344,3 +352,187 @@ def test_the_backlog_sweep_survives_a_hostile_grep_config(tmp_path: Path) -> Non
     )
 
     assert _floor(repo, kind="backlog") == planted
+
+
+def _body_whose_blob_id_ends_in_a_lead_byte(repo: Path) -> tuple[str, str]:
+    """Find an ADR body whose blob id's final byte is a DBCS lead byte (0x81-0xFE).
+
+    Cheap: git hashes a short string in well under a millisecond and roughly half of all ids qualify,
+    so this lands in a handful of tries. Raises rather than degrading, because a fixture that quietly
+    settles for a non-lead byte is a test that cannot see the defect it was written for.
+    """
+    for i in range(2000):
+        body = f"# Primer\n\nvariant {i}\n"
+        oid = (
+            subprocess.run(
+                ["git", "hash-object", "--stdin"],
+                cwd=str(repo),
+                input=body.encode(),
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+        if int(oid[-2:], 16) >= 0x81:
+            return body, oid
+    raise AssertionError("no body found whose blob id ends in a lead byte")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="console code pages are a Windows concept")
+@pytest.mark.parametrize("codepage", [437, 932, 936, 950])
+def test_the_adr_sweep_is_invariant_under_the_console_code_page(
+    tmp_path: Path, codepage: int
+) -> None:
+    """The defect this case exists for SHIPPED, and nothing here could see it.
+
+    An earlier adr stage 2 piped RAW tree objects through the pipeline and scanned them for
+    ``(?:100644|100755) NNNN-``. A tree entry carries 20 raw bytes of object id, and PowerShell
+    decodes native output with ``[Console]::OutputEncoding`` -- the OEM console code page on Windows.
+    Under a DBCS page (932 Japanese, 936 Simplified Chinese, 949 Korean, 950 Traditional, all locale
+    DEFAULTS) a lead byte ending one entry's id consumes the ``1`` that starts the next entry's
+    ``100644``, and that ADR vanishes. Measured on the real clone: 181 numbers under utf-8, cp437 and
+    cp1252; **174 under cp932 and 164 under cp936/950**.
+
+    The comment that shipped it argued no multi-byte decode could swallow an ASCII byte. That is true
+    of UTF-8 and false of DBCS, and no test disagreed because every runner here is cp437 or UTF-8.
+
+    ``chcp`` runs BEFORE pwsh starts, so the shell initialises its own encoding rather than having a
+    test mutate it mid-session -- otherwise this would measure the mutation, not the environment.
+
+    **THE FIXTURE IS SEARCHED, NOT WRITTEN, AND THAT IS WHAT MAKES IT DISCRIMINATE.** The damage
+    needs a DBCS lead byte immediately before the next entry's ``100644``, and a tree entry ends with
+    20 RAW bytes of the preceding file's blob id. An arbitrary body gives that a ~50% chance, so the
+    first version of this case passed under cp932 with the defect fully present -- it was measured
+    doing exactly that. So 0100's body is varied until its blob id ENDS in a lead byte (0x81-0xFE),
+    which puts the hazard next to 0999's entry by construction rather than by luck.
+    """
+    repo = _checkout(tmp_path / f"cp{codepage}", {"0100-primer.md": "# Primer\n"})
+
+    body, oid = _body_whose_blob_id_ends_in_a_lead_byte(repo)
+    (repo / "docs" / "adr" / "0100-primer.md").write_text(body, encoding="utf-8")
+    (repo / "docs" / "adr" / "0999-highest.md").write_text("# Highest\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "two adrs", "--no-verify", cwd=repo)
+    assert _git("rev-parse", "HEAD:docs/adr/0100-primer.md", cwd=repo).strip() == oid
+    assert int(oid[-2:], 16) >= 0x81, f"fixture blob id {oid} does not end in a DBCS lead byte"
+
+    script = repo / "scripts" / "coord" / "alloc.ps1"
+    # shell=True, NOT ["cmd", "/c", ...]. The list form makes Python quote the whole command as one
+    # argument and cmd.exe then hands pwsh the quotes as part of the filename -- measured, it fails
+    # identically under EVERY code page, which would have read as "the sweep is broken everywhere"
+    # rather than as a quoting bug in the test.
+    proc = subprocess.run(
+        f'chcp {codepage} >nul && pwsh -NoProfile -NonInteractive -File "{script}" '
+        "-ShowFloor -Kind adr",
+        shell=True,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    match = re.search(r"^floor\s*:\s*(\d+)$", proc.stdout, re.MULTILINE)
+    assert match, f"no floor line under code page {codepage}:\n{proc.stdout}\n{proc.stderr}"
+    assert int(match.group(1)) == 999, (
+        f"code page {codepage} changed the ADR floor to {match.group(1)}. The sweep is reading "
+        "bytes the console decoder can damage; it must read text git has already decoded."
+    )
+
+
+def test_an_adr_kept_as_a_directory_still_holds_its_number(tmp_path: Path) -> None:
+    """Also shipped, also invisible here: a mode filter that ``ls-tree`` never had.
+
+    The reverted byte scan anchored on ``100644|100755``, which admits regular files ONLY. Every
+    other entry shape became invisible: an ADR kept as a folder with its diagrams
+    (``docs/adr/0199-with-assets/``, mode 040000) or a superseded ADR left as a symlink to its
+    replacement (120000). ``git ls-tree --name-only`` reports every mode, which is why the sweep was
+    reverted to it.
+
+    The number here lives ONLY in the directory entry and only on a ref, so nothing else can supply
+    it. A mode-filtered sweep returns 100 and the next allocation lands on a live 0199.
+    """
+    repo = _checkout(tmp_path / "moded", {"0100-plain.md": "# Plain\n"})
+    assets = repo / "docs" / "adr" / "0199-with-assets"
+    assets.mkdir()
+    (assets / "README.md").write_text("# With assets\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "adr as a directory", "--no-verify", cwd=repo)
+
+    modes = {
+        line.split()[0]
+        for line in _git("ls-tree", "HEAD:docs/adr", cwd=repo).splitlines()
+        if "0199-with-assets" in line
+    }
+    assert modes == {"040000"}, f"fixture is not exercising a non-blob entry; modes={modes}"
+
+    assert _floor(repo) == 199
+
+
+def test_a_ledger_with_no_numbered_heading_can_still_be_swept(tmp_path: Path) -> None:
+    """``git grep`` exits 1 for "no match", and an earlier guard threw on it.
+
+    ``$?`` is False after ANY non-zero native exit, so ``if (-not $?) { throw }`` fired on exit 1 --
+    the documented no-match code -- and the accurate exit-code check below it became dead code that
+    could never print. A repository whose ledger blobs carry no ``## N.`` heading yet could not
+    allocate a backlog number AT ALL, which is the state of a fresh clone of this tooling.
+
+    Measured while fixing it: a blob with no heading gives ``LASTEXITCODE=1`` with ``$?`` False.
+
+    The floor here comes from the registry seed alone, so the assertion is that the sweep RETURNS
+    rather than that it finds anything.
+    """
+    repo = _checkout(tmp_path / "noheadings", {"0001-first.md": "# First\n"})
+    (repo / "docs" / "BACKLOG.md").write_text(
+        "# Backlog\n\nProse only. No numbered headings anywhere in this file.\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "ledger with no numbered heading", "--no-verify", cwd=repo)
+    assert "## " not in (repo / "docs" / "BACKLOG.md").read_text(encoding="utf-8")
+
+    assert _floor(repo, kind="backlog") == 0
+
+
+def test_a_number_living_only_in_the_archive_is_taken(tmp_path: Path) -> None:
+    """Retiring an item MOVES its heading into the archive, and the sweep must read both paths.
+
+    No fixture covered the archive at all, so deleting it from ``$backlogPaths`` -- which drops it
+    from the ref sweep AND the working-tree term together -- left the suite green. The comment beside
+    that line calls the loss "the #240-#247 shape again, just sourced from a different blind spot",
+    and nothing was checking.
+    """
+    repo = _checkout(tmp_path / "archive", {"0001-first.md": "# First\n"})
+    archive = repo / "docs" / "archive" / "backlog"
+    archive.mkdir(parents=True)
+    (archive / "BACKLOG-CLOSED.md").write_text(
+        "# Closed\n\n## 555. A retired item, living only here\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "archive", "--no-verify", cwd=repo)
+    assert "555" not in (repo / "docs" / "BACKLOG.md").read_text(encoding="utf-8")
+
+    assert _floor(repo, kind="backlog") == 555
+
+
+def test_a_number_written_but_committed_nowhere_is_taken(tmp_path: Path) -> None:
+    """The working-tree term, which no fixture reached.
+
+    Every fixture writes ``docs/BACKLOG.md`` and then COMMITS it, so its numbers are always reachable
+    from a ref and the committed sweep supplies them. Nothing exercised the one thing this term
+    exists for -- a number written to a file and committed NOWHERE -- so dropping the Multiline flag
+    left the suite green, and that flag's absence is the exact silent hole its comment records.
+
+    Here 888 is UNCOMMITTED, so only the working-tree term can find it. ``^`` in .NET anchors at the
+    start of the STRING unless Multiline is set, and this term feeds ``Get-Content -Raw``: without
+    the flag the count goes to zero.
+    """
+    repo = _checkout(tmp_path / "wip", {"0001-first.md": "# First\n"})
+    committed = (repo / "docs" / "BACKLOG.md").read_text(encoding="utf-8")
+    (repo / "docs" / "BACKLOG.md").write_text(
+        committed + "\n## 888. Drafted here and committed nowhere\n", encoding="utf-8"
+    )
+    assert _git("status", "--porcelain", cwd=repo).strip(), (
+        "fixture must leave the edit uncommitted"
+    )
+    assert "888" not in _git("show", "HEAD:docs/BACKLOG.md", cwd=repo)
+
+    assert _floor(repo, kind="backlog") == 888
