@@ -30942,6 +30942,12 @@ The script also now states what is NOT a reason: **a long quiet period**. Age is
 
 ### What this row does not do
 
-**It does not release the 56.** Twenty claims were released the same day under the two settling conditions -- every `gone` holder plus the three closed-item directory-only ones -- taking the register from 80 to 60. The remaining 56 are open items with live-unknown holders and each still needs one of the two conditions met. That is work for whoever holds the register, not a side effect of this fix.
+**THE REGISTER WAS THEN WORKED, on the owner's instruction the same day: 80 claims down to 18.** Recorded here because this row's first draft said the 56 were left standing, and that is no longer true.
+
+The work was done per HOLDER WORKTREE rather than per claim -- the 55 directory-only claims clustered into just **15 trees**, and liveness and unmerged work are properties of a tree, not a claim. Fifteen parallel assessments asked one question each: *would releasing lose anything?*
+
+**THE DECISION RULE THAT CAME OUT OF IT, and it is not the liveness question the tool asks.** Releasing a claim never deletes a branch. The only real risk is that a fresh seat REBUILDS work that exists unmerged. So a claim is safe to release when its item's work has LANDED, or the tree holds nothing `main` lacks, or the unmerged work is PUSHED and therefore recoverable. It is unsafe only when unmerged work sits on a **local-only** branch. Two claims met that bar and were deliberately kept: **#1125**, whose branch carries 111 lines of RFC 9112 listener hardening that refuses nine malformed shapes the shipped listener accepts, present nowhere else on this machine; and **#1217**, review fixes on PR 1034.
+
+**TWO INSTRUMENT TRAPS THE ASSESSMENT HIT, both recorded because they produce confident wrong answers.** `git rev-list --count origin/main..<branch>` reported 285 to 374 on branches carrying almost no work -- this repository squash-merges, so every merged PR's original commits stay unreachable from `main` forever, and the count is merged history. And `git -C <empty-holder-dir> status` **succeeds**: with no `.git` at the path git walks up to the primary checkout and reports ITS dirty files, so an empty holder reads as a tree full of uncommitted work. Compare CONTENT, and confirm the path is a real worktree before believing a status.
 
 **Related:** [#1348](#1348) defined the third state this routes on. [#1358](#1358) is the sibling defect in the same script -- `-Release` records the script copy's tree as the actor rather than the caller's.
