@@ -79,11 +79,22 @@ concurrency:
   #   * `merge_group` -- `cla` is required and branch protection evaluates it on the merge-group
   #     commit. A cancelled run reports a cancelled context, the same wedge the `on:` note above
   #     records for an ABSENT one. One group per run, so nothing can cancel it.
-  #   * `issue_comment` -- the signing path: a contributor's sign comment is processed by that run.
+  #   * `issue_comment` -- a signing path: a contributor's sign comment is processed by that run.
   #     Keying it on the pull request would be unsafe EVEN AT `cancel-in-progress: false`, because
   #     GitHub cancels a run already PENDING in a group when a newer one queues. Two sign comments
   #     in quick succession on one pull request would then discard the first instead of queueing it.
   #     One group per run: never cancelled, never pending behind a sibling.
+  #
+  #     THAT PENDING-CANCEL IS THE `queue: single` DEFAULT, NOT A LAW, and the escape is closed here
+  #     for a different reason -- said explicitly so nobody date-checks the paragraph above, finds
+  #     `queue: max` (up to 100 runs may wait instead of being replaced), and adopts it as the fix.
+  #     Per GitHub's own syntax reference `queue: max` beside `cancel-in-progress: true` is a
+  #     WORKFLOW VALIDATION ERROR, and this block's cancel-in-progress is an expression that is true
+  #     on the pull_request_target arm. Whether GitHub applies that validation statically to an
+  #     expression-valued flag is NOT established here, so treat it as a validation RISK rather than
+  #     a certainty -- and note what the risk costs: an invalid workflow produces no runs, `cla` is a
+  #     required context, and the `on:` note above records what an absent `cla` does. Keying by run
+  #     needs no `queue:` key at all, which is why it is the safe answer rather than the lazy one.
   #
   # DO NOT HOIST THE NUMBER OUT OF THE CONDITION. `github.event.pull_request.number` is populated on
   # `pull_request_target` but is EMPTY on `issue_comment`, whose payload carries no top-level
