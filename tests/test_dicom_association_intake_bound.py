@@ -34,6 +34,7 @@ import inspect
 import re
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -500,17 +501,35 @@ async def test_a_paced_scp_still_establishes_every_association(
         max_associations_per_second=rate, association_burst=_PACED_BURST
     )
 
-    # REPORTED, NOT GATED, the way tests/test_benchmark_parser.py records its scaling ratio. A green
-    # that used 3 percent of its headroom and a green that used 95 percent are the same word and mean
-    # opposite things: the second is a flake waiting for a contended runner and nothing in a pass/fail
-    # line distinguishes them. The decision arm below is exact and needs no number; the wall-clock arm
-    # does, so put its realised fraction where a CI log keeps it. Printed BEFORE the assertions so a
-    # red and a green emit the same line and can be compared directly.
+    # REPORTED, NOT GATED. A green that used 3 percent of its headroom and a green that used 95
+    # percent are the same word and mean opposite things, and nothing in a pass/fail line separates
+    # them. The decision arm below is exact and needs no number; the wall-clock arm does.
+    #
+    # TWO CHANNELS, because the obvious one is dead where it is most needed. `capsys.disabled()` is
+    # the form tests/test_benchmark_parser.py uses, and MEASURED 2026-09-11 it does not survive
+    # `-n 4 --dist loadfile`, which is exactly how ci.yml:894 runs this suite: the line appears on a
+    # serial run and is swallowed under xdist. Probed on all three channels -- stdout and stderr are
+    # both captured, `warnings.warn` reaches the summary. So the print serves a HAND RUN, where
+    # somebody investigating the thresholds wants the numbers, and the warning below serves CI.
+    realised = paced_elapsed / floor
+    summary = (
+        f"control {unpaced_elapsed:.3f}s -> {rate:.3f}/s, floor {floor:.3f}s | paced "
+        f"{paced_elapsed:.3f}s = {realised:.3f}x floor against a {_PACED_MARGIN} bound | waits "
+        f"{len(paced_waits)}/{int(_PACED_STEPS)}"
+    )
     with capsys.disabled():
-        print(
-            f"\n[BACKLOG #1536 margin] control {unpaced_elapsed:.3f}s -> {rate:.3f}/s, floor "
-            f"{floor:.3f}s | paced {paced_elapsed:.3f}s = {paced_elapsed / floor:.3f}x floor "
-            f"against a {_PACED_MARGIN} bound | waits {len(paced_waits)}/{int(_PACED_STEPS)}"
+        print(f"\n[BACKLOG #1536 margin] {summary}")
+
+    # The trigger is the ARITHMETIC and not a guessed band: an honest run cannot come in below the
+    # floor, because `paced_elapsed == floor + 2w` for a positive `w`. So a realised fraction under
+    # 1.0 that still clears `_PACED_MARGIN` is pacing already partly degraded, passing on the slack
+    # -- the only state where this test is green and should not be trusted. Healthy runs sit at 1.03
+    # and up and say nothing.
+    if realised < 1.0:
+        warnings.warn(
+            f"DICOM pacing passed BELOW its own arithmetic floor, which an honest run cannot do: "
+            f"{summary}. Pacing is degraded but still inside _PACED_MARGIN; see BACKLOG #1536.",
+            stacklevel=1,
         )
 
     assert paced == [True] * _ECHOES, "pacing REFUSED an association; it may only ever wait"
