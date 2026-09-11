@@ -30565,13 +30565,31 @@ At filing, 17 of 23 open pull requests carried a cancelled `cla`, and on 11 of t
 
 ### One claim here is documented, not measured, and is marked so
 
-That a cancelled required context blocks the merge is **inferred**: branch protection requires a
-success, and `cancelled` is a distinct conclusion. It could not be observed directly on this
-population. Branch protection sets `strict: true`, so a stale pull request reports `BEHIND`, and
-`mergeStateStatus` reports `BEHIND` or `DIRTY` in preference to `BLOCKED` -- every one of those 11 was
-`BEHIND` or `DIRTY`, which masks the reading. No pull request existed that was up to date, green
-elsewhere, and cancelled only on `cla`, and none was manufactured. The 21 cancellations are measured;
-this consequence is not.
+That a cancelled required context blocks the merge was filed here as **inferred**, and it is now
+**MEASURED**. The reasoning for the original label is kept because it explains why the observation was
+hard to get: branch protection sets `strict: true`, so a stale pull request reports `BEHIND`, and
+`mergeStateStatus` reports `BEHIND` or `DIRTY` in preference to `BLOCKED`. All 11 pull requests in the
+table above were `BEHIND` or `DIRTY`, which masks the reading, so that population could not supply the
+case no matter how its contexts were filtered.
+
+**This item's own pull request supplied it.** PR 1046, read 2026-09-11 at head `a6ace2aad`:
+
+```
+mergeable: MERGEABLE        mergeStateStatus: BLOCKED
+12 of 13 required contexts: SUCCESS
+cla:                        CANCELLED
+```
+
+Up to date, so no `BEHIND` to hide behind; every other required context green, so nothing else to
+blame; `BLOCKED` reported directly. A cancelled required context does block the merge. The one
+remaining gap is that this is one observation, not a rule GitHub documents -- but the observation is
+now on the record rather than an inference from the enumerated statuses.
+
+**The same reading is the sharpest available statement of the cost.** A pull request in this state
+presents as one failing check. Following it the normal way -- open the failed check, read the log --
+gives `fail` from `gh pr checks` and then `log not found`, because no step ever ran. Nothing anywhere
+on the pull request says the run was cancelled by a sibling rather than by the author's own change, and
+the only place the word `cancelled` appears is the run JSON, which nobody reads by default.
 
 ### The whole workflow population was checked, not just the file that broke
 
