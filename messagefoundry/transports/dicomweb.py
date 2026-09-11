@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DICOMweb STOW-RS transport (ADR 0025 Phase 2): an HTTP destination that **stores** a DICOM object to
 a DICOMweb service via STOW-RS.
 

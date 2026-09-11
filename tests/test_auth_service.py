@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """AuthService unit tests: bootstrap, local login + lockout, sessions, AD group->role mapping."""
 
 from __future__ import annotations

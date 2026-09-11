@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Rename / delete PRE-FLIGHT (#152) — :mod:`messagefoundry.config.impact`.
 
 Loads real config modules (so the referrer edges come from genuinely-compiled ``co_consts``) then

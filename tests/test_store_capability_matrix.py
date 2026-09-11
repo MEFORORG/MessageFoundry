@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Doc-drift guard for the per-backend store capability matrix in ``docs/CONFIGURATION.md``.
 
 **Why this exists.** The engine's per-backend capabilities are `supports_*` flags on the

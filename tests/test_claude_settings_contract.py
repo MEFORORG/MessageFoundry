@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`.claude/settings.json` is now a TRACKED control, so its shape gets a test.
 
 Tracking the file (see `tests/test_private_paths_stay_ignored.py` for the boundary half) is what

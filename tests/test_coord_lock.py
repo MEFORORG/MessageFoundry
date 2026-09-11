@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the cross-session operation mutex (``scripts/coord/lock.ps1``).
 
 ``git worktree add -b <name> <base>`` writes ``.git/config``, so two sessions creating worktrees at

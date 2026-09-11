@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``record_message_event`` — the public message-event writer (ADR 0154 D8).
 
 ``_event`` is private to each backend and only ever called inside a store-owned transaction, so

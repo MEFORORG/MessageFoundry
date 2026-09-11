@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # syntax=docker/dockerfile:1
 #
 # TEST-ONLY smoke image: the runtime engine image + a baked minimal config and a self-contained MLLP

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 3.7.5 — the CSP-ENFORCEMENT canary, its expected-violation filter, and the degrade contract.
 
 The console relies on browser features that a non-conforming client can silently ignore. Before this,

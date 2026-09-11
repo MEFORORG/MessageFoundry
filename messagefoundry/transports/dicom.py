@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DICOM DIMSE transport (ADR 0025) — the inbound **C-STORE SCP source** (Phase 1) and the outbound
 **C-STORE SCU destination** + **C-ECHO** verification (Phase 2).
 

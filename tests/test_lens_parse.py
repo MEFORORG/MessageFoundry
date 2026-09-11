@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The static Steps view (ADR 0076 §3–§4) — coverage-partition property (gate 1) + static-only
 (gate 4), over every ``samples/config`` handler plus adversarial hand-written handlers."""
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The control-id ↔ sequence-number scheme shared by the sender, sink, and corpus.
 
 Each sent message gets a dense, monotonic sequence number encoded into MSH-10 as

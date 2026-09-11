@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Do the coordination hooks that are WIRED actually resolve to a script that exists?
 
 The coordination hooks wired in ``settings.json`` are not installed copies. Each is an inline command

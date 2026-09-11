@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0016 — synchronous X12 request/response (real-time eligibility 270/271, TA1 classification).
 
 Covers the TA1 classification matrix (TA1*A/E/R, business-response-instead-of-TA1, unparseable, the

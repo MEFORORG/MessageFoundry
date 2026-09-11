@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure XML/SOAP codec (BACKLOG #31) — a hardened, namespace-aware XPath read/set message model over
 ``lxml``, plus opt-in XSD schema validation and XML-DSig verification, mirroring the HL7
 :mod:`messagefoundry.parsing` library and the X12 / FHIR / DICOM codecs.

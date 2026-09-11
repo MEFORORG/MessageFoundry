@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Service-status reporting (L6a, ADR 0065 / BACKLOG #75): the read-only NSSM `sc query` badge.
 
 Read-only + unprivileged (no shell, no elevation, validated name, off the loop); default OFF; gated by

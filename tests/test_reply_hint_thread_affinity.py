@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The reply rendezvous is only ever touched from the event loop thread (ADR 0154 D3).
 
 **Static, because the failure is not reliably reproducible.** ``asyncio.Event.set()`` is not

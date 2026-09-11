@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Typed action vocabulary — small, pure helpers over the mutable :class:`~messagefoundry.parsing.message.Message`.
 
 The analyst-facing half of ADR 0076 (phase 1): a bounded set of composable helpers mirroring the

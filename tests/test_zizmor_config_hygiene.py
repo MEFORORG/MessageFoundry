@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every zizmor suppression must name a workflow that still exists.
 
 ``.github/zizmor.yml`` was asserted by nothing, so its ``release-sync-check.yml`` entry survived that

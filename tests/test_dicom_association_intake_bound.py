@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 2.4.1 / 15.2.2 -- the DICOM SCP association bound (BACKLOG #1114).
 
 **Why this file exists separately from the poll ceilings.** BACKLOG #1114 needed two different

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0060 — rename-based FIFO covering-index migration (land ADR 0059's re-key on UPGRADED DBs).
 
 ADR 0059 re-keyed the per-lane FIFO indexes to trail in ``seq`` but KEPT the names

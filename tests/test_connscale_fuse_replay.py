@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Replay of the COMMITTED 2026-07-06 ADR 0071 B5 `fuse_ab` SQL-Server bench artifact through the
 fusion A/B comparator — the regression guard for the ``in_pipeline`` verdict fix (ADR 0071 §10 item 8).
 

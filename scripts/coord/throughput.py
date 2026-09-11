@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Throughput counter — how many backlog items CLOSED between two refs.
 
 **Why this exists.** On 2026-08-21 a wave of 30 items ran overnight across two builder lanes and

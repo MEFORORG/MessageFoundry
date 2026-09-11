@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#201 (ADR 0078 amendment) posture-keyed revocation refusal for OUTBOUND verifying-TLS connectors.
 
 ADR 0078 ENFORCED "no in-engine OCSP/CRL → refuse an unproven off-loopback in-process ``[api]`` TLS bind"

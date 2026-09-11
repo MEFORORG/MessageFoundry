@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Transform steps for the ``IB_DEMO_ORU`` feed — the *transformer* half of the per-feed **Hybrid**
 config layout (see docs/CONNECTIONS.md §"Decomposing by role").
 

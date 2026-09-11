@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The shipped-default posture lane: ONE posture, and operators may only LOOSEN from it.
 
 Two defaults moved to the hardened value (ADR 0148 GIVEN 1 — the hardened path is the shipped path, so it
