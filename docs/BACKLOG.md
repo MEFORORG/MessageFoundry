@@ -30451,6 +30451,42 @@ above or below it"*.
 5. **Enqueue authority moved to the Lander.** Not a narrowing of a live permission: the seat that held
    it no longer exists, and korus `MANAGER.md` has never granted it.
 
+### A second reader of the same roster, and it was blind
+
+**`scripts/coord/seat.ps1` never read `docs/roles/seats.json`.** It copied whatever `-Seat` it was
+handed into the record, and `fleet.ps1` rendered that as a live seat. One roster, two readers, and
+only `role-card-inject.ps1` could see it.
+
+**Reported by the session it happened to**, 2026-09-10, and verified here rather than taken on trust:
+that session started undeclared, the hook listed the live seats with **no manager among them**, and
+the owner corrected it in-band -- *"you are not the console... you are a manager"*. It then declared
+`-Seat manager`, **a label that was in no map at all**, and the script accepted it and wrote a record.
+Nothing reported a problem, because the record was valid. That is the hollow-record failure
+`test_coord_seat_session_key.py` pins for the session id, arriving one field over.
+
+**With the Console retired, the mirror case is the dangerous one.** `-Seat console` would be recorded
+in silence while the card hook refuses the same label loudly -- so the retirement would hold on the
+path a session reads and leak on the path a session writes.
+
+**It warns and records; it does NOT gate, and that half is deliberate.** An undeclared seat renders as
+UNDECLARED to every other session, so refusing a declaration trades a readable-but-odd record for
+**no** record, which is worse. A label may also be a legitimate spelling nobody has added to the alias
+map yet. `test_a_retired_declaration_is_still_recorded` is the arm that stops a later change turning
+this into a refusal.
+
+Two additive fields carry the verdict -- `seatCanonical` and `seatRosterVerdict` -- while `seat` keeps
+the verbatim label, because every existing reader keys on it.
+
+**The objection goes to STDERR, not `Write-Warning`.** Measured on pwsh 7 here: `Write-Warning`
+renders to **stdout**, which would make a roster objection narrate into a session's context on the
+`-Record` and `-Prompt` hook paths -- the one thing `seat.ps1` says those paths must not do -- and
+would land in whatever parses its `wrote <path>` line. `[System.Console]::Error.WriteLine` is the
+idiom `overlap.ps1` already uses.
+
+**Armed before trusted:** run against the pre-change script, 9 of the 10 new tests fail; against the
+change, 10 pass. The one that passes either way is the missing-roster arm, which is why it exists --
+without it, "no objection" and "nothing checked" would be the same value.
+
 ### What was deliberately NOT changed, and why
 
 - **The product "Console" is a different subject and is untouched.** The retired PySide6 desktop
