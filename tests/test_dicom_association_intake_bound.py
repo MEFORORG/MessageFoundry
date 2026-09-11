@@ -409,7 +409,9 @@ async def _echo_run(**settings: object) -> tuple[list[bool], float, list[float]]
         await src.stop()
 
 
-async def test_a_paced_scp_still_establishes_every_association() -> None:
+async def test_a_paced_scp_still_establishes_every_association(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """THE LOAD-BEARING DICOM TEST: pacing waits, it never refuses.
 
     **The timing arm runs BOTH arms, and that is a correction this test earned.** The first draft
@@ -497,6 +499,19 @@ async def test_a_paced_scp_still_establishes_every_association() -> None:
     paced, paced_elapsed, paced_waits = await _echo_run(
         max_associations_per_second=rate, association_burst=_PACED_BURST
     )
+
+    # REPORTED, NOT GATED, the way tests/test_benchmark_parser.py records its scaling ratio. A green
+    # that used 3 percent of its headroom and a green that used 95 percent are the same word and mean
+    # opposite things: the second is a flake waiting for a contended runner and nothing in a pass/fail
+    # line distinguishes them. The decision arm below is exact and needs no number; the wall-clock arm
+    # does, so put its realised fraction where a CI log keeps it. Printed BEFORE the assertions so a
+    # red and a green emit the same line and can be compared directly.
+    with capsys.disabled():
+        print(
+            f"\n[BACKLOG #1536 margin] control {unpaced_elapsed:.3f}s -> {rate:.3f}/s, floor "
+            f"{floor:.3f}s | paced {paced_elapsed:.3f}s = {paced_elapsed / floor:.3f}x floor "
+            f"against a {_PACED_MARGIN} bound | waits {len(paced_waits)}/{int(_PACED_STEPS)}"
+        )
 
     assert paced == [True] * _ECHOES, "pacing REFUSED an association; it may only ever wait"
     assert unpaced_waits == [], (
