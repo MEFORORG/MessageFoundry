@@ -30479,3 +30479,113 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1536. the DICOM association-pacing test asserts a fixed absolute delta between two separately-timed arms, so a loaded runner reds it while the pacer is exactly right
+
+> 🚧 **Built 2026-09-11; open until its pull request merges, when the Lander flips this banner.** Value **6/10** · Difficulty **3/10**. Value 6 -- the test is red on `main` inside a required context, so it blocks every pull request, and it guards the one DICOM property that a bound may delay a modality but never turn one away. Difficulty 3 -- the arithmetic is a twenty-line simulation of a token bucket, and both arms are reproducible on a developer box under synthetic load.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test invariance / DICOM intake. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is a test-harness defect. `_MessagePacer` and
+`DicomScpSource._pace_association` are unchanged and were correct throughout; nothing about the
+shipped connector would behave differently on a first deployment, and the association bound still
+ships OFF.
+
+### The red named the wrong arm
+
+`tests/test_dicom_association_intake_bound.py::test_a_paced_scp_still_establishes_every_association`
+fails on `main` in `test (windows-2025, py3.14)`. Measured 2026-09-11: `main` run `34563466896` and
+PR 1031 run `34555983878` fail the identical test on the same leg, PR 1031 with `1 failed, 12842
+passed` over a diff that adds a test file and a docs edit and touches nothing DICOM.
+
+The assertion was:
+
+```python
+assert paced_elapsed - unpaced_elapsed >= 0.5
+```
+
+and the observed failure was paced 1.373 s against unpaced 1.056 s, a difference of 0.317.
+
+### The pacing delay is not additive, which is what a difference assertion assumes
+
+Simulating `_MessagePacer` against the connector's own call order -- `EVT_CONN_OPEN` waits off
+`deficit()`, then `EVT_ACCEPTED` charges one token -- gives the paced arm's schedule exactly, for
+`N` associations of per-association work `w` and capacity `max(burst, 1.0)`:
+
+```
+paced_elapsed == max(N * w, (N - 1 - capacity) / rate + 2 * w)
+```
+
+The two terms **compete; they do not add**. At the shipped fixture of rate 3 and burst 1 the pacing
+floor is `(6 - 1 - 1) / 3 == 1.333 s`, so the CI run's paced arm of 1.373 s matched its own schedule
+to three decimal places. **The paced arm was exactly right.** What had moved was the control, which
+took 1.056 s where this box takes 0.18 s -- and every second the control gains is a second the
+difference loses, while both arms behave perfectly.
+
+### The two arms are timed one after the other, so they need not see the same machine
+
+On that CI run the paced arm's own work implies about 0.02 s per association against the control's
+0.176 s, a factor of nine between two arms of one test. The gap is not only noise. Measured locally
+2026-09-11 on a quiet box, the control's associations queue back-to-back at 0.030 s each while the
+paced arm's arrive into an idle SCP at 0.017 s, so a difference assertion is biased against itself
+even with nothing else running.
+
+### The fix derives the rate from the measured control, so control noise cancels
+
+The rate is no longer a constant. It is chosen so the pacing floor lands `_SEPARATION` times the
+control arm that was just measured, and the assertion is on that derived floor:
+
+```python
+rate = min(max(_PACED_STEPS / (_SEPARATION * unpaced_elapsed), _RATE_FLOOR), _RATE_CEILING)
+floor = _PACED_STEPS / rate
+assert paced_elapsed >= floor * _PACED_MARGIN
+```
+
+`floor == _SEPARATION * unpaced_elapsed` by construction and `paced_elapsed >= floor` exactly, so a
+spuriously slow control buys a proportionally lower rate and a proportionally larger floor and both
+sides of the comparison move together. Simulated across a hundredfold swing in the paced arm's speed
+relative to the control, the ratio never fell below 4.03.
+
+### Both arms were watched, and the load arm is the one that settles it
+
+Under 24 spinning processes on 20 cores, running the old and new assertions against the **same**
+machine conditions in the same trial:
+
+```
+ #  unpaced | OLD paced   delta  >=0.5 |   rate  floor NEW paced  thresh   ok
+ 0    1.337 |     1.664   0.327    RED |  0.748  5.348     5.643   4.278 pass
+ 3    2.025 |     1.858  -0.167    RED |  0.494  8.100     8.390   6.480 pass
+ 5    1.833 |     1.689  -0.145    RED |  0.545  7.333     7.731   5.867 pass
+```
+
+Six trials, old assertion red 6/6 -- three of them with a **negative** difference, the paced arm
+finishing ahead of its own control -- and the new assertion green 6/6. Every arm established all six
+associations in every trial, which is the property that had to survive.
+
+Mutation, two independent forms, each applied and restored:
+
+| Mutation | Quiet | Under load |
+| --- | --- | --- |
+| `_pace_association` returns before it consults the bucket | RED, paced 0.167 s against a 0.553 s threshold | RED 3/3, paced 3.622 s against a 19.909 s threshold |
+| `EVT_CONN_OPEN` handler never registered | RED, paced 0.172 s against a 0.541 s threshold | not run; the first mutation covers the wait |
+
+The margin **grows** as the runner slows, because the derived rate falls with it. That is the
+property the fixed delta had backwards.
+
+### The pattern was unique to this test, which is worth recording because it looks common
+
+Swept `tests/` and `packaging/messagefoundry-webconsole/tests/`, 826 modules. **No other test in the
+corpus subtracts one measured duration from another**; the needle finds the retired line and nothing
+else, against a negative control that it does find the pre-fix line.
+
+The three sibling pacing modules -- `test_ingress_message_pacing.py`, `test_mllp_message_pacing.py`,
+`test_security_doc_rate_limits.py` -- do use fixed absolute constants, at
+`test_ingress_message_pacing.py:211`, `:226`, `:309` and `test_mllp_message_pacing.py:156`. They are
+a **different shape and a different failure mode**: each is a lower bound on a single paced arm with
+no control, so a slow runner only pushes the measured value further above the threshold. Those cannot
+red on runner speed. Their exposure is the opposite one -- on a runner slow enough for the unpaced
+work alone to clear the constant, they would pass without discriminating. Each already records a
+watched mutation in its docstring. Left alone here: none is failing, and changing a green test in the
+pull request that fixes a red one hides the fix.
