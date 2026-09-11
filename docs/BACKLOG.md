@@ -31156,3 +31156,90 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+## 1552. no gate pins the copyright holder string, so a header copied from a neighbour can carry a superseded entity
+
+> 🚧 **Built 2026-09-11 on branch `claude/holder-gate`; open until it merges.** Extends
+> `scripts/quality/licence_header_check.py` with `EXPECTED_HOLDER`, asserted positionally in the same
+> header window under the same comment rule, plus a template scan for the header-stamping literals the
+> comment rule cannot see. Swept the 9 files the gate itself reported. Value **5/10** · Difficulty
+> **3/10**. Value 5: the entity is the one a code-signing certificate would name, and the rename has
+> now been left incomplete four times. Difficulty 3: the gate reuses existing machinery, but the
+> template discriminator had to be derived rather than listed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** licensing / project identity. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- there are zero deployments. The exposure is a release
+artifact, not a running instance: these packages are published to PyPI, so headers naming a superseded
+entity **would** ship to real installers on the next release. Nothing has shipped wrong today.
+
+### The shape is the defect, and the file list is only ever its symptom
+
+`licence_header_check.py` asserted the SPDX **licence** identifier and nothing else. A file could
+declare the right licence and name any entity at all, and no gate, hook or test could see it.
+
+So the PR 1020 rename was left incomplete repeatedly. PR 1021 added three files after 1020's branch
+was cut, which 1020 structurally could not reach, and PR 1025 fixed those three. Each repair was a
+human noticing. **A human noticing is not a control**, which is why this item pins the string rather
+than sweeping it again.
+
+### A FOURTH incompleteness, which an exact-string sweep could never have found
+
+Every previous repair searched for the superseded name. This gate asks the opposite question -- *does
+this header name the right holder* -- and that question found five files carrying a **third** form:
+
+```
+# Copyright (c) MessageFoundry contributors.
+```
+
+Those files never held the old string, so no substitution pass could reach them and no re-run of the
+old survey would have reported them. A further four files declared the correct licence and carried **no
+copyright line at all**. Nine files total, all swept here.
+
+**This is the argument for a positional check stated as a measurement rather than a preference.** A
+search for the old name is bounded by the names you already know.
+
+### Pinned positionally. There is no exclusion list, deliberately
+
+A path exclusion answers *"is this file allowed to contain the old string"*, which rots silently the
+moment anyone legitimately quotes the superseded entity somewhere new -- an ADR recording the rename, a
+NOTICE, a migration note. Nothing would report that the list needed an edit.
+
+Item **#1528**'s body quotes the old entity on purpose, to record what was replaced. That quote is
+prose, not a header, so it never trips this gate and needs no exemption. The exclusion list does not
+exist, and neither does the thing that rots.
+
+### The template blind spot the comment rule leaves
+
+The gate requires a header to be a COMMENT, so a header inside a string literal is skipped. That rule
+is correct and it hides the lines that decide the holder of **files that do not exist yet**: literals
+that stamp headers onto generated output.
+
+A naive scan for "SPDX tag inside a string literal" finds **seven** sites, and only two are templates:
+
+| Site | Verdict |
+|---|---|
+| `messagefoundry/corepoint_import.py` | template -- stamps a module header on Corepoint import |
+| `harness/config/connscale/gen_toml.py` | template -- `_SHARED_MODULE` |
+| `scripts/quality/licence_header_check.py` (x2) | prose, and its own `SPDX_TAG` constant |
+| `tests/test_licence_header_gate.py` (x3) | prose, and two test fixtures |
+
+The discriminator is **adjacency**: a template carries the SPDX line and a copyright line together
+inside one literal; prose quotes the tag alone and continues into sentences. A path list was rejected
+as the same enumeration mistake one level down. The test asserts **identities**, not a count, because
+two results can be the wrong two.
+
+### Status, stated honestly
+
+The gate runs wherever the licence-header gate already runs -- the `licence-header` pre-commit hook and
+the CI step -- so it needs no new entry point. It is **advisory until branch protection requires it**:
+it is deliberately not in `.github/required-contexts.txt`, since adding it needs an owner-only
+branch-protection change plus the pinned count in `tests/test_required_contexts.py` moving in the same
+PR. **Requiring it is the step that actually closes the window** (ADR 0158, silent controls).
+
+Measured at the time of filing: 1494 in-scope files checked, 9 violations found and swept, gate green
+on first run. The one vendored Apache-2.0 file is exempt through the existing `VENDORED_LICENCES`
+registry rather than a second list -- stamping this project's holder on third-party code is the same
+affirmative misstatement the licence half exists to prevent.
