@@ -14606,7 +14606,7 @@ commit.**
 
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
-> ✅ **SHIPPED 2026-09-10 -- a NULL column is NOT READ, and an incomplete read is never `OBSERVED`.**
+> 🚧 **Built 2026-09-10 -- a NULL column is NOT READ, and an incomplete read is never `OBSERVED`.**
 > `probe_principal_privileges` in `messagefoundry/store/sqlserver.py` now classifies every probed grant
 > three ways -- held, not held, or not read -- and returns `UNOBSERVABLE`, naming each unread grant, as
 > soon as any column comes back NULL. That routes straight through the arm already built for *"could
