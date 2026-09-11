@@ -307,38 +307,73 @@ _ECHOES = 6
 #: The paced arm's bucket capacity. ``_MessagePacer`` clamps capacity to ``max(burst, 1.0)``, so 1.0
 #: is the smallest burst that means what it says.
 _PACED_BURST = 1.0
-#: How many associations must actually WAIT. The bucket starts full, so the first ``capacity`` go
-#: free on the initial tokens and one more goes free at a deficit of exactly zero; every later
-#: arrival waits ``1 / rate``. Derived from the schedule in the test docstring, not guessed -- an
-#: earlier draft guessed ``N - burst`` and was wrong by exactly this one.
+#: How many arrivals must WAIT, and so how many entries the pacer's decision record must hold.
+#: Derived from the schedule in the test docstring, never written as a literal -- an earlier draft
+#: guessed ``N - burst`` and was wrong by exactly this one.
 _PACED_STEPS = _ECHOES - 1 - _PACED_BURST
 #: How far the pacing floor is held above the MEASURED control. It sets the test's wall time (about
 #: ``_SEPARATION`` times the control arm) and it sets how much slower per association the paced arm
-#: would have to run, for a reason other than pacing, before the measurement stopped discriminating.
+#: would have to run, for a reason other than pacing, before either timing arm stopped discriminating.
 _SEPARATION = 4.0
-#: Asserted at this fraction of the derived floor. The floor is an exact lower bound on the paced
-#: arm in the bucket arithmetic, so this absorbs only an ``Event.wait`` that returns marginally
-#: early -- it is not slack for runner speed, which the derived rate already handles.
-_PACED_MARGIN = 0.8
-#: Above this rate a step is under 0.1 s, close enough to the Windows timer granularity (about
-#: 15.6 ms) that the schedule stops being the thing measured. Clamping here only RAISES separation.
-_RATE_CEILING = 10.0
-#: Below this rate a step runs over 5 s, and a wait that outlasts the SCU's ACSE timeout becomes an
-#: abort on the sender's side -- a refusal this control is otherwise careful never to make, and one
-#: this test would then misreport as the pacer refusing. Clamping here LOWERS separation, which is
-#: why the assertion below reads the floor back from the clamped rate and checks it still separates.
-#: It also caps the paced arm at ``_PACED_STEPS / _RATE_FLOOR`` seconds, which is what keeps a
-#: derived rate from walking this test into the ``--timeout=60`` watchdog on a badly loaded runner.
-_RATE_FLOOR = 0.2
+#: Below this the floor no longer separates from the control and the wall-clock arm could be
+#: satisfied by machine speed alone, so the test says that rather than passing.
+_MIN_SEPARATION = 2.0
+#: The wall-clock arm is asserted at this fraction of the floor. The floor is an exact lower bound in
+#: the bucket arithmetic, so this absorbs only an ``Event.wait`` that returns early -- measured 0 of
+#: 240 early returns on Windows (``tests/_pace_probe.py``), so the slack is deliberate headroom on a
+#: mechanism that has never been observed, not a tolerance the derivation needs.
+_PACED_MARGIN = 0.75
+#: Shortest step the schedule may be squeezed to, in seconds. Windows' timer granularity is about
+#: 15.6 ms, so a shorter step stops being the thing measured. Clamping here only RAISES separation.
+_STEP_FLOOR_S = 0.1
+#: Longest step, in seconds. A wait that outlasts the SCU's ACSE timeout becomes an abort on the
+#: sender's side -- a refusal this control is careful never to make, and one this test would then
+#: misreport as the pacer refusing. It also caps the paced arm at ``_PACED_STEPS * _STEP_CEILING_S``,
+#: which keeps a derived rate off the ``--timeout=60`` watchdog on a badly loaded runner. Clamping
+#: here LOWERS separation, which is why ``_MIN_SEPARATION`` is checked rather than assumed.
+_STEP_CEILING_S = 5.0
 
 
-async def _echo_run(**settings: object) -> tuple[list[bool], float]:
-    """Open ``_ECHOES`` C-ECHO associations against one SCP; return what established and the elapsed
-    seconds. Serial on purpose: the bound is on the ACCEPTANCE rate, so the arrivals must queue."""
+class _WaitRecorder(threading.Event):
+    """A ``DicomScpSource._stopping`` that records every pacing wait the SCP is asked to take.
+
+    ``_stopping.wait`` has exactly ONE caller -- the wait in ``_pace_association`` -- so what lands
+    here is the pacer's decision and nothing else. The wait still happens: this records what the seam
+    DECIDED without changing what the peer experiences, which is the distinction
+    ``tests/_pace_probe.py`` draws for the egress pacer (BACKLOG #82). Recording rather than
+    substituting is why both timing arms below can be read from one run.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: Driven from N concurrent pynetdicom association threads, so the list needs its own lock.
+        self._lock = threading.Lock()
+        self._asked: list[float] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is not None:
+            with self._lock:
+                self._asked.append(timeout)
+        return super().wait(timeout)
+
+    @property
+    def asked(self) -> list[float]:
+        with self._lock:
+            return list(self._asked)
+
+
+async def _echo_run(**settings: object) -> tuple[list[bool], float, list[float]]:
+    """Open ``_ECHOES`` C-ECHO associations against one SCP; return what established, the elapsed
+    seconds, and every wait the pacer asked for. Serial on purpose: the bound is on the ACCEPTANCE
+    rate, so the arrivals must queue."""
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
     src = _scp(**settings)
+    # Installed before start(), which only clear()s it. An unpaced source registers no pacing handler
+    # at all, so its record stays empty -- that emptiness is this recorder's own negative control.
+    recorder = _WaitRecorder()
+    src._stopping = recorder
 
     async def handler(raw: bytes) -> str | None:  # pragma: no cover - C-ECHO stores nothing
         return None
@@ -360,7 +395,7 @@ async def _echo_run(**settings: object) -> tuple[list[bool], float]:
 
         start = time.monotonic()
         established = await asyncio.to_thread(run)
-        return established, time.monotonic() - start
+        return established, time.monotonic() - start, recorder.asked
     finally:
         await src.stop()
 
@@ -387,61 +422,74 @@ async def test_a_paced_scp_still_establishes_every_association() -> None:
         paced_elapsed == max(N * w, (N - 1 - capacity) / rate + 2 * w)
 
     **The two terms compete; they do not add**, and that is the whole defect in a difference
-    assertion. As a loaded runner pushes ``N * w`` up toward the pacing floor, the DIFFERENCE
-    collapses while both arms behave perfectly. Measured on CI 2026-09-11 at rate 3 and burst 1:
-    paced 1.373 s against unpaced 1.056 s, a difference of 0.317 against the required 0.5. The floor
-    there is 1.333 s, so the paced arm matched its own schedule to three decimal places -- the
-    control was the arm that had drifted, and the red named the wrong one.
+    assertion: as a loaded runner pushes ``N * w`` up toward the pacing floor, the difference
+    collapses while both arms behave perfectly. The two arms are also timed one after the other on a
+    shared runner, so they need not see the same machine at all. BACKLOG #1536 carries the CI and
+    local figures.
 
-    **The two arms also do not see the same machine.** They are timed one after the other on a shared
-    runner. On that CI run the paced arm's own work came out near 0.02 s per association against the
-    control's 0.176 s. The gap is not only noise: measured locally 2026-09-11, the control's
-    associations queue back-to-back at 0.030 s each while the paced arm's arrive into an idle SCP at
-    0.017 s, so a difference assertion is biased against itself even on a quiet box.
+    **So this asserts what the pacer DECIDED before it asserts how long the box took to obey** --
+    the rule ``tests/_pace_probe.py`` established for the egress pacer after the same class of flake
+    ejected a pull request from the merge queue (BACKLOG #82). ``_stopping.wait`` has one caller, so
+    :class:`_WaitRecorder` turns the pacing wait into a list no runner can influence, and the
+    unpaced control's own record must come back EMPTY -- that pair is what catches a recorder which
+    has stopped recording as well as one that over-records.
 
-    **So the RATE is derived from the measured control, and the assertion is on the floor that rate
-    implies.** Choose ``rate`` so the floor lands ``_SEPARATION`` times the control and the algebra
-    cancels: ``floor == _SEPARATION * unpaced_elapsed`` by construction, and ``paced_elapsed >=
-    floor`` exactly, for any ``w``. A spuriously slow control buys a proportionally lower rate and a
-    proportionally larger floor, so control noise moves both sides together. Simulated across a
-    hundredfold swing in the paced arm's speed relative to the control, the ratio never fell below
-    4.03.
+    **The wall-clock arm is kept, because the decision arm cannot see a wait that is asked for and
+    not taken.** It is made runner-proof the same way the rate is: choose ``rate`` so the floor lands
+    ``_SEPARATION`` times the measured control and the algebra cancels, since ``floor ==
+    _SEPARATION * unpaced_elapsed`` by construction and ``paced_elapsed >= floor`` exactly, for any
+    ``w``. A spuriously slow control buys a proportionally lower rate and a proportionally larger
+    floor, so control noise moves both sides together. Simulated across a hundredfold swing in the
+    paced arm's speed relative to the control, the ratio never fell below 4.03.
 
     **What must hold exactly is that all six associate in both arms** -- a bound on this plane may
     delay a modality, never turn one away.
 
-    **The residual, stated because a threshold that hides one is worse than no threshold.** The paced
-    arm could clear the floor on WORK rather than on pacing if it ran about ``_SEPARATION *
-    _PACED_MARGIN`` times slower per association than the control did. That is a silent loss of
-    discrimination, never a false red, which is the right way round for a required context; the
-    mutation arm is what keeps it honest.
+    **The residual, stated because a threshold that hides one is worse than no threshold.** Both
+    timing arms scale the schedule off the CONTROL arm's work, never the paced arm's, so a paced arm
+    running several times slower per association than the control would stop discriminating: the
+    bucket would refill between arrivals, fewer waits would be asked for, and the wall clock would
+    clear the floor on work. That is a silent loss of power, never a false red, which is the right
+    way round for a required context. The mutation arms are what keep it honest.
 
-    **Mutation arm, measured 2026-09-11.** With ``_pace_association`` returning before it consults
-    the bucket, the paced arm collapses onto the control and this assertion fails by more than
-    threefold. Recorded because a test nobody watched fail is not evidence.
+    **Mutation arms, measured 2026-09-11, quiet and under 24-way CPU load.** With
+    ``_pace_association`` returning before it consults the bucket, and again with its
+    ``EVT_CONN_OPEN`` handler never registered, the decision record comes back empty and the paced
+    arm collapses onto the control. Recorded because a test nobody watched fail is not evidence.
     """
-    unpaced, unpaced_elapsed = await _echo_run()
+    unpaced, unpaced_elapsed, unpaced_waits = await _echo_run()
+    assert unpaced == [True] * _ECHOES, "the control arm could not associate; the fixture is broken"
 
-    # Derived, not chosen: the floor has to scale with the machine, or the threshold is a guess about
-    # the runner rather than a statement about the pacer.
-    rate = min(max(_PACED_STEPS / (_SEPARATION * unpaced_elapsed), _RATE_FLOOR), _RATE_CEILING)
-    floor = _PACED_STEPS / rate
+    # Derived in floor-space, because both clamps are reasoned in step DURATIONS and the connector's
+    # knob is a rate: stating the floor directly leaves exactly one inversion, on the line below it.
+    floor = min(
+        max(_SEPARATION * unpaced_elapsed, _PACED_STEPS * _STEP_FLOOR_S),
+        _PACED_STEPS * _STEP_CEILING_S,
+    )
+    rate = _PACED_STEPS / floor
+    # Checked BEFORE the paced arm is paid for, since it condemns that arm's measurement and the
+    # clamp that causes it has already fired by here.
+    assert floor >= unpaced_elapsed * _MIN_SEPARATION, (
+        f"a control of {unpaced_elapsed:.3f}s for {_ECHOES} loopback associations clamps the "
+        f"schedule at {_STEP_CEILING_S}s per step, so the floor ({floor:.3f}s) no longer separates "
+        f"from it and the wall-clock arm below could be satisfied by machine speed alone. This "
+        f"runner is too slow for that arm to discriminate"
+    )
 
-    paced, paced_elapsed = await _echo_run(
+    paced, paced_elapsed, paced_waits = await _echo_run(
         max_associations_per_second=rate, association_burst=_PACED_BURST
     )
 
-    assert unpaced == [True] * _ECHOES, "the control arm could not associate; the fixture is broken"
     assert paced == [True] * _ECHOES, "pacing REFUSED an association; it may only ever wait"
-    assert floor >= unpaced_elapsed * 2.0, (
-        f"the pacing floor ({floor:.3f}s at {rate:.3f}/s) does not separate from the control "
-        f"({unpaced_elapsed:.3f}s), so the assertion below could be satisfied by machine speed "
-        f"alone. Either _RATE_FLOOR clamped the derived rate, which means this runner needs over "
-        f"{_PACED_STEPS / _RATE_FLOOR / _SEPARATION:.1f}s for six loopback associations, or "
-        "_SEPARATION was edited below 2.0"
+    assert unpaced_waits == [], (
+        f"the unpaced control asked for {len(unpaced_waits)} pacing wait(s), but it has no pacer at "
+        "all -- the recorder is attributing something else's wait to the bound"
+    )
+    assert len(paced_waits) == int(_PACED_STEPS), (
+        f"the pacer decided on {len(paced_waits)} wait(s) where the schedule says "
+        f"{int(_PACED_STEPS)} at {rate:.3f}/s with a burst of {_PACED_BURST}: {paced_waits}"
     )
     assert paced_elapsed >= floor * _PACED_MARGIN, (
-        f"pacing applied no measurable delay: paced {paced_elapsed:.3f}s against a floor of "
-        f"{floor:.3f}s derived from {rate:.3f}/s, itself derived from an unpaced control of "
-        f"{unpaced_elapsed:.3f}s"
+        f"the pacer asked for {sum(paced_waits):.3f}s of waiting but the paced arm took only "
+        f"{paced_elapsed:.3f}s against a floor of {floor:.3f}s, so the waits were not taken"
     )

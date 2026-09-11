@@ -30532,26 +30532,61 @@ On that CI run the paced arm's own work implies about 0.02 s per association aga
 paced arm's arrive into an idle SCP at 0.017 s, so a difference assertion is biased against itself
 even with nothing else running.
 
-### The fix derives the rate from the measured control, so control noise cancels
+### The fix asserts what the pacer DECIDED, then how long the box took to obey
 
-The rate is no longer a constant. It is chosen so the pacing floor lands `_SEPARATION` times the
-control arm that was just measured, and the assertion is on that derived floor:
+The repository had already answered this once. `tests/_pace_probe.py` retired an elapsed-time pacing
+assertion under **#82** after the same class of flake ejected a pull request from the merge queue,
+and it states the rule: assert what the seam decided, "which no runner can influence, instead of how
+long the box took to obey." Its module docstring also argues against a multiplicative tolerance. That
+argument does not land on a derived *rate* -- the floor here genuinely scales with the runner -- but
+the decision arm it recommends is strictly better, and the DICOM seam turned out to be probeable.
+
+`_stopping.wait` has exactly one caller, the pacing wait in `_pace_association`, so a `threading.Event`
+subclass records what the pacer asked for and nothing else. The wait still happens, so one run yields
+both arms:
 
 ```python
-rate = min(max(_PACED_STEPS / (_SEPARATION * unpaced_elapsed), _RATE_FLOOR), _RATE_CEILING)
-floor = _PACED_STEPS / rate
-assert paced_elapsed >= floor * _PACED_MARGIN
+assert unpaced_waits == []                          # the recorder's own negative control
+assert len(paced_waits) == int(_PACED_STEPS)        # the DECISION: exact, runner-immune
+assert paced_elapsed >= floor * _PACED_MARGIN       # the peer actually waited
 ```
 
-`floor == _SEPARATION * unpaced_elapsed` by construction and `paced_elapsed >= floor` exactly, so a
+Measured on a quiet box: the control arm records `[]` every run, and the paced arm records exactly
+four waits every run, at `1 / rate` less the work each arrival absorbed.
+
+The wall-clock arm is kept because the decision arm cannot see a wait that is asked for and not
+taken. It is made runner-proof the same way: the rate is chosen so the floor lands `_SEPARATION`
+times the control just measured, computed in floor-space because both clamps are reasoned in step
+durations.
+
+```python
+floor = min(max(_SEPARATION * unpaced_elapsed, _PACED_STEPS * _STEP_FLOOR_S),
+            _PACED_STEPS * _STEP_CEILING_S)
+rate = _PACED_STEPS / floor
+```
+
+`floor == _SEPARATION * unpaced_elapsed` while unclamped, and `paced_elapsed >= floor` exactly, so a
 spuriously slow control buys a proportionally lower rate and a proportionally larger floor and both
-sides of the comparison move together. Simulated across a hundredfold swing in the paced arm's speed
-relative to the control, the ratio never fell below 4.03.
+sides move together. Simulated across a hundredfold swing in the paced arm's speed relative to the
+control, the ratio never fell below 4.03.
 
-### Both arms were watched, and the load arm is the one that settles it
+### Three mutations, and they do not land on the same assertion
 
-Under 24 spinning processes on 20 cores, running the old and new assertions against the **same**
-machine conditions in the same trial:
+| Mutation | What fires | Result |
+| --- | --- | --- |
+| `_pace_association` returns before it consults the bucket | decision arm | RED: "decided on 0 wait(s) where the schedule says 4" |
+| `EVT_CONN_OPEN` handler never registered | decision arm | RED, same message |
+| `_stopping.wait(0.0)` -- the wait is asked for and not taken | wall-clock arm | RED: paced 0.187 s against a 0.806 s floor |
+
+The third is why both arms are kept: the decision arm passes it, recording four waits, and only the
+wall clock sees that none was honoured. Each mutation was applied and restored; the first was also
+run under load, three times, where it reds by a wider margin because the derived rate falls with the
+runner.
+
+### The load arm is what settles the original defect
+
+Under 24 spinning processes on 20 cores, running the retired and replacement assertions against the
+**same** machine conditions in the same trial:
 
 ```
  #  unpaced | OLD paced   delta  >=0.5 |   rate  floor NEW paced  thresh   ok
@@ -30560,32 +30595,108 @@ machine conditions in the same trial:
  5    1.833 |     1.689  -0.145    RED |  0.545  7.333     7.731   5.867 pass
 ```
 
-Six trials, old assertion red 6/6 -- three of them with a **negative** difference, the paced arm
-finishing ahead of its own control -- and the new assertion green 6/6. Every arm established all six
-associations in every trial, which is the property that had to survive.
+Six trials, the retired assertion red 6/6 -- three of them with a **negative** difference, the paced
+arm finishing ahead of its own control -- and the replacement green 6/6. Every arm established all
+six associations in every trial, which is the property that had to survive. The finished test then
+passed 5/5 under the same load.
 
-Mutation, two independent forms, each applied and restored:
+### What it costs, because the paced arm now scales with the runner
 
-| Mutation | Quiet | Under load |
+The old paced arm was pinned near 1.33 s whatever the machine did. The new one is `_SEPARATION` times
+the control, so break-even is a control of about 0.34 s: below that the test got faster, above it
+slower in proportion. On a quiet box here the whole test runs about 0.9 s against 1.55 s before. On
+the CI leg that went red (control 1.056 s) it goes from about 2.4 s to about 5.3 s. Under 24-way
+oversubscription it measured 12 to 16 s.
+
+`_STEP_CEILING_S` caps the paced arm at `_PACED_STEPS * _STEP_CEILING_S` = 20 s, and the separation
+guard rejects a control above 10 s, so a passing run cannot exceed about 30 s against a
+`--timeout=60` on ubuntu and `--timeout=120` on the Windows legs. The suite runs this file 10 or more
+times per merged pull request, which puts the added cost near 0.2 percent of a test step that runs 20
+to 36 minutes. Paid deliberately: the gate is red today, and the alternative is a cheaper threshold
+that cannot discriminate.
+
+### The census found the SPELLING was unique; the SHAPE is not, and that distinction is the finding
+
+Swept `tests/` and `packaging/messagefoundry-webconsole/tests/`, 826 modules. **No other test
+subtracts one measured duration from another** -- the needle finds the retired line and nothing else,
+against a negative control confirming it does find the pre-fix line.
+
+**That is a census of one spelling, not of the hazard.** The class is "a wall-clock comparison across
+separately-timed arms on a shared runner", and a ratio is the same comparison as a difference.
+`.github/workflows/ci.yml:1503-1505` already records two members going red under contention, and
+`tests/test_benchmark_parser.py:241` asserts a ratio of two separately-timed arms, deliberately
+weakened from a 6x bar to `> 1.0` for this same reason and printing the number instead. Anyone
+reading the uniqueness line as a clean bill of health for the repository would be reading a fact
+about a regular expression.
+
+### The sibling pacing tests have the MIRROR defect, and it is filed as #1538
+
+`tests/test_ingress_message_pacing.py:211`, `:226`, `:309` and `tests/test_mllp_message_pacing.py:156`
+bound a single paced arm against a fixed constant with no control arm. A slow runner only pushes the
+measured value further above the threshold, so **those cannot red on runner speed** -- their exposure
+is the opposite one, and each already records a watched mutation in its docstring. Left alone here:
+none is failing, and changing a green test inside the pull request that fixes a red one hides the
+fix. Filed as **#1538** so the finding does not archive with this item.
+
+An earlier draft of this row named `tests/test_security_doc_rate_limits.py` as a third such module.
+That was wrong and is retracted here rather than deleted: it is a 1,653-line doc-drift guard over
+`docs/SECURITY.md` and contains no timing construct at all (grep for `elapsed`, `monotonic`,
+`perf_counter`, `time.sleep`, `time.time` returns zero). The enumeration was written from the module
+list that mentions the pacing KEYS, not from the ones that measure time.
+
+## 1538. four ingress pacing tests bound a single paced arm against a fixed constant, so a slow enough runner passes them on work alone
+
+> 🔢 **Filed 2026-09-11 from the #1536 census. Not started.** Value **4/10** · Difficulty **3/10**. Value 4 -- none of the four is failing and none can red on runner speed, so this is a power problem rather than a queue problem; it is worth doing because a guard that cannot fail is worse than one that reds, since a red gets fixed. Difficulty 3 -- #1536 has already built and measured the pattern that replaces them, and the stream intakes' unpaced control is nearly free.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test invariance / ingress pacing. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). `_MessagePacer` and the four intakes that drive it are not
+in question. This is about what the tests over them would still catch on a slow runner.
+
+### The four sites
+
+| Site | Assertion | Fixture |
 | --- | --- | --- |
-| `_pace_association` returns before it consults the bucket | RED, paced 0.167 s against a 0.553 s threshold | RED 3/3, paced 3.622 s against a 19.909 s threshold |
-| `EVT_CONN_OPEN` handler never registered | RED, paced 0.172 s against a 0.541 s threshold | not run; the first mutation covers the wait |
+| `tests/test_ingress_message_pacing.py:211` | `elapsed >= _MIN_DELAY` | raw TCP, 12 frames, 20/s, burst 2 |
+| `tests/test_ingress_message_pacing.py:226` | `elapsed >= _MIN_DELAY` | X12, 12 interchanges, same |
+| `tests/test_ingress_message_pacing.py:309` | `elapsed >= 0.3` | HTTP, 12 requests on 12 connections |
+| `tests/test_mllp_message_pacing.py:156` | `elapsed >= 0.3` | MLLP, 12 messages, same |
 
-The margin **grows** as the runner slows, because the derived rate falls with it. That is the
-property the fixed delta had backwards.
+`_MIN_DELAY = 0.3` at `tests/test_ingress_message_pacing.py:197`, against a debt of `(12 - 2) / 20`
+= 0.5 s the fixture comment derives in place.
 
-### The pattern was unique to this test, which is worth recording because it looks common
+### They are the MIRROR of #1536, which is why they are not red
 
-Swept `tests/` and `packaging/messagefoundry-webconsole/tests/`, 826 modules. **No other test in the
-corpus subtracts one measured duration from another**; the needle finds the retired line and nothing
-else, against a negative control that it does find the pre-fix line.
+#1536 retired a fixed absolute DIFFERENCE between two separately-timed arms; that can red on runner
+speed, and did. These four bound a SINGLE paced arm from below with no control, so a slow runner only
+pushes the measured value further above the constant. **None of them can red on runner speed.**
 
-The three sibling pacing modules -- `test_ingress_message_pacing.py`, `test_mllp_message_pacing.py`,
-`test_security_doc_rate_limits.py` -- do use fixed absolute constants, at
-`test_ingress_message_pacing.py:211`, `:226`, `:309` and `test_mllp_message_pacing.py:156`. They are
-a **different shape and a different failure mode**: each is a lower bound on a single paced arm with
-no control, so a slow runner only pushes the measured value further above the threshold. Those cannot
-red on runner speed. Their exposure is the opposite one -- on a runner slow enough for the unpaced
-work alone to clear the constant, they would pass without discriminating. Each already records a
-watched mutation in its docstring. Left alone here: none is failing, and changing a green test in the
-pull request that fixes a red one hides the fix.
+Their exposure runs the other way. On a runner slow enough for the 12 frames' own work to reach
+0.3 s, the assertion would be satisfied with the pacer removed, and nothing would report it. That is
+the trap the DICOM test's own docstring was written to prevent, quoted there from its first draft:
+a threshold satisfied by the baseline proves nothing. Each of the four already records a watched
+mutation in its docstring, so the power was real when written; what is missing is anything that keeps
+it real as runners change.
+
+### The replacement already exists and is measured
+
+`tests/_pace_probe.py` (BACKLOG #82) states the rule -- assert what the seam decided, not how long the
+box took to obey -- and #1536 applied it to the DICOM seam with a `threading.Event` subclass that
+records the waits the pacer asks for while still taking them. The stream intakes drive the pacer
+through `pace()`/`settle()` rather than `deficit()`/`charge()`, so the schedule differs and the DICOM
+recorder does not transfer unchanged, but the shape does.
+
+**Do not build one shared self-calibration helper for all five sites.** The two drive protocols
+produce genuinely different schedules, and a helper parameterised over both is a larger abstraction
+than either caller needs. If a shared thing is built, build the probe, because it makes the wall
+clock irrelevant at every site instead of calibrating against it at every site.
+
+### One documentation gap found alongside, worth folding in
+
+The emergent multi-arrival schedule of the `deficit()`/`charge()` protocol,
+`max(N * w, (N - 1 - capacity) / rate + 2 * w)`, is written down only in a DICOM test docstring.
+`_MessagePacer` documents both drive protocols and neither schedule. The DICOM test's own history is
+two wrong derivations in three drafts. A cross-reference comment beside `deficit()` would cost one
+line; a `schedule()` method would be product surface built to serve a test, which section 4 forbids.
