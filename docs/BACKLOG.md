@@ -31193,3 +31193,73 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+---
+
+## 1541. the SQL Server cluster coordinator namespaced its lease key by a db_schema its store never reads, so two installs on one database would elect two leaders over one queue
+
+> 🚧 **Built 2026-09-11 by a Builder on branch `claude/sqlserver-lease-schema`, PR 1056, in branch commits `cce2db39c` and `7bb408d8b`. Open until that PR merges, when the Lander flips this banner.** Value **7/10**, Difficulty **2/10**. `SqlServerCoordinator` built its leadership lease key and its DDL applock name from `[store].db_schema`. The SQL Server store never reads that setting, so the key split by schema while the tables it guards stayed shared. The fix makes both keys constant on SQL Server and refuses `db_schema` at load on every backend but Postgres. Value 7: the failure is two leaders over one queue, though only under one misconfiguration. Difficulty 2: two constants, one validator and one doc row.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** HA / clustering. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). The defect is real and shipped. On `main` at `8c1ad29d8`, the SQL Server coordinator derives its lease key from `db_schema`. The exposure is conditional, because there are zero deployments. Two installs on one SQL Server database with different `db_schema` values would elect separately on first deployment. Each would then run a leader over one shared queue.
+
+### Two leaders break the premise the SQL Server design rests on
+
+The SQL Server coordinator is active-passive only. Its module docstring says "The single active node (the leader) drains every lane". It also skips the startup `reset_stale_inflight`, which "would steal a live sibling's rows", and runs it on promotion instead. Both rules assume one leader. With two, duplicate delivery is the expected result. No test here ran two leaders, so that outcome is inferred from the design, not measured.
+
+### The key split by schema while the tables stayed shared
+
+Measured at `8c1ad29d8` with `git show` and a per-line match:
+
+| Measure | Value |
+|---|---|
+| `messagefoundry/store/sqlserver.py` length | 10,288 lines |
+| Lines naming `db_schema` in that file | 0 |
+| Control: lines naming `_settings` in the same file | 16 |
+| Control: lines naming `db_schema` in `store/postgres.py` | 7 |
+| `CREATE TABLE` statements in the SQL Server store / its coordinator | 32 / 3 |
+| Of those, schema-qualified | 0 |
+
+The qualified-name pattern matched `CREATE TABLE dbo.nodes` and `CREATE TABLE [mefor].[nodes]` before it was trusted, so that zero is real. A plain line count gives the coordinator 4, because a docstring also names `CREATE TABLE`. The brief that raised this row cited 9,787 lines for the store, a figure from an older tree.
+
+Unqualified names resolve against the login's default schema, whatever `db_schema` says. So two installs that differed only in `db_schema` would share every table, including `leader_lease` and `nodes`. Each would hold its own lease row, keyed by its own schema, so each would elect its own leader. The DDL applock would split the same way. A concurrent first open would then no longer be serialized across the two installs.
+
+The same key derivation is correct on Postgres. `PostgresStore` points the pool's `search_path` at `db_schema`, so each schema there has its own tables.
+
+### The natural wrong reading: "the store never reads db_schema, so the key always fell back to dbo"
+
+A reader who searches `store/sqlserver.py` finds no `db_schema`. The easy next step is to decide that the old `getattr(..., "db_schema", None) or "dbo"` always fell through to `"dbo"`. Both installs would then share one key and elect together, which would be safe. **That reading is wrong.**
+
+`db_schema` is a field on `StoreSettings` in `messagefoundry/config/settings.py`. It is set from `[store].db_schema` or from the env var `MEFOR_STORE_DB_SCHEMA`. The SQL Server store keeps that settings object as `self._settings`. The old coordinator read `db_schema` off `store._settings`, not off the store module. So the setting reached the key even though the store never used it. **Absent from the implementation is not absent from the settings.**
+
+Measured by the Builder that filed this row, not relayed. It loaded the coordinator from `8c1ad29d8` and gave it a real `SqlServerStore`. The store's settings carried no schema, then a schema read through `MEFOR_STORE_DB_SCHEMA`, then a third schema. They were built with `model_construct`, because the fixed validator now refuses them. The store module's text names no `db_schema`, yet the old coordinator produced three lease keys: `dbo:mefor_cluster_leader`, `tenant_a:mefor_cluster_leader` and `tenant_b:mefor_cluster_leader`. The fixed coordinator produced one.
+
+### The recurrence shape: a mirrored comment whose premise holds only in the original
+
+`SqlServerCoordinator` in `pipeline/cluster_sqlserver.py` is a hand-mirror of the Postgres coordinator, `DbCoordinator` in `pipeline/cluster.py`. Its module docstring says the in-memory pieces "are copied verbatim and only the DB layer differs". Its comments say "Mirrors DbCoordinator" and "keep the two in lockstep".
+
+**A hand-mirrored backend copy carries a comment whose premise is TRUE in the original and FALSE in the copy, and nothing compares the two.** Here the namespacing line came across with its comment: "Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two deployments sharing one database via different schemas don't contend / co-elect." That premise holds on Postgres, where `search_path` separates the tables. It is false on SQL Server, where nothing does.
+
+A mirror carries two kinds of line. Mechanism lines, such as the fence math, should match. Premise lines depend on what that backend's store actually does, so each must be re-derived. Nothing marks which kind a line is, and a "keep the two in lockstep" comment pushes a reader to copy both.
+
+The test suites mirrored it too. The SQL Server store tests and the pooled-rider test seeded `dbo:mefor_cluster_leader`, a string only the old derivation produced. Expect the next instance wherever a backend file says it mirrors another.
+
+### What was built
+
+1. `SqlServerCoordinator`'s keys are constants: `mefor_cluster_leader` and `mefor_cluster_nodes`. Installs that share tables now share the election and the DDL lock.
+2. `StoreSettings._db_schema_backend` refuses a non-empty `db_schema` on `sqlserver` and `sqlite` at load, because neither store reads it. Its docstring holds the reasoning, and the comments on both coordinators point at it.
+3. `build_coordinator` reads `db_schema` only on the Postgres path.
+4. `docs/CONFIGURATION.md` gives `db_schema` its own row, marked Postgres only, and `docs/CLUSTERING.md` links to it.
+
+PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignores_db_schema` and both cases of `test_db_schema_refused_off_postgres` fail without the fix and pass with it. No Postgres assertion was removed.
+
+**Rejected:** making the SQL Server store honour `db_schema` by qualifying every table. That rewrites the store, its claim procedures and its privilege probe to close a two-leader window. If several installs on one SQL Server database are ever wanted, that is a feature with its own row (unfiled).
+
+### Left open
+
+- Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
+- The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
+- Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
