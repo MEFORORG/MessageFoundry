@@ -81,7 +81,6 @@ namespace MessageFoundry.NetHelper
                     expected = new[] { "op", "address", "interface", "mask" };
                     break;
                 case "release":
-                case "arp":
                     expected = new[] { "op", "address", "interface" };
                     break;
                 default:

@@ -481,20 +481,32 @@ acceptance*, and records what the engine-side controller must not re-derive.
   `FILE_FLAG_FIRST_PIPE_INSTANCE` and reuses that instance for every caller. If another process created the
   name first, the helper refuses to start rather than serve under that process's ACL. **The cost falls on
   the controller:** a request can wait behind another caller for up to 20 seconds with today's timeouts (a
-  5-second read, a 10-second netsh cap, a 5-second close). That is longer than the release budget, so the
-  controller must not overlap calls near a fence.
+  5-second read, a 10-second budget for the work, a 5-second close). That is longer than the release
+  budget, so the controller must not overlap calls near a fence. The 10 seconds is a budget for the whole
+  REQUEST, deliberately: `bind` runs netsh twice when it re-plumbs, and a per-run cap would silently make
+  this published figure 30 seconds.
 - **Bind and release.** `netsh interface ipv4 add|delete address ... store=active`, run by full path. The
   active store means a rebooted node does not come back holding the VIP. `bind` adds
   `skipassource=true`, so the engine's own outbound connections, the lease heartbeat among them, never
-  take the VIP as their source. Both are idempotent. Neither has yet run against a real adapter.
-- **`arp` is not a sender-equals-target gratuitous ARP, and that is measured.** On Windows 11 on
-  2026-09-10, `SendARP` for the host's own address returned in about 1 ms with the host's MAC, while two
-  unused neighbours each took about 3.1 s and failed. The IP helper answers a local address without
-  transmitting. So `arp` sends an ARP request to the adapter's IPv4 gateway with the VIP as source. Under
-  RFC 826 that updates the gateway's entry and any host already caching the VIP. **Nobody has verified
-  that Windows puts the VIP in the sender field**; that needs a capture on a Windows Server node before
-  the controller relies on `arp`, and BACKLOG #1522 tracks it. The helper refuses to announce an address
-  the node does not hold.
+  take the VIP as their source. `release` is idempotent. `bind` is idempotent in its RESULT but not in its
+  actions: see the next bullet. Both ran against a real adapter for the first time on 2026-09-11 and
+  behaved as designed, `skipassource=true` included.
+- **The bind is the announcement. `arp` was deleted (2026-09-11, BACKLOG #1522).** Captured on Windows
+  Server 2025 build 26100.33296: the `arp` op put an ARP request on the wire targeting the gateway, but
+  its **sender protocol address was the adapter's own primary IPv4, not the VIP** — reproduced with the
+  gateway's neighbour entry flushed and cached. This is not a defect in the call. Microsoft documents
+  `SendARP`'s `SrcIP` as an argument "used to select the interface to send the request on"; it is an
+  interface selector and was never a sender field, and `ResolveIpNetEntry2`, the documented replacement,
+  drops the parameter entirely. No user-mode mechanism controls the ARP sender field without a packet
+  driver, so the op was removed rather than repaired.
+  **What actually satisfies AC-1 is `netsh interface ipv4 add address`:** the same capture shows the stack
+  emitting duplicate-address probes and then `who-has <vip> tell <vip>` twice, unprompted, with
+  `skipassource=true` in force. AC-1 binds the obligation to THE SYSTEM, not to any one op, and the bind
+  discharges it. Two consequences the controller must not re-derive: the announcement trails the add by
+  about 5 seconds, so a returned `bind` is not a converged fence; and because Windows announces only when
+  the address is actually plumbed, `bind` now REMOVES AND RE-ADDS an address that is already present. The
+  old "already there, change nothing" path was measured emitting no frame at all — silent exactly in the
+  promotion of a node that still held the VIP from a crashed failover or a failed release.
 - **Runtime.** The helper targets .NET 10, the long-term support release serviced until November 2028. The
   owner ruled on 2026-09-10 that it pin a supported .NET, and not .NET 8 or 9, which leave support in
   November 2026. `dotnet publish` compiles it with NativeAOT into one native executable, so the server
@@ -741,7 +753,12 @@ The failover button follows the established **privileged-write** pattern, not th
   an **IPv4** gratuitous ARP. *(IPv6 NDP / unsolicited-NA is deferred for **all platforms** — a later
   cross-platform follow-up, not a Windows-specific limitation; see To resolve on acceptance.)*
   → `tests/test_cluster_vip.py::test_binds_on_promotion_before_listeners`
-  **Open: BACKLOG #1522 blocks the controller slice that builds this criterion.**
+  **The gratuitous ARP is emitted by the bind, not by a separate call** — measured 2026-09-11, BACKLOG
+  #1522; see "The helper as built". Two things this criterion does NOT yet assert, and a test cannot:
+  that the frame reached the wire on the operator's own network (that is a capture, not a CI assertion),
+  and that the address is not in `Duplicate` state, where nothing is announced and `bind` still succeeds.
+  **Still open: the helper cannot report which of those happened.** Do not read #1522's closure as
+  unblocking this criterion.
 - **AC-2** — WHEN a leader self-fences (lease not renewed within `leader_fence_timeout_seconds`), THE
   SYSTEM SHALL release the VIP locally (a non-DB action signalled synchronously from the fence) **within
   `leader_lease_ttl_seconds − leader_fence_timeout_seconds`** of the fence firing — i.e. before a standby
@@ -861,4 +878,12 @@ the build is greenlit:
   release within `ttl − fence_timeout`) / CANNOT (wedged-host VIP release); external VRRP recommended for
   the strictest posture; **Windows-only at v1**" statement for the user-facing docs
   ([CLUSTERING.md](../CLUSTERING.md), [DEPLOYMENT.md](../DEPLOYMENT.md)) when the feature ships.
-- [ ] **Gratuitous ARP sender field:** BACKLOG #1522, which blocks the controller slice.
+- [x] **Gratuitous ARP sender field** — **settled 2026-09-11 (BACKLOG #1522), as a negative.** `SendARP`
+  cannot set the sender field, the `arp` op was deleted, and the bind's own announcement is what satisfies
+  AC-1. See §"The helper as built". The capture and its `.etl` are the evidence.
+- [ ] **Announcement observability** — successor to #1522, and the reason AC-1 is still not fully
+  verifiable. `bind` reports that the stack accepted the address; it reports neither the duplicate-address
+  outcome nor whether a frame was transmitted. A `Duplicate` address announces nothing and still answers
+  `{"ok":true}`. Decide whether the helper should read the address state back and report it, and whether
+  `ArpRetryCount=0` — the documented machine-wide suppression of address-announcement ARPs, unmeasured on
+  this path — needs a startup check.
