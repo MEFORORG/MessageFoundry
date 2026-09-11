@@ -30510,7 +30510,7 @@ Both arms are `-ShowFloor -Kind adr`, which computes the identical floor without
 
 Two `git` processes, whatever the ref count. One `cat-file --batch-check` resolves every `<ref>:docs/adr` spec at once -- 7,199 specs collapse to **434 distinct trees** -- and one `cat-file --batch` reads each of those trees once.
 
-**`git rev-list --objects` over those trees was measured and rejected.** It produces the same listing as text in one process, but it dedupes by OBJECT: a tree holding `0150-alpha.md` and `0151-beta.md` with byte-identical content printed ONE name, so 0151 read as free. Re-issuing a number that is already on disk is the single failure this allocator exists to prevent. `tests/test_coord_alloc_adr_floor.py` holds that case, the side-branch case, and a `GIT_TRACE` process count that fails if the sweep starts scaling with the ref count again.
+**`git rev-list --objects` over those trees was measured and rejected.** It produces the same listing as text in one process, but it dedupes by OBJECT: a tree holding `0150-alpha.md` and `0151-beta.md` with byte-identical content printed ONE name, so 0151 read as free. Re-issuing a number that is already on disk is the single failure this allocator exists to prevent. `tests/test_coord_alloc_floor.py` holds that case, the side-branch case, and a `GIT_TRACE` process count that fails if the sweep starts scaling with the ref count again.
 
 The batched set was compared against a per-tree `ls-tree` sweep of all 434 trees before the change was accepted: identical, 181 numbers, max 0187.
 

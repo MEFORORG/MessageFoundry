@@ -181,7 +181,7 @@ function Get-Floor {
         # name that never prints is a number that reads as FREE. Measured directly, not inferred:
         # `0150-alpha.md` and `0151-beta.md` sharing one blob printed ONE name, which would re-issue
         # 0151 over a live ADR. That is the exact collision this script exists to prevent, so a faster
-        # stage 2 does not buy it. tests/test_coord_alloc_adr_floor.py holds that case.
+        # stage 2 does not buy it. tests/test_coord_alloc_floor.py holds that case.
         #
         # ANCHORING ON THE MODE IS WHAT MAKES A TEXT SCAN SAFE OVER BINARY. A tree entry is the mode,
         # a space, the name, a NUL, then 20 RAW BYTES of object id -- so raw ids are in this stream.
