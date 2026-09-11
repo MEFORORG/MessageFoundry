@@ -14606,7 +14606,55 @@ commit.**
 
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
+> ✅ **SHIPPED 2026-09-10 -- a NULL column is NOT READ, and an incomplete read is never `OBSERVED`.**
+> `probe_principal_privileges` in `messagefoundry/store/sqlserver.py` now classifies every probed grant
+> three ways -- held, not held, or not read -- and returns `UNOBSERVABLE`, naming each unread grant, as
+> soon as any column comes back NULL. That routes straight through the arm already built for *"could
+> not observe"*: a distinct log line, a distinct audit `status`, its own posture entry, and a refusal
+> under a declared `[store].require_least_privilege`. **`HAS_PERMS_BY_NAME` is covered alongside the two
+> role built-ins**, which is the limb the 2026-09-03 amendment below flagged as outside the original
+> scope -- a direct `GRANT CONTROL SERVER` NULLs on the same unresolved-name condition, so a fix to the
+> role columns alone would have left it mis-read exactly as before.
+>
+> **BOTH ARMS THIS ITEM DEMANDED ARE PRESENT AND THEIR REDS ARE DISJOINT.** Nine legs in
+> `tests/test_store_privilege_preflight.py` drive the real T-SQL arm with `_fetchone` / `_fetchall`
+> monkeypatched -- no live SQL Server and no container, so they run in the default local suite rather
+> than on a hosted leg nobody reads. Measured by reverting **only** `sqlserver.py` and re-running the
+> file: **5 of the 9 go red** on the unfixed arm, the all-NULL row reporting
+> `StorePrivilegeStatus.OBSERVED` with an empty excess list -- the false-clean reproduced verbatim --
+> and **4 stay green**: the documented least-privilege row, an honest all-zero row, a boolean-driver
+> row, and the pre-existing empty-result guard. That second set is the negative control this item's own
+> scope asked for. A fix that reported UNKNOWN for everything would have turned those four red as well,
+> and would still have passed a single-arm test.
+>
+> **Severity is unchanged and still conditional (CLAUDE.md section 0):** with zero deployments nothing
+> was ever mis-reported. What is fixed is what a first deployment would have read.
+>
+> **THE OWNER DECISION BELOW IS SUPERSEDED ON ITS OWN STATED PREMISE, AND THE PREMISE IS THE ONLY PART
+> THAT MOVED.** It reads *"Do not dispatch this"*, resting on two measurements: that
+> `messagefoundry/store/privilege.py` was **absent** from `main`, and that
+> `require_least_privilege|least_privilege` returned **zero** hits across `messagefoundry/**/*.py`. Both
+> were true when written. Neither is true now. The preflight landed on `main` at **`6148f4181`**
+> (PR #764) on **2026-09-09**, and that same instrument at `origin/main` today returns **3** files for
+> `require_least_privilege` -- `api/app.py`, `config/settings.py`, `store/privilege.py` -- against a
+> POSITIVE CONTROL of **3** files for `require_managed_identity` on the same instrument and the same
+> ref. **Nothing here reverses the owner's POLICY ruling**, which is #1008's and is untouched: this row
+> is a code defect and was independent of that ruling by its own filing.
+>
+> **THE BANNER SAT ABOVE A CORRECTION OF ITSELF FOR SEVEN DAYS, WHICH IS THE REUSABLE PART.** This
+> item's newest amendment -- *"THE CLEARING CONDITION IS MET"* -- landed inside merged PR #764 and is
+> written at the FOOT of the row, while the *"do not dispatch"* banner it answers stayed at the head.
+> A reader trusts the head and re-checks it last, so the row read blocked and startable at once. That
+> is the intra-item contradiction #1235 records twice and #1241 records once, now a fourth instance:
+> **correcting a body does not correct the banner that summarises it**, and the two fail in both
+> directions.
+>
+> **ONE INCONSISTENCY IS LEFT STANDING DELIBERATELY, BECAUSE IT IS NOT THIS ROW'S TO FLIP.** #1008
+> still carries its 2026-09-03 ruling to keep the preflight deferred, while the preflight is on `main`.
+> That is real, it belongs to #1008, and flipping it is the owner's act. It is recorded here only so a
+> reader arriving from that row does not conclude this one was closed against a live defer.
+>
+> **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
 >
 > **OWNER DECISION 2026-09-03 -- RECORDED AS BLOCKED, NOT DISPATCHED. The measurement below was re-taken
 > today rather than trusted:** the amendment further down is three weeks old, and this seat spent the day
