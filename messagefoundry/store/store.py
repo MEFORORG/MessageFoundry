@@ -8178,11 +8178,25 @@ class MessageStore:
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op instead of the IntegrityError
         # that UNIQUE(username) would otherwise raise on a background pass.
         #
-        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the measured note in postgres.py's copy.
-        # This backend serialises its writes behind `self._lock`, so the interleave measured on
-        # PostgreSQL is not reachable through THIS store; that is a property of the lock, not of the
-        # statement, and it would be lost the moment a second process shared the file. The residual
-        # is absorbed at the call site (`_refresh_cached_username`) for every backend alike.
+        # ON THIS BACKEND THE GUARD DOES HOLD UNDER CONCURRENCY, unlike PostgreSQL and SQL Server --
+        # and the REASON is not the one an earlier version of this comment gave.
+        #
+        # MEASURED: 150 concurrent pairs / 300 calls, SEPARATE CONNECTIONS per call, zero exceptions
+        # and 150 clean UPDATE 0s. SQLite serialises WRITERS AT THE FILE LEVEL, so the losing side
+        # BLOCKS until the winner commits and then re-evaluates its NOT EXISTS against committed
+        # data -- which is exactly the no-op the guard promises. Compare postgres.py's copy: there the
+        # loser's snapshot predates the winner's commit, so its guard passes and the write raises.
+        #
+        # THE EARLIER COMMENT CREDITED `self._lock` AND SAID THE PROPERTY "would be lost the moment a
+        # second process shared the file". That was wrong, and wrong in the direction that invites
+        # damage: SQLite's locks are per-connection at the OS file level, so the guarantee SURVIVES
+        # the ADR 0037 engine-shard model (N processes, ONE store) rather than dying under it. An
+        # understated guarantee is an invitation to "fix" something that is not broken.
+        # (Caveat from the measurement: separate connections in ONE process, which models separate
+        # processes for SQLite's file locking but is not literally multi-process.)
+        #
+        # The residual is still absorbed at the call site (`_refresh_cached_username`) for every
+        # backend alike -- this store must not be the reason that handler looks unnecessary.
         now = time.time() if now is None else now
         async with self._lock:
             await self._db.execute(

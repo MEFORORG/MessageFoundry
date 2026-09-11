@@ -9971,10 +9971,20 @@ class SqlServerStore:
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the pyodbc
         # IntegrityError that UNIQUE(username) would raise on a background pass.
         #
-        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the measured note in postgres.py's copy.
-        # This backend takes READ COMMITTED with locking rather than MVCC, so its interleave differs
-        # in shape from PostgreSQL's; it is not measured here, and the residual is absorbed at the
-        # call site (`_refresh_cached_username`) by MRO name, which covers whichever class surfaces.
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the mechanism in postgres.py's copy.
+        #
+        # THIS BACKEND FIRES HARDEST OF THE THREE. Measured, 120 concurrent pairs, autocommit,
+        # separate connections: 97 raise (81%) against PostgreSQL's 60%, with 23 guards holding. An
+        # earlier version of this comment guessed only that locking rather than MVCC would make the
+        # interleave "differ in shape"; that was right about the mechanism and wrong about the
+        # direction, if one expected locking to serialise it away the way SQLite's file-level writer
+        # lock does (store.py's copy).
+        #
+        # The class that surfaces is `pyodbc.IntegrityError`, whose MRO carries the literal name
+        # `IntegrityError`. The residual is absorbed at the call site (`_refresh_cached_username`) by
+        # MRO name, and that predicate was verified against all three real driver classes rather than
+        # assumed -- see its comment, which records why the test is on "Integrity" and not on
+        # "IntegrityError".
         #
         # As with get_user_by_directory_object_id above, the name comparison is the DATABASE's and
         # this column carries no explicit COLLATE: under a case-insensitive server default this guard

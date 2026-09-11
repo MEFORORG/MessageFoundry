@@ -2340,6 +2340,22 @@ class AuthService:
             # them here would make this module import-aware of every driver and silently stop covering
             # a backend added later. Anything that is NOT an integrity violation re-raises untouched,
             # so a genuine store fault still reaches the caller.
+            #
+            # THE TEST IS ON "Integrity", NOT ON "IntegrityError", AND THAT IS LOAD-BEARING. Measured
+            # against the three real driver classes on this interpreter:
+            #     asyncpg.UniqueViolationError  -> UniqueViolationError, IntegrityConstraintViolation-
+            #                                      Error, PostgresError, ...   NO class named
+            #                                      "IntegrityError" anywhere in the MRO
+            #     pyodbc.IntegrityError         -> IntegrityError, DatabaseError, Error, ...
+            #     sqlite3.IntegrityError        -> IntegrityError, DatabaseError, Error, ...
+            # So tightening this to "IntegrityError" would cover the two backends that need it LEAST
+            # and miss PostgreSQL -- the one where the race was measured firing 60% of contended pairs
+            # (store/postgres.py). The "UniqueViolation" arm catches asyncpg a second way, which is
+            # belt-and-braces rather than redundancy: either term alone covers it, both together mean
+            # a rename of one asyncpg class cannot silently drop the backend.
+            #
+            # THIS APPLIES TO THE TWO SIBLING SITES TOO -- they use the same two strings, so anyone
+            # "fixing" the predicate here should not fix it there either.
             mro = "".join(t.__name__ for t in type(exc).__mro__)
             if "Integrity" not in mro and "UniqueViolation" not in mro:
                 raise

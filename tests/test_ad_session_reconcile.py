@@ -870,6 +870,78 @@ async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name
 # --- BACKLOG #1532: the residual race the store's in-statement guard cannot close ------------------
 
 
+def _driver_integrity_errors() -> list[tuple[str, Exception]]:
+    """One real integrity exception per installed backend driver, for the absorb's MRO predicate.
+
+    **Constructed from the ACTUAL driver classes, never a stand-in.** The predicate is a string test
+    over the MRO, so a hand-rolled `class FakeIntegrityError(Exception)` would pass it by virtue of
+    its own name and prove nothing about asyncpg or pyodbc. Missing extras are skipped rather than
+    faked -- a skipped arm is honest, a faked one is a green that means nothing.
+    """
+    out: list[tuple[str, Exception]] = [("sqlite3", sqlite3.IntegrityError("dup"))]
+    try:
+        import asyncpg
+
+        # THE ONE THAT MATTERS. asyncpg's hierarchy contains NO class named `IntegrityError` -- it is
+        # UniqueViolationError -> IntegrityConstraintViolationError -> PostgresError. A predicate
+        # tightened from "Integrity" to "IntegrityError" would miss PostgreSQL, which is the backend
+        # where the race was measured firing 60% of contended pairs.
+        out.append(("asyncpg", asyncpg.UniqueViolationError("dup")))
+    except ImportError:  # pragma: no cover - the postgres extra is not installed
+        pass
+    try:
+        import pyodbc
+
+        out.append(("pyodbc", pyodbc.IntegrityError("23000", "dup")))
+    except ImportError:  # pragma: no cover - the sqlserver extra is not installed
+        pass
+    return out
+
+
+@pytest.mark.parametrize(
+    ("driver", "error"), _driver_integrity_errors(), ids=lambda v: v if isinstance(v, str) else ""
+)
+async def test_every_backend_integrity_class_is_absorbed(driver: str, error: Exception) -> None:
+    """The absorb's predicate, against EVERY installed driver's real integrity class.
+
+    The handler tests `"Integrity" in mro or "UniqueViolation" in mro`. Those two strings were chosen
+    from measurement, not taste, and the choice is invisible in the code: `"IntegrityError"` reads
+    like the obvious tightening and would silently drop PostgreSQL. This is the arm that reddens if
+    anyone makes it.
+
+    It matters beyond this method: the same two strings are the predicate at the ADR 0068 section 4
+    duplicate-label race and the BACKLOG #1256 federated-subject bind, so a tightening "fix" applied
+    across all three would break PostgreSQL coverage at every one of them.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None
+
+        async def _raise_driver_error(*a: object, **kw: object) -> None:
+            await store.create_user(user_id="winner", username="jbloggs", auth_provider="ad")
+            raise error
+
+        store.set_user_username = _raise_driver_error  # type: ignore[method-assign]
+
+        ldap.present = {"jbloggs": _principal("jbloggs", object_id=_object_id_for("jdoe"))}
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted is None, f"{driver}'s integrity class was not absorbed"
+        assert await service.identity_for_token(token) is not None
+        rows = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert len(rows) == 1 and json.loads(rows[0]["detail"])["detected"] == "write_race"
+    finally:
+        await store.close()
+
+
 async def test_a_lost_username_race_is_absorbed_and_does_not_kill_the_pass() -> None:
     """The store guard NARROWS the check-then-act window; it does not close it, so this absorbs it.
 
