@@ -24250,7 +24250,9 @@ git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # sa
 >
 > **TWO-ARM, ONE VARIABLE, because an arm that cannot go red is not a measurement.** With the routing, that module is 28 passed. Reverting the one line to `dict(os.environ)` reds exactly the new arm, on `tooling=false` -- the item's own damage shape, where the failure text accuses the workflow filter of narrowing and a reader goes off to edit ci.yml. The stub PATH is synthesised from one extensionless `git` shim rather than read off the host, so the arm is not vacuous on Linux, where `git` and coreutils share `/usr/bin`. The row also carries its own anti-vacuity control: it asserts `grep` is genuinely unreachable on that PATH before it asserts anything about the verdict.
 >
-> **TWO THINGS STAY DELIBERATELY UNSETTLED, and both keep their record below.** `bash_sees` still runs `cat` rather than a bash builtin, because settling #1216's open WSL question needs a host with working WSL and this box returns an RPC error instead of a verdict. And the probe is not widened to reject the WSL launcher: widening the sibling gate's probe is how it acquired five new fail-opens.
+> **THE RESIDUAL IS NOT A LIMB OF THIS ITEM, AND IT NOW CARRIES ITS OWN NUMBER: [#1539](#1539).** Two questions stay open and both keep their record below: `bash_sees` still runs `cat` rather than a bash builtin, and the probe is not widened to reject the WSL launcher. Neither is a limb here. This item enumerates FOUR, and its own scoring note states the remainder as *"routing that one child env through `probe_env` plus a regression arm pinning the detector verdict under a coreutils-less PATH, and flipping the banner"* -- all three of those are done. The text below already places both residuals outside: one says *"PRE-EXISTING and is NOT fixed here"*, the other that this row *"does not settle"* the question.
+>
+> **AND THE HAND-OFF TARGET BELOW IS WRONG, WHICH IS WHY #1539 EXISTS RATHER THAN A POINTER.** The paragraph below calls the builtin swap the change *"#1216 says must not be settled in either direction"*. **#1216 is CLOSED** -- shipped, verified on main 2026-08-23 -- **and its body does not contain that prohibition.** Measured over its 28 lines and 7,431 characters: `builtin` 0 hits, `settle` 0 hits, `1373` 0 hits. The same scan over THIS item's body, as the positive control, returns `builtin` 2, `settle` 3, `1216` 4 -- so the instrument finds those words where they are, and its zero over #1216 is a reading rather than a broken pattern. A closed item cannot hold a residual, so *"belongs to #1216"* was never a sentence that survived reading #1216. `tests/test_bash_probe_path.py:27` carries the same misattribution and is NOT edited here -- recorded in #1539.
 >
 > **The banner is flipped in the pull request that lands the work**, not left to the Lander: every seat now pushes its own ledger update with its own change.
 >
@@ -30487,3 +30489,25 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1539. `bash_sees` cannot tell a WSL launcher from a working bash, and the cat-versus-builtin swap that would settle it is unmeasurable without working WSL
+
+> 🔢 **Filed 2026-09-11, split out of [#1373](#1373) on closing it.** Value **4/10** · Difficulty **5/10**. #1373 recorded two residuals and handed them to #1216, **which is closed** -- so they had no open home and nothing would have reported that. This row is that home. It is a filing, not a dispatch: the work is BLOCKED on hardware, and difficulty 5 is that blocker rather than the size of the edit.
+>
+> **THE GUARD FAILS OPEN TODAY, and that is the subject.** `bash_sees` is the #1216 control that asks whether a candidate interpreter shares this process's filesystem namespace. Measured in #1373: with an inherited environment the WSL launcher **passes** it -- three trials on `origin/main` and three on the fix, `[True, True, True]` both times. It is not reachable through `require_bash` today, because under the PATH that would offer the launcher the git-derived candidates are offered first and now succeed. So this is a latent fail-open behind a working ordering, not a live defect.
+>
+> **THE OBVIOUS FIX IS THE ONE THAT MUST NOT BE TAKEN ON THIS EVIDENCE.** Swapping `cat` for a bash builtin in the probe changes what the probe MEANS against the WSL launcher, and no box available has measured that. Driving `C:\Windows\System32\bash.exe` here returns rc=1 with a UTF-16LE *"The RPC call contains a handle that diff..."* -- a Windows RPC error, so the launcher never started and never reached a filesystem namespace at all. A rejection measured on this box is evidence about RPC, in either direction. Two earlier passes read that same rejection as two different things, and their disagreement is fully explained if neither was measuring what it thought.
+>
+> **AND WIDENING THE PROBE IS HOW THE SIBLING GATE ACQUIRED FIVE NEW FAIL-OPENS**, which is why #1373 recorded this rather than quietly fixing it.
+>
+> **A DOC DEFECT TO CLEAR WITH IT, CHEAP AND INDEPENDENT OF THE HARDWARE.** `tests/test_bash_probe_path.py:27` and #1373's own body both attribute the do-not-settle prohibition to #1216. #1216 does not contain it -- measured, with a positive control, in #1373's closing note. The prohibition is real; only its cited home is wrong. #1373's row is corrected; the test file is not, and is the remaining edit.
+>
+> **PRECONDITION: a host with working WSL.** Until one exists, a pass here can only re-derive the RPC finding, which #1373 already records and which nobody should pay for twice.
+> Verdict: research
+> Research: whether the WSL launcher passes or fails `bash_sees` on a host where it actually starts -- measured, not reasoned
+> Closing-act: code
+
+**Cluster:** Test harness / instrument integrity. **Priority:** P3. **Verdict:** research.
+**Severity:** developer tooling only -- no product, engine or PHI surface, and **no deployment axis (sec. 0)**. The cost is a namespace control that would approve an interpreter it exists to reject, if the candidate ordering that currently hides it ever changes.
+
+**Related:** [#1216](#1216) shipped the resolver this guards and is closed. [#1373](#1373) fixed the coreutils-less PATH conflation and is closed; this row is its residual. [#1272](#1272) is the 126-versus-127 discrimination in the same module.
