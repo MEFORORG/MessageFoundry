@@ -31093,3 +31093,173 @@ Acceptance: inject a synthetic forbidden-file canary into a test archive, make t
 ### Verification limits
 
 Workflow logic was read, not executed. No hosted workflow ran, no release was built, and no artifact was inspected. The claim rests on the checked-in `if:` conditions and documented platform semantics.
+
+## 1553. AllowLocalSystem on a rerun leaves the old run-as account configured and then strips that account access to the data directory
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **3/10** · _no research_. On a rerun over an existing service, `-AllowLocalSystem` makes **zero** account-setting calls, so the prior run-as account stays configured while the script warns that the service will run as LocalSystem. The same empty-`$ServiceAccount` value then flows into `Set-SecureDataDirAcl`, which grants only SYSTEM and Administrators under `/inheritance:r /grant:r` -- so the account the service is still configured as loses read and write on the data directory it needs at startup.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator reconfiguring an existing service with `-AllowLocalSystem` would be told the service runs as LocalSystem while it still runs as the old account, and would then find that account locked out of its own data directory.** The wrong statement is the smaller half; the broken service is the larger one.
+
+### Measured, with the control beside it
+
+Extracted the account branches with the PowerShell AST and drove them with recording fakes. PowerShell 7.6.5. No service, no `nssm`, no `icacls`, no registry was touched -- `nssm` is not on PATH on this machine, and the ACL probe asserted `(Get-Command icacls).CommandType -eq 'Function'` before executing.
+
+| Arm | AllowLocalSystem | account-setting calls | ObjectName after | warned |
+|---|---|---:|---|---|
+| rerun over existing `CONTOSO\svc_mefor` | True | 0 | `CONTOSO\svc_mefor` | yes |
+| rerun over existing `CONTOSO\svc_mefor` | False | 1 | `NT SERVICE\MessageFoundry` | no |
+| fresh install | True | 0 | LocalSystem | yes |
+| fresh install | False | 1 | `NT SERVICE\MessageFoundry` | no |
+| positive control: rerun with explicit `-ServiceAccount` | False | 1 | `CONTOSO\svc_other` | no |
+
+The fresh-install arm is correct **by NSSM's create-time default, not by anything this script does**. The rerun arm is the defective one.
+
+Then the ACL branch that follows:
+
+    empty account (LocalSystem branch) -> icacls <DataDir> /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F
+    named account (control)            -> icacls <DataDir> /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F CONTOSO\svc_mefor:(OI)(CI)M
+
+### The existing test cannot catch it, and its comment is the assumption
+
+`tests/test_service_install_manifest.py` asserts one thing: a regex for the `Write-Warning` string. Its comment states that an unset `ObjectName` means NSSM runs as LocalSystem. The whole file is a static manifest test that reads the script as text and never executes it, so that assumption lives in prose and nothing checks it. `windows-service-smoke` confirms the gap from the other side by testing only the no-switch fresh install.
+
+### What closing looks like
+
+Set the identity explicitly when LocalSystem is selected, then read the account back before reporting success. Pass the effective account into `Set-SecureDataDirAcl` rather than the empty parameter. Cover fresh installs and reruns from both virtual and domain identities.
+
+### Verification limits
+
+Extracted functions with fakes. No service operation, no real `icacls`, no effective-access test on a real directory. Whether NSSM's create-time default is in fact LocalSystem was not measured here and is the one inherited assumption.
+
+## 1554. install-service.ps1 normalizes only -Config, so a relative -DbPath is validated against one directory and resolved against another
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **3/10** · _no research_. Only three `Resolve-Path` sites exist and none touches `-DbPath`. A relative `-DbPath`, `-DataDir` or `-AppExe` is written into the service verbatim, and `AppDirectory` is then set to the repository root, so the path resolves against a different directory than the one that validated it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator installing from their own directory would get a service pointing at a different database than the one they named.** Installing from `C:\Operator` with `--db .\data\messagefoundry.db` validates `C:\Operator\data\messagefoundry.db` and runs against `C:\EngineRepo\data\messagefoundry.db`.
+
+### The documented remedy is the thing that does not work
+
+This is the part that raises it above a latent trap. [`docs/SERVICE.md`](SERVICE.md) tells an operator whose service will not start that the cause is a relative path, and that re-running this script resolves all paths to absolute. It does not. A compensating instruction resting on a false premise is the shape **SDS-3.7** forbids, and it belongs in the first sentence of any fix.
+
+### What closing looks like
+
+Anchor `-DbPath`, `-DataDir` and `-AppExe` to the invocation directory before validation, before directory creation and before service configuration. Permit a database file that does not exist yet, since a first install legitimately has none. Assert absolute executable, database and log paths in the captured command.
+
+Acceptance: different caller and service directories, paths with spaces, and a missing database file. Correct the SERVICE.md sentence in the same change, because leaving it would keep pointing operators at a remedy that does nothing.
+
+### Verification limits
+
+Argument assignment was extracted and driven with fakes; path resolution was proven without creating a database or starting NSSM. No service operation ran.
+
+## 1555. the tray anchors its start-stall deadline to first-pending and never re-anchors on checkpoint progress, so a healthy slow start reads as wedged
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. The tray keeps the moment the service entered `START_PENDING` and never re-anchors that clock when the checkpoint advances, so total pending time is compared against a per-step wait hint. A service still publishing progress is classified wedged once the total passes the hint.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tray / service status. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator watching a healthy but slow start would see a false failure and be offered Restart, which would interrupt a start that was working.**
+
+### Measured against the real pure functions
+
+With a ten-second wait hint:
+
+| elapsed | checkpoint | state |
+|---:|---:|---|
+| 0 | 1 | Starting |
+| 8 | 2 | Starting |
+| 16 | 3 | Starting |
+| 17 | 3 | Wedged |
+
+Only one second had passed since the latest progress.
+
+### The contract says re-anchor, and it says it precisely
+
+Microsoft's own `DoStartSvc` example resets `dwStartTickCount` inside `if (ssStatus.dwCheckPoint > dwOldCheckPoint)`. The rule is **reset only when the checkpoint INCREASES**, not on every poll. That distinction is the whole fix: resetting on any sample would destroy the genuinely-stalled case, where the checkpoint never advances and must still reach wedged.
+
+### What closing looks like
+
+Track elapsed time since the latest checkpoint advance. Keep a truly stalled start reaching wedged after the wait hint passes with no progress. The tray is stdlib ctypes with no PySide6, and the fix stays inside that.
+
+### Verification limits
+
+Pure state functions driven with synthetic readings. No service was started, queried or stopped.
+
+## 1556. both service-status text parsers substring-search the whole sc query output for RUNNING before reading the STATE field
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **4/10** · Difficulty **2/10** · _no research_. `service_status.py` and `service.py` both substring-search the entire `sc query` stdout for RUNNING before looking at the STATE field, so any token anywhere in the output containing that word forces a running verdict. Reproduced on both parsers, with a single-variable control.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** service status parsing. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator who named their service something containing RUNNING would see a stopped service reported as running.**
+
+**The severity is genuinely modest and the item says so rather than inflating it.** The only name-bearing field on this code path is the operator's own service name, so this is a self-inflicted foot-gun rather than anything an outsider reaches. Nothing branches on the result -- it is displayed, not acted on. The tray's separate structured reader is unaffected, and that was verified rather than assumed. It is filed because a parser that answers the wrong question is worth two lines to fix, not because it is dangerous.
+
+### What closing looks like
+
+Parse the STATE field and its numeric code, or use the structured service status. **Share one correct parser between both helpers** -- the duplication is why one fix would otherwise leave the other standing.
+
+Acceptance: names containing RUNNING and STOP, across stopped, running and pending states. Unrelated output fields must not affect the result.
+
+### Verification limits
+
+Synthetic `sc query` output into the real parsers. No service was queried.
+
+## 1557. Supervisor.stop never wakes its watchers and children launch with no process group, so no cooperative Windows stop is reachable
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **5/10** · _no research_. `Supervisor.stop()` sets an event and nothing else; watchers stay blocked in `child.process.wait()` and the event does not wake them. Cancellation is what actually reaches the drain, and it calls terminate, which is `TerminateProcess` on Windows with no cooperative interval before it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** engine-shard supervision. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site using multi-process engine shards would get a hard process stop where the docstring promises a graceful drain.** No message loss is claimed: a hard-terminated child's in-flight work is recoverable through the staged queue, so this is an operational-correctness finding rather than a data one.
+
+**Two scoping facts, both of which narrow it.** `stop()` has **zero production callers** -- it is a public method whose docstring promises a contract nothing currently exercises, so the defect is latent rather than live. And this is the **engine-shard** supervisor, not the ordinary NSSM `serve` shutdown path, which was confirmed independently from the installer's registered command.
+
+### The fix spans launch and stop, which is why it is not a two-line change
+
+A graceful stop on Windows needs a signal the child can receive. `Popen.terminate` maps to `TerminateProcess` and is not graceful. `CTRL_BREAK_EVENT` via `os.kill` requires `CREATE_NEW_PROCESS_GROUP` at **launch**. Children here are launched with no process-group flag, so no cooperative signal is deliverable at all today. Any fix has to change how children are started as well as how they are stopped, and an item scoped to `stop()` alone would be unbuildable.
+
+### What closing looks like
+
+Make `stop()` wake supervision. Add a deliverable cooperative request, wait a bounded interval, then force. Ensure the launch configuration supports the chosen mechanism. Do not fix this by shielding and then abandoning an untracked cleanup task.
+
+Acceptance: stop without an extra task cancellation; request, wait and force in that order; a responsive child that needs no force. Validate the Windows path with a disposable synthetic child, never an installed MessageFoundry service.
+
+### Verification limits
+
+Fake children, no real subprocess and no service. The existing shutdown test masks the stop-only contract by cancelling as well, which is why the suite is green over this.
+
+## 1558. uninstall removes the service registration without re-reading status, and install-service.ps1 carries the same swallow on reconfigure
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **2/10** · _no research_. `uninstall-service.ps1` never re-reads the service status after stopping, so a failed, timed-out or thrown stop still reaches `nssm remove` and still prints the green success line. `install-service.ps1` carries the byte-identical swallow on the documented reconfigure path.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator would be told the service was removed cleanly while its process kept running, and Windows would hold the name marked for deletion so an immediate reinstall would fail.** The success line is the part that makes it hard to diagnose: nothing distinguishes a clean removal from a swallowed failure.
+
+**The mirror is the half the review missed.** The same swallow sits in `install-service.ps1` on the reconfigure path, which is the path an operator is explicitly told to use. Fixing only the uninstall script would leave the more frequently executed instance standing.
+
+### What closing looks like
+
+Require a confirmed Stopped status with a bounded timeout before removal. Define any intentional still-running removal path explicitly rather than reaching it by accident. Apply the same rule to the install script's reconfigure branch.
+
+Acceptance: failed stop, delayed stop, already-stopped, timeout, and successful removal -- five arms, all with fakes. Assert that a swallowed failure cannot print the success line.
+
+### Verification limits
+
+Source trace plus extracted functions with fakes across all five arms. No Windows service operation ran, so whether a particular failure leaves the process running or the registration pending deletion is reasoned from documented platform behaviour rather than measured.
