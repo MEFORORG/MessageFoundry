@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connections-dashboard statistics reset (console "Reset Statistics").
 
 The dashboard counts are derived on the fly from store rows (since engine start), so a reset can't

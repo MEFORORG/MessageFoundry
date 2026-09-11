@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the announce hook (``scripts/hooks/announce-session.ps1``).
 
 The hook cannot send anything: hooks are shell commands and the session-messaging tool is MCP. What it

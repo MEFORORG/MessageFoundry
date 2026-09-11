@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live-runner end-to-end for handler-callable ``db_lookup`` (SYNTHETIC-TEST-PLAN §1.0.a / §1.2).
 
 ``test_db_lookup.py`` covers the accessor + the bare executor (parameterization, the fail-closed

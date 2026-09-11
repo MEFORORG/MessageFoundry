@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every connection factory's EMITTED settings survive `redacted_settings` (BACKLOG #1106).
 
 This is the FOURTH guard against one class, and the first three ALL failed the same way: **they chose

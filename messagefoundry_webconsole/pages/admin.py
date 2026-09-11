@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """User/RBAC administration pages for the /ui ops dashboard (ADR 0065, L4a).
 
 Every builder returns escaped markup via :mod:`.._html` — an admin-entered display name or AD group

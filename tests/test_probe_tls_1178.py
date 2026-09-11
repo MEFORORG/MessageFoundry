@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``probe_tcp_reachable`` speaks the destination's own transport (BACKLOG #1178, ASVS 12.3.1).
 
 The shared reachability probe used by ``test_connection`` on the socket destinations used to open a

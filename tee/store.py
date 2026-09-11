@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQLite log for the tee relay — its only store (the NAK log + an optional body capture).
 
 Deliberately tiny: one row per forwarding **leg** (``corepoint`` / ``mefor``) recording the outcome

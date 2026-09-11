@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Thin bridge to the `messagefoundry` Python CLI: shell out to a subcommand and parse its JSON.
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";

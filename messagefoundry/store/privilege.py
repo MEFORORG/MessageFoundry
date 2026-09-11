@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Startup preflight on the **effective privileges of the store principal** (BACKLOG #1008, ASVS 13.2.2).
 
 Both server-DB runbooks prescribe a least-privilege grant for the engine's database principal

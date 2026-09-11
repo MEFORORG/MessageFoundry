@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """W4-5 (ADR 0142): the browser federated-login legs — OIDC authorization-code + PKCE, default-OFF.
 
 Three routes, all unauthenticated, modelled closely on ``routes/sso.py``:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cluster-wide aggregation in :class:`~harness.load.enginepoll.EnginePoller`.
 
 A ``supervise`` cluster spreads inbounds across several shard APIs; the poller must poll EVERY shard

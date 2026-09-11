@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fail-closed guard for the **application log** (BACKLOG #122, ADR 0162).
 
 CLAUDE.md section 1's count-and-log invariant says every message a connection takes in or puts out is

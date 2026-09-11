@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1008 (ASVS 13.2.2) — the startup preflight on the store principal's EFFECTIVE privileges.
 
 The defect, in the conditional this repo requires (MessageFoundry is a not-deployed beta, zero

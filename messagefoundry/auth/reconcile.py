@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Directory session reconciliation — the pure decision layer (ADR 0079 mechanism 2).
 
 Disabling an account in Active Directory does **not** terminate its live engine session: once an

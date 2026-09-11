@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Message-content search (ADR 0046, BACKLOG #51) — scan-and-decrypt-per-row first slice.
 
 Covers the encrypted-row scan finding a needle in a body the at-rest bytes hide, the metadata

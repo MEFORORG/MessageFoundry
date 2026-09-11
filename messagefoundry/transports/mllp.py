@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MLLP (Minimal Lower Layer Protocol) transport + HL7 ACK building.
 
 MLLP wraps each message in a *block*::

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI for the WIN2025 acceptance harness.
 
 ``python -m harness.acceptance``                       → run probes + the backing pytest suites, print

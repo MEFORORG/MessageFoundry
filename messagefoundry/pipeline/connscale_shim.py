@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale executor boot-shim (B11) — a harness-only, env-gated measurement hook.
 
 The router/transform workers run ``route_only``/``transform_one`` via bare ``asyncio.to_thread``,

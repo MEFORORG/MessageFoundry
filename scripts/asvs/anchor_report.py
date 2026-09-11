@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WHICH SECURITY-SCORECARD ANCHORS STOPPED RESOLVING WHEN THE ENGINE CODE MOVED?
 
 BACKLOG #1405. An **anchor** is a citation from one graded requirement to a line of engine code. The

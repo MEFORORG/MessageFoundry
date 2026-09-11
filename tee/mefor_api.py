@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MEFOR engine API client for the tee parity comparison (#14) — stdlib only.
 
 Pulls MEFOR's transformed outbound payloads from the engine's localhost API for ``tee compare``:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The AI-assistance policy model: the clamping algorithm, [ai] settings, and the /ai/policy endpoint.
 
 ``resolve_effective_policy`` is pure, so the bulk here is a direct truth-table + an exhaustive sweep

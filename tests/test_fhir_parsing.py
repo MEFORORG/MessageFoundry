@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the FHIR codec's **extra-less surface** (ADR 0022): the tolerant FhirPeek routing tier,
 the ValueError-rooted error hierarchy, the PHI-no-leak peek path, and the two console-carve-out
 import-purity guards + the lazy-extra guard. These run WITHOUT the optional ``[fhir]`` extra (FhirPeek's

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """RFC 6238 TOTP — the engine's own second factor (WP-14, ADR 0002 §3).
 
 Pure standard-library crypto (``hmac`` / ``hashlib`` / ``base64`` / ``secrets``) so MFA adds **no new

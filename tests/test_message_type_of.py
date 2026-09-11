@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``message_type_of`` — the ADR 0104 / ADR 0084 ``accepts=`` enforcement predicate.
 
 Verifies AC-5 (component-wise MSH-9.1+9.2 match via the message's own MSH-2 — a 3-component

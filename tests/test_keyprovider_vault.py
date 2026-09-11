@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the `vault` KeyProvider (store/keyprovider_vault.py, ADR 0019 §3, BACKLOG #196).
 
 Covers the WP-BL3-04 acceptance criterion for the Vault provider: a faked Transit backend returns a

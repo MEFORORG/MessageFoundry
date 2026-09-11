@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # mefor-net-helper scope. Copy this file to mefor-net-helper.conf beside mefor-net-helper.exe and edit it.
 # The helper reads it once at start. It refuses to start if a key is missing, unknown, repeated or invalid,

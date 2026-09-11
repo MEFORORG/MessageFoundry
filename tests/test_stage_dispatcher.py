@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0066 §8 row 5 — the pooled-mode ``StageDispatcher`` state-machine unit tests.
 
 These are the **only** caller of :mod:`messagefoundry.pipeline.stage_dispatcher` (it is unwired in

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The unscored-row advisory in ``backlog_status_check.py`` (BACKLOG #1455).
 
 **What it guards.** An OPEN row with no value/difficulty is absent from the ranked table while

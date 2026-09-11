@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synchronous captured-downstream reply on the inbound HTTP listener (ADR 0154 increment B).
 
 Starts with the **factory-local** half of D4: everything decidable from one ``Http()`` call with no

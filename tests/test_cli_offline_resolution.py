@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0050 §3 / AC-6 — the offline subcommands (validate/graph/dryrun/check) carry the same
 project-root / active-env / service-config flags serve does, resolve the same bundle root, and check
 suppresses its messagefoundry.toml upward-walk when --service-config / --project-root is supplied —

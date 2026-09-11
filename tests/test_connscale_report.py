@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale report (B11) — curve schema, no-loss, the SEPARATED herd metric, monotonicity."""
 
 from __future__ import annotations

@@ -16,7 +16,7 @@ terms for Your present and future Contributions.
 - **"Contribution"** means any original work of authorship — including any modifications or
   additions to existing work — that You intentionally submit to the Project (e.g. via a pull
   request, patch, or issue attachment) for inclusion in or documentation of the Project.
-- **"Project Owner"** means **MessageFoundry Organization**, the owner and steward of the Project.
+- **"Project Owner"** means **MessageFoundry Foundation, LLC**, the owner and steward of the Project.
 
 ## 2. Grant of Copyright License
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Outbound forward/egress web proxy for the stdlib HTTP family (BACKLOG #112/#127/#128, ADR 0126).
 
 Covers, without touching the network (everything is decided at connector construction):

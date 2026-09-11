@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A mutable XML/SOAP message — read and set nodes by XPath, then namespace-aware re-encode (the HL7
 :class:`~messagefoundry.parsing.message.Message` / X12 :class:`~messagefoundry.parsing.x12.message.X12Message`
 analog for XML, BACKLOG #31).

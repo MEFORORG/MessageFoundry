@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Platform memory-encryption **read-out** — report-only, and NOT evidence (ADR 0152, Phase 1).
 
 READ THIS BEFORE CITING ANYTHING THIS MODULE PRODUCES.

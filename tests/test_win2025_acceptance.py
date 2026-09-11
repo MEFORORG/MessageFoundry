@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guards for the WIN2025 acceptance matrix + smoke tests for the live host probes.
 
 Marked ``win2025_acceptance`` so the on-server pass can select it (``pytest -m win2025_acceptance``),

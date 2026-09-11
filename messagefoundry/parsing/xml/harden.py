@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The hardened lxml parser — the single place an ``lxml.etree.XMLParser`` is constructed for the XML
 codec, locked down against XML attacks on **untrusted** inbound bodies (BACKLOG #31).
 
