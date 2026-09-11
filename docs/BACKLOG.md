@@ -30881,3 +30881,133 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+## 1546. the net-helper's bind answers ok on netsh's exit code alone, so a VIP that failed duplicate detection and announced nothing is indistinguishable from a successful promotion
+
+> 🔢 **Filed 2026-09-11 from PR 1061, which deleted the `arp` op, made the bind itself the announcement, and recorded this gap. Not started. SUCCESSOR to #1522: that row's question is answered, but the answer did NOT make AC-1 verifiable, and this item is what now blocks the AC-1 controller slice.** Value **7/10** · Difficulty **4/10**. Value 7 -- the mechanism AC-1 depends on works, and the one case where it silently does not is the split brain, which is the failure the feature exists to survive. Difficulty 4 -- the state read is a few lines on an object `Apply` already holds; the work is deciding what a `Duplicate` answer obliges the caller to do, plus one lab pass on a hardened image.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** active-passive HA / engine-managed VIP (ADR 0056). **Priority:** P2. **Verdict:** research.
+**Severity:** no deployment axis (sec. 0). There are zero deployments and nothing in the engine calls the
+helper yet.
+
+### What `bind` answers, and on what basis
+
+`NetOps.Apply` runs `netsh interface ipv4 add address ... store=active skipassource=true`, returns null
+when netsh exits 0, and `Protocol` turns that null into `{"ok":true}`. The answer means exactly one thing:
+the stack accepted the address. `NetOps.cs` says so in its own comment -- "A successful bind means the
+stack accepted the address, never that peers have converged."
+
+Everything AC-1 asks for happens after that return, inside the Windows IP stack, on no channel the helper
+reads.
+
+### Three facts the helper now causes and cannot report
+
+1. **The duplicate-address detection outcome. This is the dangerous one.** If DAD fails -- the VIP
+   genuinely live on another host, which is the split brain -- the address lands in `Duplicate` state, no
+   announcement is emitted, and `bind` still answers `{"ok":true}`. A promoting node would report a held,
+   announced VIP while holding nothing any peer can reach. **Not measured here:** no duplicate case was
+   staged during #1522's capture. Field reports describing a `DadState` of `Duplicate` stalling failover
+   until an operator removes the address by hand are inherited from vip-manager on Windows Server 2022 --
+   not this helper, not this build.
+2. **The adapter's operational status.** `Apply` selects the NIC by an ordinal name comparison and nothing
+   else, and reads no `OperationalStatus`, though it is a property of the object the selection already
+   returns. *Inference, not measurement:* a media-disconnected adapter is expected to match by name and
+   take the address while nothing leaves the wire. That was not staged either.
+3. **`ArpRetryCount`.** A machine-wide registry value of 0 is the documented way to suppress
+   address-announcement ARPs. Its effect on THIS path is unmeasured. A hardened cluster image is exactly
+   where a VIP runs and exactly where such a value is likely set, so the announcement this feature now
+   rests on may be absent on the builds most likely to host it.
+
+### The helper cannot observe the frame it causes, and that is a limit rather than an omission
+
+Reading the address state back would raise the answer from "netsh exited 0" to "the address is Preferred
+on an adapter that is up", and that is as far as any in-process instrument can go. Confirming a frame
+reached the wire is a packet capture on a real node; no assertion in this repository can stand in for it.
+**Do not close this item with a test that asserts the announcement.** A test can only assert what the
+helper reports, and the reporting is the subject.
+
+### A returned bind is not a converged fence
+
+Measured 2026-09-11 on Windows Server 2025 build 26100.33296, during #1522's capture. Carried forward from
+that pass, not re-measured for this row:
+
+| Moment | Elapsed after the add |
+|---|---|
+| address reaches `Preferred` | about 1 s |
+| duplicate-address probes run to | about 2.3 s |
+| first gratuitous ARP | about 3.3 s |
+| second gratuitous ARP | about 5.3 s |
+
+`bind` returns long before the first of those. ADR 0056's *The release time budget* section, and the
+`CORRECTION (2026-08-01)` block under it, put the corrected release budget at roughly 8 s on the shipped
+timings -- so the announcement's own tail is more than half a budget of that size. A controller reading a
+returned `bind` as "the peers know" is wrong by about five seconds, and nothing the helper returns says so.
+
+### What PR 1061 changed, including a new state it introduced
+
+PR 1061 established which act emits the announcement and made it unconditional: `bind` now removes and
+re-adds an address that is already present, because Windows announces only when the address is actually
+plumbed and the old "already there, change nothing" path emitted no frame at all. That fix carries its own
+unreported state -- for the few hundred milliseconds of the re-plumb the node does not hold the VIP, and if
+the delete succeeds while the add fails the caller gets an error but the node is left without the address.
+Neither is visible in the wire contract.
+
+ADR 0056 also ratified a `gratuitous_arp` seam key whose comment reads *announce on bind (default true)*.
+After PR 1061 that description is literally what happens, which was not true when the key was ratified.
+What the key should now mean, or whether it should survive, is part of this item.
+
+### Why it matters
+
+AC-1 says a node that wins leadership SHALL bind the VIP and SHALL emit an IPv4 gratuitous ARP. The
+mechanism is no longer in doubt; each individual promotion still is. The controller slice that builds AC-1
+has to decide whether a promotion succeeded, and its only evidence is an `{"ok":true}` returned in the
+silent case too. At zero deployments nothing is exposed today. The exposure arrives with the first node
+that promotes against a VIP someone else still holds -- the one event the feature exists for.
+
+### What would settle it
+
+1. Read the address state back after the add and decide what the helper answers when the state is
+   `Duplicate` rather than `Preferred`: an error, or an ok that carries the state. Both are defensible and
+   the controller contract has to pick one. The presence check deliberately treats an address in ANY state
+   as held so that `release` can remove a duplicate; a state read must not break that.
+2. Decide whether a state still `Tentative` at the moment of the read is worth waiting for, given the
+   measured ~1 s to `Preferred` against the 10-second whole-request budget the pipe publishes.
+3. Decide whether a bind on an adapter whose operational status is not up is refused or merely reported.
+4. Measure `ArpRetryCount=0` on the rig #1522 used -- set it, reboot, bind, capture -- and record whether
+   the probes, the announcement, or both disappear.
+5. Re-run #1522's capture procedure against whatever the first four produce, on Windows Server, with the
+   OS build recorded beside the capture. That step cannot be delegated to CI.
+
+### Not established
+
+- Whether the duplicate-address state of a netsh-added address is reported through
+  `System.Net.NetworkInformation` promptly enough to be read straight after the add. The ~1 s to
+  `Preferred` is measured on the wire; the API's own reporting latency is not.
+- Whether `ArpRetryCount` affects this path at all.
+- Whether `skipassource=true` interacts with any of the above. The capture shows the announcement
+  happening with the flag in force, and nothing beyond that was measured.
+- What the controller does with any of these answers. That belongs to the AC-1 slice, which has no item of
+  its own, and is not decided here.
+
+### Status of #1522, stated precisely
+
+#1522's question is answered: the `arp` op emitted an ARP request targeting the gateway whose sender
+protocol address was the adapter's own primary IPv4, not the VIP, reproduced twice; `SendARP` documents its
+`SrcIP` as an interface selector and never a sender field; the op was deleted. **That work is in PR 1061,
+which is open at the time of filing, so #1522's banner still reads as open and flips when 1061 lands.**
+This row does not close it.
+
+**The obligation in AC-1 is a separate question and is not closed by either.** PR 1061 amends
+[ADR 0056](adr/0056-engine-managed-vip-failover.md) to say so in the criterion itself and opens this
+successor there as a checklist entry, "Announcement observability". This row is that entry.
+
+**Do not fix this by making `bind` sleep until the announcement should have happened.** The wait would be a
+guess at another machine's timing, it would spend the caller's budget, and it would still report nothing
+about what the stack did. The defect is that the helper answers a narrower question than the caller is
+asking; a delay hides the gap and re-creates it.
+
+**Related, not duplicate:** #1523 is the install script for the same helper. The two share the helper and
+nothing else -- an install script cannot report what a bind did.

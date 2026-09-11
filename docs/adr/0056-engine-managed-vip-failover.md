@@ -881,9 +881,9 @@ the build is greenlit:
 - [x] **Gratuitous ARP sender field** — **settled 2026-09-11 (BACKLOG #1522), as a negative.** `SendARP`
   cannot set the sender field, the `arp` op was deleted, and the bind's own announcement is what satisfies
   AC-1. See §"The helper as built". The capture and its `.etl` are the evidence.
-- [ ] **Announcement observability** — successor to #1522, and the reason AC-1 is still not fully
-  verifiable. `bind` reports that the stack accepted the address; it reports neither the duplicate-address
-  outcome nor whether a frame was transmitted. A `Duplicate` address announces nothing and still answers
-  `{"ok":true}`. Decide whether the helper should read the address state back and report it, and whether
-  `ArpRetryCount=0` — the documented machine-wide suppression of address-announcement ARPs, unmeasured on
-  this path — needs a startup check.
+- [ ] **Announcement observability — BACKLOG #1546**, successor to #1522, and the reason AC-1 is still not
+  fully verifiable. `bind` reports that the stack accepted the address; it reports neither the
+  duplicate-address outcome nor whether a frame was transmitted. A `Duplicate` address announces nothing
+  and still answers `{"ok":true}`. Decide whether the helper should read the address state back and report
+  it, and whether `ArpRetryCount=0` — the documented machine-wide suppression of address-announcement ARPs,
+  unmeasured on this path — needs a startup check.
