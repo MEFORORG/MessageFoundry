@@ -26,11 +26,13 @@ if the implementation changed underneath it).
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.models import ContentType, OrderingMode, RetryPolicy
 from messagefoundry.config.settings import DeliverySettings
 from messagefoundry.config.wiring import (
@@ -273,3 +275,78 @@ def test_the_configuration_catalog_does_not_still_promise_the_pre_floor_behaviou
         "the row must keep naming the internal idiom the floor deliberately does NOT touch, or a "
         "later reader completes the tightening and deletes it"
     )
+
+
+# --- BACKLOG #1217 half 2: the "forever" string spelling, per-outbound side -------------------
+#
+# `DeliverySettings.retry_max_attempts` (tested in tests/test_settings.py) is the [delivery]
+# GLOBAL default. A per-outbound `[outbound.retry]` table in connections.toml decodes through a
+# SEPARATE path -- connections_file.py builds a RetryPolicy straight from the TOML table, never
+# touching DeliverySettings -- so it needed its own, independent coercion. A spelling that works
+# in one place and silently corrupts (or just fails to load) in the other would be worse than not
+# shipping it at all.
+
+
+def _outbound_retry_toml(max_attempts_literal: str) -> str:
+    return textwrap.dedent(
+        f"""
+        [[outbound]]
+        name = "OB"
+        transport = "file"
+          [outbound.settings]
+          directory = "out"
+          [outbound.retry]
+          max_attempts = {max_attempts_literal}
+        """
+    )
+
+
+def test_retry_forever_spelling_loads_from_a_per_outbound_toml_table(
+    tmp_path: Path,
+) -> None:  # #1217
+    cfg = tmp_path / "connections.toml"
+    cfg.write_text(_outbound_retry_toml('"Forever"'), encoding="utf-8")  # mixed case, on purpose
+    reg = Registry()
+    load_connections_file(cfg, reg)
+    ob = reg.outbound["OB"]
+    assert ob.retry is not None and ob.retry.max_attempts is None
+
+
+def test_retry_max_attempts_per_outbound_still_refuses_a_garbage_string(
+    tmp_path: Path,
+) -> None:  # #1217
+    cfg = tmp_path / "connections.toml"
+    cfg.write_text(_outbound_retry_toml('"sometimes"'), encoding="utf-8")
+    reg = Registry()
+    with pytest.raises(WiringError):
+        load_connections_file(cfg, reg)
+
+
+def test_retry_max_attempts_per_outbound_numeric_forms_are_unaffected(
+    tmp_path: Path,
+) -> None:  # #1217
+    """The new coercion must be a narrow addition, not a rewrite of the existing per-outbound path --
+    a real integer (including the `RetryPolicy(max_attempts=0)` no-retry idiom, unfloored here on
+    purpose, see test_the_internal_no_retry_idiom_is_untouched_by_the_operator_facing_floor above)
+    still loads exactly as it did before this item."""
+    cfg = tmp_path / "connections.toml"
+    cfg.write_text(_outbound_retry_toml("0"), encoding="utf-8")
+    reg = Registry()
+    load_connections_file(cfg, reg)
+    assert reg.outbound["OB"].retry is not None and reg.outbound["OB"].retry.max_attempts == 0
+
+
+def test_the_configuration_catalog_no_longer_claims_no_toml_or_env_spelling() -> None:
+    """BACKLOG #1217 half 2. Companion to test_the_configuration_catalog_does_not_still_promise_the_
+    pre_floor_behaviour above: that one pins half 1's prose, this one pins half 2's. Deliberately
+    negative -- what must never come back is the claim that the spelling does not exist."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+    row = next((ln for ln in doc.splitlines() if ln.startswith("| `retry_max_attempts`")), None)
+    assert row is not None, "the retry_max_attempts catalog row has moved or been renamed"
+    assert "there is no TOML or env spelling for retry-forever" not in row, (
+        "the catalog again claims retry-forever has no TOML/env spelling. It has since #1217 -- "
+        'the string "forever" is coerced to None, which the tests above drive directly.'
+    )
+    assert '"forever"' in row, "the row must name the spelling an operator would actually write"

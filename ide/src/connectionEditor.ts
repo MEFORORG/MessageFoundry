@@ -609,7 +609,10 @@ export function connectionFormHtml(
       } else {
         if ($('ordering').value) conn.ordering = $('ordering').value;
         const ma = $('maxAttempts').value.trim();
-        if (ma) conn.retry = { max_attempts: parseInt(ma, 10) };
+        // BACKLOG #1217 half 2: "forever" (case-insensitive) is the TOML/env spelling of retry-forever
+        // (connections_file.py coerces it back to None on load). parseInt('forever', 10) is NaN, which
+        // would silently corrupt a word into a number here — write the word itself instead.
+        if (ma) conn.retry = { max_attempts: ma.toLowerCase() === 'forever' ? 'forever' : parseInt(ma, 10) };
       }
       return conn;
     }

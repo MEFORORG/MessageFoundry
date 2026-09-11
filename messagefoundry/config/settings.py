@@ -1156,6 +1156,20 @@ class DeliverySettings(_Section):
     retry_backoff_seconds: float = 5.0
     retry_backoff_multiplier: float = 2.0
     retry_max_backoff_seconds: float = 300.0
+
+    # BACKLOG #1217 half 2. TOML has no null literal and an env var is always a string, so `None`
+    # (retry-forever) was reachable from code-first Python only. The string spelling "forever"
+    # (case-insensitive; MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever works the same way) is coerced to
+    # None here, `mode="before"` so it runs ahead of int|None coercion (precedent: _split_oidc_lists
+    # above). Every other value — a real int, or a garbage string like "" or "none" — falls through
+    # unchanged to that normal coercion/the `ge=1` floor, so it fails exactly as it did before.
+    @field_validator("retry_max_attempts", mode="before")
+    @classmethod
+    def _retry_forever_spelling(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip().lower() == "forever":
+            return None
+        return value
+
     # Default queue ordering for every outbound (FIFO = strict in-order per connection).
     ordering: OrderingMode = OrderingMode.FIFO
     # What a delivery worker does on an internal/code error: continue (dead-letter + advance, default)
