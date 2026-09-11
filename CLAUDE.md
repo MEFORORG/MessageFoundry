@@ -717,11 +717,14 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   question once already. Censused over git-tracked files at `172b1327c`: 496 occurrences across 75
   files, and 479 across 70 once #1265's first slice landed.** That slice was the five shipped operator
   docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — now at zero
-  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left: 430 under `docs/`
-  (127 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 38 in `docs/adr/`), 26 in `harness/`, 10 in
-  `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across repository-root and
-  `.github/` files, and **zero in `scripts/` and in this file**. Those buckets sum to the total; the
-  filed table's did not.
+  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left, re-measured
+  2026-09-11: 427 under `docs/` (125 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 37 in `docs/adr/`),
+  26 in `harness/`, 10 in `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across
+  repository-root and `.github/` files, and **zero in `scripts/` and in this file**. Those buckets
+  sum to **476**, the population today. The 479 above is the figure at `172b1327c`, a dated
+  measurement rather than a current one, and the filed table's buckets did not sum at all. Two of
+  the three that have left `docs/` since came off `BACKLOG.md` in the 2026-09-11 #1003 repair; the
+  third, and the `docs/adr/` row, were drift that nothing reported.
 
   **Two rows of the filed table were instrument errors, both SDS-3.8.** It read the web console as
   zero by counting `packaging/`; the console's source is `messagefoundry_webconsole/`, which carries
@@ -730,7 +733,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 
   **Census this population only with the ledger counts as a positive control** — the first attempt
   returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere is
-  indistinguishable from a clean repo. `docs/BACKLOG.md` at 127 and `BACKLOG-CLOSED.md` at 93 are that
+  indistinguishable from a clean repo. `docs/BACKLOG.md` at 125 and `BACKLOG-CLOSED.md` at 93 are that
   control: an instrument that cannot find those proves nothing by returning zero anywhere else.
 
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never

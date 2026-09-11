@@ -1996,9 +1996,13 @@ mutual-auth `out_token` browser-behavior question.
 
 **Why:** ADR 0068 §9 ships browser SSO with `channel_bindings=None` always and records the CBT
 question as a spike; the L5c code is deliberately containment-first (off by default, boot-once
-preflight, single-leg). **Trigger:** a deployment that wants EPA, or the first domain-joined lab box
-(project memory: the test-server box has no AD). The Phase-2 AD-fidelity lab in **#99(e)** is exactly
-that first domain-joined box — run this spike alongside it.
+preflight, single-leg). **Trigger:** a deployment that wants EPA, or the first domain-joined lab box. **The second limb is
+now reachable and was not before:** the owner ruled 2026-09-11 that a lab is available for validation,
+which is **#1003**'s trigger, so the standing note that the test-server box has no AD no longer means
+there is nowhere to stand one up. It has not fired yet — *available for validation* is not *a
+domain-joined box exists*, and standing up the DC plus AD CS is **#1003** step 1. The Phase-2
+AD-fidelity lab in **#99(e)** is still that first domain-joined box — run this spike alongside it.
+Carried by **#1003**.
 
 ---
 
@@ -2010,7 +2014,7 @@ that first domain-joined box — run this spike alongside it.
 > **AMENDED 2026-07-28 — this is no longer a 6/6 engineering build; ONE sub-item remains, and it is PROVISIONING, not code.** ⚠️ **Do not schedule this as a build.**
 > * **(g) — engine-side "require an AD MFA claim" hook: SHIPPED**, not "build only on a customer requirement". It landed via **#274** / [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) as `oidc_require_mfa_claim: bool = True` (`messagefoundry/config/settings.py:1854`, enforced at `:2102`) — note it ships **on by default**. *(ADR 0142's own status line reads "Proposed — code COMPLETE, awaiting lab validation": the code is merged and green; the ADR flips to Accepted only when its runbook cells report. The **hook exists** either way.)*
 > * **(b)** was closed separately via **#224**. **(c)** remains a documented stdlib scope-out (OpenSSL, not SChannel) — a decision, not a task.
-> * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **rig/provisioning the project does not own** (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275**. No engineering capacity closes it.
+> * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **provisioning, not code** — and as of the owner's 2026-09-11 ruling the project has a lab available for validation to provision it in, so it is schedulable rather than unreachable (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275** and carried by **#1003**, whose trigger fired 2026-09-11. No engineering capacity closes it: it closes on a DC, AD CS and a gMSA being stood up in that lab, which is **#1003** step 1.
 > ⚠️ **Two cross-references above resolve to paths that no longer exist from this baseline** (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`): `docs/security/` is **gitignored post-cutover**. The deployment content is intact for operators with the working tree; the links simply do not resolve in the public repo. See [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md).
 > Verdict: demand-gate
 > Closing-act: blocked
@@ -2110,20 +2114,6 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > ⛔ **DROPPED 2026-08-10 -- owner-ruled at the G26 demand-gate triage.** Its named trigger has not fired, and a shipped mechanism, a configuration change or the network layer already answers the need it describes. Dropping is reversible: re-filing costs one item, while carrying it costs a re-read and a re-price at every planning pass, which is the failure mode the sitting exists to end.
 
 > **No longer demand-gated -- declined.** The line applied across the sitting: KEEP the rows whose trigger, if it fires, BLOCKS a feed; DROP the rows whose trigger merely INCONVENIENCES.
-
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: its residual is the live domain-lab gMSA / SSO / reverse-proxy smoke, and that is the ONLY thing left on this item.
-
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: it needs the same real DC + AD CS the #99 smoke does.
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -3221,7 +3211,7 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. Diagnosis only: the CI symptom was absorbed by #115's widened stranding budget, nothing was lost, and the record-correction half is in the tree at report.py:596-606. What is left is a single measurement under concurrent load driven from an existing dispatch-only workflow, so both worth and cost stay small. _(was 3/10 · 3/10.)_
 >
-> **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is blocked: that runner is unregistered (`actions/runners` → `total_count: 0`) and `selfhosted-win2025-sql.yml` has never run.
+> **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is **runnable, and what is left is provisioning rather than a block**: the owner ruled 2026-09-11 that the lab is available for validation, which is **#1003**'s trigger. What has not changed is the measurement. Re-read 2026-09-11, `actions/runners` still returns `total_count: 0` and the workflows API reports `selfhosted-win2025-sql.yml` at `total_count: 0` runs against a `ci.yml` control of 4988, so the runner is still unregistered and that workflow has still never run. Register the runner in the lab, then run the sweep. Carried by **#1003**.
 > Verdict: build
 > **NO `Closing-act` DELIBERATELY -- THE CLASSIFICATION IS CONTESTED AND A GATE SHOULD REFUSE THIS.**
 > *An adversarial pass moved this from `research` to `build` on a real argument (the item mentions
@@ -3871,12 +3861,31 @@ The distinction matters because these two paths do not look like the case AV cov
 > 🚧 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. The margin is unchanged in the shipped test and the item's own remedy is parked behind #1003, whose trigger the owner ruled on 2026-08-20 will not fire. Value 4 because the cost is a CI red that misreads as the PR's own defect, with no engine path and no PHI effect; difficulty 3 because the remainder is a one-file test change plus an _acquire latency benchmark that has to run against a real SQL Server rather than the mocked path. _(was 4/10 · 3/10.)_
 >
 > **Status OPEN (filed 2026-08-02).** `tests/test_cluster_failover_sqlserver.py::test_preferred_delay0_wins_expired_lease_race_over_delayed_node` sleeps `_TTL + 0.15` so the lease is expired by ~0.15s, then requires a node carrying a **0.5s** acquire handicap to be rejected. Correctness therefore rests on **less than 0.35s of wall clock** elapsing between the sleep and `dr._maintain_leadership()` — across a real SQL Server round-trip, on a shared CI runner. Observed failing as `assert dr.is_leader() is False → assert True is False`.
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: its patch has never been executed against a real SQL Server, and the `_acquire` latency question it reserves needs a benchmark rather than a lease-election test.
+> ⚠️ **AMENDED 2026-09-11 — THE 2026-08-04 EXPIRY DATE WAS WRONG ABOUT THE DATE AND RIGHT ABOUT
+> THE OUTCOME.** That amendment said a multi-VM lab was about two weeks out, and that every sentence
+> below calling the rig unavailable was *"true today and scheduled to become false"*. The owner then
+> ruled 2026-08-20 that no such lab existed, and ruled 2026-09-11 that **the lab is available for
+> validation**. So read those sentences as **false now, not as scheduled to become false**. Tracked
+> by **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, whose
+> trigger fired 2026-09-11.
+>
+> **BUT THE PATCH HALF NEEDED NO LAB, AND STILL DOES NOT.** `ci.yml`'s `sqlserver-store` job runs
+> `pytest -v tests/test_cluster_failover_sqlserver.py` against `mcr.microsoft.com/mssql/server:2022-latest`
+> and `:2025-latest` — and this item's own discriminating evidence is a pass/fail split between
+> exactly those two legs. What no hosted leg covers is a real Windows plus a real ODBC stack;
+> `selfhosted-win2025-sql.yml` supplies that for the store, coordinator and connector suites but
+> **deliberately excludes this item's test file**, because it hangs on that VM. So registering the
+> `mefor-win2025-sql` runner would still not run this item's test.
+>
+> **THE `_acquire` MEASUREMENT MUST BE RE-HOMED BEFORE THE PATCH LANDS.** It is recorded only here
+> and in #1003. **Re-home it to ADR 0159 as a named residual**, because the patch makes the test
+> deterministic and so removes the only thing raising the question. **Re-specify it while
+> re-homing:** today's `_acquire` in `messagefoundry/store/sqlserver.py` carries at least three later
+> per-call additions that are not ADR 0159's — the B11 `perf_counter` timing pair, BACKLOG #1052's
+> bounded `acquire_pooled(...)`, and the STORE-3 `command_timeout` assignment — while ADR 0159's
+> own success-path cost is a `try/except BaseException` frame plus one `isinstance` that does not
+> execute. Note that `messagefoundry_store_pool_acquire_wait_*_seconds` measures the WAIT for a free
+> pooled connection, not the frame's overhead; a green percentile there answers a different question.
 
 **Cluster:** Testing & CI. **Priority:** P3. **Verdict:** triage — **do not "fix" by widening the margin until the question below is answered.** **Severity:** medium (a red that reads as the PR's own defect), unknown (likelihood: one observation).
 
@@ -3940,15 +3949,17 @@ So the registered control for a context should record **what it does not break**
 
 ## 1003. Validate the lab and discharge the four hardware-gated residuals
 
-> 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **6/10** · _money pit_. The owner ruled 2026-08-20 that no multi-VM lab exists, so the trigger cannot fire, and the item's own cheapest deliverable is undone: docs/BACKLOG.md:3075 still tells a reader #351's blocker is scheduled to become false. Worth-if-built is breadth over four validation residuals whose own banners read 5, 3, 3 and 4, none of them a shipping-default defect, so 5 rather than a number above every part. Difficulty 6 on the explicit Windows-CI-gated anchor: #320 needs a registered self-hosted WS2025 runner, #99 and #98 a real DC plus AD CS plus gMSA, #351 a real SQL Server. _(was 7/10 · 4/10.)_
+> 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **6/10** · _money pit_. The owner ruled 2026-08-20 that no multi-VM lab exists, so the trigger cannot fire, and the item's own cheapest deliverable is undone: #351's own 2026-08-04 amendment still tells a reader its blocker is scheduled to become false. Worth-if-built is breadth over four validation residuals whose own banners read 5, 3, 3 and 4, none of them a shipping-default defect, so 5 rather than a number above every part. Difficulty 6 on the explicit Windows-CI-gated anchor: #320 needs a registered self-hosted WS2025 runner, #99 and #98 a real DC plus AD CS plus gMSA, #351 a real SQL Server. _(was 7/10 · 4/10.)_
 >
 > **Filed 2026-08-04 — not started.** Four open items are blocked on the same missing thing — a controlled multi-VM environment — and each currently asserts a premise that expires when it arrives; the work is the validation runs themselves, which are bounded, already specified by the items they discharge, and need no new design.
 > Verdict: build
 > Closing-act: code
 
-**Cluster:** Testing & CI. **Priority:** P2. **Verdict:** build when the trigger fires. **Severity:** medium (four items are parked on a blocker that is about to stop existing, and their own text will keep saying otherwise).
+**Cluster:** Testing & CI. **Priority:** P2. **Verdict:** build — the trigger fired 2026-09-11. **Severity:** medium (four items still read as parked on a blocker that has lifted, and their own text will keep saying so until each row is corrected).
 
-**THE TRIGGER WILL NOT FIRE. OWNER RULED 2026-08-20: THERE IS NO MULTI-VM LAB.** Asked directly whether one was available, the answer was no. **So this item's own framing is now FALSE and it is the sentence that misleads every planning pass:** the body above says the four residuals are *"parked on a blocker that is about to stop existing"*. **That blocker is not about to stop existing.** It is indefinite, and the four are blocked on HARDWARE rather than on a decision -- which is not a thing any amount of triage, scoring or re-reading can move.
+**THE TRIGGER FIRED. OWNER RULED 2026-09-11: THE LAB IS AVAILABLE FOR VALIDATION.** That is this item's trigger in its own words, so the two paragraphs below — *THE TRIGGER WILL NOT FIRE* and *WHAT THAT CHANGES FOR EACH RESIDUAL* — are **withdrawn as statements of current state** and kept only as the record of what was true between 2026-08-20 and 2026-09-11. **#99, #98, #320 and #351 are runnable rather than parked — schedule them.** Two bounds, so nobody reads this as more than it is. First, *available for validation* is not *validated*: Scope step 1 below is still undone, and an environment that is merely up has not been shown to carry a Domain Controller, AD CS, a gMSA or a registered runner. Second, the runner is still unregistered as re-measured 2026-09-11 — `actions/runners` returns `total_count: 0`, and the workflows API reports `selfhosted-win2025-sql.yml` at `total_count: 0` runs against a `ci.yml` control of 4988 — but that is now **provisioning with somewhere to happen**, which is the whole of the change. **The *TRAP* paragraph further down is NOT withdrawn**; it is now live, and it is the first thing to read before recording any rig result. **This item's own first deliverable is DONE as of 2026-09-11** — the four rows were amended in one pass, and the two copies of the 2026-08-04 expiry stanza that had been misfiled onto **#108** were deleted, their content re-sited onto #99 and #98 where it belongs. A third misfiled copy remains on **#321** and was left deliberately; see that row.
+
+**THE TRIGGER WILL NOT FIRE. OWNER RULED 2026-08-20: THERE IS NO MULTI-VM LAB.** Asked directly whether one was available, the answer was no. **So this item's own framing is now FALSE and it is the sentence that misleads every planning pass:** the body above said the four residuals were *"parked on a blocker that is about to stop existing"* when this amendment was written. **That blocker is not about to stop existing.** It is indefinite, and the four are blocked on HARDWARE rather than on a decision -- which is not a thing any amount of triage, scoring or re-reading can move.
 
 **WHAT THAT CHANGES FOR EACH RESIDUAL.** #99, #98, #320 and #351 stay open and stay blocked, but they stop being *imminent*. **Do not price any of them as capacity in a wave plan, and do not re-triage them hoping for a different answer** -- a hardware precondition does not yield to analysis. #98 is the one partial exception and only in one limb: its trigger reads *"a deployment that wants EPA, OR the first domain-joined lab box"*, and **the first disjunct survives this ruling** -- a real deployment wanting EPA would still fire it. The lab half is dead; the deployment half is not.
 
@@ -3956,11 +3967,11 @@ So the registered control for a context should record **what it does not break**
 
 *Amended by the Dispatcher on the owner's ruling. No hardware was required for this amendment and none is implied by it; the ruling closed a question, it did not unblock any work.*
 
-**Trigger:** the lab is **available for validation** — reachable, with VMs provisionable. **Not** "lab validated": proving the lab does what these items need is this item's own first deliverable, so gating on validation would mean the trigger can never fire.
+**Trigger:** the lab is **available for validation** — reachable, with VMs provisionable. **Not** "lab validated": proving the lab does what these items need is this item's own first deliverable, so gating on validation would mean the trigger can never fire. **FIRED 2026-09-11:** the owner ruled that the lab is available for validation.
 
 **Scope.** Two halves, in order.
 
-1. **Validate the lab against what the residuals actually require** — a real Domain Controller, AD CS, a gMSA, a registered self-hosted Windows runner, and a real SQL Server instance. Each is a precondition of a specific item below; an environment that is merely *up* is not one that can discharge them. Record what was stood up and what was verified, because "the lab exists" and "the lab can answer question X" are different claims and only the second unblocks anything.
+1. **Validate the lab against what the residuals actually require** — a real Domain Controller, AD CS, a gMSA, and a registered self-hosted Windows runner. **Not a SQL Server:** `ci.yml`'s `sqlserver-store` legs already provide one. Each is a precondition of a specific item below; an environment that is merely *up* is not one that can discharge them. Record what was stood up and what was verified, because "the lab exists" and "the lab can answer question X" are different claims and only the second unblocks anything.
 2. **Run the four residuals** and record their results.
 
 **What it discharges** (each already fully specified in its own item — this item adds no new design):
@@ -3970,7 +3981,7 @@ So the registered control for a context should record **what it does not break**
 | **#99** | the live domain-lab gMSA / SSO / reverse-proxy smoke — the **only** residual left on that item | real DC + AD CS + gMSA |
 | **#98** | Kerberos SSO channel-binding (EPA) opt-in + acceptor-enforcement spike | same gate as #99 |
 | **#320** | the decisive windows-2025 capacity sweep, currently blocked because the runner is unregistered (`actions/runners` → `total_count: 0`) | a registered self-hosted WS2025 runner |
-| **#351** | execute the failover patch against a real SQL Server, **and** measure ADR 0159's `_acquire` cost — the question that item reserves | a real SQL Server |
+| **#351** | measure the `_acquire` cost the item reserves | a benchmark rig. **Not a SQL Server, and not the self-hosted runner:** `ci.yml`'s `sqlserver-store` legs already run this item's test against real SQL Server 2022 and 2025, and `selfhosted-win2025-sql.yml` deliberately excludes that test file. |
 
 ⚠️ **#351's measurement is the one that is easy to lose.** Its patch makes the test deterministic, which removes the only thing currently raising the latency question. The item says plainly that a lease-election test is the wrong instrument for discovering latency — so the measurement belongs here, as a benchmark or an explicit budget assertion, not there. Landing the patch without doing this drops the question rather than answering it.
 
@@ -3978,7 +3989,7 @@ So the registered control for a context should record **what it does not break**
 
 **Also, and it is the part that rots if nobody does it:** four items assert a premise that becomes false the moment the lab lands. #99 says its residual is *"rig/provisioning the project does not own"*; #320 says its experiment is blocked on an unregistered runner. Left alone, those sentences keep telling every future planning pass that the work is unreachable — the same stale-premise rot the 2026-07-28 reconcile found on five items and the 2026-08-03 re-score found on twenty-four. Each of the four gets its trigger line amended in this item's first commit, whether or not the runs have started.
 
-**Source:** owner, 2026-08-04 — a server for multi-VM testing is ~2 weeks out.
+**Source:** owner, 2026-08-04 — a server for multi-VM testing was then said to be about two weeks out. **That forecast was wrong about the date and right about the outcome, so read this line as history and never as a schedule.** The owner ruled 2026-08-20 that no such lab existed, and ruled 2026-09-11 that the lab **is available for validation**. The 2026-09-11 ruling is the current state.
 
 ## 1004. ASVS 13.3.4 — the store DEK's calendar expiry alerts and never refuses; build the enforced stop with a loud opt-out
 
