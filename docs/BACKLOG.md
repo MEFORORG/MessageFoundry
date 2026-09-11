@@ -14606,7 +14606,55 @@ commit.**
 
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
+> 🚧 **Built 2026-09-10 on branch `claude/store-privilege-null-1234` (PR #1036); open until that merges, when the Lander flips this banner (`CLOSING_SEAT["code"]`) -- a NULL column is NOT READ, and an incomplete read is never `OBSERVED`.**
+> `probe_principal_privileges` in `messagefoundry/store/sqlserver.py` now classifies every probed grant
+> three ways -- held, not held, or not read -- and returns `UNOBSERVABLE`, naming each unread grant, as
+> soon as any column comes back NULL. That routes straight through the arm already built for *"could
+> not observe"*: a distinct log line, a distinct audit `status`, its own posture entry, and a refusal
+> under a declared `[store].require_least_privilege`. **`HAS_PERMS_BY_NAME` is covered alongside the two
+> role built-ins**, which is the limb the 2026-09-03 amendment below flagged as outside the original
+> scope -- a direct `GRANT CONTROL SERVER` NULLs on the same unresolved-name condition, so a fix to the
+> role columns alone would have left it mis-read exactly as before.
+>
+> **BOTH ARMS THIS ITEM DEMANDED ARE PRESENT AND THEIR REDS ARE DISJOINT.** Nine legs in
+> `tests/test_store_privilege_preflight.py` drive the real T-SQL arm with `_fetchone` / `_fetchall`
+> monkeypatched -- no live SQL Server and no container, so they run in the default local suite rather
+> than on a hosted leg nobody reads. Measured by reverting **only** `sqlserver.py` and re-running the
+> file: **5 of the 9 go red** on the unfixed arm, the all-NULL row reporting
+> `StorePrivilegeStatus.OBSERVED` with an empty excess list -- the false-clean reproduced verbatim --
+> and **4 stay green**: the documented least-privilege row, an honest all-zero row, a boolean-driver
+> row, and the pre-existing empty-result guard. That second set is the negative control this item's own
+> scope asked for. A fix that reported UNKNOWN for everything would have turned those four red as well,
+> and would still have passed a single-arm test.
+>
+> **Severity is unchanged and still conditional (CLAUDE.md section 0):** with zero deployments nothing
+> was ever mis-reported. What is fixed is what a first deployment would have read.
+>
+> **THE OWNER DECISION BELOW IS SUPERSEDED ON ITS OWN STATED PREMISE, AND THE PREMISE IS THE ONLY PART
+> THAT MOVED.** It reads *"Do not dispatch this"*, resting on two measurements: that
+> `messagefoundry/store/privilege.py` was **absent** from `main`, and that
+> `require_least_privilege|least_privilege` returned **zero** hits across `messagefoundry/**/*.py`. Both
+> were true when written. Neither is true now. The preflight landed on `main` at **`6148f4181`**
+> (PR #764) on **2026-09-09**, and that same instrument at `origin/main` today returns **3** files for
+> `require_least_privilege` -- `api/app.py`, `config/settings.py`, `store/privilege.py` -- against a
+> POSITIVE CONTROL of **3** files for `require_managed_identity` on the same instrument and the same
+> ref. **Nothing here reverses the owner's POLICY ruling**, which is #1008's and is untouched: this row
+> is a code defect and was independent of that ruling by its own filing.
+>
+> **THE BANNER SAT ABOVE A CORRECTION OF ITSELF FOR SEVEN DAYS, WHICH IS THE REUSABLE PART.** This
+> item's newest amendment -- *"THE CLEARING CONDITION IS MET"* -- landed inside merged PR #764 and is
+> written at the FOOT of the row, while the *"do not dispatch"* banner it answers stayed at the head.
+> A reader trusts the head and re-checks it last, so the row read blocked and startable at once. That
+> is the intra-item contradiction #1235 records twice and #1241 records once, now a fourth instance:
+> **correcting a body does not correct the banner that summarises it**, and the two fail in both
+> directions.
+>
+> **ONE INCONSISTENCY IS LEFT STANDING DELIBERATELY, BECAUSE IT IS NOT THIS ROW'S TO FLIP.** #1008
+> still carries its 2026-09-03 ruling to keep the preflight deferred, while the preflight is on `main`.
+> That is real, it belongs to #1008, and flipping it is the owner's act. It is recorded here only so a
+> reader arriving from that row does not conclude this one was closed against a live defer.
+>
+> **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
 >
 > **OWNER DECISION 2026-09-03 -- RECORDED AS BLOCKED, NOT DISPATCHED. The measurement below was re-taken
 > today rather than trusted:** the amendment further down is three weeks old, and this seat spent the day
@@ -28858,6 +28906,23 @@ unfiled. Named here so it is not lost; it is not this row's scope.
 **Cluster:** repository gates / suppression hygiene. **Priority:** P3. **Verdict:** build the guard.
 **Severity:** no deployment axis (sec. 0). A CI configuration anchor. No engine behaviour, no shipped artifact, no PHI.
 
+**AMENDMENT 2026-09-11 -- IT HAS NOW FIRED TWICE, which is the evidence the "guard not built"
+decision was taken without.** BACKLOG #1533 added 28 comment lines to `.github/workflows/cla.yml`,
+moving the same `uses:` line from 122 to 150 and staling the same anchor -- the entry had already been
+re-anchored once from `102` to `122` by this item. Same file, same anchor, same shape, three months of
+line numbers. Recorded here rather than only on #1533 because a reader deciding whether to build the
+guard needs the recurrence count, and a citation that points only one way does not carry it.
+
+Two details from that occurrence bear on the guard's design. First, the re-anchor is not reliably a
+one-line edit: #1533's own fix moved the line a second time in the same branch, so the number has to be
+derived from the workflow file at fix time rather than copied from the zizmor report. Second, the
+mis-reasoning is as reusable as the defect -- #1533 first reported the red as PRE-EXISTING on the
+grounds that the flagged line's content was byte-identical on `main` and the diff did not touch it.
+Both were true and neither was the question, because the anchor keys on the line NUMBER. **Inserting
+lines ABOVE a line is how a line-anchored control breaks without the line being touched**, so "my diff
+does not touch it" is the specific sentence that conceals this class, and a guard that only compares
+line content would reproduce the same blind spot.
+
 ### The measured instance
 
 `.github/zizmor.yml` suppresses the `self-repository` finding on `cla.yml` by LINE NUMBER:
@@ -30495,6 +30560,7 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
 
+
 ---
 
 ## 1529. Retire the Console seat; the Manager is the live dispatching seat
@@ -30629,3 +30695,390 @@ one state git cannot recover, which is why the check was a read and not an edit.
 **Related:** [#1448](#1448) and [#1391](#1391) -- an item or a pointer stays live because nothing records
 what answered it. Here the pointer was accurate about its own subject and wrong about the one the reader
 brought to it.
+
+---
+
+## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
+
+> 🚧 **Built 2026-09-11 (PR 1046); open until that merges, when the Lander flips this banner.** One-line key change in `.github/workflows/cla.yml` -- `github.ref` becomes `github.event.pull_request.number` on the `pull_request_target` arm -- plus `tests/test_workflow_concurrency_keys.py`, which holds the invariant over all 28 workflow files. Value **8/10** · Difficulty **2/10**. Value 8: `cla` is a required context, 25 of the last 61 `pull_request_target` runs were cancelled, and 17 open pull requests carried a cancelled `cla` when this was filed. Difficulty 2: the fix is one expression; establishing that it was the cause, and that nothing else shares the shape, was the work.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI / merge gating. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is the repository's own CI, not the shipped engine. No
+product code, no PHI path and no security control changes. What it broke was the ability to merge.
+
+### The key named the base branch, so every pull request landed in one group
+
+The group was `cla-${{ github.event_name == 'pull_request_target' && github.ref || github.run_id }}`
+with `cancel-in-progress` true on that arm. The condition matches -- the workflow does declare
+`pull_request_target` -- so the `github.ref` arm is live. The trap is what `github.ref` holds there.
+
+For `pull_request` it is `refs/pull/<n>/merge`, which carries the number and so is per-pull-request.
+For `pull_request_target` it is `refs/heads/<default branch>` -- see the correction section below, which
+records how that was settled and why GitHub's own pages disagree about it. Every open pull request
+therefore resolved to the single group `cla-refs/heads/main`, and each new run cancelled whatever was in
+flight there -- which belonged to a different pull request.
+
+The author had already written the governing fact down, one arm over. The `issue_comment` note in the
+same block says an issue_comment ref "is the default branch" and keys that arm on `github.run_id` to
+avoid exactly this. The reasoning was correct and was not carried across to the sibling arm.
+
+### Measured, with a paired control that differs only in the trigger
+
+Over this workflow's last 100 runs, read 2026-09-11:
+
+| Event arm | Key it takes | Runs | Cancelled |
+|---|---|---|---|
+| `pull_request_target` | `github.ref` (shared) | 61 | 25 |
+| `issue_comment` | `github.run_id` (unique) | 29 | 0 |
+| `merge_group` | `github.run_id` (unique) | 10 | 0 |
+
+The 25 cancellations spanned 19 distinct head branches, and they chain: each one is stamped cancelled
+one second after a run on an unrelated branch was created. `retry-forever-spelling-1217` died at
+04:14:35 as `fence-ordering-inc0-1497` started at 04:14:34; `ad-immutable-id-1471` died at 04:05:17 as
+`retry-forever-spelling-1217` started at 04:05:16; and so on back through the window.
+
+Attributing those requires care, because a same-branch re-push is a cancellation this block is supposed
+to cause. Each cancellation was credited to cross-pull-request collapse only when **no** run on its own
+branch started within 5 seconds of the kill -- a rule that biases against the finding. Under it:
+
+| Workflow | Group key | Trigger | Cross-branch-only cancellations |
+|---|---|---|---|
+| `cla.yml` | `github.ref` | `pull_request_target` | **21** |
+| `security.yml` | `github.ref` | `pull_request` | **0** (6 same-branch supersedes) |
+
+`security.yml` carries the same expression shape in the same repository over the same hour. Only the
+trigger differs, and with it the meaning of `github.ref`. That is the discriminator.
+
+### What a victim saw, and why nobody traced it
+
+A cancelled run reports `conclusion: cancelled` with `steps: 0` and no downloadable log -- measured on
+run 34560869543, against 5 steps on the healthy run 34561465510. No step ever started, so there is no
+failure to read. `gh pr checks` renders it in the fail column.
+
+The cause is not in the victim's own run at all. It is the creation timestamp of a run on somebody
+else's branch, which is not a place a reviewer looks.
+
+At filing, 17 of 23 open pull requests carried a cancelled `cla`, and on 11 of them `cla` was the
+**only** required context that was not a success.
+
+### One claim here is documented, not measured, and is marked so
+
+That a cancelled required context blocks the merge was filed here as **inferred**, and it is now
+**MEASURED**. The reasoning for the original label is kept because it explains why the observation was
+hard to get: branch protection sets `strict: true`, so a stale pull request reports `BEHIND`, and
+`mergeStateStatus` reports `BEHIND` or `DIRTY` in preference to `BLOCKED`. All 11 pull requests in the
+table above were `BEHIND` or `DIRTY`, which masks the reading, so that population could not supply the
+case no matter how its contexts were filtered.
+
+**This item's own pull request supplied it.** PR 1046, read 2026-09-11 at head `a6ace2aad`:
+
+```
+mergeable: MERGEABLE        mergeStateStatus: BLOCKED
+12 of 13 required contexts: SUCCESS
+cla:                        CANCELLED
+```
+
+Up to date, so no `BEHIND` to hide behind; every other required context green, so nothing else to
+blame; `BLOCKED` reported directly. A cancelled required context does block the merge. The one
+remaining gap is that this is one observation, not a rule GitHub documents -- but the observation is
+now on the record rather than an inference from the enumerated statuses.
+
+**The same reading is the sharpest available statement of the cost.** A pull request in this state
+presents as one failing check. Following it the normal way -- open the failed check, read the log --
+gives `fail` from `gh pr checks` and then `log not found`, because no step ever ran. Nothing anywhere
+on the pull request says the run was cancelled by a sibling rather than by the author's own change, and
+the only place the word `cancelled` appears is the run JSON, which nobody reads by default.
+
+### The whole workflow population was checked, not just the file that broke
+
+All 28 files in `.github/workflows/`, none skipped:
+
+| Verdict | Files |
+|---|---|
+| collapses across pull requests, with cancel | **1** -- `cla.yml` |
+| shared key, cancel off | 1 -- `asvs-prove-absences.yml` |
+| per-pull-request isolated | 13 |
+| unique per run, or a deliberate singleton | 4 |
+| per branch, no pull-request trigger | 2 |
+| no concurrency block | 7 |
+
+`asvs-prove-absences.yml` keys on `github.ref` unconditionally, which is shared on its `push` and
+`workflow_dispatch` arms, but sets `cancel-in-progress: false` and reports no required context, so a
+second run queues rather than killing the first. `freethread-smoke.yml` can have a manual dispatch
+cancel an in-flight weekly canary; it is informational and reports nothing required. Neither is fixed
+here, and neither is the defect this item names.
+
+`unread-signal.yml` is the only other file declaring `pull_request_target`, and it already keys on
+`github.event.pull_request.head.ref` rather than `github.ref`, so it does not collapse.
+`dependabot-auto-merge.yml` and `dependabot-lock-resync.yml` already key on the payload number, which
+is the pattern this fix adopts.
+
+### The guard, and why it is event-aware rather than a grep
+
+`tests/test_workflow_concurrency_keys.py` holds the invariant: for `pull_request_target` and
+`issue_comment` -- the two events that fire per pull request and whose `github.ref` is shared -- a
+concurrency group must not key on `github.ref`.
+
+`push`, `schedule`, `workflow_dispatch` and `workflow_run` are deliberately outside that set, which is
+why the test does not flag `ci.yml`; they do not fire per pull request, so a ref key there groups a
+branch with itself. `merge_group` is outside it because its ref already carries the pull request
+number.
+
+A checker that simply grepped for `github.ref` would condemn the five workflows that are correct and
+teach nothing about the sixth. The test therefore reads the trigger, and its table asserts both
+directions on one expression: the five-sibling expression is clean on `pull_request` and clean on
+`pull_request_target`, while the same expression with the arms swapped is dirty on
+`pull_request_target` and clean on `pull_request`.
+
+Mutation-tested both ways rather than assumed. Reverting the key to `github.ref` reddens the general
+invariant and the cla-specific test. Replacing it with `github.run_id` on every arm -- safe, but it
+discards the re-push saving the block exists for -- reddens only the cla-specific test. The two arms
+fail disjoint sets, so the tests discriminate instead of both firing on any edit.
+
+### The required set does not move
+
+The job key stays `cla` and still declares no `name:`, so the reported context string is unchanged.
+`.github/required-contexts.txt` and the count pinned in `tests/test_required_contexts.py` are untouched.
+Live branch protection read the same day returns 13 contexts, set-equal to that file. The existing
+negative control for `cla` in `tests/negative_controls.toml` already guards the context string, and it
+still passes.
+
+### Why it bit some pull requests and not others, which is why it read as flakiness
+
+The victim is always a run that had not finished yet, and a healthy `cla` run finishes in seconds.
+Over the same 61 `pull_request_target` runs:
+
+| Runs | n | Median lifetime | Min | Max |
+|---|---|---|---|---|
+| succeeded | 36 | 16s | 11s | 1,492s |
+| cancelled | 25 | 114s | 3s | 743s |
+
+25 of the 36 successes finished under 30 seconds. 21 of the 25 cancellations were still alive at 30
+seconds or more. A run that got a runner immediately and did its 5 steps in about 13 seconds closed
+before the next pull request's run arrived; a run left waiting for a runner did not. That is also why
+a cancelled run shows `steps: 0` -- it was not interrupted midway, it never started.
+
+So the gate's failure rate tracked runner availability rather than anything about the pull request,
+and a re-push usually cleared it. That is the most expensive thing a required check can look like: the
+remedy that gets reached for is a re-run, the re-run works, and the cause survives. This item's own
+pull request had two `cla` runs, both green at 13 seconds. That is not evidence the defect was absent;
+it is the same escape.
+
+### The group key cannot collide with anything else in the repository
+
+A concurrency group is scoped to the repository, not the workflow, so two files using one group string
+contend. GitHub states it outright: group names must be unique across workflows. Checked against all
+21 group expressions here: every one carries a distinct literal prefix, and `cla-` belongs to
+`cla.yml` alone. No job-level blocks, no reusable workflows, and no `concurrency:` outside
+`.github/workflows/`.
+
+The two arms cannot collide with each other either. That would need a run id equal to a pull request
+number: run ids here are about 3.46e10 against pull request numbers near 1,046. A `cla-pr-<n>` /
+`cla-run-<id>` spelling would make the separation structural rather than numeric, and is deliberately
+not adopted -- it buys nothing reachable and breaks the uniform `<workflow slug>-<expansion>` shape
+all 21 blocks use, which is what makes the prefix census a one-line check.
+
+### An adversarial pass found four holes in the guard and one in this change's side effects
+
+Five independent review lenses ran against the first commit. None found a defect in the concurrency
+key. Four found the regression guard weaker than its own comments claimed, and each hole was measured
+passing GREEN before it was closed:
+
+1. The cla-specific test asserted that `github.event.pull_request.number` and `github.run_id` appeared
+   somewhere in the group string, never which arm each sat in. Swapping the arms passed green while
+   removing the re-push saving and collapsing `issue_comment` and `merge_group` onto the bare key
+   `cla-`, because neither payload carries a pull request number. Adding a third arm for the signing
+   path also passed, because `run_id` was still present in the string. The fallback arm is now required
+   to be EXACTLY `github.run_id`; containment is what let the third arm hide.
+2. The invariant modelled one token. Under `pull_request_target` `github.ref` IS the base ref, so
+   `github.ref_name`, `github.base_ref` and `github.event.pull_request.base.ref` name the same branch,
+   and `github.workflow` and `github.repository` are constants. The first commit shipped a row
+   asserting `github.ref_name` was SAFE on that event -- an affirmative blessing for a substitution
+   that reinstates the defect, which is worse than an omission.
+3. `workflow_run` was excluded on a premise that is false here. `failure-signal.yml` runs on
+   `workflow_run` over CI, Security, CodeQL and backlog-hygiene, all of which run on `pull_request`,
+   so it fires once per pull request run, and a `workflow_run` ref is the default branch. Added, with
+   `check_suite`.
+4. "Fails closed on an unrecognised shape" held only for a NON-match. The arm regex's `then` is lazy,
+   so a parenthesised inner conditional splits in the wrong place, both arm checks clear, and the
+   verdict is False on an expression that IS the defect -- in the worked case narrowed to fork pull
+   requests, exactly the population a CLA gate polices.
+
+Nothing was broadened without first measuring the false-positive cost: no group expression in the
+repository uses `base_ref`, `ref_name` or `base.ref`, and neither `workflow_run` file keys on a shared
+context, so both changes flag nothing that works today.
+
+The guard also now reads `jobs.<id>.concurrency`. It has identical grouping semantics and was
+invisible, and `cla.yml` has exactly one job -- so the same defect one indentation level down cancels
+the same required check. No workflow declares one today, which is when to cover it.
+
+### This change broke a line-anchored zizmor suppression, and the mis-reasoning is the lesson
+
+`.github/zizmor.yml` suppressed the `self-repository` finding on this file with `- cla.yml:122`, an
+anchor whose own comment says "Re-anchor if the line moves; do not broaden it to the file." The 28
+comment lines added above the job body moved
+`uses: ./.github/actions/cla-assistant-lite` from 122 to 150, the anchor stopped matching, and
+`zizmor` went red on this pull request.
+
+It was first reported here as PRE-EXISTING, wrongly, and the reasoning is worth recording because it
+looked sound. What was checked: the flagged line's CONTENT is byte-identical on `origin/main`, and the
+diff does not touch it. Both true, and both answer a question nobody asked -- the suppression keys on
+the line NUMBER. **Inserting lines ABOVE a line is how a line-anchored control breaks without the line
+being touched**, so "my diff does not touch it" is the specific sentence that conceals this class.
+
+This is [BACKLOG #1493](BACKLOG.md) re-firing verbatim -- filed 2026-09-08 for exactly this, recording
+that its guard was deliberately not built. Second occurrence, so the class now has two instances rather
+than one.
+
+Re-anchored to 161, computed from the workflow file rather than copied from the zizmor report, because
+the hardening commit moved the line again. `archived-uses: - cla.yml:44` at `zizmor.yml:205` is left
+untouched: it was already mis-anchored on main (line 44 is `types: [created]` before and after), which
+is pre-existing under BACKLOG #1381, and re-pointing it at the `uses:` line would start suppressing a
+finding nobody decided to suppress. An intermediate revision of the fix did exactly that, through a
+regex that matched the first anchor in the file instead of the intended one; reverted, and the diff to
+`zizmor.yml` is one line.
+
+### Two peer claims about the impact were checked and one did not survive
+
+A peer offered that a CONFLICTING pull request has no merge ref, so "every `pull_request`-triggered
+workflow cannot run at all", which would make `cla` one of the few required contexts able to report and
+so sharpen this item's cost. Measured against the only two DIRTY pull requests open at the time, by
+head SHA: each carried SEVEN `pull_request`-triggered runs, all reporting, plus the cancelled
+`pull_request_target` CLA run. So CONFLICTING-now does not stop them.
+
+The discriminator is WHEN the conflict arose, not whether it exists. Those two were pushed while
+mergeable and went DIRTY later as main moved, so their runs already existed. A push made while the
+branch ALREADY conflicts is a different case and is consistent with the peer's own reading of their
+SHA, but it was not tested here and is not claimed. `mergeStateStatus` cannot tell the two histories
+apart, which is why the general version is not recorded as fact.
+
+### CORRECTION: the ref is the DEFAULT branch, not the base branch, and a stacked pull request proved it
+
+This item first said `github.ref` under `pull_request_target` is the BASE ref, quoting GitHub's
+variables page: "`pull_request_target` events have the `ref` from the base branch." That quote is real
+and the reading built on it is wrong for github.com. The events page says "Default branch" for the same
+event, and the two pages disagree.
+
+**No measurement taken here could separate them, and that is the instructive part.** Every pull request
+in the 61-run population targeted `main`, so the base ref and the default branch were the same string
+and both readings predicted the same group. The discriminating case is a pull request based on
+something other than the default branch, and this item had none.
+
+One arrived from another session on 2026-09-11. PR 1048, head `claude/reconciler-rekey-stack`, base
+`claude/ad-immutable-id-1471` -- not `main`. Its `cla` run 34568093043 was cancelled at 06:17:07, one
+second after run 34569280155 on a `main`-based pull request was created at 06:17:06. Under the
+base-branch reading those two runs key to `cla-refs/heads/claude/ad-immutable-id-1471` and
+`cla-refs/heads/main`, two groups that cannot touch each other. They cancelled each other, so the ref
+is the default branch.
+
+**This makes the defect broader than first described, and changes no remedy.** Every open pull request
+collapsed into one group regardless of what it targeted, stacked pull requests included, so the blast
+radius was the whole repository rather than one base branch at a time. The fix is unaffected: a pull
+request number separates pull requests under either reading. What the distinction protects against is a
+reader repairing some future variant from the base-branch sentence, building a per-BASE key, and
+believing it is per-pull-request -- which is why `github.base_ref` and
+`github.event.pull_request.base.ref` are in the guard's shared-context set rather than treated as
+discriminators.
+
+### Two corrections to the operator-facing advice, both from the same session
+
+**`gh pr checks` does not show the word this item told readers to look for.** It renders the cancelled
+`cla` context as `fail`:
+
+```
+cla     fail    1m36s   https://github.com/.../actions/runs/34568093043/job/103167391241
+```
+
+while the status rollup for the same check reports `conclusion=CANCELLED status=COMPLETED`. So the
+surface a reader reaches for first DISGUISES the signature. Reading the real conclusion needs
+`gh pr view --json statusCheckRollup` or `gh run view --json jobs`. An instruction to "look for
+CANCELLED" fails against `gh pr checks`, and the finding still presents as a failure with nothing in
+the log.
+
+**"A re-push usually clears it" was too strong.** A retry re-enters the same shared group and is
+cancellable by the next arrival, so it is not a dependable escape while other sessions are pushing.
+Measured directly by that session: `gh run rerun 34568093043` queued, ran 1m36s, and came back
+CANCELLED again. Over the whole `pull_request_target` population the success rate is **35 of 69**, near
+enough a coin flip -- and with 13 live sessions in this repository the arrival rate is what sets it.
+That is worse for the operator than "clears up on retry" implies: the workaround is unreliable in
+exactly the conditions that cause the problem.
+
+### A cancelled `cla` is not confined to stale or conflicting pull requests
+
+Every pull request in the 11-PR table above was `BEHIND` or `DIRTY` -- nine and two. That leaves a
+confound a reader can point at: perhaps something about a stale or conflicting state caused the
+cancellation rather than the shared group. It did not, and two `MERGEABLE` cases settle it.
+
+The first is this item's own pull request. PR 1046 read `mergeable=MERGEABLE mergeStateStatus=BLOCKED`
+with `cla=CANCELLED` and every other required context either pending on a fresh run or green. Nothing
+stale, nothing conflicting. The second was reported by another session on PR 1030 at head `e520ad2f3`,
+also `MERGEABLE` with `cla` cancelled, 28 check runs otherwise progressing.
+
+That is the whole claim: the cancellation does not need a stale or conflicting pull request. It says
+nothing about merge-blocking, which stays INFERRED for the reason given above.
+
+**The fix could not protect its own pull request, and that is expected rather than a failure.**
+`pull_request_target` workflows run from the DEFAULT branch, so PR 1046's `cla` check executes `main`'s
+copy of this workflow, not the corrected one in the diff. It takes effect on merge.
+
+### `gh run rerun` restarts the check without a push, and prints nothing while doing it
+
+The remedy that does not re-fire the whole suite:
+
+```
+gh run rerun <cla run id> --repo MEFORORG/MessageFoundry
+```
+
+An empty commit also works and is worse -- it re-runs every leg and re-enters the same race.
+
+**Verify it took, because the command is silent on success.** It printed no output at all, which is
+indistinguishable from a swallowed failure. Reading the run back is the check: `run_attempt=2` with a
+fresh `status`. Measured on run 34569960533 for this pull request, and independently by another session
+on PR 1030.
+
+**"Re-running clears it" is NOT established, and should not be written as if it were.** What is measured
+is that the re-run STARTS without a push. Whether it FINISHES is a separate question, and a re-run
+re-enters the same shared group, so it faces the same arrival rate that caused the cancellation.
+
+**DO NOT QUOTE A RATE FOR THE RE-RUN, and do not read the population rate as one.** The
+whole-population figure is 63 successes in 95 first-attempt runs. Attempt-2+ runs are four, and putting
+each through the SAME conservative attribution rule used above -- credit the collapse only when no run
+on its own branch started within 5s of the kill -- leaves exactly ONE attributable to this defect:
+
+| run | conclusion | verdict under the rule |
+|---|---|---|
+| 34499682853 | success | n/a |
+| 34568093043 | cancelled | **CROSS-BRANCH** -- attributable; the run created 1s before the kill was on another branch |
+| 34569715633 | cancelled | **UNATTRIBUTED** -- no cla run created within 5s either way |
+| 34569960533 | cancelled | **self-supersession** -- its own branch's next push, 1s before the kill |
+
+So the measured count of this defect killing a re-run is **one**. An earlier revision of this item said
+"one success and two cancellations", which counted the unattributed row as though it were the defect.
+That was the rule applied unevenly: it was run on the one re-run belonging to this branch and not on the
+other two. n=1 is not a rate in either direction.
+
+**THE "RE-RUNS ARE SYSTEMATICALLY DISADVANTAGED BY QUEUEING" READING IS REFUTED AT THE RUN LEVEL.** It
+was offered on a measurement of 7m13s "queued" for run 34569715633, and on a 318s figure this item
+briefly carried for another. Both come from `created_at`, which for a multi-attempt run is the FIRST
+attempt's creation -- so the span covers attempt 1, plus the idle gap before anybody requested the
+re-run, plus any real queueing. The per-attempt endpoint
+(`/actions/runs/<id>/attempts/<n>`) separates them, and the answer is that these re-runs did not queue:
+
+| run | attempt | created | started | queued | ran |
+|---|---|---|---|---|---|
+| 34569715633 | 2 | 06:30:42 | 06:30:41 | ~0s | 95s |
+| 34569960533 | 2 | 06:32:14 | 06:32:13 | ~0s | 110s |
+
+**WHERE THE WAITING ACTUALLY IS, and it is not visible in any run-level timestamp.** A cancelled run
+reports `steps: 0` -- no step ever started -- while the run itself shows as having started minutes
+earlier. So the wait is the JOB waiting for a runner, which `run_started_at` does not measure: it records
+when the RUN was accepted. The `steps: 0` observation recorded earlier on this item is the evidence for
+the exposure window; neither `created_at` nor `run_started_at` is.
+
+**READ A RE-RUN WITH THE PER-ATTEMPT ENDPOINT.** Two sessions independently drew wrong quantities from
+the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
+median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
+confirmation. They were the same artifact.
