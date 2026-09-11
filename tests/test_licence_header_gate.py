@@ -49,6 +49,10 @@ def _load() -> ModuleType:
 
 _MOD = _load()
 _GOOD = f"{_MOD.SPDX_TAG} {_MOD.EXPECTED_IDENTIFIER}"
+# A compliant COPYRIGHT line (BACKLOG #1552). Kept beside _GOOD because a fully-compliant header is
+# now both lines: the gate asserts the licence and the holder separately, and a fixture carrying only
+# the licence is no longer a clean file.
+_GOOD_COPYRIGHT = f"Copyright (C) 2026 {_MOD.EXPECTED_HOLDER} and contributors"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -299,6 +303,221 @@ def test_the_file_is_read_from_the_path_as_given_not_from_the_registry_key(
         probe.unlink(missing_ok=True)
 
 
+# --------------------------------------------------------------------------------------------------
+# THE COPYRIGHT HOLDER (BACKLOG #1552).
+#
+# The licence and the holder fail separately, so they are asserted separately. Every fixture below is
+# built from _GOOD / _GOOD_COPYRIGHT rather than from a literal header, and that is load-bearing
+# rather than tidy: a literal SPDX line followed by a literal copyright line ANYWHERE IN THIS FILE
+# would make this file itself a template site, and the identity control at the bottom would then fail
+# on the test file that exists to police it. Interpolating keeps the literal tag out of this source.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_compliant_holder_passes(tmp_path: Path) -> None:
+    path = tmp_path / "clean.py"
+    path.write_text(f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\nprint(1)\n", encoding="utf-8")
+    assert _MOD.check_holder(path) is None
+
+
+def test_no_copyright_line_is_its_own_class(tmp_path: Path) -> None:
+    """A correct licence with no copyright line at all. Four real files were in this state."""
+    path = tmp_path / "licence_only.py"
+    path.write_text(f"# {_GOOD}\nprint(1)\n", encoding="utf-8")
+    result = _MOD.check_holder(path)
+    assert result is not None
+    assert result[0] == _MOD.HOLDER_MISSING
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        "MessageFoundry Organization",  # the superseded entity -- the defect that prompted this
+        "MessageFoundry contributors.",  # a THIRD form, found by the sweep in five test files
+        "Some Other Company, LLC",
+        "MessageFoundry Foundation",  # no ", LLC" -- one comma away, which a prefix check would pass
+    ],
+)
+def test_a_wrong_holder_is_its_own_class(tmp_path: Path, named: str) -> None:
+    """Naming the wrong entity is a distinct defect from naming none, and is reported as one.
+
+    ``MessageFoundry Foundation`` without the ``, LLC`` is in the list deliberately: it is a strict
+    prefix of the expected value, so a ``startswith`` comparison would bless a header naming an
+    entity that is not the registered one.
+    """
+    path = tmp_path / "wrong_holder.py"
+    path.write_text(f"# {_GOOD}\n# Copyright (C) 2026 {named}\n", encoding="utf-8")
+    result = _MOD.check_holder(path)
+    assert result is not None
+    assert result[0] == _MOD.HOLDER_WRONG
+    assert named in result[1]
+
+
+def test_the_holder_is_pinned_positionally_not_by_excluding_paths(tmp_path: Path) -> None:
+    """Quoting the superseded entity in PROSE must not trip the gate, wherever the file lives.
+
+    This is why there is no exclusion list. ``docs/BACKLOG.md`` quotes the old entity deliberately to
+    record what was replaced, and an ADR or a migration note may do the same tomorrow. A path
+    exclusion would have to be edited for each one, and nothing would report that it needed editing.
+    A positional check asks only whether the HEADER names the right holder, so prose is simply not a
+    header and never trips.
+    """
+    path = tmp_path / "quotes_the_old_name.py"
+    path.write_text(
+        f"# {_GOOD}\n"
+        f"# {_GOOD_COPYRIGHT}\n"
+        '"""The entity was renamed from "MessageFoundry Organization" in PR 1020."""\n',
+        encoding="utf-8",
+    )
+    assert _MOD.check_holder(path) is None
+
+
+def test_a_vendored_file_is_not_forced_to_name_this_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Third-party code keeps its own provenance. The real vendored file carries no copyright line.
+
+    Stamping this project's holder onto someone else's Apache-2.0 source is the same affirmative
+    misstatement the licence half of this gate exists to prevent, so the holder check honours the
+    SAME registry rather than keeping a second list that could drift from it.
+    """
+    path = tmp_path / "vendored.js"
+    path.write_text("// SPDX-License-Identifier: Apache-2.0\nconsole.log(1);\n", encoding="utf-8")
+    assert _MOD.check_holder(path) is not None  # unregistered: the holder is demanded
+    monkeypatch.setitem(_MOD.VENDORED_LICENCES, path.as_posix(), "Apache-2.0")
+    assert _MOD.check_holder(path) is None  # registered: exempt
+
+
+def test_the_real_vendored_file_is_exempt_from_the_holder_check() -> None:
+    """The shipped registry entry, through the real lookup -- not a monkeypatched stand-in."""
+    assert _MOD.VENDORED_LICENCES, "no entries left to check -- update or remove this test"
+    for rel_path in _MOD.VENDORED_LICENCES:
+        assert _MOD.check_holder(_ROOT / rel_path) is None
+
+
+# --------------------------------------------------------------------------------------------------
+# TEMPLATES, and the blind spot they sit in.
+#
+# The comment rule means a header inside a string literal is skipped. Some of those literals STAMP
+# headers onto generated files, so they decide the copyright holder of files that do not exist yet --
+# and they are exactly what the comment rule cannot see.
+# --------------------------------------------------------------------------------------------------
+
+
+def _template_body(holder_line: str) -> str:
+    """A file that STAMPS a header: the tag and a copyright line together inside one literal."""
+    return f'TEMPLATE = """# {_GOOD}\n# {holder_line}\n"""\n'
+
+
+def test_a_template_stamping_the_wrong_holder_is_caught(tmp_path: Path) -> None:
+    """The case no header check can reach: the file's OWN header is fine, the template is not."""
+    path = tmp_path / "generator.py"
+    path.write_text(
+        f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\n"
+        + _template_body("Copyright (C) 2026 MessageFoundry Organization"),
+        encoding="utf-8",
+    )
+    assert _MOD.check_file(path) is None, "the file's own licence header is correct"
+    assert _MOD.check_holder(path) is None, "the file's own copyright header is correct"
+    violations = _MOD.check_templates(path)
+    assert len(violations) == 1
+    assert violations[0][0] == _MOD.TEMPLATE_HOLDER_WRONG
+    assert "MessageFoundry Organization" in violations[0][1]
+
+
+def test_a_template_stamping_the_right_holder_passes(tmp_path: Path) -> None:
+    path = tmp_path / "generator.py"
+    path.write_text(
+        f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\n" + _template_body(_GOOD_COPYRIGHT),
+        encoding="utf-8",
+    )
+    assert _MOD.check_templates(path) == []
+    assert len(_MOD.template_sites(path)) == 1, "the site is still FOUND, just not violating"
+
+
+def test_prose_quoting_the_tag_is_not_a_template(tmp_path: Path) -> None:
+    """The false positive that makes a naive scan expensive to read.
+
+    A naive "SPDX tag inside a string literal" scan flags this module's own documentation of why it
+    must not flag such a thing. The discriminator is ADJACENCY: a template carries a copyright line
+    beside the tag; prose quotes the tag alone and continues into sentences.
+    """
+    path = tmp_path / "prose.py"
+    path.write_text(
+        f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\n"
+        f'"""This module emits `# {_GOOD}` into generated files,\n'
+        'because a substring check would read a header-emitting file as a headered one."""\n',
+        encoding="utf-8",
+    )
+    assert _MOD.template_sites(path) == []
+    assert _MOD.check_templates(path) == []
+
+
+def test_a_blank_line_inside_a_template_does_not_end_the_search(tmp_path: Path) -> None:
+    """Blank lines are skipped, not treated as evidence: a template may space its header block."""
+    path = tmp_path / "spaced.py"
+    path.write_text(
+        f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\n"
+        f'TEMPLATE = """# {_GOOD}\n\n# Copyright (C) 2026 MessageFoundry Organization\n"""\n',
+        encoding="utf-8",
+    )
+    violations = _MOD.check_templates(path)
+    assert len(violations) == 1
+    assert "MessageFoundry Organization" in violations[0][1]
+
+
+# --------------------------------------------------------------------------------------------------
+# THE IDENTITY CONTROL over the real tree.
+#
+# A count is not enough -- two results can be the WRONG two. This asserts WHICH files the scan finds
+# and, just as importantly, which it does not. The two it must not find are the gate's own
+# documentation and this very file, both of which quote the tag while explaining the trap.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_scan_finds_exactly_the_real_templates_and_not_the_prose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_ROOT)
+
+    found = {name for name in _MOD.tracked_files() if _MOD.template_sites(Path(name))}
+
+    assert found == {
+        "messagefoundry/corepoint_import.py",
+        "harness/config/connscale/gen_toml.py",
+    }, f"the template scan drifted: {sorted(found)}"
+
+    # Stated separately from the equality above, because this is the half that regresses quietly: an
+    # over-broad discriminator would add these two and the equality would fail with a message that
+    # does not say WHY they matter.
+    for prose in ("scripts/quality/licence_header_check.py", "tests/test_licence_header_gate.py"):
+        assert prose not in found, (
+            f"{prose} quotes the tag in prose and must not read as a template"
+        )
+
+
+def test_the_real_tracked_tree_names_the_right_holder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operational assertion, matching the licence one: the real tree must satisfy the gate.
+
+    ``test_the_real_tracked_tree_is_clean`` already covers this through the exit code, since ``main``
+    aggregates all three checks. This names the holder specifically, so a failure says which of the
+    two invariants broke instead of reporting a generic non-zero exit.
+    """
+    monkeypatch.chdir(_ROOT)
+    offenders = []
+    for name in _MOD.tracked_files():
+        path = Path(name)
+        if not path.is_file():
+            continue
+        verdict = _MOD.check_holder(path)
+        if verdict is not None:
+            offenders.append(f"{name}: {verdict[0]} {verdict[1]}")
+        offenders.extend(f"{name}: {detail}" for _, detail in _MOD.check_templates(path))
+    assert not offenders, "files do not name {}:\n{}".format(
+        _MOD.EXPECTED_HOLDER, "\n".join(offenders)
+    )
+
+
 def test_tag_inside_a_string_literal_does_not_count(tmp_path: Path) -> None:
     """A header-emitting file is not a headered file."""
     path = tmp_path / "emitter.py"
@@ -350,7 +569,7 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
 def test_exit_codes(tmp_path: Path) -> None:
     """0 clean / 1 violations / 2 usage error -- the contract pre-commit and CI both key on."""
     good = tmp_path / "good.py"
-    good.write_text(f"# {_GOOD}\n", encoding="utf-8")
+    good.write_text(f"# {_GOOD}\n# {_GOOD_COPYRIGHT}\n", encoding="utf-8")
     bad = tmp_path / "bad.py"
     bad.write_text("print(1)\n", encoding="utf-8")
 
