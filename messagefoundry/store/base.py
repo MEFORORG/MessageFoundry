@@ -1584,12 +1584,42 @@ class AuthStore(Protocol):
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        directory_object_id: str | None = None,
         now: float | None = None,
     ) -> None: ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
 
     async def get_user_by_username(self, username: str) -> UserRecord | None: ...
+
+    async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
+        """The account bound to this directory-immutable identifier, or ``None`` (BACKLOG #1471).
+
+        **The identification read for a directory login.** ``sAMAccountName`` is a *label*: a
+        directory frees a deleted account's name and may reissue it to a different person, so
+        resolving a login by name let the new holder adopt the departed operator's row — and with it
+        the ``user_id`` that uploaded-file ownership, the per-uploader quota and saved search presets
+        all key on. This is the AD leg of what ``(issuer, sub)`` does for OIDC.
+
+        **A NULL binding is never adopted by name.** A row whose ``directory_object_id`` is NULL is
+        not this method's to return, and ``auth/service.py`` refuses a login whose presented id
+        disagrees with the row holding its username rather than writing the id onto it. Backfilling
+        on first sight was the alternative and is rejected: it leaves the recycle window open for
+        every account that has not signed in yet, which is the hole being closed.
+
+        Written at account creation (``create_user``), never updated afterwards — the directory's id
+        for an account does not change, and a *row* that needs a different one is a different account.
+
+        **IT DIVERGES FROM ITS FEDERATED SIBLING ON EXACTLY ONE POINT, and the difference is the
+        source of the claim, not a disagreement about strictness.** ``set_user_federated_subject``
+        binds ``(issuer, sub)`` on FIRST PRESENTATION (ADR 0142), because the engine never holds that
+        pair until an IdP presents it — there is no other moment at which a binding could be created.
+        The directory id is different in kind: the engine READS it itself, from its own service-account
+        search, at the instant the row is created. Because it is available at creation, an account
+        that lacks it was created without a directory read, and accepting one later would be accepting
+        it on the strength of a name — which is the thing being replaced.
+        """
+        ...
 
     async def list_users(self) -> Sequence[UserRecord]: ...
 
