@@ -30609,3 +30609,112 @@ The job key stays `cla` and still declares no `name:`, so the reported context s
 Live branch protection read the same day returns 13 contexts, set-equal to that file. The existing
 negative control for `cla` in `tests/negative_controls.toml` already guards the context string, and it
 still passes.
+
+### Why it bit some pull requests and not others, which is why it read as flakiness
+
+The victim is always a run that had not finished yet, and a healthy `cla` run finishes in seconds.
+Over the same 61 `pull_request_target` runs:
+
+| Runs | n | Median lifetime | Min | Max |
+|---|---|---|---|---|
+| succeeded | 36 | 16s | 11s | 1,492s |
+| cancelled | 25 | 114s | 3s | 743s |
+
+25 of the 36 successes finished under 30 seconds. 21 of the 25 cancellations were still alive at 30
+seconds or more. A run that got a runner immediately and did its 5 steps in about 13 seconds closed
+before the next pull request's run arrived; a run left waiting for a runner did not. That is also why
+a cancelled run shows `steps: 0` -- it was not interrupted midway, it never started.
+
+So the gate's failure rate tracked runner availability rather than anything about the pull request,
+and a re-push usually cleared it. That is the most expensive thing a required check can look like: the
+remedy that gets reached for is a re-run, the re-run works, and the cause survives. This item's own
+pull request had two `cla` runs, both green at 13 seconds. That is not evidence the defect was absent;
+it is the same escape.
+
+### The group key cannot collide with anything else in the repository
+
+A concurrency group is scoped to the repository, not the workflow, so two files using one group string
+contend. GitHub states it outright: group names must be unique across workflows. Checked against all
+21 group expressions here: every one carries a distinct literal prefix, and `cla-` belongs to
+`cla.yml` alone. No job-level blocks, no reusable workflows, and no `concurrency:` outside
+`.github/workflows/`.
+
+The two arms cannot collide with each other either. That would need a run id equal to a pull request
+number: run ids here are about 3.46e10 against pull request numbers near 1,046. A `cla-pr-<n>` /
+`cla-run-<id>` spelling would make the separation structural rather than numeric, and is deliberately
+not adopted -- it buys nothing reachable and breaks the uniform `<workflow slug>-<expansion>` shape
+all 21 blocks use, which is what makes the prefix census a one-line check.
+
+### An adversarial pass found four holes in the guard and one in this change's side effects
+
+Five independent review lenses ran against the first commit. None found a defect in the concurrency
+key. Four found the regression guard weaker than its own comments claimed, and each hole was measured
+passing GREEN before it was closed:
+
+1. The cla-specific test asserted that `github.event.pull_request.number` and `github.run_id` appeared
+   somewhere in the group string, never which arm each sat in. Swapping the arms passed green while
+   removing the re-push saving and collapsing `issue_comment` and `merge_group` onto the bare key
+   `cla-`, because neither payload carries a pull request number. Adding a third arm for the signing
+   path also passed, because `run_id` was still present in the string. The fallback arm is now required
+   to be EXACTLY `github.run_id`; containment is what let the third arm hide.
+2. The invariant modelled one token. Under `pull_request_target` `github.ref` IS the base ref, so
+   `github.ref_name`, `github.base_ref` and `github.event.pull_request.base.ref` name the same branch,
+   and `github.workflow` and `github.repository` are constants. The first commit shipped a row
+   asserting `github.ref_name` was SAFE on that event -- an affirmative blessing for a substitution
+   that reinstates the defect, which is worse than an omission.
+3. `workflow_run` was excluded on a premise that is false here. `failure-signal.yml` runs on
+   `workflow_run` over CI, Security, CodeQL and backlog-hygiene, all of which run on `pull_request`,
+   so it fires once per pull request run, and a `workflow_run` ref is the default branch. Added, with
+   `check_suite`.
+4. "Fails closed on an unrecognised shape" held only for a NON-match. The arm regex's `then` is lazy,
+   so a parenthesised inner conditional splits in the wrong place, both arm checks clear, and the
+   verdict is False on an expression that IS the defect -- in the worked case narrowed to fork pull
+   requests, exactly the population a CLA gate polices.
+
+Nothing was broadened without first measuring the false-positive cost: no group expression in the
+repository uses `base_ref`, `ref_name` or `base.ref`, and neither `workflow_run` file keys on a shared
+context, so both changes flag nothing that works today.
+
+The guard also now reads `jobs.<id>.concurrency`. It has identical grouping semantics and was
+invisible, and `cla.yml` has exactly one job -- so the same defect one indentation level down cancels
+the same required check. No workflow declares one today, which is when to cover it.
+
+### This change broke a line-anchored zizmor suppression, and the mis-reasoning is the lesson
+
+`.github/zizmor.yml` suppressed the `self-repository` finding on this file with `- cla.yml:122`, an
+anchor whose own comment says "Re-anchor if the line moves; do not broaden it to the file." The 28
+comment lines added above the job body moved
+`uses: ./.github/actions/cla-assistant-lite` from 122 to 150, the anchor stopped matching, and
+`zizmor` went red on this pull request.
+
+It was first reported here as PRE-EXISTING, wrongly, and the reasoning is worth recording because it
+looked sound. What was checked: the flagged line's CONTENT is byte-identical on `origin/main`, and the
+diff does not touch it. Both true, and both answer a question nobody asked -- the suppression keys on
+the line NUMBER. **Inserting lines ABOVE a line is how a line-anchored control breaks without the line
+being touched**, so "my diff does not touch it" is the specific sentence that conceals this class.
+
+This is [BACKLOG #1493](BACKLOG.md) re-firing verbatim -- filed 2026-09-08 for exactly this, recording
+that its guard was deliberately not built. Second occurrence, so the class now has two instances rather
+than one.
+
+Re-anchored to 161, computed from the workflow file rather than copied from the zizmor report, because
+the hardening commit moved the line again. `archived-uses: - cla.yml:44` at `zizmor.yml:205` is left
+untouched: it was already mis-anchored on main (line 44 is `types: [created]` before and after), which
+is pre-existing under BACKLOG #1381, and re-pointing it at the `uses:` line would start suppressing a
+finding nobody decided to suppress. An intermediate revision of the fix did exactly that, through a
+regex that matched the first anchor in the file instead of the intended one; reverted, and the diff to
+`zizmor.yml` is one line.
+
+### Two peer claims about the impact were checked and one did not survive
+
+A peer offered that a CONFLICTING pull request has no merge ref, so "every `pull_request`-triggered
+workflow cannot run at all", which would make `cla` one of the few required contexts able to report and
+so sharpen this item's cost. Measured against the only two DIRTY pull requests open at the time, by
+head SHA: each carried SEVEN `pull_request`-triggered runs, all reporting, plus the cancelled
+`pull_request_target` CLA run. So CONFLICTING-now does not stop them.
+
+The discriminator is WHEN the conflict arose, not whether it exists. Those two were pushed while
+mergeable and went DIRTY later as main moved, so their runs already existed. A push made while the
+branch ALREADY conflicts is a different case and is consistent with the peer's own reading of their
+SHA, but it was not tested here and is not claimed. `mergeStateStatus` cannot tell the two histories
+apart, which is why the general version is not recorded as fact.
