@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """N-active engine-shard CERTIFICATION system-under-test (ADR 0073).
 
 N shard-tagged inbound hubs (one per shard) whose handlers deliver to the SAME shared pool of outbound

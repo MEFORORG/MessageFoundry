@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lazy loaders for the optional ``[fhir]`` extra (``fhir.resources`` + ``fhirpathpy``).
 
 The heavy, typed FHIR libraries live behind the ``messagefoundry[fhir]`` optional extra (ADR 0022 §6),

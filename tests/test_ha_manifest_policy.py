@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural policy tests for the active-passive HA k8s manifest (ADR 0047, DEPLOY-26).
 
 These parse ``docker/k8s/ha-postgres.yaml`` with PyYAML and assert the ADR 0047 AC-4/AC-5

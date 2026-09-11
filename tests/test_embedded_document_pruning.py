@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Embedded-document (base64 attachment) pruning (#47, ADR 0042).
 
 A per-connection ``prune_documents_after`` window drives an in-place strip of bulky base64 embedded

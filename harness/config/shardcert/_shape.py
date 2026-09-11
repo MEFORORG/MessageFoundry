@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shape parameters for the N-active engine-shard CERTIFICATION graph (ADR 0073).
 
 Loader skips ``_*`` modules, so this is *imported* by :mod:`graph`, not loaded as config. It models a

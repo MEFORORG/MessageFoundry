@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A reassignable username used as an ACCESS KEY lets a recycled account inherit objects.
 
 ``Identity`` carries an immutable ``user_id`` and a reassignable ``username``. A username is

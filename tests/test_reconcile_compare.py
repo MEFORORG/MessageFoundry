@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-connection reconcile orchestration: key extraction, message loading, pairing + diff, reporting.
 
 Pure + offline (no DB, no sockets). Covers: field_value on a message's own separators; load_messages from

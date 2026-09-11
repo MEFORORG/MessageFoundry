@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The verify step must name the source it LOADED, not the file it installed (BACKLOG #1080).
 
 ``setup-leak-gate.ps1 -Synthetic`` printed *"Installed the SYNTHETIC template"* and, three lines

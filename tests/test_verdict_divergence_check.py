@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The verdict-divergence check must fire on a contradicted banner and on nothing else (#1342).
 
 Every test is one half of a PAIR. A bare-word search for ``demand-gate`` reports FIVE against a true

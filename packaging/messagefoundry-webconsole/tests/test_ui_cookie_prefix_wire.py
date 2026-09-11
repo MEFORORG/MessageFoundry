@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1117 / ASVS 3.3.1: what the browser-hardening opt-out costs, measured ON THE WIRE.
 
 **OWNER RULING 2026-09-05: the opt-out drops ``__Host-`` ONLY.** It was never written down whether

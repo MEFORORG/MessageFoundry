@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.3 on the cookie plane — the /ui half of the MFA access gate.
 
 The JSON plane refuses a pending session with 403 + ``X-MFA-Required``; a browser cannot act on that,

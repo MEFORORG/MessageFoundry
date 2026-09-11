@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Adversarial cases for ``verify_compact_jws`` — the OIDC ``id_token`` verify path (ADR 0142).
 
 This is the highest-risk-per-line code in the federated-SSO build: a bug here is a silent, total

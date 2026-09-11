@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The synchronous-reply resolver (ADR 0154 D3) — the wait loop's outcome matrix.
 
 Driven through a store double so every branch is deterministic, including the ones a real store

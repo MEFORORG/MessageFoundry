@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-registry validation for ``reply_from`` (ADR 0154 D4) — the facts one ``Http()`` call cannot
 know, because they are about the *other* connection.
 

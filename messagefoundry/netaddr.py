@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Source-address matching — the ONE place an IP allow-list decision is made.
 
 Two callers share this, deliberately, so the operator surface and the ingest listeners can never

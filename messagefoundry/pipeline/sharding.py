@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Coarse-grained, per-connection multi-process sharding (L3).
 
 The GIL caps a single engine process at one CPU core for routing/transform. To scale past it

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Two staleness signals that are really one, and the third that is not.
 
 Readers across this repo treat ``seats/.writer-alive/<box>.txt`` and the seat record's ``asOf`` as

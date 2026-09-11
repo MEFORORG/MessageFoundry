@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Finding A: SQL Server schema-init takes the cross-node schema applock BEFORE any CREATE, so two
 nodes doing an HA cold start against a virgin DB serialize the DDL instead of both running the
 check-then-create `IF OBJECT_ID(...) IS NULL CREATE` guards and racing the loser into a 2714 ("There

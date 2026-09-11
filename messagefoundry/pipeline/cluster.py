@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cluster coordination seam (active-passive HA — Track B Steps 3-7).
 
 Active-passive HA runs the engine as a leader plus one or more hot standbys against one shared

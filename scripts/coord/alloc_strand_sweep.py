@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Census of ledger allocations by WHERE the ledger gate would still let them be committed.
 
 WHAT THIS ANSWERS. `scripts/hooks/ledger_check.py` refuses a commit that introduces an ADR or BACKLOG

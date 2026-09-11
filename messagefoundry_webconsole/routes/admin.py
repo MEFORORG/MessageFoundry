@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """L4a admin surface (ADR 0065; #75 phase 4): user, role, and AD-group-mapping /ui pages + actions. Clients of the injected JSON handlers (called directly, re-asserting each gate via require_ui*)."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 2.4.1 / 15.2.2 — message-rate pacing on the inbound MLLP data plane.
 
 The engine had no bound on messages per second from an accepted peer in any configuration, so a

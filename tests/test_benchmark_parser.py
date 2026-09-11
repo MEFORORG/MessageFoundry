@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Parser throughput / free-threaded scaling benchmark harness (ADR 0054 AC-6, PARSE-15).
 
 ADR 0054 makes the low-allocation built-ins HL7 parser the *free-threading keystone*: its acceptance

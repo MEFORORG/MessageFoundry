@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Streaming-attachment substrate (#149, ADR 0105 Phase 0). A very-large document (e.g. a base64 PDF in
 OBX-5.5 too large for the frame cap) is DETACHED from its message into a content-addressed, chunked,
 per-chunk-sealed in-store attachment. This generalizes the ``shared_body`` store-once model (content

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0152 rungs 1 + 2 — the platform memory-encryption READ-OUT and the operator declaration.
 
 Three things are on trial here and only one of them is behaviour.

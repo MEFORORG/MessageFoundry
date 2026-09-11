@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Security hardening for the built-ins HL7 unescape (DELTA-01 / DELTA-02 / ASVS 1.3.3).
 
 The built-in tolerant parser is the **default** hot-path backend (ADR 0054). Its rich-text
