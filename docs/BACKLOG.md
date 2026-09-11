@@ -30482,7 +30482,7 @@ and will move to the archive when it closes.
 
 ## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
 
-> 🚧 **Built 2026-09-11; open until its pull request merges, when the Lander flips this banner.** One-line key change in `.github/workflows/cla.yml` -- `github.ref` becomes `github.event.pull_request.number` on the `pull_request_target` arm -- plus `tests/test_workflow_concurrency_keys.py`, which holds the invariant over all 28 workflow files. Value **8/10** · Difficulty **2/10**. Value 8: `cla` is a required context, 25 of the last 61 `pull_request_target` runs were cancelled, and 17 open pull requests carried a cancelled `cla` when this was filed. Difficulty 2: the fix is one expression; establishing that it was the cause, and that nothing else shares the shape, was the work.
+> 🚧 **Built 2026-09-11 (PR 1046); open until that merges, when the Lander flips this banner.** One-line key change in `.github/workflows/cla.yml` -- `github.ref` becomes `github.event.pull_request.number` on the `pull_request_target` arm -- plus `tests/test_workflow_concurrency_keys.py`, which holds the invariant over all 28 workflow files. Value **8/10** · Difficulty **2/10**. Value 8: `cla` is a required context, 25 of the last 61 `pull_request_target` runs were cancelled, and 17 open pull requests carried a cancelled `cla` when this was filed. Difficulty 2: the fix is one expression; establishing that it was the cause, and that nothing else shares the shape, was the work.
 > Verdict: build
 > Research: none
 > Closing-act: code
