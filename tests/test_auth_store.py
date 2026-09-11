@@ -17,6 +17,8 @@ from tests._directory_identity_store_contract import (
     _assert_directory_id_compare_is_byte_exact,
     _assert_directory_identity_contract,
     _assert_the_binding_column_is_unconstrained_and_username_is_not,
+    _assert_username_compare_is_byte_exact,
+    _assert_username_refresh_contract,
 )
 
 
@@ -302,6 +304,33 @@ async def test_the_binding_column_is_unconstrained_and_username_is_not_on_sqlite
     store = await _store()
     try:
         await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
+    finally:
+        await store.close()
+
+
+async def test_the_username_refresh_contract_on_sqlite() -> None:
+    """``set_user_username`` (BACKLOG #1532), against the same shared body the live suites run.
+
+    Found the same way #1471's gap was: the method shipped covered on SQLite only, and that coverage
+    was incidental -- service-level reconciler tests that happen to call it. A green ``postgres
+    store`` leg is not evidence about a method that leg never calls.
+    """
+    store = await _store()
+    try:
+        await _assert_username_refresh_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_the_username_comparison_is_byte_exact_on_sqlite() -> None:
+    """SQLite's guard is case-sensitive, so a name differing only in case is NOT a collision.
+
+    PostgreSQL agrees. SQL Server delegates to the collation and refuses such a rename; that
+    divergence is recorded at ``store/sqlserver.py`` and pinned in its own suite.
+    """
+    store = await _store()
+    try:
+        await _assert_username_compare_is_byte_exact(store)
     finally:
         await store.close()
 

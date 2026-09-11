@@ -176,3 +176,124 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
             "a duplicate username was accepted; UNIQUE(username) is the documented reason"
             " directory_object_id needs no uniqueness constraint of its own"
         )
+
+
+#: The account whose cached username the directory renames (BACKLOG #1532).
+RENAME_GUID = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+#: A second account, already holding the name the first one is renamed onto -- the collision the
+#: guarded UPDATE has to answer without raising.
+SQUATTER_GUID = "c9bf9e57-1685-4c89-bafb-ff5af830be8a"
+
+
+async def _assert_username_refresh_contract(store: Any) -> None:
+    """The behaviour every backend owes ``set_user_username`` (BACKLOG #1532).
+
+    **This is the write the rename fix resolves through**, and like the lookup above it shipped with
+    coverage on SQLite only -- and that coverage was incidental, through service-level reconciler
+    tests. Neither live suite mentioned it. The gap was found the same way #1471's was, and by the
+    same reasoning: a green ``postgres store`` leg is not evidence a method that leg never calls
+    works.
+
+    **The guard is why this needs a contract rather than three separately-worded tests.**
+    ``username`` is ``NOT NULL UNIQUE`` on all three backends, so a plain ``UPDATE`` to a taken name
+    raises a backend-specific integrity error -- three exception classes for one condition, on a
+    path whose caller is a background loop. Each implementation therefore carries a ``NOT EXISTS``
+    subquery so the collision is a **no-op**. Three hand-written SQL statements agreeing on that is
+    an assertion here rather than a hope.
+    """
+    await store.create_user(
+        user_id="rename-me",
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id=RENAME_GUID,
+        now=1_000.0,
+    )
+    await store.create_user(
+        user_id="squatter",
+        username="taken",
+        auth_provider="ad",
+        directory_object_id=SQUATTER_GUID,
+        now=1_000.0,
+    )
+
+    # 1. THE ORDINARY REFRESH. The row keeps its id and its binding; only the label moves. Both
+    #    halves are asserted: a write that moved the row would pass a name check alone, and a write
+    #    that did nothing would pass an id check alone.
+    await store.set_user_username("rename-me", "jdoe-married", now=2_000.0)
+    moved = await store.get_user_by_username("jdoe-married")
+    assert moved is not None, "the refresh did not apply"
+    assert moved.id == "rename-me", "the refresh moved the row"
+    assert moved.directory_object_id == RENAME_GUID, "the refresh disturbed the binding"
+    assert await store.get_user_by_username("jdoe") is None, "the old name outlived the refresh"
+    # The row is still reachable by the key that identifies it, which is the whole premise of
+    # treating the name as a cache.
+    by_id = await store.get_user_by_directory_object_id(RENAME_GUID)
+    assert by_id is not None and by_id.id == "rename-me"
+
+    # 2. THE COLLISION IS A NO-OP, NOT AN ERROR. This is the divergence from a plain UPDATE and the
+    #    only reason the subquery exists. A backend that dropped the guard would raise its own
+    #    integrity class here and take the reconciler pass down with it.
+    await store.set_user_username("rename-me", "taken", now=3_000.0)
+    still = await store.get_user_by_directory_object_id(RENAME_GUID)
+    assert still is not None and still.username == "jdoe-married", (
+        "the guarded UPDATE forced a username another row holds"
+    )
+    other = await store.get_user_by_username("taken")
+    assert other is not None and other.id == "squatter", "the collision disturbed the other row"
+
+    # 3. A ROW MAY BE SET TO THE NAME IT ALREADY HOLDS. The guard excludes the row being written
+    #    (``other.id <> <user_id>``); drop that term and the subquery matches the row's OWN name, so
+    #    every idempotent refresh silently becomes a no-op. Harmless here, but it is the term whose
+    #    loss nothing else in this file would notice, and a caller that re-applied a rename after a
+    #    crash would be relying on it.
+    await store.set_user_username("rename-me", "jdoe-married", now=4_000.0)
+    same = await store.get_user_by_username("jdoe-married")
+    assert same is not None and same.id == "rename-me"
+
+    # 4. AN UNKNOWN user_id TOUCHES NOTHING. The reconciler plans a pass and applies it afterwards,
+    #    so a row deleted in between reaches this method; it must not become an error or, worse,
+    #    match some other row.
+    await store.set_user_username("no-such-user", "ghost", now=5_000.0)
+    assert await store.get_user_by_username("ghost") is None
+
+
+async def _assert_username_compare_is_byte_exact(store: Any) -> None:
+    """SQLite and PostgreSQL compare ``username`` byte-for-byte, so the guard is case-sensitive.
+
+    Called by those two suites only, mirroring the id column's split above. SQL Server delegates to
+    the database collation and under a ``_CI_`` default would treat these as the same name, so its
+    guard REFUSES a rename this one permits. That divergence is recorded at ``store/sqlserver.py``'s
+    copy of the method, and this is the arm that makes the recorded claim testable rather than
+    asserted in a comment.
+
+    **The refusal is the safe direction either way** -- SQL Server declines a write rather than
+    performing one -- which is why the divergence is documented rather than normalised away.
+    """
+    await store.create_user(
+        user_id="case-holder",
+        username="Alice",
+        auth_provider="ad",
+        directory_object_id=SQUATTER_GUID,
+        now=1_000.0,
+    )
+    await store.create_user(
+        user_id="case-mover",
+        username="bob",
+        auth_provider="ad",
+        directory_object_id=RENAME_GUID,
+        now=1_000.0,
+    )
+    # The control: a byte-identical collision IS refused, so the success below is a fact about case
+    # rather than about the guard being absent.
+    await store.set_user_username("case-mover", "Alice", now=2_000.0)
+    assert (
+        await store.get_user(  # type: ignore[union-attr]
+            "case-mover"
+        )
+    ).username == "bob", "the guard did not refuse a byte-identical collision"
+
+    await store.set_user_username("case-mover", "alice", now=3_000.0)
+    moved = await store.get_user("case-mover")
+    assert moved is not None and moved.username == "alice", (
+        "a name differing only in case was refused; this backend compares byte-for-byte"
+    )

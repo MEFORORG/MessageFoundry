@@ -502,6 +502,22 @@ async def test_directory_binding_column_is_unconstrained_and_username_is_not(sto
     await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
 
 
+async def test_username_refresh_contract(store) -> None:
+    """BACKLOG #1532 ``set_user_username`` on the real SQL Server backend.
+
+    Same gap as #1471's and found the same way: covered on SQLite only, incidentally, and never
+    mentioned by either live suite. The ``sql server`` legs were green throughout and said nothing
+    about this method, because they never called it.
+
+    Case is NOT asserted here. This backend's ``=`` takes the database collation, so under a
+    ``_CI_`` default its guard refuses a rename SQLite and Postgres permit -- the same divergence
+    the id column shows, in the same direction (it declines a write rather than performing one).
+    """
+    from tests._directory_identity_store_contract import _assert_username_refresh_contract
+
+    await _assert_username_refresh_contract(store)
+
+
 async def _directory_id_collation(store) -> str | None:
     """The collation SQL Server reports for ``users.directory_object_id``, or None if it has none."""
     async with store._pool.acquire() as conn:
