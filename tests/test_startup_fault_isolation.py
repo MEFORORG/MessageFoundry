@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0031 — a connection that fails to build/bind at startup is ISOLATED, never fatal.
 
 The engine starts the rest of the graph and serves the API; a failed outbound retries the rows

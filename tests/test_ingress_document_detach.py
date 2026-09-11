@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Ingress-side very-large-document detach (#149, ADR 0105 Phase 1a).
 
 Phase 0 shipped the attachment substrate; Phase 1a WIRES it into ingress: an over-threshold streaming

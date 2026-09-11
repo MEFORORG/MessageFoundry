@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR activation fencing + mode (#61, ADR 0048). Acquire-VIP-or-abort: an optional takeover_hook that
 SUCCEEDS lets activation proceed; one that FAILS (or times out) aborts activation, binds no priority
 listener, stays passive, and records a dr_activation_aborted audit row (AC-6). Activation is MANUAL only

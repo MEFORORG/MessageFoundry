@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 B5 PR1 — offline (no-DB) tests for the SQL Server synchronous fused-handoff twins.
 
 These run in normal CI (no ``MEFOR_TEST_SQLSERVER`` gate, no aioodbc/pyodbc): the module imports

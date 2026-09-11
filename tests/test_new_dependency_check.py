@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the new-dependency (anti-slopsquat) gate.
 
 Every test drives the SHIPPED functions from ``scripts/security/new_dependency_check.py`` through an

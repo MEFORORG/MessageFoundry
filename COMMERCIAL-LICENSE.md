@@ -50,7 +50,7 @@ yet established.** Do not rely on any specific terms until they are published an
 
 ## How to inquire
 
-Commercial licensing is handled by **MessageFoundry Organization**, the project's owner and steward.
+Commercial licensing is handled by **MessageFoundry Foundation, LLC**, the project's owner and steward.
 To inquire, contact the maintainer:
 
 - GitHub: [@wshallwshall](https://github.com/wshallwshall) (see [MAINTAINERS.md](MAINTAINERS.md)).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // "Stage → Promote": validate the local config, choose a target environment, pre-flight it against
 // that environment (dry-run — resolves its env() values, so a missing value fails BEFORE going
 // live), confirm, then apply. The engine/API do the hard part (atomic quiesce-and-swap reload); this

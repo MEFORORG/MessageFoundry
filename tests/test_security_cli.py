@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``security show|set`` CLI (ADR 0118): the comment-preserving backend the VS Code ``[security]``
 editor shells. Mirrors the ``alert`` CLI — validate-before-persist + roll-back, offline, applies on the
 next engine restart."""

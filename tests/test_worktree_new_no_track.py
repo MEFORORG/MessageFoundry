@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A new worktree's branch must not inherit the BASE as its upstream (BACKLOG #1087).
 
 THE DEFECT. ``new.ps1`` created the branch with ``git worktree add <path> -b <Branch> <Base>`` and

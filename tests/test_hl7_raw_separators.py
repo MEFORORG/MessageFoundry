@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-outbound opt-in to emit reserved HL7 separators as RAW bytes (BACKLOG #107).
 
 The deliberate escape-hatch for a partner that cannot decode HL7 escapes: when enabled on an MLLP

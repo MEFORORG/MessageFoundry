@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The FHIR search-value vocabulary: what a ``fhir_lookup`` ``params`` value MEANS (BACKLOG #1243).
 
 A leaf module by design (it imports nothing from the engine), so ``config/`` and ``transports/`` can

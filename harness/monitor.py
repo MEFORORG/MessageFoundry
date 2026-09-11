@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Monitor tab: connect to a running engine and observe what it actually did with traffic.
 
 The harness's other tabs only see the transport edge (an ACK, a file). This tab closes the loop

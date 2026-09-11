@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The estate driver — N persistent MLLP connections, one token bucket, EVENT-calibrated weights (#216).
 
 Where :class:`~harness.load.connscale.driver.ConnScaleDriver` meters every connection UNIFORMLY (~R/N

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The banner-sha agreement check must fire on a transposed banner and on nothing else (#1301).
 
 Every test here is one half of a PAIR. The literal rule this check narrows fired 94 times across the

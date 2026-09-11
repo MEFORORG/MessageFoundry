@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Edit a stored message and resubmit the edited body (ADR 0090 §9, BACKLOG #153).
 
 Stacked on #123's resend seam. The SQLite invariant matrix for the RE-ROUTE re-ingress

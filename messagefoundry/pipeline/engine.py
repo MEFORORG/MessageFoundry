@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine: owns the store and supervises the code-first :class:`RegistryRunner`.
 
 This is the object the API layer (and tests) drive. It opens the durable store, recovers

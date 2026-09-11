@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Example config (code-first): receive ADT over MLLP, archive A01/A04/A08 to a file.
 
 Connection names follow the project convention ``[TYPE]_[PARTNER]_[MESSAGE]`` (see

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Is this navigation leaving the organization, and what host do we tell the operator it goes to?
 
 ASVS 3.7.3 asks for a notification, with a cancel, when the user is sent to a URL **outside the

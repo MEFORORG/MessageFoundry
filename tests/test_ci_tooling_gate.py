@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The CI `tooling` path-gate, driven directly.
 
 `ci.yml`'s `changes` job decides whether the `tooling` job runs. That job is the ONLY place the

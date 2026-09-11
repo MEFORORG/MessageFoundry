@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Phase-5 store/file robustness: ODBC injection (STORE-5), filename traversal (FILE-1), and
 atomic non-clobbering writes (FILE-5)."""
 

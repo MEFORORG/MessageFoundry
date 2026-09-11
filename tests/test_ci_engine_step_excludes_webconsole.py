@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CI's engine pytest step must subtract the web console package that ``testpaths`` now includes.
 
 BACKLOG #1027 added ``packaging/messagefoundry-webconsole/tests`` to the root ``testpaths`` so a

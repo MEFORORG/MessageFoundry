@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The advisory ``raise-fstring`` lint (SEC-023): an AST scan of the config-dir Router/Handler modules
 that flags ``raise <Exc>(f"...{var}...")`` — the pattern that can carry free-text PHI past the
 exception-path redaction. It only ever prints a heuristic reminder; it never blocks the gate."""

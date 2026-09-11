@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Payload-agnostic ingress (ADR 0004): RawMessage, content_type routing, and the HL7 path intact."""
 
 from __future__ import annotations

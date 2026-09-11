@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The outbound wire-encode fails CONTENT-FREE.
 
 A bare ``payload.encode(self.encoding)`` raises ``UnicodeEncodeError`` — a ``ValueError``, so a
