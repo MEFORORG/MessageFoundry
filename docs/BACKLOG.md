@@ -30821,7 +30821,32 @@ fresh `status`. Measured on run 34569960533 for this pull request, and independe
 on PR 1030.
 
 **"Re-running clears it" is NOT established, and should not be written as if it were.** What is measured
-is that the re-run STARTS without a push. Whether it finishes is a separate question, and the answer so
-far is sometimes: one session's re-run of run 34568093043 came back CANCELLED again after 1m36s. A
-re-run re-enters the same shared group, so it faces the same arrival rate that caused the problem --
-35 successes in 69 runs across the population.
+is that the re-run STARTS without a push. Whether it FINISHES is a separate question, and a re-run
+re-enters the same shared group, so it faces the same arrival rate that caused the cancellation.
+
+**DO NOT QUOTE A RATE FOR THE RE-RUN, and do not read the population rate as one.** The whole-population
+figure is 63 successes in 95 first-attempt runs. Attempt-2+ runs are a separate and tiny sample, and one
+of the four is misattributed if taken at face value:
+
+| run | conclusion | attempt lifetime | note |
+|---|---|---|---|
+| 34499682853 | success | 14s | got a runner immediately |
+| 34568093043 | cancelled | 102s | |
+| 34569715633 | cancelled | 95s | |
+| 34569960533 | cancelled | 110s | **excluded** -- killed by its own branch's next push, not by the bug |
+
+So the workaround's own record is one success and two cancellations. **n=3 is not a rate**, and computing
+1/4 = 25% from the table above would be wrong twice: the sample is too small, and the fourth row is
+ordinary self-supersession.
+
+**THE "RE-RUNS ARE SYSTEMATICALLY DISADVANTAGED" READING IS NOT SUPPORTED EITHER.** It was proposed on
+the grounds that a re-run must wait for a runner before doing its ~13s of work. The one successful
+re-run ran 14 seconds, so a re-run is not inherently made to wait. What the rows actually show is the
+SAME duration mechanism recorded above, applying to re-runs exactly as to first attempts: the fast one
+lived, the slow ones died. That is one finding, not two.
+
+**TIMING A RE-RUN NEEDS `run_started_at`, NOT `created_at`.** For an attempt-2+ run, `created_at` is the
+ORIGINAL run's creation, so `updated_at - created_at` spans the first attempt plus the idle gap plus the
+re-run -- it reported 428-1040s for attempts that actually lived 95-110s. The 95s figure above was
+measured independently by another session on its own pull request and matches this corpus exactly, which
+is what establishes the corrected field is the right one.
