@@ -15,18 +15,23 @@ is defined here and nowhere else, so other pages point at this line rather than 
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Console | Long-lived | The only seat the owner talks to. Reads the record and writes a brief citing an item, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
+| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
 | Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
-| Lander | Standing authority | Merges. |
+| Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
 
-**Whether a session can spawn a session depends on its account, and it turns on one grant.** Check
-your own root: in the `settings.json` of the config root named by `CLAUDE_CONFIG_DIR`, look under
-`permissions.allow` for a rule matching `Bash(claude:*)` or `PowerShell(claude:*)`. A root that
-carries the grant starts its own Builders. A root without it leaves every Builder for the owner to
-start by hand. Key this on the grant, not on which account you are: a root that gains the grant
-later is served wrongly by a rule written about identity.
+**NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE.** The owner starts each Manager in a desktop
+instance, and a Manager's workers are **subagents in its own process**, on its own account. So a
+Manager needs no spawn grant, no account roster, and no way to reach another Manager: the shape
+dissolves the cross-account coordination problem rather than solving it. Several Managers run at
+once, usually one per account, and what binds them is the repository they share.
+
+**The grant below is kept as a measurement, not as a live rule.** It gated the retired Console's
+session-spawning, and the numbers are kept so nobody re-derives them and nobody reads the
+retirement as a capability that broke. In the `settings.json` of the config root named by
+`CLAUDE_CONFIG_DIR`, under `permissions.allow`, it is a rule matching `Bash(claude:*)` or
+`PowerShell(claude:*)`.
 
 Measured 2026-09-02: `.claude-account-1` carries both rules and spawned a Builder, exit 0 in 38.8
 seconds. Every root measured that day without them was refused by the classifier. Read that exit
@@ -47,8 +52,14 @@ each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
 Manager, Process Improvement and ASVS Tracker. **The Reviewer went on 2026-09-05**, with the
-`reviewed` label, `review-gate.yml` and `unread-signal.yml`. If a document names one, that document
-is stale.
+`reviewed` label, `review-gate.yml` and `unread-signal.yml`. **The CONSOLE went on 2026-09-10, and
+the Manager above replaces it.** If a document names one, that document is stale.
+
+**A Manager is not a renamed Console, and substituting one for the other is the measured failure
+this retirement was written to stop.** A Console's workers were separate sessions across several
+accounts under a spawn grant, and one Console ran; a Manager's workers are subagents in its own
+process on one account, it needs no grant, and several Managers run. A Console enqueued; a Manager
+does not. `docs/roles/seats.json` resolves every spelling of `console` to a notice saying so.
 
 Three rules went with those seats, and they are not repeated anywhere. Routing an owner question
 through the Liaison is retired. Getting owner approval before your own push is retired. Falling back
@@ -67,13 +78,14 @@ Nothing in this system gets pushed to anybody. Everything is polled.
 
 ## Your brief holds for exactly one turn
 
-The Console wrote your brief so you can finish without asking anything. Treat that as the contract.
+Your Manager wrote your brief so you can finish without asking anything. Treat that as the contract.
 Plan the turn as if no answer is coming, because none is.
 
-**You cannot ask a question and wait for the answer.** Your process exits when your turn ends. Mail
-reaches the reader's next turn, never yours.
+**You cannot ask a question and wait for the answer.** Your process exits when your turn ends. Your
+final report and any mail reach the reader's NEXT turn, never yours.
 
-The Console puts its own worktree path in your brief. Mail it directly:
+As a subagent your report is the channel back, so put the question there. Where a worker is its own
+session instead, the Manager puts its own worktree path in the brief. Mail it directly:
 
 ```powershell
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To <the path from your brief> -Body "<question>"
@@ -160,7 +172,8 @@ same rule covers any file whose content is later fed to a command.
 ### A forbidden-content trip leaves no commit, so mail is the durable channel
 
 The leak guard blocks the commit, so there is no commit and no PR to carry the news. Stop, and do not
-work around it. Mail the Console path from your brief, naming the file and the rule that fired.
+work around it. Report it, or mail the Manager path from your brief, naming the file and the rule
+that fired.
 
 If your brief carries no address, name the file and the rule in your final message, then stop. Leave
 the worktree in place and untouched either way, so the next session can see what you saw.
@@ -221,7 +234,7 @@ named files, and the two **merge clean**. It has fired three times here. Full re
 
 ## A PR's state is a join over three clocks
 
-**This section is for the Console, the Regulator and the Lander. A Builder never evaluates it,
+**This section is for the Manager, the Regulator and the Lander. A Builder never evaluates it,
 because its process exits before any run reports.**
 
 `mergeStateStatus` alone will mislead you. It reports `BEHIND` or `DIRTY` in preference to `BLOCKED`.
@@ -264,7 +277,8 @@ nothing, which is honest. The day someone allocates it, your citation quietly st
 unrelated work. If you must gesture at unfiled work, name the subject rather than a number. Where the
 number exists but has not merged, say that in the same sentence.
 
-**Never arm auto-merge.** Enqueuing a PR is the Console's decision, and merging is the Lander's.
+**Never arm auto-merge.** Enqueuing a PR and merging it are BOTH the Lander's, since the Console's
+retirement on 2026-09-10. A Manager talks to the Lander and leaves the queue to it.
 Arming a PR and then pushing to it is a silent race. Auto-merge fires on the head it saw and drops
 your later push. The PR reads MERGED, the branch stays alive, and nothing reports it.
 
@@ -272,10 +286,9 @@ Never announce a hold, a freeze, or a promise about future state. A 2026-08-01 r
 shape stayed "in force" for hours after its condition had cleared. `main` moved four times underneath
 it.
 
-Never spawn a session from a root that does not carry the spawn grant. The classifier refuses it
-there, and on that root the owner starts each Builder. Where the grant is present, spawning belongs
-to the Console and to nothing else in the roster. The grant, and how to check your own root for it,
-are in "The KORUS seats" above.
+Never spawn a session. No seat in the roster does: the owner starts each Manager, and a Manager's
+workers are subagents in its own process. Why, and what the retired spawn grant measured, are in
+"The KORUS seats" above.
 
 ---
 
@@ -288,8 +301,8 @@ You have one turn and no way to ask, so when the brief runs out of road, do this
 1. Push the branch before your turn ends, green or not. Open the PR as a draft if the checks did not
    finish. An unpushed branch is lost; a red draft PR is recoverable.
 2. Name in the PR body what you ran, what you skipped, and what is therefore unproven.
-3. If you need a decision, mail it to the Console path from your brief. It reaches the reader's next
-   turn, not yours.
+3. If you need a decision, put it in your report, or mail it to the Manager path from your brief.
+   It reaches the reader's next turn, not yours.
 4. Leave the BACKLOG item honest. Do not flip a banner to closed for work you did not finish.
 
 The full suite can outlast a turn. This repo collects two testpaths under a per-test timeout, so a
@@ -345,7 +358,7 @@ And end the turn rather than watching for a result you cannot act on. Respawning
 there is actually something to do costs a small fraction of the wait.
 
 **The same arithmetic governs a question.** A worker that hits something its brief does not answer
-must not wait for the answer either. Write the question to the Console, comment it on the pull
+must not wait for the answer either. Put the question in your report, comment it on the pull
 request, and stop. The answer arrives as the next spawn, not as a reply to a session that is still
 burning tokens to hear it. Stopping costs nothing; waiting for a reply is the 22,275 row.
 
