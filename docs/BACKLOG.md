@@ -30937,3 +30937,155 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+## 1547. the DSN credential scrubber is quadratic on a delimiter-free run, and one unauthenticated request target stalls the event loop through access logging
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **9/10** · Difficulty **3/10** · _no research_. `_DSN_PASSWORD` in `messagefoundry/secretscrub.py:229` has an unbounded URL-scheme class, and neither `-` nor `.` suppresses `\b`, so every letter in an `a-a-a-` run is a fresh start position that re-walks the rest of the run hunting for `://`. Its admission gate is the two-character substring `://` and nothing else (`:132`, `:280`, `:353`). `logging_setup._install_phi_filters` puts the carrying filter on every handler, and `logging_setup.py:990` makes `uvicorn.access` propagate into them, so an unauthenticated request target reaches it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / secret redaction. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would let any client that can reach the operator HTTP port block the engine event loop for seconds per request**, without authenticating. Nothing is exposed today because nothing is running. That removes the urgency and none of the fix.
+
+### The measurement, end to end against a real uvicorn
+
+Measured 2026-09-11 on Python 3.14.6, GIL enabled, against a real uvicorn 0.49.0 with the httptools protocol, real `configure_logging("INFO")`, `log_config=None`, and an ASGI app that answers 401 with no authentication of any kind. Request target shape: `/` + an alternating `a-` run + `?x=://`.
+
+| target chars | response | wall | max event-loop gap |
+|---|---|---|---|
+| 17 | 401 | 1.22 ms | 17.4 ms (idle floor) |
+| 4,007 | 401 | 34.7 ms | 34.6 ms |
+| 16,007 | 401 | 385.8 ms | 389.0 ms |
+| 32,007 | 401 | 1,603.6 ms | 1,603.5 ms |
+| 64,007 | 401 | 6,441.6 ms | 6,443.8 ms |
+| 80,007 and above | 400 | under 1 ms | idle floor, no access record |
+
+The loop gap tracks wall time one to one: the regex blocks the loop for its whole duration. The server's own request-line ceiling sits between 64,007 and 80,007 target characters on this box, so **the measured worst case for a single unauthenticated request is about 6.4 seconds**.
+
+### The admission gate is what lets it in, and one pattern is the whole cost
+
+The identical 16,007-character string with the marker replaced by `?x=nothing` costs **0.041 ms** -- the hint gate rejects and no pattern runs. Adding the two characters `://` raises the same input to about **292 ms**, a factor of roughly 7,000.
+
+Per pattern at 16,007 characters: `_MEFOR_SECRET` 0.14 ms, `_BEARER` 3.81, `_AUTH_SCHEME` 0.21, `_CREDENTIAL_KV` 3.59, `_KEY_MATERIAL` 2.75, **`_DSN_PASSWORD` 326.38 ms**. Growth of `_DSN_PASSWORD.sub` alone is quadratic at power approximately 2.0, not exponential: 1.13 ms at 1,000 chars, 4.49 at 2,000, 17.87 at 4,000, 75.47 at 8,000, 308.55 at 16,000, 1,162.91 at 32,000.
+
+### Three facts that widen the fix
+
+**Sinks multiply it.** One 16,007-character record through one, two and three filtered handlers costs 287.24, 578.44 and 861.35 ms. The chain is installed per handler and the scrub is idempotent, so the second pass re-pays the same cost on an unchanged run.
+
+**Thread offload does not isolate it.** `await asyncio.to_thread(redact_log_line, line)` at 16,007 characters gave a 363.57 ms wall and a 362.31 ms loop gap. Under the GIL the worker thread stalls the loop anyway. Any fix that reaches for `to_thread` instead of fixing the pattern will not work.
+
+**The twin is unfiled, not merely unfixed.** `messagefoundry/support/redact.py:242` carries a byte-identical copy; measured in process, `redact._DSN_PASSWORD.pattern == secretscrub._DSN_PASSWORD.pattern` returns `True`. That module's own comment block at `support/redact.py:106-114` already records the cost as measured and deliberately deferred, calling for "a fix with its own reasoning and its own test". A ledger search for the DSN scan found nothing filing it. Its live caller (`api/app.py:5336`) is authenticated and thread-offloaded, so it is the lower-severity half -- but it is the same pattern and should be fixed in the same change.
+
+### This is NOT the `redact()` quadratic that #1437 closed
+
+Different pattern, different file, different admission path. The `_HL7_FIELD_RUN` fix in `messagefoundry/redaction.py:61` holds: an independent attempt to break it across five input classes, 21 shapes and sizes to 4 MiB found nothing that grows faster than linearly. Do not describe this item as that fix failing.
+
+### An existing test already forbids exactly this shape, and cannot see this pattern
+
+`tests/test_log_redaction_secret_domain.py:397`, `test_the_label_prefix_repetition_stays_bounded`, forbids an unbounded quantifier in a credential pattern for precisely this reason, and says so: "An UNBOUNDED label prefix is quadratic in line length, on attacker-influenceable log text." It asserts only on `_LABEL_PREFIX`. `_DSN_PASSWORD` is covered by it and by no sibling. Widening that test to the whole credential pattern set is the regression gate.
+
+### What closing looks like
+
+Make both scheme scans linear -- bound the scheme class, or anchor so a non-matching start cannot re-walk the run. Do not cut the string to bound the work: truncating before redaction is how a fragment escapes the redactor, and the sibling hazard is real (see the note on the `safe_text` order below). Keep credential-redaction coverage intact; a pattern that no longer matches a real DSN is not a fix.
+
+Acceptance: alternating letter-and-hyphen request targets through the actually installed access-log chain, asserting near-linear growth and event-loop responsiveness, plus the existing credential corpus still redacting. Include the `support/redact.py` twin. Use the no-marker control above as the negative arm -- without it, a fast result proves only that the hint gate rejected.
+
+### Verification limits
+
+Timings are from one Windows box, one interpreter build. The 400-response ceiling above 64,007 characters is a property of this uvicorn build's request-line limit and may differ elsewhere; it bounds the worst case measured here, not the worst case in general. No non-loopback bind was exercised -- `config/settings.py:783` defaults the host to `127.0.0.1` -- but a non-loopback bind is a supported configuration with its own gate, so loopback-by-default narrows who can reach this and does not close it. No rate limit stands in front: `auth/ratelimit.py` is wired only into `api/auth_routes.py`, and a 401 or 404 path is not rate limited.
+
+## 1548. the SQLite writer transaction helper does not unwind on cancellation, so a cancelled route handoff can have its ingress deletion committed by an unrelated writer
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **8/10** · Difficulty **5/10** · _no research_. The writer path catches `except Exception:` and rolls back, but `CancelledError` derives from `BaseException`, so no handler runs and the lock releases with the transaction still open. A route handoff deletes its ingress row before creating handler rows; an unrelated later write then commits that partial deletion. The raw message survives, no queue row drives it, and startup recovery finds nothing. The read pool already gets this right with `except BaseException:`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** store / staged queue. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would accept and acknowledge a message, then silently stop processing it**, with the inbound count still correct and no disposition recorded as failed. No attacker is required -- normal teardown cancels workers before it finishes flushing connection events, so an ordinary lifecycle event reaches the sequence.
+
+### Where it is
+
+`messagefoundry/store/store.py`, the grouped-writer path, group-commit-disabled arm, which is the default. Ten writers inherit the gap through it: `enqueue_ingress`, `route_handoff`, `transform_handoff`, `dead_letter_now`, `mark_done`, `mark_batch_done`, `complete_with_response`, `mark_failed`, `mark_batch_failed`, `dead_letter_batch`. The fused handoff carries the same shape inline. The read pool is the contrast case and is correct.
+
+### Reproduction
+
+Enqueue and claim a synthetic message, pause `route_handoff` after its DELETE, cancel the task, then call `record_connection_event`. Cancellation leaves the transaction open; the unrelated commit lands the deletion; queue rows go to zero; startup recovery recovers nothing. The ordinary-exception control arm behaves correctly, which is what isolates cancellation as the cause.
+
+### Two things that make this worse than it reads
+
+**With store encryption on, the "unrelated writer" prerequisite disappears.** `MessageStore.close()` is itself a committing writer through `checkpoint_cipher_invocations`. So on an encrypted store, shutdown alone supplies both halves.
+
+**Do not take the obvious remedy.** Shielding the `route_handoff` await in the runner adds an unbounded await inside the high-availability demote budget, and `_teardown_unsafe` documents that a teardown must never sit under an outside `wait_for`. Take a bounded shielded rollback inside the writer instead.
+
+### What closing looks like
+
+One writer-transaction context manager that unwinds on `BaseException`, completes the rollback **inside** the lock, and re-raises. Shield the rollback so a second cancel during teardown cannot abandon it. Route every SQLite writer through it, and give the group-committer flush the same treatment, since that task is itself cancellable.
+
+Acceptance: assert the connection is not in a transaction after a cancelled `route_handoff` at three cancel points -- after the DELETE, between inserts, and during commit. Follow each with an unrelated writer and then recovery, and require either the complete handoff or the original recoverable ingress row. Keep an ordinary-exception control arm byte-identical. Cancel twice. Repeat with group commit enabled.
+
+**One existing test must be read before starting and must NOT be swept into this change.** `tests/test_adr0114_claim_fold.py::test_ac3_cancellation_at_body_await_no_rollback_guard_runs` deliberately freezes no-rollback-on-cancel for `claim_fifo_heads`, parametrized twice. That is a SQL Server path with SQL Server fakes and a separate question.
+
+### Verification limits
+
+Reproduced against the real store with an in-memory database and synthetic rows. No file-backed crash, no PostgreSQL, no SQL Server execution. The sibling backends were read, not run. This is a control-flow defect, so the interpreter version is not a factor.
+
+## 1549. disabling action step-up lets a password holder enrol a new factor on an account that already has one, satisfying MFA without proving the existing factor
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **8/10** · Difficulty **4/10** · _no research_. With `require_action_step_up=False`, the enrolment dependency's fallback accepts session freshness instead of an action grant. The existing-factor check governs action-grant issuance, so turning off action binding routes around it. An account holding a passkey but no TOTP can have a new TOTP enrolled by a password-only session, and enrolment then marks that session MFA-satisfied.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** authn / MFA enrolment. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site that turned off action binding would let anyone holding only the password add their own second factor to an already-enrolled account and reach a fully authenticated session.** The setting is documented as disabling action-bound freshness checks. It does not announce that existing MFA may be bypassed, and that gap between what the knob says and what it does is the defect.
+
+### Reproduction
+
+Real HTTP handlers, real password hashing, real TOTP, in-memory store, and a synthetic existing-passkey record.
+
+| Setting | Reauthenticate | Enrol TOTP | Confirm TOTP | Final session |
+|---|---|---|---|---|
+| Action binding on (default) | 200 | 403 | not reached | MFA pending |
+| `require_action_step_up=False` | 200 | 200 | 200 | MFA satisfied |
+
+No hardware passkey ceremony ran; the existing factor was inserted as a store record.
+
+### What closing looks like
+
+Require proof of an existing factor at enrolment admission **and** at confirmation, independently of the action-binding setting. Apply it to the API route and the web-console route, not just the API one.
+
+Acceptance: repeat the sequence under both settings against an account that already holds a factor, and require the password-only session to stay blocked in both. First-factor enrolment for a genuinely unenrolled account must still work -- that is the arm a careless fix breaks.
+
+### Related, and NOT the same item
+
+`#1021` is closed and covered the enrolment-confirm replay window, which is a different mechanism on the same route. Do not read that closure as covering this.
+
+### Verification limits
+
+In-process HTTP against the real handlers. No browser, no hardware passkey, no live directory or identity provider. The web-console arm was read, not exercised.
+
+## 1550. the release leak gate rejects a forbidden archive and the later always() upload publishes it as a workflow artifact anyway
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **2/10** · _no research_. `.github/workflows/release.yml` rejects an archive containing forbidden files, and a later artifact step still runs under `if: always()` and uploads the whole `dist/` directory. Publication to PyPI stops; the rejected archive becomes a downloadable workflow artifact.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** release / CI containment. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments, no release has hit this path). Conditional: **on a packaging regression, a deploying project would have its leak gate correctly refuse to publish while the rejected archive stayed downloadable by any signed-in reader of the public repository.** The prerequisite is a packaging regression, so this is a failure-path containment gap rather than a live leak. No actual leaked artifact was sought or established.
+
+### Why the gate does not cover the upload
+
+GitHub documents that `always()` runs a step despite an earlier failure in the job, and that workflow artifacts are downloadable by signed-in repository readers. So the two behaviours compose exactly the wrong way: the gate's failure is what enables the upload.
+
+### What closing looks like
+
+Require successful leak validation before any package artifact upload. Keep failure-path artifacts limited to sanitised diagnostics -- the reason the step is `always()` is to preserve evidence on a red run, and that intent is worth keeping. Review the sibling package jobs, not only the first one.
+
+Acceptance: inject a synthetic forbidden-file canary into a test archive, make the leak gate fail, then evaluate every later upload and publish step and require none of them to receive the rejected archive. A workflow-shape test can assert the `if:` conditions without a hosted run; a hosted run is the stronger gate and this repository has legs that only ever execute on a runner.
+
+### Verification limits
+
+Workflow logic was read, not executed. No hosted workflow ran, no release was built, and no artifact was inspected. The claim rests on the checked-in `if:` conditions and documented platform semantics.
