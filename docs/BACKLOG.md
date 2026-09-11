@@ -19965,6 +19965,57 @@ also carry a prose re-score, 23 agree, 3 diverge.** *Reconciles nothing, as scop
 > Research: none
 > Closing-act: code
 
+**Amendment 2026-09-10 -- THE ROW'S CENTRAL PREMISE IS FALSE ON TODAY'S TREE, and what is left is
+narrower than what is filed.** All three arms were driven end to end against `origin/main` at
+`817db9651`: the real gate run as a subprocess, over a real repository with a real linked worktree, with
+a real staged code file and a real claim registry.
+
+| arm | the delegate's code-touching commit |
+| --- | --- |
+| claim held by the author | REFUSED -- "claimed by ANOTHER worktree" (reproduces the row) |
+| claim released entirely | REFUSED -- "is NOT CLAIMED" (reproduces the row) |
+| claim taken in the DELEGATE's name via `-AsWorktree` | **PASSES** |
+
+**`-AsWorktree` POST-DATES THIS ROW AND ALREADY GIVES A DELEGATION THE HONEST EXPRESSION THE ROW SAYS IT
+HAS NONE OF.** #1346 shipped it for an unrelated reason -- a second repository's gate reading a registry
+nothing wrote -- and it answers this row as a side effect. The author runs `claim.ps1 -Take <n>
+-AsWorktree "<delegate tree>"` from their own checkout; the record names the delegate, which is TRUE
+about who is building it; the delegate's commit passes; and no false record is written anywhere.
+**Neither flawed path this row names is needed** -- no transient take putting the delegate's name on the
+author's history, and no `-Force` recording a live claim as stale.
+
+**SO THE DELEGATION CASE IS ANSWERED AND NOTHING WAS BUILT FOR IT.** What remains is the CO-HOLDER case,
+measured in the same run: with the claim in the delegate's name, the AUTHOR's own code-touching commit is
+then refused, "claimed by ANOTHER worktree". Two seats cannot both commit code on one item without
+handing the claim back and forth. **That is clunky, not impossible**, which is a materially smaller cost
+than "no expression at all".
+
+**THE DESIGN FOR THE RESIDUAL, RECORDED AND NOT BUILT.** A `delegates` key in the claim record -- an
+ARRAY OF WORKTREE PATHS, never prose -- written only by a verb that requires already holding the claim,
+and read by `claim_check.py`'s holder test through the same normalised comparison it already applies to
+`worktree`. That meets this row's constraint: the gate would compare paths, not parse intent out of
+`note`, and the delegate could not enrol itself because taking and releasing both test ownership first.
+Three things it would have to get right, each of them a way the gate gets widened by accident:
+`-Take`'s refresh path rebuilds the record from scratch and would DROP the key; a non-list or
+non-string payload must read as NO delegates rather than as permission, the same fail-closed rule
+`_holder` already applies to a corrupt record; and `-List` must show it or the key becomes invisible
+state that only a gate can see.
+
+**WHY IT IS NOT BUILT. The verdict is research, the research changed the question, and the residual has
+no measured demand.** Every state added to a narrow gate is another way past it, and the case this one
+would serve now has a working if clumsy expression. Widening it deserves a deliberate decision, not a
+side effect of a row written before the flag existed.
+
+**AND THE ANSWER MUST NOT BE ADVERTISED IN THE GATE'S DENY TEXT YET -- considered, and rejected on
+evidence.** The refusal a blocked seat reads today offers `-Force` and nothing else, which teaches
+exactly the two paths this row warns against, so naming `-AsWorktree` there looked like a small honest
+fix. It is not: `-Release <key> -AsWorktree <holder>` releases a claim the caller does not hold with no
+`-Force` at all (measured the same day, recorded on #1358), so handing that flag to the party the gate
+is stopping hands them a silent release of the holder's claim.
+
+**Amended expiry:** the finding above stops being right if `-AsWorktree` is narrowed so it can no longer
+take a claim in another tree's name.
+
 **Cluster:** coordination tooling / claim integrity. **Priority:** P3. **Verdict:** research -- ***the
 obvious fix is worse than the defect, so this must be measured before anything is built.***
 **Severity:** fleet tooling, no product or deployment axis (sec. 0).
@@ -20675,6 +20726,39 @@ error rather than at any engine defect.**
 > Verdict: build
 > Research: none
 > Closing-act: code
+
+**Amendment 2026-09-10 -- the RECORD half is BUILT, so what is left on this row is a banner flip.**
+`scripts/coord/claim.ps1` now writes `invoked_from` into both release records -- the `release` line and
+the `release-failed` correction -- from a single `Get-CallerTree` read shared by both, so one release
+cannot write two lines that disagree about where its operator stood. `Write-DivergenceNote` reads the
+same function, for the same reason. The `$PSScriptRoot` anchoring is untouched, which is the #1060
+constraint: nothing about where the registry lives, who owns a claim, or which tree a release is judged
+against moved. The new value is written down and never acted on.
+
+**THE ROW'S OWN DESCRIPTION WAS STALE, AND THE CODE WINS.** It says `released_by` is "bare `$repo`". It
+has been `$holder` since #1346 landed `-AsWorktree` -- which defaults to `$repo`, so the defect the row
+describes survives that change intact and only the variable name moved. Read the file before the row.
+
+**AND `-AsWorktree` MAKES THE DEFECT WORSE THAN THIS ROW COULD KNOW. Measured 2026-09-10, driven end to
+end.** `-Release <key> -AsWorktree <holder>` re-aims the ownership test at the tree it names, so a
+checkout that holds nothing releases another's claim **with no `-Force` at all**: a second worktree
+released a claim held by the first, exit 0, claim file gone, and the ledger line came back with
+`released_by`, `released_branch` and `prior_holder` every one of them naming the HOLDER and `force`
+still `false`. The flag that exists to mark a takeover stays down, so the line is indistinguishable from
+that holder releasing its own claim routinely. `invoked_from` is the only field that says otherwise.
+
+**Two arms, both mutation-killed** (`tests/test_script_root_anchoring.py`, beside the shipped warn arm
+and sharing its two-checkout fixture): a plain foreign release, where `invoked_from` must differ from
+`$repo`; and an `-AsWorktree` release, where it must differ from `$holder`. Neither alone rules out both
+readings. Reverting the script turned exactly those two red and left the other six green -- including
+both divergence-note controls -- so the arms measure the record half and not the warning that shipped
+earlier.
+
+**Still open and deliberately NOT built here: the record makes a misdirected release VISIBLE, it does
+not REFUSE one.** Refusing would break #1346's own case, where a release performed from elsewhere is the
+correct usage. Whether the no-`-Force` takeover above should additionally be refused is a separate
+decision with a real false-positive profile, and it is filed as **#1530** rather than settled as a side
+effect of this one.
 
 **Cluster:** coordination tooling. **Priority:** P2. **Verdict:** build.
 **Severity:** no product axis (sec. 0). ***The cost is an audit record that names the wrong actor while reading as authoritative*** -- and that record exists specifically because `-Force` takeovers previously "left no record of who released whose claim". **The defect is the record silently failing at the job it was built for, one verb over.**
@@ -30391,3 +30475,58 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 **Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
 
 **Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
+
+## 1530. claim.ps1 -Release -AsWorktree releases a claim the caller does not hold, with no -Force
+
+> 🔢 **Filed 2026-09-10, measured end to end while building #1358.** Value **4/10** · Difficulty **3/10**. `-AsWorktree` re-aims `-Release`'s ownership test at the tree it names, so **a checkout holding nothing releases another worktree's claim and never touches `-Force`.** The ledger line it writes is indistinguishable from that holder releasing its own claim routinely. **Whether this should be refused, or is the correct #1346 behaviour recorded and left alone, is the open question.**
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim integrity. **Priority:** P3. **Verdict:** research.
+**Severity:** fleet tooling, no product or deployment axis (sec. 0).
+
+### Measured 2026-09-10, driven rather than read
+
+Two linked worktrees of one repository, sharing a registry. `author` takes a claim. `other` then runs
+`author`'s copy of the script with `-Release <key> -AsWorktree "<author>"`, from its own shell.
+
+| what happened | value |
+| --- | --- |
+| exit code | `0` |
+| claim file | removed |
+| `-Force` required | **no** |
+| `released_by` | the AUTHOR |
+| `released_branch` | the AUTHOR's branch |
+| `prior_holder` | the AUTHOR |
+| `force` | `false` |
+
+**Every attributed field named a seat that did not act, and the flag that exists to mark a takeover
+stayed down.** The only signal was a console note that nothing downstream reads.
+
+### Why this is a separate row from #1358 and not a duplicate of it
+
+#1358 is about the RECORD, and it shipped: `invoked_from` now carries the caller's tree, so this
+takeover is legible to anyone reading the ledger afterwards. **This row is about AUTHORISATION** --
+whether the operation should happen at all without `-Force`. Visible and permitted are different
+properties, and the first does not settle the second.
+
+### Why it is not simply a bug
+
+The same call is the CORRECT usage under [#1346](#1346): a shared registry across two repositories
+means the operator's shell is legitimately somewhere other than the tree the claim is held for.
+Refusing on divergence alone would break that. So the question is not *"is this wrong"* but *"what
+distinguishes the #1346 case from a takeover"*, and the honest answer today is that nobody has
+measured how often each shape occurs.
+
+### What would settle it
+
+1. Count the real population in the release ledger now that `invoked_from` is written: how many
+   releases diverge, and how many of those are the shared-registry shape.
+2. Decide from that count. A refusal, a `-Force` requirement on divergence, or a documented decline
+   are all defensible; **a decision made without the count is not.**
+
+**Do not "fix" this by re-anchoring on cwd.** That is [#1060](#1060) and it is deliberate.
+
+**Related:** [#1358](#1358) (the record half, shipped), [#1346](#1346) (why the flag exists),
+[#1068](#1068) (why releases are recorded at all).
