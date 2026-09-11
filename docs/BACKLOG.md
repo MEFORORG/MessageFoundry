@@ -3490,10 +3490,13 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 > step's **whole install prologue**, located by the step that runs `cyclonedx_py environment`, because after the
 > move no line names `cyclonedx-bom` and the line that replaced it is one `release.yml` runs at five sites.
 > The DEP-1 membership pin this item asked for is in `tests/test_dep1_lock_resync_lockstep.py`.
-> **The step-6 decision this item did NOT pre-decide: one group, not a third one.** The three tools run in the
-> same job, on the same runner, at the same trust level, so a second lock would be another artifact to export,
-> diff, resync and audit for a separation nobody acts on. ADR 0034 had predicted a third group; that prediction
-> is corrected in place there.
+> **The step-6 decision this item did NOT pre-decide: one group, not a third one.** The three tools run at the
+> same trust level, so a second lock would be another artifact to export, diff, resync and audit for a
+> separation nobody acts on. ADR 0034 had predicted a third group; that prediction is corrected in place there.
+> *(An earlier draft of this sentence said the three run "in the same job, on the same runner". They do not, and
+> the error is worth naming because it also reached ADR 0034: the three `build` sites are in THREE jobs --
+> `release`, `release-webconsole`, `release-harness` -- all holding `id-token: write`, with
+> `attestations: write` only on the first. Read each job's own `permissions:` block; do not trust a copy.)*
 >
 > **THE CONTAMINATION THIS ITEM'S DIFFICULTY NOTE PREDICTED DID FIRE, and it was accepted rather than absent —
 > read this before re-deriving it.** Control first, on the unchanged tree, with the LOCAL `uv 0.11.25` rather
@@ -3512,12 +3515,32 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 > `[tool.uv] conflicts` was tried as the alternative and is **worse**: it did not undo the downgrade AND it
 > leaked eight lines into each of `requirements.lock` and the two container image locks. Measured, then reverted.
 >
-> **WHAT COULD NOT BE VERIFIED, and it is half the change.** **No PR CI leg executes `release.yml`** (tag push
-> only), so the `build` half and `release.yml`'s SBOM half are unexercised until a tag or a `workflow_dispatch`
-> dry-run. The `cyclonedx-bom` half IS partly covered: `security.yml`'s `sbom` job runs on every PR and executes
-> the byte-identical command. ADR 0034's documented pre-tag protocol is to dispatch that job and read its log,
-> and the twin test is what makes that log evidence about the release. **Read the `sbom` job before the next
-> tag.**
+> **CORRECTION 2026-09-11, naming the claim it replaces, because that claim was published on PR 1039 and in an
+> earlier draft of this row.** The superseded sentence read: *"The `cyclonedx-bom` half IS partly covered:
+> `security.yml`'s `sbom` job runs on every PR and executes the byte-identical command."* **That is FALSE, and it
+> came from the dispatch brief rather than from the tree.** The `sbom` job carries
+> `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`, so it never runs on
+> `pull_request`; it is additionally `continue-on-error: true` and is not a required context, so it cannot fail
+> anything even when it does run. Measured on PR 1039's own head: `SBOMs (CycloneDX, multi-ecosystem)` reported
+> **`skipped`**. The shape worth recognising is a coverage claim adopted from a brief and never put to the
+> workflow file.
+>
+> **WHAT WAS NOT VERIFIED: the install command itself, in BOTH halves.** All **six** sites running
+> `pip install --require-hashes -r ci/locks/release-tools.lock` are gated away from `pull_request` — the five in
+> `release.yml` by `on: push: tags:` + `workflow_dispatch`, and `security.yml`'s one by the `if:` above. **So
+> nothing in PR CI executes the changed command in the form this work introduces, and both halves are
+> unexercised, not one.** First execution is whichever comes first: the **nightly `0 6 * * *` run of
+> `security.yml` on `main` after merge**, a manual **`workflow_dispatch` of `security.yml`** (ADR 0034's
+> documented pre-tag dry-run — which must be DISPATCHED, it does not happen by itself), or a **tag push**
+> running `release.yml`. **Read one of those logs before the next tag.**
+>
+> **WHAT WAS VERIFIED, kept beside it so the two are not confused.** PR CI does exercise the *artifacts*, just
+> not the install. On PR 1039's head the ungated `pip-audit` job re-exported all seven DEP-1 artifacts under
+> **CI's pinned `uv==0.12.0`** and passed `git diff --exit-code` — which independently confirms that the local
+> `uv 0.11.25` control recorded above produced byte-identical output, retiring the contamination risk this
+> item's difficulty note flagged. The same job audited `ci/locks/release-tools.lock` (all 65 requirements) and
+> `ci/locks/ci-quality.lock` (carrying the downgraded `chardet`) clean. **Lock correctness is checked in PR CI;
+> lock INSTALLATION is not.**
 >
 > **PRE-STEP-6 RECORD, kept verbatim.** **WHY THIS ITEM IS STILL OPEN, in one place:** **step 6 only** — the version is settled and steps 1-5 are done. Step 6 is (`build` and
 > `cyclonedx-bom` into the same group), which was never started. Step 6's constraint is unchanged and

@@ -337,7 +337,9 @@ jobs:
           # BYTE-IDENTICAL to security.yml's SBOM install, enforced by tests/test_ci_venv_pinning.py.
           # Nothing in PR CI executes release.yml (tag push only), so ADR 0034's documented pre-tag check
           # is to dispatch security.yml's sbom job and read ITS log -- which only proves anything while
-          # the two steps run the same commands.
+          # the two steps run the same commands. NOTE that job is ALSO gated to schedule/workflow_dispatch,
+          # so the dry-run has to be dispatched by hand; no pull request performs it. Both halves of this
+          # install are therefore unexercised until a tag, a dispatch, or the nightly cron on `main`.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock

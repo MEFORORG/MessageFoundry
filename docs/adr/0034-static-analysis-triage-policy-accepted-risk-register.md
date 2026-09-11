@@ -343,14 +343,20 @@ that is the point, not a consolation.
 
 The **2 genuinely open** `PinnedDependenciesID` alerts were untouched at the time of writing: the medium
 pair on the **SBOM scratch venv** (`python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, in
-`release.yml` and `security.yml`). **Both closed 2026-09-10 (BACKLOG #332 step 6)**, and not via the
-third group this paragraph predicted: `cyclonedx-bom` joined the EXISTING `release-tools` group, since
-the three release tools run in the same job on the same runner at the same trust level and a second lock
-would be a second artifact to export, diff, resync and audit for no separation anybody acts on. Both
-halves moved in one commit, as the lockstep requirement below demanded, and
+`release.yml` and `security.yml`). **Both closed IN THE TREE 2026-09-10 (BACKLOG #332 step 6)**, and not
+via the third group this paragraph predicted: `cyclonedx-bom` joined the EXISTING `release-tools` group,
+since the three release tools run at the same trust level and a second lock would be a second artifact to
+export, diff, resync and audit for no separation anybody acts on. Both halves moved in one commit, as the
+lockstep requirement below demanded, and
 `test_sbom_install_is_byte_identical_in_release_and_security` moved with them — it now compares each
 SBOM step's whole install prologue rather than the single line that used to name `cyclonedx-bom`, which
-after the move names a lock five other sites also install.
+after the move names a lock `release.yml` installs at five sites.
+
+**"CLOSED IN THE TREE" IS THE LIMIT OF THE CLAIM, and the distinction is this register's own.** The
+replacement install has not been executed anywhere: see the amended *"No PR CI leg executes the signing
+path"* bullet below, which now covers the SBOM path too. A dismissal recorded as closed on the strength
+of a diff nothing has run is precisely the shape this ADR's Decision warns about, so it is bounded here
+rather than left for a reader to assume.
 
 ### Residuals — dismissals that stay dismissed, and why
 
@@ -538,11 +544,16 @@ place rather than deleted.
   instrument matches CI's). All six pre-existing DEP-1 artifacts stay byte-identical; `uv lock` moves
   one line and `release-tools.lock` three. The `semgrep`-style excluded-by-decision call was never
   reached.
-* **CLOSED 2026-09-10, having been recorded here as "still open, deliberately".** That bullet said
-  `build` and `cyclonedx-bom` remain inline installs in the same privileged job, tracked at BACKLOG
-  #332. Both now flow through the `release-tools` group and `ci/locks/release-tools.lock`; the
+* **CLOSED IN THE TREE 2026-09-10, having been recorded here as "still open, deliberately".** That
+  bullet said `build` and `cyclonedx-bom` remain inline installs in the same privileged job, tracked at
+  BACKLOG #332. Both now flow through the `release-tools` group and `ci/locks/release-tools.lock`; the
   byte-identical pair moved in one commit as required. The lock went from 31 requirements to 65 and
-  from 193 hashes to 383. **The contamination this ADR's convergence criterion exists to catch DID
+  from 193 hashes to 383. **Bounded exactly as the SBOM-path amendment below bounds it: the replacement
+  install is verified by guards reading the workflow text, and has not been EXECUTED anywhere.** (One
+  correction to the quoted old bullet while it is in view: those installs were never in one job. The
+  three `build` sites are in three different jobs — `release`, `release-webconsole`, `release-harness` —
+  all holding `id-token: write`, with `attestations: write` only on the first.)
+  **The contamination this ADR's convergence criterion exists to catch DID
   fire this time**, unlike the `sigstore` increment above, and is recorded in the next bullet rather
   than in this one.
 * **Contamination, second increment: ONE pre-existing artifact moved, and it was accepted rather than
@@ -567,3 +578,19 @@ place rather than deleted.
   `sigstore` exactly, is fully hashed and is installed with `--require-hashes`; they cannot assert it
   installs. **The first real run of this change is a release** — dry-run via `workflow_dispatch` and
   read the log before the next tag.
+  * **AMENDED 2026-09-11: this now covers the SBOM path too, and a correction belongs with it.** After
+    #332 step 6 the same sentence applies to `build` and `cyclonedx-bom`, whose installs sit at the same
+    six sites. **An earlier draft of that work claimed `security.yml`'s `sbom` job gave the
+    `cyclonedx-bom` half PR-CI coverage. It does not.** That job is gated
+    `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`, is
+    `continue-on-error: true`, and is not a required context; it reported **`skipped`** on PR 1039's own
+    head. So **no pull request executes `pip install --require-hashes -r ci/locks/release-tools.lock` in
+    any workflow**, and this ADR's pre-tag dry-run route is a DISPATCH somebody performs, never something
+    a PR performs for them. Earliest unattended execution is the **nightly `0 6 * * *` `security.yml` run
+    on `main`** after merge.
+  * **What PR CI does cover, so the gap is not overstated.** The ungated `pip-audit` job re-exports all
+    seven DEP-1 artifacts under CI's pinned `uv==0.12.0` and `git diff --exit-code`s them, and audits
+    `ci/locks/release-tools.lock` and `ci/locks/ci-quality.lock`. Both passed on PR 1039's head. **The
+    lock's CONTENT is verified every pull request; only its INSTALLATION is not.** That split is the
+    useful one to carry forward: this register's residuals here are about an unexecuted command, not an
+    unchecked artifact.

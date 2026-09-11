@@ -454,9 +454,14 @@ jobs:
           # step 6), so its transitives are hashed rather than resolved from PyPI at run time. The
           # `~=7.3.1` bound is UNCHANGED and its rationale lives ONCE, at that group in pyproject.toml.
           # No pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
-          # This job is ADR 0034's pre-tag dry-run for the release SBOM step, and since nothing in PR CI
-          # executes release.yml, THIS is the only leg that runs the command before a tag. If the two
-          # drift, dispatching this one proves nothing about the release.
+          # This job is ADR 0034's pre-tag dry-run for the release SBOM step, so if the two drift,
+          # dispatching this one proves nothing about the release.
+          # IT DOES NOT RUN ON A PULL REQUEST. The job's `if:` above gates it to `schedule` and
+          # `workflow_dispatch`, so the dry-run must be DISPATCHED -- reaching it is a deliberate act, not
+          # something a PR does for you. Said here because the opposite was believed and published once
+          # (PR 1039, corrected at BACKLOG #332): that PR's head reported this job `skipped`, and NOTHING in
+          # PR CI executes this install line in any workflow. The earliest unattended run is the nightly
+          # cron on `main` after merge.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
