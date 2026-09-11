@@ -217,6 +217,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("paths", nargs="*", type=Path)
     ap.add_argument("--repo", type=Path, default=_ROOT)
+    ap.add_argument(
+        "--advisory",
+        action="store_true",
+        help="report findings without failing; a MALFUNCTION still exits 2",
+    )
     args = ap.parse_args(argv)
 
     paths = args.paths or [
@@ -254,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:
             "Both corrupt two items in opposite directions."
         )
         print("")
-    return 1
+    # `--advisory` downgrades a FINDING and nothing else. The empty-population refusal above is a
+    # MALFUNCTION -- what running from the wrong directory looks like -- and still exits 2, so a scan
+    # that read nothing stays distinguishable from one that found nothing.
+    return 0 if args.advisory else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

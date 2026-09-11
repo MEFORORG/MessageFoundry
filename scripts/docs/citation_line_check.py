@@ -57,6 +57,35 @@ naming a symbol that legitimately appears in many places can agree by coincidenc
 symbol moved only a line or two reads as agreement by design, because the span is deliberately
 tolerant. This reduces one class; it does not certify the corpus, and the summary line reports the
 denominator so the covered fraction is never implied to be the whole.
+
+THE BASELINE, AND WHY A DETECTOR THIS FAR BEHIND NEEDS ONE (BACKLOG #1525)
+---------------------------------------------------------------------------
+204 of the 309 checkable citations drift today. Wired without a baseline this reports a finding on
+every run forever, which is the state a check gets switched off in -- ``backlog_citation_check.py``
+records the same reasoning for its diff scope, in its own words: *"a gate that fails on a legitimate
+archive is one people delete"*. ``--baseline FILE`` records today's population, so a run can separate
+**a drift somebody just wrote** from the 204 that were already here.
+
+``--advisory`` downgrades a FINDING to exit 0. **It never downgrades a MALFUNCTION** -- an unreadable
+ledger or an unreadable baseline still exits 2, because a scan that read nothing and a scan that found
+nothing must not render alike.
+
+**THE KEY CARRIES NO ACTUAL LINE AND NO LEDGER FILE, and both omissions are deliberate.** A key is
+``<cited path>:<cited span>::<symbol>``:
+
+* the **actual** line is where the symbol really is, and it moves on every refactor -- putting it in
+  the key would retire a baseline entry and re-report the same drift as new, on a change that touched
+  no citation at all;
+* the **ledger file** is where the row sits today, and retiring an item MOVES it verbatim from
+  ``docs/BACKLOG.md`` into the archive -- keying on it would make every archived row read as new drift.
+
+So an entry retires when the CITATION changes or the symbol leaves the file, which is what a reader
+means by "that one is dealt with". Both directions print on every run: a key no longer reported is
+either a fixed citation or a screen that stopped seeing it, and those are opposite facts.
+
+**A NEW KEY IS NOT ALWAYS A NEW CITATION.** Moving the code under a citation that agreed yesterday
+produces one too, and that citation is now genuinely wrong -- the same defect arriving from the other
+side. The report names the symbol and the line it is really on, so either remedy is one edit.
 """
 
 from __future__ import annotations
@@ -108,12 +137,32 @@ _PROSE_WINDOW = 80
 _SPAN_SLACK = 3
 
 
+#: Judged drifts, one key per line. See the module docstring for what a key deliberately OMITS.
+DEFAULT_BASELINE = _ROOT / "scripts" / "docs" / "citation_line_baseline.txt"
+
+
 class Drift(NamedTuple):
     source: str
     path: str
     cited: str
     symbol: str
     actual_line: int
+
+    @property
+    def key(self) -> str:
+        """Stable across a refactor and across archival. ``actual_line`` and ``source`` are out."""
+        return f"{self.path}:{self.cited}::{self.symbol}"
+
+
+def load_baseline(path: Path) -> set[str]:
+    """Read judged keys. Raises rather than defaulting to empty: a baseline that cannot be read and
+    one that is genuinely empty have opposite meanings, and the caller turns the first into exit 2."""
+    keys: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            keys.add(line)
+    return keys
 
 
 class Report(NamedTuple):
@@ -187,6 +236,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--max-report", type=int, default=25, help="drifted citations to print (0 = all)"
     )
+    ap.add_argument(
+        "--baseline",
+        type=Path,
+        nargs="?",
+        const=DEFAULT_BASELINE,
+        default=None,
+        metavar="FILE",
+        help="judged drifts; fail only on a key that is not in it (bare flag = the shipped file)",
+    )
+    ap.add_argument(
+        "--advisory",
+        action="store_true",
+        help="report findings without failing; a MALFUNCTION still exits 2",
+    )
     args = ap.parse_args(argv)
 
     ledgers = args.ledgers or [
@@ -208,17 +271,50 @@ def main(argv: list[str] | None = None) -> int:
         f"symbol and were checked -- {r.agreed} agree, {r.unresolved} name a symbol not in the file, "
         f"{len(r.drifted)} DRIFTED"
     )
-    if not r.drifted:
+    if r.drifted:
+        print("")
+        shown = r.drifted if args.max_report == 0 else r.drifted[: args.max_report]
+        for d in shown:
+            print(f"  {d.path}:{d.cited} names `{d.symbol}` -- which is at :{d.actual_line}")
+        if len(shown) < len(r.drifted):
+            print(f"  ... and {len(r.drifted) - len(shown)} more (--max-report 0 for all)")
+    elif args.baseline is None:
         print("citation-line: OK -- every checkable citation points at the symbol its prose names")
-        return 0
 
+    if args.baseline is None:
+        return 0 if (args.advisory or not r.drifted) else 1
+
+    try:
+        judged = load_baseline(args.baseline)
+    except OSError as exc:
+        # A malfunction, and `--advisory` does not reach it. An unreadable baseline makes every
+        # known drift read as new, which is the alarm-on-everything direction this file warns about.
+        print(f"citation-line: cannot read baseline {args.baseline}: {exc}", file=sys.stderr)
+        return 2
+
+    seen = {d.key for d in r.drifted}
+    new = sorted(seen - judged)
+    retired = sorted(judged - seen)
+
+    # STATED EVEN WHEN EMPTY, for the reason username_access_key_screen.py gives: a retired key is
+    # either a fixed citation or a screen that stopped seeing it, and printing the count is what lets
+    # a reader notice the second one.
     print("")
-    shown = r.drifted if args.max_report == 0 else r.drifted[: args.max_report]
-    for d in shown:
-        print(f"  {d.path}:{d.cited} names `{d.symbol}` -- which is at :{d.actual_line}")
-    if len(shown) < len(r.drifted):
-        print(f"  ... and {len(r.drifted) - len(shown)} more (--max-report 0 for all)")
-    return 1
+    print(
+        f"citation-line: baseline {args.baseline.name} -- {len(judged)} judged, {len(seen)} seen, "
+        f"{len(retired)} no longer reported, {len(new)} NEW"
+    )
+    for key in retired:
+        print(f"    NO LONGER REPORTED (citation fixed, or the screen stopped seeing it): {key}")
+    if not new:
+        return 0
+    print("")
+    print(
+        "citation-line: NEW DRIFTED CITATION(S) -- re-anchor each, or add its key to the baseline:"
+    )
+    for key in new:
+        print(f"    {key}")
+    return 0 if args.advisory else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

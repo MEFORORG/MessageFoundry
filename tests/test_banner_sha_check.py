@@ -155,3 +155,22 @@ def test_the_clean_run_still_states_its_coverage(repo: Path, tmp_path: Path, cap
     assert rc == 0
     assert "examined 1 closing-claim sha" in out
     assert "1 name their own item" in out
+
+
+def test_advisory_downgrades_a_finding_and_never_the_empty_population_refusal(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #1525. `--advisory` is what lets this run in a job that must not gate a merge.
+
+    BOTH HALVES, because the second is the one that matters: a flag that also swallowed the
+    no-ledger-to-read refusal would install a step incapable of failing for the reason it exists,
+    and the run that read nothing would render exactly like the run that found nothing.
+    """
+    sha = _commit(repo, "fix(x): something (BACKLOG #999) (#42)", "a.txt")
+    led = _ledger(tmp_path, f"## 123. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    mod = _load()
+    assert mod.main([str(led), "--repo", str(repo)]) == 1
+    assert mod.main([str(led), "--repo", str(repo), "--advisory"]) == 0
+    absent = str(tmp_path / "no-such-ledger.md")
+    assert mod.main([absent, "--repo", str(repo)]) == 2
+    assert mod.main([absent, "--repo", str(repo), "--advisory"]) == 2
