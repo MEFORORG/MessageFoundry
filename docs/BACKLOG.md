@@ -27987,13 +27987,53 @@ I did not enumerate the engine's actual logging call sites to ask which of these
 
 ## 1481. A scoped secret scan can walk zero commits and pass; nothing asserts the range is non-empty
 
-> 🔢 **Filed 2026-09-07 -- not started. FILED ONLY: nothing here is fixed on this branch.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
+> 🚧 **IN PROGRESS 2026-09-10 -- built on branch `claude/gitleaks-range-guard-1481`, awaiting review and land.** Not a closure: the Lander flips this banner on merge.
+> **Filed 2026-09-07.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
 > Verdict: build
 > Research: none
 > Closing-act: code
 
 **Cluster:** CI merge gates / instrument honesty. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is a required secret gate that could report success having looked at nothing.
+
+### Built on this branch 2026-09-10
+
+The prescribed fix, unchanged in shape from the section below: `set -o pipefail` on its own line, the
+scan piped through `tee gitleaks-scan.log`, and the scanner's own count read back with
+`grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned'`. No `shell: bash`, no `git rev-list`, no change to
+`--log-opts HEAD`, and no change to the job's `name:` or the workflow's triggers.
+
+`2>&1` was added to the capture and is the one decision the filing did not settle. The count is one
+of the scanner's own log lines and those go to stderr, while `--verbose` findings go to stdout, so a
+stdout-only pipe could capture no count and red every clean run. Merging is correct under either
+reading of that split; the binary was not re-run to decide which.
+
+A third `[[control]]` for `gitleaks (secret scan)` is registered in `tests/negative_controls.toml`,
+backed by three arms in `tests/test_merge_gate_controls.py`. Eight neutering arms were run against the
+real workflow, restored byte-identical after each: deleting the pipefail line reds exactly the
+pipefail arm, deleting the guard reds exactly the range arm, and renaming the step reds nothing. The
+arm counts and the one arm that needs reading carefully are in the registry entry.
+
+**The pipefail rule was written for the job rather than for the one step, because the sibling step had
+the same hole.** `Install gitleaks (pinned + checksum-verified)` selects its checksum line with
+`grep ... | sha256sum -c -` and set no pipefail, so a `grep` matching nothing -- a renamed asset -- was
+discarded and the step's status came from `sha256sum`, which happens to refuse empty input. Safe by the
+downstream tool, not by design, inside the gate that exists to verify those bytes. It now sets pipefail
+too, and the control covers every piped step in the job rather than the one the row named.
+
+**That rule is general and its home is one module over, unfiled.** A pipe with no pipefail is `|| true`
+spelled differently, and `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` is
+the sweep over every required job where it belongs. Measured while building this: of 190 POSIX `run:`
+steps across the workflows, 30 carry a real pipe and 7 of those 30 set pipefail. After this change no
+required-job step pipes without it; at least several that remain sit in advisory or release-only jobs,
+off the merge path. Named by subject, not by a number nobody has allocated.
+
+Two sentences in the step's existing `--log-opts` comment described a `push: branches: [main]` arm
+removed on 2026-09-08, and one of them counted the triggers. Both were corrected in place rather than
+left for the reader this row's own guard comment sends there. That is the second-definition defect
+`tests/test_security_posture.py` pins for this file's HEADER (#1079), one level down in a step body,
+where no test looks.
+
 
 **Measured 2026-09-07 on the pinned gitleaks 8.18.4 binary** -- the version `.github/workflows/security.yml` installs, downloaded from the release and version-checked, not a local build.
 
