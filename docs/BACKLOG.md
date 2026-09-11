@@ -30506,7 +30506,9 @@ The assertion was:
 assert paced_elapsed - unpaced_elapsed >= 0.5
 ```
 
-and the observed failure was paced 1.373 s against unpaced 1.056 s, a difference of 0.317.
+and it failed on two legs of run 34563466896 with two DIFFERENT signatures. On `test (windows-2025, py3.14)`, paced 1.373 s against unpaced 1.056 s: a difference of 0.317, short of the required 0.5. On `test (windows-2022, py3.14)`, the only failing job of 16, paced 1.379 s against unpaced 1.760 s -- a difference of MINUS 0.381.
+
+**The second signature is what rules out widening the threshold**, and it is the one that had been reading as a branch problem on every pull request inheriting `main`. The paced arm finished FASTER than its own control. A wider window admits that case too, so the test would then pass while measuring nothing; only an assertion that never compares the two arms' durations to each other survives it.
 
 ### The pacing delay is not additive, which is what a difference assertion assumes
 
@@ -30528,7 +30530,7 @@ difference loses, while both arms behave perfectly.
 
 On that CI run the paced arm's own work implies about 0.02 s per association against the control's
 0.176 s, a factor of nine between two arms of one test. The gap is not only noise. Measured locally
-2026-09-11 on a quiet box, the control's associations queue back-to-back at 0.030 s each while the
+2026-09-11 on this box, the control's associations queue back-to-back at 0.030 s each while the
 paced arm's arrive into an idle SCP at 0.017 s, so a difference assertion is biased against itself
 even with nothing else running.
 
@@ -30551,7 +30553,7 @@ assert len(paced_waits) == int(_PACED_STEPS)        # the DECISION: exact, runne
 assert paced_elapsed >= floor * _PACED_MARGIN       # the peer actually waited
 ```
 
-Measured on a quiet box: the control arm records `[]` every run, and the paced arm records exactly
+Measured here: the control arm records `[]` every run, and the paced arm records exactly
 four waits every run, at `1 / rate` less the work each arrival absorbed.
 
 The wall-clock arm is kept because the decision arm cannot see a wait that is asked for and not
@@ -30589,9 +30591,9 @@ pass showed was far too loose: the paced arm's own work hands the comparison `fl
 at 0.75 pacing need only supply about 60 percent of what it honestly supplies. Measured: the halved
 wait lands at 0.86 of the floor, so 0.75 passes it and 0.95 reds it. The slack bought nothing in
 return, because the floor is exact bucket arithmetic rather than a measurement -- the honest arm ran
-1.03 to 1.21 times the floor over five runs on a quiet box, and its low end of 1.03 is the
-arithmetic one rather than a lucky sample. The loaded runs recorded pass or fail, not ratios, so
-this range is a quiet-box measurement and nothing more -- and an `Event.wait` returns LATE
+1.03 to 1.21 times the floor over five runs, and its low end of 1.03 is the
+arithmetic one rather than a lucky sample. The loaded runs recorded pass or fail, not ratios, and the
+host carried 117 processes and 5,308 CPU-seconds while the five were taken, so read that spread as a range from a BUSY machine rather than a floor from a quiet one -- and an `Event.wait` returns LATE
 on Windows, never early (0 of 240, `tests/_pace_probe.py`).
 
 ### The load arm is what settles the original defect
@@ -30615,7 +30617,7 @@ passed 5/5 under the same load.
 
 The old paced arm was pinned near 1.33 s whatever the machine did. The new one is `_SEPARATION` times
 the control, so break-even is a control of about 0.34 s: below that the test got faster, above it
-slower in proportion. On a quiet box here the whole test runs about 0.9 s against 1.55 s before. On
+slower in proportion. On this box the whole test runs about 0.9 s against 1.55 s before. On
 the CI leg that went red (control 1.056 s) it goes from about 2.4 s to about 5.3 s. Under 24-way
 oversubscription it measured 12 to 16 s.
 

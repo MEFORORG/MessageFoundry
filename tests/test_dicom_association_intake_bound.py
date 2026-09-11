@@ -322,8 +322,10 @@ _MIN_SEPARATION = 2.0
 #: measured to be far too loose: the paced arm's own work hands it ``floor / 4`` for free, so at 0.75
 #: pacing need only supply 60 percent of what it honestly supplies and a wait capped at half a step
 #: would still pass. The floor is exact bucket arithmetic rather than a measurement -- ``paced_elapsed
-#: == floor + 2w``, so the honest arm measured 1.03 to 1.21 times the floor over five quiet runs, its
-#: floor of 1.03 being the arithmetic one rather than a lucky sample -- and an ``Event.wait``
+#: == floor + 2w``, so the honest arm measured 1.03 to 1.21 times the floor over five runs, its low
+#: end of 1.03 being the arithmetic one rather than a lucky sample. That spread is itself the host
+#: rather than the pacer: the box carried 117 processes and 5,308 CPU-seconds while it was taken, so
+#: read it as a range from a BUSY machine and not a floor from a quiet one -- and an ``Event.wait``
 #: returns LATE on Windows, never early (0 of 240, ``tests/_pace_probe.py``). So the slack buys
 #: nothing against a false red and costs discrimination on the one mutation class the decision arm
 #: below cannot see: a wait asked for and then shortened.
@@ -429,8 +431,14 @@ async def test_a_paced_scp_still_establishes_every_association() -> None:
     **The two terms compete; they do not add**, and that is the whole defect in a difference
     assertion: as a loaded runner pushes ``N * w`` up toward the pacing floor, the difference
     collapses while both arms behave perfectly. The two arms are also timed one after the other on a
-    shared runner, so they need not see the same machine at all. BACKLOG #1536 carries the CI and
-    local figures.
+    shared runner, so they need not see the same machine at all.
+
+    **On ``main`` the difference did not merely fall short -- on one leg it came out NEGATIVE, which
+    is what rules out widening the threshold.** Run 34563466896, ``test (windows-2022, py3.14)``:
+    paced 1.379 s against unpaced 1.760 s. The paced arm finished FASTER than its own control. A
+    wider window admits that case too, so the test would then pass while measuring nothing; only an
+    assertion that never compares the two arms' durations to each other survives it. BACKLOG #1536
+    carries both legs' figures.
 
     **So this asserts what the pacer DECIDED before it asserts how long the box took to obey** --
     the rule ``tests/_pace_probe.py`` established for the egress pacer after the same class of flake
