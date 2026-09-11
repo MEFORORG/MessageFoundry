@@ -5588,7 +5588,9 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 ## 1039. `git worktree add --force` also defeats the already-checked-out guard, so "git will refuse this" must be written as conditional
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The gate's own site is already written as conditional (worktree_gate.ps1:865-879 spells out the three bypass flags and the allowlist reason), so the remainder is one measurement plus the sweep for other deferring sites, and at least two unconditional ones survive (prune-merged.ps1:1271, BACKLOG-CLOSED.md:6675). It ships nothing runnable to an adopter, which caps it at internal-tooling hygiene, and the work is one command plus doc edits. _(was 5/10 · 2/10.)_
+> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The gate's own site is already written as conditional (worktree_gate.ps1:865-879 spells out the three bypass flags and the allowlist reason), so the remainder is one measurement plus the sweep for other deferring sites, and at least two unconditional ones survive (prune-merged.ps1:1271, BACKLOG-CLOSED.md:6675). **SUPERSEDED 2026-09-11 -- the count of two is stale and is corrected here rather than deleted, because it is quoted in the ranked table.** `2b9f5b3c4` closed the `prune-merged.ps1:1271` half: that line now states WHY `--force` refuses there (the directory is not empty, and an empty one it would accept), which is the conditional form this item asks for. `BACKLOG-CLOSED.md:6675` is the only one of the two still standing, and it is the residual the sweep note below names. It ships nothing runnable to an adopter, which caps it at internal-tooling hygiene, and the work is one command plus doc edits. _(was 5/10 · 2/10.)_
+>
+> **PROSE SWEEP DONE 2026-09-10, CORRECTED 2026-09-11, IN THE PR THAT CARRIES THIS LINE -- not yet on `main`.** The gate half shipped in `2b9f5b3c4`. **EIGHT sites** now state what defeats the guard (`git worktree add --force` / `-f`, `git checkout --ignore-other-worktrees`): the three this item named -- `ledger_check.py`'s branch-fallback docstring, `alloc_strand_sweep.py`'s `drifted-branch-held` definition and that verdict's test docstring -- plus `ledger_check.py`'s `ownership_remedy` operator text, `docs/WORKTREE-GATE.md`'s rule-3b escape-hatch paragraph, and three in `tests/test_ledger_check.py`. **THE FIRST VERSION OF THIS LINE SAID FIVE SITES AND WAS WRONG, WHICH IS WORSE THAN SAYING NOTHING: a seat picking this item up would have read the sweep as finished and stopped.** The miss was `tests/test_ledger_check.py:211`, and it is the STRONGEST instance in the repository -- not narration, but the stated safety argument for #1282's branch-fallback loosening, which the same PR's new `Ledger.owns` docstring now contradicts. **Cause, because it generalises:** the sweep grep was case-sensitive and that site is in capitals. Re-run case-insensitively over two needles, which is what found the two extra sites as well. **ONE RESIDUAL, deliberately not touched:** `docs/archive/backlog/BACKLOG-CLOSED.md:6675` says *"git will refuse this itself"* and is closed-archive prose, which is single-writer territory an owner ruling governs. **A FINDING, recorded rather than repaired:** forcing a second checkout of a recorded branch makes `Ledger.owns`'s branch key non-exclusive, so entitlement to a number leaks to a tree that never allocated it -- narrow, because the fallback is unreachable while the recorded path still matches. Documented at the site; the ownership model is unchanged here.
 >
 > **Filed 2026-08-05 — not started.** At least three git flags defeat the guard that stops a branch being checked out in two worktrees. Any code or comment reasoning that "git already refuses this" is making a claim about a **configuration**, not about git, and must say so.
 > Verdict: build
@@ -14606,7 +14608,55 @@ commit.**
 
 ## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
+> 🚧 **Built 2026-09-10 on branch `claude/store-privilege-null-1234` (PR #1036); open until that merges, when the Lander flips this banner (`CLOSING_SEAT["code"]`) -- a NULL column is NOT READ, and an incomplete read is never `OBSERVED`.**
+> `probe_principal_privileges` in `messagefoundry/store/sqlserver.py` now classifies every probed grant
+> three ways -- held, not held, or not read -- and returns `UNOBSERVABLE`, naming each unread grant, as
+> soon as any column comes back NULL. That routes straight through the arm already built for *"could
+> not observe"*: a distinct log line, a distinct audit `status`, its own posture entry, and a refusal
+> under a declared `[store].require_least_privilege`. **`HAS_PERMS_BY_NAME` is covered alongside the two
+> role built-ins**, which is the limb the 2026-09-03 amendment below flagged as outside the original
+> scope -- a direct `GRANT CONTROL SERVER` NULLs on the same unresolved-name condition, so a fix to the
+> role columns alone would have left it mis-read exactly as before.
+>
+> **BOTH ARMS THIS ITEM DEMANDED ARE PRESENT AND THEIR REDS ARE DISJOINT.** Nine legs in
+> `tests/test_store_privilege_preflight.py` drive the real T-SQL arm with `_fetchone` / `_fetchall`
+> monkeypatched -- no live SQL Server and no container, so they run in the default local suite rather
+> than on a hosted leg nobody reads. Measured by reverting **only** `sqlserver.py` and re-running the
+> file: **5 of the 9 go red** on the unfixed arm, the all-NULL row reporting
+> `StorePrivilegeStatus.OBSERVED` with an empty excess list -- the false-clean reproduced verbatim --
+> and **4 stay green**: the documented least-privilege row, an honest all-zero row, a boolean-driver
+> row, and the pre-existing empty-result guard. That second set is the negative control this item's own
+> scope asked for. A fix that reported UNKNOWN for everything would have turned those four red as well,
+> and would still have passed a single-arm test.
+>
+> **Severity is unchanged and still conditional (CLAUDE.md section 0):** with zero deployments nothing
+> was ever mis-reported. What is fixed is what a first deployment would have read.
+>
+> **THE OWNER DECISION BELOW IS SUPERSEDED ON ITS OWN STATED PREMISE, AND THE PREMISE IS THE ONLY PART
+> THAT MOVED.** It reads *"Do not dispatch this"*, resting on two measurements: that
+> `messagefoundry/store/privilege.py` was **absent** from `main`, and that
+> `require_least_privilege|least_privilege` returned **zero** hits across `messagefoundry/**/*.py`. Both
+> were true when written. Neither is true now. The preflight landed on `main` at **`6148f4181`**
+> (PR #764) on **2026-09-09**, and that same instrument at `origin/main` today returns **3** files for
+> `require_least_privilege` -- `api/app.py`, `config/settings.py`, `store/privilege.py` -- against a
+> POSITIVE CONTROL of **3** files for `require_managed_identity` on the same instrument and the same
+> ref. **Nothing here reverses the owner's POLICY ruling**, which is #1008's and is untouched: this row
+> is a code defect and was independent of that ruling by its own filing.
+>
+> **THE BANNER SAT ABOVE A CORRECTION OF ITSELF FOR SEVEN DAYS, WHICH IS THE REUSABLE PART.** This
+> item's newest amendment -- *"THE CLEARING CONDITION IS MET"* -- landed inside merged PR #764 and is
+> written at the FOOT of the row, while the *"do not dispatch"* banner it answers stayed at the head.
+> A reader trusts the head and re-checks it last, so the row read blocked and startable at once. That
+> is the intra-item contradiction #1235 records twice and #1241 records once, now a fourth instance:
+> **correcting a body does not correct the banner that summarises it**, and the two fail in both
+> directions.
+>
+> **ONE INCONSISTENCY IS LEFT STANDING DELIBERATELY, BECAUSE IT IS NOT THIS ROW'S TO FLIP.** #1008
+> still carries its 2026-09-03 ruling to keep the preflight deferred, while the preflight is on `main`.
+> That is real, it belongs to #1008, and flipping it is the owner's act. It is recorded here only so a
+> reader arriving from that row does not conclude this one was closed against a live defer.
+>
+> **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. The defect is real and unfixed on the branch that holds it: the SQL Server arm returns OBSERVED unconditionally and folds NULL role results to False, so a probe that read nothing reports observed-and-clean, and the refusal arm is opt-in so WARN is the only arm a default install reaches. The fix is a NULL-versus-clean distinction on one backend arm plus the two-arm test the item specifies, provable against a fixture row rather than a live server, but it stays unstartable until that branch lands. _(was 6/10 · 2/10.)_
 >
 > **OWNER DECISION 2026-09-03 -- RECORDED AS BLOCKED, NOT DISPATCHED. The measurement below was re-taken
 > today rather than trusted:** the amendment further down is three weeks old, and this seat spent the day
@@ -16398,8 +16448,15 @@ such an instrument is the most misleading artifact available.***
 
 ## 1266. the seat clock's broadcast fanout drops seats per-firing, and no seat can detect it from its own inbox
 
-
-> 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **4/10** · _fill-in_. The item's stated first deliverable is untouched: seat-tick.ps1 is outside version control anywhere in the tree (zero hits from git ls-files against 1997 tracked files, and the only repo reference is docs/BACKLOG.md itself), so every downstream fix would still be an unattributable write to a live machine-global control. Value 5 because this is internal coordination tooling with no product or PHI axis, where the one confirmed defect is the seats-unreadable path that drops every seat for a firing and exits 0; difficulty 4 because the concrete fixes are individually small (ConvertFrom-Json -AsHashtable, emitting SUPPRESSED(opt-out) instead of a bare continue, a durable per-firing decision line carrying a rotation answer) but sit behind the version-control precondition and a 2000-character tick-body cap that kills the fleet clock silently. _(was 5/10 · 4/10.)_
+> ⛔ **CLOSED 2026-09-11 as INVALID -- owner ruling.** Verbatim: *"close 1266 as an invalid issue"*, and on scope: *"I'm not using the tick, so mark it as invalid"*. **THE REASON IS THE SUBJECT, NOT THE ANALYSIS: the seat clock (`seat-tick.ps1`) IS NOT IN USE.** A defect in a tool nobody runs is not a defect worth tracking. **This is NOT a finding that the work below was wrong** -- that is a weaker and different claim, and the owner did not make it. The 53-of-112 figure, the quantised-versus-ragged discriminator and the seats-unreadable case all stand exactly as written. What the ruling removes is the SUBJECT, not the evidence. **Anyone tempted to re-file this must first establish that the clock is in use again.**
+>
+> **THE ONE CONFIRMED DEFECT CLOSES WITH THIS ITEM AND IS DELIBERATELY NOT RE-FILED.** A `seats.json` holding one worktree path in two casings makes `ConvertFrom-Json` throw, so every seat is dropped for that firing and the process exits 0 (`:313`, described below); `ConvertFrom-Json -AsHashtable` fixes it. It was measured and it is real -- and it is a fault in a tool nobody runs. **No new number was allocated for it and none should be.** Recorded here so the finding survives its item.
+>
+> **THE VERSION-CONTROL DELIVERABLE FURTHER DOWN IS SUPERSEDED BY THIS RULING**, and it is marked as such at the line that states it. A live-looking instruction left inside a closed item is the thing a later seat acts on.
+>
+> **`#1267` IS NOT CLOSED BY THIS RULING AND WAS NOT TOUCHED.** It is the tick-RUBRIC item and its artefact is the same unused `seat-tick.ps1`, so the owner's reason reads as though it invalidates that row too. **The owner ruled on THIS item only, and no seat extends a ruling.** Routed to the owner as its own decision.
+>
+> **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **4/10** · _fill-in_. The item's stated first deliverable is untouched: seat-tick.ps1 is outside version control anywhere in the tree (zero hits from git ls-files against 1997 tracked files, and the only repo reference is docs/BACKLOG.md itself), so every downstream fix would still be an unattributable write to a live machine-global control. Value 5 because this is internal coordination tooling with no product or PHI axis, where the one confirmed defect is the seats-unreadable path that drops every seat for a firing and exits 0; difficulty 4 because the concrete fixes are individually small (ConvertFrom-Json -AsHashtable, emitting SUPPRESSED(opt-out) instead of a bare continue, a durable per-firing decision line carrying a rotation answer) but sit behind the version-control precondition and a 2000-character tick-body cap that kills the fleet clock silently. _(was 5/10 · 4/10.)_
 >
 > **MEASURED 2026-08-15 -- A RECEIVING SEAT *CAN* DISCRIMINATE SUPPRESSION FROM A FAILED SEND, AND
 > THIS ITEM SAYS IT CANNOT. The single-instance claim is right; the COUNT over a long dark window is
@@ -16429,7 +16486,7 @@ such an instrument is the most misleading artifact available.***
 > gap would have scored 57 fanout skips, and the true fault count for it is ZERO.** Before anyone
 > builds a fix, **re-derive 53-of-112 with dark intervals excluded** -- the fault may be much smaller
 > than filed, or absent.
-> 🔢 **Filed 2026-08-14 -- routed to this seat as an UNCLAIMED CODE item. It sat as three seats' corroboration for a full day with nobody owning it, because it is invisible from every vantage point that noticed it.** **THE CLOCK IS HEALTHY AND THE FANOUT IS NOT** -- conflating those is the whole reason this went unfiled.
+> **Filed 2026-08-14 -- routed to this seat as an UNCLAIMED CODE item. It sat as three seats' corroboration for a full day with nobody owning it, because it is invisible from every vantage point that noticed it.** **THE CLOCK IS HEALTHY AND THE FANOUT IS NOT** -- conflating those is the whole reason this went unfiled.
 > **THE MEASUREMENT.** 112 firings on 2026-08-14 at a **10.0 min cadence** (9.9 / 10.0 / 10.1) -- the timer is fine. But recipients per firing swing **1 to 11, median 2**, and **53 of 112 firings reached exactly ONE seat**. The seat that measured it received **33 of 112**. **The dropout is PER-SEAT-PER-FIRING, not an outage window:** two seats missed 19:01 and 19:11 which 7 and 6 other seats received, and one missed 18:51 which the other received.
 > **TWO INNOCENT EXPLANATIONS ARE ALREADY REFUTED -- do not re-run them.** *Roster growth* (few seats live early, more later) fails because the count **collapses and recovers**: 10,10,10,10,9,11,11 then 2,5,3,3,6,2,2,2 then back to 10,10,10,10,11. Eleven seats do not all die at 15:01 and all return at 16:21. *"The seat was dark"* fails **first-hand** -- one skip is bracketed by the skipped seat's own demonstrated sends 5 minutes before and **93 seconds after**, and seats come back (`Y Y Y . . Y`), so it is not progressive death either.
 > **THE UNEXPLAINED PART IS THE BEST LEAD.** **Three seats received all six firings in a window where others flickered.** Whatever varies does not vary for them. Recorded as the strongest open lead, **not** as a conclusion.
@@ -16445,6 +16502,7 @@ such an instrument is the most misleading artifact available.***
 > **SO ANY FIX HERE IS AN UNATTRIBUTABLE WRITE TO A LIVE, SHARED, MACHINE-GLOBAL CONTROL** that every seat's clock depends on **while the edit is being made** -- no review, no rollback, no record of who changed it. **That is the same defect class as `#1247`, one level worse: the worktree gate at least had a committed source to compare an installed copy against. This has none.**
 > **AND THE BLAST RADIUS IS DOCUMENTED IN THE FILE ITSELF, `:191-198`:** *"THE TICK BODY HAS A HARD 2000-CHARACTER CAP AND EXCEEDING IT KILLS THE CLOCK SILENTLY ... THE CLOCK WAS DEAD FOR ABOUT 35 MINUTES"*, and the first symptom was the author noticing they had stopped receiving their own ticks. **A bad edit here silences the entire fleet AND EXITS 0 WHILE DOING IT** -- which is this item's own subject, turned on the item's own fix.
 > **THEREFORE THE FIRST DELIVERABLE IS VERSION CONTROL, NOT THE LOG.** Bring `seat-tick.ps1` and `seats.json` under version control -- this repo under `scripts/coord/`, or the vault -- **and the retention change becomes an ordinary reviewable commit.** Until then **every improvement anyone makes to this clock hits the same wall**, and `#1267` is blocked identically because its fix is a rewrite of the tick body: **the exact edit that caused the 35-minute outage.**
+> **SUPERSEDED 2026-09-11 -- DO NOT ACT ON THE DELIVERABLE IN THE LINE ABOVE.** Earlier on 2026-09-11 the owner ruled that `seat-tick.ps1` and `seats.json` be brought under version control in `scripts/coord/`. The closing ruling at the top of this item MOOTS that: there is no point versioning a tool nobody is using. **Neither the version-control deliverable nor the `#1247` out-of-repo fallback named just below it is live work, and neither is an owner question still waiting for an answer.** `#1267` stays open on its own terms; this line retires the PRECONDITION, not that row.
 > **IF THE OWNER PREFERS IT STAY OUT-OF-REPO, the `#1247` pattern is the fallback and transfers directly:** back up the bytes, write a receipt naming who wrote it and from where, and **refuse to overwrite an unrecognised copy.**
 > **THIS IS AN OWNER DECISION. An AFK delegation lets a seat exercise grants it already holds; it does not create a grant over a shared machine-global control.** The building lane reached that conclusion independently and handed the item back rather than proceeding -- **which is the correct outcome and the reason nothing was broken.**
 > **READ THIS FIRST -- THE CLOCK ALREADY DECIDES OUT LOUD; ONLY THE RETENTION IS MISSING. THE FIRST DELIVERABLE IS MUCH SMALLER THAN THIS ITEM IMPLIES.** Measured in `seat-tick.ps1` by a builder and verified line-by-line here.
@@ -21435,7 +21493,15 @@ counted broken by fleet today              27 of 32
 
 ## 1373. the bash resolver rejects a working interpreter when coreutils is absent from PATH, conflating a harness fault with a namespace verdict
 
-> 🔢 **Filed 2026-08-27 -- REPRODUCED ON ONE VARIABLE, and the file already carried the distinction it drops.** `tests/_bash_resolver.py` defines `BASH_HARNESS_FAILURE = 127` at :40 under a comment saying 127 is *"a finding about the HARNESS"* and that conflating it *"lets a broken harness impersonate a failing test"*, and `explain_returncode` implements exactly that split at :177. `bash_sees` at :87 runs `cat mf_bash_probe.txt` and returns a bare bool, so a PATH without coreutils -- what PowerShell and cmd supply -- makes bash exit 127 and the probe reports it as a FILESYSTEM NAMESPACE failure. The distinction is built deliberately and then dropped at one call, 77 lines away.
+> ✅ **CLOSED 2026-09-10 -- the fourth limb is met.** `tests/test_ci_tooling_gate.py` built its child environment from `os.environ` alone; `_run_detector` now routes it through `probe_env`, the same one-line call the sibling gate already carries, and a new arm pins the detector's `tooling` verdict under a PATH holding `git` and nothing else.
+>
+> **TWO-ARM, ONE VARIABLE, because an arm that cannot go red is not a measurement.** With the routing, that module is 28 passed. Reverting the one line to `dict(os.environ)` reds exactly the new arm, on `tooling=false` -- the item's own damage shape, where the failure text accuses the workflow filter of narrowing and a reader goes off to edit ci.yml. The stub PATH is synthesised from one extensionless `git` shim rather than read off the host, so the arm is not vacuous on Linux, where `git` and coreutils share `/usr/bin`. The row also carries its own anti-vacuity control: it asserts `grep` is genuinely unreachable on that PATH before it asserts anything about the verdict.
+>
+> **TWO THINGS STAY DELIBERATELY UNSETTLED, and both keep their record below.** `bash_sees` still runs `cat` rather than a bash builtin, because settling #1216's open WSL question needs a host with working WSL and this box returns an RPC error instead of a verdict. And the probe is not widened to reject the WSL launcher: widening the sibling gate's probe is how it acquired five new fail-opens.
+>
+> **The banner is flipped in the pull request that lands the work**, not left to the Lander: every seat now pushes its own ledger update with its own change.
+>
+> Originally: **Filed 2026-08-27 -- REPRODUCED ON ONE VARIABLE, and the file already carried the distinction it drops.** `tests/_bash_resolver.py` defines `BASH_HARNESS_FAILURE = 127` at :40 under a comment saying 127 is *"a finding about the HARNESS"* and that conflating it *"lets a broken harness impersonate a failing test"*, and `explain_returncode` implements exactly that split at :177. `bash_sees` at :87 runs `cat mf_bash_probe.txt` and returns a bare bool, so a PATH without coreutils -- what PowerShell and cmd supply -- makes bash exit 127 and the probe reports it as a FILESYSTEM NAMESPACE failure. The distinction is built deliberately and then dropped at one call, 77 lines away.
 >
 > **Scored 2026-09-03 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. Three limbs verify: `probe_env` appends the interpreter's own directory (tests/_bash_resolver.py:105, :122), `require_bash` returns `Git/usr/bin/bash.exe` instead of raising under a PATH of `Git\cmd` plus `System32` only (driven directly), and tests/test_bash_probe_path.py passes 9 of 9 under that same stripped PATH while tests/test_dependabot_automerge_guardrails.py:229 gives the item's own 28 passed, 7 skipped. The fourth limb is unmet because the item's enumeration is incomplete: it names tests/test_dependabot_automerge_guardrails.py as the only child built from `os.environ` alone, and tests/test_ci_tooling_gate.py:188 still does exactly that. Measured on one variable, that module is 27 passed with coreutils on PATH and 1 failed without, because the shipped ci.yml detector's `if echo ... | grep -qE` takes the else branch when `grep` is missing, so the step writes `tooling=false` and the test accuses the workflow filter it reads (tests/test_ci_tooling_gate.py:281) of narrowing when the workflow was never wrong -- the exact damage shape the item's own severity note describes. The remainder is routing that one child env through `probe_env` plus a regression arm pinning the detector verdict under a coreutils-less PATH, and flipping the banner that still reads open at docs/BACKLOG.md:19424.
 >
@@ -23700,6 +23766,18 @@ So there is no writer anywhere in the merge path. An **anchor** -- a citation fr
 > can deliver it.
 >
 > **Scored 2026-09-03 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Partly shipped, not fully -- the hook landed in cb4a8cf60 but does not fire on the spawn path the item was written about. scripts/hooks/usage-headroom-inject.ps1 is real at 15,602 bytes, cites BACKLOG #1406 at :9, is wired at .claude/settings.json:60 on matcher ^(Task|Agent|Workflow)$|spawn_task, guards exactly those names at :109 and :176, and carries 476 lines of tests plus a matcher check in tests/test_claude_settings_contract.py. The gap is that CLAUDE.md:290 says the Console spawns a Builder through a rule matching Bash(claude:*) or PowerShell(claude:*), which a tool-name matcher cannot select: tests/test_claude_settings_contract.py:151 lists Bash among the near-miss names and :375-380 ASSERTS that no matcher wiring this hook selects it, priced at :150 as a process spawn on every one of 19.0 tool calls per turn. So the item's own sentence, headroom in context exactly when the console is about to spend it, is unmet for the launch that spends the most, and neither the hook nor its tests record that exclusion anywhere. Value stays low because the item itself blesses the alternative -- pulling usage.ps1 at the point of use is called the right design, not a compromise -- so what is left is either a cheaper seam for the CLI launch or an honest written-down exclusion with a test arm, which is a small additive change on the guard the contract test already parses.
+> 
+> **AMENDED 2026-09-11: the stated GAP names a spawn path that no longer exists, so re-read the
+> premise before building this.** [#1529](#1529) retired the Console seat and CLAUDE.md section 5 now
+> says **no seat spawns a session** -- the owner starts each Manager, and a Manager's workers are
+> subagents in its own process. So *"CLAUDE.md:290 says the Console spawns a Builder through a rule
+> matching `Bash(claude:*)`"* above is stale in both halves: the line moved AND the claim is retired.
+> 
+> **This may have CLOSED the item rather than changed it, and that needs its own read.** The launch
+> that now spends the most is a subagent dispatch, and the matcher this row calls unselectable --
+> `^(Task|Agent|Workflow)$|spawn_task` -- already selects exactly that. **Not verified here:** #1529
+> did not test the hook, and this note records the premise change only. Whoever picks this up should
+> establish whether any launch path is still uncovered before treating the row as live work.
 > Verdict: build
 > Closing-act: code
 
@@ -26982,6 +27060,38 @@ Two properties the fix must keep. **An unrecognised declaration shape must repor
 ## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
 
 > 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked, and CORRECTED the same day by a third that read the source.** Value **4/10** · Difficulty **3/10** · _quick win_. A session can end while its worktree survives. Its claims then have no live holder and no observable evidence of abandonment. `-Force` recovers them -- that is what it is for -- but the seat using it cannot distinguish an abandoned claim from a quiet one, and **74 of 76 live claims sit in exactly that ambiguity.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+
+**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+
+**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+
+**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+
+**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
+
+| | |
+|---|---|
+| claims held | **76** |
+| worktree still present | **74** |
+| worktree absent | **2** (`#1453`, `#1416`) |
+
+**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
+
+**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
+
+**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
+
+**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
+
+**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
+
+**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
 
 ## 1467. the connscale intake-audit probe fails a full-suite run with a SQLite disk I/O error and passes in isolation
 
@@ -27189,38 +27299,22 @@ I did not survey how the fence came to be written, or whether any dispatcher has
 ## 1470. a deleted item heading silently merges two ledger rows and every gate stays green
 
 > 🔢 **Filed 2026-09-06. AMENDED SAME DAY: the repair is NOT gate-blocked, and my first version of this row said it was.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
+>
+> **BUILT 2026-09-10 IN THE PR THAT CARRIES THIS LINE -- not yet on `main`.** `Ledger.check_backlog` gains the reverse arm: a commit that DROPS a `## N.` id from the BACKLOG-plus-archive union is refused, index-against-parent on the pre-commit path and base-against-HEAD under `--ci`. Ids are read through `backlog_status_check.parse_items` and the local second-definition regex is gone. #1480's detector is subsumed for the PREVENTION case and is not being built twice; what it still adds is detection of damage ALREADY on `main`, which a commit-time gate cannot see.
 > Verdict: build
 > Research: none
 > Closing-act: code
 
-**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
-**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+**Cluster:** Ledger integrity / repository gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost falls on the record: an item's banner, fields and whole body stay in the file, silently re-attributed to the item above it, and no instrument says so.
 
-**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+**THE MEASURED INSTANCE IS `642225f78`, AND [#1480](#1480) HOLDS THE MEASUREMENT RATHER THAN THIS ROW.** An appended paragraph absorbed the `## 1147.` heading; the diffstat read 5 insertions and 1 deletion, the commit subject never named the item, and `origin/main` carried 442 live items where it should carry 443. Read that row before building anything adjacent to this one -- it also records a DEAD END (the mid-line heading probe) so nobody spends a second pass on it.
 
-**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+**WHAT THE REVERSE ARM DOES AND DOES NOT COVER, because the two rows are easy to conflate.** A commit-time gate refuses the commit that destroys an item, for EVERY item, whether or not it carries a ranked-table row. It is blind to damage that is already on `main`, which is what #1480's row-versus-item comparison detects. The two are complements, not duplicates, and only the prevention half is built here.
 
-**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+**THE CI HALF WOULD HAVE SHIPPED DEAD, AND THE FIRST MEASUREMENT SAID IT WAS FINE.** `actions/checkout` takes `refs/pull/N/merge` at its default depth of **1**, so HEAD is a shallow GRAFT and `git rev-list --parents` honours the graft by reporting **no parents** -- an empty prior set, indistinguishable from a clean answer, with every test still green. Measured 2026-09-10 on the merge-ref shape, before AND after the ledger step's own `git fetch --depth=200 origin main`: rev-list **1 token** both times, `git cat-file commit` **2 parents** both times, first parent's object PRESENT after the deepen and the second ABSENT. **The first rig said the opposite** -- with HEAD sitting on `main` rather than on a merge ref, rev-list recovered the parent after the deepen, which reads as *no problem*. The arm reads the raw commit object instead, a test pins the grafted shape, and the mutation that proves the pin fails exactly that one test. **The residual is the PR-head parent**, whose ids are additions the forward arm owns; and a run where NO parent is readable is refused rather than narrowed, so a shallower fetch fails loudly instead of quietly checking nothing.
 
-**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
-
-| | |
-|---|---|
-| claims held | **76** |
-| worktree still present | **74** |
-| worktree absent | **2** (`#1453`, `#1416`) |
-
-**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
-
-**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
-
-**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
-
-**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
-
-**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
-
-**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
+**A SECOND SHAPE, FOUND WHILE BUILDING THIS AND REPAIRED IN THE SAME CHANGE: the insertion whose OFFSET is wrong.** `ea390db5c` filed #1467 and #1470 into the middle of #1466's banner block -- after its status line and before its `Verdict:`/`Research:`/`Closing-act:` lines. No id was added or removed, so the reverse arm built here would NOT have fired on it, and neither did any other gate. The effect was that #1466 lost its three fields and its entire body to #1470, and #1470 read as a fully-bodied row about claim liveness. Both rows are restored to what their filing commits wrote (`5e295953c` and `ea390db5c`); this body is new, because #1470 never had one. **The residual is stated rather than closed: an id-set comparison cannot see a heading that moved**, and nothing in the repository detects that today.
 
 ## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
 
@@ -28180,13 +28274,53 @@ New items append at the ledger tail, so concurrent filings are scheduled conflic
 
 ## 1481. A scoped secret scan can walk zero commits and pass; nothing asserts the range is non-empty
 
-> 🔢 **Filed 2026-09-07 -- not started. FILED ONLY: nothing here is fixed on this branch.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
+> 🚧 **IN PROGRESS 2026-09-10 -- built on branch `claude/gitleaks-range-guard-1481`, awaiting review and land.** Not a closure: the Lander flips this banner on merge.
+> **Filed 2026-09-07.** Value **6/10** · Difficulty **2/10** · _quick win_. #1479 scopes the required `gitleaks (secret scan)` job with `--log-opts`. A range is a thing that can resolve EMPTY, and an empty range makes the scanner report `0 commits scanned` and exit **0** -- a PASS, indistinguishable in the checks UI from a clean scan, on a required secret gate. The shipped range is a literal and is measured safe; this row is about the next edit to it.
 > Verdict: build
 > Research: none
 > Closing-act: code
 
 **Cluster:** CI merge gates / instrument honesty. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is a required secret gate that could report success having looked at nothing.
+
+### Built on this branch 2026-09-10
+
+The prescribed fix, unchanged in shape from the section below: `set -o pipefail` on its own line, the
+scan piped through `tee gitleaks-scan.log`, and the scanner's own count read back with
+`grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned'`. No `shell: bash`, no `git rev-list`, no change to
+`--log-opts HEAD`, and no change to the job's `name:` or the workflow's triggers.
+
+`2>&1` was added to the capture and is the one decision the filing did not settle. The count is one
+of the scanner's own log lines and those go to stderr, while `--verbose` findings go to stdout, so a
+stdout-only pipe could capture no count and red every clean run. Merging is correct under either
+reading of that split; the binary was not re-run to decide which.
+
+A third `[[control]]` for `gitleaks (secret scan)` is registered in `tests/negative_controls.toml`,
+backed by three arms in `tests/test_merge_gate_controls.py`. Eight neutering arms were run against the
+real workflow, restored byte-identical after each: deleting the pipefail line reds exactly the
+pipefail arm, deleting the guard reds exactly the range arm, and renaming the step reds nothing. The
+arm counts and the one arm that needs reading carefully are in the registry entry.
+
+**The pipefail rule was written for the job rather than for the one step, because the sibling step had
+the same hole.** `Install gitleaks (pinned + checksum-verified)` selects its checksum line with
+`grep ... | sha256sum -c -` and set no pipefail, so a `grep` matching nothing -- a renamed asset -- was
+discarded and the step's status came from `sha256sum`, which happens to refuse empty input. Safe by the
+downstream tool, not by design, inside the gate that exists to verify those bytes. It now sets pipefail
+too, and the control covers every piped step in the job rather than the one the row named.
+
+**That rule is general and its home is one module over, unfiled.** A pipe with no pipefail is `|| true`
+spelled differently, and `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` is
+the sweep over every required job where it belongs. Measured while building this: of 190 POSIX `run:`
+steps across the workflows, 30 carry a real pipe and 7 of those 30 set pipefail. After this change no
+required-job step pipes without it; at least several that remain sit in advisory or release-only jobs,
+off the merge path. Named by subject, not by a number nobody has allocated.
+
+Two sentences in the step's existing `--log-opts` comment described a `push: branches: [main]` arm
+removed on 2026-09-08, and one of them counted the triggers. Both were corrected in place rather than
+left for the reader this row's own guard comment sends there. That is the second-definition defect
+`tests/test_security_posture.py` pins for this file's HEADER (#1079), one level down in a step body,
+where no test looks.
+
 
 **Measured 2026-09-07 on the pinned gitleaks 8.18.4 binary** -- the version `.github/workflows/security.yml` installs, downloaded from the release and version-checked, not a local build.
 
@@ -30409,6 +30543,9 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 
 **Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
 
+
+---
+
 ## 1528. the repository's copyright and CLA entity renames to MessageFoundry Foundation, LLC, per the owner's 2026-09-10 ruling
 
 > 🚧 **Built 2026-09-10 on branch `claude/entity-rename-llc` (PR 1020); open until that merges, when the Lander flips this banner.** Commit `cabcb3e5c` replaces "MessageFoundry Organization" with "MessageFoundry Foundation, LLC" in 1,530 files, one line for one line. It changes no licence, no year and no code path. Value **5/10** · Difficulty **2/10**. Value 5: a code-signing certificate would name the registered entity, and no file in the source named it. Difficulty 2: the change is one exact substitution plus one line fixed by hand, and a script re-checks its shape. Its only real cost is width, because nearly every tracked file changes and every open branch conflicts with it.
@@ -30496,6 +30633,144 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+
+---
+
+## 1529. Retire the Console seat; the Manager is the live dispatching seat
+
+> 🚧 **Filed 2026-09-10, and the change is IN THIS PR. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
+> Verdict: build
+> Research: none
+> Closing-act: the Lander flips this banner
+
+**Cluster:** KORUS seats and role cards. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is method and documentation, not shipped engine code.
+
+### The defect: a pointer about which CARD resolves was read as an instruction about which SEAT you hold
+
+`docs/roles/seats.json` said of the Manager label, in full:
+
+    "manager": "A korus seat, not one here. CLAUDE.md section 5 runs the Console instead."
+
+That sentence is **true about card resolution** and says nothing about which seat a session holds. A
+Manager session read it as *"substitute the Console"*, and then went looking for a spawn grant it does
+not need and an enqueue authority it does not have. Its own words, reporting the error:
+
+> I read that as "substitute the Console." Wrong read -- that file governs which card resolves in this
+> repo, not which seat I hold.
+
+**A bare retirement would not have fixed it.** "The Console is retired" tells a reader the label is
+gone and leaves substitution as the obvious next move. The notice has to **deny the rename and name a
+difference**, which is what `tests/test_role_cards.py::TheConsoleRetirementSaysTheManagerIsNotARenameOfIt`
+now pins.
+
+### What the Manager is, and why it is not a renamed Console
+
+| | the retired Console | the Manager |
+|---|---|---|
+| Workers | separate `claude -p` sessions | **subagents, in its own process** |
+| Accounts touched | several | **one: its own** |
+| Spawn grant | required, per config root | **not needed, and not used** |
+| Peers | none, it was the only one | **several, usually one per account** |
+| Enqueuing a PR | its call | **the Lander's** |
+
+Source: korus `roles/MANAGER.md` at `origin/main`, *"You are an ALTERNATIVE to the Console, not a layer
+above or below it"*.
+
+### What this PR changed
+
+1. **`docs/roles/seats.json`** -- `manager` is live; `console` and its three observed spellings
+   (`console1`, `console-1`, `consul`) are retired, each carrying the deny-the-rename notice. The
+   Manager left the `elsewhere` map. Every spelling is listed individually **on purpose**: an alias
+   must land on a live seat, so a spelling left out would resolve to `MATCHES NO SEAT` and read as a
+   typo rather than a roster fact.
+2. **`docs/roles/console.card.md` -> `docs/roles/manager.card.md`**, rewritten, leading with a
+   *"You are not a renamed Console"* table.
+3. **`CLAUDE.md` section 5** -- the roster row, the retirement paragraph, the spawn-grant paragraph
+   (no seat spawns a session now, so the grant binds nothing; its measurements are kept so nobody
+   re-derives them), the dispatch section, and the enqueue bullet.
+4. **`docs/METHOD.md`**, **`docs/ROLE-CARDS.md`**, **`docs/LEDGER-GATE.md`**, `scripts/coord/alloc.ps1`.
+5. **Enqueue authority moved to the Lander.** Not a narrowing of a live permission: the seat that held
+   it no longer exists, and korus `MANAGER.md` has never granted it.
+
+### A second reader of the same roster, and it was blind
+
+**`scripts/coord/seat.ps1` never read `docs/roles/seats.json`.** It copied whatever `-Seat` it was
+handed into the record, and `fleet.ps1` rendered that as a live seat. One roster, two readers, and
+only `role-card-inject.ps1` could see it.
+
+**Reported by the session it happened to**, 2026-09-10, and verified here rather than taken on trust:
+that session started undeclared, the hook listed the live seats with **no manager among them**, and
+the owner corrected it in-band -- *"you are not the console... you are a manager"*. It then declared
+`-Seat manager`, **a label that was in no map at all**, and the script accepted it and wrote a record.
+Nothing reported a problem, because the record was valid. That is the hollow-record failure
+`test_coord_seat_session_key.py` pins for the session id, arriving one field over.
+
+**With the Console retired, the mirror case is the dangerous one.** `-Seat console` would be recorded
+in silence while the card hook refuses the same label loudly -- so the retirement would hold on the
+path a session reads and leak on the path a session writes.
+
+**It warns and records; it does NOT gate, and that half is deliberate.** An undeclared seat renders as
+UNDECLARED to every other session, so refusing a declaration trades a readable-but-odd record for
+**no** record, which is worse. A label may also be a legitimate spelling nobody has added to the alias
+map yet. `test_a_retired_declaration_is_still_recorded` is the arm that stops a later change turning
+this into a refusal.
+
+Two additive fields carry the verdict -- `seatCanonical` and `seatRosterVerdict` -- while `seat` keeps
+the verbatim label, because every existing reader keys on it.
+
+**The objection goes to STDERR, not `Write-Warning`.** Measured on pwsh 7 here: `Write-Warning`
+renders to **stdout**, which would make a roster objection narrate into a session's context on the
+`-Record` and `-Prompt` hook paths -- the one thing `seat.ps1` says those paths must not do -- and
+would land in whatever parses its `wrote <path>` line. `[System.Console]::Error.WriteLine` is the
+idiom `overlap.ps1` already uses.
+
+**Armed before trusted:** run against the pre-change script, 9 of the 10 new tests fail; against the
+change, 10 pass. The one that passes either way is the missing-roster arm, which is why it exists --
+without it, "no objection" and "nothing checked" would be the same value.
+
+### What was deliberately NOT changed, and why
+
+- **The product "Console" is a different subject and is untouched.** The retired PySide6 desktop
+  console and the web console at `/ui` keep their names throughout `docs/adr/`, `docs/design/` and
+  `docs/TRAY.md`.
+- **Dated decision provenance stays.** [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
+  records that the owner delegated a call to the Console on 2026-09-02 and the Console decided, and
+  `tests/test_security_config.py` carries the same attribution. Those say **who decided**, not **who to
+  go to**, so rewriting them would falsify the record rather than repair a stale route.
+- **Closed and historical ledger rows stay.** This file and
+  [`BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md) record what was true when each row was
+  filed.
+
+### Residual: the korus half is IN FLIGHT, not unassigned
+
+`roles/CONSOLE.md` is live at `wshallwshall/korus` `origin/main`, and `roles/MANAGER.md` still defines
+the Manager by contrast with a seat this repository no longer runs. **That is a second repository and a
+second PR, and it is already owned.** Measured 2026-09-10: a korus worktree whose branch and session
+title both name Console-reference removal holds **uncommitted** edits across 20-plus files, including
+`docs/roles/seats.json`, `docs/roles/console.card.md`, `CLAUDE.md`, `README.md`,
+`.specify/memory/constitution.md` and four `.claude/skills/` files. **Nothing was committed or pushed
+there and no korus PR exists for it**, so a zero-commit branch read alone would have looked like a dry
+lane -- the working tree is what discriminates. Find it with `git worktree list` in the korus clone
+rather than from a slug written down here; the leak guard refuses a worktree slug in a tracked file,
+and a slug recorded in prose goes stale when the worktree is pruned.
+
+**So this item does NOT cover korus, and nobody should start it again.** That seat was messaged with
+the four choices its half has to match: the 2026-09-10 date, the deny-the-rename wording, all three
+observed spellings in the retired map individually, and enqueue moving to the Lander. Until its work
+lands, a session reading the korus `roles/` folder finds a Console playbook with nothing beside it
+saying the seat is retired here.
+
+**korus is NOT covered by the worktree gate** -- `worktree-gate.repos.txt` lists only the
+MessageFoundry primary -- so nothing would have stopped a write into that tree. Uncommitted work is the
+one state git cannot recover, which is why the check was a read and not an edit.
+
+**Related:** [#1448](#1448) and [#1391](#1391) -- an item or a pointer stays live because nothing records
+what answered it. Here the pointer was accurate about its own subject and wrong about the one the reader
+brought to it.
+
+---
 
 ## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
 
