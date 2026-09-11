@@ -8171,6 +8171,22 @@ class MessageStore:
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # The NOT EXISTS clause is what makes a taken name a no-op instead of the IntegrityError that
+        # UNIQUE(username) would otherwise raise on a background pass. One statement, so the guard and
+        # the write are evaluated together and a concurrent claim cannot slip between them.
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+                (username, now, user_id, username, user_id),
+            )
+            await self._commit()
+
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM users ORDER BY username")

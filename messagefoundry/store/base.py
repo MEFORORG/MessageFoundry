@@ -1621,6 +1621,38 @@ class AuthStore(Protocol):
         """
         ...
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
+
+        **This is a cache refresh, not a rename operation, and the distinction decides who may call
+        it.** Since BACKLOG #1471 a directory login identifies its row by ``directory_object_id``, so
+        ``users.username`` stopped being that row's key and became what it now is: a display and audit
+        label, mirrored from the directory's ``sAMAccountName``. The directory owns the value. This
+        method is how the engine copies a new one down after the directory reports it -- on the login
+        path and on the ADR 0079 reconciler's pass.
+
+        **NO OPERATOR SURFACE CALLS THIS, DELIBERATELY.** An administrator who could set this field
+        could point a MessageFoundry row at a directory account it is not bound to, which is the
+        privilege transfer BACKLOG #1471 exists to close, re-introduced through a route. The value an
+        operator would type is one the directory already knows; the engine reads it rather than
+        accepting it. The same argument governs the id itself: there is no setter for
+        ``directory_object_id`` and this method is not a way to grow one.
+
+        **A NAME ANOTHER ROW HOLDS IS A NO-OP, NOT AN ERROR.** ``username`` is ``NOT NULL UNIQUE`` on
+        all three backends, so a plain ``UPDATE`` to a taken name raises a backend-specific integrity
+        error -- three different exception types for one condition, on a path whose caller is a
+        background loop. Each implementation therefore guards the write inside the statement, so the
+        collision leaves the row alone and the caller's pass continues. The caller checks first and
+        audits what it found; this guard is what keeps the race between that check and this write from
+        surfacing as a 500.
+
+        Local accounts are out of scope by construction -- nothing routes a local row here -- and the
+        engine has no other writer of this column after ``create_user``.
+        """
+        ...
+
     async def list_users(self) -> Sequence[UserRecord]: ...
 
     async def count_users(self) -> int: ...

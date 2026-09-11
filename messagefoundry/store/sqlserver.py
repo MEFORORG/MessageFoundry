@@ -9964,6 +9964,26 @@ class SqlServerStore:
             (scope_json, now, user_id),
         )
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # The NOT EXISTS clause makes a taken name a no-op rather than the pyodbc IntegrityError that
+        # UNIQUE(username) would raise on a background pass. One statement, so the guard and the write
+        # are evaluated together and a concurrent claim cannot slip between them.
+        #
+        # As with get_user_by_directory_object_id above, the name comparison is the DATABASE's and
+        # this column carries no explicit COLLATE: under a case-insensitive server default this guard
+        # refuses a name differing from another row's only in case, where SQLite and Postgres would
+        # allow it. That is the SAFE direction -- it declines a write rather than performing one --
+        # and it is recorded because byte-exact comparison is what a reader would assume.
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+            "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+            (username, now, user_id, username, user_id),
+        )
+
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
     ) -> None:

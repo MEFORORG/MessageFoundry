@@ -74,16 +74,29 @@ All notable changes to MessageFoundry are documented here. The format follows
   would leave the recycle window open for every account that had not signed in yet. A directory that
   returns no immutable identifier still resolves by username, and the engine warns once per distinct
   cause -- the attribute absent, or present in a shape it cannot read -- so a site on that path is
-  told rather than left to assume the control is running. **One behaviour change worth planning
-  for, and it has no remedy today:** a directory-side rename now keeps the account instead of
-  minting a second one, and the stored username stays as created, so the username-keyed
-  `reconcile_directory_sessions` reads a renamed account as absent and revokes its sessions once it
-  reaches `ad_session_recheck_strikes`. **Nothing writes `users.username` after account creation** --
-  not the store protocol, any of its three backends, or the API -- so a renamed person would re-enter
-  that cycle after every sign-in rather than being fixed by an administrator. Deleting the row is the
-  only escape available, and it discards the `user_id` that uploads, quota and presets key on.
-  Re-keying the probe and adding a rename path are both the ADR 0184 reconciler question.
+  told rather than left to assume the control is running. **A directory-side rename now keeps the
+  account instead of minting a second one**, which is the other half of the same defect: before this,
+  a rename resolved to nothing and silently orphaned the uploads and presets keyed to the first row.
   ([BACKLOG #1471](docs/BACKLOG.md))
+- **The directory session reconciler is keyed on that same immutable id, and the stored username is
+  now a cache the directory refreshes.** Identifying a login by `objectGUID` while
+  `reconcile_directory_sessions` went on probing `resolve_principal(<the stored name>)` left a renamed
+  account reading as absent on every pass -- the same answer a deleted or disabled account gives -- so
+  at the shipped `ad_session_recheck_seconds = 300` and `ad_session_recheck_strikes = 2` a deploying
+  site would have seen a renamed person's sessions revoked, a security notice emailed, and the cycle
+  restart at the next sign-in, roughly every ten minutes and with no administrative escape, because
+  nothing in the engine could write `users.username`. `_probe_principal` now asks the directory by
+  `directory_object_id` where the row carries one, and the directory's current `sAMAccountName` is
+  copied down onto the row -- from the login path and from the reconciler pass alike -- so the
+  `user_id` that uploaded-file ownership, the per-uploader quota and saved search presets key on never
+  moves. **A rename onto a name another row already holds is refused, not forced** (`username` is
+  `NOT NULL UNIQUE`): the login path refuses at the `directory_identity_conflict` guard, and the
+  reconciler leaves both rows alone and audits `auth.ad_username_refresh_conflict`, costing the renamed
+  person neither their session nor their roles. A directory returning no readable `objectGUID` still
+  probes by name, unchanged. **`set_user_username` is engine-internal and reachable from no API route,
+  deliberately** -- an operator able to set it could point a row at a directory account it is not bound
+  to, which is the privilege transfer #1471 closes; there is still no setter for
+  `directory_object_id`. ([BACKLOG #1532](docs/BACKLOG.md))
 - **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
   additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
   Additive with a default, so an older console ignores it; the seam still moves because the golden seam

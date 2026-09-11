@@ -1533,8 +1533,14 @@ lookup the Kerberos path uses — and revokes the sessions of accounts AD has di
 membership is re-diffed on the same pass at no extra directory cost, so a **role demotion** takes effect
 without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked`.
 
-Three safety properties, because the lookup returns one indistinguishable "not found" for *disabled*,
-*deleted*, *moved out of the search base* and *the search base was never right*:
+**The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
+is identified by, and a renamed account's stored username is refreshed from the directory on the same
+pass. That is why *renamed* is absent from the ambiguity list below: it used to sit there, and reading a
+rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
+no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532).
+
+Three safety properties, because the lookup still returns one indistinguishable "not found" for
+*disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:
 
 - **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the

@@ -1900,35 +1900,28 @@ class AuthService:
         before the column existed. The engine cannot key on an identifier it is not given; the LDAP
         layer logs each such read.
 
-        **WHAT THIS DELIBERATELY DOES NOT DO: propagate a directory-side RENAME.** A renamed account
-        is found by its id and keeps the username its row was created with, because the stored name is
-        a display and audit label rather than a key. **That is an improvement and a new wart, and both
-        are worth stating.** Before this, a rename resolved to nothing and minted a SECOND account, so
-        the person silently lost the uploads and presets keyed to the first -- the same class of defect
-        this item closes, arriving from the other side. Now they keep the account, and
-        ``reconcile_directory_sessions`` still probes the directory BY USERNAME, which the directory
-        no longer answers to. At the shipped settings (``ad_session_recheck_seconds`` 300 and
-        ``ad_session_recheck_strikes`` 2, i.e. on whenever a directory is wired) a renamed account
-        reads as absent on every probe, so it would collect a strike per pass and have its sessions
-        revoked once it reaches the threshold.
+        **A DIRECTORY-SIDE RENAME IS PROPAGATED, ONTO A ROW THAT NEVER MOVES (BACKLOG #1532).** The id
+        finds the account, and the directory's current ``sAMAccountName`` is then copied down onto the
+        row's cached ``username``. The ``user_id`` is untouched, so uploaded-file ownership, the
+        per-uploader quota and saved search presets stay pointed at the same person; only the label
+        follows the directory, which owns it.
 
-        **THERE IS NO ADMINISTRATIVE REMEDY FOR THAT TODAY. An earlier draft of this paragraph said
-        the revocation continued "until an administrator corrects the stored name", and no such
-        operation exists** -- nothing writes ``users.username`` after ``create_user``, in this module,
-        in the store protocol or any of its three backends, or in the API. That sentence was a
-        compensating control resting on a false premise, which is worse than naming no remedy: a
-        reader plans around the correction and there is nothing to run.
+        **WHY THAT REFRESH IS HERE AND NOT ONLY IN THE RECONCILER.** The ADR 0079 reconciler refreshes
+        the same label on its own pass, but it is not always running: ``ad_session_recheck_seconds``
+        can be set to 0, and a pass reaches only accounts holding a live session. This path reaches
+        every directory sign-in, so the cached name is correct from the first login after a rename
+        rather than up to one interval later. The two writers agree by construction -- both copy the
+        directory's answer, neither invents one.
 
-        What a deploying site would actually get: sign-in works (the id finds the row), then the
-        sessions are revoked again a couple of passes later, indefinitely, because the account leaves
-        the candidate set once it holds no live session and re-enters it on the next login. The only
-        escape available today is deleting the row and letting the next login mint a fresh one, which
-        discards the ``user_id`` -- and with it the uploaded-file ownership, the per-uploader quota
-        and the saved search presets this binding exists to keep pointed at one person.
-
-        Fail-closed and audited, never a widened grant, which is what makes this a wart rather than a
-        blocker. Both candidate fixes -- a rename path, and re-keying the probe off the name -- belong
-        to the ADR 0184 reconciler question, which this item does not claim.
+        **THE HISTORY IS KEPT BECAUSE IT NAMES A DEFECT CLASS, NOT BECAUSE IT IS STILL LIVE.** Before
+        BACKLOG #1471 a rename resolved to nothing and minted a SECOND account, silently orphaning the
+        uploads and presets keyed to the first. #1471 fixed identification and left the reconciler
+        probing by the old name, so a renamed account read as ABSENT on every pass and had its sessions
+        revoked on a roughly ten-minute cycle a deploying site could not break out of -- an earlier
+        draft of this docstring said that lasted "until an administrator corrects the stored name", and
+        no such operation existed. That was a compensating control resting on a false premise, which is
+        worse than naming no remedy. #1532 re-keyed the probe and added the refresh above. Both
+        spellings of the bug were the same mistake: reading a recyclable label as an identity.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
@@ -1957,6 +1950,22 @@ class AuthService:
             )
         else:
             user_id = existing.id
+            if principal.username != existing.username:
+                # BACKLOG #1532. Reachable only through the id-keyed lookup above: a name-keyed hit
+                # matched on this very column, and a `by_name` row whose id disagrees already raised.
+                # So arriving here means the directory renamed an account the engine has identified
+                # by its immutable id, and the cached label is what is stale.
+                #
+                # `held=by_name` rather than a fresh read, and it is provably None on this path: this
+                # branch needs the id lookup to have run, which needs `by_name` to have missed. That
+                # is why the collision branch inside is the reconciler's alone.
+                await self._refresh_cached_username(
+                    user_id=user_id,
+                    old_username=existing.username,
+                    new_username=principal.username,
+                    held=by_name,
+                    client=client,
+                )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
             # ``update_user_profile``'s write is unconditional, so passing ``principal.email``
             # straight through let a directory that returned no ``mail`` blank the stored address on
@@ -2032,8 +2041,15 @@ class AuthService:
     @property
     def directory_reconcile_enabled(self) -> bool:
         """Whether a reconciliation pass would do anything: the interval is set AND a directory is
-        wired. Drives whether the API lifespan creates the loop at all — at the default
-        ``ad_session_recheck_seconds = 0`` no task exists and the upgrade is byte-identical."""
+        wired. Drives whether the API lifespan creates the loop at all — at
+        ``ad_session_recheck_seconds = 0`` no task exists.
+
+        **The default is 300, not 0.** This docstring said 0 and called that "the default"; the field
+        has shipped at 300 since the reconciler was turned on by default, which
+        ``test_reconciler_is_on_by_default`` pins. The distinction is load-bearing rather than
+        cosmetic: reading it as off-by-default makes every defect in this loop sound like it needs an
+        operator to opt in first, when in fact the loop runs on any instance that wires a directory.
+        """
         return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
 
     @property
@@ -2070,13 +2086,39 @@ class AuthService:
     async def _probe_principal(self, user: UserRecord) -> reconcile.Probe:
         """One directory probe, off the event loop (``ldap3`` is blocking).
 
-        ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses; it
-        already rejects a disabled account (``userAccountControl & 0x2``) by returning ``None``, and
-        returns the group set, so the role re-diff below costs no extra round trip.
+        **THE KEY IS THE DIRECTORY LAYER'S CHOICE, NOT THIS METHOD'S (BACKLOG #1532).** Everything the
+        row knows about its own identity is handed over -- the cached name and the immutable id -- and
+        ``resolve_principal`` prefers the id when there is one. This method deliberately carries no
+        branch: a per-caller key preference is exactly how the reconciler came to ask a different
+        question from the login path in the first place.
+
+        **What the name-keyed probe did to a renamed account, and why it is not a small defect.**
+        BACKLOG #1471 made a directory login resolve by the immutable id, so a renamed person keeps
+        signing in to their own row. This probe kept asking the directory about the name that row was
+        created with -- a name the directory no longer answers to -- so it read ABSENT, which is the
+        same answer a deleted or disabled account gives. After ``ad_session_recheck_strikes`` passes
+        the sessions were revoked and the holder was emailed a security notice. They could sign back in
+        immediately, which returned them to the candidate set, and the next pass revoked them again:
+        at the shipped ``ad_session_recheck_seconds`` of 300 a deploying site would have seen roughly a
+        ten-minute cycle with no end and no administrative escape, because nothing in the engine could
+        write ``users.username``. The fix is to stop asking a question whose answer has stopped
+        meaning what the caller reads it as.
+
+        A row whose ``directory_object_id`` is NULL still probes by name. That is a **directory's**
+        property rather than a choice here: one that returns no readable ``objectGUID`` leaves every
+        row unbound, and the engine cannot key on an identifier it is never given. Such a site keeps
+        the old behaviour, rename wart included; ``auth/ldap.py`` warns once per distinct shape so an
+        operator can find out.
+
+        ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses. It
+        already rejects a disabled account (``userAccountControl & 0x2``) by returning ``None`` on
+        either key, and returns the group set, so the role re-diff below costs no extra round trip.
         """
         assert self._ldap is not None  # guarded by directory_reconcile_enabled
         try:
-            principal = await asyncio.to_thread(self._ldap.resolve_principal, user.username)
+            principal = await asyncio.to_thread(
+                self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
+            )
         except LdapError as exc:
             # FAIL OPEN. An unreachable DC must never revoke: a fail-closed re-check would turn a
             # directory blip into a total console outage during exactly the incident when operators
@@ -2087,7 +2129,11 @@ class AuthService:
         if principal is None:
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.ABSENT)
         return reconcile.Probe(
-            user.id, user.username, reconcile.ProbeOutcome.PRESENT, groups=principal.groups
+            user.id,
+            user.username,
+            reconcile.ProbeOutcome.PRESENT,
+            groups=principal.groups,
+            directory_username=principal.username,
         )
 
     async def reconcile_directory_sessions(self) -> reconcile.ReconcilePlan:
@@ -2180,7 +2226,85 @@ class AuthService:
             )
         for revocation in plan.revocations:
             await self._apply_reconcile_revocation(revocation)
+        for refresh in plan.renames:
+            # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
+            # plan carries: the reconciler's invariant is that an aborted pass leaves the store
+            # byte-identical, and a rename is a store write like any other.
+            #
+            # AFTER the revocations, and the order is load-bearing. `_apply_reconcile_revocation`
+            # audits with the name the PLAN captured and notifies with the name it RE-READS from the
+            # row, so renaming first would put two different names on one account's records for one
+            # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
+            # Both reads see the pre-rename name this way, and the rename still lands on this pass.
+            await self._refresh_cached_username(
+                user_id=refresh.user_id,
+                old_username=refresh.old_username,
+                new_username=refresh.new_username,
+                held=await self._store.get_user_by_username(refresh.new_username),
+            )
         return plan
+
+    async def _refresh_cached_username(
+        self,
+        *,
+        user_id: str,
+        old_username: str,
+        new_username: str,
+        held: UserRecord | None,
+        client: str | None = None,
+    ) -> None:
+        """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        **ONE implementation for two callers, deliberately.** The login path
+        (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
+        both must resolve the collision case the same way. Two copies of this decision would be two
+        policies, and the one that ran less often would be the one nobody noticed drifting.
+
+        ``held`` is the row currently holding ``new_username``, read by the caller. Passed rather than
+        re-read for the reason :meth:`_upsert_ad_user` gives about ``by_name``: it puts the dependency
+        in the signature instead of only in prose, and here it also saves a query the login caller
+        **provably** already has the answer to. ``_complete_ad_login`` reads that exact row before it
+        calls down, and refuses outright when it exists with a different id -- so the login path
+        reaches this method only with ``held=None``, and the collision branch below is reachable from
+        the **reconciler alone**, which probes an account it has already identified and has no such
+        guard. (The store's own ``UPDATE`` is guarded too, so a row claiming the name between this
+        check and that write is a no-op rather than an integrity error.)
+
+        The account keeps its ``user_id``, its sessions, its roles and everything keyed to them. Only
+        the label moves, which is what makes this the end of the revocation cycle rather than a
+        gentler version of it.
+        """
+        if held is not None and held.id != user_id:
+            # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
+            # write is the only safe move, and it is audited rather than logged-and-forgotten because
+            # an operator has to resolve it. The likely cause is a stale row for a departed operator
+            # whose name the directory has now reissued -- BACKLOG #1471's recycle case, arriving
+            # through a rename instead of through a fresh login.
+            #
+            # This costs the renamed person nothing: they were identified by their immutable id, so
+            # their sessions and roles are untouched and they keep signing in. Only the cached label
+            # stays stale, which is a display defect rather than a lockout.
+            await self._audit(
+                "auth.ad_username_refresh_conflict",
+                actor=old_username,
+                detail=_json(
+                    {"user_id": user_id, "held_by_user_id": held.id, "source": "directory"}
+                ),
+                client=client,
+            )
+            _log.warning(
+                "AD account %s was renamed in the directory but the new name is already held by "
+                "another account; the stored name is left as-is (BACKLOG #1532)",
+                old_username,
+            )
+            return
+        await self._store.set_user_username(user_id, new_username)
+        await self._audit(
+            "auth.ad_username_refreshed",
+            actor=new_username,
+            detail=_json({"user_id": user_id, "source": "directory"}),
+            client=client,
+        )
 
     async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
