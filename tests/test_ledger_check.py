@@ -172,10 +172,11 @@ def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_p
     """A sibling session holds 0002. Hand-writing it here must not slip through.
 
     ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
-    worktree AND on another branch -- git refuses one branch in two worktrees, so that pairing is not
-    a coincidence, it is the only shape a live sibling can have. Once ownership grew a branch fallback
-    (BACKLOG #1282) this arm had to name the branch or it would have been asserting the weaker
-    "different path" and passing for a reason unrelated to sibling-ness.
+    worktree AND on another branch -- git refuses an ORDINARY second checkout of one branch in two
+    worktrees (a DEFAULT, not a law of git; `Ledger.owns` records what defeats it, BACKLOG #1039), so
+    that pairing is not a coincidence, it is the shape a live sibling has. Once ownership grew a
+    branch fallback (BACKLOG #1282) this arm had to name the branch or it would have been asserting
+    the weaker "different path" and passing for a reason unrelated to sibling-ness.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -207,10 +208,21 @@ def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
     permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
     nothing anywhere reported the loss.
 
-    ***IT IS SAFE ONLY BECAUSE GIT REFUSES ONE BRANCH IN TWO WORKTREES.*** The gate exists to stop two
-    sessions filing one number, and two sessions cannot hold one branch -- so "the session on this
-    branch" is exactly as single-valued as "the session in this worktree" was, while outliving it. A
-    branch that is free to check out is one nobody is working in.
+    ***IT IS SAFE ONLY BECAUSE GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO
+    WORKTREES.*** The gate exists to stop two sessions filing one number, and two sessions do not hold
+    one branch -- so "the session on this branch" is as single-valued as "the session in this
+    worktree" was, while outliving it. A branch that is free to check out is one nobody is working in.
+
+    ***THAT REFUSAL IS A DEFAULT, NOT A LAW OF GIT, AND THIS DOCSTRING SAID IT FLAT (BACKLOG #1039).***
+    `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get past it, so
+    forcing a second checkout makes the branch key non-exclusive and leaks entitlement to a tree that
+    never allocated the number. `Ledger.owns` carries the full statement of the residual; it is named
+    here because THIS is the sentence that licenses the loosening, and a flat version of it here
+    contradicts the qualified version there.
+
+    **Recorded because the miss generalises: the first sweep for this premise used a CASE-SENSITIVE
+    grep and this site is in capitals**, so the strongest instance in the repository was the one left
+    behind while the ledger row said the sweep was finished.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -370,6 +382,302 @@ def test_editing_backlog_without_adding_a_number_passes(repo: Path) -> None:
     assert code == 0, out
 
 
+# ------------------------------------------------- the REVERSE arm: a number that DISAPPEARS (#1470)
+#
+# Everything above asks which numbers APPEARED. An item is destroyed by losing its `## N.` heading,
+# which adds no number at all: the banner, the fields and the body stay in the file, re-attributed to
+# the item ABOVE. That happened on 642225f78 and reached main with every wired gate green.
+#
+# Each must-fire arm below is paired with a must-NOT-fire arm exercising the SAME machinery, because a
+# rule of this shape has two ways to be useless and the tests for them do not overlap: one that never
+# fires is invisible, and one that fires on a stale branch or on a moving main reddens a REQUIRED leg
+# for everybody.
+
+
+def test_deleting_an_item_heading_is_blocked(repo: Path) -> None:
+    """The must-fire arm. The body survives, so nothing but the heading distinguishes this from an edit."""
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\nFirst item\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "BACKLOG item #1" in out, out
+    assert "DELETES it" in out, out
+
+
+def test_a_heading_ABSORBED_into_the_line_above_is_blocked(repo: Path) -> None:
+    """The real shape, not a clean deletion: the `## N. ` prefix goes and the title fuses upward.
+
+    Reproduces 642225f78. The line COUNT does not move, so a diffstat cannot see it -- which is why
+    the rule compares parsed item sets rather than counting anything.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n",
+    )
+    allocate(repo, "backlog", "1001")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-qm", "file 1001")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    # The append swallows the next heading: `## 1001. ` is gone and its title rides the previous line.
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody Mine\n\nbody\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "BACKLOG item #1001" in out, out
+
+
+def test_moving_an_item_into_the_ARCHIVE_is_not_a_deletion(repo: Path) -> None:
+    """Retirement is the sanctioned way an item leaves docs/BACKLOG.md, and it must stay silent.
+
+    The number space is the UNION of the live file and the archive, so a verbatim move keeps the id in
+    the set on both sides. Without that union this rule would refuse every retirement in the repo.
+    """
+    write(repo, "docs/BACKLOG.md", "# Backlog\n")
+    write(
+        repo,
+        "docs/archive/backlog/BACKLOG-CLOSED.md",
+        "# Closed\n\n## 1. First item\n\nbody\n",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion(repo: Path) -> None:
+    """`git commit --amend` taking back an item you filed one commit ago must not read as destruction.
+
+    The parent carries #1001 and the index does not, which is byte-for-byte the shape the arm above
+    refuses. What separates them is the `& base` intersection in `_item_sets`: #1001 never reached
+    origin/main, so nothing shared was lost.
+
+    ***MAIN MUST MOVE AHEAD HERE, AND THAT IS THE WHOLE RIG RATHER THAN SCENERY.*** The first version
+    of this test left `base - head` EMPTY, which short-circuits the reverse arm before `prior` is
+    computed at all -- so it passed without the intersection ever running, and `& base` could have
+    been deleted as redundant with all 50 tests green. Proven by deleting it: with this rig the test
+    goes red naming #1001, and restoring it goes green. Keep #1002 on origin/main, or this test stops
+    testing anything.
+    """
+    # origin/main gains #1002, so `base - head` is non-empty and the reverse arm actually runs.
+    git(repo, "checkout", "-q", "-b", "sibling")
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1002. Theirs\n\nbody\n",
+    )
+    git(repo, "commit", "-qam", "somebody else files 1002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "sibling")
+    git(repo, "checkout", "-q", "main")
+
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
+    allocate(repo, "backlog", "1001")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-qm", "file 1001 -- NOT pushed, so origin/main never sees it")
+
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+    assert "1001" not in out, (
+        "#1001 is on the parent and NOT on origin/main, so the `& base` intersection must drop it; "
+        f"reporting it means the intersection is gone:\n{out}"
+    )
+
+
+def test_main_MOVING_AHEAD_is_not_a_deletion_by_this_change(repo: Path, tmp_path: Path) -> None:
+    """The false positive that would have reddened a REQUIRED leg for everybody.
+
+    A two-way comparison cannot see WHICH SIDE MOVED. In `--ci`, HEAD is the merge ref computed when
+    the event fired and origin/main is fetched when the job starts, so anything that lands in between
+    is in base and not in head. A rule reading `base - head` reports somebody else's landed item as
+    destroyed by this pull request; under a merge queue that window is minutes wide.
+
+    The arm asks the commit's own PARENTS instead, so main advancing afterwards changes nothing. This
+    test is the guard on that choice: swap `prior` back to `base` and it goes red.
+    """
+    # This change: an ordinary edit that deletes nothing.
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody, now edited\n")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-qm", "edit a body")
+
+    # Meanwhile, somebody else's item lands on main -- AFTER the commit under test was written.
+    other = tmp_path / "other"
+    git(repo, "worktree", "add", "-q", "-b", "sibling", str(other), "refs/remotes/origin/main")
+    write(
+        other,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1002. Theirs\n\nbody\n",
+    )
+    git(other, "add", "docs/BACKLOG.md")
+    git(other, "commit", "-qm", "somebody else files 1002", "--no-verify")
+    git(repo, "update-ref", "refs/remotes/origin/main", "sibling")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 0, f"main moving ahead is not this change deleting anything; got:\n{out}"
+
+
+def test_ci_mode_catches_a_deletion_that_skipped_the_commit_hook(repo: Path) -> None:
+    """--ci is the backstop for `git commit --no-verify`, in the reverse direction too."""
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\nFirst item\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-qm", "drop a heading", "--no-verify")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "BACKLOG item #1" in out, out
+    assert "DELETES it" in out, out
+
+
+def test_the_reverse_arm_still_fires_on_a_DEPTH_1_CI_CHECKOUT(repo: Path, tmp_path: Path) -> None:
+    """The arm's CI half is dead without this, and every other test in this file still passes.
+
+    ***THE SHAPE IS `actions/checkout` AT ITS DEFAULT DEPTH OF 1 OVER A MERGE REF.*** HEAD is then a
+    SHALLOW GRAFT, and `git rev-list --parents` honours the graft by reporting no parents -- measured
+    2026-09-10 as 1 token before AND after the ledger step's `git fetch --depth=200 origin main`,
+    while `git cat-file commit` reported 2 parents in both states. An empty parent list gives an empty
+    prior set, which looks exactly like a clean answer.
+
+    ***HEAD MUST BE THE GRAFTED COMMIT ITSELF, NOT A COMMIT MADE INSIDE THE CLONE.*** The first
+    version of this test committed in the shallow clone, so the graft sat on HEAD's PARENT and
+    rev-list answered fine -- it passed under the mutation it was written to catch. Caught by running
+    that mutation, which is the only reason this rig is shaped the way it is.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Theirs\n\nbody\n",
+    )
+    allocate(repo, "backlog", "1001")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main carries 1001")
+
+    # The PR deletes #1001's heading and leaves its body behind; GitHub publishes the MERGE of it.
+    git(repo, "checkout", "-q", "-b", "feature")
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\nTheirs\n\nbody\n")
+    git(repo, "commit", "-qam", "drop a heading")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--no-ff", "feature", "-m", "merge the PR")
+    git(repo, "update-ref", "refs/pull/1/merge", "HEAD")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")  # main's tip is the BASE, as it is on the server
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    # What the runner does: checkout@v7 at its DEFAULT depth of 1 over refs/pull/N/merge...
+    ci = tmp_path / "ci"
+    subprocess.run(
+        ["git", "clone", "--depth=1", "--no-local", "--branch", "main", repo.as_uri(), str(ci)],
+        capture_output=True,
+        check=True,
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        git(ci, "config", k, v)
+    git(ci, "fetch", "--no-tags", "--depth=1", "origin", "+refs/pull/1/merge:refs/pull/1/merge")
+    git(ci, "checkout", "-q", "--detach", "refs/pull/1/merge")
+    # ...and then the ledger step's own deepen, before the gate runs.
+    git(ci, "fetch", "--no-tags", "--depth=200", "origin", "main")
+    assert (ci / ".git" / "shallow").exists(), "clone was not shallow -- test proves nothing"
+    assert git(ci, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:] == [], (
+        "the graft is not on HEAD, so this rig is not the CI shape and cannot catch a rev-list "
+        "implementation"
+    )
+
+    code, out = run_check(ci, "--ci")
+    assert "Traceback" not in out, out
+    assert code == 1, f"a deletion must still be caught on a depth-1 checkout:\n{out}"
+    assert "BACKLOG item #1001" in out, out
+    assert "DELETES it" in out, out
+
+
+def test_a_rewrite_that_changes_no_heading_scores_nothing(repo: Path) -> None:
+    """The negative control the detector must pass: rewrite the file, keep every id, stay silent.
+
+    A rule that plants a violation has to REFUSE to score a plant that did not change the item set --
+    otherwise the must-fire arm above is satisfied by a detector that simply always fires.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\nA new preamble paragraph.\n\n## 1. First item\n\nan entirely rewritten body\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+# ------------------------------------------- item identity is the PARSER's, not a regex kept in here
+
+
+def test_a_SUB_heading_inside_a_body_is_not_an_item(repo: Path) -> None:
+    """`### N.` is a sub-heading, and the gate must not police it as a number in either direction.
+
+    This file used to scan with its own `^#{2,3} (\\d+)\\.` regex -- a second definition of item
+    identity beside `backlog_status_check.parse_items`, which CLAUDE.md section 11 names as the single
+    source. Against the real ledger the two readings return the same 746 ids, so this is the arm that
+    can tell them apart: under the old regex `### 9999.` is an unallocated item and the commit is
+    refused; under the parser it is prose.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n### 9999. a sub-heading, not an item\n\nmore body\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+    assert "9999" not in out, out
+
+
+def test_a_CONFLICTED_ledger_is_refused_without_a_traceback(repo: Path) -> None:
+    """A conflicted file parses into a census counting items from BOTH sides, so the reader refuses.
+
+    That refusal has to reach the operator as a gate failure. This gate's own worst recorded failure
+    mode was crashing on the files it guards, and a traceback reads as "the hook is broken" rather
+    than "your ledger is conflicted".
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n<<<<<<< HEAD\n## 1. First item\n=======\n## 1. First item, theirs\n"
+        ">>>>>>> other\n\nbody\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "does not parse" in out, out
+    assert "Traceback" not in out, out
+
+
+def test_conflict_markers_QUOTED_IN_PROSE_do_not_trip_the_refusal(repo: Path) -> None:
+    """Item #1257 quotes all three markers inline in backticks, so a substring test calls it corrupt.
+
+    The parser anchors on a line start, and this pins that: a gate that refuses the ledger for
+    describing a conflict is one every seat learns to bypass.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nresolve a `<<<<<<< HEAD` / `=======` / `>>>>>>> theirs` "
+        "block by hand\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
 # ----------------------------------------------------------------- encoding
 
 
@@ -520,6 +828,10 @@ def test_ci_mode_skips_the_ownership_rule_but_still_catches_a_reused_number(repo
 
 _CONFIG = Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml"
 _INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
+_CI = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+#: The `--depth=N` in the ledger step's own fetch. Not a free-standing number: see the test below.
+_FETCH_DEPTH = re.compile(r"--depth=(\d+)\s+origin\s+main")
 
 
 def test_ADDING_a_backlog_that_the_base_lacks_is_not_a_wall_of_unallocated_numbers(
@@ -687,9 +999,11 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
     disjoint FROM EACH OTHER, which says nothing about whether either points at the real shape.
 
     ***THE MERGER MUST BE ON A DIFFERENTLY-NAMED BRANCH, AND THAT IS NOT INCIDENTAL.*** git refuses
-    one branch in two worktrees, so a merger cannot stand on the author's branch -- it cuts its own
-    from theirs, exactly as `lander-fix/850` was cut. Stay on the author's branch NAME and `owns()`'s
-    branch fallback (BACKLOG #1282) returns True, so the run passes for a reason unrelated to merging.
+    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git;
+    `Ledger.owns` records what defeats it, BACKLOG #1039), so a merger does not stand on the author's
+    branch -- it cuts its own from theirs, exactly as `lander-fix/850` was cut. Stay on the author's
+    branch NAME and `owns()`'s branch fallback (BACKLOG #1282) returns True, so the run passes for a
+    reason unrelated to merging.
     The first reproduction of this did precisely that and reported a false all-clear.
     """
     git(repo, "checkout", "-q", "-b", "sibling")
@@ -715,6 +1029,20 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
 
     git(repo, "checkout", "-q", "-b", "lander-fix/850", "sibling")
     git(repo, "merge", "--no-commit", "--no-ff", "origin/main")
+    # ***THE MERGE CONFLICTS, AND THE RESOLUTION HAS TO BE WRITTEN OUT.*** Both sides appended at the
+    # tail of docs/BACKLOG.md, which is the very conflict a Lander is here to resolve. `git add -A`
+    # alone stages the file WITH its markers still in it -- a state no commit should ever reach, and
+    # one the gate now refuses outright rather than scan (`parse_items` will not read a conflicted
+    # source, because a conflicted ledger parses into a census counting items from BOTH sides). This
+    # test is about the OWNERSHIP question, so the conflict is resolved the way a Lander resolves it
+    # -- keep both items -- and the ownership rule then gets a file it can actually read.
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n"
+        "\n## 1441. Filed by the sibling\n\nbody\n"
+        "\n## 1440. Filed on main\n\nbody\n",
+    )
     git(repo, "add", "-A")
 
     code, out = run_check(repo)
@@ -765,6 +1093,47 @@ def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
     # ...and it must still MIGRATE an old standalone install away, or upgrading users stay broken.
     assert "Remove-Item -LiteralPath $preCommit" in src, (
         "the installer must remove a previously-installed standalone ledger hook"
+    )
+
+
+def test_the_CI_ledger_step_fetches_DEEPER_THAN_ONE() -> None:
+    """The reverse arm's CI coverage depends on this fetch depth, and nothing else pins it.
+
+    ***THE DEPENDENCY IS NEW AND IT IS INVISIBLE AT THE SITE THAT MATTERS.*** `actions/checkout` takes
+    `refs/pull/N/merge` at its default depth of 1, so HEAD is a shallow GRAFT whose parent objects are
+    absent. The arm reads those parents; the base tip arrives ONLY because this step runs
+    `git fetch --no-tags --depth=200 origin main` before invoking the gate. Trim that to `--depth=1`
+    as a plausible speedup and the arm stops being able to see anything -- and it would go SILENT
+    rather than red, which is the exact failure shape this whole item exists to catch.
+
+    Until this test existed the dependency lived in a comment beside the fetch. A comment cannot fail.
+
+    The depth is asserted as a FLOOR, not pinned to 200: the number is a judgement about how far main
+    can move, and re-tuning it is legitimate. Dropping to 1 is not.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    steps = [
+        s
+        for job in cfg["jobs"].values()
+        for s in job.get("steps", [])
+        if "Ledger gate" in str(s.get("name", ""))
+    ]
+    assert len(steps) == 1, f"expected exactly one ledger-gate step in ci.yml, found {len(steps)}"
+    run = str(steps[0]["run"])
+
+    assert "ledger_check.py --ci" in run, (
+        f"the ledger-gate step no longer invokes the gate -- this test is now vacuous:\n{run}"
+    )
+    depths = [int(d) for d in _FETCH_DEPTH.findall(run)]
+    assert depths, (
+        "the ledger-gate step no longer fetches origin main with an explicit --depth. If the "
+        f"checkout became deep, say so here rather than deleting the assertion:\n{run}"
+    )
+    assert min(depths) > 1, (
+        f"--depth={min(depths)} leaves HEAD's parents unfetched, and the reverse arm (BACKLOG #1470) "
+        "reads them. At depth 1 it goes SILENT, not red."
     )
 
 

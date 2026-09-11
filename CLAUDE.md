@@ -255,8 +255,9 @@ diverge enough to warrant it; keep this root file general.
 
 ## 5. Every seat that runs this repo has a different contract
 
-**Console with a capital C is a seat. The web console is the product's operator UI at `/ui`** (§10).
-Never write a bare "console". The method is named KORUS, and
+**There is no Console seat. The MANAGER is the seat the owner talks to** (roster below), and the
+only "console" here is the product's operator UI, the **web console** at `/ui` (§10). Never write a
+bare "console" for the seat; there is no seat to name. The method is named KORUS, and
 [`docs/METHOD.md`](docs/METHOD.md) defines that name once; read it there rather than restating it
 here. That page is the long form; this section is the short form and it binds.
 
@@ -264,15 +265,28 @@ This section replaced the pre-2026-09-01 method. The retired rules are not repea
 retractions. At least these went:
 
 - plan, then wait for the owner's "go" before writing code, as a rule binding a Builder. It still
-  binds the Console;
-- the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Console, for
-  the same reason the planning gate does: the Console is the seat that can warn somebody and wait;
+  binds the Manager;
+- the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Manager, for
+  the same reason the planning gate does: the Manager is the seat that can warn somebody and wait;
 - `/clear` and `/compact` as the fix for a stuck session;
 - declaring your own seat with `seat.ps1 -Declare`;
 - routing owner questions through a Liaison.
 
 Seven seats went with them: Dispatcher, Liaison, PM, Cleaner, Role Manager, Process Improvement,
-ASVS Tracker. If a document you are reading names a retired seat or a retired rule, treat **that
+ASVS Tracker.
+
+**An eighth went on 2026-09-10, by owner decision: the CONSOLE. The MANAGER replaces it, and a
+Manager is NOT a renamed Console.** A Console's workers were separate `claude -p` sessions across
+several accounts, spawned under a per-root grant, and exactly one Console ran. A Manager's workers
+are **subagents inside its own process on its own account**, it needs **no spawn grant**, and
+**several Managers run at once, usually one per account**. The Manager also does **not enqueue** --
+that moved to the Lander. **So a Console rule does not transfer by substitution.** Read the Manager's
+row below and korus `MANAGER.md`, and decide as a Manager; do not reach for what a Console would have
+done. `docs/roles/seats.json` resolves `console` to a retirement notice saying exactly this, because
+reading its old "the Console runs instead" line as *"substitute the Console"* is the measured error
+this retirement was written to stop.
+
+If a document you are reading names a retired seat or a retired rule, treat **that
 naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule
 often leaves a mechanism running on purpose, with the reason recorded beside it -- `.github/` headers
 are the source of record for what CI still reads and why. A mechanism this section does not mention
@@ -282,24 +296,29 @@ is not thereby retired; this section binds on seats and rules, not on the machin
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Console** | long-lived, one | The only seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, spawns a Builder bound to an account via `CLAUDE_CONFIG_DIR`, polls for state, enqueues PRs, spawns a Regulator on a red. | Build. Wait on inbound messages; it polls instead. |
-| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it writes the question to the Console, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads `docs/BACKLOG.md`, writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes and opens PRs, dispatches a Regulator on a red. | Build. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a diff it has not read. Arm auto-merge. |
 
-The Console spawns a Builder where it holds the spawn permission, and that is per config root. The
-grant is a rule matching `Bash(claude:*)` or `PowerShell(claude:*)` under `permissions.allow` in the
-`settings.json` of the config root named by `CLAUDE_CONFIG_DIR`. Measured 2026-09-02:
-`.claude-account-1` carries both and spawned one, exit 0 in 38.8 seconds; every root measured that
-day without them was refused. Exit 0 alone does not prove the spawn worked, because a prompt
-swallowed by a list-taking flag exits 0 too (see the spawn bullet below), so check what the child
-did. On a root without the grant the owner starts each Builder. Nothing else in the roster spawns
-one.
+**NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds nothing. The owner starts each
+Manager, in a desktop instance, and a Manager's workers are subagents in its own process.** That is
+why a Manager needs no account roster and cannot reach another Manager: the shape dissolves the
+cross-account coordination problem instead of solving it.
+
+**The grant's measurements are kept, not deleted, so nobody re-derives them and nobody mistakes this
+for a capability that was lost.** The grant is a rule matching `Bash(claude:*)` or
+`PowerShell(claude:*)` under `permissions.allow` in the `settings.json` of the config root named by
+`CLAUDE_CONFIG_DIR`. Measured 2026-09-02: `.claude-account-1` carries both and spawned a session,
+exit 0 in 38.8 seconds; every root measured that day without them was refused. Exit 0 alone does not
+prove a spawn worked, because a prompt swallowed by a list-taking flag exits 0 too (see the dispatch
+bullet below), so check what the child did. **What binds a Manager's workers instead is the
+tool-grant spelling, and the careful spelling is the broken one** -- same bullet.
 
 The brief is disposable. The BACKLOG item is the record.
 
-No seat may rely on a notice arriving -- the Console finds state by asking. `stalled-prs.yml` reports
+No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
 green-but-unmergeable PRs on a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a
 PR whose required check went red, and no workflow reads that label back. Some workflows do comment on
 a PR -- at least `failure-signal.yml`, `nightly-notice.yml` and `unread-signal.yml` (BACKLOG #1413) --
@@ -307,10 +326,12 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
 
 ### A Builder gets one turn, and a brief that forgets this deadlocks it
 
-1. The brief must hold for one turn. A Builder cannot ask and wait. It may mail a question, but the
-   answer lands in the reader's next turn, not in its own. `mail.ps1` requires `-To` and refuses to
-   guess, so the Console puts its own worktree path in the brief. Do not use `-To all`: that path
-   spawns a nested process and may be refused. With no address, put the question in the PR body.
+1. The brief must hold for one turn. A Builder cannot ask and wait. A subagent Builder's **final
+   report** is its channel back to its Manager, and it reaches the Manager's next turn, not its own,
+   so a question there is answered by the next brief rather than by a reply. Where a worker is its
+   own session instead, `mail.ps1` requires `-To` and refuses to guess, so the Manager puts its own
+   worktree path in the brief. Do not use `-To all`: that path spawns a nested process and may be
+   refused. With no address, put the question in the PR body.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
    tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
@@ -334,8 +355,8 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
    second's brief asked it to declare and the first's did not, and only the second declared. They
    also differed in task, worktree and grant list, so that is the cause and not a controlled arm.
    A SessionStart hook (`scripts/hooks/seat-declare-prompt.ps1`) prints a line telling every
-   starting session to declare. **Do not ignore it.** The Console should still supply seat and goal
-   at spawn, because no hook will invent a goal, by design: a machine that invents one writes a
+   starting session to declare. **Do not ignore it.** The Manager should still supply seat and goal
+   at dispatch, because no hook will invent a goal, by design: a machine that invents one writes a
    record that looks declared and says nothing.
 
 6. **A brief can be wrong by the time you read it, and nothing will tell you.** Verify it against
@@ -361,22 +382,36 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
    record it with evidence and stop, rather than building it again. BACKLOG #1448, same family
    as #1391.
 
-### The Console plans, spawns, and holds the owner's attention
+### The Manager plans, dispatches, and holds the owner's attention
 
-- **Plan first, then spawn.** For anything past a trivial change the Console produces a plan and
+- **Plan first, then dispatch.** For anything past a trivial change the Manager produces a plan and
   waits for the owner's explicit "go". Point the brief at the relevant existing code; it measurably
   improves the result.
-- Prefer **ultracode** for substantive work. The keyword is session-only and opt-in, so the Console
+- Prefer **ultracode** for substantive work. The keyword is session-only and opt-in, so the Manager
   warns the owner up front and offers to re-send with it. You cannot switch it on yourself. This gate
   never applies to a Builder, which has no user to warn and exits without a reply.
-- One brief per Builder. After about two failed attempts at the same problem, spawn a fresh Builder
+- One brief per Builder. After about two failed attempts at the same problem, dispatch a fresh Builder
   with a better brief rather than reuse a poisoned context. A Builder cannot do this. When you are
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
+- **Your workers die when you do, and that is the one way work is lost here.** A subagent that has
+  not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
+  every brief ends with push, then open the PR, then report; never "finish and I will push for you",
+  never "hold this until I say". Check before you close the instance.
+- **Say who else is running, in three fields that are always present, including when the answer is
+  nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
+  third field is the whole of the collision -- two workers given one worktree each reported the
+  other's output as an unexplained intruder, because neither was told the other existed.
+- **Hand down readings, not conclusions.** A worker told what you concluded applies your conclusion,
+  and its own correct evidence loses. That has happened. Mark a conclusion as yours and say what the
+  worker should do if it does not hold.
+- **Announce the files a wave's PRs will CHANGE, never the items' subjects.** A dispatch announce
+  naming three engine modules was read downstream as a collision forecast; the PRs touched
+  `docs/BACKLOG.md` and one test file, and those modules were only what the items were *about*.
 - **If you take back part of a brief you already dispatched, mail the receiver, because you cannot
   update the chip.** `dismiss_task` withdraws only a chip the user has **not** acted on, so a
   started one stays live and frozen around your stale text, and no channel carries the correction.
-  Say which item is already done and where it landed. **This binds whichever seat dispatched, not
-  only the Console:** any seat can raise a chip, and in the 2026-09-04 case above the spawner was
+  Say which item is already done and where it landed. **This binds whichever seat dispatched:** any
+  seat can raise a chip, and in the 2026-09-04 case above the spawner was
   the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
   still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
 - Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
@@ -434,12 +469,18 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
 
 ### Branch, commit one layer, open the PR
 
-- **"Merge when ready" is the ENQUEUE action here and is permitted. Arming auto-merge on a branch
-  that would merge WITHOUT the queue stays forbidden.** Enqueuing is still the Console's call and
-  merging still the Lander's — that division is unchanged. What changed is the reading of the
-  button: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue
-  entry rather than merging on green. **Owner ruling 2026-09-05**, given when a seat stopped and
-  asked rather than guess which of the two operations it was.
+- **"Merge when ready" is the ENQUEUE action here. Arming auto-merge on a branch that would merge
+  WITHOUT the queue stays forbidden.** What the button does was settled by **owner ruling
+  2026-09-05**, given when a seat stopped and asked rather than guess which of the two operations it
+  was: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue entry
+  rather than merging on green.
+
+  **WHO may press it changed with the Console's retirement on 2026-09-10: enqueuing and merging are
+  BOTH the Lander's now.** A Manager does not enqueue, and that is not a narrowing of an old
+  permission -- the seat that held it no longer exists, and korus `MANAGER.md` has never granted it.
+  Talk to the Lander before you open a PR, and leave the queue to it. Reading this bullet's earlier
+  wording as *"the dispatching seat enqueues"* is exactly the Console-by-substitution error §5's
+  retirement paragraph names.
 
   **The hazard this bullet was written against is KEPT, not deleted, because nobody has measured it
   under a queue.** It read, in full: *"Never arm auto-merge. Auto-merge fires on the head it saw, so
@@ -513,7 +554,7 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   Record in the PR body which checks you ran and which you skipped. An unpushed branch is lost.
 - Some checks only ever run on a hosted runner, for example NSSM under `windows-service-smoke`. A
   Builder never sees their result. Push, open the PR, and name in the body which legs must be read.
-  The Console or the Regulator reads them after the process exits.
+  The Manager or the Regulator reads them after the process exits.
 
 ### Product security rules outlive any method rewrite
 
