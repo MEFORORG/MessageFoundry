@@ -711,6 +711,21 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
   conclusion for a *step* question. Name the question and what the tool returns; check they are the
   same sentence.
+- **A `path:line` citation must carry something that can find the line again** (**BACKLOG #1315**).
+  §5 says line numbers are never evidence; this is what to write instead. Put ONE of these in the
+  same sentence:
+  - the **symbol** the line is about, in backticks — it survives the line moving, and stops
+    resolving when the code changes under it, which is the failure you want;
+  - the **base commit you read against**, in backticks. Never the commit you are creating: that is
+    circular, and writing the base is what exposes a stale address at write time.
+
+  A bare `path:line` does not break when the code moves — it resolves to a line that still exists
+  and says something else, so nothing reports a problem. The convention binds everything a seat
+  authors, **commit messages included**, and that is where it binds hardest: a message is the one
+  artifact nobody can correct in place. `scripts/docs/prose_anchor_check.py` enforces it on
+  `docs/BACKLOG.md` alone, diff-scoped, so it can only be red about a line the change wrote.
+  **Existing rows are deliberately not retrofitted** — they are unverifiable rather than rotten, and
+  a bulk rewrite of the most-edited file here buys nothing the convention does not.
 
 ---
 
