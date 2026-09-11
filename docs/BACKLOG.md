@@ -30587,3 +30587,66 @@ every defect in this loop sound like it needs an operator to opt in first.
 **Related:** [#1471](#1471) is the row this completes -- it named this work by subject, unfiled.
 [ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
 is the federated sibling, untouched.
+
+## 1540. Dual-control self-approval compares usernames, which BACKLOG #1532 made mutable; key it on the immutable user_id
+
+> 🔢 **Filed 2026-09-11 by the change that caused it.** Value **7/10** · Difficulty **4/10**.
+> `ApprovalGate.approve` refuses self-approval with `if str(row["requester"]) == approver`, a
+> **username string** comparison. That was sound only while `users.username` was immutable for the
+> life of a row -- which it was, until [#1532](#1532) added `set_user_username` and made the column
+> directory-writable. The two sides of that comparison are now snapshots, taken up to
+> `[approvals].expiry_hours` apart, of a value the **directory** controls.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / authorization. **Priority:** P2. **Verdict:** build.
+**Severity:** on a first deployment that turned dual-control on, a requester renamed in the directory
+between requesting and approving would pass the self-approval refusal and release their own gated
+action. The privilege bar is *"can rename one AD account"* -- self-service, or a helpdesk delegate
+with write rights over that account -- rather than *"holds a second approver account"*. **Off by
+default** (`[approvals].enabled = False`), so no shipped configuration reaches it without an operator
+turning it on. Section 0: zero deployments, so nothing is exposed today.
+
+### The mechanism, end to end
+
+1. `guard()` persists `pending_approvals.requester = 'jdoe'` with `expires_at = now + expiry_hours`.
+2. Inside that window the directory renames `jdoe` to `jdoe2`.
+3. Either the ADR 0079 reconciler pass (within `ad_session_recheck_seconds`, 300 by default) or the
+   next sign-in copies the new name down through `_refresh_cached_username`.
+4. `POST /approvals/{id}/approve` passes `approver=identity.username`, now `'jdoe2'`.
+5. `'jdoe' == 'jdoe2'` is False. **The refusal does not fire and the requester releases their own
+   request.** Both audit rows name one person two different ways, so the trail does not show it
+   either.
+
+**The reverse failure also exists and is worth stating**, because a fix that only chased the first
+would leave it: once the rename frees `'jdoe'`, a *different* person can be given that name, and
+their attempt to approve is refused as self-approval. That direction is a false REFUSAL rather than a
+false accept, so it is less severe -- but it is the same defect.
+
+### Why the fix is not a one-line change
+
+`pending_approvals.requester` is declared `TEXT NOT NULL` on all three backends and there is **no id
+column** -- the schema comment beside it reads *"who initiated; can never self-approve (dual-control,
+2.3.5)"*. Keying the comparison on the immutable id needs a `requester_user_id` column added on
+SQLite, PostgreSQL and SQL Server, written at `guard()` time, and compared at `approve()` time, with
+the username kept as the display label. That is the shape every other ownership key in the engine
+already uses: uploads key on `uploader_id`, saved search presets were re-keyed onto `owner_user_id`
+for exactly this reason, and WebAuthn credentials key on `user_id`.
+
+Resolving `requester` to an id at comparison time instead is **not** a fix: after a rename the name
+may belong to somebody else, so the lookup would compare the wrong person.
+
+### How it was found, and the general lesson
+
+An adversarial correctness review of #1532 (five lenses, three refuters per finding). This was the
+only HIGH finding that survived 3/3 unrefuted, and it is in a file #1532 does not touch -- the defect
+is the **removal of a premise** another subsystem rested on, not a bad line of code.
+
+`store/base.py`'s own docstring stated that premise in terms: *"the engine has no other writer of this
+column after `create_user`."* #1532 made that sentence false and did not audit who was relying on it.
+**A load-bearing fact stated once is also a fact that can be invalidated once, from somewhere that
+never reads the statement.** The general form is worth more than this instance: when a change makes
+something mutable that was immutable, the work is not the writer -- it is enumerating the readers.
+
+**Related:** [#1532](#1532) is the change that caused this and the row that filed it.

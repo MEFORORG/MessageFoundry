@@ -509,13 +509,28 @@ async def test_username_refresh_contract(store) -> None:
     mentioned by either live suite. The ``sql server`` legs were green throughout and said nothing
     about this method, because they never called it.
 
-    Case is NOT asserted here. This backend's ``=`` takes the database collation, so under a
-    ``_CI_`` default its guard refuses a rename SQLite and Postgres permit -- the same divergence
-    the id column shows, in the same direction (it declines a write rather than performing one).
+    Case IS asserted for this method, unlike for ``get_user_by_directory_object_id``. The two columns
+    differ in the schema: ``username`` carries ``COLLATE Latin1_General_100_BIN2`` and the id column
+    carries none. An earlier version of this test excluded the case arm by analogy with the id
+    column and was wrong.
     """
     from tests._directory_identity_store_contract import _assert_username_refresh_contract
 
     await _assert_username_refresh_contract(store)
+
+
+async def test_username_comparison_is_byte_exact_on_sqlserver(store) -> None:
+    """``username`` is declared ``COLLATE Latin1_General_100_BIN2``, so this backend agrees with the
+    other two -- a rename differing only in case is NOT a collision.
+
+    The arm that would have caught the false divergence note this test was written to justify. It is
+    also the guard against a schema edit dropping that ``COLLATE``: the column would silently become
+    case-insensitive under a ``_CI_`` database default, and the rename path would start refusing
+    writes the other two backends perform.
+    """
+    from tests._directory_identity_store_contract import _assert_username_compare_is_byte_exact
+
+    await _assert_username_compare_is_byte_exact(store)
 
 
 async def _directory_id_collation(store) -> str | None:

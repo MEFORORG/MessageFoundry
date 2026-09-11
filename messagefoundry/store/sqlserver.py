@@ -9986,11 +9986,14 @@ class SqlServerStore:
         # assumed -- see its comment, which records why the test is on "Integrity" and not on
         # "IntegrityError".
         #
-        # As with get_user_by_directory_object_id above, the name comparison is the DATABASE's and
-        # this column carries no explicit COLLATE: under a case-insensitive server default this guard
-        # refuses a name differing from another row's only in case, where SQLite and Postgres would
-        # allow it. That is the SAFE direction -- it declines a write rather than performing one --
-        # and it is recorded because byte-exact comparison is what a reader would assume.
+        # NO COLLATION DIVERGENCE HERE, unlike get_user_by_directory_object_id above. An earlier
+        # version of this comment claimed one, by analogy with that method -- and the analogy is
+        # backwards. The two columns are declared differently in this file's own `_SCHEMA`:
+        #     username            NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE
+        #     directory_object_id NVARCHAR(256) NULL                        -- database default
+        # BIN2 is a BINARY collation, so `other.username=?` compares byte for byte on this backend
+        # exactly as it does on SQLite and PostgreSQL. The divergence is real for the id column and
+        # imaginary for this one, which is why the cross-backend case arm runs on all three.
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "

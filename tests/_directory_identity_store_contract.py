@@ -241,14 +241,25 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     other = await store.get_user_by_username("taken")
     assert other is not None and other.id == "squatter", "the collision disturbed the other row"
 
-    # 3. A ROW MAY BE SET TO THE NAME IT ALREADY HOLDS. The guard excludes the row being written
-    #    (``other.id <> <user_id>``); drop that term and the subquery matches the row's OWN name, so
-    #    every idempotent refresh silently becomes a no-op. Harmless here, but it is the term whose
-    #    loss nothing else in this file would notice, and a caller that re-applied a rename after a
-    #    crash would be relying on it.
+    # 3. A ROW MAY BE SET TO THE NAME IT ALREADY HOLDS, and the assertion is on ``updated_at``,
+    #    NOT on the name. The guard excludes the row being written (``other.id <> <user_id>``); drop
+    #    that term and the subquery matches the row's OWN name, the NOT EXISTS fails, and the write
+    #    silently becomes a no-op.
+    #
+    #    **Asserting the name here cannot fail, and this step did exactly that until it was checked.**
+    #    The row already holds ``jdoe-married`` from step 1, so a no-op leaves the name correct and
+    #    every assertion about it green -- the term this step is named for could be deleted from all
+    #    three backends with the whole suite still passing. ``updated_at`` is the only observable that
+    #    separates "wrote the same value" from "did not write".
+    before = await store.get_user("rename-me")
+    assert before is not None
     await store.set_user_username("rename-me", "jdoe-married", now=4_000.0)
     same = await store.get_user_by_username("jdoe-married")
     assert same is not None and same.id == "rename-me"
+    assert same.updated_at != before.updated_at, (
+        "setting a row to the name it already holds wrote nothing; the guard's `other.id <> ?` term "
+        "is matching the row against itself"
+    )
 
     # 4. AN UNKNOWN user_id TOUCHES NOTHING. The reconciler plans a pass and applies it afterwards,
     #    so a row deleted in between reaches this method; it must not become an error or, worse,
@@ -258,16 +269,18 @@ async def _assert_username_refresh_contract(store: Any) -> None:
 
 
 async def _assert_username_compare_is_byte_exact(store: Any) -> None:
-    """SQLite and PostgreSQL compare ``username`` byte-for-byte, so the guard is case-sensitive.
+    """ALL THREE backends compare ``username`` byte-for-byte, so the guard is case-sensitive.
 
-    Called by those two suites only, mirroring the id column's split above. SQL Server delegates to
-    the database collation and under a ``_CI_`` default would treat these as the same name, so its
-    guard REFUSES a rename this one permits. That divergence is recorded at ``store/sqlserver.py``'s
-    copy of the method, and this is the arm that makes the recorded claim testable rather than
-    asserted in a comment.
+    **This ran on two backends until it was checked.** It was written SQLite + PostgreSQL only, by
+    analogy with the id column's genuine split above, and SQL Server was excluded on the strength of
+    a comment claiming its guard delegates to the database collation. The schema says otherwise:
+    ``username`` is declared ``NVARCHAR(256) COLLATE Latin1_General_100_BIN2`` -- a BINARY collation
+    -- while ``directory_object_id`` is declared with no ``COLLATE`` at all and does take the
+    database default. Reasoning from the neighbouring column got the answer backwards, and the effect
+    was that the one backend anybody doubted was the one with no coverage.
 
-    **The refusal is the safe direction either way** -- SQL Server declines a write rather than
-    performing one -- which is why the divergence is documented rather than normalised away.
+    So this runs everywhere now, and a future schema edit that dropped the ``COLLATE`` from
+    ``username`` would redden it on SQL Server rather than changing behaviour silently.
     """
     await store.create_user(
         user_id="case-holder",

@@ -1035,3 +1035,72 @@ async def test_a_store_fault_that_is_not_an_integrity_violation_still_propagates
             await service.reconcile_directory_sessions()
     finally:
         await store.close()
+
+
+async def test_a_name_keyed_probe_never_plans_a_rename() -> None:
+    """A NAME-keyed probe must not report a rename, because its question can name another principal.
+
+    **This is a takeover, not a tidiness rule.** On the residual path -- a directory whose
+    ``objectGUID`` the bind account cannot read, so every row is unbound -- ``_find_user`` searches
+    ``(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))`` and takes ``entries[0]``. An
+    account that can set its own ``userPrincipalName`` to the victim's ``<name>@<domain>`` matches the
+    same filter, so on a pass where the directory returns that entry first the probe reports the
+    ATTACKER's ``sAMAccountName`` as this row's new name.
+
+    Without this gate the refresh would write that name onto the victim's row -- moving the only key
+    an unbound login path has onto the attacker's label. The attacker's next sign-in then resolves to
+    the victim's ``user_id``: both ids are NULL, so BACKLOG #1471's conflict guard compares ``None``
+    to ``None``, passes, and hands over the victim's uploaded files, quota and saved presets. That is
+    the privilege transfer #1471 exists to close, arriving on the rows #1471 could not bind.
+
+    The UPN ambiguity is older than #1532 and is not fixed here. What #1532 must not do is make the
+    wrong answer PERSISTENT, so an unbound row is left on genuinely unchanged behaviour.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        # Unbound: the directory returns no readable objectGUID, so the row carries none.
+        ldap = _FakeLdap({"jdoe": replace(_principal("jdoe"), directory_object_id=None)})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None
+        victim = await store.get_user_by_username("jdoe")
+        assert victim is not None and victim.directory_object_id is None
+
+        # The name-keyed probe now resolves to a DIFFERENT principal -- what a UPN collision does.
+        ldap.present = {"jdoe": replace(_principal("mallory"), directory_object_id=None)}
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.renames == (), "a name-keyed probe planned a rename"
+        still = await store.get_user(victim.id)
+        assert still is not None and still.username == "jdoe", (
+            "the victim's row took the name the ambiguous probe reported"
+        )
+    finally:
+        await store.close()
+
+
+async def test_an_unchanged_name_plans_no_rename() -> None:
+    """THE MUST-NOT-FIRE ARM. Every other rename test asserts a refresh HAPPENED.
+
+    Without this, an implementation that planned a `UsernameRefresh` on every PRESENT probe -- whether
+    or not the name moved -- would pass all of them, and would write to `users.username` once per
+    account per pass forever, audit `auth.ad_username_refreshed` every 300 seconds per signed-in user,
+    and bury any real rename in the noise. A control that fires on everything reports nothing.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+
+        for _ in range(3):  # the directory says the same name every pass
+            plan = await service.reconcile_directory_sessions()
+            assert plan.renames == (), "an unchanged name planned a refresh"
+
+        assert not [
+            a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
+        ], "an unchanged name audited a refresh"
+    finally:
+        await store.close()

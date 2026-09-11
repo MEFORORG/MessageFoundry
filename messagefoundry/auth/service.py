@@ -2133,7 +2133,23 @@ class AuthService:
             user.username,
             reconcile.ProbeOutcome.PRESENT,
             groups=principal.groups,
-            directory_username=principal.username,
+            # ONLY AN ID-KEYED PROBE MAY REPORT A RENAME. A rename is evidence of a rename only when
+            # the question asked cannot be answered by a different principal, and the name-keyed
+            # fallback's question can be: `_find_user` searches
+            # `(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))` and takes entries[0], so
+            # an account that sets its own UPN to the victim's `<name>@<domain>` matches the same
+            # filter. On a pass where the directory returns that entry first, the probe would report
+            # the attacker's `sAMAccountName` as this row's new name -- and the refresh would write it
+            # onto the victim's row, moving the ONLY key an unbound login path has onto the attacker's
+            # label. Their next sign-in then resolves to the victim's `user_id` (both ids are NULL, so
+            # the BACKLOG #1471 conflict guard compares None to None and passes), taking the victim's
+            # uploaded files, per-uploader quota and saved search presets with it.
+            #
+            # That is exactly the privilege transfer #1471 exists to close, arriving on the rows #1471
+            # could not bind. The UPN ambiguity and the role re-diff that rides on it are older than
+            # this item and unchanged; what #1532 must not do is make the wrong answer PERSISTENT.
+            # `None` here leaves the residual no-objectGUID site on genuinely unchanged behaviour.
+            directory_username=principal.username if user.directory_object_id is not None else None,
         )
 
     async def reconcile_directory_sessions(self) -> reconcile.ReconcilePlan:
@@ -2284,9 +2300,13 @@ class AuthService:
         integrity error would take down the whole pass and with it every OTHER account's revocation in
         it -- turning a cosmetic label collision into a missed directory disable.
 
-        The account keeps its ``user_id``, its sessions, its roles and everything keyed to them. Only
-        the label moves, which is what makes this the end of the revocation cycle rather than a
-        gentler version of it.
+        On the SUCCESS path the account keeps its ``user_id``, its sessions, its roles and everything
+        keyed to them, and only the label moves -- which is what makes this the end of the revocation
+        cycle rather than a gentler version of it.
+
+        **The conflict path is different and must not be read as the same outcome**: the row keeps its
+        id and its current session, but its next sign-in is refused with ``directory_identity_conflict``
+        until an operator removes the row holding the name. See the comment on that branch.
         """
 
         async def _refuse(held_by: str | None, detected: str) -> None:
@@ -2296,9 +2316,23 @@ class AuthService:
             # whose name the directory has now reissued -- BACKLOG #1471's recycle case, arriving
             # through a rename instead of through a fresh login.
             #
-            # This costs the renamed person nothing: they were identified by their immutable id, so
-            # their sessions and roles are untouched and they keep signing in. Only the cached label
-            # stays stale, which is a display defect rather than a lockout.
+            # **THIS IS A PENDING LOCKOUT, NOT A COSMETIC DEFECT, AND THIS WARNING IS THE ONLY SIGNAL
+            # AN OPERATOR GETS.** An earlier version of this comment said the person "keeps signing
+            # in" and called a stale label "a display defect rather than a lockout". That is wrong,
+            # and `tests/test_ad_directory_identity.py::test_a_login_renamed_onto_a_taken_name_is_
+            # refused` -- added by this same item -- asserts the opposite.
+            #
+            # What actually happens: the row keeps its id, so the CURRENT session survives. But the
+            # next sign-in reads `get_user_by_username(<the directory's new name>)`, finds the other
+            # row, sees an id that disagrees, and returns `directory_identity_conflict`. So the person
+            # is locked out from their next login, bounded only by `session_absolute_hours` (12h) on
+            # the session they already hold, and the state never clears on its own -- the stale row
+            # holds no live session, so the reconciler never probes it.
+            #
+            # Framing that as cosmetic in the one message an operator sees is the compensating-control-
+            # on-a-false-premise shape section 11 forbids: it tells them not to act on the thing they
+            # must act on. The remedy is theirs -- remove the stale row -- and it is BACKLOG #1471's
+            # stated residual, unchanged here.
             #
             # ``detected`` separates the two ways one condition arrives -- the pre-check saw the
             # holder, or the write lost a race to it. The OUTCOME is deliberately identical, which is
@@ -2320,7 +2354,9 @@ class AuthService:
             )
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account (%s); the stored name is left as-is (BACKLOG #1532)",
+                "another account (%s). The stored name is left as-is, AND THIS ACCOUNT WILL BE "
+                "REFUSED AT ITS NEXT SIGN-IN (directory_identity_conflict) until the stale row is "
+                "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
                 old_username,
                 detected,
             )
@@ -2374,6 +2410,22 @@ class AuthService:
             # audit row naming the holder is what makes the collision actionable.
             winner = await self._store.get_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race")
+            return
+        # READ BACK BEFORE AUDITING SUCCESS. The guarded UPDATE can match zero rows and raise nothing
+        # -- that is the whole point of the NOT EXISTS -- so an unconditional success audit would
+        # report a rename that did not happen. Reachable two ways: the race where the losing side's
+        # guard HOLDS (81 of 200 pairs on PostgreSQL, `store/postgres.py`) rather than raising, and a
+        # row deleted between the plan and the apply.
+        #
+        # An audit trail that says a name moved when it did not is worse than a missing row: an
+        # operator reconciling "who is this account" against the directory would take the engine's
+        # word for a state neither side is in.
+        written = await self._store.get_user(user_id)
+        if written is None or written.username != new_username:
+            await _refuse(
+                None if written is not None else user_id,
+                "write_noop" if written is not None else "row_gone",
+            )
             return
         await self._audit(
             "auth.ad_username_refreshed",

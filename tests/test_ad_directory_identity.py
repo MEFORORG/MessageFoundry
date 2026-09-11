@@ -830,14 +830,20 @@ def test_the_disabled_account_rejection_covers_the_id_keyed_lookup_too() -> None
 class _RecordingConn:
     """A service connection that records EVERY search, not just the last one.
 
-    ``resolve_principal`` issues two: the user lookup, then the nested-group lookup. A double keeping
-    only the last one reports on the group search and reads as though the user search never ran --
-    which is the shape of a test that passes while measuring the wrong statement.
+    **Under ``_authenticator()`` exactly ONE search is issued**, and an earlier version of this
+    docstring said two. ``_resolve_groups`` searches only when ``ad_use_nested_groups`` AND
+    ``ad_group_search_base`` are both set, and that fixture sets neither, so the group leg reads the
+    entry's ``memberOf`` without a round trip. Recording every search rather than the last still
+    matters -- it is what lets a test assert the COUNT, which is the only way to see a second,
+    unwanted lookup such as a name fallback behind an id-keyed miss.
+
+    ``entry=None`` models a search that matches nothing, which is a different question from a
+    malformed filter: a well-formed id bound to no account.
     """
 
-    def __init__(self, entry: _FakeEntry) -> None:
+    def __init__(self, entry: _FakeEntry | None) -> None:
         self._entry = entry
-        self.entries: list[_FakeEntry] = [entry]
+        self.entries: list[_FakeEntry] = [entry] if entry is not None else []
         self.searches: list[dict[str, Any]] = []
 
     def __enter__(self) -> _RecordingConn:
@@ -848,12 +854,16 @@ class _RecordingConn:
 
     def search(self, **kwargs: Any) -> None:
         self.searches.append(kwargs)
-        # The group search must match nothing, so `_resolve_groups` falls back to the entry's
-        # `memberOf` and this double stays a user-lookup instrument rather than a group fixture.
-        self.entries = [self._entry] if len(self.searches) == 1 else []
+        # Only the FIRST search (the user lookup) may match, and only when this double was given an
+        # entry. Anything after it answers empty, so the double stays a user-lookup instrument rather
+        # than a group fixture.
+        first_hit = len(self.searches) == 1 and self._entry is not None
+        self.entries = [self._entry] if first_hit else []  # type: ignore[list-item]
 
 
-def _recording_authenticator(entry: _FakeEntry) -> tuple[LdapAuthenticator, _RecordingConn]:
+def _recording_authenticator(
+    entry: _FakeEntry | None,
+) -> tuple[LdapAuthenticator, _RecordingConn]:
     auth = _authenticator()
     conn = _RecordingConn(entry)
     auth._service_conn = lambda: conn  # type: ignore[method-assign]
@@ -905,3 +915,32 @@ def test_resolve_principal_asks_by_name_when_given_no_id() -> None:
     assert principal is not None
     assert conn.searches[0]["search_filter"].startswith("(|(sAMAccountName=jsmith)")
     assert "objectGUID=" not in conn.searches[0]["search_filter"]
+
+
+def test_an_id_keyed_miss_does_not_fall_back_to_the_name() -> None:
+    """A well-formed id that matches NOTHING must return None, not retry by name (BACKLOG #1532).
+
+    **This gap was measured, not imagined.** Adding ``or self._find_user(svc, username)`` to the
+    id-keyed arm of ``resolve_principal`` left 249 tests green across eight auth suites. The two
+    tests that do assert "no fallback" call ``_find_user_by_object_id`` directly -- one layer BELOW
+    the branch -- and only for a MALFORMED id, so neither can see a fallback added at the layer above.
+    The two real-authenticator tests assert only on the filter of a search that SUCCEEDS.
+
+    What that mutation would ship: AD account 'jdoe' (objectGUID G1) binds its row; AD deletes it and
+    reissues 'jdoe' to a new hire (objectGUID G2); the reconciler probes with object_id=G1, the id
+    search misses, the name search finds the NEW HIRE's enabled entry, and the probe reads PRESENT.
+    The departed operator's live session is never revoked, and the role re-diff runs against a
+    different person's group memberships. That is ADR 0079 mechanism 2 silently ending -- the exact
+    shape this whole change set is built to avoid.
+
+    Two assertions, because the first alone is satisfiable by a fallback that also misses: the result
+    must be None AND exactly one search must have been issued.
+    """
+    auth, conn = _recording_authenticator(None)  # a well-formed id bound to nobody
+
+    assert auth.resolve_principal("jsmith", object_id=GUID_B_TEXT) is None
+    assert len(conn.searches) == 1, (
+        f"the id-keyed miss issued {len(conn.searches)} searches; a second one is a name fallback, "
+        "which would resolve a reissued name to a different person and never revoke the departed one"
+    )
+    assert conn.searches[0]["search_filter"].startswith("(objectGUID=")
