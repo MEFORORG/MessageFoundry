@@ -31111,7 +31111,7 @@ confirmation. They were the same artifact.
 
 ## 1546. Pin the PEP 517 build backend: hatchling floats unpinned in every build-system table, so a release resolves it from PyPI inside the publishing job
 
-> 🚧 **Built 2026-09-11; open until its pull request merges, when the Lander flips this banner.** `hatchling==1.32.0` in every `[build-system]` table, plus two tests in `tests/test_packaging.py`. Value **7/10**, Difficulty **2/10**. Value 7: the release jobs ran a build backend nobody pinned, inside the jobs that publish to PyPI. Difficulty 2: the edit is three lines. The measurement and the `--no-isolation` evaluation were the work.
+> 🚧 **Built 2026-09-11 (PR 1060); open until that merges, when the Lander flips this banner.** `hatchling==1.32.0` in every `[build-system]` table, plus two tests in `tests/test_packaging.py`. Value **7/10**, Difficulty **2/10**. Value 7: the release jobs ran a build backend nobody pinned, inside the jobs that publish to PyPI. Difficulty 2: the edit is three lines. The measurement and the `--no-isolation` evaluation were the work.
 > Verdict: build
 > Research: none
 > Closing-act: code
