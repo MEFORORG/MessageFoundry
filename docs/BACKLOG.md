@@ -30515,10 +30515,10 @@ with `cancel-in-progress` true on that arm. The condition matches -- the workflo
 `pull_request_target` -- so the `github.ref` arm is live. The trap is what `github.ref` holds there.
 
 For `pull_request` it is `refs/pull/<n>/merge`, which carries the number and so is per-pull-request.
-For `pull_request_target` it is the base ref. GitHub's contexts documentation states it in one
-sentence: "`pull_request_target` events have the `ref` from the base branch." Every open pull request
-against `main` therefore resolved to the single group `cla-refs/heads/main`, and each new run cancelled
-whatever was in flight there -- which belonged to a different pull request.
+For `pull_request_target` it is `refs/heads/<default branch>` -- see the correction section below, which
+records how that was settled and why GitHub's own pages disagree about it. Every open pull request
+therefore resolved to the single group `cla-refs/heads/main`, and each new run cancelled whatever was in
+flight there -- which belonged to a different pull request.
 
 The author had already written the governing fact down, one arm over. The `issue_comment` note in the
 same block says an issue_comment ref "is the default branch" and keys that arm on `github.run_id` to
@@ -30735,3 +30735,54 @@ mergeable and went DIRTY later as main moved, so their runs already existed. A p
 branch ALREADY conflicts is a different case and is consistent with the peer's own reading of their
 SHA, but it was not tested here and is not claimed. `mergeStateStatus` cannot tell the two histories
 apart, which is why the general version is not recorded as fact.
+
+### CORRECTION: the ref is the DEFAULT branch, not the base branch, and a stacked pull request proved it
+
+This item first said `github.ref` under `pull_request_target` is the BASE ref, quoting GitHub's
+variables page: "`pull_request_target` events have the `ref` from the base branch." That quote is real
+and the reading built on it is wrong for github.com. The events page says "Default branch" for the same
+event, and the two pages disagree.
+
+**No measurement taken here could separate them, and that is the instructive part.** Every pull request
+in the 61-run population targeted `main`, so the base ref and the default branch were the same string
+and both readings predicted the same group. The discriminating case is a pull request based on
+something other than the default branch, and this item had none.
+
+One arrived from another session on 2026-09-11. PR 1048, head `claude/reconciler-rekey-stack`, base
+`claude/ad-immutable-id-1471` -- not `main`. Its `cla` run 34568093043 was cancelled at 06:17:07, one
+second after run 34569280155 on a `main`-based pull request was created at 06:17:06. Under the
+base-branch reading those two runs key to `cla-refs/heads/claude/ad-immutable-id-1471` and
+`cla-refs/heads/main`, two groups that cannot touch each other. They cancelled each other, so the ref
+is the default branch.
+
+**This makes the defect broader than first described, and changes no remedy.** Every open pull request
+collapsed into one group regardless of what it targeted, stacked pull requests included, so the blast
+radius was the whole repository rather than one base branch at a time. The fix is unaffected: a pull
+request number separates pull requests under either reading. What the distinction protects against is a
+reader repairing some future variant from the base-branch sentence, building a per-BASE key, and
+believing it is per-pull-request -- which is why `github.base_ref` and
+`github.event.pull_request.base.ref` are in the guard's shared-context set rather than treated as
+discriminators.
+
+### Two corrections to the operator-facing advice, both from the same session
+
+**`gh pr checks` does not show the word this item told readers to look for.** It renders the cancelled
+`cla` context as `fail`:
+
+```
+cla     fail    1m36s   https://github.com/.../actions/runs/34568093043/job/103167391241
+```
+
+while the status rollup for the same check reports `conclusion=CANCELLED status=COMPLETED`. So the
+surface a reader reaches for first DISGUISES the signature. Reading the real conclusion needs
+`gh pr view --json statusCheckRollup` or `gh run view --json jobs`. An instruction to "look for
+CANCELLED" fails against `gh pr checks`, and the finding still presents as a failure with nothing in
+the log.
+
+**"A re-push usually clears it" was too strong.** A retry re-enters the same shared group and is
+cancellable by the next arrival, so it is not a dependable escape while other sessions are pushing.
+Measured directly by that session: `gh run rerun 34568093043` queued, ran 1m36s, and came back
+CANCELLED again. Over the whole `pull_request_target` population the success rate is **35 of 69**, near
+enough a coin flip -- and with 13 live sessions in this repository the arrival rate is what sets it.
+That is worse for the operator than "clears up on retry" implies: the workaround is unreliable in
+exactly the conditions that cause the problem.

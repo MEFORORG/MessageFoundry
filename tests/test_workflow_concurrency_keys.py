@@ -4,9 +4,18 @@
 
 THE DEFECT THIS HOLDS. `cla.yml` keyed its group on ``github.ref`` under ``pull_request_target``.
 For ``pull_request`` that context is ``refs/pull/<n>/merge`` and so is per-pull-request; for
-``pull_request_target`` it is the BASE ref, ``refs/heads/main``. Every open pull request therefore
+``pull_request_target`` it is ``refs/heads/<DEFAULT branch>``. Every open pull request therefore
 resolved to one group, ``cla-refs/heads/main``, and with that arm cancellable each new run cancelled
-the in-flight ``cla`` run of an unrelated one. ``cla`` is a REQUIRED context, and a cancelled run
+the in-flight ``cla`` run of an unrelated one.
+
+DEFAULT BRANCH, NOT BASE BRANCH. GitHub's own pages disagree -- the variables page says the ref comes
+from the base branch, the events page says the default branch -- and on a main-based pull request the
+two readings are the same string, so main-based measurements cannot tell them apart. A STACKED pull
+request can: measured 2026-09-11, a pull request based on a feature branch had its ``cla`` run
+cancelled one second after a ``main``-based pull request's run was created, which is impossible if
+the keys were per-base. It does not change the fix -- a pull request number separates them either
+way -- but it is why ``github.base_ref`` is in ``_SHARED_CONTEXTS`` below: a per-BASE key looks
+per-pull-request and is not. ``cla`` is a REQUIRED context, and a cancelled run
 carries no steps and no logs -- it renders in the fail column with nothing to read, which is why it
 went unattributed.
 

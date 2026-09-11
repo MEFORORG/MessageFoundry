@@ -56,7 +56,7 @@ on:
 
 concurrency:
   # KEYED ON THE PULL REQUEST NUMBER, NOT ON `github.ref` -- BACKLOG #1533.
-  # Under `pull_request_target` github.ref is the BASE ref (`refs/heads/main`), not
+  # Under `pull_request_target` github.ref is `refs/heads/<DEFAULT branch>`, not
   # `refs/pull/<n>/merge`, so the previous key put EVERY open pull request into ONE group named
   # `cla-refs/heads/main`. With this arm cancellable, a push to ANY pull request cancelled the
   # in-flight `cla` run of an UNRELATED one. `cla` is a REQUIRED context and a cancelled run is not
@@ -66,6 +66,23 @@ concurrency:
   # cause sat unattributed: the evidence is not in the victim's own run, it is in the start time of a
   # run on somebody else's branch. Measured 2026-09-11 over this workflow's last 100 runs, with
   # security.yml as a paired control; numbers and method in BACKLOG #1533.
+  #
+  # DEFAULT BRANCH, NOT BASE BRANCH, AND THE DIFFERENCE IS MEASURED RATHER THAN READ OFF A PAGE.
+  # GitHub documents this inconsistently: the variables page says a `pull_request_target` run takes
+  # "the `ref` from the base branch", while the events page says "Default branch" for github.com. On
+  # a pull request based on `main` the two readings coincide, so no amount of measuring main-based
+  # pull requests can separate them. A STACKED pull request does separate them, and one settled it
+  # here on 2026-09-11: PR 1048 (head `claude/reconciler-rekey-stack`, base
+  # `claude/ad-immutable-id-1471`, NOT main) had its `cla` run 34568093043 cancelled at 06:17:07,
+  # one second after run 34569280155 on a `main`-based pull request was created at 06:17:06. Under
+  # the base-branch reading those two keys differ and neither can touch the other. They shared a
+  # group, so the ref is the DEFAULT branch.
+  #
+  # That makes the defect broader than the base-branch reading implies -- every open pull request
+  # collapses into one group no matter what it targets, stacked pull requests included -- and it does
+  # not change this fix, because a pull request number separates them under either reading. The
+  # distinction is recorded because a reader who repairs a future variant from the base-branch
+  # sentence will build a per-base key and think it is per-pull-request.
   #
   # DO NOT "RESTORE" THE SIBLING SPELLING. security.yml, codeql.yml, net-helper.yml, zizmor.yml and
   # quality-advisory.yml all write `github.event_name == 'pull_request' && github.ref`, and they are
