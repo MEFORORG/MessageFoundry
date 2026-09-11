@@ -345,18 +345,30 @@ def _cells_from(record_text: str, name: str) -> list[Cell]:
 
 
 def _repairs_declared(record_text: str) -> int:
-    """How many cells in this record declare an anchor repair.
+    """How many cells in this record carry a witness that an anchor repair happened.
 
     THE FLOOR CAVEAT, MADE COUNTABLE. Every repair at or before the ref being measured has already
     overwritten its own witness, so what the run finds is what survived them -- "at least", never
     "exactly". A caveat in prose is not the same artifact as a number a reader can compare between two
     refs, and the tool that has the record open is the one that can print it.
 
-    ``anchor_repair`` is a WRITER instruction that persists into the record (BACKLOG #1369), which is
-    a defect on its own row and is exactly why it is legible here: nothing else in the record says a
-    repair happened.
+    TWO KEYS, COUNTED TOGETHER, BECAUSE THE WRITER MOVED UNDER THIS COUNT (BACKLOG #1369). This used
+    to read ``anchor_repair``, which is a WRITER INSTRUCTION that persisted into the record -- a
+    defect on its own row, and it FROZE the cell it landed on, because the next ordinary correction
+    authored from that live cell carried the flag forward and was refused. ``apply.py`` now consumes
+    the instruction and records ``anchor_repaired_at`` in its place: the same fact, carrying the date
+    of the pass, read as an instruction by nothing.
+
+    Counting only the new key would report a collapse that never happened -- cells the new writer has
+    not rewritten still carry the old one. Counting only the old key would watch the number decay as
+    the record is cleaned. A cell carrying both counts ONCE, which is what ``any``-shaped truthiness
+    in a generator gives here.
     """
-    return sum(1 for c in tomllib.loads(record_text).get("cell", []) if c.get("anchor_repair"))
+    return sum(
+        1
+        for c in tomllib.loads(record_text).get("cell", [])
+        if c.get("anchor_repair") or c.get("anchor_repaired_at")
+    )
 
 
 @dataclass

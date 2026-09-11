@@ -16,12 +16,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
 import pytest
 
-from scripts.asvs.apply import (
+# `scripts/asvs` has no `__init__.py`, so its modules import BY PATH -- the same line the sibling
+# suites carry. Stated here rather than inside the one arm that needs `anchor_provenance`, so that
+# arm does not silently depend on `apply` having been imported first for its side effect.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "asvs"))
+
+from scripts.asvs.apply import (  # noqa: E402
     _BANNED,
     _SUBTABLES,
     _control_keys,
@@ -1273,6 +1279,151 @@ def test_END_TO_END_a_successful_retirement_leaves_no_declaration_behind(tmp_pat
     # ...and the retirement itself still happened, so this is not passing by doing nothing.
     assert "verify_mode" not in after, "the retired anchor should be gone"
     assert "tls_cert_file" in after, "the surviving anchor must remain"
+
+
+# --- BACKLOG #1369, second limb: `anchor_repair` is the control the derivation could not reach -----
+#
+# `_control_keys()` derives from `_SUBTABLES`, so it covers `retired_evidence` and `retired_absence`
+# and misses `anchor_repair` -- the OTHER declaration the same function consumes as an instruction,
+# and one that nothing in `scorecard.py` reads back. Persisted, it FREEZES the cell: a later ordinary
+# residual correction, authored from the live cell and therefore carrying the flag forward, is
+# refused with "declared anchor_repair but 'residual' differs from the record". That is the #1333
+# freeze shape, reintroduced through a persisted control.
+#
+# THE NAME LIST IS CORRECT HERE and is not a relapse into the one `_carried`'s docstring rejects.
+# That objection is about DATA, where a missed name is a field lost silently and forever behind a
+# valid-looking default. A missed name HERE keeps one key too many -- visible in the record, readable
+# by anyone who opens it, recoverable on the next write. Cheap and loud against expensive and silent.
+#
+# AND THE SIGNAL IS REPLACED RATHER THAN DESTROYED. `anchor_provenance._repairs_declared` counts
+# cells declaring a repair and its docstring says nothing else in the record marks one, so consuming
+# the control without recording anything would delete a measurement. The writer records
+# `anchor_repaired_at` instead: the same fact, carrying the date, instruction to nobody.
+
+
+def _cell_with_repair(**over: object) -> dict:
+    """An anchor-repair payload for `1.1.1` -- prose byte-identical to the fixture, anchors moved."""
+    cell = _cell_111(anchor_repair=True, reviewed_by="fixture")
+    cell.update(over)
+    return cell
+
+
+def test_anchor_repair_is_CONSUMED_and_never_stored() -> None:
+    """The narrow defect: the writer must read the instruction and not keep it."""
+    parsed = tomllib.loads(
+        render(
+            {
+                "id": "1.2.3",
+                "level": 1,
+                "verdict": "pass",
+                "last_verified": "2026-08-27",
+                "verified_at": "0" * 40,
+                "anchor_repair": True,
+            }
+        )
+    )["cell"][0]
+    # Asserted on the PARSED key, never as a substring: the witness field's own name contains
+    # "anchor_repair", so a substring check cannot tell the control from its replacement and would
+    # red on a correct fix. Exactly the presence-equals-meaning trap the glyph rule names.
+    assert "anchor_repair" not in parsed, parsed
+    assert parsed["anchor_repaired_at"] == "2026-08-27", parsed
+
+
+def test_a_cell_that_was_NOT_repaired_gets_no_witness() -> None:
+    """The witness must record a fact, not appear on every rewrite. Without this arm the field is
+    decoration and the count it feeds means nothing."""
+    parsed = tomllib.loads(render(_cell_111()))["cell"][0]
+    assert "anchor_repaired_at" not in parsed, parsed
+
+
+def test_the_named_control_rides_BESIDE_the_derivation_rather_than_replacing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both sources, at once. A fix that swapped the derivation for a list would satisfy the arm
+    above and silently un-fix the row this file's earlier section is about, so the derived half is
+    re-driven here through a NEW sub-table rather than assumed still present."""
+    import scripts.asvs.apply as apply_mod
+
+    assert "anchor_repair" in _control_keys()
+    monkeypatch.setattr(apply_mod, "_SUBTABLES", (*_SUBTABLES, "mitigation"))
+    keys = _control_keys()
+    assert "retired_mitigation" in keys, "the derived half stopped following _SUBTABLES"
+    assert "anchor_repair" in keys, "the named half was lost when the derived half moved"
+
+
+def test_a_cell_ALREADY_CARRYING_the_persisted_control_is_still_WRITABLE(tmp_path: Path) -> None:
+    """MUST APPLY, and without the key-set exclusion this refuses.
+
+    `render` strips the control, so the round-trip LOSES a key the live cell had, and the
+    field-preservation invariant is a pure key-set difference. Fixing #1369 without excusing it
+    would make every cell carrying the persisted flag permanently unwritable by this tool -- the
+    same unwritability #1308 had to undo once already, arriving from a new direction.
+    """
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace(
+            'reviewed_by = "fixture"\n', 'reviewed_by = "fixture"\nanchor_repair = true\n', 1
+        ),
+        encoding="utf-8",
+    )
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert live["1.1.1"]["anchor_repair"] is True, "the fixture splice did not land"
+
+    rc = main([str(_payload(tmp_path, [_cell_with_repair()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0, "the persisted control made the cell unwritable"
+    after = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert "anchor_repair" not in after["1.1.1"], "the control was persisted again"
+    assert after["1.1.1"]["anchor_repaired_at"] == "2026-08-09", after["1.1.1"]
+    # ...and the repair itself happened, so this is not passing by writing nothing.
+    assert after["1.1.1"]["evidence"][0]["line"] == 11
+
+
+def test_the_FREEZE_LIFTS_once_the_control_has_been_stripped(tmp_path: Path) -> None:
+    """THE WHOLE POINT OF THE ROW, driven end to end on the arm that actually writes.
+
+    Before: a repair persisted the flag, so the NEXT ordinary residual correction -- authored the
+    only way anyone authors one, by echoing the live cell -- carried it forward and was refused as
+    "declared anchor_repair but 'residual' differs from the record". After: the repair strips the
+    flag, so the echo carries no control and the correction goes through.
+    """
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE, encoding="utf-8")
+    assert (
+        main([str(_payload(tmp_path, [_cell_with_repair()])), "--scorecard", str(rec), "--apply"])
+        == 0
+    )
+
+    # Author the next payload the realistic way: echo the live cell, change the prose.
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["1.1.1"]
+    follow_up = dict(live)
+    follow_up["residual"] = "a later, ordinary correction"
+    follow_up["reviewed_by"] = "a later pass"
+    rc = main([str(_payload(tmp_path, [follow_up])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0, "the cell is still frozen -- the control survived the repair"
+    assert "a later, ordinary correction" in rec.read_text(encoding="utf-8")
+
+
+def test_the_repair_WITNESS_is_what_the_provenance_counter_reads(tmp_path: Path) -> None:
+    """The replacement signal, checked against its actual reader rather than asserted in isolation.
+
+    Consuming the control destroys the only thing in the record saying a repair happened. This drives
+    `anchor_provenance._repairs_declared` over a record the writer produced, so the decision to
+    replace the signal is verified where it is consumed -- not where it was written.
+    """
+    import anchor_provenance
+
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE, encoding="utf-8")
+    text = rec.read_text(encoding="utf-8")
+    assert anchor_provenance._repairs_declared(text) == 0, "the control must fire, not the fixture"
+
+    assert (
+        main([str(_payload(tmp_path, [_cell_with_repair()])), "--scorecard", str(rec), "--apply"])
+        == 0
+    )
+    after = rec.read_text(encoding="utf-8")
+    assert "anchor_repair = true" not in after, "the control was persisted"
+    assert anchor_provenance._repairs_declared(after) == 1, "the repair signal was destroyed"
 
 
 # --- BACKLOG #1476: a whole-file re-render from a stale clone reverts cells it never named ---------

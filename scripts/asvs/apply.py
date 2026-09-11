@@ -131,13 +131,43 @@ _SUBTABLES = ("evidence", "absence")
 #: name-keyed fix satisfies the symptom and drops the next field anyone adds" -- and that objection
 #: is right and applies here too. Deriving means a new sub-table brings its own control with it and
 #: this line never changes, while a hand list would rot exactly as the docstring predicts.
+#:
+#: The derivation above covers the `retired_{sub}` FAMILY and nothing else, which is the whole of
+#: what a derivation can reach. The constant below is the second source, for a control that belongs
+#: to no family.
+
+
+#: A control the `_SUBTABLES` derivation cannot reach, because it is not one of a family.
+#:
+#: NAMING IT IS CORRECT HERE AND IS NOT A RELAPSE INTO THE LIST `_carried` REJECTS, because the two
+#: lists fail in opposite directions. A name list governing DATA loses the next field anyone adds,
+#: silently and forever, and an absent field reads as a valid default -- that is the 7818991d
+#: incident. A name list governing CONTROLS fails by keeping one key too many: the control is simply
+#: persisted, which is visible in the record, readable by anyone who opens it, and recoverable on
+#: the next write. Cheap and loud against expensive and silent.
+#:
+#: `anchor_repair` was the one it missed. The same function consumes it as an instruction -- it
+#: relaxes the glyph and `reviewed_by` guards for exactly one run -- and nothing reads it back, so it
+#: sat in the record FREEZING the cell: a later ordinary residual correction, authored from the live
+#: cell and therefore carrying the flag forward, is refused with "declared anchor_repair but
+#: 'residual' differs from the record". That is the #1333 freeze shape, reintroduced through a
+#: persisted control.
+_NAMED_CONTROLS = ("anchor_repair",)
+
+#: The field the writer records INSTEAD, so consuming the instruction does not destroy the evidence.
+#: `anchor_provenance._repairs_declared` counts cells that declare a repair and its docstring says
+#: nothing else in the record marks one. That reader is why this exists: plain data, carrying the
+#: date of the pass, read as an instruction by nothing.
+_REPAIR_WITNESS = "anchor_repaired_at"
+
+
 def _control_keys() -> tuple[str, ...]:
     """Computed on EVERY call, deliberately, so the derivation is a live property rather than a
     snapshot. A module-level constant holding the same tuple is byte-identical in behaviour today and
     silently stops tracking `_SUBTABLES` the moment anyone edits it -- which is precisely the rot
     `_carried`'s docstring warns a name list invites. A mutation run proved that: a hand-written
     literal matching today's value passed every test, because there was no behaviour to differ on."""
-    return tuple(f"retired_{name}" for name in _SUBTABLES)
+    return tuple(f"retired_{name}" for name in _SUBTABLES) + _NAMED_CONTROLS
 
 
 #: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
@@ -235,7 +265,16 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # listed (BACKLOG #1369). Without it a retirement declaration is consumed at :468 and then written
     # back into the record, where nothing reads it -- the instruction outliving the operation.
     _controls = _control_keys()
-    for key, value in {**(live or {}), **cell}.items():
+    merged = {**(live or {}), **cell}
+    # THE INSTRUCTION IS CONSUMED; THE FACT IT RECORDED IS KEPT (BACKLOG #1369). Dropping
+    # `anchor_repair` un-freezes the cell, and it would also destroy the only thing in the record
+    # saying a repair ever happened -- `anchor_provenance._repairs_declared` counts exactly that, and
+    # its docstring says nothing else marks one. So the control leaves as DATA: same evidence,
+    # carrying the date of the pass, read as an instruction by nothing. A re-render of a cell that
+    # was never repaired adds nothing, so this cannot manufacture a witness.
+    if cell.get("anchor_repair"):
+        merged[_REPAIR_WITNESS] = str(cell.get("last_verified", ""))
+    for key, value in merged.items():
         if key in _ORDERED or key in _SUBTABLES or key in _controls:
             continue
         out.append(_scalar(key, value))
@@ -408,6 +447,17 @@ def main(argv: list[str] | None = None) -> int:
         # record that was not already in it, and an existing empty `reviewed_by` is preserved rather
         # than invented. Any difference in verdict or residual takes it out of this mode immediately.
         anchor_repair = bool(c.get("anchor_repair"))
+        if anchor_repair and live.get("anchor_repair"):
+            # A cell whose RECORD already carries the control is frozen, and the freeze is invisible
+            # from the payload's side: a payload authored by echoing the live cell carries the flag
+            # forward without anyone choosing it, and then every prose field must stay byte-identical
+            # or the run refuses. This write strips the key, so the freeze lifts here -- but say so,
+            # because a refusal the operator cannot explain gets re-run with an override.
+            print(
+                f"  note: {c.get('id')} carries a PERSISTED anchor_repair in the record "
+                "(BACKLOG #1369) and this write strips it. If the payload echoed it from the live "
+                "cell rather than meaning a fresh repair, drop it and re-run."
+            )
         if anchor_repair:
             # Assert byte-identity on EVERY prose-bearing field, not just the two the glyph check
             # reads. Holding only verdict+residual was sound by argument -- the writer never rewrites
@@ -555,8 +605,14 @@ def main(argv: list[str] | None = None) -> int:
         # Undeclared, or without the flag, the key stays in `lost` and refuses here exactly as before.
         # That asymmetry is what #1363 says any fix must preserve -- a bare reordering of the two
         # checks converts a loud false refusal into a quiet always-pass, which is worse than the bug.
+        #
+        # A CONTROL KEY ALREADY IN THE RECORD IS LIKEWISE NOT A DROPPED FIELD (#1369). `render`
+        # consumes controls and declines to store them, so rewriting a cell that already carries one
+        # strips it BY DESIGN -- and without this exclusion the fix for #1369 would make every such
+        # cell PERMANENTLY UNWRITABLE by this tool, which is the same unwritability #1308 had to
+        # undo once already. The strip is the point: it is what lifts the freeze.
         excused = {sub for sub in _SUBTABLES if allow_retirement and c.get(f"retired_{sub}")}
-        lost = set(was) - set(now) - excused
+        lost = set(was) - set(now) - excused - set(_control_keys())
         if lost:
             # Name the retirement route when the lost key is a sub-table. This refusal is otherwise
             # unanswerable for the one legitimate way to reach it -- the operator is told a key
