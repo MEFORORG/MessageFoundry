@@ -320,8 +320,9 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 
 > **What shipped, and three places it differs from the paragraph above.** As built: the baseline is
 > read before the claim is issued in both coordinators' `_maintain_leadership`; a new
-> `[cluster].lease_renew_timeout_seconds` (default **5.0**) is passed to asyncpg as the claim's own
-> per-statement `timeout=`; and `ClusterSettings._renew_fits_the_margin` refuses a config at load.
+> `[cluster].lease_renew_timeout_seconds` (**derived from the margin** when unset — half of it, capped
+> at 5.0 s, so 4.5 at the shipped 10/20/30) is passed to asyncpg as the claim's own per-statement
+> `timeout=`; and `ClusterSettings._renew_fits_the_margin` refuses a config at load.
 > `tests/test_adr0157_inc0_margin.py` carries the slow-renew fixture with an executed control arm
 > (the same `_check_fence`, driven from the pre-Inc-0 baseline, showing the two-leader window), plus
 > a mutation-confirmed red for each of the four changes.
@@ -329,10 +330,11 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 > 1. **The check's SUBJECT is the clamp, not `command_timeout`.** Once the renew stops inheriting
 >    `command_timeout`, a check written against `command_timeout` is a control resting on a premise
 >    its own increment made false. The rule is `lease_renew_timeout_seconds < (ttl − fence −
->    fence_tick)`; at the shipped 10/20/30 that margin is 9.0 s and the 5.0 default sits inside it, so
+>    fence_tick)`; at the shipped 10/20/30 that margin is 9.0 s and the derived 4.5 sits inside it, so
 >    **a stock configuration loads with no error and no warning**. That was the condition for shipping
 >    the check at all: one that fires on every install trains operators to ignore it, and an ignored
->    check withdraws the caution its absence would have preserved.
+>    check withdraws the caution its absence would have preserved. See 4: a *stock* install was not a
+>    wide enough condition, and the first cut of this increment failed it.
 > 2. **It REFUSES rather than warning.** The paragraph above specified a warning because the check as
 >    drafted fired on stock defaults, and a hard failure on every install is unshippable. Once the
 >    defaults pass cleanly that constraint is gone, the three neighbouring `[cluster]` validators all
@@ -344,6 +346,31 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    naming a bound that does not bind is the defect in 1, one level down. The **baseline stamp** did
 >    land on both coordinators, and on SQL Server it is currently the only thing keeping the margin
 >    real, which is why it was not scoped to Postgres with the clamp.
+> 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
+>    increment, before merge.** The first cut shipped a constant 5.0 and it refused **this
+>    repository's own failover configurations** at config load: `harness/load/profiles/failover.toml`
+>    (fence 4.0 / TTL 6.0, margin 1.2 s) and `tests/_failover_load_support.py` (fence 3.0 / TTL 5.0,
+>    margin 1.4 s). Both `messagefoundry serve` subprocesses of a failover load run would have aborted
+>    before the scenario started, because `harness/load/failover.py::_node_env` exports the fence
+>    timeout and the lease TTL and no clamp. Deviation 1's condition — *a stock install loads cleanly*
+>    — was met and was **not wide enough**: it tests one point in a two-dimensional space, and every
+>    legitimate tight pair sat outside it. The shipped `EARLY-ADOPTER-GUIDE.md` makes that concrete by
+>    telling operators to lower all three timings **proportionally**; under a constant 5.0 *every*
+>    proportional lowering past the stock values was refused, so the first operator to follow the
+>    shipped advice would have hit the guard and turned it off. A guard that refuses valid
+>    configurations does not get tightened, it gets deleted.
+>
+>    The fix is arithmetic, not a weakening: unset now means `min(5.0, 0.5 × margin)`. A constant
+>    cannot be right here, because the clamp's only requirement is `clamp < margin` and the margin is
+>    a function of the fence/TTL pair. The 0.5 is deliberately the same fraction as
+>    `pipeline.cluster._DEMOTE_BUDGET_FRACTION`, off the same margin: the teardown and a still-in-
+>    flight renew are **concurrent**, both start at the fence moment, so each takes half and each is
+>    strictly inside. An **explicitly set** clamp is still checked and still refused — never silently
+>    shrunk to fit, which would make the check accept everything — and a fence/TTL pair with **no
+>    margin at all** (`ttl − fence − fence_tick <= 0`, which `_fence_ordering` accepts: fence 4.0 /
+>    TTL 4.5 orders fine and leaves −0.3) is refused before the clamp is resolved, naming the pair
+>    rather than blaming the clamp. The derived value falls through the same check rather than
+>    returning early, so a mis-retuned derivation is a refusal and not a silently oversized clamp.
 >
 > **What the baseline stamp is worth, stated once because the rest of this ADR still says otherwise in
 > places now corrected.** The margin is `(t_exec + ttl) − (baseline + fence + fence_tick)`. With the

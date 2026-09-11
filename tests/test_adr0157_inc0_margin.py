@@ -13,12 +13,20 @@ Three things ship together here and each is pinned below.
    ``command_timeout = 0``).
 3. **A config-load check on the margin**, which ``_fence_ordering`` never made: it establishes
    ``fence < ttl`` and stops, so it accepts a pair whose remaining margin is a fraction of a second.
+   The clamp's default is DERIVED from that margin, so it cannot contradict it.
 
-**Both arms, or the checks prove nothing.** A stock configuration must load CLEANLY — a check that
-fires on every install trains operators to ignore it, and an ignored check withdraws the caution its
-absence would have preserved. So each refusal here is paired with the stock config passing, and the
-baseline test carries an executed control arm that reproduces the pre-Inc-0 stamp and shows the
-two-leader window it left open.
+**Both arms, or the checks prove nothing.** A check that refuses a legitimate configuration gets
+turned off by whoever hits it first, and an ignored check withdraws the caution its absence would
+have preserved. So each refusal here is paired with a load that must SUCCEED, and the baseline test
+carries an executed control arm that reproduces the pre-Inc-0 stamp and shows the two-leader window
+it left open.
+
+**"A stock install loads cleanly" is not a wide enough passing arm, and this module learned that the
+hard way.** The first cut of the increment shipped a fixed 5.0 clamp, met that condition, and refused
+this repository's OWN failover configurations — both engine subprocesses of a failover load run would
+have aborted at config load. One point in a two-dimensional space is not coverage of the space. The
+passing arm is therefore a CENSUS of every failover configuration the repository ships, driven
+through the harness's real environment export rather than a hand-built settings object.
 
 Severity, per CLAUDE.md section 0: **zero deployments**. Nothing is failing over anywhere today. This
 is what a first deployment running active-passive HA would have hit.
@@ -30,10 +38,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _failover_load_support import failover_test_profile
 from pydantic import ValidationError
 
+from harness.load.failover import FailoverPorts, _node_env
+from harness.load.profile import PROFILES_DIR, Failover, LoadProfileError, load_profile
 from messagefoundry.config.settings import (
     ClusterSettings,
+    _detection_margin_seconds,
     _fence_tick_seconds,
     load_settings,
 )
@@ -70,17 +82,19 @@ def test_the_settings_copy_of_the_fence_tick_matches_the_definition() -> None:
 # --- the new default, and the stock config that must pass cleanly -----------
 
 
-def test_the_renew_clamp_default_is_five_seconds() -> None:
-    assert ClusterSettings().lease_renew_timeout_seconds == 5.0
+def test_the_renew_clamp_default_is_derived_from_the_margin() -> None:
+    """Unset means DERIVED, not a constant. At the shipped 10/20/30 the margin is 9.0 s, so the clamp
+    resolves to half of it. The 5.0 s ceiling does not bind here -- it binds only past a 10 s margin."""
+    assert ClusterSettings().lease_renew_timeout_seconds == 4.5
 
 
 def test_a_stock_clustered_config_loads_cleanly(tmp_path: Path) -> None:
     """The paired arm of every refusal below. At the shipped 10/20/30 the margin is
-    30 - 20 - 1.0 = 9.0 s and the 5.0 default sits inside it with room, so an operator who changed
+    30 - 20 - 1.0 = 9.0 s and the derived clamp sits inside it with room, so an operator who changed
     nothing sees no error and no warning."""
     cfg = _write(tmp_path / "messagefoundry.toml", _PG + "[cluster]\nenabled = true\n")
     s = load_settings(config_path=cfg, environ={})
-    assert s.cluster.lease_renew_timeout_seconds == 5.0
+    assert s.cluster.lease_renew_timeout_seconds == 4.5
     # The margin the default is being held against, spelled out so a defaults change has to move this
     # number too rather than quietly consuming the slack.
     margin = (
@@ -92,19 +106,77 @@ def test_a_stock_clustered_config_loads_cleanly(tmp_path: Path) -> None:
     assert s.cluster.lease_renew_timeout_seconds < margin
 
 
+def test_the_derived_clamp_fits_every_margin_it_is_reachable_with() -> None:
+    """The by-construction property, which is the whole reason the default is derived.
+
+    A FIXED default cannot hold this. The first cut of this increment shipped a constant 5.0 and it
+    refused this repository's own failover profiles at config load -- the pairs two tests below. The
+    grid spans both fence-tick clamps (the 0.05 floor and the 1.0 ceiling) and margins either side of
+    the 10 s point where the derived clamp's own ceiling starts to bind, because a rule verified only
+    where one branch is taken is verified on one branch."""
+    pairs = [
+        (0.2, 0.3),  # sub-second margin, fence tick at its 0.05 floor
+        (2.0, 3.0),
+        (3.0, 5.0),
+        (4.0, 6.0),
+        (12.0, 20.0),
+        (20.0, 30.0),  # the shipped pair
+        (20.0, 45.0),  # margin 24.0 -- past the ceiling, so the ceiling binds
+        (99.0, 400.0),  # margin 300.0 -- far past it
+    ]
+    saw_ceiling_bind = False
+    for fence, ttl in pairs:
+        s = ClusterSettings(
+            heartbeat_seconds=min(1.0, fence / 2.0),
+            leader_fence_timeout_seconds=fence,
+            leader_lease_ttl_seconds=ttl,
+        )
+        margin = ttl - fence - _fence_tick_seconds(fence)
+        clamp = s.lease_renew_timeout_seconds
+        assert clamp is not None
+        assert 0 < clamp < margin, (fence, ttl, clamp, margin)
+        saw_ceiling_bind |= clamp == 5.0
+    # Without this the grid could be all short margins and still pass, proving nothing about the cap.
+    assert saw_ceiling_bind, "no pair in the grid exercised the derived clamp's ceiling"
+
+
 # --- the margin check fires on a genuinely unsafe configuration -------------
 
 
 def test_a_renew_clamp_wider_than_the_margin_is_refused(tmp_path: Path) -> None:
     """heartbeat/fence/ttl of 1/2/3 passes ``_fence_ordering`` — fence is below the TTL — and leaves a
-    0.6 s margin against a 5.0 s renew clamp. That is the configuration the ordering check accepts and
-    this one must not."""
+    0.6 s margin against the 5.0 s renew clamp pinned here. That is the configuration the ordering
+    check accepts and this one must not.
+
+    The clamp is set EXPLICITLY because that is now the only way to reach this refusal: left unset it
+    would be derived to 0.3 and fit. An explicit value is never silently shrunk to fit — a check that
+    rewrites its subject to pass accepts everything, which is the same as not checking."""
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         _PG + "[cluster]\nenabled = true\nheartbeat_seconds = 1\n"
-        "leader_fence_timeout_seconds = 2\nleader_lease_ttl_seconds = 3\n",
+        "leader_fence_timeout_seconds = 2\nleader_lease_ttl_seconds = 3\n"
+        "lease_renew_timeout_seconds = 5.0\n",
     )
     with pytest.raises(ValidationError, match="lease_renew_timeout_seconds"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_a_fence_ttl_pair_with_no_margin_at_all_is_refused(tmp_path: Path) -> None:
+    """The refusal no clamp can escape, and the one the derived default must NOT paper over.
+
+    fence 4.0 / TTL 4.5 orders fine, so ``_fence_ordering`` passes it, but the fence tick is 0.8 and
+    the margin is -0.3: detection can land at or after the moment the lease expires and a standby
+    acquires. Deriving the clamp cannot fix that — there is no positive number below -0.3 — so this
+    refuses BEFORE the clamp is resolved, and names the fence/TTL pair rather than blaming the clamp.
+
+    Without this arm, making the default derived would have turned a refusal into a silent pass on the
+    one pair where the margin is genuinely gone."""
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        _PG + "[cluster]\nenabled = true\nheartbeat_seconds = 1\n"
+        "leader_fence_timeout_seconds = 4.0\nleader_lease_ttl_seconds = 4.5\n",
+    )
+    with pytest.raises(ValidationError, match="NO demotion detection margin"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -149,6 +221,96 @@ def test_a_non_positive_renew_clamp_is_refused(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError, match="lease_renew_timeout_seconds"):
         load_settings(config_path=cfg, environ={})
+
+
+# --- the repository's OWN failover configurations still load ----------------
+#
+# The arm the first cut of this increment did not have, and the one that would have caught it. A fixed
+# 5.0 default refused BOTH configurations below at config load, so both `messagefoundry serve`
+# subprocesses of a failover load run would have aborted before the scenario started. Nothing in the
+# suite noticed, because nothing drove the real settings path with the real profile timings.
+
+
+def _failover_timings() -> dict[str, Failover]:
+    """Every failover configuration this repository ships, read from the shipped files.
+
+    Enumerated rather than listed, so a profile added later is covered without editing this test.
+    ``load_profile`` refuses the profiles carrying other harness entry points' top-level tables
+    (``connscale``, ``estate``), which are not failover profiles — but skipping on a raised error
+    would also skip a failover profile that failed to load for a real reason, so the set is
+    cross-checked against a raw text scan below."""
+    declares = {
+        path.name
+        for path in sorted(PROFILES_DIR.glob("*.toml"))
+        if "[load.failover]" in path.read_text(encoding="utf-8")
+    }
+    found: dict[str, Failover] = {}
+    for path in sorted(PROFILES_DIR.glob("*.toml")):
+        try:
+            profile = load_profile(path)
+        except LoadProfileError:
+            continue
+        if profile.failover is not None:
+            found[path.name] = profile.failover
+    # The negative control on the enumeration: a file that DECLARES the table but did not survive the
+    # load would otherwise vanish from this census silently, and a census that cannot report a miss is
+    # not a census.
+    assert declares == set(found), (declares, set(found))
+
+    ci = failover_test_profile()
+    assert ci.failover is not None
+    found["tests/_failover_load_support.py"] = ci.failover
+    return found
+
+
+def test_the_census_of_shipped_failover_configurations_is_not_empty() -> None:
+    """The positive control for the test below. A glob that matches nothing makes a parametrized test
+    vacuously green, and a zero is a fact about the pattern, not about the repository."""
+    timings = _failover_timings()
+    assert "failover.toml" in timings
+    assert "tests/_failover_load_support.py" in timings
+    assert len(timings) >= 2
+
+
+@pytest.mark.parametrize("source", sorted(_failover_timings()))
+def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
+    source: str, tmp_path: Path
+) -> None:
+    """Drive the REAL settings path with the REAL exported environment, not a hand-built object.
+
+    ``harness/load/failover.py::_node_env`` is what actually configures the two engine subprocesses,
+    and it exports the fence timeout and the lease TTL but no renew clamp — so whatever the clamp
+    defaults to is what those nodes get. Building a ``ClusterSettings`` by hand here would test the
+    validator against numbers a human retyped; going through ``_node_env`` + ``load_settings`` tests it
+    against the numbers the harness will really export.
+
+    The fence/TTL assertions are the aim check: if ``_node_env`` stopped exporting the timings, the
+    settings would silently fall back to the stock 20/30, the clamp would fit, and this test would pass
+    while covering nothing."""
+    fo = _failover_timings()[source]
+    ports = FailoverPorts(
+        inbound_adt=2600,
+        inbound_results=2601,
+        inbound_other=2602,
+        sink=2700,
+        sink_count=2,
+        api_a=2800,
+        api_b=2801,
+    )
+    env = _node_env({}, node_id="fo-a", ports=ports, fo=fo, sink_host="127.0.0.1")
+    cfg = _write(tmp_path / "messagefoundry.toml", _PG)
+
+    s = load_settings(config_path=cfg, environ=env)
+
+    assert s.cluster.enabled
+    assert s.cluster.leader_fence_timeout_seconds == fo.leader_fence_timeout_seconds
+    assert s.cluster.leader_lease_ttl_seconds == fo.leader_lease_ttl_seconds
+    margin = _detection_margin_seconds(
+        s.cluster.leader_fence_timeout_seconds, s.cluster.leader_lease_ttl_seconds
+    )
+    clamp = s.cluster.lease_renew_timeout_seconds
+    assert clamp is not None
+    assert 0 < clamp < margin, (source, clamp, margin)
 
 
 # --- the clamp reaches the statement ----------------------------------------

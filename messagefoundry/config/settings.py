@@ -3356,6 +3356,45 @@ def _fence_tick_seconds(fence_timeout_seconds: float) -> float:
     return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
 
 
+def _detection_margin_seconds(fence_timeout_seconds: float, lease_ttl_seconds: float) -> float:
+    """The demotion DETECTION MARGIN: what is left of the lease after the fence timeout elapses.
+
+    ``ttl - fence - fence_tick``. The watchdog polls once per tick, so detection lands up to one tick
+    after the fence timeout, and the tick is why this is not simply ``ttl - fence``. Everything the
+    ex-leader still has to do -- tear the graph down, and stop a renew it issued before it fenced --
+    has to fit inside this remainder. Written once here because three callers below need it."""
+    return lease_ttl_seconds - fence_timeout_seconds - _fence_tick_seconds(fence_timeout_seconds)
+
+
+#: Absolute cap on the DERIVED renew clamp. A renew is one small UPDATE; waiting longer than this for
+#: it is pathological whatever the lease timings are. It binds only when the margin exceeds 10.0 s, so
+#: it does not bind at the shipped 10/20/30 (margin 9.0, derived 4.5).
+_RENEW_CLAMP_CEILING_SECONDS = 5.0
+
+#: Share of the detection margin the derived renew clamp may take. Deliberately the same 0.5 as
+#: ``pipeline.cluster._DEMOTE_BUDGET_FRACTION``, off the same margin, because the two things that must
+#: fit inside it are CONCURRENT, not sequential: at the fence moment the ex-leader starts tearing the
+#: graph down while a renew it issued beforehand may still be in flight. Each gets half, each is
+#: strictly inside the margin, and neither has to know the other's number.
+_RENEW_CLAMP_MARGIN_FRACTION = 0.5
+
+
+def _derived_renew_timeout_seconds(margin_seconds: float) -> float:
+    """The renew clamp for an operator who did not set one, as a function of the margin it must fit.
+
+    A FIXED default cannot do this job. The clamp's only correctness requirement is
+    ``clamp < margin``, and the margin is a function of the fence/TTL pair, so any constant is wrong
+    for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
+    (``harness/load/profiles/failover.toml``, margin 1.2 s) at config load. Deriving it instead means
+    a tight fence/TTL pair gets a proportionally tight clamp rather than a refusal, and the default
+    can never contradict the margin: ``margin > 0`` is checked first, so
+    ``min(ceiling, 0.5 * margin) < margin`` holds for every margin this is reachable with.
+
+    An EXPLICIT value is never silently clamped down to this -- it is checked and refused, because
+    quietly overriding an operator's number would make the check unfalsifiable."""
+    return min(_RENEW_CLAMP_CEILING_SECONDS, _RENEW_CLAMP_MARGIN_FRACTION * margin_seconds)
+
+
 class ClusterSettings(_Section):
     """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
@@ -3429,10 +3468,18 @@ class ClusterSettings(_Section):
     # per-statement override there lives in `store/sqlserver.py`. That is a NAMED, open residual of
     # ADR 0157 Inc 0 — not something this setting silently covers.
     #
-    # Must be > 0 and strictly below the detection margin (ttl - fence - fence_tick); at the shipped
-    # 10/20/30 that margin is 9.0 s, so the 5.0 default passes with room. Lower it before you tighten
-    # the fence/TTL pair, or the load-time check refuses the pair.
-    lease_renew_timeout_seconds: float = 5.0
+    # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
+    # capped at 5.0 s. A fixed default cannot be right here. The clamp's correctness requirement is
+    # `clamp < (ttl - fence - fence_tick)`, which is a function of the fence/TTL pair, so a constant is
+    # wrong for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
+    # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
+    # proportionally tight clamp instead of a refusal, and the default can never contradict the margin
+    # by construction. At the shipped 10/20/30 the margin is 9.0 s and this resolves to 4.5.
+    #
+    # Set it EXPLICITLY and it is checked, not clamped: a value that does not fit the margin is
+    # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
+    # fit would make the check unfalsifiable -- it would accept everything. Must be > 0.
+    lease_renew_timeout_seconds: float | None = None
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
     # (byte-identical to before this knob existed). A preferred site keeps its nodes at 0.0 and a warm
@@ -3463,12 +3510,21 @@ class ClusterSettings(_Section):
         "reclaim_interval_seconds",
         "leader_lease_ttl_seconds",
         "leader_fence_timeout_seconds",
-        "lease_renew_timeout_seconds",
     )
     @classmethod
     def _positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be > 0")
+        return value
+
+    @field_validator("lease_renew_timeout_seconds")
+    @classmethod
+    def _positive_renew_clamp(cls, value: float | None) -> float | None:
+        # Split out of _positive above because None is this field's "derive it" sentinel, and the
+        # shared validator would compare None to 0. There is deliberately no "0 disables" escape
+        # hatch: an unbounded renew is the defect the knob removes.
+        if value is not None and value <= 0:
+            raise ValueError("must be > 0 (leave it unset to derive it from the detection margin)")
         return value
 
     @field_validator("acquire_delay_seconds")
@@ -3519,25 +3575,60 @@ class ClusterSettings(_Section):
 
     @model_validator(mode="after")
     def _renew_fits_the_margin(self) -> ClusterSettings:
-        """The MARGIN check ``_fence_ordering`` does not make (ADR 0157 Inc 0).
+        """Resolve the renew clamp against the detection margin, and refuse a pair that has none.
 
-        ``_fence_ordering`` establishes ``fence < ttl`` and stops there, so it accepts a pair whose
-        remaining detection margin is a fraction of a second. The margin is
-        ``ttl - fence - fence_tick``: the watchdog polls once per tick, so detection lands up to one
-        tick after the fence timeout elapses. Everything the ex-leader still has to do -- tear the
-        graph down, and stop a renew it issued before it fenced -- has to fit inside that remainder.
+        The MARGIN check ``_fence_ordering`` does not make (ADR 0157 Inc 0). ``_fence_ordering``
+        establishes ``fence < ttl`` and stops there, so it accepts a pair whose remaining margin --
+        ``ttl - fence - fence_tick``, see :func:`_detection_margin_seconds` -- is a fraction of a
+        second, or negative.
 
-        This checks the one of those that is a configured number: the renew clamp must be strictly
-        below the margin. **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157
-        Inc 4/5) is derived from the same remainder and bounds the source phase only.
+        Three outcomes, in order:
+
+        1. **No margin at all** (``<= 0``, or NaN): refused outright. The fence fires so close to the
+           lease expiry that no clamp of any size fits, so this is not about the clamp and lowering it
+           cannot help. ``_fence_ordering`` accepts such a pair -- fence 4.0 / TTL 4.5 orders fine and
+           leaves -0.3 s.
+        2. **Clamp unset**: DERIVED from the margin (:func:`_derived_renew_timeout_seconds`) and filled
+           in here, so every consumer downstream reads a concrete float. This is why the default
+           cannot refuse a legitimate pair -- there is no constant to contradict the margin. It is
+           then held to the same rule below rather than trusted, so a mis-retuned derivation is a
+           refusal and not a silently oversized clamp.
+        3. **Clamp set explicitly**: it must be strictly below the margin, or refused. Not silently
+           clamped: a check that rewrites its subject to pass accepts everything, which is the same as
+           not checking. An operator who tightens the fence/TTL pair under a pinned clamp gets told.
+
+        **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157 Inc 4/5) is derived
+        from the same margin and bounds the source phase only.
 
         **Backend scope.** ``lease_renew_timeout_seconds`` clamps the Postgres coordinator's renew.
         The SQL Server coordinator's renew still inherits ``[store].command_timeout``, an open ADR 0157
         Inc 0 residual, so on that backend this checks a value the renew does not yet use. Said here
         rather than left to be inferred from a green config load."""
         tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
-        margin = self.leader_lease_ttl_seconds - self.leader_fence_timeout_seconds - tick
-        # Written as a positive test so a NaN fails it too, as _vip_fits_the_cluster is.
+        margin = _detection_margin_seconds(
+            self.leader_fence_timeout_seconds, self.leader_lease_ttl_seconds
+        )
+        # Written as positive tests so a NaN fails them too, as _vip_fits_the_cluster is.
+        if not margin > 0:
+            raise ValueError(
+                "cluster lease timing leaves NO demotion detection margin: "
+                "(leader_lease_ttl_seconds - leader_fence_timeout_seconds - the fence tick) must "
+                "be > 0 "
+                f"(got leader_lease_ttl_seconds={self.leader_lease_ttl_seconds}, "
+                f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
+                f"fence tick={tick}, so the margin is {margin}) -- the self-fence watchdog polls once "
+                "per tick, so detection can land at or after the moment the lease expires and a "
+                "standby acquires it. Widen the gap between leader_fence_timeout_seconds and "
+                "leader_lease_ttl_seconds; no lease_renew_timeout_seconds fits this pair"
+            )
+        if self.lease_renew_timeout_seconds is None:
+            self.lease_renew_timeout_seconds = _derived_renew_timeout_seconds(margin)
+        # The derived value FALLS THROUGH the same check rather than returning early. It cannot fail it
+        # as written -- see _derived_renew_timeout_seconds -- and that is exactly why the check runs on
+        # it: "correct by construction" is a claim about today's arithmetic, and the construction is
+        # two constants and a `min` that a later retune can get wrong. Checked beats asserted. Verified
+        # by mutation: breaking the derivation back to a fixed 5.0 makes this refuse the repository's
+        # own failover profiles instead of silently handing them an oversized clamp.
         if not self.lease_renew_timeout_seconds < margin:
             raise ValueError(
                 "cluster lease timing leaves no room for the renew clamp: "
@@ -3548,8 +3639,9 @@ class ClusterSettings(_Section):
                 f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
                 f"fence tick={tick}, so the margin is {margin}) -- a renew still in flight when this "
                 "node self-fences can re-extend the lease it is standing down from, and a standby "
-                "cannot take over until that extension expires. Lower lease_renew_timeout_seconds, or "
-                "widen the gap between the fence timeout and the TTL"
+                "cannot take over until that extension expires. Lower lease_renew_timeout_seconds, "
+                "unset it to derive it from the margin, or widen the gap between the fence timeout "
+                "and the TTL"
             )
         return self
 

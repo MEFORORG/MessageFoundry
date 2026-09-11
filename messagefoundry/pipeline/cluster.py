@@ -1628,7 +1628,14 @@ def build_coordinator(
         # ADR 0157 Inc 0. Threaded to this coordinator ALONE: SqlServerCoordinator above has no
         # per-statement seam to apply it through (its renew still inherits [store].command_timeout
         # via the ODBC connection), so passing it there would name a bound that does not bind.
-        lease_renew_timeout_seconds=getattr(cluster_settings, "lease_renew_timeout_seconds", 5.0),
+        #
+        # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
+        # validator, so a real settings object always hands over a concrete float and the derivation
+        # is not copied here. The `or` covers a DUCK-TYPED settings stand-in that carries the field
+        # unresolved -- this function takes `Any` on purpose and several tests pass a SimpleNamespace.
+        lease_renew_timeout_seconds=(
+            getattr(cluster_settings, "lease_renew_timeout_seconds", None) or 5.0
+        ),
         acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
         promotable=getattr(cluster_settings, "promotable", True),
         db_schema=db_schema,
