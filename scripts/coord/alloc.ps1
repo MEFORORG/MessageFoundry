@@ -40,7 +40,7 @@
 
     -For NAMES THE OWNER AT BIRTH. IT IS NOT A TRANSFER VERB, AND THE DIFFERENCE IS THE WHOLE ARGUMENT.
     A claim records the tree that will COMMIT the number, and by default that is the tree the allocator
-    runs in. When one seat allocates on another seat's behalf -- a Console reading the backlog and
+    runs in. When one seat allocates on another seat's behalf -- a Manager reading the backlog and
     cutting a brief for a Builder in a different worktree -- the default records the wrong tree, both of
     ledger_check.py's ownership keys miss, and the gate correctly refuses the Builder's commit. Nothing
     can then move the number, so the work is re-filed at a fresh one and the first is burned. Measured
