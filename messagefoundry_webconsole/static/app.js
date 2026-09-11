@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // First-party JS for the /ui ops dashboard (ADR 0065). No third-party JS — CSP script-src 'self'.
 //
 // Dispatch registry: each page feature registers a (hook-selector, init) pair via feature(); on load

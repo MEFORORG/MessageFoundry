@@ -1,4 +1,4 @@
-# Copyright (c) MessageFoundry contributors.
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """A3 — value-level coverage for the per-PID CPU collector, and for the SUBTREE the values cover.
 

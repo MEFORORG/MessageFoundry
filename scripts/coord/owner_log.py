@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """OWNER ITEM LOG -- the four-leg ledger for anything routed to the repository owner.
 
 WHY THIS EXISTS. The prior send log recorded that an item was SENT and never that it was

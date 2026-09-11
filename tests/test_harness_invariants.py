@@ -1,4 +1,4 @@
-# Copyright (c) MessageFoundry contributors.
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """A4 — structural guards against the harness's ONE bug class.
 
