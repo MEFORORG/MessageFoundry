@@ -99,7 +99,12 @@ async def test_background_polls_do_not_refresh_the_idle_clock(engine: Engine) ->
         user = await service.store.get_user_by_username("op")
         assert user is not None
         before = await _session_last_used(service, user.id)
-        for path in ("/ui/nav-status", "/ui/connections", "/ui/monitoring/live"):
+        for path in (
+            "/ui/nav-status",
+            "/ui/connections",
+            "/ui/monitoring/live",
+            "/ui/cluster/live",
+        ):
             assert (await c.get(path)).status_code == 200, path
         assert (await c.get("/ui/session-status")).status_code == 200
         assert await _session_last_used(service, user.id) == before

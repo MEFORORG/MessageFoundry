@@ -6,6 +6,10 @@ GET /ui/account/sessions
 GET /ui/ad-groups
 GET /ui/alerts
 GET /ui/audit
+GET /ui/cluster
+GET /ui/cluster/force-stepdown-confirm
+GET /ui/cluster/live
+GET /ui/cluster/stepdown-confirm
 GET /ui/config
 GET /ui/connection/{name}
 GET /ui/connections
@@ -56,6 +60,8 @@ POST /ui/alerts/{alert_id}/ack
 POST /ui/alerts/{alert_id}/resolve
 POST /ui/alerts/{alert_id}/resume
 POST /ui/alerts/{alert_id}/suspend
+POST /ui/cluster/force-stepdown
+POST /ui/cluster/stepdown
 POST /ui/config/reload
 POST /ui/connections/bulk-control
 POST /ui/connections/purge-bulk

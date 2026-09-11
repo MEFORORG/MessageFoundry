@@ -18,6 +18,7 @@ from __future__ import annotations
 from .account import *  # noqa: F401,F403
 from .admin import *  # noqa: F401,F403
 from .audit import *  # noqa: F401,F403
+from .cluster import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .connections import *  # noqa: F401,F403
 from .messages import *  # noqa: F401,F403

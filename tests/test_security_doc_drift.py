@@ -64,9 +64,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # POST /ui/uploaded-logs/file/{file_id}/filter, so the needle can travel in a body instead of a URL.
 # BACKLOG #1494 (ADR 0056 slice 1) added one JSON route -- POST /cluster/stepdown, the planned-failover
 # control plane -- so each basis moved by one.
+# BACKLOG #1495 added six /ui routes -- the High Availability page, its live fragment, and a confirm
+# GET plus a stepdown POST for each of the planned and forced variants -- and no JSON route.
 _ROUTES_DEFAULT = 109
 _ROUTES_WITH_DOCS = 113
-_ROUTES_WITH_UI = 210
+_ROUTES_WITH_UI = 216
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -101,6 +103,10 @@ _MULTI_PERMISSION_ROUTES = frozenset(
         # `messages:view_raw` alongside `messages:edit`.
         ("GET", "/ui/messages/{message_id}/edit"),
         ("POST", "/ui/messages/{message_id}/edit-resend"),
+        # BACKLOG #1495: each stepdown confirm page re-reads cluster membership through the
+        # monitoring:read handlers before it offers the cluster:control POST.
+        ("GET", "/ui/cluster/stepdown-confirm"),
+        ("GET", "/ui/cluster/force-stepdown-confirm"),
     }
 )
 
@@ -767,7 +773,7 @@ def test_route_count_parity_with_the_console_mounted() -> None:
     pytest.importorskip("messagefoundry_webconsole")
     assert len(create_app(serve_ui=True).routes) == _ROUTES_WITH_UI, (
         "the /ui plane's route count changed; update docs/SECURITY.md's counting basis and the "
-        "'100 routes + one /ui/static mount' statement in the same change."
+        "'106 routes + one /ui/static mount' statement in the same change."
     )
 
 
@@ -917,7 +923,7 @@ def _ui_route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
 
 
 def test_every_ui_route_appears_in_the_ui_route_map() -> None:
-    """The console plane is 100 of the 210 route objects a ``serve_ui=True`` app serves — 209 endpoint
+    """The console plane is 106 of the 216 route objects a ``serve_ui=True`` app serves — 215 endpoint
     functions plus the one ``/ui/static`` mount — and the SOLE operator UI in the deployed posture, so
     8.1.1's "every function" includes it.
 

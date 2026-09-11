@@ -134,7 +134,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f8809a31f626de15"
+ENGINE_UI_SEAM: str = "c609055939e9a577"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +172,9 @@ class CoreHandlers:
     security_posture: Callable[..., Awaitable[Any]]
     cluster_status: Callable[..., Awaitable[Any]]
     cluster_nodes: Callable[..., Awaitable[Any]]
+    # Planned failover (ADR 0056, BACKLOG #1495): the High Availability page's one control. Its JSON
+    # gate is require_step_up(CLUSTER_CONTROL), so the /ui route must be require_ui_step_up.
+    cluster_stepdown: Callable[..., Awaitable[Any]]
     dr_status: Callable[..., Awaitable[Any]]
     service_status: Callable[..., Awaitable[Any]]
     ack_alert: Callable[..., Awaitable[Any]]

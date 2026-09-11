@@ -20,12 +20,21 @@ engine compatibility range.
 this line.**
 
 ### Added
+- **High Availability page** (BACKLOG #1495, ADR 0056). `/ui/cluster`, under Monitoring, renders
+  cluster membership, each node's state and the leadership lease from whichever node serves it, and
+  refreshes every 5 seconds. It carries one control: a planned stepdown of the node serving it, behind
+  a step-up confirm page, plus a separate forced drain for the last promotable node. Each refusal the
+  engine returns (400, 409, 412, 503) gets its own guidance. It renders no VIP owner, because the
+  engine binds no address.
 - **Engine-wide KPI headline on the status page** (BACKLOG #93). The status page now renders the
   top-line roll-up the engine surfaces on `/status` as `SystemStatus.kpis`: combined inbound+outbound
   endpoint count (running/stopped), total messages, and an engine-wide msg/s rate. Metadata only, no
   PHI.
 
 ### Changed
+- **The engine UI seam moved for the High Availability page** (BACKLOG #1495): `CoreHandlers` gained
+  `cluster_stepdown`, and the console now constructs `ClusterStepdownRequest`. Same one-value
+  `SUPPORTED_ENGINE_SEAMS` rule as the entry below.
 - **The engine UI seam moved** (`SystemStatus` gained the additive `kpis` field, so the contract
   surface changed). `SUPPORTED_ENGINE_SEAMS` holds the one new value, so this console build refuses
   any engine but the one it was built against -- including an engine one contract behind, whatever

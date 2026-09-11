@@ -271,7 +271,7 @@ def wordmark(*, tm: bool = False) -> Markup:
 #: here falls into a trailing "More" menu, so a new page lane still appears without editing this.
 _NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Traffic", ("dashboard", "messages", "dead-letters", "events")),
-    ("Monitoring", ("status", "alerts", "flow", "audit", "uploaded-logs")),
+    ("Monitoring", ("status", "cluster", "alerts", "flow", "audit", "uploaded-logs")),
     ("Admin", ("users", "config")),
     ("Account", ("account", "security-events")),
 )

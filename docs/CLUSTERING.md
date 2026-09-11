@@ -340,6 +340,9 @@ service out from under a live feed. The node **releases its leadership lease and
 to standby: a standby acquires the expired lease on its next heartbeat and promotes its graph, and the
 node you drained stays up, heartbeating, ready to take leadership back later.
 
+The web console's **High Availability** page (`/ui/cluster`) makes this call for the node that serves
+it, behind a confirm page, and gives each refusal below its own guidance.
+
 ```
 POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last promotable node
 { "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5,

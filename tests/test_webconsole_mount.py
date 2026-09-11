@@ -33,6 +33,7 @@ _REPRESENTATIVE_ROUTES = (
     "/ui/connections",
     "/ui/dead-letters",
     "/ui/status",
+    "/ui/cluster",
     "/ui/users",
     "/ui/audit",
 )
