@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Minimal stdlib ``multipart/form-data`` parser for the uploaded-logs endpoint (ADR 0134).
 
 **No `python-multipart`.** The engine deliberately carries no multipart dependency — the console

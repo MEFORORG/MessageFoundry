@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Real :class:`~messagefoundry.pipeline.alerts.AlertSink` transports — webhook + email.
 
 The :class:`AlertSink` emit methods are called **inline on a delivery worker** and must be cheap and

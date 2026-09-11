@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shape-pin: neither server-DB runbook may instruct an operator to over-grant the engine login.
 
 ASVS 13.2.2 scores least-privilege backend-component accounts, and ``docs/AOAG-DEPLOYMENT.md``

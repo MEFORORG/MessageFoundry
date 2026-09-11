@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """AuthService-level MFA (TOTP) tests (WP-14, ASVS 6.3.3).
 
 Covers the full second-factor lifecycle — enrollment to confirm to recovery codes, the step-up MFA

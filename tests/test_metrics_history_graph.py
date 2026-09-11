@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Historical-metrics ring + status-colored by-name data-flow graph (BACKLOG #76, ADR 0065 amendment).
 
 Covers the two read-only, ``monitoring:read`` endpoints the console Flow & trends page renders from:

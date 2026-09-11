@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQL Server-backed cluster coordinator for **active-passive HA** (SQL Server store, Phase 4).
 
 The Postgres :class:`~messagefoundry.pipeline.cluster.DbCoordinator` drives an asyncpg pool; the SQL

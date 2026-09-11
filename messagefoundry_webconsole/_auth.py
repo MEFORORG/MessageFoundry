@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cookie-based auth for the /ui ops dashboard, CONFINED to /ui (ADR 0065 §3).
 
 ``require_ui(*perms, phi=...)`` mirrors ``api.security.require`` / ``require_phi_read`` but reads the

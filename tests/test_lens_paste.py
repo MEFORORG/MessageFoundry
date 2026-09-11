@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``lens rewrite`` — the Steps view BLOCK paste op (``paste_block``) + the CUT delete-broadening (ADR
 0076 §5 / ADR 0089 block-cut).
 

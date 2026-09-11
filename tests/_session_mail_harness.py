@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared fixture and helpers for the session-mail suite (``test_session_mail*.py``).
 
 Extracted so the suite can live in more than one FILE. Under ``pytest -n N --dist loadfile`` a file

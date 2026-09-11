@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Always-run unit tests for the failover-load harness — the PURE pieces, no live engines.
 
 The full two-node SIGKILL run is container-gated (``tests/test_load_failover_{postgres,sqlserver}.py``);

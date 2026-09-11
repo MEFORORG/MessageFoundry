@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Traced dry-run (ADR 0072): the ADR gate tests + capture-semantics coverage.
 
 Gates asserted here (ADR 0072):

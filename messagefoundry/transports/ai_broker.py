@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Engine-brokered AI-assistance HTTP client (ADR 0135, BACKLOG #95).
 
 The broker POSTs a **code_only** assist prompt to a CUSTOMER-MANAGED / self-hosted LLM endpoint and

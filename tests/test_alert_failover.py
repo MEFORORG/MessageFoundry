@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """HA / DR failover event alerts (#145, ADR 0014 amendment): the new leadership_acquired / dr_activated
 alert events + their leadership_lost / dr_released auto-resolving inverses, emitted at the cluster
 leadership transitions (DbCoordinator + SqlServerCoordinator, in lockstep) and the DR activate/release."""

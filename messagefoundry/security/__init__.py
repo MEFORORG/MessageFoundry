@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Security assets shipped in the wheel (ADR 0144 Increment 3).
 
 Currently the opt-in Semgrep taint rules for operator-authored Router/Handler config. Semgrep is

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Outcome-aware elevation `control_service_ex` (ADR 0113 §4).
 
 The native ShellExecuteExW/wait/exit-code plumbing (`_runas_wait`) is Windows-only and covered by

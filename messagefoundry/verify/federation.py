@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Federated-SSO (OIDC) verify section — ADR 0142, BACKLOG #274.
 
 Wheel-only and **offline by default**: nothing here opens a socket, so `verify` never makes a

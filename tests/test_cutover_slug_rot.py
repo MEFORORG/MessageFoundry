@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guards against "slug rot" — the damage the retired publish pipeline left behind.
 
 Before the MEFORORG cutover, `scripts/publish/publish.ps1` rewrote the private source slug to the

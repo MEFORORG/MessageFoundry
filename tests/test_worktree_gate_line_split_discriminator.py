@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 r"""The per-line split hides a gated command only on the PAIR'S OWN LINE (BACKLOG #1427 / #1429).
 
 TWO LEDGER ROWS SAID OPPOSITE THINGS ABOUT ONE SUBJECT, AND BOTH WERE LOCALLY TRUE. #1427 tabled the

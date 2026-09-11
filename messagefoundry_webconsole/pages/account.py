@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Auth/session/account page builders for the /ui ops dashboard (ADR 0065): sign-in, step-up
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 

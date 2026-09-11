@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An item's banner ``Verdict`` and its prose re-score must not disagree (BACKLOG #1342).
 
 Three open items declare ``Verdict: build`` in the banner block and ``Re-scored -> DEMAND-GATE`` in

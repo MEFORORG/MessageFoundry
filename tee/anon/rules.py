@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The de-identification **rule model** — which HL7 field gets which *kind* of surrogate (ADR 0030 §2).
 
 A de-id rule has two halves and the project identity dictates which is which:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Leader-only maintenance + engine clustering wiring (Track B Step 4) — always-run unit tests (no DB).
 
 These prove, with fakes:

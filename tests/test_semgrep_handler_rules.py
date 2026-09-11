@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The packaged Semgrep handler-security rules ship in the wheel and are well-formed (ADR 0144 Inc 3).
 
 Semgrep is NOT a project dependency, so authoritative rule-syntax/behaviour validation is the

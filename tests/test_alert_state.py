@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Operator alert-state — the resolvable ``alert_instance`` store layer + the ``NotifierAlertSink``
 side-observer that upserts/auto-resolves it (ADR 0044, #56).
 

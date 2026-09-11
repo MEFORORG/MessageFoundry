@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.1.3 (WP-L3-02) scanner-behaviour guard for the widened crypto-discovery gate.
 
 Sibling of ``tests/test_crypto_inventory_doc.py`` (the §4 doc-truth guard) and #283's

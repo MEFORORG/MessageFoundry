@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 7.2.4 — rotation WIRED at the five elevation call sites, asserted by BEHAVIOUR.
 
 ``tests/test_session_rotation_primitive.py`` pins ``_rotate_session_token`` itself. This file pins

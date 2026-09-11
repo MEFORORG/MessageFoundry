@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-019 (CWE-427): the sibling-helper import finder must serve ONLY the documented ``_``-prefixed
 helper convention, so a config-dir file named after a real stdlib/installed module can't shadow it."""
 

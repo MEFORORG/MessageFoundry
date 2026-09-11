@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The committed IDE data artifacts must stay in sync with the code that generates them.
 
 A stale bundle ships wrong field-picker scope/badges silently (the IDE ships only the JSON, never runs

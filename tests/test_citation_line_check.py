@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The citation-line checker must fire on a drifted citation and stay quiet on everything else (#1263).
 
 Every test is one half of a PAIR. The naive form of this check -- match any backticked word near the

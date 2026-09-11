@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 B5 PR3 — dispatch-wiring tests (non-gated, run in normal CI).
 
 These prove the DISPATCH WIRING in ``_process_ingress_item`` / ``_process_routed_item`` in isolation:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`messagefoundry alert list|add|remove` — the comment-preserving [[alerts.rules]] editor the VS
 Code "New Alert" command shells (ADR 0014). Validates-before-persist and rolls back on failure."""
 

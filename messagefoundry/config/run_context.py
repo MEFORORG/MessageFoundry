@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Run-scoped context providers — the one seam that activates per-run engine state for a Router/Handler.
 
 Routers and Handlers read engine-published state at call time through **synchronous accessors**

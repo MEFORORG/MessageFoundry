@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample route: receive ASC X12 EDI over raw TCP (ISA/IEA framed), route by transaction set, relay.
 
 The inbound declares ``content_type="x12"`` so each interchange routes as a ``RawMessage`` (ADR 0004);

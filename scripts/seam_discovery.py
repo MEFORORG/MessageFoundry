@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DISCOVER the engine-side seam surface the web console actually depends on (BACKLOG #1220).
 
 ``scripts/webconsole_seam_snapshot.py`` used to carry five hand-maintained tuples naming that

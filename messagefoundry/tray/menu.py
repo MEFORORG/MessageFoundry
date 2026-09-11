@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure tray context-menu builder (ADR 0113 §4).
 
 ``build_menu`` maps a :class:`~messagefoundry.tray.state.StatusSnapshot` (plus a few shell-supplied
