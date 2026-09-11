@@ -174,3 +174,76 @@ def test_advisory_downgrades_a_finding_and_never_the_empty_population_refusal(
     absent = str(tmp_path / "no-such-ledger.md")
     assert mod.main([absent, "--repo", str(repo)]) == 2
     assert mod.main([absent, "--repo", str(repo), "--advisory"]) == 2
+
+
+# ------------------------------------------------------------------------------------------------
+# The house multi-item form (BACKLOG #1347, limb A). Paired like everything above: the widening has
+# to make a SIBLING agree, and it must not start reading a squash suffix as an item.
+# ------------------------------------------------------------------------------------------------
+
+#: The commit that misled two seats into holding three claims for landed work. Named in #1347 as its
+#: control, and kept verbatim here so the fixture is the measured case rather than a stand-in.
+HOUSE_SUBJECT = "feat(x): four things at once (BACKLOG #1319, #1322, #1323, #1331) (#547)"
+
+
+def test_a_banner_citing_a_SIBLING_of_a_multi_item_commit_agrees(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST NOT FIRE. #1323 is the third number in the parenthetical, and the prefix appears once.
+
+    Before the widening this reported a disagreement against #1319 -- the failure direction #1347
+    calls the expensive one, because a correct banner on landed work reads as citing another item.
+    """
+    sha = _commit(repo, HOUSE_SUBJECT, "a.txt")
+    led = _ledger(tmp_path, f"## 1323. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    report = _load().scan([led], repo)
+    assert report.findings == [], report
+    assert report.agreed == 1
+
+
+def test_the_squash_suffix_of_a_multi_item_commit_is_not_read_as_an_item(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST FIRE, and on the right number. `(#547)` is the pull request a squash-merge appended.
+
+    This is the twin of the arm above and the reason the scope is the parenthetical rather than
+    "every #N after the token": that rule calls 641 subjects multi-item against a true 38 of 1070,
+    and it would report item #547 as closed by a commit that says nothing about it.
+    """
+    sha = _commit(repo, HOUSE_SUBJECT, "a.txt")
+    led = _ledger(tmp_path, f"## 547. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    report = _load().scan([led], repo)
+    assert len(report.findings) == 1, report
+    assert "547" not in report.findings[0].names
+    assert report.findings[0].names == ["1319", "1322", "1323", "1331"]
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("fix(x): one thing (BACKLOG #1040) (#547)", ["1040"]),
+        (HOUSE_SUBJECT, ["1319", "1322", "1323", "1331"]),
+        ("docs(backlog): two records (BACKLOG #1136, #1474) (#958)", ["1136", "1474"]),
+        ("fix(x): a thing (BACKLOG #1171, ASVS 11.4.1) (#123)", ["1171"]),
+        ("fix(x): something (#999)", []),
+        ("feat(console): step-up UX (WP-L3-16, ASVS 7.5.3) (#319)", []),
+        ("chore: bare token BACKLOG #71, #72 with no parenthetical", ["71", "72"]),
+        ("backlog: close #1307 and #1320 -- both writers landed (#581)", ["1307", "1320"]),
+    ],
+)
+def test_the_citation_extractor_matches_the_two_rules_already_in_the_repo(
+    subject: str, expected: list[str]
+) -> None:
+    """The extractor's contract, stated as the cases the two existing copies of this rule were
+    written against -- scripts/coord/claim-adjudicate.ps1 and .github/workflows/backlog-hygiene.yml.
+
+    The `docs(backlog):` row is not filler: `backlog` appears there in a conventional-commit scope
+    with `re.I` in play, so a rule that did not stop at the parenthesis would start its run on the
+    wrong token.
+
+    THE LAST ROW PINS A DECISION RATHER THAN AN ACCIDENT. `backlog:` as a conventional-commit TYPE
+    opens a governing run, so those numbers are read as items -- which is why the real-ledger finding
+    count moved 32 to 37 rather than down. Both existing copies of this rule behave the same way, and
+    #1347's finding is that a third, silently different rule is the defect. Recorded here so that a
+    later reader meets it as a pinned property instead of rediscovering it as a surprise."""
+    assert _load().cited_items(subject) == expected
