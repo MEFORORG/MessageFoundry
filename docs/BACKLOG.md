@@ -30548,6 +30548,10 @@ This is the follow-up to [#1534](#1534-batch-the-adr-branch-of-allocps1-so-it-st
 
 So: **minutes, varying by at least twofold, with the quietest reading about 98 seconds against a 120-second ceiling.** Anyone re-scoping this should re-measure with the machine to themselves rather than trusting a row of this table.
 
+**The one result here that survives its own confounders is the pair 150.5s then 283.6s.** It is a negative result, and it needs no clean conditions to do its work: a cache-warming explanation predicts each repeated sweep is faster than the last, and run 2 being nearly twice run 1 refutes that outright. Contention cannot manufacture that shape, only add to it. Treat it as the reason not to reach for "the first run is just cold".
+
+**AND ASK FOR A FRACTION, NOT A DURATION.** The discriminating question is not "how long does a quiet run take" but **what proportion of the 120-second ceiling it consumes**. A quiet pass at 98s and a quiet pass at 40s are the same green and mean opposite things: the first is a coin flip waiting for a busy afternoon, the second is real headroom. A re-measurement that reports only "it passed" has not answered this row.
+
 ### The cause is a byte volume, which contention cannot distort
 
 The sweep resolves `<ref>:docs/BACKLOG.md` and the archive path for every ref, then reads each distinct blob. Measured on this clone: 7,206 refs resolve to **1,516 distinct blobs**, averaging about 2.8 MB, so stage 2 streams roughly **4.2 GB** through PowerShell's per-line object pipeline. Of the ~111s that took in one profiled run, only about **13s was git** -- the rest was PowerShell building one pipeline object per line and running a regex on each. The batching comment beside that code records ~190 distinct blobs at ~550 refs when it was written, so the object count has grown about eightfold and each object is far larger.
@@ -30556,7 +30560,9 @@ Deduping harder does not rescue this: the 1,516 blobs are already distinct. **Th
 
 ### The failure is silent, and it is safe -- both halves were checked
 
-The alarming reading was tested rather than assumed, and it came back benign. A hard kill is not an exception, so it can land in the narrow window after `CreateNew` takes the number and before the JSON is written, leaving a claim file that exists and is **zero bytes**. Probed against a throwaway checkout:
+**Attribution, because a later reader will otherwise get this backwards.** The session that hit the timeout reported exactly two things: the kill left no claim file, so the failure is silent; and a re-run that succeeds burns a number. Both are confirmed below. **It did not claim ledger corruption and was not walked back on one.** The zero-byte hypothesis below is *this row's*, not theirs -- their process died during the sweep and could not have reached that state.
+
+It is written up because it was the CAUTIOUS reading, and the cautious reading is the one that normally escapes testing: doubting "it is probably fine" looks reckless, so nobody spends a probe on it. A hard kill is not an exception, so it can land in the narrow window after `CreateNew` takes the number and before the JSON is written, leaving a claim file that exists and is **zero bytes**. Probed against a throwaway checkout:
 
 | question | result |
 |---|---|
