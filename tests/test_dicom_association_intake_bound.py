@@ -323,9 +323,11 @@ _MIN_SEPARATION = 2.0
 #: pacing need only supply 60 percent of what it honestly supplies and a wait capped at half a step
 #: would still pass. The floor is exact bucket arithmetic rather than a measurement -- ``paced_elapsed
 #: == floor + 2w``, so the honest arm measured 1.03 to 1.21 times the floor over five runs, its low
-#: end of 1.03 being the arithmetic one rather than a lucky sample. That spread is itself the host
-#: rather than the pacer: the box carried 117 processes and 5,308 CPU-seconds while it was taken, so
-#: read it as a range from a BUSY machine and not a floor from a quiet one -- and an ``Event.wait``
+#: end of 1.03 being the arithmetic one rather than a lucky sample. Read that spread as the host and
+#: not the pacer: the control arms behind it ranged 0.165 s to 0.436 s inside ONE process, which is
+#: contention visible within the measurement itself. A later reading on the same host found 117
+#: processes and 5,308 CPU-seconds, but load was not sampled at the moment those five ran, so the two
+#: are consistent rather than one measurement -- and an ``Event.wait``
 #: returns LATE on Windows, never early (0 of 240, ``tests/_pace_probe.py``). So the slack buys
 #: nothing against a false red and costs discrimination on the one mutation class the decision arm
 #: below cannot see: a wait asked for and then shortened.

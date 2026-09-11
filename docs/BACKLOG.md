@@ -30592,8 +30592,9 @@ at 0.75 pacing need only supply about 60 percent of what it honestly supplies. M
 wait lands at 0.86 of the floor, so 0.75 passes it and 0.95 reds it. The slack bought nothing in
 return, because the floor is exact bucket arithmetic rather than a measurement -- the honest arm ran
 1.03 to 1.21 times the floor over five runs, and its low end of 1.03 is the
-arithmetic one rather than a lucky sample. The loaded runs recorded pass or fail, not ratios, and the
-host carried 117 processes and 5,308 CPU-seconds while the five were taken, so read that spread as a range from a BUSY machine rather than a floor from a quiet one -- and an `Event.wait` returns LATE
+arithmetic one rather than a lucky sample. The loaded runs recorded pass or fail, not ratios.
+
+Read that spread as the host and not the pacer, with the provenance stated exactly: the control arms behind those five ranged 0.165 s to 0.436 s inside ONE process, a 2.6x swing on the same six loopback associations, which is contention visible inside the measurement itself. A later reading on the same host found 117 processes and 5,308 CPU-seconds. **Load was not sampled at the moment the five ran**, so those are two consistent observations and not one measurement. An earlier draft of this row called the box quiet, which was asserted from an absence of this session's own heavy work -- a different claim entirely, and the one this correction exists to retract -- and an `Event.wait` returns LATE
 on Windows, never early (0 of 240, `tests/_pace_probe.py`).
 
 ### The load arm is what settles the original defect
@@ -30627,6 +30628,8 @@ guard rejects a control above 10 s, so a passing run cannot exceed about 30 s ag
 times per merged pull request, which puts the added cost near 0.2 percent of a test step that runs 20
 to 36 minutes. Paid deliberately: the gate is red today, and the alternative is a cheaper threshold
 that cannot discriminate.
+
+That cost has a concrete gate attached, so it is priced rather than waved through. `scripts/ci/step_margin.py` reds a leg whose step comes within 1.30x of its own cap. The ubuntu `Tests (pytest)` leg records a maximum passing step of 20:28 against a 31:00 cap (`.github/workflows/ci.yml:519-520`), so it may grow to 23:51 before the floor bites: 3m23s of headroom, of which this change spends about 3 s, or 1.5 percent. The same gate reddened a peer's `web console tests (windows-2025)` leg on 2026-09-11 with zero failing assertions. That is a different job against a separately rotted baseline, not this one, and it is recorded here because a timing gate that reds on host speed is the same hazard class this item is about.
 
 ### The census found the SPELLING was unique; the SHAPE is not, and that distinction is the finding
 
