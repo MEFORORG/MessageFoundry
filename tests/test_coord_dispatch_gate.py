@@ -18,6 +18,7 @@ The field parsing is tested against the SHARED parser, because putting a second 
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -1557,3 +1558,131 @@ def test_the_two_live_fenced_rows_block_under_refuse(
     out = capsys.readouterr().out
     for num in sorted(_FENCED_ROWS):
         assert f"#{num}" in out, f"#{num} blocked the wave without being named in the output"
+
+
+# ---------------------------------------------------------------------------
+# cp1252 stdout hardening (BACKLOG #1526): a note can quote a ledger row's own prose verbatim, and
+# on a stock Windows console printing one that carries a glyph killed the process partway through the
+# listing with an exit code indistinguishable from a --refuse fence.
+#
+# THE MODEL IS `test_a_finding_carrying_a_glyph_survives_a_cp1252_console` in
+# `test_asvs_tally_lint.py`, and the shape is copied rather than reinvented: forcing the encoding
+# IN-PROCESS is not the same instrument, because pytest's own capture wrapper is one of the objects
+# the hardening explicitly guards against (it may lack `reconfigure` or reject it), so an in-process
+# test could pass having measured nothing. A child process gets a real stream, and
+# PYTHONIOENCODING=cp1252 with no error handler starts it at errors='strict', so only the hardening
+# in `dispatch_gate.main` can save it.
+#
+# MEASURED AGAINST THE PRE-FIX FILE BEFORE THIS TEST WAS WRITTEN: the identical ledger and command,
+# run against `dispatch_gate.py` from before this change, raised
+# ``UnicodeEncodeError: 'charmap' codec can't encode character '⛔' in position 84`` from the
+# exact `print(f"  #{num}: {note}")` line BACKLOG #1526 names, and exited 1 -- the same code a
+# --refuse fence returns on purpose. That confirms this fixture reproduces the filed defect rather
+# than a plausible-looking stand-in.
+# ---------------------------------------------------------------------------
+
+_GLYPH_ITEM = 999995
+
+#: The same shape as BACKLOG #1526's own reproducer (#1022's note: "the glyph reaches stdout"), with
+#: the row's own subject and number changed. U+26D4 (NO ENTRY) is outside cp1252 the same way #1022's
+#: glyph was, and the "ALREADY ... DO NOT REBUILD" wording is what makes `judge` quote it back in a
+#: MUST BE READ note -- the same print call the traceback above names.
+_GLYPH_LEDGER = _FILLER + (
+    f"## {_GLYPH_ITEM}. a fixture item whose own body carries a status glyph\n"
+    f"{_OPEN}\n> Closing-act: code\n\n"
+    "**⛔ ALREADY SHIPPED IN #488. DO NOT REBUILD IT.**\n"
+)
+
+
+def test_a_note_carrying_a_glyph_survives_a_cp1252_console(tmp_path: Path) -> None:
+    """BACKLOG #1526: the hardening in `main` must stop a ledger row's own glyph from killing the
+    process before the listing finishes.
+
+    Driven as a SUBPROCESS with PYTHONIOENCODING=cp1252, deliberately -- see the module comment above
+    for why an in-process test would not measure the same thing.
+    """
+    root = _ledger_root(tmp_path, _GLYPH_LEDGER)
+    cmd = [
+        sys.executable,
+        str(_GATE),
+        str(_GLYPH_ITEM),
+        "--root",
+        str(root),
+        "--no-tree",
+    ]
+    print(f"SCANNED: {' '.join(cmd)} with PYTHONIOENCODING=cp1252")
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+
+    assert "UnicodeEncodeError" not in proc.stderr, (
+        "the gate died printing a ledger row's own glyph on a cp1252 console -- the defect is that "
+        f"this happens only when the gate has something to say:\n{proc.stderr}"
+    )
+    assert proc.returncode == 0, (
+        f"a --refuse fence was not requested, so a clean run must exit 0, not fall over; "
+        f"rc={proc.returncode}\n{proc.stderr}"
+    )
+    # The listing finished and the row is readable: the glyph is gone or replaced, never a crash.
+    assert f"#{_GLYPH_ITEM}" in proc.stdout
+    assert "ALREADY SHIPPED" in proc.stdout
+
+
+class _NoReconfigureStdout:
+    """A minimal stream with no ``reconfigure``, so `main`'s hardening cannot help it.
+
+    This is the ONE shape ``EXIT_PRINT_FAILURE`` exists for -- see that constant's own comment in
+    ``dispatch_gate.py``. ``hasattr(sys.stdout, "reconfigure")`` is ``False`` against an instance of
+    this class, so the hardening is a deliberate no-op here and the wrapped report must still fail,
+    under a code that cannot be mistaken for a --refuse fence.
+    """
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def write(self, text: str) -> int:
+        # THE SAME FAILURE MODE AS A STOCK cp1252 CONSOLE MEETING A GLYPH, without needing a real
+        # console: encoding to plain ASCII raises on anything the hardening was written to catch.
+        text.encode("ascii")
+        self.written.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_a_print_failure_exits_under_its_own_code_not_as_a_refuse_fence(
+    gate: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #1526: a print failure and a --refuse fence must not share an exit code.
+
+    Before this change an uncaught ``UnicodeEncodeError`` here fell through to Python's default
+    handler, which exits 1 -- the SAME CODE ``--refuse`` returns on purpose, so a caller checking the
+    exit code alone could not tell a genuine fence from the tool falling over mid-listing. This drives
+    the report through a stream the hardening cannot save (see ``_NoReconfigureStdout``) and asserts
+    the two failures land on codes nobody can conflate.
+    """
+    root = _ledger_root(tmp_path, _GLYPH_LEDGER)
+    fake_stdout = _NoReconfigureStdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    rc = gate.main([str(_GLYPH_ITEM), "--root", str(root), "--no-tree"])
+
+    assert rc == gate.EXIT_PRINT_FAILURE
+    assert rc != 0, "a failed listing is not a clean dispatch"
+    assert rc != 1, "a print failure must not share --refuse's exit code -- that IS the defect"
+    err = capsys.readouterr().err
+    assert "PRINT FAILURE" in err
+    assert str(gate.EXIT_PRINT_FAILURE) in err
+    # The underlying exception detail rides along -- stderr is not the stream that failed, so it is
+    # free to carry it, and a reader debugging the environment wants to know what did not encode.
+    assert "can't encode character" in err
