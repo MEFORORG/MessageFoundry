@@ -471,3 +471,35 @@ def test_a_deliberately_wrong_citation_against_the_REAL_ledger_is_caught() -> No
         f"the checker did not catch a stale citation of the real #{num}: {wrong}"
     )
     assert right == [], f"the checker flagged a CORRECT citation of the real #{num}: {right}"
+
+
+def test_an_empty_sha_is_a_usage_error_and_not_an_empty_diff(tmp_path: Path) -> None:
+    """The shape that made this gate INERT in the merge queue, pinned here.
+
+    `main()`'s paired-flag guard tests `is None`, which two EMPTY STRINGS satisfy. Before this test
+    they reached the scan, `""...""` resolved to `HEAD...HEAD`, zero files were read, and the tool
+    printed OK at exit 0 -- a scan that never happened, rendered identically to a clean one.
+
+    NOT HYPOTHETICAL. `backlog-hygiene.yml` passes `github.event.pull_request.base.sha`, and on a
+    `merge_group` event every `pull_request.*` field is null, so both arrived empty on EVERY queue
+    entry. Measured on the live queue run for PR 1050, 2026-09-11T20:53:12Z: both SHAs blank,
+    "scanned: ... 0 in 0 file(s)", required context GREEN.
+
+    THE ASYMMETRIC ARM IS THE WORSE ONE and is asserted too: `--base "" --head <rev>` resolved to
+    `HEAD...<rev>` and scanned a WRONG scope rather than an empty one, also at exit 0.
+    """
+    repo = _plant_repo(tmp_path)
+
+    both = _run(repo, "--base", "", "--head", "")
+    assert both.returncode == 2, both.stderr + both.stdout
+    assert "empty string" in both.stderr, both.stderr
+
+    asymmetric = _run(repo, "--base", "", "--head", "HEAD")
+    assert asymmetric.returncode == 2, asymmetric.stderr + asymmetric.stdout
+
+    # THE CONTROL, and it is the half that makes the two assertions above mean anything: the same
+    # binary on the same repo must still do real work when given no flags at all. Without this, a
+    # checker that refused EVERYTHING would pass the two cases above.
+    repo_wide = _run(repo)
+    assert repo_wide.returncode == 0, repo_wide.stderr + repo_wide.stdout
+    assert "citations in scope" in repo_wide.stdout, repo_wide.stdout
