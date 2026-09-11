@@ -356,7 +356,12 @@ export function connectionFormHtml(
           <option value="unordered">unordered</option>
         </select>
       </div>
-      <div><label for="maxAttempts">Retry max attempts (blank = forever)</label><input id="maxAttempts" /></div>
+      <div><label for="maxAttempts">Retry max attempts</label><input id="maxAttempts" />
+        <div class="hint">Blank inherits the <code>[delivery]</code> default, which is
+        <strong>finite</strong>. It does <strong>not</strong> mean forever. To never give up, type
+        <code>forever</code>: it is saved as <code>max_attempts = "forever"</code> under this
+        connection's <code>[outbound.retry]</code> table (BACKLOG #1217).</div>
+      </div>
     </div>
   </div>
 
@@ -609,9 +614,16 @@ export function connectionFormHtml(
       } else {
         if ($('ordering').value) conn.ordering = $('ordering').value;
         const ma = $('maxAttempts').value.trim();
-        // BACKLOG #1217 half 2: "forever" (case-insensitive) is the TOML/env spelling of retry-forever
-        // (connections_file.py coerces it back to None on load). parseInt('forever', 10) is NaN, which
-        // would silently corrupt a word into a number here — write the word itself instead.
+        // BACKLOG #1217 half 2: "forever" (case-insensitive) is the connections.toml spelling of
+        // retry-forever — it lands as [outbound.retry] max_attempts = "forever", which
+        // connections_file.py's _coerce_retry_forever turns back into None at load. (The GLOBAL
+        // default is a different file and a different key: messagefoundry.toml's
+        // [delivery] retry_max_attempts, which this editor does not write.) parseInt('forever', 10)
+        // is NaN, which would silently corrupt a word into a number here — write the word instead.
+        // NOTE: no backticks anywhere in this block — it sits inside the outer template literal, so
+        // a backtick here terminates it and tsc reports a bare "';' expected" two lines later.
+        // Blank stays blank on purpose: it emits no retry table, so the connection inherits the
+        // [delivery] default, which is FINITE. The field's hint says so; do not reword it to "forever".
         if (ma) conn.retry = { max_attempts: ma.toLowerCase() === 'forever' ? 'forever' : parseInt(ma, 10) };
       }
       return conn;
