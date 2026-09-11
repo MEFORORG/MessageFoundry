@@ -30479,3 +30479,61 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1542. the /ui step-up gates refuse an MFA-pending session without writing auth.mfa_denied, because the flag that kept their redirect switched the audited gate off
+
+> 🚧 **Built 2026-09-11 by a Builder; open until its PR merges, when the Lander flips this banner.** `require_ui_step_up` and `require_ui_step_up_action` now let `require_ui`'s own second-factor gate refuse a pending session. The refusal writes `auth.mfa_denied` and runs above the permission loop, as it does on every other `/ui` route and on the JSON twin. Only the destination differs: `/ui/reauth?next=<action>`. Value **6/10** · Difficulty **2/10**. Value 6: the failed-authorization row that ASVS 16.3.2 asks for was missing on exactly the console's sensitive-action subset, and the same flag showed a pending session which of those permissions its account holds. Difficulty 2: one new keyword on `require_ui` and one changed line in each factory.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security / audit trail (ASVS 16.3.2, 6.3.3). **Verdict:** build.
+**Severity:** conditional (sec. 0). There are zero deployments, and the defect is in the shipped code. On a first deployment with `[security].require_mfa` on, which is the default, a stolen password-only session cookie could probe every `/ui` step-up route and would leave no `auth.mfa_denied` row. Counted at base `8c1ad29d8`, that is 42 route gates in `messagefoundry_webconsole/routes/`: 38 on `require_ui_step_up` and 4 on `require_ui_step_up_action`. They cover replay, purge, config reload, message search and edit, and uploaded-file browse and delete. They also cover user, role and AD-group administration, cluster stepdown, and the factor-removal and admin-reset actions.
+
+### The flag that kept the redirect also switched three behaviours off
+
+`require_ui_step_up` built its base as `require_ui(*permissions, phi=phi, allow_mfa_pending=True)`. The flag stopped `require_ui`'s gate from sending a pending session to `/ui/mfa`, so the factory could send it to `/ui/reauth` with the action it clicked. The factory then ran the check again and refused with a bare redirect. The comment above it ended *"Same refusal, better destination."*
+
+It was not the same refusal. `allow_mfa_pending` does not pick a destination. It turns the gate off, and three behaviours lived inside that gate:
+
+| Behaviour of `require_ui`'s gate | JSON twin, `require_step_up` | `/ui` step-up before | `/ui` step-up after |
+|---|---|---|---|
+| Writes `auth.mfa_denied` | yes | **no** | yes |
+| Refuses before the permission loop | yes | **no**: 403 from a route the account lacks, 303 from one it holds | yes |
+| Refuses before the admin-write and PHI charges | yes | **no**: a pending session spent the account's per-actor budget | yes |
+
+`require_ui_step_up_action` had the same shape. `require_ui_reauth_only` and `require_ui_reauth_only_action` also pass `allow_mfa_pending=True`, but there it is a real exemption. They gate enrollment, their JSON twins pass `mfa_gate=False`, and they are unchanged.
+
+### The recurrence shape: a flag added for one reason disabled another behaviour at the same call site
+
+A flag added for a good reason, a better redirect, silently disabled an unrelated behaviour, the audit row, because both lived at the same call site. The comment asserting equivalence was written as though only the redirect had changed. Two more behaviours went with it, and nothing reported any of them.
+
+The fix removes the flag from these two factories rather than re-adding the row beside it. `require_ui` gained `mfa_refusal`, which changes where the gate sends a pending session and nothing else. The factories' own second check stays, now unreachable, as it is in `require_step_up`.
+
+### No test reached a step-up route
+
+`packaging/messagefoundry-webconsole/tests/test_ui_mfa_denial_audit.py` navigated only `/ui/messages`, `/ui/connections` and `/ui/audit`, all plain `require_ui` routes. The only other console tests that read `auth.mfa_denied` are the WebSocket ones in `test_webui.py`. Three other test files assert a `/ui/reauth?next=` redirect, and none of them checked the trail: the whole suite passed against code that wrote no row.
+
+### What shipped, and the red run it was watched through
+
+The same test file gained seven cases rather than a sibling file, so the two cannot drift apart. The tests landed alone in `a704431a0` and the fix in `77875b5ed`. Against `a704431a0`, whose `_auth.py` is unfixed: **5 failed, 8 passed**. The three audit cases found 0 rows, the permission case got 403, and the budget case saw one charge. The two new cases that passed are controls. With the fix: **13 passed**. Both runs were repeated just before push.
+
+- `test_a_step_up_route_refusal_writes_an_mfa_denial_row`: one case per factory shape. It asserts the row **and** the unchanged `Location`, so a fix that restored the row by losing the continuation would still fail.
+- `test_a_pending_session_cannot_learn_which_step_up_permissions_it_holds`: an operator's pending cookie on `/ui/users/new` gets the MFA refusal, and no `auth.permission_denied` row is written.
+- `test_a_pending_session_spends_no_admin_write_budget_on_a_step_up_route`: the satisfied case is its control and proves the spy is wired.
+- `test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial`: a control against an audit call placed on the freshness branch.
+
+The PHI-charge ordering follows from the same gate position and is established by reading, not by a test.
+
+### It is not #1137 or #1197
+
+[#1137](#1137) is ASVS 6.3.4 authentication strength across pathways; its only `audit_mfa_denied` text is about the mTLS plane. [#1197](#1197) shipped the `require_ui` audit on 2026-09-06, and its tests drive plain `require_ui` routes. This row is the step-up subset that fix could not reach, because the flag bypassed the line it added.
+
+### Still open: differences found while comparing the two step-up gates
+
+Recorded here, not changed:
+
+1. Admin-write throttling answers `Retry-After: 10` on `/ui` and `Retry-After: 1` on the JSON plane, and only the JSON plane logs the refusal.
+2. `/ui` inlines `request.client.host` where the JSON plane calls `client_ip()`. The value is the same today, but `client_ip`'s docstring asks callers to reuse it so the two cannot drift.
+3. `require_ui` writes no `auth.permission_granted` row. That is #1197's open grant-parity work, not new here.
+4. `docs/SECURITY.md` calls the console twin of the MFA gate "a 303 to `/ui/mfa`". A step-up route sends a pending session to `/ui/reauth` instead, and did before this change too.
