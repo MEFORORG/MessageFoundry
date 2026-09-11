@@ -603,8 +603,15 @@ async def test_a_directory_rename_keeps_the_account_its_sessions_and_its_single_
        quota and saved search presets stay pointed at the same person);
     3. the cached username follows the directory (what stops the probe going stale again).
 
-    The loop runs well past the strike threshold on purpose: a fix that merely delayed the revocation
-    would pass a single-pass assertion.
+    The loop runs past the strike threshold because a fix that merely DELAYED the revocation would
+    pass a single-pass assertion. **But the loop count is not what makes this hold, and no finite
+    count could be.** The mechanism is: ``plan_pass`` sets ``strikes[user_id] = 0`` for every PRESENT
+    probe, so an account the directory keeps answering for can never accrue a strike at all. The loop
+    is a check that the mechanism is wired, not the evidence that it works -- which is the difference
+    between "I ran five passes and nothing happened" and "nothing can happen".
+
+    Worth stating because the alternative reading invites raising the count when someone gets nervous,
+    and a bigger number would look like more rigour while proving exactly as much.
     """
     store = await MessageStore.open(":memory:")
     try:
