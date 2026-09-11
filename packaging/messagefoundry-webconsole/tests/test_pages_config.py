@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The /ui config page's provenance badge (ADR 0041 D1, item C).
 
 The rendering half of the provenance feature: pure, sync ``config_page(ConfigProvenance)`` markup

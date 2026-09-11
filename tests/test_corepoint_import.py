@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Deterministic Corepoint action-list import (ADR 0086) — mapping, count-and-log, check gate, security.
 
 The lens round-trip half of the correctness gate (AC-4) lives in ``tests/test_lens_parse.py`` beside

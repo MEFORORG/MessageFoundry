@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Browser ops dashboard (/ui, ADR 0065 / BACKLOG #75): serving, confined-cookie auth, headers, XSS."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample feed: submit HL7 VXU to a certificate-authenticated WS-* SOAP web service (ADR 0015).
 
 The shape of a state-immunization-registry submission (a `submit`-style SOAP operation wrapping an

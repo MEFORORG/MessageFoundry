@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0067 — persistent outbound MLLP connections: the 12 EARS acceptance criteria.
 
 One lazily-established connection is reused across deliveries (``persistent=true`` — the opt-in reuse

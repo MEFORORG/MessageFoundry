@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure helpers for the per-message metadata bag (BACKLOG #150, ADR 0081).
 
 The ``messages.metadata`` column is a single encrypted JSON object per message. It carries two kinds of

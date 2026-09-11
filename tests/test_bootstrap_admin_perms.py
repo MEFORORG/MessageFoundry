@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-020 — the one-time bootstrap-admin password file is owner-only from the instant it exists.
 
 ``_emit_bootstrap_admin`` must create ``bootstrap-admin.txt`` via an exclusive 0o600 ``os.open`` so a

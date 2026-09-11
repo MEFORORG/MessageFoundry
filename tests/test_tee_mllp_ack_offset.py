@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The tee relay's ACK must stamp MSH-7 with an explicit UTC offset (BACKLOG #1196).
 
 The tee carries its own vendored ``build_ack`` and imports no ``messagefoundry`` module, so it

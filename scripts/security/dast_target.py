@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Bring up the DAST scan target in ONE process and hand back a frozen handle.
 
 THE DEFECT THIS EXISTS FOR. The cheap way to scan a FastAPI app is ``httpx.ASGITransport``, which

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Minimal, vendored HL7 v2 field addressing for the tee parity comparison (#14).
 
 A tiny, dependency-free reader of HL7 *structure* — segment/field addressing with the separators read

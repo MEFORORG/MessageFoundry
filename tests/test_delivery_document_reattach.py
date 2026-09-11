@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Delivery-side very-large-document re-attach (#149, ADR 0105 Phase 1b).
 
 Phase 1a detaches an oversized OBX-5 document at ingress (skeleton + ``mfdoc:v1:ref:`` handle + a

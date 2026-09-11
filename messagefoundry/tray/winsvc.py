@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unelevated Windows SCM status read for the engine service (ADR 0113 §3).
 
 Direct ctypes ``QueryServiceStatusEx`` — the only status source that yields ``dwCheckPoint`` /

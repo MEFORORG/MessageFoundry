@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #287 -- the per-actor non-GET write floor was missing on the console.
 
 Surfaced while researching BACKLOG #1115 (ASVS 2.4.2), which names the gap in its severity

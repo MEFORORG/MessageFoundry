@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Capture sink for the parallel-run **shadow** phase (TEST-ENVIRONMENT-PLAN.md §5).
 
 A headless MLLP receiver that ACKs (``AA``) every message and appends it to a per-connection capture

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The workflow local-action gate must trip on both failure modes and stay silent on neither.
 
 A gate with only failure arms passes on its own DELETION, so the silent arm is the one that makes

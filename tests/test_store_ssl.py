@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Store TLS: the ``[store].ssl_root_cert`` private-CA / server-cert pin (EF-2, #45).
 
 Pure unit tests (no DB, no asyncpg / aioodbc required) — always run in CI. They assert:

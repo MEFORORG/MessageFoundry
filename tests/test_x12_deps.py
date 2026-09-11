@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The optional ``[x12]`` extra (``pyx12``) guard (ADR 0012, X12-6): a missing extra must fail as a
 :class:`RuntimeError` (a deploy/config error), NEVER as the :class:`ValueError`-rooted data errors in
 :mod:`messagefoundry.parsing.x12.errors`. If it were a ``ValueError``, a Handler's ``except ValueError``

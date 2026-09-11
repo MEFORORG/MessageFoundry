@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 (B5) Lane 3a — per-hop SQL statement / network round-trip inventory, as a LIVING gate.
 
 Sibling to ``test_adr0071_crossing_count.py``. That gate locks the *executor->loop crossing* count;

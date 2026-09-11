@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """OIDC authorization-code + PKCE relying party for the web console (ADR 0142, BACKLOG #274).
 
 A pure, side-effect-free federation layer: PKCE + flow-binding (:mod:`flow`), JWKS handling with a

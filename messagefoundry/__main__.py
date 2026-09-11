@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Command-line entrypoint for the MessageFoundry engine + IDE tooling.
 
     messagefoundry serve     --config ./samples/config --db ./messagefoundry.db   # run engine + API

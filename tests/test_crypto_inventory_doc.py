@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.1.2 / 11.1.4 §4 truth-guard: the key-management & cryptographic inventory in
 ``docs/ASVS-L2-PHASE0-CHANGES.md`` §4 must stay TRUE and complete.
 

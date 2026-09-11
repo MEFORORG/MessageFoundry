@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WS-C Phase-0 (ADR 0061 amendment) — the long idle backstop + the armed retry wake.
 
 With per-lane wake ON, the idle backstop backs off from ``poll_interval`` to

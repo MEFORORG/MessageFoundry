@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Estate driver (#216) — the EVENT-calibrated weights make every connection emit the SAME event rate.
 
 The load-bearing check is on EVENTS, not messages: the driver must weight each connection's message

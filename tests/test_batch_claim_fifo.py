@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0058 — batch-claim the contiguous DUE head-prefix on the INGRESS/ROUTED FIFO claim path.
 
 The invariant matrix T1–T10. ``claim_next_fifo_batch`` is **store-level reliability-core** (per-lane

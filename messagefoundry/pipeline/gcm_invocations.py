@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """AES-GCM invocation-bound checkpointer + exhaustion alarm (ASVS 11.3.4).
 
 Two jobs, one small background task modelled on

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Secret-rotation reminder (#195b / ADR 0019 §5) — the secret-side twin of the TLS cert monitor.
 
 Long-lived secrets (the store data-encryption key + the connector/AD/SMTP/Vault/OIDC credentials the

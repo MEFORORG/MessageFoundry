@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fixed-offset X12 ISA delimiter discovery — the X12 analog of reading the HL7 MSH separators.
 
 An ASC X12 interchange opens with a **fixed-length 106-character ISA segment** whose element layout is

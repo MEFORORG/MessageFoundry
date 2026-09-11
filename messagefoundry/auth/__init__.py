@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Authentication & RBAC core — provider-agnostic, with no FastAPI/Qt imports.
 
 Pure building blocks the API layer composes: the permission catalog and fixed built-in roles
