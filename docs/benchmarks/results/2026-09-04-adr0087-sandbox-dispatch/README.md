@@ -112,15 +112,58 @@ serialized child time per message, a sandbox-only per-lane ceiling of roughly **
 the whole of that stated budget, not a slice of it. Whether it composes additively with the store
 round-trip chain is not measured here and must not be assumed.
 
-**3. The cost that actually blocks `subprocess` as a default is memory, and no record states it.**
-One persistent child per inbound at ~50 MiB unique resident. At the committed enterprise target of
-1,500 inbound connections that is roughly **74 GiB** of additional resident memory and 1,500 extra
-OS processes (3,000 under a Windows virtual environment, counting launcher stubs). The bench graph
-is one router and one handler; a real config loads more, so 50 MiB is a floor. This constraint
-attaches to the **per-inbound worker cardinality**, not to the process boundary — a bounded shared
-worker pool would decouple the bill from the connection count, and would preserve exactly the
-property ADR 0087 claims (a boundary to the **engine**) while dropping one it already disclaims
-(`messagefoundry/pipeline/sandbox.py:39-42`: the seam draws no line between admin functions).
+**3. The cost that actually blocks `subprocess` as a default is memory. The per-worker figure
+stands; the scaled total this finding first quoted does not.** One persistent child per inbound at
+49.9 to 57.0 MiB unique resident (76.8 to 82.5 MiB RSS), on a one-router one-handler graph, so 50 MiB
+is a floor. Those are the measured numbers and they are unchanged.
+
+> **RETRACTED 2026-09-10, IN PLACE RATHER THAN DELETED.** This finding continued: *"At the committed
+> enterprise target of 1,500 inbound connections that is roughly **74 GiB** of additional resident
+> memory and 1,500 extra OS processes (3,000 under a Windows virtual environment, counting launcher
+> stubs)."* **Do not quote that total.**
+> [ADR 0087](../../../adr/0087-sandbox-subprocess-isolation.md) retracted the same framing in place
+> on 2026-09-05, in the *"Per-worker footprint"* paragraph of its Consequences section, and **this
+> artifact was not corrected alongside it** — so a refuted sentence outlived its own retraction here.
+> The three defects are ADR 0087's, re-checked against the files:
+> **(1) The multiplier is the wrong count.**
+> [ADR 0052](../../../adr/0052-enterprise-scale-target.md) AC-2 commits to 1,500 concurrent
+> *connections*, inbound and outbound; the word *inbound* does not appear in it. Sandbox children
+> exist per traffic-carrying **inbound**, so a deployment with an outbound share has proportionally
+> fewer children.
+> **(2) Linearity was never measured.** All five result files in this directory record
+> `"worker_tree_processes": 2` and exactly **one** live worker tree. A single-tree measurement was
+> multiplied by 1,500 with nothing validating linearity, and the *"What this does not establish"*
+> section below concedes this artifact does not measure the sandbox under concurrent lanes. The
+> per-tree process count of **2** is itself measured and survives; multiplying it by 1,500 inherits
+> defect (1) exactly as the memory figure does.
+> **(3) Resident set is bounded by installed RAM.** The tier carrying this connection count is 4 to 8
+> cores and 16 GB (`docs/SYSTEM-REQUIREMENTS.md`, the high single-node row) and this bench box has
+> 31.7 GiB, so 74 GiB *resident* names a reading no sized host can produce. The observable outcome at
+> that demand is working-set trimming, paging and spawn failure. The right quantity for a demand
+> figure is **private commit charge** — demand, not residency.
+> **If a total is quoted at all, label the extrapolation:** *"roughly 73 to 74 GiB of private commit
+> demand if 1,500 traffic-carrying inbounds ran on one host, a linear extrapolation from a single
+> worker and never validated at two."*
+
+**The constraint that survives needs no extrapolation, and it is the stronger claim.**
+[ADR 0052](../../../adr/0052-enterprise-scale-target.md) AC-2 requires 1,500 concurrent connections
+*"without per-connection-worker exhaustion (fd/socket/worker-task limits)"*. At `mode=subprocess` the
+engine holds one persistent worker tree per traffic-carrying inbound — never pooled, never evicted —
+and each is a process tree, two parent daemon threads, three parent pipe file descriptors and a
+job-object handle. That is precisely the resource class AC-2 names, and it is visible without
+multiplying anything. Note that ADR 0052 records its own 1,500-connection axis as **unvalidated**
+(`:99`) and its connection-scale validation harness as one that *"does not exist"* (`:108`), so that
+criterion cannot be closed by measurement today in either direction.
+
+The constraint attaches to the **per-inbound worker cardinality**, not to the process boundary — a
+bounded shared worker pool would decouple the bill from the connection count, and would preserve
+exactly the property ADR 0087 claims (a boundary to the **engine**) while dropping one it already
+disclaims (`messagefoundry/pipeline/sandbox.py:39-42`: the seam draws no line between admin
+functions). Choosing that shape is [BACKLOG #1458](../../../BACKLOG.md), and it is ADR-gated.
+
+**A second stale sub-claim in the original heading, corrected here.** It read *"and no record states
+it"*. That was true when this artifact was written and is false now: ADR 0087's Consequences section
+carries the per-worker footprint, added under BACKLOG #1194 **because of** this measurement.
 
 **4. Isolating the ROUTER phase sacrifices no documented feature.** The live-enrichment carve-out is
 the stated reason `subprocess` cannot be a default, and it is a **transform-phase** feature only.
