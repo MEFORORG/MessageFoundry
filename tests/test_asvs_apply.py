@@ -818,6 +818,216 @@ def test_a_declared_retirement_whose_arithmetic_agrees_is_applied(tmp_path: Path
     assert "5.4.3" in after, "the untouched cell must survive byte-for-byte"
 
 
+# --- BACKLOG #1363 / #1484: the retirement flag was PREEMPTED by the key-set guard ----------------
+#
+# #1307 shipped `--allow-retirement` and it genuinely worked -- for a PARTIAL retirement. `render()`
+# emits no block for an empty list, so retiring the LAST entry of `evidence` or `absence` makes the
+# KEY vanish on the round-trip, and `lost = set(was) - set(now)` refused sixty lines before
+# `allow_retirement` was ever consulted. Both authorised retirements were that shape.
+#
+# TWO ROWS, ONE DEFECT, and the duplication is the instructive part. #1363 (2026-08-26) and #1484
+# (2026-09-07) were filed twelve days apart by different sessions against the same lines; #1484 found
+# it on a cell whose single absence claim had genuinely closed. The refusal names a KEY LOSS, so
+# neither reader searching the ledger for "retirement" found the other's row.
+#
+# THE GUARD IS NOT WIDENED, WHICH IS THE WHOLE CONSTRAINT BOTH ROWS STATE. It exists because a
+# truncating repair once cut one cell 15 -> 10 and another 17 -> 1 with the verifier green
+# throughout. So the arms below hold the asymmetry: DECLARED under the flag reaches the retirement
+# logic, UNDECLARED still refuses at the key-set guard, and a declaration whose arithmetic disagrees
+# is refused by the branch it now reaches rather than waved through.
+
+#: One absence claim, spliced into `1.1.1`. Written as a replace against a unique anchor rather than a
+#: second whole fixture, so the two records cannot drift apart in a way no test would notice.
+_ABSENCE_BLOCK = (
+    "  [[cell.absence]]\n"
+    '  pattern = "a gap this cell asserts is open"\n'
+    '  positive_control = "plant the pattern and the scan finds it"\n'
+    '  mutation = "remove the guard and the scan reds"\n'
+)
+FIXTURE_WITH_ABSENCE = FIXTURE.replace(
+    '[[cell]]\nid = "5.4.3"', _ABSENCE_BLOCK + '[[cell]]\nid = "5.4.3"'
+)
+
+
+def _record_with_absence(tmp_path: Path) -> Path:
+    """The fixture record with ONE absence claim on `1.1.1` -- the 1 -> 0 shape, which is the shape.
+
+    ASSERTED, NOT ASSUMED. `str.replace` that matches nothing returns the original string happily, so
+    a broken anchor would leave every arm below driving the plain two-evidence cell and passing for
+    the wrong reason -- an absence that reads exactly like a presence, which is the failure this whole
+    file is written against.
+    """
+    assert FIXTURE_WITH_ABSENCE != FIXTURE, "the absence block was not spliced in"
+    p = tmp_path / "asvs-scorecard.toml"
+    p.write_text(FIXTURE_WITH_ABSENCE, encoding="utf-8")
+    live = {c["id"]: c for c in tomllib.loads(FIXTURE_WITH_ABSENCE)["cell"]}
+    assert len(live["1.1.1"]["absence"]) == 1, live["1.1.1"]
+    assert "absence" not in live["5.4.3"], "the splice landed in the wrong cell"
+    return p
+
+
+def _emptied_absence(**over: object) -> dict:
+    """`1.1.1` with its evidence intact and its absence list EMPTIED.
+
+    The evidence stays on purpose. Emptying both lists trips a different guard entirely -- "partial
+    needs at least one anchor or absence claim" -- and an arm that trips that one proves nothing about
+    this one. #1307's arithmetic arm records walking into exactly that trap and only catching it by
+    mutating the check away and seeing nothing go red.
+    """
+    cell = _cell_111()
+    cell["absence"] = []
+    cell.update(over)
+    return cell
+
+
+def test_a_DECLARED_full_list_retirement_reaches_the_retirement_logic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST APPLY. The outcome both rows exist to make reachable, and the arm without which the
+    three refusals below are satisfied by a writer that refuses everything."""
+    rec = _record_with_absence(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_emptied_absence(retired_absence=["the gap closed"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    # The writer's own evidence that the retirement BRANCH ran, rather than that the run merely
+    # exited 0. #1484 measured the defect precisely by this line's absence.
+    assert "RETIRING: cell 1.1.1 absence 1 -> 0" in out, out
+    after = rec.read_text(encoding="utf-8")
+    assert "[[cell.absence]]" not in after, "the retired claim should be gone"
+    assert "tls_cert_file" in after and "verify_mode" in after, "the evidence anchors must remain"
+    assert "5.4.3" in after, "the untouched cell must survive"
+
+
+def test_an_UNDECLARED_full_list_loss_still_refuses_at_the_key_set_guard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST REFUSE, AND THIS IS THE ARM THAT MAKES THE FIX A FIX RATHER THAN A RELAXATION.
+
+    Same flag, same cell, same emptied list -- the payload simply does not say what it retired. A
+    reorder of the two checks that dropped this asymmetry would turn a loud false refusal into a
+    quiet always-pass, which #1363 names as strictly worse than the defect.
+    """
+    rec = _record_with_absence(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_emptied_absence()])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    out = capsys.readouterr().out
+    # It must refuse for THIS reason: several guards in this writer return 1.
+    assert "would LOSE field(s) ['absence']" in out, out
+
+
+def test_a_DECLARED_full_list_retirement_without_the_flag_still_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST REFUSE. The declaration alone unlocks nothing -- the excuse is gated on the flag too, so
+    the two authorisations stay independent -- and the refusal now NAMES the route out."""
+    rec = _record_with_absence(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_emptied_absence(retired_absence=["the gap closed"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "would LOSE field(s) ['absence']" in out, out
+    assert "'retired_absence'" in out and "--allow-retirement" in out, (
+        "an unanswerable refusal gets re-run with the override reflexively; it must name the route"
+    )
+
+
+def test_a_full_list_retirement_whose_ARITHMETIC_DISAGREES_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST REFUSE, and it must refuse in the RETIREMENT branch rather than at the key-set guard.
+
+    This is the arm proving the excuse did not become a bypass. The payload declares TWO retirements
+    while the count drops by ONE, so it is excused past the key-set difference and then caught by the
+    arithmetic -- the check #1363 says already computes the right distinction and simply never ran.
+    """
+    rec = _record_with_absence(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(
+                _payload(
+                    tmp_path,
+                    [_emptied_absence(retired_absence=["the gap closed", "and another"])],
+                )
+            ),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "declares 2 retirement(s) but the count drops by 1" in out, out
+    assert "would LOSE field(s)" not in out, "it refused at the key-set guard, not the arithmetic"
+
+
+def test_the_excuse_is_PER_SUBTABLE_and_does_not_disarm_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION PROOF that the excuse is narrow. A declared absence retirement must not buy silence
+    about an unrelated key the writer drops in the same run.
+
+    Without this, `excused` could have been written as "skip the key-set check when a retirement is
+    declared" -- which passes every arm above and re-opens the 7818991d silent-drop incident behind a
+    one-line declaration.
+    """
+    import scripts.asvs.apply as mod
+
+    real_render = mod.render
+
+    def dropping_render(cell: dict, live: dict | None = None) -> str:
+        stripped = {k: v for k, v in (live or {}).items() if k != "reviewed_by"}
+        text = real_render(cell, stripped)
+        return (
+            "\n".join(ln for ln in text.splitlines() if not ln.startswith("reviewed_by = ")) + "\n"
+        )
+
+    monkeypatch.setattr(mod, "render", dropping_render)
+    rec = _record_with_absence(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [
+            str(_payload(tmp_path, [_emptied_absence(retired_absence=["the gap closed"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1, "a key was dropped beside a legitimate retirement and the guard stayed quiet"
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "would LOSE field(s) ['reviewed_by']" in out, out
+
+
 # ------------------------------------------- carrying vs introducing a banned glyph (BACKLOG #1308)
 #
 # THE DEFECT IS UNWRITABILITY, NOT UNTIDINESS. Scanning the whole residual meant a cell whose own

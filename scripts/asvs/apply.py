@@ -437,9 +437,39 @@ def main(argv: list[str] | None = None) -> int:
     # a resolution check, because fewer anchors that all resolve is a passing state.
     for c in payload:
         was, now = live_cells[c["id"]], by_id[c["id"]]
-        lost = set(was) - set(now)
+        # A SUB-TABLE KEY THAT VANISHED BECAUSE ITS LIST WAS EMPTIED IS NOT A DROPPED KEY, and telling
+        # those two apart is the whole of BACKLOG #1363 (re-filed independently as #1484). `render()`
+        # emits no block for an empty list, so a FULL-LIST retirement loses the key on the round-trip
+        # and this pure key-set difference refused it -- sixty lines before the code that AUTHORISES a
+        # retirement is ever read. Measured both ways before the fix, with the flag, the declaration
+        # and the arithmetic all held constant: evidence 2 -> 1 exited 0 and wrote the file, absence
+        # 1 -> 0 exited 1 on "would LOSE field(s) ['absence']" and never printed RETIRING.
+        #
+        # THIS EXCUSES; IT DOES NOT AUTHORISE. The declaration and the arithmetic stay exactly where
+        # they are, in the retirement branch below, which is the only place that knows `before` and
+        # `after` and can refuse a declaration that fails to account for every removed entry. All this
+        # set does is stop the key-set guard answering FIRST, and only on the state that branch is
+        # about to examine: the flag is set AND the payload declares a retirement for THAT sub-table.
+        # Undeclared, or without the flag, the key stays in `lost` and refuses here exactly as before.
+        # That asymmetry is what #1363 says any fix must preserve -- a bare reordering of the two
+        # checks converts a loud false refusal into a quiet always-pass, which is worse than the bug.
+        excused = {sub for sub in _SUBTABLES if allow_retirement and c.get(f"retired_{sub}")}
+        lost = set(was) - set(now) - excused
         if lost:
-            print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
+            # Name the retirement route when the lost key is a sub-table. This refusal is otherwise
+            # unanswerable for the one legitimate way to reach it -- the operator is told a key
+            # vanished, not that the tool has a flag for exactly this -- and an unanswerable refusal
+            # is what turns a guard into a speed bump, which is the reasoning the verdict-move
+            # refusal above already states in full.
+            emptied = sorted(lost & set(_SUBTABLES))
+            route = ""
+            if emptied:
+                names = " and ".join(f"'retired_{s}'" for s in emptied)
+                route = (
+                    f" If that is a RETIREMENT, declare it in the payload as {names} and "
+                    "re-run with --allow-retirement"
+                )
+            print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}{route}")
             return 1
         # ...and the same question about the VALUE rather than the key (#1242). The check above is a
         # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
