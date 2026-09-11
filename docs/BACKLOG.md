@@ -30482,7 +30482,8 @@ and will move to the archive when it closes.
 
 ## 1537. Scope the net-helper signing secrets to a protected GitHub Environment
 
-> 🚧 **Filed and built 2026-09-11 by a Builder. Open until the owner protects the environment: a merge alone does NOT close it.** The code half is a `net-helper sign` job that names the `net-helper-signing` environment. The owner half is a repository setting that admits only `main` to that environment, with both secrets kept there and nowhere else. No certificate exists yet, so nothing can leak today. Value **8/10** · Difficulty **2/10**. Value 8: once a key exists, any account that can push a branch could otherwise read it and sign binaries as the Foundation. Difficulty 2: one workflow split and one repository setting.
+> 🚧 **Filed and built 2026-09-11 by a Builder. Open until the owner protects the environment: a merge alone does NOT close it.** The code half is a `net-helper sign` job that names the `net-helper-signing` environment. The owner half is a repository setting that admits only `main` to that environment and requires a reviewer, with both secrets kept there and nowhere else. No certificate exists yet, so nothing can leak today. Value **8/10** · Difficulty **2/10**. Value 8: once a key exists, any account that can push a branch could otherwise read it and sign binaries as the Foundation. Difficulty 2: one workflow split and one repository setting.
+> **Owner ruling, 2026-09-11: add required reviewers to the `net-helper-signing` environment.** It settles the question this row left open and adds a step to the owner half. It does not close the row, which stays open until the owner has made the setting. The section "Owner ruling 2026-09-11" below gives the reasoning.
 > Verdict: build
 > Research: none
 > Closing-act: owner-ruling
@@ -30511,15 +30512,37 @@ THE KEY" gives the mechanism.
 | Half | Who | State at filing |
 |---|---|---|
 | A `sign` job that names `net-helper-signing`, runs only on `main`, and holds the only secret references, pinned by `tests/test_net_helper_signing_scope.py` | Builder, in code | Built in the pull request that files this row |
-| Protect `net-helper-signing` so it admits only `main`, and keep both secrets in it and nowhere else | Owner, as a repository setting | Not done |
+| Protect `net-helper-signing` so it admits only `main` and requires a reviewer, and keep both secrets in it and nowhere else | Owner, as a repository setting | Not done |
 
 The code half changes nothing about who can read a repository secret. A run that names a missing
 environment creates it with no rule, so the merge configures nothing.
 
-**Closing this row narrows the exposure; it does not end it.** The rule admits whatever is merged to `main`,
-and on 2026-09-11 branch protection on `main` required no approving review. A pull request that edits the
-workflow could still reach the key once it merges, but as a commit on `main` rather than an unrecorded branch
-run. Whether to add required reviewers to the environment is the owner's decision.
+### Owner ruling 2026-09-11: required reviewers on the environment, not a review rule on `main`
+
+The branch rule admits whatever is merged to `main`, and `main` requires no approving review:
+`required_approving_review_count` read `0` from `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
+on 2026-09-11. So with the branch rule alone, a pull request that edits the workflow could reach the key once
+it merges.
+
+The owner ruled: **add required reviewers to the `net-helper-signing` environment.** Their reasoning:
+
+- Required reviewers on the environment put a person between a branch and the signing key, and they do it
+  without touching branch protection on `main`.
+- So the standing ruling of 2026-08-29, that sessions push and land their own pull requests, keeps working
+  everywhere else.
+- Raising `required_approving_review_count` on `main` would close the same hole, but it would stop sessions
+  landing their own pull requests. The owner declined it for that reason.
+
+The ruling adds a step to the owner half. On the Settings page for `net-helper-signing`, under **Deployment
+protection rules**, select **Required reviewers**, enter the reviewer, and click **Save protection rules**.
+
+**The reviewer must be an account no session can act as.** GitHub's REST documentation says a required
+reviewer can approve a waiting job through
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments` with a `repo`-scoped token. So a
+session holding the reviewer's credential could approve its own signing run. That comes from the
+documentation and is not measured, because no signing run has waited yet. **Prevent self-review** does not
+settle it. It stops the account that started a run from approving it, and nobody has measured which account
+starts a run on `main` after a queued merge. Which person reviews is the owner's choice.
 
 ### Decided and recorded, so nobody re-opens them as new
 
@@ -30545,8 +30568,21 @@ A review pass on 2026-09-11 reported these. Only the in-repository facts were re
 - Nothing re-checks the environment's branch rule after this row closes.
 - `MEFOR_FORBIDDEN_TOKENS` is a repository secret, and the scanners that read it must run on refs other
   than `main`, so an environment cannot hold it.
+- Found while recording the owner ruling, from GitHub's documentation: only repository admins can configure
+  an environment. So neither the branch rule nor the reviewer binds a session that holds an admin
+  credential, because that session could change the rules.
 
 ### How the Lander confirms the owner half before flipping this banner
 
 Run the read-only commands in `net-helper/README.md`, under "Protect the environment before either secret
 exists". The row closes when every one prints what its comment says.
+
+Those commands predate the owner ruling and do not check the reviewer, so run this one too:
+
+```
+# at least one name, and none that a session signs in as
+gh api repos/MEFORORG/MessageFoundry/environments/net-helper-signing --jq '.protection_rules[] | select(.type == "required_reviewers") | .reviewers[].reviewer | .login // .slug'
+```
+
+The jq path follows GitHub's OpenAPI description and has not run against a configured environment. An empty
+result may mean a wrong path rather than no reviewer, so confirm it on the environment's Settings page.
