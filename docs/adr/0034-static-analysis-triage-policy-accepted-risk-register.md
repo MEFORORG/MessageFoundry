@@ -204,7 +204,7 @@ make them PR-visible instead. The `dependabot-auto-merge.yml` scope row is still
 | Where | Recommendation | Status | Why it matters |
 |---|---|---|---|
 | `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | **Done, and SUPERSEDED TWICE — read the 2026-09-03 amendment at the foot of this ADR before acting on this cell.** As written it says: `sigstore==4.4.0`, deliberately *not* 4.5.0, because `.github/dependabot.yml` sets `cooldown.default-days: 5` and 4.5.0 was <48 h old; *"Re-evaluate once it ages out."* **The version is still 4.4.0** — that half is correct and is now an owner ruling (2026-08-22, re-affirmed 2026-09-03), not an inference from the cooldown. **Two things here are now wrong.** (1) It is no longer an inline `pip install` pin at all: `sigstore` flows through the PEP 735 `release-tools` group into `ci/locks/release-tools.lock`, installed with `--require-hashes`. (2) **"Re-evaluate once it ages out" is DISCHARGED, and must not be actioned again.** The cooldown expired 2026-08-02; both rulings postdate that, so re-deriving it does not reopen the version. It was re-derived once anyway, and shipped 4.5.0 in `a9354808e`. `.github/dependabot.yml` now carries a matching `ignore` entry so a bot cannot repeat it. | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
-| `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | **Done** — `pip==26.1.2 build==1.5.0`, in **both** the engine and harness build steps. | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
+| `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | **Done, and SUPERSEDED 2026-09-10 by something stronger than this cell asked for.** As written it says: `pip==26.1.2 build==1.5.0`, in **both** the engine and harness build steps. Two things are now wrong. (1) There were **three** build steps, not two — the web console's was missed when this cell was written. (2) It is no longer an inline pin at all: `build` flows through the PEP 735 `release-tools` group into `ci/locks/release-tools.lock`, installed with `--require-hashes` at all three sites (BACKLOG #332 step 6). An inline `==` pinned the frontend and left its transitives floating; the lock hashes those too. The `pip==26.1.2` half went rather than moving: `--require-hashes` resolves nothing, so the installer's version is not an input, and that line was itself an unhashed fetch of pip. | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
 | `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | **Done, both halves** — pin *derived from `constraints.lock`* (it is a DEP-1 transitive, so a literal would rot), and moved into `/tmp/harnesssmoke` mirroring `/tmp/relsmoke`. | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
 | `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | **Done** — same `constraints.lock`-derived pin. | Contained (disposable venv, version-compare only), but free to pin. |
 | `dependabot-auto-merge.yml` `security-events: read` | Remove the scope | **Open** | Dead. Its comment claims it reads Dependabot alerts, but the gate calls the **global** `/advisories` endpoint, which is repo-scope-independent. Verified; least-privilege hygiene only. |
@@ -341,12 +341,16 @@ editably, which cannot use `--require-hashes`") is now *false for those lines* b
 fixed**. Under this ADR's own Decision — a dismissal with a false reason is worse than an open finding —
 that is the point, not a consolation.
 
-The **2 genuinely open** `PinnedDependenciesID` alerts are untouched: they are the medium pair on the
-**SBOM scratch venv** (`python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, in `release.yml`
-and `security.yml`). Closing them needs a third group *and* moving **both** halves in lockstep, because
-`test_sbom_install_is_byte_identical_in_release_and_security` requires the two commands to stay
-identical. `release.yml` was deliberately scoped out of this change (see the residuals), so this is
-recorded as the next increment rather than done.
+The **2 genuinely open** `PinnedDependenciesID` alerts were untouched at the time of writing: the medium
+pair on the **SBOM scratch venv** (`python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, in
+`release.yml` and `security.yml`). **Both closed 2026-09-10 (BACKLOG #332 step 6)**, and not via the
+third group this paragraph predicted: `cyclonedx-bom` joined the EXISTING `release-tools` group, since
+the three release tools run in the same job on the same runner at the same trust level and a second lock
+would be a second artifact to export, diff, resync and audit for no separation anybody acts on. Both
+halves moved in one commit, as the lockstep requirement below demanded, and
+`test_sbom_install_is_byte_identical_in_release_and_security` moved with them — it now compares each
+SBOM step's whole install prologue rather than the single line that used to name `cyclonedx-bom`, which
+after the move names a lock five other sites also install.
 
 ### Residuals — dismissals that stay dismissed, and why
 
@@ -487,6 +491,11 @@ place rather than deleted.
   `release.yml` installing the toolchain with `pip install --require-hashes -r
   ci/locks/release-tools.lock`. The ~30 transitives that previously floated unhashed at signing
   time, inside the job holding `id-token: write`, are pinned by hash.
+  **Widened 2026-09-10 (#332 step 6):** the same group and lock now carry `build` and
+  `cyclonedx-bom` as well, so all three release tools arrive hash-verified. The lock is installed at
+  **six** sites — five in `release.yml` (three build steps, the SBOM step, the signing step) and one
+  in `security.yml`'s SBOM job. `tests/test_ci_venv_pinning.py` pins those counts exactly, because a
+  step that silently lost its install still passes every shape check in that module.
 * **The residual's reasoning contained a false counterfactual, and that is the transferable lesson.**
   It asserted that routing `sigstore` through the lock *would* resolve 4.5.0, and so treated
   "hash-lock it" and "keep 4.4.0" as mutually exclusive. A dependency group carries an explicit
@@ -529,10 +538,30 @@ place rather than deleted.
   instrument matches CI's). All six pre-existing DEP-1 artifacts stay byte-identical; `uv lock` moves
   one line and `release-tools.lock` three. The `semgrep`-style excluded-by-decision call was never
   reached.
-* **Still open, deliberately.** `build` and `cyclonedx-bom` remain inline installs in the same
-  privileged job. Per the "2 genuinely open `PinnedDependenciesID` alerts" paragraph above,
-  `cyclonedx-bom` is half of a pair `test_sbom_install_is_byte_identical_in_release_and_security`
-  requires to stay byte-identical, so both halves must move in one commit. Tracked at BACKLOG #332.
+* **CLOSED 2026-09-10, having been recorded here as "still open, deliberately".** That bullet said
+  `build` and `cyclonedx-bom` remain inline installs in the same privileged job, tracked at BACKLOG
+  #332. Both now flow through the `release-tools` group and `ci/locks/release-tools.lock`; the
+  byte-identical pair moved in one commit as required. The lock went from 31 requirements to 65 and
+  from 193 hashes to 383. **The contamination this ADR's convergence criterion exists to catch DID
+  fire this time**, unlike the `sigstore` increment above, and is recorded in the next bullet rather
+  than in this one.
+* **Contamination, second increment: ONE pre-existing artifact moved, and it was accepted rather than
+  absent.** Control first, on the unchanged tree: all seven DEP-1 artifacts re-exported
+  byte-identically, so the instrument was sound before the change. After it, the four runtime exports
+  and `ci-scanners.lock` stayed byte-identical, and `ci-quality.lock` moved by one requirement —
+  `chardet` 7.4.3 to 5.2.0. Cause: `cyclonedx-bom` declares `chardet<6.0,>=5.1` while `diff-cover`
+  declares `chardet>=3.0.0`, and uv resolves one version per package across every group. **This is not
+  the `semgrep` case and the difference is the criterion itself.** `semgrep` was excluded by decision
+  because its group downgraded the shipped otel runtime in **all four** DEP-1 artifacts, i.e. the
+  product, the SBOM and what `pip-audit` reports as runtime. This touches one advisory-only CI
+  toolchain lock, on an undeclared transitive whose version was never a decision this repo made in
+  either direction, and 5.2.0 sits inside both tools' declared ranges. Checked against OSV with a
+  positive control (`requests==2.19.0` returned 10 advisories): **neither `chardet` version carries a
+  known advisory**, and `pip-audit` runs over `ci-quality.lock` on every security run, so a future one
+  fails closed. `[tool.uv] conflicts` was tried as the alternative and is **worse**: it did not undo
+  the downgrade, and it leaked eight lines into each of `requirements.lock` and the two container
+  image locks — that is, into the SBOM input and what `pip-audit` reports as runtime, which is
+  exactly the harm the declaration was reached for to avoid. Measured, then reverted.
 * **No PR CI leg executes the signing path.** `release.yml` runs only on a tag push or
   `workflow_dispatch` (see "What no test can see"). The guards assert the lock exists, pins
   `sigstore` exactly, is fully hashed and is installed with `--require-hashes`; they cannot assert it

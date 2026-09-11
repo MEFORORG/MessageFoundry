@@ -448,13 +448,16 @@ jobs:
           # (docker/locks/requirements-core.lock) is the honest runtime closure `pip install messagefoundry`
           # pulls; the all-extras requirements.lock stays covered by the pip-audit job above. cyclonedx-bom
           # ~=7.3.1 → lxml 6.x (cp314 wheels) so the 3.14 runner doesn't source-build lxml. ADR 0149.
-          # PINNED and BYTE-IDENTICAL to release.yml's SBOM install (enforced by
-          # tests/test_ci_venv_pinning.py). ~=7.3.1 rather than ~=7.3 so a 7.4 cannot change the JSON
-          # shape sbom_finalize.py parses. This job is ADR 0034's pre-tag dry-run for the release SBOM
-          # step, so the two must stay the SAME command — if they drift, dispatching this one proves
-          # nothing about the release.
-          python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"
-          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          # HASH-PINNED and BYTE-IDENTICAL to release.yml's SBOM install, enforced by
+          # tests/test_ci_venv_pinning.py. `cyclonedx-bom` moved from an inline pin of the top package
+          # only into the PEP 735 `release-tools` group and ci/locks/release-tools.lock (BACKLOG #332
+          # step 6), so its transitives are hashed rather than resolved from PyPI at run time. The
+          # `~=7.3.1` bound is UNCHANGED and its rationale lives ONCE, at that group in pyproject.toml.
+          # No pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          # This job is ADR 0034's pre-tag dry-run for the release SBOM step, and since nothing in PR CI
+          # executes release.yml, THIS is the only leg that runs the command before a tag. If the two
+          # drift, dispatching this one proves nothing about the release.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \

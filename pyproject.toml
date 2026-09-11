@@ -305,7 +305,30 @@ ci-scanners = [
 # an inline install inside a workflow `run:` block, so the pin has no updater, no trigger and no owner.
 # Routing it through `uv.lock` hashes the transitives AND puts it under the `uv` ecosystem Dependabot
 # already watches. Non-default, like its siblings, so it stays out of the runtime exports and the SBOM.
+#
+# THE OTHER TWO ENTRIES ARE THE SAME DEFECT, closed the same way (BACKLOG #332 step 6) -- the paragraph
+# directly above states it, so it is not restated here:
+#   build          `==`, because the artifact it builds IS the release: it is the PEP 517 frontend that
+#                  produces the wheel and sdist that are then signed, attested and published. Three
+#                  install sites, in THREE DIFFERENT JOBS (engine, web console, harness). All three hold
+#                  `id-token: write`; only the engine's also holds `attestations: write`. Read each job's
+#                  own `permissions:` block rather than trusting a copy here.
+#   cyclonedx-bom  `~=7.3.1` DELIBERATELY, and the CEILING is the decision rather than the floor: 7.3.x
+#                  takes patch fixes, and a 7.4 could change the CycloneDX JSON shape
+#                  scripts/security/sbom_finalize.py parses -- which exits non-zero and FAILS the
+#                  release. `~=7.3` would float the whole 7.x minor range and lose that. Kept at the
+#                  spec the inline install already carried, so this move adds hashes for the transitives
+#                  without changing which version resolves. THIS IS THE ONE STATEMENT OF THAT REASONING;
+#                  the test suite's FLOOR_BY_DESIGN entry points here rather than repeating it.
+# Both are installed from `ci/locks/release-tools.lock` with `--require-hashes`, alongside the signing
+# tool above. One group and one lock rather than three: the three tools run on the same runners at the
+# same trust level, and a second lock would be another artifact to export, diff, resync and audit for a
+# separation nobody acts on. The priced-in cost is that each site installs the whole 65-package group
+# rather than its own closure; it lands mainly on the two wheel-build jobs and on `security.yml`'s SBOM
+# job, and a `--require-hashes -r <file>` install cannot be subset, so there is no cheaper one-lock form.
 release-tools = [
+    "build==1.5.0",
+    "cyclonedx-bom~=7.3.1",
     "sigstore==4.4.0",
 ]
 # The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's

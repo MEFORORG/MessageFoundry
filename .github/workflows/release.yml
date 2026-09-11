@@ -100,12 +100,21 @@ jobs:
 
       - name: Build sdist + wheel
         run: |
-          # PINNED (Scorecard PinnedDependenciesID; ADR 0034 §3). This runs in the job holding
-          # contents/id-token/attestations: write, and `build` produces the artifact that is signed and
-          # published — an unpinned resolve here picks whatever PyPI serves at tag time. Neither tool is
-          # in any DEP-1 lock, so `==` is drift-free (and Dependabot cannot bump an inline workflow
-          # install: re-check these by hand when bumping, tests/test_ci_venv_pinning.py keeps them pinned).
-          python -m pip install "pip==26.1.2" "build==1.5.0"
+          # HASH-PINNED (Scorecard PinnedDependenciesID; ADR 0034 §3, BACKLOG #332 step 6). This runs in
+          # the job holding contents/id-token/attestations: write, and `build` produces the very artifact
+          # that is then signed, attested and published -- so whatever executes here is inside the trust
+          # boundary of the release.
+          # This WAS an inline `pip install` that pinned the TOP package and left every transitive
+          # floating, resolved from PyPI at tag time. `build` now flows through the PEP 735
+          # `release-tools` group into ci/locks/release-tools.lock, so the transitives are hashed too and
+          # Dependabot's `uv` ecosystem can see the pin (no ecosystem parses an inline workflow install).
+          # The version rationale lives ONCE, at that group in pyproject.toml.
+          # NO pip bootstrap, deliberately, and this is the same call the sigstore step and both SBOM
+          # steps make: `--require-hashes` resolves NOTHING, so every version and artifact hash comes out
+          # of the lock and the installer's own version is not an input to what gets installed. The line
+          # it replaces fetched `pip==26.1.2` itself UNHASHED from PyPI; dropping it leaves the pip that
+          # actions/setup-python ships, which arrives from an action pinned by SHA.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m build
           ls -l dist/
 
@@ -320,15 +329,16 @@ jobs:
           # The core lock is the honest closure a `pip install messagefoundry` pulls (the all-extras
           # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
           # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
-          # ~=7.3.1 (not ~=7.3): the looser form floats the whole 7.x minor range, and a 7.4 could change
-          # the CycloneDX JSON shape sbom_finalize.py parses — which exits non-zero and FAILS the release.
-          # ~=7.3.1 still takes patch fixes and keeps the lxml-6.x/cp314 floor rationale above intact.
-          # BYTE-IDENTICAL to security.yml's SBOM install, and kept that way by a test. Nothing in PR CI
-          # executes release.yml (tag push only), so ADR 0034's documented pre-tag check is to dispatch
-          # security.yml's sbom job and read ITS log — which only proves anything while the two install
-          # commands are the same command.
-          python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"
-          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          # HASH-PINNED (BACKLOG #332 step 6): `cyclonedx-bom` replaced an inline pin of the top package
+          # only, and now flows through the PEP 735 `release-tools` group into ci/locks/release-tools.lock
+          # so its transitives are hashed too. The `~=7.3.1` bound is UNCHANGED, and its rationale lives
+          # ONCE, at that group in pyproject.toml.
+          # No pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          # BYTE-IDENTICAL to security.yml's SBOM install, enforced by tests/test_ci_venv_pinning.py.
+          # Nothing in PR CI executes release.yml (tag push only), so ADR 0034's documented pre-tag check
+          # is to dispatch security.yml's sbom job and read ITS log -- which only proves anything while
+          # the two steps run the same commands.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
@@ -525,10 +535,12 @@ jobs:
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
-          # Pinned like every other build job on this path: this workflow's jobs hold contents/id-token
+          # Hash-pinned like every other build job on this path: this workflow's jobs hold contents/id-token
           # write and publish the release artifacts, so an unpinned resolve takes whatever PyPI serves at
-          # tag time (Scorecard PinnedDependenciesID, ADR 0034 §3). Guarded by tests/test_ci_venv_pinning.py.
-          python -m pip install "pip==26.1.2" "build==1.5.0"
+          # tag time (Scorecard PinnedDependenciesID, ADR 0034 §3). `build` and its transitives come from
+          # ci/locks/release-tools.lock -- see the engine build step above for why there is no pip
+          # bootstrap. Guarded by tests/test_ci_venv_pinning.py.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Wheel-only for the same reason as the harness: messagefoundry_webconsole/ lives OUTSIDE this
           # project dir and is pulled in via force-include, so an sdist would not be self-contained.
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
@@ -653,9 +665,10 @@ jobs:
 
       - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
         run: |
-          # PINNED, same rationale as the engine's build step: this job also holds contents/id-token:
-          # write, and it publishes the harness wheel when PUBLISH_HARNESS is set.
-          python -m pip install "pip==26.1.2" "build==1.5.0"
+          # HASH-PINNED, same rationale as the engine's build step: this job also holds contents/id-token:
+          # write, and it publishes the harness wheel when PUBLISH_HARNESS is set. `build` and its
+          # transitives come from ci/locks/release-tools.lock; see that step for why no pip bootstrap.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Wheel-only on purpose: the harness source (harness/) lives OUTSIDE this project dir (it is
           # force-included from ../../harness), so an sdist would not be self-contained. Pure-Python, so a
           # wheel suffices. Version is read from messagefoundry/__init__.py (lockstep with the engine).

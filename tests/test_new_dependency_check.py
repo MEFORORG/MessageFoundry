@@ -379,11 +379,11 @@ def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
     """The count must MOVE, not merely be plausible — a parser that silently reads nothing new passes
     every floor above.
 
-    Measured on this branch: 42 distributions before `[dependency-groups]` was swept, 49 after. Six of
-    the seven added names are the CI toolchain (`bandit`, `pip-audit`, `zizmor`, `diff-cover`,
-    `mutmut`, `pytest-cov`). The seventh, `sigstore`, is the RELEASE SIGNING toolchain that BACKLOG
-    #332 routes through `uv.lock` — a different group doing a different job, listed here because this
-    test asserts what the SWEEP finds, not what any one group holds.
+    Measured on this branch: 42 distributions before `[dependency-groups]` was swept, 51 after. Six of
+    the nine added names are the CI toolchain (`bandit`, `pip-audit`, `zizmor`, `diff-cover`,
+    `mutmut`, `pytest-cov`). The other three — `sigstore`, `build` and `cyclonedx-bom` — are the
+    RELEASE toolchain that BACKLOG #332 routes through `uv.lock`: a different group doing a different
+    job, listed here because this test asserts what the SWEEP finds, not what any one group holds.
     `pytest-timeout` is declared in BOTH the `dev` extra and `ci-quality` and so adds nothing, which is
     itself deliberate — the identical spec in both places is what stops uv resolving two versions.
 
@@ -414,10 +414,12 @@ def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
         "mutmut",
         "pytest-cov",
         "sigstore",
+        "build",
+        "cyclonedx-bom",
     }, (
         f"the [dependency-groups] sweep added {sorted(added)}; expected the six CI toolchain names "
-        "plus sigstore, the release-signing toolchain. If a tool was deliberately added or removed, "
-        "re-point this set in the same commit."
+        "plus the three release-toolchain ones (sigstore, build, cyclonedx-bom). If a tool was "
+        "deliberately added or removed, re-point this set in the same commit."
     )
     assert "pytest-timeout" in without, (
         "pytest-timeout must remain declared in the [dev] extra too — the ci-quality group deliberately "
