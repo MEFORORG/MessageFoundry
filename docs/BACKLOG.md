@@ -30903,3 +30903,45 @@ the exposure window; neither `created_at` nor `run_started_at` is.
 the run-level fields in opposite directions -- one reporting a re-run as 8m48s long, one reporting a
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
+
+## 1543. claim.ps1 routed every directory-only holder to the Cleaner and the Dispatcher, both retired seats, so 56 of 80 claims had no working release path
+
+> ✅ **FIXED 2026-09-11 in the same change that files this row.** Value **6/10** · Difficulty **2/10** · _quick win_. `scripts/coord/claim.ps1` reports a third holder state -- DIRECTORY ONLY, the worktree exists but no live session sits in it (BACKLOG #1348) -- and refuses to release on that signal. **The refusal is correct and is unchanged.** What was broken is where it sent you: three call sites said *"ROUTE to the Cleaner/Dispatcher"*, *"Route to the Cleaner or the Dispatcher"* and *"Hand it to the Cleaner or the Dispatcher"*. CLAUDE.md section 5 retired both seats, so the register's largest category had **no live destination at all**.
+
+**Cluster:** coordination tooling. **Priority:** P2. **Verdict:** fix.
+**Severity:** no deployment axis (sec. 0). Repository coordination only -- no engine behaviour, no shipped artifact, no PHI.
+
+### The measurement that produced this row
+
+Censused 2026-09-11 against the live register, before any cleanup:
+
+| Holder state | Item status | Claims | Release path |
+| --- | --- | --- | --- |
+| gone | closed | 5 | tool-sanctioned |
+| gone | open | 12 | tool-sanctioned |
+| directory-only | closed | 3 | none named |
+| **directory-only** | **open** | **56** | **none that exists** |
+| live | -- | 4 | not applicable |
+
+**56 of 80, or 70 percent.** Median age **118 hours**, with **48 held over 96 hours**, and **43 of the 56 were one wave** -- the ASVS packet rows #1107-#1199, claimed together and never released. So this is not drift accruing row by row; it is a single dispatch that ended with no release path, and a register with no mechanism to recover it.
+
+### Why the refusal stays and only the routing changed
+
+`claim.ps1` says it plainly: *"occupancy can VETO but never authorise"*. Occupancy sees a session by the cwd it launched in, so a session working in that path BY ABSOLUTE PATH from another cwd is invisible. Nothing on the host can prove a session is gone, and weakening the guard to clear the backlog would trade a stuck register for two seats building the same thing.
+
+### What replaced the seat names, and the general rule
+
+**The fix names the CONDITION that settles the case, not the role that performs it.** Two things settle a directory-only claim, and both were used the same day:
+
+1. **The item is already closed.** Then no live session can be doing the work, so liveness stops mattering. Used to release #1430, #1456 and #1494.
+2. **The owner rules.** Used to release #1265, whose note already read *"Release when the PR merges"* -- the condition was met and only the liveness signal blocked it.
+
+The script also now states what is NOT a reason: **a long quiet period**. Age is not evidence, and this is the state where you cannot tell.
+
+**A TOOL THAT NAMES A ROLE INHERITS THAT ROLE'S LIFETIME.** That is the reusable half. The two seat names were correct when written and silently became a dead end; nothing failed, nothing reported it, and the register simply grew. The replacement text is conditioned on facts (a banner, an owner decision) that cannot retire, and the code carries a comment saying not to put a seat name back.
+
+### What this row does not do
+
+**It does not release the 56.** Twenty claims were released the same day under the two settling conditions -- every `gone` holder plus the three closed-item directory-only ones -- taking the register from 80 to 60. The remaining 56 are open items with live-unknown holders and each still needs one of the two conditions met. That is work for whoever holds the register, not a side effect of this fix.
+
+**Related:** [#1348](#1348) defined the third state this routes on. [#1358](#1358) is the sibling defect in the same script -- `-Release` records the script copy's tree as the actor rather than the caller's.
