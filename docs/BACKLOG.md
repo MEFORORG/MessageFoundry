@@ -30479,3 +30479,133 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
+
+> 🚧 **Built 2026-09-11; open until its pull request merges, when the Lander flips this banner.** One-line key change in `.github/workflows/cla.yml` -- `github.ref` becomes `github.event.pull_request.number` on the `pull_request_target` arm -- plus `tests/test_workflow_concurrency_keys.py`, which holds the invariant over all 28 workflow files. Value **8/10** · Difficulty **2/10**. Value 8: `cla` is a required context, 25 of the last 61 `pull_request_target` runs were cancelled, and 17 open pull requests carried a cancelled `cla` when this was filed. Difficulty 2: the fix is one expression; establishing that it was the cause, and that nothing else shares the shape, was the work.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI / merge gating. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is the repository's own CI, not the shipped engine. No
+product code, no PHI path and no security control changes. What it broke was the ability to merge.
+
+### The key named the base branch, so every pull request landed in one group
+
+The group was `cla-${{ github.event_name == 'pull_request_target' && github.ref || github.run_id }}`
+with `cancel-in-progress` true on that arm. The condition matches -- the workflow does declare
+`pull_request_target` -- so the `github.ref` arm is live. The trap is what `github.ref` holds there.
+
+For `pull_request` it is `refs/pull/<n>/merge`, which carries the number and so is per-pull-request.
+For `pull_request_target` it is the base ref. GitHub's contexts documentation states it in one
+sentence: "`pull_request_target` events have the `ref` from the base branch." Every open pull request
+against `main` therefore resolved to the single group `cla-refs/heads/main`, and each new run cancelled
+whatever was in flight there -- which belonged to a different pull request.
+
+The author had already written the governing fact down, one arm over. The `issue_comment` note in the
+same block says an issue_comment ref "is the default branch" and keys that arm on `github.run_id` to
+avoid exactly this. The reasoning was correct and was not carried across to the sibling arm.
+
+### Measured, with a paired control that differs only in the trigger
+
+Over this workflow's last 100 runs, read 2026-09-11:
+
+| Event arm | Key it takes | Runs | Cancelled |
+|---|---|---|---|
+| `pull_request_target` | `github.ref` (shared) | 61 | 25 |
+| `issue_comment` | `github.run_id` (unique) | 29 | 0 |
+| `merge_group` | `github.run_id` (unique) | 10 | 0 |
+
+The 25 cancellations spanned 19 distinct head branches, and they chain: each one is stamped cancelled
+one second after a run on an unrelated branch was created. `retry-forever-spelling-1217` died at
+04:14:35 as `fence-ordering-inc0-1497` started at 04:14:34; `ad-immutable-id-1471` died at 04:05:17 as
+`retry-forever-spelling-1217` started at 04:05:16; and so on back through the window.
+
+Attributing those requires care, because a same-branch re-push is a cancellation this block is supposed
+to cause. Each cancellation was credited to cross-pull-request collapse only when **no** run on its own
+branch started within 5 seconds of the kill -- a rule that biases against the finding. Under it:
+
+| Workflow | Group key | Trigger | Cross-branch-only cancellations |
+|---|---|---|---|
+| `cla.yml` | `github.ref` | `pull_request_target` | **21** |
+| `security.yml` | `github.ref` | `pull_request` | **0** (6 same-branch supersedes) |
+
+`security.yml` carries the same expression shape in the same repository over the same hour. Only the
+trigger differs, and with it the meaning of `github.ref`. That is the discriminator.
+
+### What a victim saw, and why nobody traced it
+
+A cancelled run reports `conclusion: cancelled` with `steps: 0` and no downloadable log -- measured on
+run 34560869543, against 5 steps on the healthy run 34561465510. No step ever started, so there is no
+failure to read. `gh pr checks` renders it in the fail column.
+
+The cause is not in the victim's own run at all. It is the creation timestamp of a run on somebody
+else's branch, which is not a place a reviewer looks.
+
+At filing, 17 of 23 open pull requests carried a cancelled `cla`, and on 11 of them `cla` was the
+**only** required context that was not a success.
+
+### One claim here is documented, not measured, and is marked so
+
+That a cancelled required context blocks the merge is **inferred**: branch protection requires a
+success, and `cancelled` is a distinct conclusion. It could not be observed directly on this
+population. Branch protection sets `strict: true`, so a stale pull request reports `BEHIND`, and
+`mergeStateStatus` reports `BEHIND` or `DIRTY` in preference to `BLOCKED` -- every one of those 11 was
+`BEHIND` or `DIRTY`, which masks the reading. No pull request existed that was up to date, green
+elsewhere, and cancelled only on `cla`, and none was manufactured. The 21 cancellations are measured;
+this consequence is not.
+
+### The whole workflow population was checked, not just the file that broke
+
+All 28 files in `.github/workflows/`, none skipped:
+
+| Verdict | Files |
+|---|---|
+| collapses across pull requests, with cancel | **1** -- `cla.yml` |
+| shared key, cancel off | 1 -- `asvs-prove-absences.yml` |
+| per-pull-request isolated | 13 |
+| unique per run, or a deliberate singleton | 4 |
+| per branch, no pull-request trigger | 2 |
+| no concurrency block | 7 |
+
+`asvs-prove-absences.yml` keys on `github.ref` unconditionally, which is shared on its `push` and
+`workflow_dispatch` arms, but sets `cancel-in-progress: false` and reports no required context, so a
+second run queues rather than killing the first. `freethread-smoke.yml` can have a manual dispatch
+cancel an in-flight weekly canary; it is informational and reports nothing required. Neither is fixed
+here, and neither is the defect this item names.
+
+`unread-signal.yml` is the only other file declaring `pull_request_target`, and it already keys on
+`github.event.pull_request.head.ref` rather than `github.ref`, so it does not collapse.
+`dependabot-auto-merge.yml` and `dependabot-lock-resync.yml` already key on the payload number, which
+is the pattern this fix adopts.
+
+### The guard, and why it is event-aware rather than a grep
+
+`tests/test_workflow_concurrency_keys.py` holds the invariant: for `pull_request_target` and
+`issue_comment` -- the two events that fire per pull request and whose `github.ref` is shared -- a
+concurrency group must not key on `github.ref`.
+
+`push`, `schedule`, `workflow_dispatch` and `workflow_run` are deliberately outside that set, which is
+why the test does not flag `ci.yml`; they do not fire per pull request, so a ref key there groups a
+branch with itself. `merge_group` is outside it because its ref already carries the pull request
+number.
+
+A checker that simply grepped for `github.ref` would condemn the five workflows that are correct and
+teach nothing about the sixth. The test therefore reads the trigger, and its table asserts both
+directions on one expression: the five-sibling expression is clean on `pull_request` and clean on
+`pull_request_target`, while the same expression with the arms swapped is dirty on
+`pull_request_target` and clean on `pull_request`.
+
+Mutation-tested both ways rather than assumed. Reverting the key to `github.ref` reddens the general
+invariant and the cla-specific test. Replacing it with `github.run_id` on every arm -- safe, but it
+discards the re-push saving the block exists for -- reddens only the cla-specific test. The two arms
+fail disjoint sets, so the tests discriminate instead of both firing on any edit.
+
+### The required set does not move
+
+The job key stays `cla` and still declares no `name:`, so the reported context string is unchanged.
+`.github/required-contexts.txt` and the count pinned in `tests/test_required_contexts.py` are untouched.
+Live branch protection read the same day returns 13 contexts, set-equal to that file. The existing
+negative control for `cla` in `tests/negative_controls.toml` already guards the context string, and it
+still passes.
