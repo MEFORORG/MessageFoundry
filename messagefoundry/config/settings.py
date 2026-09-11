@@ -3344,6 +3344,18 @@ class ClusterVipSettings(_Section):
         return self
 
 
+def _fence_tick_seconds(fence_timeout_seconds: float) -> float:
+    """The self-fence watchdog's poll interval, as a function of the fence timeout.
+
+    A SECOND copy of ``messagefoundry.pipeline.cluster.fence_tick_seconds``, which is the definition.
+    It is copied rather than imported because ``config/`` is the leaf layer and ``pipeline/`` imports
+    it, so importing back would invert the dependency — and :class:`DbCoordinator` deliberately
+    duck-types its settings for the same reason. A copied safety constant is a drift hazard, so
+    ``tests/test_adr0157_inc0_margin.py`` pins the two equal across a range of inputs. Do not "fix"
+    this by importing; fix it by keeping the test green."""
+    return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
+
+
 class ClusterSettings(_Section):
     """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
@@ -3394,13 +3406,33 @@ class ClusterSettings(_Section):
     # acquire. MUST be > heartbeat_seconds so a single missed renew doesn't fence. _fence_ordering below
     # enforces exactly that ordering — and ONLY the ordering.
     #
-    # What the ordering does NOT establish, for anyone sizing these down from the defaults: the usable
-    # margin is smaller than (ttl - fence), because the fence baseline is stamped after the renew round
-    # trip returns while the lease expiry is stamped on the DB clock at statement execution, and
-    # detection lands up to one fence tick late. Nor does fencing stop the graph — it flips a boolean;
-    # the listeners and in-flight sends wind down on their own schedule, which nothing budgets against
-    # the remainder. The shipped 10/20/30 leave real slack; tightened values consume it silently.
+    # What the ordering does NOT establish, for anyone sizing these down from the defaults: detection
+    # lands up to one fence tick late, so the usable margin is (ttl - fence - fence_tick) and NOT
+    # (ttl - fence). _renew_fits_the_margin below checks that remainder against the renew clamp. The
+    # renew round trip is no longer a term in it — ADR 0157 Inc 0 stamps the fence baseline BEFORE the
+    # renew is issued, so the baseline is never later than the DB clock's own lease stamp — and the
+    # prose that used to subtract it here was left over from the pre-Inc-0 ordering. Fencing still does
+    # not stop the graph: it flips a boolean, and the listeners and in-flight sends wind down on the
+    # DEMOTE teardown budget (ADR 0157 Inc 4/5), which is derived from that same remainder. The shipped
+    # 10/20/30 leave real slack; tightened values consume it silently.
     leader_fence_timeout_seconds: float = 20.0
+    # ADR 0157 Inc 0 — the CLAMP on the leadership-lease acquire/renew round trip. Before this the renew
+    # inherited `[store].command_timeout` (30 s), which EQUALS the stock lease TTL, so a self-fenced node
+    # could keep a renew in flight long enough to extend its own lease well past the moment it stopped
+    # calling itself leader. That is a liveness cost, not a split-brain one (the fence baseline is
+    # stamped before the renew is issued, so the detection margin holds either way) — a standby cannot
+    # take over until the lease it just re-extended expires again.
+    #
+    # SCOPE, stated because a control that claims more than it covers is worse than none: this clamps
+    # the POSTGRES coordinator, where it is asyncpg's own per-statement `timeout=`. The SQL Server
+    # coordinator's renew still inherits `[store].command_timeout` from the ODBC connection, because a
+    # per-statement override there lives in `store/sqlserver.py`. That is a NAMED, open residual of
+    # ADR 0157 Inc 0 — not something this setting silently covers.
+    #
+    # Must be > 0 and strictly below the detection margin (ttl - fence - fence_tick); at the shipped
+    # 10/20/30 that margin is 9.0 s, so the 5.0 default passes with room. Lower it before you tighten
+    # the fence/TTL pair, or the load-time check refuses the pair.
+    lease_renew_timeout_seconds: float = 5.0
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
     # (byte-identical to before this knob existed). A preferred site keeps its nodes at 0.0 and a warm
@@ -3431,6 +3463,7 @@ class ClusterSettings(_Section):
         "reclaim_interval_seconds",
         "leader_lease_ttl_seconds",
         "leader_fence_timeout_seconds",
+        "lease_renew_timeout_seconds",
     )
     @classmethod
     def _positive(cls, value: float) -> float:
@@ -3481,6 +3514,42 @@ class ClusterSettings(_Section):
                 f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
                 f"leader_lease_ttl_seconds={self.leader_lease_ttl_seconds}) — the leader must renew "
                 "faster than it fences, and fence before the lease can expire and a standby acquire it"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _renew_fits_the_margin(self) -> ClusterSettings:
+        """The MARGIN check ``_fence_ordering`` does not make (ADR 0157 Inc 0).
+
+        ``_fence_ordering`` establishes ``fence < ttl`` and stops there, so it accepts a pair whose
+        remaining detection margin is a fraction of a second. The margin is
+        ``ttl - fence - fence_tick``: the watchdog polls once per tick, so detection lands up to one
+        tick after the fence timeout elapses. Everything the ex-leader still has to do -- tear the
+        graph down, and stop a renew it issued before it fenced -- has to fit inside that remainder.
+
+        This checks the one of those that is a configured number: the renew clamp must be strictly
+        below the margin. **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157
+        Inc 4/5) is derived from the same remainder and bounds the source phase only.
+
+        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the Postgres coordinator's renew.
+        The SQL Server coordinator's renew still inherits ``[store].command_timeout``, an open ADR 0157
+        Inc 0 residual, so on that backend this checks a value the renew does not yet use. Said here
+        rather than left to be inferred from a green config load."""
+        tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
+        margin = self.leader_lease_ttl_seconds - self.leader_fence_timeout_seconds - tick
+        # Written as a positive test so a NaN fails it too, as _vip_fits_the_cluster is.
+        if not self.lease_renew_timeout_seconds < margin:
+            raise ValueError(
+                "cluster lease timing leaves no room for the renew clamp: "
+                "lease_renew_timeout_seconds must be < (leader_lease_ttl_seconds - "
+                "leader_fence_timeout_seconds - the fence tick) "
+                f"(got lease_renew_timeout_seconds={self.lease_renew_timeout_seconds}, "
+                f"leader_lease_ttl_seconds={self.leader_lease_ttl_seconds}, "
+                f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
+                f"fence tick={tick}, so the margin is {margin}) -- a renew still in flight when this "
+                "node self-fences can re-extend the lease it is standing down from, and a standby "
+                "cannot take over until that extension expires. Lower lease_renew_timeout_seconds, or "
+                "widen the gap between the fence timeout and the TTL"
             )
         return self
 
