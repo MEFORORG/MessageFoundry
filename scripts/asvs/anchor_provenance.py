@@ -793,15 +793,12 @@ def _write_annotation(
         f"{len(result.payload)} cell(s). Apply it with scripts/asvs/apply.py where the record lives; "
         "this tool does not write the record."
     )
-    # The writer refuses an unstated write above its own ceiling (BACKLOG #1476), and this payload is
-    # machine-generated, so its size is whatever the population turned out to be. Naming the flag
-    # HERE, beside the count, is what keeps that refusal answerable: an operator who meets it with no
-    # warning re-runs with whatever override silences it, which is how a guard becomes a speed bump.
-    #
-    # THE IDS ARE NOT PRINTED, and that is not an oversight. Every arm of this tool's suite scans its
-    # streams for a planted row id, because a summary this module calls safe to paste anywhere must
-    # not name a graded row. The ids are in the payload file, where the operator already is.
-    print("  a payload above the writer's ceiling must state its scope: apply.py --scope <ids>")
+    # DELIBERATELY NO HINT HERE ABOUT THE WRITER'S `--scope` CEILING (BACKLOG #1476). A line was
+    # added and then removed: it hardcoded the flag spelling and the ceiling's existence into a
+    # SECOND tool with no shared source and nothing pinning the pair, and it printed on every
+    # annotation including the payloads below the ceiling that need no scope -- the noise-then-ignore
+    # shape this file argues against elsewhere. The refusal belongs to `apply.py` and already names
+    # the flag AT the refusal, which is where the operator is standing when they need it.
     print(f"  already carried a witness, left alone      {result.already}")
     print(f"  cell no longer in the live record          {result.cell_gone}")
     print(f"  anchor no longer in the live cell          {result.anchor_gone}")

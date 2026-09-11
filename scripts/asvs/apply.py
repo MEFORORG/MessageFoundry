@@ -270,10 +270,29 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # `anchor_repair` un-freezes the cell, and it would also destroy the only thing in the record
     # saying a repair ever happened -- `anchor_provenance._repairs_declared` counts exactly that, and
     # its docstring says nothing else marks one. So the control leaves as DATA: same evidence,
-    # carrying the date of the pass, read as an instruction by nothing. A re-render of a cell that
-    # was never repaired adds nothing, so this cannot manufacture a witness.
+    # carrying a date, read as an instruction by nothing.
+    #
+    # BOTH PATHS, AND THE SECOND ONE IS THE MIGRATION. The first version of this wrote the witness
+    # only when the PAYLOAD declared a repair, which is the rarer path and not the one the record
+    # travels. A cell already carrying a PERSISTED `anchor_repair` is normally rewritten by an
+    # ordinary payload that declares nothing -- precisely the "comes clean as it is written" route
+    # the strip depends on -- and the control was stripped there with no witness written at all.
+    # Measured before the fix, one variable between two arms: an undeclaring payload took
+    # `_repairs_declared` from 1 to 0, exit 0, nothing printed; a declaring one kept it. So the fix
+    # for #1369 quietly decayed the single counter it was chosen to preserve, on the exact path the
+    # banner advertises as the migration. Silent, green, and in the direction that looks like success.
+    #
+    # PRECEDENCE, because the two paths carry different dates and clobbering is not symmetric:
+    #   1. the PAYLOAD declares a repair -- a fresh, dated event, so it WINS and overwrites;
+    #   2. otherwise the LIVE cell carries the legacy control -- a migration, so the witness takes
+    #      the date the record ALREADY held for that cell, and FILLS ONLY. An existing
+    #      `anchor_repaired_at` on either side is newer evidence than a legacy flag with no date of
+    #      its own, so it is never overwritten by this branch.
+    # A cell that was never repaired matches neither, so this cannot manufacture a witness.
     if cell.get("anchor_repair"):
         merged[_REPAIR_WITNESS] = str(cell.get("last_verified", ""))
+    elif (live or {}).get("anchor_repair") and not merged.get(_REPAIR_WITNESS):
+        merged[_REPAIR_WITNESS] = str((live or {}).get("last_verified", ""))
     for key, value in merged.items():
         if key in _ORDERED or key in _SUBTABLES or key in _controls:
             continue
@@ -447,17 +466,25 @@ def main(argv: list[str] | None = None) -> int:
         # record that was not already in it, and an existing empty `reviewed_by` is preserved rather
         # than invented. Any difference in verdict or residual takes it out of this mode immediately.
         anchor_repair = bool(c.get("anchor_repair"))
-        if anchor_repair and live.get("anchor_repair"):
-            # A cell whose RECORD already carries the control is frozen, and the freeze is invisible
-            # from the payload's side: a payload authored by echoing the live cell carries the flag
-            # forward without anyone choosing it, and then every prose field must stay byte-identical
-            # or the run refuses. This write strips the key, so the freeze lifts here -- but say so,
-            # because a refusal the operator cannot explain gets re-run with an override.
+        if live.get("anchor_repair"):
+            # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
+            # both meant the note fired only where the flag was ALSO declared -- the rare path -- and
+            # stayed silent on the ordinary rewrite, which is the one that actually migrates the
+            # cell. A conversion the operator never sees is a conversion nobody can check.
             print(
                 f"  note: {c.get('id')} carries a PERSISTED anchor_repair in the record "
-                "(BACKLOG #1369) and this write strips it. If the payload echoed it from the live "
-                "cell rather than meaning a fresh repair, drop it and re-run."
+                f"(BACKLOG #1369). This write strips the control and records {_REPAIR_WITNESS} in "
+                "its place, so the repair stays countable."
             )
+            if anchor_repair:
+                # The extra half, only where it applies: the cell is FROZEN while the flag is set,
+                # and the freeze is invisible from the payload's side, because a payload authored by
+                # echoing the live cell carries the flag forward without anyone choosing it.
+                print(
+                    "        The payload ALSO declares it. If that was an echo of the live cell "
+                    "rather than a fresh repair, drop it and re-run -- while it is set, every "
+                    "prose field must stay byte-identical or this run refuses."
+                )
         if anchor_repair:
             # Assert byte-identity on EVERY prose-bearing field, not just the two the glyph check
             # reads. Holding only verdict+residual was sound by argument -- the writer never rewrites

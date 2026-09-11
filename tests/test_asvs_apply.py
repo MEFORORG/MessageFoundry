@@ -1426,6 +1426,107 @@ def test_the_repair_WITNESS_is_what_the_provenance_counter_reads(tmp_path: Path)
     assert anchor_provenance._repairs_declared(after) == 1, "the repair signal was destroyed"
 
 
+@pytest.mark.parametrize(
+    ("persisted", "want_after"),
+    [(True, 1), (False, 0)],
+)
+def test_an_UNDECLARING_rewrite_still_carries_the_repair_WITNESS_FORWARD(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], persisted: bool, want_after: int
+) -> None:
+    """THE MIGRATION PATH, and the first version of the fix did not cover it.
+
+    The witness was written only where the PAYLOAD declared a repair. That is the rarer path. A cell
+    already carrying a PERSISTED `anchor_repair` is normally rewritten by an ORDINARY payload that
+    declares nothing -- which is the "comes clean as it is written" route the strip depends on -- and
+    there the control was stripped with no witness written at all. Measured with one variable between
+    two arms: an undeclaring payload took `_repairs_declared` from 1 to 0, exit 0, nothing printed.
+    So the fix for #1369 decayed the single counter it was chosen to preserve, silently, greenly, and
+    in the direction that reads as success.
+
+    THE SECOND ARM IS THE CONTROL AND IT IS NOT DECORATION. Without a record carrying NO persisted
+    flag, a writer that stamped `anchor_repaired_at` on every rewrite would satisfy the first arm
+    exactly -- and manufacturing a witness corrupts the same counter in the opposite direction, which
+    is worse than losing it because it reads as evidence.
+    """
+    import anchor_provenance
+
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace(
+            'reviewed_by = "fixture"\n', 'reviewed_by = "fixture"\nanchor_repair = true\n', 1
+        )
+        if persisted
+        else FIXTURE,
+        encoding="utf-8",
+    )
+    live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["1.1.1"]
+    assert live.get("anchor_repair", False) is persisted, "the fixture splice did not land"
+    assert anchor_provenance._repairs_declared(rec.read_text(encoding="utf-8")) == want_after
+
+    # An ORDINARY rewrite: new prose, new reviewer, and NO `anchor_repair` anywhere in the payload.
+    ordinary = _cell_111(
+        residual="a later, ordinary correction",
+        reviewed_by="a later pass",
+        last_verified="2026-09-11",
+    )
+    assert "anchor_repair" not in ordinary, "the arm must not declare what it is testing for"
+    rc = main([str(_payload(tmp_path, [ordinary])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0, capsys.readouterr().out
+
+    after = rec.read_text(encoding="utf-8")
+    got = {c["id"]: c for c in tomllib.loads(after)["cell"]}["1.1.1"]
+    assert "anchor_repair" not in got, "the control was persisted through an ordinary rewrite"
+    assert anchor_provenance._repairs_declared(after) == want_after, (
+        "the repair count moved on an ordinary rewrite -- decayed if it fell, manufactured if it rose"
+    )
+    # ...and the rewrite itself happened, so neither arm passes by writing nothing.
+    assert got["residual"] == "a later, ordinary correction"
+
+    if persisted:
+        # THE DATE IS THE RECORD'S, NOT THE PAYLOAD'S. A legacy flag carries no date of its own, so
+        # the honest value is the `last_verified` the record already held for that cell -- the date
+        # of the pass that set the flag. Stamping the migrating run's own date would move a
+        # measurement to the day somebody happened to rewrite the cell.
+        assert got["anchor_repaired_at"] == "2026-08-09", got
+        assert "records anchor_repaired_at in its place" in capsys.readouterr().out, (
+            "a conversion the operator never sees is a conversion nobody can check"
+        )
+    else:
+        assert "anchor_repaired_at" not in got, "a witness was manufactured for an unrepaired cell"
+
+
+def test_an_EXISTING_witness_is_not_overwritten_by_a_legacy_flag(tmp_path: Path) -> None:
+    """The precedence, on the one cell where the two sources disagree.
+
+    A cell mid-transition can hold BOTH a dated `anchor_repaired_at` from the new writer and the
+    legacy undated flag. The legacy branch FILLS ONLY: a dated witness is strictly better evidence
+    than a flag with no date, so migrating must not roll it back to the cell's `last_verified`.
+    """
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace(
+            'reviewed_by = "fixture"\n',
+            'reviewed_by = "fixture"\nanchor_repair = true\nanchor_repaired_at = "2026-09-01"\n',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(residual="ordinary", reviewed_by="later")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0
+    got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["1.1.1"]
+    assert got["anchor_repaired_at"] == "2026-09-01", (
+        "the legacy flag rolled a dated witness back to the cell's last_verified"
+    )
+    assert "anchor_repair" not in got
+
+
 # --- BACKLOG #1476: a whole-file re-render from a stale clone reverts cells it never named ---------
 #
 # A vault commit whose subject named ONE cell re-rendered the record and reverted an owner-approved
