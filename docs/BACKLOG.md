@@ -5995,7 +5995,9 @@ complete result, not a stall.
 
 ## 1039. `git worktree add --force` also defeats the already-checked-out guard, so "git will refuse this" must be written as conditional
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The gate's own site is already written as conditional (worktree_gate.ps1:865-879 spells out the three bypass flags and the allowlist reason), so the remainder is one measurement plus the sweep for other deferring sites, and at least two unconditional ones survive (prune-merged.ps1:1271, BACKLOG-CLOSED.md:6675). It ships nothing runnable to an adopter, which caps it at internal-tooling hygiene, and the work is one command plus doc edits. _(was 5/10 · 2/10.)_
+> 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The gate's own site is already written as conditional (worktree_gate.ps1:865-879 spells out the three bypass flags and the allowlist reason), so the remainder is one measurement plus the sweep for other deferring sites, and at least two unconditional ones survive (prune-merged.ps1:1271, BACKLOG-CLOSED.md:6675). **SUPERSEDED 2026-09-11 -- the count of two is stale and is corrected here rather than deleted, because it is quoted in the ranked table.** `2b9f5b3c4` closed the `prune-merged.ps1:1271` half: that line now states WHY `--force` refuses there (the directory is not empty, and an empty one it would accept), which is the conditional form this item asks for. `BACKLOG-CLOSED.md:6675` is the only one of the two still standing, and it is the residual the sweep note below names. It ships nothing runnable to an adopter, which caps it at internal-tooling hygiene, and the work is one command plus doc edits. _(was 5/10 · 2/10.)_
+>
+> **PROSE SWEEP DONE 2026-09-10, CORRECTED 2026-09-11, IN THE PR THAT CARRIES THIS LINE -- not yet on `main`.** The gate half shipped in `2b9f5b3c4`. **EIGHT sites** now state what defeats the guard (`git worktree add --force` / `-f`, `git checkout --ignore-other-worktrees`): the three this item named -- `ledger_check.py`'s branch-fallback docstring, `alloc_strand_sweep.py`'s `drifted-branch-held` definition and that verdict's test docstring -- plus `ledger_check.py`'s `ownership_remedy` operator text, `docs/WORKTREE-GATE.md`'s rule-3b escape-hatch paragraph, and three in `tests/test_ledger_check.py`. **THE FIRST VERSION OF THIS LINE SAID FIVE SITES AND WAS WRONG, WHICH IS WORSE THAN SAYING NOTHING: a seat picking this item up would have read the sweep as finished and stopped.** The miss was `tests/test_ledger_check.py:211`, and it is the STRONGEST instance in the repository -- not narration, but the stated safety argument for #1282's branch-fallback loosening, which the same PR's new `Ledger.owns` docstring now contradicts. **Cause, because it generalises:** the sweep grep was case-sensitive and that site is in capitals. Re-run case-insensitively over two needles, which is what found the two extra sites as well. **ONE RESIDUAL, deliberately not touched:** `docs/archive/backlog/BACKLOG-CLOSED.md:6675` says *"git will refuse this itself"* and is closed-archive prose, which is single-writer territory an owner ruling governs. **A FINDING, recorded rather than repaired:** forcing a second checkout of a recorded branch makes `Ledger.owns`'s branch key non-exclusive, so entitlement to a number leaks to a tree that never allocated it -- narrow, because the fallback is unreachable while the recorded path still matches. Documented at the site; the ownership model is unchanged here.
 >
 > **Filed 2026-08-05 — not started.** At least three git flags defeat the guard that stops a branch being checked out in two worktrees. Any code or comment reasoning that "git already refuses this" is making a claim about a **configuration**, not about git, and must say so.
 > Verdict: build
@@ -26903,6 +26905,38 @@ Two properties the fix must keep. **An unrecognised declaration shape must repor
 ## 1466. nothing can tell whether a claim's holder is live, so every takeover is a judgment under uncertainty
 
 > 🔢 **Filed 2026-09-06 -- not started. Measured by the Lander while two packet sessions were blocked, and CORRECTED the same day by a third that read the source.** Value **4/10** · Difficulty **3/10** · _quick win_. A session can end while its worktree survives. Its claims then have no live holder and no observable evidence of abandonment. `-Force` recovers them -- that is what it is for -- but the seat using it cannot distinguish an abandoned claim from a quiet one, and **74 of 76 live claims sit in exactly that ambiguity.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+
+**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+
+**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+
+**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+
+**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
+
+| | |
+|---|---|
+| claims held | **76** |
+| worktree still present | **74** |
+| worktree absent | **2** (`#1453`, `#1416`) |
+
+**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
+
+**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
+
+**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
+
+**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
+
+**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
+
+**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
 
 ## 1467. the connscale intake-audit probe fails a full-suite run with a SQLite disk I/O error and passes in isolation
 
@@ -27025,38 +27059,22 @@ neither of which is this).
 ## 1470. a deleted item heading silently merges two ledger rows and every gate stays green
 
 > 🔢 **Filed 2026-09-06. AMENDED SAME DAY: the repair is NOT gate-blocked, and my first version of this row said it was.** Value **6/10** · Difficulty **3/10** · _quick win_. A commit amending one item deleted the next item's `## N.` heading line and put its own prose there. The orphaned item's banner, verdict, closing-act and body were absorbed into the item above it, `parse_items` stopped returning it, and **both ledger gates passed**. It reached `main`.
+>
+> **BUILT 2026-09-10 IN THE PR THAT CARRIES THIS LINE -- not yet on `main`.** `Ledger.check_backlog` gains the reverse arm: a commit that DROPS a `## N.` id from the BACKLOG-plus-archive union is refused, index-against-parent on the pre-commit path and base-against-HEAD under `--ci`. Ids are read through `backlog_status_check.parse_items` and the local second-definition regex is gone. #1480's detector is subsumed for the PREVENTION case and is not being built twice; what it still adds is detection of damage ALREADY on `main`, which a commit-time gate cannot see.
 > Verdict: build
 > Research: none
 > Closing-act: code
 
-**Cluster:** coordination tooling / claim registry. **Priority:** P3. **Verdict:** build.
-**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost is a seat guessing about another seat's liveness, and built work that waits on the guess.
+**Cluster:** Ledger integrity / repository gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No engine behaviour, no shipped artifact, no PHI. The cost falls on the record: an item's banner, fields and whole body stay in the file, silently re-attributed to the item above it, and no instrument says so.
 
-**THE FILED VERSION OF THIS ITEM WAS WRONG AND IS CORRECTED HERE RATHER THAN QUIETLY EDITED.** Its heading and first paragraph said such a claim is "neither releasable nor forceable" and that "nobody can release it". **That is false.** `claim.ps1:421` is the only enforcement -- `if (-not $info.IsMine -and -not $Force)` -- and **nothing anywhere tests whether the worktree exists**. `:253` records that `docs/WORKTREES.md` describes `-Release <key> -Force` as the ordinary by-hand remedy for exactly this case, and `:246` records that CLAUDE.md carries no prohibition on the switch.
+**THE MEASURED INSTANCE IS `642225f78`, AND [#1480](#1480) HOLDS THE MEASUREMENT RATHER THAN THIS ROW.** An appended paragraph absorbed the `## 1147.` heading; the diffstat read 5 insertions and 1 deletion, the commit subject never named the item, and `origin/main` carried 442 live items where it should carry 443. Read that row before building anything adjacent to this one -- it also records a DEAD END (the mid-line heading probe) so nobody spends a second pass on it.
 
-**How the error was made, because the shape recurs.** The script's header narrates a 2026-08-10 release performed "after establishing on evidence that the holder's worktree was gone", and calls that release CORRECT. **A described good instance was read as a required precondition.** Nothing in the code says the worktree must be gone; a well-judged example was mistaken for a gate. The correction came from a peer session that read the source before choosing, on its way to being archived.
+**WHAT THE REVERSE ARM DOES AND DOES NOT COVER, because the two rows are easy to conflate.** A commit-time gate refuses the commit that destroys an item, for EVERY item, whether or not it carries a ranked-table row. It is blind to damage that is already on `main`, which is what #1480's row-versus-item comparison detects. The two are complements, not duplicates, and only the prevention half is built here.
 
-**WHAT SURVIVES THE CORRECTION, AND IT IS THE WHOLE SUBJECT.** `-Force` is available; what is missing is any basis for using it. The script is emphatic on the point in its own refusal path: it deliberately stopped recommending `-Force` unconditionally because that was "an instruction to guess, printed at exactly the moment" a seat is least able to check. **Quiet is not dead, and an occupied worktree cannot prove a session alive.** So the switch exists, the evidence for pulling it does not, and every takeover is a judgment nobody can ground.
+**THE CI HALF WOULD HAVE SHIPPED DEAD, AND THE FIRST MEASUREMENT SAID IT WAS FINE.** `actions/checkout` takes `refs/pull/N/merge` at its default depth of **1**, so HEAD is a shallow GRAFT and `git rev-list --parents` honours the graft by reporting **no parents** -- an empty prior set, indistinguishable from a clean answer, with every test still green. Measured 2026-09-10 on the merge-ref shape, before AND after the ledger step's own `git fetch --depth=200 origin main`: rev-list **1 token** both times, `git cat-file commit` **2 parents** both times, first parent's object PRESENT after the deepen and the second ABSENT. **The first rig said the opposite** -- with HEAD sitting on `main` rather than on a merge ref, rev-list recovered the parent after the deepen, which reads as *no problem*. The arm reads the raw commit object instead, a test pins the grafted shape, and the mutation that proves the pin fails exactly that one test. **The residual is the PR-head parent**, whose ids are additions the forward arm owns; and a run where NO parent is readable is refused rather than narrowed, so a shallower fetch fails loudly instead of quietly checking nothing.
 
-**MEASURED 2026-09-06 over the live registry, all 76 claim files parsed:**
-
-| | |
-|---|---|
-| claims held | **76** |
-| worktree still present | **74** |
-| worktree absent | **2** (`#1453`, `#1416`) |
-
-**That table measures worktree survival, which is what was counted. It does NOT measure releasability, which is what the filed version wrongly inferred from it.** The number is retained; the inference is withdrawn.
-
-**Two live instances that day.** `BACKLOG #1188`, held for PR 935 with the note `release on merge` -- PR 935 merged 2026-09-06T16:20:52Z and the holding worktree still existed. `BACKLOG #1210`, whose holder mailed the release command itself, likewise. Both were recoverable by `-Force` throughout; what neither the holder nor the Lander could establish was whether the holding session was still alive.
-
-**A THIRD CASE THE SAME DAY SHOWS THE CHEAP FIX ALREADY WORKS.** A session about to be archived was asked whether it would strand eight claims. It released all eight itself, in seconds, and explained why it declined to remove its worktree instead: doing so to satisfy a precondition that does not exist would have been risk for nothing. **A holder that releases on its way out costs nothing and removes the ambiguity entirely.** The gap is that nothing asks it to.
-
-**Why the path key cannot answer this.** `ledger_check.owns()` records why `BACKLOG #1282` added the branch as a second key: *"THE PATH IS MORTAL AND THE BRANCH IS NOT"*, because a worktree removed outside `scripts/worktree/remove.ps1` leaves a number uncommittable. That fix addressed the path VANISHING. This is the opposite failure -- the path SURVIVING its session -- and the same reasoning does not reach it.
-
-**What a fix must preserve.** Git refuses to check one branch out in two worktrees, so "the session on this branch" is single-valued. Any liveness signal must not become a way for one seat to take a number another seat is actively using, which is the hole the declined transfer verb would have opened.
-
-**Shapes worth considering, none chosen here:** a heartbeat the holder refreshes, so staleness is observable rather than inferred -- `refreshed` is already recorded and was already stale on both instances; a release a MERGED pull request can satisfy, since both instances named a PR and one had merged; or a prompt at session end asking a holder to release, which is what the third case did by hand.
+**A SECOND SHAPE, FOUND WHILE BUILDING THIS AND REPAIRED IN THE SAME CHANGE: the insertion whose OFFSET is wrong.** `ea390db5c` filed #1467 and #1470 into the middle of #1466's banner block -- after its status line and before its `Verdict:`/`Research:`/`Closing-act:` lines. No id was added or removed, so the reverse arm built here would NOT have fired on it, and neither did any other gate. The effect was that #1466 lost its three fields and its entire body to #1470, and #1470 read as a fully-bodied row about claim liveness. Both rows are restored to what their filing commits wrote (`5e295953c` and `ea390db5c`); this body is new, because #1470 never had one. **The residual is stated rather than closed: an id-set comparison cannot see a heading that moved**, and nothing in the repository detects that today.
 
 ## 1468. the ledger gate has no path for RESTORING a number main lost, only for allocating or recovering one
 
