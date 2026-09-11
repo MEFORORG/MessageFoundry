@@ -30479,3 +30479,43 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+## 1534. Batch the adr branch of alloc.ps1 so it stops spawning one git ls-tree per ref
+
+> 🚧 **Filed 2026-09-11 -- the code fix ships in this PR.** Value **6/10** · Difficulty **2/10** · _quick win_. `Get-Floor`'s ADR branch swept `docs/adr/` with one `git ls-tree` per ref, which is one PROCESS per ref, and this clone carries 7,196 of them. A single ADR allocation measured 322.4s and 359.7s here; the session that reported it lost over 17 minutes and two tool timeouts before its number came back. The backlog branch of the same function had already been batched for exactly this reason, and its own comment records the cost it was avoiding at a tenth the ref count. The ADR branch never received that fix. Batched, the same sweep takes 5.3s and returns the same floor and the same next number.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger allocator. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, and no deploying site would ever meet it. The cost falls entirely on this repository's own sessions: every seat that files an ADR pays it, and a seat whose turn dies mid-allocation leaves behind the question of whether a number was burned.
+
+### The refs grew and the shape did not
+
+`for-each-ref refs/heads refs/remotes` returned 7,196 entries on 2026-09-11. The backlog branch's own comment dates its batching to roughly 550 refs and to a `git show` per ref costing about 34s -- so the defect is not that the per-ref shape was ever wrong, it is that its cost is linear in a number that grew thirteenfold while nobody re-measured it. A clone with few refs cannot see this at all, which is why no test caught it and why the guard added with this row counts PROCESSES rather than seconds.
+
+### Measured 2026-09-11, paired, on this clone
+
+Both arms are `-ShowFloor -Kind adr`, which computes the identical floor without advancing the ratchet or spending a number. The pre-fix script was kept beside the new one so both resolve `$PSScriptRoot` to the same checkout.
+
+| arm | elapsed | floor | next |
+|---|---|---|---|
+| before, first run | 359.7s | 187 | 188 |
+| before, paired run | 322.4s | 187 | 188 |
+| after, paired run | 5.3s | 187 | 188 |
+
+`alloc.ps1 -List` reported the same holdings before and after, and the registry kept its 34 ADR records and its `.floor-highwater` of 186 across every run above. Allocation stays a test-and-set on an exclusive `CreateNew`; this row changed only how the floor is READ.
+
+### What the batching is, and the one shape that was rejected
+
+Two `git` processes, whatever the ref count. One `cat-file --batch-check` resolves every `<ref>:docs/adr` spec at once -- 7,199 specs collapse to **434 distinct trees** -- and one `cat-file --batch` reads each of those trees once.
+
+**`git rev-list --objects` over those trees was measured and rejected.** It produces the same listing as text in one process, but it dedupes by OBJECT: a tree holding `0150-alpha.md` and `0151-beta.md` with byte-identical content printed ONE name, so 0151 read as free. Re-issuing a number that is already on disk is the single failure this allocator exists to prevent. `tests/test_coord_alloc_adr_floor.py` holds that case, the side-branch case, and a `GIT_TRACE` process count that fails if the sweep starts scaling with the ref count again.
+
+The batched set was compared against a per-tree `ls-tree` sweep of all 434 trees before the change was accepted: identical, 181 numbers, max 0187.
+
+### Not fixed here, and both are separate subjects rather than cited numbers
+
+1. **The backlog branch is now slow too, for the same reason its comment predicted.** A `-Kind backlog` allocation took 1m59s on 2026-09-11. Its ref resolution is already batched, so the cost has moved to reading the distinct `BACKLOG.md` blobs -- a much bigger file, and many more distinct versions at 7,196 refs than at 550. That is a different fix in the same function and is not attempted here.
+2. **The ADR branch has no working-tree term.** The backlog branch reads both of its paths off disk to catch "a number written to a file but committed nowhere"; the ADR branch has never done so, so a hand-created `docs/adr/NNNN-*.md` that no registry claim covers is invisible to the floor. Pre-existing, unchanged by this row, and deliberately left alone rather than widened into a speed fix.
+

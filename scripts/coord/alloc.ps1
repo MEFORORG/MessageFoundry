@@ -21,7 +21,10 @@
 
     The floor is the max over: the numbers on origin/main, the numbers on EVERY local and remote ref, and
     every existing allocation. The all-refs term closes the "registry wiped -> re-issue a number that only
-    exists on an unpushed branch" hole. It costs about a second, once per ADR -- not per edit.
+    exists on an unpushed branch" hole. BOTH kinds sweep those refs in a fixed handful of `git`
+    processes, never one PROCESS per ref -- a per-ref sweep is fine at a few hundred refs and unusable
+    at several thousand, and it does not announce the crossing. Get-Floor's adr branch carries that
+    measurement (BACKLOG #1534). The cost is per allocation, not per edit.
 
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
@@ -161,11 +164,53 @@ function Get-Floor {
     $seen.Add(0)
 
     if ($Kind -eq "adr") {
+        # Batched for the reason the backlog branch below was batched, and it is the same measurement
+        # taken again on a bigger clone: one `git ls-tree` PER REF is one PROCESS per ref, and this
+        # clone now carries 7,196 of them. Measured 2026-09-11 -- 359.7s for a single -ShowFloor, and
+        # over 17 minutes for the session that reported it, which lost two tool timeouts before its
+        # allocation returned. The refs collapse hard: 7,199 specs resolve to 434 DISTINCT docs/adr
+        # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
+        # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
+        #
+        # A TREE, NOT A BLOB, is the only difference from the backlog branch. A directory has no fixed
+        # path to hand `--batch-check`, so stage 2 reads the raw tree OBJECTS and scans their entry
+        # headers instead of file contents.
+        #
+        # `git rev-list --objects` prints the same listing as text and was REJECTED. It dedupes by
+        # OBJECT, so two ADR files with byte-identical content lose one of their two names -- and a
+        # name that never prints is a number that reads as FREE. Measured directly, not inferred:
+        # `0150-alpha.md` and `0151-beta.md` sharing one blob printed ONE name, which would re-issue
+        # 0151 over a live ADR. That is the exact collision this script exists to prevent, so a faster
+        # stage 2 does not buy it. tests/test_coord_alloc_adr_floor.py holds that case.
+        #
+        # ANCHORING ON THE MODE IS WHAT MAKES A TEXT SCAN SAFE OVER BINARY. A tree entry is the mode,
+        # a space, the name, a NUL, then 20 RAW BYTES of object id -- so raw ids are in this stream.
+        # PowerShell splits it on 0x0A and decodes it, and neither can damage `100644 ` followed by
+        # four digits: no byte of that literal is >= 0x80, so no multi-byte decode can swallow it (a
+        # continuation byte is 0x80-0xBF and `1` is 0x31), and it carries no newline for a split to
+        # land inside. A false POSITIVE needs those twelve bytes to fall inside an object id. The whole
+        # set was compared against a per-tree `ls-tree` sweep of all 434 trees: identical, 181 numbers,
+        # max 0187.
+        #
+        # A SECOND DEFINITION OF "WHICH ADR NUMBERS EXIST ON A REF" LIVES NEXT DOOR, in Python:
+        # `numbers_on_refs` in scripts/coord/alloc_strand_sweep.py. It builds the same specs and the
+        # same batch-check, then reads each distinct tree with one `ls-tree` per tree -- the 434
+        # processes this branch batches away. Two implementations of one question drift; change one
+        # and read the other. They already differ observably: the mode literal above admits regular
+        # files only, where `ls-tree` reports any mode.
         $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        foreach ($ref in ($refs | Select-Object -Unique)) {
-            $names = & git -C $repo ls-tree --name-only $ref docs/adr/ 2>$null
-            foreach ($n in $names) {
-                if ($n -match 'docs/adr/(\d{4})-') { $seen.Add([int]$Matches[1]) }
+        $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
+
+        $trees = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
+        }
+
+        $rx = [regex]::new('(?:100644|100755) (\d{4})-')
+        if ($trees.Count -gt 0) {
+            foreach ($line in (($trees -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
+                foreach ($m in $rx.Matches("$line")) { $seen.Add([int]$m.Groups[1].Value) }
             }
         }
     } else {
