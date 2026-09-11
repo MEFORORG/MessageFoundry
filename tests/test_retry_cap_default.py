@@ -350,3 +350,84 @@ def test_the_configuration_catalog_no_longer_claims_no_toml_or_env_spelling() ->
         'the string "forever" is coerced to None, which the tests above drive directly.'
     )
     assert '"forever"' in row, "the row must name the spelling an operator would actually write"
+
+
+# --- #1217 review finding 1: the docs named a file that refuses the key ----------------------
+#
+# The first cut of half 2 told an operator to write `retry_max_attempts = "forever"` into
+# connections.toml, at BOTH levels. Neither spelling loads, so following the doc produced a startup
+# error rather than a retry-forever connection. The two negative controls below are the tests that
+# would have caught it: they drive the two WRONG spellings through the real loader and pin the
+# refusal, so a doc edit that reintroduces either has a failing test sitting beside it.
+#
+# The three surfaces and their spellings, each proven by a test in this file or in
+# tests/test_settings.py:
+#
+#   code-first Python       retry=RetryPolicy(max_attempts=None)
+#   global default          messagefoundry.toml   [delivery]         retry_max_attempts = "forever"
+#   per-outbound override   connections.toml      [outbound.retry]   max_attempts       = "forever"
+
+
+def test_connections_toml_refuses_a_delivery_table(tmp_path: Path) -> None:  # #1217
+    """`[delivery]` is a messagefoundry.toml section, NOT a connections.toml one -- the loader takes
+    only `[[inbound]]`/`[[outbound]]` at top level, so a doc that sends an operator here produces a
+    startup error. Pinned as refused, with the message shape a reader would actually see."""
+    cfg = tmp_path / "connections.toml"
+    cfg.write_text('[delivery]\nretry_max_attempts = "forever"\n', encoding="utf-8")
+    with pytest.raises(WiringError, match="unknown top-level key"):
+        load_connections_file(cfg, Registry())
+
+
+def test_connections_toml_refuses_a_flat_retry_max_attempts_key(tmp_path: Path) -> None:  # #1217
+    """The other spelling a reader could mistake for the real one. `retry_max_attempts` is the
+    GLOBAL's key name; an outbound table carries `retry` (a sub-table) whose key is `max_attempts`,
+    so the flat form trips `_reject_unknown`."""
+    cfg = tmp_path / "connections.toml"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            [[outbound]]
+            name = "OB"
+            transport = "file"
+            retry_max_attempts = "forever"
+              [outbound.settings]
+              directory = "out"
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="retry_max_attempts"):
+        load_connections_file(cfg, Registry())
+
+
+_FOREVER_DOCS = ("CONNECTIONS.md", "CONFIGURATION.md", "USER-GUIDE.md")
+
+
+def _forever_passage(doc: str) -> str:
+    """The doc's retry-forever passage: everything between its first and last `"forever"`, plus a
+    margin. Scoped rather than whole-file because these are long documents and `connections.toml`
+    appears all over them -- a whole-file search could not tell the passage from the neighbours."""
+    first = doc.index('"forever"')
+    last = doc.rindex('"forever"')
+    return doc[max(0, first - 600) : last + 600]
+
+
+@pytest.mark.parametrize("name", _FOREVER_DOCS)
+def test_a_doc_that_teaches_the_forever_spelling_names_the_file_that_accepts_it(
+    name: str,
+) -> None:  # #1217
+    """Both anchors, because the passage teaches two different surfaces and the retired text had
+    NEITHER -- it named connections.toml for the global and gave no per-outbound key at all. An
+    operator who can only find one of the two is still one file away from a startup error."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / name).read_text(encoding="utf-8")
+    passage = _forever_passage(doc)
+    assert "messagefoundry.toml" in passage, (
+        f"docs/{name}'s retry-forever passage does not name messagefoundry.toml, which is the only "
+        "file whose [delivery] table accepts retry_max_attempts. connections.toml refuses it -- see "
+        "test_connections_toml_refuses_a_delivery_table above, which drives that refusal."
+    )
+    assert "[outbound.retry]" in passage, (
+        f"docs/{name}'s retry-forever passage does not name the [outbound.retry] table, so a reader "
+        "cannot find the per-outbound spelling. The key there is max_attempts, NOT "
+        "retry_max_attempts -- see test_connections_toml_refuses_a_flat_retry_max_attempts_key."
+    )

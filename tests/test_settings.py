@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import (
+    _DEFAULT_FILE,
     ApiSettings,
     AuthSettings,
     DeliverySettings,
@@ -1769,3 +1770,17 @@ def test_retry_max_attempts_as_a_quoted_number_still_hits_the_floor() -> None:  
     bare `0` hits -- the new validator must not accidentally widen what a string can smuggle past it."""
     with pytest.raises(ValidationError):
         DeliverySettings(retry_max_attempts="0")
+
+
+def test_retry_forever_loads_from_a_file_named_messagefoundry_toml(tmp_path: Path) -> None:  # #1217
+    """#1217 review finding 1. The test above proves the `[delivery]` table parses; this one pins the
+    FILE the docs send an operator to. The first cut of half 2 named connections.toml, which refuses
+    a `[delivery]` table outright (tests/test_retry_cap_default.py drives that refusal), so the
+    documented instruction produced a startup error. Uses the real default filename and asserts it is
+    the default, so a rename moves the docs and this test together."""
+    assert _DEFAULT_FILE == "messagefoundry.toml", (
+        "the default settings file was renamed; docs/CONFIGURATION.md, docs/CONNECTIONS.md and "
+        "docs/USER-GUIDE.md all name it by hand in the retry-forever passage"
+    )
+    cfg = _write(tmp_path / _DEFAULT_FILE, '[delivery]\nretry_max_attempts = "forever"\n')
+    assert load_settings(config_path=cfg, environ={}).delivery.retry_max_attempts is None

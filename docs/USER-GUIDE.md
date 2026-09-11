@@ -567,7 +567,7 @@ The key operator shift under the staged pipeline: **an `AA` ACK means "received 
 
 A delivery dead-letters when its retries are exhausted. Retry behavior is per-outbound (defaults in `[delivery]` — see [CONFIGURATION.md](CONFIGURATION.md)):
 
-- `retry_max_attempts` **defaults to 100 — finite** (about 7 h 50 m under the default backoff). Attempts are counted per row, so a long outage dead-letters roughly the lane heads rather than the backlog, and every exhausted row lands in the replayable dead-letter queue below. Retry forever for a partner that must never be advanced past is still expressible — a code-first `retry=RetryPolicy(max_attempts=None)`, or the string spelling `retry_max_attempts = "forever"` from `connections.toml`/`MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS` (BACKLOG #1217) — under FIFO that head blocks its lane until it succeeds or is purged.
+- `retry_max_attempts` **defaults to 100 — finite** (about 7 h 50 m under the default backoff). Attempts are counted per row, so a long outage dead-letters roughly the lane heads rather than the backlog, and every exhausted row lands in the replayable dead-letter queue below. Retry forever for a partner that must never be advanced past is still expressible (BACKLOG #1217), and the key differs by surface: a code-first `retry=RetryPolicy(max_attempts=None)`; `retry_max_attempts = "forever"` under `[delivery]` in `messagefoundry.toml` (or `MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever`) for the global default; `max_attempts = "forever"` under `[outbound.retry]` in `connections.toml` for one outbound. Under FIFO that head blocks its lane until it succeeds or is purged.
 - A partner **`AR` reject fails fast** (no retry); an **`AE` NAK / transient transport failure is retried** with backoff.
 
 To recover:
