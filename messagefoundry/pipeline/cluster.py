@@ -1557,6 +1557,25 @@ class DbCoordinator:
             log.warning("cluster: leadership_lost alert failed", exc_info=True)
 
 
+#: Fallback renew clamp for a DUCK-TYPED settings stand-in that carries no resolved value. A real
+#: ``ClusterSettings`` never reaches this -- its validator derives the clamp from the detection margin
+#: and fills the field in, so the attribute is always a concrete float by the time it is read here.
+_DUCK_TYPED_RENEW_TIMEOUT_FALLBACK = 5.0
+
+
+def _renew_timeout_or_default(cluster_settings: Any) -> float:
+    """Read the resolved renew clamp off duck-typed settings (ADR 0157 Inc 0).
+
+    ``is None``, not ``or``. A falsy-test also swallows ``0.0`` and substitutes the fallback, which
+    would be wrong twice over: ``0.0`` is a value :class:`ClusterSettings` refuses outright, and
+    silently turning it into a fixed 5.0 re-introduces exactly the constant this increment removed --
+    at the one seam that feeds the live coordinator, where it would be least visible."""
+    configured = getattr(cluster_settings, "lease_renew_timeout_seconds", None)
+    if configured is None:
+        return _DUCK_TYPED_RENEW_TIMEOUT_FALLBACK
+    return float(configured)
+
+
 def build_coordinator(
     store: Any, cluster_settings: Any, *, alert_sink: AlertSink | None = None
 ) -> ClusterCoordinator:
@@ -1631,11 +1650,12 @@ def build_coordinator(
         #
         # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
         # validator, so a real settings object always hands over a concrete float and the derivation
-        # is not copied here. The `or` covers a DUCK-TYPED settings stand-in that carries the field
-        # unresolved -- this function takes `Any` on purpose and several tests pass a SimpleNamespace.
-        lease_renew_timeout_seconds=(
-            getattr(cluster_settings, "lease_renew_timeout_seconds", None) or 5.0
-        ),
+        # is not copied here. The fallback covers a DUCK-TYPED settings stand-in that carries the
+        # field unresolved -- this function takes `Any` on purpose and several tests pass a
+        # SimpleNamespace. `is None`, never `or`: `or` also swallows a duck-typed 0.0 and silently
+        # substitutes 5.0, which is both a value the settings model refuses and the exact fixed
+        # constant this increment exists to stop deriving behaviour from.
+        lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
         acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
         promotable=getattr(cluster_settings, "promotable", True),
         db_schema=db_schema,

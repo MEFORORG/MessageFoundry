@@ -13,7 +13,8 @@ Three things ship together here and each is pinned below.
    ``command_timeout = 0``).
 3. **A config-load check on the margin**, which ``_fence_ordering`` never made: it establishes
    ``fence < ttl`` and stops, so it accepts a pair whose remaining margin is a fraction of a second.
-   The clamp's default is DERIVED from that margin, so it cannot contradict it.
+   The clamp's default is DERIVED from that margin, between a floor and a ceiling, and is then held
+   to the same comparison as an operator's own value rather than trusted.
 
 **Both arms, or the checks prove nothing.** A check that refuses a legitimate configuration gets
 turned off by whoever hits it first, and an ignored check withdraws the caution its absence would
@@ -35,6 +36,7 @@ is what a first deployment running active-passive HA would have hit.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,6 +46,8 @@ from pydantic import ValidationError
 from harness.load.failover import FailoverPorts, _node_env
 from harness.load.profile import PROFILES_DIR, Failover, LoadProfileError, load_profile
 from messagefoundry.config.settings import (
+    _RENEW_CLAMP_CEILING_SECONDS,
+    _RENEW_CLAMP_FLOOR_SECONDS,
     ClusterSettings,
     _detection_margin_seconds,
     _fence_tick_seconds,
@@ -107,24 +111,27 @@ def test_a_stock_clustered_config_loads_cleanly(tmp_path: Path) -> None:
 
 
 def test_the_derived_clamp_fits_every_margin_it_is_reachable_with() -> None:
-    """The by-construction property, which is the whole reason the default is derived.
+    """The derived clamp lands inside the margin, and above the floor, across the reachable range.
 
-    A FIXED default cannot hold this. The first cut of this increment shipped a constant 5.0 and it
-    refused this repository's own failover profiles at config load -- the pairs two tests below. The
-    grid spans both fence-tick clamps (the 0.05 floor and the 1.0 ceiling) and margins either side of
-    the 10 s point where the derived clamp's own ceiling starts to bind, because a rule verified only
-    where one branch is taken is verified on one branch."""
+    A FIXED default cannot hold the first half. The first cut of this increment shipped a constant 5.0
+    and it refused this repository's own failover profiles at config load -- two of the pairs below.
+
+    **Not a by-construction property, and it used to be described as one.** Adding the floor means the
+    derivation CAN exceed a small margin, and such a pair is refused rather than run; that case is its
+    own test below. The grid here covers the margins where a clamp does fit, and spans both the floor
+    and the ceiling, because a rule verified only where one branch is taken is verified on one
+    branch."""
     pairs = [
-        (0.2, 0.3),  # sub-second margin, fence tick at its 0.05 floor
-        (2.0, 3.0),
-        (3.0, 5.0),
-        (4.0, 6.0),
+        (2.0, 3.6),  # margin 1.2 -- the floor binds
+        (3.0, 5.0),  # the CI failover pair
+        (4.0, 6.0),  # the shipped failover profile's pair
         (12.0, 20.0),
         (20.0, 30.0),  # the shipped pair
         (20.0, 45.0),  # margin 24.0 -- past the ceiling, so the ceiling binds
         (99.0, 400.0),  # margin 300.0 -- far past it
     ]
     saw_ceiling_bind = False
+    saw_floor_bind = False
     for fence, ttl in pairs:
         s = ClusterSettings(
             heartbeat_seconds=min(1.0, fence / 2.0),
@@ -135,9 +142,57 @@ def test_the_derived_clamp_fits_every_margin_it_is_reachable_with() -> None:
         clamp = s.lease_renew_timeout_seconds
         assert clamp is not None
         assert 0 < clamp < margin, (fence, ttl, clamp, margin)
-        saw_ceiling_bind |= clamp == 5.0
-    # Without this the grid could be all short margins and still pass, proving nothing about the cap.
+        # The floor is a LIVENESS bound: below it the clamp would time out renews a healthy-but-loaded
+        # database would have completed, and a leader that cannot renew self-fences.
+        assert clamp >= _RENEW_CLAMP_FLOOR_SECONDS, (fence, ttl, clamp)
+        saw_ceiling_bind |= clamp == _RENEW_CLAMP_CEILING_SECONDS
+        saw_floor_bind |= clamp == _RENEW_CLAMP_FLOOR_SECONDS
+    # Without these the grid could be all mid-range margins and still pass, proving nothing about
+    # either clamp of the derivation.
     assert saw_ceiling_bind, "no pair in the grid exercised the derived clamp's ceiling"
+    assert saw_floor_bind, "no pair in the grid exercised the derived clamp's floor"
+
+
+def test_a_margin_too_small_for_the_floor_is_refused_rather_than_run_at_a_fencing_clamp() -> None:
+    """The floor's refusal arm, and the reason the derivation is CHECKED rather than trusted.
+
+    A pair whose margin cannot fit the floor has no safe clamp: anything inside the margin is short
+    enough to time out renews a merely-slow database would have completed, and a leader that cannot
+    renew self-fences. Refusing at config load beats running it and failing over spuriously.
+
+    This is where the derived value genuinely fails the comparison below it -- so the fall-through is
+    load-bearing, not a backstop against a hypothetical."""
+    for fence, ttl in [(4.0, 5.2), (4.0, 5.8), (2.0, 2.8)]:
+        with pytest.raises(ValidationError, match="lease_renew_timeout_seconds"):
+            ClusterSettings(
+                enabled=True,
+                heartbeat_seconds=1.0,
+                leader_fence_timeout_seconds=fence,
+                leader_lease_ttl_seconds=ttl,
+            )
+
+
+def test_the_derived_clamp_clears_the_liveness_limit_at_both_shipped_failover_profiles() -> None:
+    """The finding the floor exists for, pinned as a number rather than left to the comment.
+
+    A renew is retried every ``heartbeat_seconds`` and the fence baseline advances only on success, so
+    a configuration tolerates a renew latency of roughly ``(fence - heartbeat) / 2`` before it fences
+    a leader whose database is merely slow -- with or without any clamp. A clamp BELOW that limit
+    narrows the operating envelope the configuration already has; a clamp at or above it never fences
+    a node that would otherwise have survived.
+
+    Without the floor the derivation returned 0.6 s and 0.7 s here, both below the limit. With it,
+    neither profile's clamp binds first."""
+    for hb, fence, ttl in [(2.0, 4.0, 6.0), (1.5, 3.0, 5.0)]:
+        s = ClusterSettings(
+            enabled=True,
+            heartbeat_seconds=hb,
+            leader_fence_timeout_seconds=fence,
+            leader_lease_ttl_seconds=ttl,
+        )
+        clamp = s.lease_renew_timeout_seconds
+        assert clamp is not None
+        assert clamp >= (fence - hb) / 2.0, (hb, fence, ttl, clamp)
 
 
 # --- the margin check fires on a genuinely unsafe configuration -------------
@@ -169,8 +224,13 @@ def test_a_fence_ttl_pair_with_no_margin_at_all_is_refused(tmp_path: Path) -> No
     acquires. Deriving the clamp cannot fix that — there is no positive number below -0.3 — so this
     refuses BEFORE the clamp is resolved, and names the fence/TTL pair rather than blaming the clamp.
 
-    Without this arm, making the default derived would have turned a refusal into a silent pass on the
-    one pair where the margin is genuinely gone."""
+    **This arm changes the MESSAGE, not the verdict, and an earlier version of this docstring claimed
+    otherwise.** It said the branch stopped a refusal becoming a silent pass. That was false and was
+    measured false: with ``if not margin > 0:`` mutated to ``if False:`` this pair is still refused,
+    because the derived clamp off a -0.3 margin is itself negative and fails the comparison below. The
+    only thing that goes red under that mutation is this test's own ``match=`` regex. The branch earns
+    its place by telling the operator their fence/TTL pair has no margin, instead of telling them to
+    lower a clamp they never set — which is worth having, and is not the same as catching something."""
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         _PG + "[cluster]\nenabled = true\nheartbeat_seconds = 1\n"
@@ -422,6 +482,35 @@ def test_build_coordinator_threads_the_clamp_from_settings() -> None:
     coord = build_coordinator(store, settings)
     assert isinstance(coord, DbCoordinator)
     assert coord._renew_timeout == 3.25
+
+
+def test_build_coordinator_threads_the_DERIVED_clamp_from_settings() -> None:
+    """The same seam for the value an operator actually gets, which the test above does not cover.
+
+    Pinning only an EXPLICIT 3.25 leaves the derived path unasserted, and ``build_coordinator``'s
+    duck-typed fallback is a literal 5.0 -- so a validator regression that stopped filling the field
+    in would be absorbed silently and the coordinator would run on a constant nobody chose. This says
+    the stock config's 4.5 reaches the coordinator, and it is a different number from that fallback on
+    purpose."""
+    mono = _Clock(0.0)
+    store = _FakeStore(_RecordingPool(_Clock(0.0), mono))
+    settings = ClusterSettings(enabled=True)  # unset -> derived
+    assert settings.lease_renew_timeout_seconds == 4.5
+    coord = build_coordinator(store, settings)
+    assert isinstance(coord, DbCoordinator)
+    assert coord._renew_timeout == 4.5
+
+
+def test_the_duck_typed_fallback_does_not_swallow_a_zero() -> None:
+    """``is None``, not ``or``. A falsy-test would turn a duck-typed 0.0 into the 5.0 fallback -- a
+    value ClusterSettings refuses outright, substituted at the one seam feeding the live coordinator,
+    where nothing downstream would report it."""
+    mono = _Clock(0.0)
+    store = _FakeStore(_RecordingPool(_Clock(0.0), mono))
+    stand_in = SimpleNamespace(enabled=True, lease_renew_timeout_seconds=0.0)
+    coord = build_coordinator(store, stand_in)
+    assert isinstance(coord, DbCoordinator)
+    assert coord._renew_timeout == 0.0
 
 
 # --- the baseline is stamped before the renew is issued ---------------------

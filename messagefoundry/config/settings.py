@@ -3378,21 +3378,45 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #: strictly inside the margin, and neither has to know the other's number.
 _RENEW_CLAMP_MARGIN_FRACTION = 0.5
 
+#: FLOOR on the derived clamp, and the reason it exists is a LIVENESS bound the margin does not see.
+#: The clamp is asyncpg's per-statement timeout on the lease renew, so a renew slower than it RAISES
+#: and ``_last_renew_ok`` is not advanced; enough consecutive failures and the watchdog self-fences a
+#: leader whose database was merely slow. The margin bounds the clamp from ABOVE (correctness: a stray
+#: renew must not outlive the fence). Nothing in the margin bounds it from BELOW, and at a tight
+#: fence/TTL pair ``0.5 * margin`` lands at 0.6-0.7 s -- a plausible latency for one small UPDATE on a
+#: loaded server, which would turn a slow DB into a spurious failover. 1.0 s is a sane floor for a
+#: single-row UPSERT. A pair whose margin cannot fit even this is refused by the check below rather
+#: than run with a clamp that would fence it; see :meth:`ClusterSettings._renew_fits_the_margin`.
+_RENEW_CLAMP_FLOOR_SECONDS = 1.0
+
 
 def _derived_renew_timeout_seconds(margin_seconds: float) -> float:
-    """The renew clamp for an operator who did not set one, as a function of the margin it must fit.
+    """The renew clamp for an operator who did not set one, from the two bounds it sits between.
 
-    A FIXED default cannot do this job. The clamp's only correctness requirement is
-    ``clamp < margin``, and the margin is a function of the fence/TTL pair, so any constant is wrong
-    for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
-    (``harness/load/profiles/failover.toml``, margin 1.2 s) at config load. Deriving it instead means
-    a tight fence/TTL pair gets a proportionally tight clamp rather than a refusal, and the default
-    can never contradict the margin: ``margin > 0`` is checked first, so
-    ``min(ceiling, 0.5 * margin) < margin`` holds for every margin this is reachable with.
+    A FIXED default cannot do this job. The clamp's correctness requirement is ``clamp < margin``,
+    and the margin is a function of the fence/TTL pair, so any constant is wrong for some legitimate
+    pair -- a fixed 5.0 refused this repository's own failover profiles
+    (``harness/load/profiles/failover.toml``, margin 1.2 s) at config load. Deriving it means a tight
+    fence/TTL pair gets a proportionally tight clamp rather than a refusal.
 
-    An EXPLICIT value is never silently clamped down to this -- it is checked and refused, because
-    quietly overriding an operator's number would make the check unfalsifiable."""
-    return min(_RENEW_CLAMP_CEILING_SECONDS, _RENEW_CLAMP_MARGIN_FRACTION * margin_seconds)
+    **But the margin is only the UPPER bound, and deriving from it alone is how this went wrong
+    once.** The first cut returned ``min(ceiling, 0.5 * margin)`` with no floor, which at those same
+    failover profiles is 0.6-0.7 s. That is a per-statement timeout on the lease renew, so it trades
+    a config-load refusal for a RUNTIME one: a renew slower than the clamp raises, the fence baseline
+    is not advanced, and a merely-slow database self-fences the leader. The floor is the lower bound
+    that the margin cannot express.
+
+    **So the result is CHECKED, not correct by construction.** With a floor in it this can exceed a
+    small margin -- deliberately, because that pair cannot carry a safe clamp and should be refused
+    rather than quietly run at a fencing one. :meth:`ClusterSettings._renew_fits_the_margin` applies
+    the same comparison to this value as to an operator's own.
+
+    An EXPLICIT value is never silently clamped to this -- it is checked and refused, because quietly
+    overriding an operator's number would make the check unfalsifiable."""
+    return max(
+        _RENEW_CLAMP_FLOOR_SECONDS,
+        min(_RENEW_CLAMP_CEILING_SECONDS, _RENEW_CLAMP_MARGIN_FRACTION * margin_seconds),
+    )
 
 
 class ClusterSettings(_Section):
@@ -3469,7 +3493,10 @@ class ClusterSettings(_Section):
     # ADR 0157 Inc 0 — not something this setting silently covers.
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
-    # capped at 5.0 s. A fixed default cannot be right here. The clamp's correctness requirement is
+    # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
+    # this value is the renew's per-statement timeout, so a clamp below a realistic latency for one
+    # small UPDATE self-fences a leader whose DB was merely slow. A fixed default cannot be right
+    # either. The clamp's correctness requirement is
     # `clamp < (ttl - fence - fence_tick)`, which is a function of the fence/TTL pair, so a constant is
     # wrong for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
     # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
@@ -3584,18 +3611,21 @@ class ClusterSettings(_Section):
 
         Three outcomes, in order:
 
-        1. **No margin at all** (``<= 0``, or NaN): refused outright. The fence fires so close to the
-           lease expiry that no clamp of any size fits, so this is not about the clamp and lowering it
-           cannot help. ``_fence_ordering`` accepts such a pair -- fence 4.0 / TTL 4.5 orders fine and
-           leaves -0.3 s.
-        2. **Clamp unset**: DERIVED from the margin (:func:`_derived_renew_timeout_seconds`) and filled
-           in here, so every consumer downstream reads a concrete float. This is why the default
-           cannot refuse a legitimate pair -- there is no constant to contradict the margin. It is
-           then held to the same rule below rather than trusted, so a mis-retuned derivation is a
-           refusal and not a silently oversized clamp.
-        3. **Clamp set explicitly**: it must be strictly below the margin, or refused. Not silently
-           clamped: a check that rewrites its subject to pass accepts everything, which is the same as
-           not checking. An operator who tightens the fence/TTL pair under a pinned clamp gets told.
+        1. **No margin at all** (``<= 0``, or NaN): refused, naming the fence/TTL pair. ``_fence_ordering``
+           accepts such a pair -- fence 4.0 / TTL 4.5 orders fine and leaves -0.3 s. **This branch changes
+           the MESSAGE, not the verdict:** step 3 refuses the same pair anyway, because a derived clamp
+           off a negative margin is itself negative and fails the comparison. It is here so the operator
+           is told their fence/TTL pair has no margin, instead of being told to lower a clamp they never
+           set; do not describe it as catching something step 3 misses.
+        2. **Clamp unset**: DERIVED (:func:`_derived_renew_timeout_seconds`) and filled in here, so every
+           consumer downstream reads a concrete float. The derivation carries a FLOOR, so it is **not**
+           correct by construction and is not trusted -- it falls through to step 3 like any other value.
+           A margin too small to fit the floor is a pair that cannot carry a safe clamp, and is refused
+           rather than run at one that would self-fence a merely-slow leader.
+        3. **The comparison, applied to whichever value step 2 left**: it must be strictly below the
+           margin, or refused. An explicit value is never silently clamped to fit: a check that rewrites
+           its subject to pass accepts everything, which is the same as not checking. An operator who
+           tightens the fence/TTL pair under a pinned clamp gets told.
 
         **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157 Inc 4/5) is derived
         from the same margin and bounds the source phase only.
@@ -3623,12 +3653,13 @@ class ClusterSettings(_Section):
             )
         if self.lease_renew_timeout_seconds is None:
             self.lease_renew_timeout_seconds = _derived_renew_timeout_seconds(margin)
-        # The derived value FALLS THROUGH the same check rather than returning early. It cannot fail it
-        # as written -- see _derived_renew_timeout_seconds -- and that is exactly why the check runs on
-        # it: "correct by construction" is a claim about today's arithmetic, and the construction is
-        # two constants and a `min` that a later retune can get wrong. Checked beats asserted. Verified
-        # by mutation: breaking the derivation back to a fixed 5.0 makes this refuse the repository's
-        # own failover profiles instead of silently handing them an oversized clamp.
+        # The derived value FALLS THROUGH the same check rather than returning early, and since the
+        # derivation gained a floor it can genuinely fail here: any margin at or below the floor. That
+        # is the intended refusal -- such a pair cannot carry a clamp that is both inside the margin
+        # and long enough for one small UPDATE, so running it would self-fence a merely-slow leader.
+        # Checked beats asserted in any case: mutating the derivation back to a fixed 5.0 makes this
+        # refuse the repository's own failover profiles instead of silently handing them an oversized
+        # clamp.
         if not self.lease_renew_timeout_seconds < margin:
             raise ValueError(
                 "cluster lease timing leaves no room for the renew clamp: "
