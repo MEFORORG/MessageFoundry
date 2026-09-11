@@ -424,7 +424,7 @@ def test_the_rig_cannot_reach_the_real_registry(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
 def test_For_records_the_named_worktree_and_its_branch(tmp_path: Path) -> None:
-    """The third limb closed at birth: the Console allocates, the Builder's tree is recorded."""
+    """The third limb closed at birth: the Manager allocates, the Builder's tree is recorded."""
     repo = _alloc_rig(tmp_path)
     builder = tmp_path / "builder"
     out = _alloc(repo, "-Kind", "backlog", "-Title", "builders item", "-For", str(builder))

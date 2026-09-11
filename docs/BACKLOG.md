@@ -24344,6 +24344,18 @@ git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # sa
 > can deliver it.
 >
 > **Scored 2026-09-03 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Partly shipped, not fully -- the hook landed in cb4a8cf60 but does not fire on the spawn path the item was written about. scripts/hooks/usage-headroom-inject.ps1 is real at 15,602 bytes, cites BACKLOG #1406 at :9, is wired at .claude/settings.json:60 on matcher ^(Task|Agent|Workflow)$|spawn_task, guards exactly those names at :109 and :176, and carries 476 lines of tests plus a matcher check in tests/test_claude_settings_contract.py. The gap is that CLAUDE.md:290 says the Console spawns a Builder through a rule matching Bash(claude:*) or PowerShell(claude:*), which a tool-name matcher cannot select: tests/test_claude_settings_contract.py:151 lists Bash among the near-miss names and :375-380 ASSERTS that no matcher wiring this hook selects it, priced at :150 as a process spawn on every one of 19.0 tool calls per turn. So the item's own sentence, headroom in context exactly when the console is about to spend it, is unmet for the launch that spends the most, and neither the hook nor its tests record that exclusion anywhere. Value stays low because the item itself blesses the alternative -- pulling usage.ps1 at the point of use is called the right design, not a compromise -- so what is left is either a cheaper seam for the CLI launch or an honest written-down exclusion with a test arm, which is a small additive change on the guard the contract test already parses.
+> 
+> **AMENDED 2026-09-11: the stated GAP names a spawn path that no longer exists, so re-read the
+> premise before building this.** [#1529](#1529) retired the Console seat and CLAUDE.md section 5 now
+> says **no seat spawns a session** -- the owner starts each Manager, and a Manager's workers are
+> subagents in its own process. So *"CLAUDE.md:290 says the Console spawns a Builder through a rule
+> matching `Bash(claude:*)`"* above is stale in both halves: the line moved AND the claim is retired.
+> 
+> **This may have CLOSED the item rather than changed it, and that needs its own read.** The launch
+> that now spends the most is a subagent dispatch, and the matcher this row calls unselectable --
+> `^(Task|Agent|Workflow)$|spawn_task` -- already selects exactly that. **Not verified here:** #1529
+> did not test the hook, and this note records the premise change only. Whoever picks this up should
+> establish whether any launch path is still uncovered before treating the row as live work.
 > Verdict: build
 > Closing-act: code
 
@@ -30483,6 +30495,9 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 
 **Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
 
+
+---
+
 ## 1528. the repository's copyright and CLA entity renames to MessageFoundry Foundation, LLC, per the owner's 2026-09-10 ruling
 
 > 🚧 **Built 2026-09-10 on branch `claude/entity-rename-llc` (PR 1020); open until that merges, when the Lander flips this banner.** Commit `cabcb3e5c` replaces "MessageFoundry Organization" with "MessageFoundry Foundation, LLC" in 1,530 files, one line for one line. It changes no licence, no year and no code path. Value **5/10** · Difficulty **2/10**. Value 5: a code-signing certificate would name the registered entity, and no file in the source named it. Difficulty 2: the change is one exact substitution plus one line fixed by hand, and a script re-checks its shape. Its only real cost is width, because nearly every tracked file changes and every open branch conflicts with it.
@@ -30570,6 +30585,144 @@ git grep -n "MessageFoundry Organization" -- ":!docs/BACKLOG.md" ":!docs/archive
 
 The pathspecs leave out the ledger and its archive, because this item names the old entity on purpose
 and will move to the archive when it closes.
+
+
+---
+
+## 1529. Retire the Console seat; the Manager is the live dispatching seat
+
+> 🚧 **Filed 2026-09-10, and the change is IN THIS PR. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
+> Verdict: build
+> Research: none
+> Closing-act: the Lander flips this banner
+
+**Cluster:** KORUS seats and role cards. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is method and documentation, not shipped engine code.
+
+### The defect: a pointer about which CARD resolves was read as an instruction about which SEAT you hold
+
+`docs/roles/seats.json` said of the Manager label, in full:
+
+    "manager": "A korus seat, not one here. CLAUDE.md section 5 runs the Console instead."
+
+That sentence is **true about card resolution** and says nothing about which seat a session holds. A
+Manager session read it as *"substitute the Console"*, and then went looking for a spawn grant it does
+not need and an enqueue authority it does not have. Its own words, reporting the error:
+
+> I read that as "substitute the Console." Wrong read -- that file governs which card resolves in this
+> repo, not which seat I hold.
+
+**A bare retirement would not have fixed it.** "The Console is retired" tells a reader the label is
+gone and leaves substitution as the obvious next move. The notice has to **deny the rename and name a
+difference**, which is what `tests/test_role_cards.py::TheConsoleRetirementSaysTheManagerIsNotARenameOfIt`
+now pins.
+
+### What the Manager is, and why it is not a renamed Console
+
+| | the retired Console | the Manager |
+|---|---|---|
+| Workers | separate `claude -p` sessions | **subagents, in its own process** |
+| Accounts touched | several | **one: its own** |
+| Spawn grant | required, per config root | **not needed, and not used** |
+| Peers | none, it was the only one | **several, usually one per account** |
+| Enqueuing a PR | its call | **the Lander's** |
+
+Source: korus `roles/MANAGER.md` at `origin/main`, *"You are an ALTERNATIVE to the Console, not a layer
+above or below it"*.
+
+### What this PR changed
+
+1. **`docs/roles/seats.json`** -- `manager` is live; `console` and its three observed spellings
+   (`console1`, `console-1`, `consul`) are retired, each carrying the deny-the-rename notice. The
+   Manager left the `elsewhere` map. Every spelling is listed individually **on purpose**: an alias
+   must land on a live seat, so a spelling left out would resolve to `MATCHES NO SEAT` and read as a
+   typo rather than a roster fact.
+2. **`docs/roles/console.card.md` -> `docs/roles/manager.card.md`**, rewritten, leading with a
+   *"You are not a renamed Console"* table.
+3. **`CLAUDE.md` section 5** -- the roster row, the retirement paragraph, the spawn-grant paragraph
+   (no seat spawns a session now, so the grant binds nothing; its measurements are kept so nobody
+   re-derives them), the dispatch section, and the enqueue bullet.
+4. **`docs/METHOD.md`**, **`docs/ROLE-CARDS.md`**, **`docs/LEDGER-GATE.md`**, `scripts/coord/alloc.ps1`.
+5. **Enqueue authority moved to the Lander.** Not a narrowing of a live permission: the seat that held
+   it no longer exists, and korus `MANAGER.md` has never granted it.
+
+### A second reader of the same roster, and it was blind
+
+**`scripts/coord/seat.ps1` never read `docs/roles/seats.json`.** It copied whatever `-Seat` it was
+handed into the record, and `fleet.ps1` rendered that as a live seat. One roster, two readers, and
+only `role-card-inject.ps1` could see it.
+
+**Reported by the session it happened to**, 2026-09-10, and verified here rather than taken on trust:
+that session started undeclared, the hook listed the live seats with **no manager among them**, and
+the owner corrected it in-band -- *"you are not the console... you are a manager"*. It then declared
+`-Seat manager`, **a label that was in no map at all**, and the script accepted it and wrote a record.
+Nothing reported a problem, because the record was valid. That is the hollow-record failure
+`test_coord_seat_session_key.py` pins for the session id, arriving one field over.
+
+**With the Console retired, the mirror case is the dangerous one.** `-Seat console` would be recorded
+in silence while the card hook refuses the same label loudly -- so the retirement would hold on the
+path a session reads and leak on the path a session writes.
+
+**It warns and records; it does NOT gate, and that half is deliberate.** An undeclared seat renders as
+UNDECLARED to every other session, so refusing a declaration trades a readable-but-odd record for
+**no** record, which is worse. A label may also be a legitimate spelling nobody has added to the alias
+map yet. `test_a_retired_declaration_is_still_recorded` is the arm that stops a later change turning
+this into a refusal.
+
+Two additive fields carry the verdict -- `seatCanonical` and `seatRosterVerdict` -- while `seat` keeps
+the verbatim label, because every existing reader keys on it.
+
+**The objection goes to STDERR, not `Write-Warning`.** Measured on pwsh 7 here: `Write-Warning`
+renders to **stdout**, which would make a roster objection narrate into a session's context on the
+`-Record` and `-Prompt` hook paths -- the one thing `seat.ps1` says those paths must not do -- and
+would land in whatever parses its `wrote <path>` line. `[System.Console]::Error.WriteLine` is the
+idiom `overlap.ps1` already uses.
+
+**Armed before trusted:** run against the pre-change script, 9 of the 10 new tests fail; against the
+change, 10 pass. The one that passes either way is the missing-roster arm, which is why it exists --
+without it, "no objection" and "nothing checked" would be the same value.
+
+### What was deliberately NOT changed, and why
+
+- **The product "Console" is a different subject and is untouched.** The retired PySide6 desktop
+  console and the web console at `/ui` keep their names throughout `docs/adr/`, `docs/design/` and
+  `docs/TRAY.md`.
+- **Dated decision provenance stays.** [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
+  records that the owner delegated a call to the Console on 2026-09-02 and the Console decided, and
+  `tests/test_security_config.py` carries the same attribution. Those say **who decided**, not **who to
+  go to**, so rewriting them would falsify the record rather than repair a stale route.
+- **Closed and historical ledger rows stay.** This file and
+  [`BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md) record what was true when each row was
+  filed.
+
+### Residual: the korus half is IN FLIGHT, not unassigned
+
+`roles/CONSOLE.md` is live at `wshallwshall/korus` `origin/main`, and `roles/MANAGER.md` still defines
+the Manager by contrast with a seat this repository no longer runs. **That is a second repository and a
+second PR, and it is already owned.** Measured 2026-09-10: a korus worktree whose branch and session
+title both name Console-reference removal holds **uncommitted** edits across 20-plus files, including
+`docs/roles/seats.json`, `docs/roles/console.card.md`, `CLAUDE.md`, `README.md`,
+`.specify/memory/constitution.md` and four `.claude/skills/` files. **Nothing was committed or pushed
+there and no korus PR exists for it**, so a zero-commit branch read alone would have looked like a dry
+lane -- the working tree is what discriminates. Find it with `git worktree list` in the korus clone
+rather than from a slug written down here; the leak guard refuses a worktree slug in a tracked file,
+and a slug recorded in prose goes stale when the worktree is pruned.
+
+**So this item does NOT cover korus, and nobody should start it again.** That seat was messaged with
+the four choices its half has to match: the 2026-09-10 date, the deny-the-rename wording, all three
+observed spellings in the retired map individually, and enqueue moving to the Lander. Until its work
+lands, a session reading the korus `roles/` folder finds a Console playbook with nothing beside it
+saying the seat is retired here.
+
+**korus is NOT covered by the worktree gate** -- `worktree-gate.repos.txt` lists only the
+MessageFoundry primary -- so nothing would have stopped a write into that tree. Uncommitted work is the
+one state git cannot recover, which is why the check was a read and not an edit.
+
+**Related:** [#1448](#1448) and [#1391](#1391) -- an item or a pointer stays live because nothing records
+what answered it. Here the pointer was accurate about its own subject and wrong about the one the reader
+brought to it.
+
+---
 
 ## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
 
