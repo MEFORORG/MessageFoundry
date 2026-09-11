@@ -1906,11 +1906,29 @@ class AuthService:
         are worth stating.** Before this, a rename resolved to nothing and minted a SECOND account, so
         the person silently lost the uploads and presets keyed to the first -- the same class of defect
         this item closes, arriving from the other side. Now they keep the account, and
-        ``reconcile_directory_sessions`` still probes the directory BY USERNAME, so with the shipped
-        ``ad_session_recheck_seconds`` (300, i.e. on whenever a directory is wired) a renamed
-        account's sessions are revoked each pass until an administrator corrects the stored name.
-        Fail-closed and audited, never a widened grant. Re-keying that probe is the ADR 0184
-        reconciler question, which this item does not claim.
+        ``reconcile_directory_sessions`` still probes the directory BY USERNAME, which the directory
+        no longer answers to. At the shipped settings (``ad_session_recheck_seconds`` 300 and
+        ``ad_session_recheck_strikes`` 2, i.e. on whenever a directory is wired) a renamed account
+        reads as absent on every probe, so it would collect a strike per pass and have its sessions
+        revoked once it reaches the threshold.
+
+        **THERE IS NO ADMINISTRATIVE REMEDY FOR THAT TODAY. An earlier draft of this paragraph said
+        the revocation continued "until an administrator corrects the stored name", and no such
+        operation exists** -- nothing writes ``users.username`` after ``create_user``, in this module,
+        in the store protocol or any of its three backends, or in the API. That sentence was a
+        compensating control resting on a false premise, which is worse than naming no remedy: a
+        reader plans around the correction and there is nothing to run.
+
+        What a deploying site would actually get: sign-in works (the id finds the row), then the
+        sessions are revoked again a couple of passes later, indefinitely, because the account leaves
+        the candidate set once it holds no live session and re-enters it on the next login. The only
+        escape available today is deleting the row and letting the next login mint a fresh one, which
+        discards the ``user_id`` -- and with it the uploaded-file ownership, the per-uploader quota
+        and the saved search presets this binding exists to keep pointed at one person.
+
+        Fail-closed and audited, never a widened grant, which is what makes this a wart rather than a
+        blocker. Both candidate fixes -- a rename path, and re-keying the probe off the name -- belong
+        to the ADR 0184 reconciler question, which this item does not claim.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is

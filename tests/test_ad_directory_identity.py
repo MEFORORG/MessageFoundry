@@ -46,6 +46,13 @@ GUID_A_TEXT = "12345678-1234-1234-1234-56789abcdef0"
 GUID_A_BRACED = "{12345678-1234-1234-1234-56789ABCDEF0}"
 GUID_B_TEXT = str(uuid.UUID("fedcba98-7654-3210-fedc-ba9876543210"))
 
+# The SAME 16 bytes as a directory hands back when no formatter is registered for the attribute: the
+# octets decoded as text rather than rendered as a GUID. ``normalise_object_guid`` refuses it -- it is
+# a 16-character string, not a parseable UUID -- and that refusal is what lets
+# ``test_the_raw_wire_bytes_win_over_whatever_formatter_ldap3_registered`` fail when the preference it
+# is named for is deleted. A braced string beside its own bytes cannot: both arms normalise alike.
+GUID_A_UNFORMATTED = GUID_A_BYTES.decode("latin-1")
+
 
 @pytest.fixture(autouse=True)
 def _reset_the_warning_latch() -> None:
@@ -125,10 +132,31 @@ class _FakeEntry:
 
 
 def test_the_raw_wire_bytes_win_over_whatever_formatter_ldap3_registered() -> None:
-    """``raw_values`` is read in preference to ``value``: it is the bytes before any formatter had an
-    opinion. Here the two disagree on spelling and agree on identity, which is the real case."""
-    entry = _FakeEntry({"objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES)})
+    """``raw_values`` is read in preference to ``value``, ON A PAIR THAT CAN TELL THE TWO APART.
+
+    The pairing that reads naturally -- the braced string beside its own bytes -- cannot, and this
+    test used to use it. The first test in this file proves both of those arms normalise to the same
+    text, so both sides of the choice returned the same answer: the preference could be deleted
+    outright and the assertion still held. Measured by mutation, and the mutation stayed green.
+
+    What the preference actually buys is independence from whichever formatter ``ldap3`` registered
+    for the attribute, so the discriminating case is a ``value`` the normaliser REFUSES beside raw
+    bytes it accepts. Reading ``value`` there yields no identity at all, which is the real failure:
+    the login falls back to the recyclable name and nothing downstream says why.
+    """
+    assert normalise_object_guid(GUID_A_UNFORMATTED) is None, (
+        "the fixture stopped discriminating: this value normalises on its own, so the assertion "
+        "below would pass with the raw_values preference deleted"
+    )
+    entry = _FakeEntry({"objectGUID": _FakeAttr(GUID_A_UNFORMATTED, raw=GUID_A_BYTES)})
     assert _object_guid(entry) == GUID_A_TEXT
+
+
+def test_the_two_spellings_of_one_account_still_agree_through_the_entry() -> None:
+    """The ordinary case the test above gave up in order to discriminate: a registered formatter and
+    the wire bytes name the same object, so which one is read cannot change the identity."""
+    both = _FakeEntry({"objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES)})
+    assert _object_guid(both) == GUID_A_TEXT
 
 
 def test_a_formatted_string_alone_is_still_read() -> None:
@@ -239,6 +267,117 @@ def test_a_directory_entry_without_the_attribute_yields_no_identity() -> None:
     )
     info = _authenticator()._find_user(_FakeConn(entry), "jsmith")
     assert info is not None and info["object_id"] is None
+
+
+# --- the producers: the two entry points that put the id ON the principal ------------------------
+#
+# THE ONLY PRODUCERS OF ``AdPrincipal.directory_object_id`` ARE ``authenticate`` AND
+# ``resolve_principal``, and until these tests landed nothing asserted that either one copies the
+# looked-up value onto what it returns. Measured: deleting ``directory_object_id=info["object_id"]``
+# from either method left the WHOLE SUITE GREEN. The service tests all build an ``AdPrincipal`` by
+# hand, the lookup tests above stop at the returned mapping, and the entry doubles in
+# ``tests/test_ldap_timeouts`` carry no ``objectGUID`` -- so the assignment was invisible three ways
+# at once, and mypy cannot see it either because the dataclass field defaults to None.
+#
+# What that would ship: a site on AD gets ``directory_object_id=None`` on every login through the
+# dropped method, so new rows would bind to nothing and the recycle hole would reopen. Worse for an
+# account already bound -- including one bound moments earlier over the OTHER method, since Kerberos
+# and password take one each -- which would then fail the id check in ``_complete_ad_login`` and be
+# refused as ``directory_identity_conflict`` on every attempt.
+
+
+def _install_directory(monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry) -> None:
+    """Replace ``ldap3.Server`` / ``ldap3.Connection`` so the REAL entry points run against ``entry``.
+
+    Deliberately not the ``_FakeConn`` above: that one is handed straight to ``_find_user`` and skips
+    everything the entry points do with what it returns, which is the step under test here.
+    """
+    import ldap3
+
+    class FakeServer:
+        def __init__(self, host: Any = None, **kwargs: Any) -> None: ...
+
+    class FakeConnection:
+        def __init__(self, server: Any = None, **kwargs: Any) -> None:
+            self.entries: list[_FakeEntry] = []
+
+        def __enter__(self) -> FakeConnection:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            # None, not False: both are falsy and neither swallows, but the annotation says so.
+            return None
+
+        def search(self, **kwargs: Any) -> bool:
+            self.entries = [entry]
+            return True
+
+        def bind(self) -> bool:
+            return True
+
+        def unbind(self) -> None: ...
+
+    monkeypatch.setattr(ldap3, "Server", FakeServer)
+    monkeypatch.setattr(ldap3, "Connection", FakeConnection)
+
+
+def _directory_entry(guid: _FakeAttr | None) -> _FakeEntry:
+    """One enabled AD account, with ``objectGUID`` present or absent. ``userAccountControl`` is 512
+    (a normal enabled account); 0x2 would be refused by the lookup before any of this is reached."""
+    attrs = {
+        "sAMAccountName": _FakeAttr("jsmith"),
+        "displayName": _FakeAttr("J Smith"),
+        "mail": _FakeAttr("jsmith@example.org"),
+        "memberOf": _FakeAttr(["CN=MF-Ops,DC=x"]),
+        "userAccountControl": _FakeAttr("512"),
+    }
+    if guid is not None:
+        attrs["objectGUID"] = guid
+    return _FakeEntry(attrs, dn="CN=jsmith,DC=x")
+
+
+def _drive(name: str, auth: LdapAuthenticator) -> AdPrincipal | None:
+    """Call one entry point by name. Both take a username; only one takes a password, which is why
+    this exists rather than a bare ``getattr``."""
+    if name == "authenticate":
+        return auth.authenticate("jsmith", "synthetic-user-pw")
+    return auth.resolve_principal("jsmith")
+
+
+#: The two methods that build an ``AdPrincipal``. Parametrised so each is a SEPARATELY NAMED case
+#: that fails on its own -- dropping the assignment from one must not be masked by the other.
+_ENTRY_POINTS = ["authenticate", "resolve_principal"]
+
+
+@pytest.mark.parametrize("entry_point", _ENTRY_POINTS)
+def test_the_entry_point_carries_the_immutable_id_onto_the_principal(
+    entry_point: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The producer's own assertion: the value the lookup read reaches the returned principal.
+
+    ``_complete_ad_login`` resolves the row by ``principal.directory_object_id`` and by nothing else,
+    so an id that stops at the lookup's return mapping is an id the engine never uses.
+    """
+    _install_directory(monkeypatch, _directory_entry(_FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES)))
+    principal = _drive(entry_point, _authenticator())
+    assert principal is not None, f"{entry_point} did not reach a principal at all"
+    assert principal.username == "jsmith"
+    assert principal.directory_object_id == GUID_A_TEXT, (
+        f"{entry_point} returned a principal carrying {principal.directory_object_id!r} rather than "
+        "the directory's immutable id -- every row it binds would bind to nothing (BACKLOG #1471)"
+    )
+
+
+@pytest.mark.parametrize("entry_point", _ENTRY_POINTS)
+def test_the_entry_point_reports_no_identity_rather_than_inventing_one(
+    entry_point: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback arm through the same real method: a directory that returns no ``objectGUID``
+    yields ``None`` on the principal -- not the string ``"None"``, which would key a row."""
+    _install_directory(monkeypatch, _directory_entry(None))
+    principal = _drive(entry_point, _authenticator())
+    assert principal is not None
+    assert principal.directory_object_id is None
 
 
 # --- the service: who a directory login is -------------------------------------------------------

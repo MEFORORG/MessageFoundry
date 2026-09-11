@@ -27109,11 +27109,17 @@ I did not survey how the fence came to be written, or whether any dispatcher has
 > minted a SECOND account, silently orphaning the uploads and presets keyed to the first -- this item's
 > own defect from the other side. Now the id finds the row and the person keeps their account, while
 > the stored username stays as created. `reconcile_directory_sessions` still probes BY USERNAME, so at
-> the shipped `ad_session_recheck_seconds` (300, i.e. on whenever a directory is wired) a renamed
-> account's sessions are revoked each pass until an administrator corrects the name. Fail-closed and
-> audited, never a widened grant; pinned by `test_a_renamed_account_keeps_its_row_and_its_original_username`.
-> **Re-keying that probe is unfiled work and is named by subject, not by number:** the reconciler's
-> username-keyed probe, which is the ADR 0184 reconciler question this row never claimed.
+> the shipped settings (`ad_session_recheck_seconds` 300, `ad_session_recheck_strikes` 2 -- on whenever
+> a directory is wired) a renamed account reads as absent on every probe and has its sessions revoked
+> once it reaches the strike threshold. **AND THERE IS NO ADMINISTRATIVE REMEDY: nothing writes
+> `users.username` after `create_user`**, in the store protocol, any of its three backends or the API,
+> so a renamed person would re-enter that cycle after every sign-in. Deleting the row is the only
+> escape available and it discards the `user_id` that uploads, quota and presets key on. Fail-closed
+> and audited, never a widened grant; pinned by
+> `test_a_renamed_account_keeps_its_row_and_its_original_username`.
+> **Re-keying that probe and adding a rename path are both unfiled work, named by subject rather than
+> by number:** the reconciler's username-keyed probe and a username writer, which are the ADR 0184
+> reconciler question this row never claimed.
 >
 > **The first-contact rule taken, and it is the one that decides the acceptance test:** resolve by the
 > immutable id ONLY. A NULL-id row is never adopted by name, and a login whose id disagrees with the
