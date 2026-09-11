@@ -555,8 +555,10 @@ class Ledger:
         if branch:
             lines.append(f"    2. or check that branch out and commit there: {branch}")
         lines += [
-            "       (git refuses a branch held by another worktree; from the worktree in 1 you can",
-            "        still reach it with: git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+            "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
+            "        not force past that -- two trees on one branch is what makes the branch key above",
+            "        stop being exclusive. From the worktree in 1 you can still reach it with:",
+            "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
             "    3. ONLY if neither tree nor branch still exists, allocate a new number:",
             f"       {allocate}",
             "",
@@ -842,11 +844,25 @@ class Ledger:
         # the MERGE PARENTS block above for why this is safe and what it cost when it was missing.
         for parent in self._merge_parents():
             base |= self._backlog_numbers_at(parent)
-        # `prior - head` expands to `P & (base - head)`, so an empty `base - head` makes the reverse
-        # arm unable to report anything -- and that is the shape of every ordinary commit, which adds
-        # items and deletes none. Skipping the parent read there is not a heuristic, it is the same
-        # answer for free: measured 2026-09-10, it saves six git subprocesses (582 ms) and two full
-        # parses of a 30k-line file. A branch behind origin/main has a non-empty difference and pays.
+        # ***TWO SEPARATE THINGS ON ONE LINE, AND THE `& base` IS THE LOAD-BEARING ONE. DO NOT DELETE
+        # IT AS REDUNDANT WITH THE SHORT-CIRCUIT.***
+        #
+        # `& base` is BEHAVIOUR. It confines the reverse arm to numbers that reached shared history,
+        # which is what stops `git commit --amend` withdrawing an item you filed one commit ago from
+        # reading as destruction -- the parent has it, the index does not, and that is byte-for-byte
+        # the shape the arm refuses. Without it the gate falsely refuses a pre-commit on any branch
+        # that withdrew a number it invented. `_prior_item_numbers`' docstring states the rule; this
+        # is where it is applied. Pinned by
+        # test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion, and pinned ONLY
+        # because that test's rig keeps `base - head` non-empty: an earlier rig left it empty, so the
+        # short-circuit below fired first and the whole intersection could be deleted with every test
+        # green. Measured 2026-09-11 -- deleting `& base` reddens that one test and nothing else.
+        #
+        # `if base - head` is PERFORMANCE ONLY and changes no verdict. `prior - head` expands to
+        # `P & (base - head)`, so an empty difference makes the arm unable to report anything -- the
+        # shape of every ordinary commit, which adds items and deletes none. Measured 2026-09-10, the
+        # skip saves six git subprocesses (582 ms) and two full parses of a 30k-line file. A branch
+        # behind origin/main has a non-empty difference and pays.
         prior = self._prior_item_numbers() & base if base - head else set()
         return head, base, prior
 

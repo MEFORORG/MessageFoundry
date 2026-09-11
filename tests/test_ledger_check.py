@@ -208,10 +208,21 @@ def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
     permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
     nothing anywhere reported the loss.
 
-    ***IT IS SAFE ONLY BECAUSE GIT REFUSES ONE BRANCH IN TWO WORKTREES.*** The gate exists to stop two
-    sessions filing one number, and two sessions cannot hold one branch -- so "the session on this
-    branch" is exactly as single-valued as "the session in this worktree" was, while outliving it. A
-    branch that is free to check out is one nobody is working in.
+    ***IT IS SAFE ONLY BECAUSE GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO
+    WORKTREES.*** The gate exists to stop two sessions filing one number, and two sessions do not hold
+    one branch -- so "the session on this branch" is as single-valued as "the session in this
+    worktree" was, while outliving it. A branch that is free to check out is one nobody is working in.
+
+    ***THAT REFUSAL IS A DEFAULT, NOT A LAW OF GIT, AND THIS DOCSTRING SAID IT FLAT (BACKLOG #1039).***
+    `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get past it, so
+    forcing a second checkout makes the branch key non-exclusive and leaks entitlement to a tree that
+    never allocated the number. `Ledger.owns` carries the full statement of the residual; it is named
+    here because THIS is the sentence that licenses the loosening, and a flat version of it here
+    contradicts the qualified version there.
+
+    **Recorded because the miss generalises: the first sweep for this premise used a CASE-SENSITIVE
+    grep and this site is in capitals**, so the strongest instance in the repository was the one left
+    behind while the ledger row said the sweep was finished.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -445,8 +456,27 @@ def test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion(repo:
     """`git commit --amend` taking back an item you filed one commit ago must not read as destruction.
 
     The parent carries #1001 and the index does not, which is byte-for-byte the shape the arm above
-    refuses. What separates them is that #1001 never reached origin/main, so nothing shared was lost.
+    refuses. What separates them is the `& base` intersection in `_item_sets`: #1001 never reached
+    origin/main, so nothing shared was lost.
+
+    ***MAIN MUST MOVE AHEAD HERE, AND THAT IS THE WHOLE RIG RATHER THAN SCENERY.*** The first version
+    of this test left `base - head` EMPTY, which short-circuits the reverse arm before `prior` is
+    computed at all -- so it passed without the intersection ever running, and `& base` could have
+    been deleted as redundant with all 50 tests green. Proven by deleting it: with this rig the test
+    goes red naming #1001, and restoring it goes green. Keep #1002 on origin/main, or this test stops
+    testing anything.
     """
+    # origin/main gains #1002, so `base - head` is non-empty and the reverse arm actually runs.
+    git(repo, "checkout", "-q", "-b", "sibling")
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1002. Theirs\n\nbody\n",
+    )
+    git(repo, "commit", "-qam", "somebody else files 1002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "sibling")
+    git(repo, "checkout", "-q", "main")
+
     write(
         repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
     )
@@ -459,6 +489,10 @@ def test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion(repo:
 
     code, out = run_check(repo)
     assert code == 0, out
+    assert "1001" not in out, (
+        "#1001 is on the parent and NOT on origin/main, so the `& base` intersection must drop it; "
+        f"reporting it means the intersection is gone:\n{out}"
+    )
 
 
 def test_main_MOVING_AHEAD_is_not_a_deletion_by_this_change(repo: Path, tmp_path: Path) -> None:
@@ -794,6 +828,10 @@ def test_ci_mode_skips_the_ownership_rule_but_still_catches_a_reused_number(repo
 
 _CONFIG = Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml"
 _INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
+_CI = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+#: The `--depth=N` in the ledger step's own fetch. Not a free-standing number: see the test below.
+_FETCH_DEPTH = re.compile(r"--depth=(\d+)\s+origin\s+main")
 
 
 def test_ADDING_a_backlog_that_the_base_lacks_is_not_a_wall_of_unallocated_numbers(
@@ -1055,6 +1093,47 @@ def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
     # ...and it must still MIGRATE an old standalone install away, or upgrading users stay broken.
     assert "Remove-Item -LiteralPath $preCommit" in src, (
         "the installer must remove a previously-installed standalone ledger hook"
+    )
+
+
+def test_the_CI_ledger_step_fetches_DEEPER_THAN_ONE() -> None:
+    """The reverse arm's CI coverage depends on this fetch depth, and nothing else pins it.
+
+    ***THE DEPENDENCY IS NEW AND IT IS INVISIBLE AT THE SITE THAT MATTERS.*** `actions/checkout` takes
+    `refs/pull/N/merge` at its default depth of 1, so HEAD is a shallow GRAFT whose parent objects are
+    absent. The arm reads those parents; the base tip arrives ONLY because this step runs
+    `git fetch --no-tags --depth=200 origin main` before invoking the gate. Trim that to `--depth=1`
+    as a plausible speedup and the arm stops being able to see anything -- and it would go SILENT
+    rather than red, which is the exact failure shape this whole item exists to catch.
+
+    Until this test existed the dependency lived in a comment beside the fetch. A comment cannot fail.
+
+    The depth is asserted as a FLOOR, not pinned to 200: the number is a judgement about how far main
+    can move, and re-tuning it is legitimate. Dropping to 1 is not.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    steps = [
+        s
+        for job in cfg["jobs"].values()
+        for s in job.get("steps", [])
+        if "Ledger gate" in str(s.get("name", ""))
+    ]
+    assert len(steps) == 1, f"expected exactly one ledger-gate step in ci.yml, found {len(steps)}"
+    run = str(steps[0]["run"])
+
+    assert "ledger_check.py --ci" in run, (
+        f"the ledger-gate step no longer invokes the gate -- this test is now vacuous:\n{run}"
+    )
+    depths = [int(d) for d in _FETCH_DEPTH.findall(run)]
+    assert depths, (
+        "the ledger-gate step no longer fetches origin main with an explicit --depth. If the "
+        f"checkout became deep, say so here rather than deleting the assertion:\n{run}"
+    )
+    assert min(depths) > 1, (
+        f"--depth={min(depths)} leaves HEAD's parents unfetched, and the reverse arm (BACKLOG #1470) "
+        "reads them. At depth 1 it goes SILENT, not red."
     )
 
 
