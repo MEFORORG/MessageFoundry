@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#329 — route the four remaining ``MEFOR_ALLOW_INSECURE_TLS`` cells through the ADR-0092 clamp.
 
 Before this lane four cells still consulted the raw ``insecure_tls_allowed()`` predicate, so on first

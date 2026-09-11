@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PHI redaction for the exception/logging path (WP-6c; ASVS 16.2.5, PHI.md P1-3).
 
 Inbound HL7 is attacker-/PHI-bearing, and a Router/Handler is user code that can do

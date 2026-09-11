@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The unread-PR signal must fire on the real shape and stay silent on everything adjacent to it.
 
 These drive the REAL ``is_unread()``, ``decide()`` and ``main()`` against payloads, not a re-statement

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Retention / purge enforcement (WP-12, PHI.md §8): body-purge keeps the message ROW while blanking
 its PHI columns — ``metadata`` included, ASVS 14.2.7 — and never touches an in-flight or (for the
 messages window) a dead body; dead-letters have their own window; WAL/VACUUM maintenance runs clean;

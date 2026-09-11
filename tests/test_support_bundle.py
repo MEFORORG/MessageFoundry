@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Support-bundle (#49) tests: the zip contents, the secret-free config summary, the status snapshot
 built from the real models, and the log-tail redaction — with the hard rule that no raw message body
 or secret reaches the bundle."""

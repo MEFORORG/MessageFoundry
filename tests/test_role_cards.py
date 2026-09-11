@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A role card is injected at SessionStart, so a WRONG one outranks the document that corrects it.
 
 THE FAILURE THESE TESTS PIN. `CLAUDE.md` reaches a session as context. A card reaches it at session

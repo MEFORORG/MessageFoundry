@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the forward-only ASVS tally lint (``scripts/docs/asvs_tally_lint.py``).
 
 Every idiom is driven from BOTH sides. A detector that has only ever been shown text it should

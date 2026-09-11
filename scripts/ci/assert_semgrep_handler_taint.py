@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CI behavioural regression gate for the ADR 0144 Increment-3 Semgrep handler-security rules.
 
 Deterministic + cross-platform (used instead of ``semgrep --test``, which crashes on Windows in its

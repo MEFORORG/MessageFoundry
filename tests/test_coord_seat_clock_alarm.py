@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The seat-clock alarm must fire on a dead chain and stay quiet on a healthy one (#1269).
 
 Every test is one half of a PAIR, because the item's whole thesis is that the OBVIOUS

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DICOM → HL7 v2 mapping **helpers** (ADR 0025 §1) — pure functions a code-first Handler calls to turn
 a parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` (or its
 :class:`~messagefoundry.parsing.dicom.dataset.SrMeasurement` list) into HL7 v2 **segment lines** it then

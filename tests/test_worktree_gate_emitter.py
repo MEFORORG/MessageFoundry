@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The worktree gate as an OUTPUT surface: what it emits, not what it decides.
 
 Every other module in this family asks whether the gate allowed or denied. This one asks what the deny

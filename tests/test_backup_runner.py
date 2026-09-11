@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DR BackupRunner (ADR 0049, #60): the scheduled/on-demand pass snapshots a live store read-only
 (never mutating a staged-queue row — AC-2), encrypts to a verified .mfbak archive + audits PHI-free
 (AC-1), prunes keep-N excluding a verify-failed archive (AC-6), is config-only on a server-DB store

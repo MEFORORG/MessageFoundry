@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the allocation-stranding sweep and for `alloc.ps1 -For` (BACKLOG #1414).
 
 **THE LOAD-BEARING ARM IS THE ONE THAT RUNS THE REAL GATE.** A sweep that reports who can commit a

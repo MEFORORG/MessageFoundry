@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Low-allocation built-ins HL7 v2 parser (ADR 0054) — the python-hl7 drop-in.
 
 This module reimplements python-hl7's *tolerant* parse over native ``dict``/``list``/``str``

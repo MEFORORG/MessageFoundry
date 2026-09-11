@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """TOTP clock-skew window semantics ([auth].totp_skew_steps, BACKLOG #187; ASVS 6.5.5) + the SEC-014
 (CWE-287) fast-clock clamp.
 

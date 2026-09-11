@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure FHIR codec (ADR 0022) — a tolerant routing peek + a validated resource model, mirroring the
 HL7 :mod:`messagefoundry.parsing` library and the X12 :mod:`messagefoundry.parsing.x12` codec.
 

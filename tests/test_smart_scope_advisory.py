@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The SMART scope over-grant advisory (#1159, ASVS 10.2.3).
 
 Both scope settings travelled from operator config to the wire through one ``str(...)`` conversion and

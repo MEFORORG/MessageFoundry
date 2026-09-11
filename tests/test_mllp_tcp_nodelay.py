@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """TCP_NODELAY is set on every MLLP request-response socket.
 
 MLLP is a small-frame request-response protocol (write one framed message, drain, block on the ACK).

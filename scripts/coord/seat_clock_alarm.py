@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A watchdog cannot watch its own death, so something outside the chain has to (BACKLOG #1269).
 
 The seat clock (``MEFOR-Seat-Clock``, ``PT10M``) is what makes a session's "keep going" duty

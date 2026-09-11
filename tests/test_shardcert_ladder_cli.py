@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI-level tests for the shardcert ladder subcommands: the D2 soak-drain coupling and the D5 report
 robustness / provenance / store-env logging. The live ladder never runs — ``run_drive_ladder`` /
 ``run_engine_ladder`` are monkeypatched to capture their kwargs, so these exercise the argument wiring and

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Leak-check bridge (ADR 0030 §5) — the **non-parity seam** to the publish-guard's token authority.
 
 A de-identified dataset is only safe to commit/share once it is **proven** free of known

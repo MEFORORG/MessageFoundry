@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Turnkey DR backup: scheduled + on-demand config + SQLite-store backup (ADR 0049, #60).
 
 :class:`BackupRunner` is a sibling of the :class:`~messagefoundry.pipeline.retention.RetentionRunner`:

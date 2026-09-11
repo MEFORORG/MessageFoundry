@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """At-least-once across a DR restore (ADR 0049 AC-11): a store restored from a backup archive recovers
 in-flight rows via ``reset_stale_inflight`` and re-runs the pure router/transform stages, preserving
 at-least-once — no staged-queue row lost, re-derived output identical (a tolerated duplicate to an

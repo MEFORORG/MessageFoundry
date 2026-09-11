@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``lens rewrite`` v2 — STRUCTURAL edits (delete/insert/move) + multi-line-call param edits (ADR 0076
 §2 phase 3 v2 / BACKLOG #222).
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 8.1.1 (BACKLOG #1151) — the monitoring plane's DATA-scoping rule, executed and documented.
 
 THE DEFECT THIS EXISTS FOR. ``docs/SECURITY.md``'s per-channel-scoping blockquote — the public

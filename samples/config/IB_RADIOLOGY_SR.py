@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample route: receive radiology **DICOM Structured Reports** over C-STORE and map them to HL7 v2
 **ORU** for a dictation/reporting system (the Corepoint "DICOM Gear" replacement, ADR 0025).
 

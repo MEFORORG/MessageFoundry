@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 2.3.4 — the per-uploader upload quota must hold ACROSS processes, not only within one.
 
 BACKLOG #1112's surviving half. ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is

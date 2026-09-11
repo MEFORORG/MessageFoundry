@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`seat.ps1` wrote whatever `-Seat` it was handed, so one roster had two readers and one was blind.
 
 THE FAILURE THESE TESTS PIN. `role-card-inject.ps1` resolves a seat against `docs/roles/seats.json`

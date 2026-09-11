@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Emit a STABLE, deterministic text snapshot of the engine-side seam contract the web console
 (``messagefoundry-webconsole``, Option B / ADR 0065) depends on.
 
