@@ -322,7 +322,8 @@ _MIN_SEPARATION = 2.0
 #: measured to be far too loose: the paced arm's own work hands it ``floor / 4`` for free, so at 0.75
 #: pacing need only supply 60 percent of what it honestly supplies and a wait capped at half a step
 #: would still pass. The floor is exact bucket arithmetic rather than a measurement -- ``paced_elapsed
-#: == floor + 2w``, so the honest arm measured 1.03 to 1.06 times the floor -- and an ``Event.wait``
+#: == floor + 2w``, so the honest arm measured 1.03 to 1.21 times the floor over five quiet runs, its
+#: floor of 1.03 being the arithmetic one rather than a lucky sample -- and an ``Event.wait``
 #: returns LATE on Windows, never early (0 of 240, ``tests/_pace_probe.py``). So the slack buys
 #: nothing against a false red and costs discrimination on the one mutation class the decision arm
 #: below cannot see: a wait asked for and then shortened.

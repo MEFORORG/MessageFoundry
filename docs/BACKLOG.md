@@ -30589,7 +30589,9 @@ pass showed was far too loose: the paced arm's own work hands the comparison `fl
 at 0.75 pacing need only supply about 60 percent of what it honestly supplies. Measured: the halved
 wait lands at 0.86 of the floor, so 0.75 passes it and 0.95 reds it. The slack bought nothing in
 return, because the floor is exact bucket arithmetic rather than a measurement -- the honest arm ran
-1.03 to 1.21 times the floor across nine runs, quiet and loaded -- and an `Event.wait` returns LATE
+1.03 to 1.21 times the floor over five runs on a quiet box, and its low end of 1.03 is the
+arithmetic one rather than a lucky sample. The loaded runs recorded pass or fail, not ratios, so
+this range is a quiet-box measurement and nothing more -- and an `Event.wait` returns LATE
 on Windows, never early (0 of 240, `tests/_pace_probe.py`).
 
 ### The load arm is what settles the original defect
