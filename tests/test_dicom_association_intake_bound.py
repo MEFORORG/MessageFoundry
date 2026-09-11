@@ -318,11 +318,15 @@ _SEPARATION = 4.0
 #: Below this the floor no longer separates from the control and the wall-clock arm could be
 #: satisfied by machine speed alone, so the test says that rather than passing.
 _MIN_SEPARATION = 2.0
-#: The wall-clock arm is asserted at this fraction of the floor. The floor is an exact lower bound in
-#: the bucket arithmetic, so this absorbs only an ``Event.wait`` that returns early -- measured 0 of
-#: 240 early returns on Windows (``tests/_pace_probe.py``), so the slack is deliberate headroom on a
-#: mechanism that has never been observed, not a tolerance the derivation needs.
-_PACED_MARGIN = 0.75
+#: The wall-clock arm is asserted at this fraction of the floor. Kept TIGHT on purpose, and 0.75 was
+#: measured to be far too loose: the paced arm's own work hands it ``floor / 4`` for free, so at 0.75
+#: pacing need only supply 60 percent of what it honestly supplies and a wait capped at half a step
+#: would still pass. The floor is exact bucket arithmetic rather than a measurement -- ``paced_elapsed
+#: == floor + 2w``, so the honest arm measured 1.03 to 1.06 times the floor -- and an ``Event.wait``
+#: returns LATE on Windows, never early (0 of 240, ``tests/_pace_probe.py``). So the slack buys
+#: nothing against a false red and costs discrimination on the one mutation class the decision arm
+#: below cannot see: a wait asked for and then shortened.
+_PACED_MARGIN = 0.95
 #: Shortest step the schedule may be squeezed to, in seconds. Windows' timer granularity is about
 #: 15.6 ms, so a shorter step stops being the thing measured. Clamping here only RAISES separation.
 _STEP_FLOOR_S = 0.1
@@ -454,8 +458,11 @@ async def test_a_paced_scp_still_establishes_every_association() -> None:
 
     **Mutation arms, measured 2026-09-11, quiet and under 24-way CPU load.** With
     ``_pace_association`` returning before it consults the bucket, and again with its
-    ``EVT_CONN_OPEN`` handler never registered, the decision record comes back empty and the paced
-    arm collapses onto the control. Recorded because a test nobody watched fail is not evidence.
+    ``EVT_CONN_OPEN`` handler never registered, the decision record comes back empty. With the wait
+    HALVED rather than removed the record is still four entries and only the wall clock sees it, at
+    0.86 of the floor -- which is why ``_PACED_MARGIN`` is 0.95 and not the 0.75 an earlier draft
+    used, since 0.75 passes that mutation. Recorded because a test nobody watched fail is not
+    evidence, and because the three do not land on the same assertion.
     """
     unpaced, unpaced_elapsed, unpaced_waits = await _echo_run()
     assert unpaced == [True] * _ECHOES, "the control arm could not associate; the fixture is broken"

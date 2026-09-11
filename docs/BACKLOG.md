@@ -30570,18 +30570,27 @@ spuriously slow control buys a proportionally lower rate and a proportionally la
 sides move together. Simulated across a hundredfold swing in the paced arm's speed relative to the
 control, the ratio never fell below 4.03.
 
-### Three mutations, and they do not land on the same assertion
+### Four mutations, and they do not land on the same assertion
 
 | Mutation | What fires | Result |
 | --- | --- | --- |
 | `_pace_association` returns before it consults the bucket | decision arm | RED: "decided on 0 wait(s) where the schedule says 4" |
 | `EVT_CONN_OPEN` handler never registered | decision arm | RED, same message |
-| `_stopping.wait(0.0)` -- the wait is asked for and not taken | wall-clock arm | RED: paced 0.187 s against a 0.806 s floor |
+| `_stopping.wait(0.0)` -- asked for, not taken | wall-clock arm | RED: paced 0.187 s against a 0.806 s floor |
+| `_stopping.wait(wait * 0.5)` -- asked for, halved | wall-clock arm | RED: paced 9.441 s against a 10.971 s floor, that is 0.86 |
 
-The third is why both arms are kept: the decision arm passes it, recording four waits, and only the
-wall clock sees that none was honoured. Each mutation was applied and restored; the first was also
-run under load, three times, where it reds by a wider margin because the derived rate falls with the
-runner.
+The last two are why both arms are kept: the decision arm passes both, recording four waits, and only
+the wall clock sees that the waits were not honoured. Each mutation was applied and restored; the
+first was also run under load, three times, where it reds by a wider margin because the derived rate
+falls with the runner.
+
+**The fourth is also why `_PACED_MARGIN` is 0.95.** An earlier draft used 0.75, which an adversarial
+pass showed was far too loose: the paced arm's own work hands the comparison `floor / 4` for free, so
+at 0.75 pacing need only supply about 60 percent of what it honestly supplies. Measured: the halved
+wait lands at 0.86 of the floor, so 0.75 passes it and 0.95 reds it. The slack bought nothing in
+return, because the floor is exact bucket arithmetic rather than a measurement -- the honest arm ran
+1.03 to 1.21 times the floor across nine runs, quiet and loaded -- and an `Event.wait` returns LATE
+on Windows, never early (0 of 240, `tests/_pace_probe.py`).
 
 ### The load arm is what settles the original defect
 
@@ -30692,6 +30701,29 @@ recorder does not transfer unchanged, but the shape does.
 produce genuinely different schedules, and a helper parameterised over both is a larger abstraction
 than either caller needs. If a shared thing is built, build the probe, because it makes the wall
 clock irrelevant at every site instead of calibrating against it at every site.
+
+### The alternative structure this work considered and did not ship, recorded for whoever builds the probe
+
+#1536 derives its rate from a control arm, so its wall time scales with the runner: about
+`_SEPARATION` times the control, which measured 0.9 s quiet, about 5.3 s on the CI leg that went red,
+and 12 to 16 s under 24-way oversubscription.
+
+A judged design avoided that by making the debt an **input** rather than the outcome of a contest
+between refill and work: hand-charge a known number of tokens into the bucket immediately before the
+run, at a fixed rate, so the owed wait is a constant the test states rather than a quantity it has to
+infer. Wall time then does not scale with the runner at all. The existing
+`test_stop_releases_an_outstanding_pacing_wait` already hand-charges a live SCP, so the precedent is
+in this file.
+
+Two cautions that came with it. The SCU-side interval from charge to first accept is exactly
+erosion-immune, because the bucket drains at one second per second whatever the dispatch costs, so it
+is the STRONGER of the two available assertions rather than the weaker; and the recorded wait
+magnitude degrades one-for-one with any delay between the charge and the first connect, which argues
+for charging inside the SCU worker thread rather than on the event loop.
+
+It was not shipped in #1536 because that fix was already measured across four mutation arms and a
+load arm, and the wall time it trades away is about 0.2 percent of a test step. It is the better
+starting point here, where four sites are being rewritten at once and none of them is red.
 
 ### One documentation gap found alongside, worth folding in
 
