@@ -34177,3 +34177,82 @@ A configuration file records what is **possible**, never what is **practised**, 
 **Duplicate search.** #1250 carries decision 2 and is the only item that names a stub. #1751 is the other #1250 blocker and concerns shared numbers between the two ledgers. #1754 is the sibling filed alongside this one and concerns the allocator rather than the stub. ADR 0160 sets the public-repository content policy and is the document a stub's wording would have to satisfy. Searched `stub`, `blank_issues_enabled`, `ISSUE_TEMPLATE`, `GitHub Issues`, `contributor`, `decision 2`.
 
 **Source.** Dispatched as a brief naming the gap. The issue and pull-request counts, the shared-sequence arithmetic, the vault comparison and the three configuration files were measured by the filing seat on 2026-09-12. No findings report was written; this item is the record.
+
+## 1756. the vault CI docs-only short-circuit skips the ledger structure test on exactly the PRs that edit the ledger, and the move makes the vault the ledger's only home
+
+> 🔢 **Filed 2026-09-12 from a read of both repositories' `.github/workflows/ci.yml` at `origin/main`. Open; not started. FUTURE-CONDITIONAL -- nothing is broken today; this fires once #1250 makes the vault the ledger's only home.** Value **6/10**, Difficulty **2/10**. The vault's `test` job takes `needs: changes` for a docs-only short-circuit: on a pull request touching only `docs/`, `changes.outputs.code == 'false'` and the install, lint, type-check and pytest steps all skip while the required context still reports green, in seconds. **Exactly one step in that job is deliberately ungated** -- `Ledger gate (ADR / BACKLOG number space)`, whose own comment explains that an ADR-only pull request is by definition docs-only, so gating it would skip it on precisely the changes it polices. **The protection therefore splits in two and only half survives.** The number-space gate runs; the structure test that catches a malformed banner, an item declaring two statuses or a conflicted ledger does not, because it is reachable only through pytest. **The engine closed this same gap in August with two ungated steps of its own. The vault never received them.**
+> Verdict: build
+> Research: none outstanding on the mechanism; both workflows were read at `origin/main` on 2026-09-12
+> Closing-act: a CI change in the vault, plus a floor constant the vault does not yet carry
+
+**Cluster:** Ledger / CI gating. **Priority:** P2, matching #1250, which this rides with. **Verdict:** build (small).
+**Severity:** no deployment axis (§0). The exposure is a malformed ledger merging green -- a bad banner, an item declaring two statuses, a duplicated field, an unresolved conflict -- in the repository that would by then be the ledger's only home.
+
+### The split, read out of the vault's own `test` job
+
+Every step in that job carries the same condition except one. The table is the whole finding.
+
+| step | `if:` | runs on a docs-only PR |
+| --- | --- | --- |
+| `Ledger gate (ADR / BACKLOG number space)` | `runner.os == 'Linux'` | **yes** |
+| `Install Qt offscreen system libraries` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Set up uv` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Install project` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Lint (ruff)`, `Format check (ruff)` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Type-check (mypy)`, both platforms | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Web console tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+
+The ledger gate runs `python scripts/hooks/ledger_check.py --ci` and needs only git and stdlib python, which is why it costs seconds and why leaving it ungated was free.
+
+The structure check is a different program. The vault already carries **both** `scripts/docs/backlog_status_check.py` and `tests/test_backlog_status_check.py` on `origin/main`, from an earlier slice of the #1250 port. Neither is invoked by anything outside `pytest`, and `pytest` is in the gated column. **The file is present and the check is unreachable on the one change shape that needs it.**
+
+### The engine already fixed this, twice, and that changes what the fix is
+
+This is the part the finding turns on, because it means the remedy is a port rather than a design.
+
+The engine's `test` job carries **three** steps that run on a docs-only pull request, not one:
+
+1. `Ledger gate (ADR / BACKLOG number space)` -- the same step, same condition.
+2. `Backlog status invariant (ungated -- see above)`, `if: runner.os == 'Linux'`, running `python scripts/docs/backlog_status_check.py --min-items 300`. This is the structure check invoked through its own CLI, so it inherits the ledger gate's cost profile exactly: no install, git and stdlib only.
+3. `Doc guards (ungated -- the docs-only blind spot; see above)`, conditioned `runner.os == 'Linux' && needs.changes.outputs.code != 'true' && github.event_name == 'pull_request'` -- that is, it fires **only** on the docs-only PRs the gated steps skip. It runs `pytest -q -rs` over a named list of **21** modules, and `tests/test_backlog_status_check.py` is one of them. A preceding `Install (minimal -- for the doc guards on a docs-only PR)` step, under the same condition, installs `-e ".[dev]" --constraint constraints.lock`.
+
+The engine's workflow records why each was added, and both reasons are incidents rather than theory. Step 2 came from **2026-08-01**: a docs-only pull request added a `#320` entry whose banner used a glyph the invariant does not accept, went green in seconds without compiling the suite, merged, and reddened `main` for every other session. Step 3 came from **2026-08-04**, when four docs-only pull requests merged with none of the ten document guards running, and it **recurred on 2026-08-11** when the curated list turned out not to name `tests/test_dast_claims.py`.
+
+### What the move would undo
+
+#1250 moves both ledger files to the vault. After that the vault is the only place a `## N.` heading exists, so it is the only place a ledger defect can be introduced -- and the vault's CI is the August engine, before either fix.
+
+Stated as the shape of the regression rather than as a present fault: **the protection would not be lost to a bug, it would be lost to a relocation.** Nothing in the vault breaks, nothing in the engine breaks, and no check anywhere reports that a guard stopped covering the file it guards. The engine keeps two ungated steps over a ledger it no longer holds; the vault holds the ledger with one.
+
+The engine's own comment names the residual hazard that survives even a complete port: the doc-guards list is a **curated allowlist**, and a green run never says "a guard exists that I did not run." That is what let the 2026-08-11 recurrence through. A vault port inherits it.
+
+### What the port costs, stated honestly
+
+The two engine steps do not cost the same, and collapsing them into one recommendation would misprice the work.
+
+- **The CLI invocation is effectively free.** `backlog_status_check.py` imports only `argparse`, `re`, `sys` and `pathlib` and has its own CLI, so an ungated `python scripts/docs/backlog_status_check.py --min-items N` step needs no install and sits beside the ledger gate at the same cost. This is the recommended first slice.
+- **The pytest lane is not free.** It needs a Python install where the ledger gate needs only git and stdlib. In the engine that is a minimal `[dev]` install rather than the full extras set, and `[dev]` specifically because `pyproject` sets `asyncio_mode = "auto"` and a `--timeout` addopt, so a bare `pip install pytest` errors on an unknown option before collecting anything.
+- **A floor has to be chosen, and it lives in two places.** The engine passes `--min-items 300` in the workflow and pins `_MIN_TOTAL_ITEMS = 300` in the test, and its own comment warns that nothing compares the two, so the lower one becomes the only floor that binds. The vault's copy of the test carries **no** floor constant today, so a port that adds the CLI step without one adds a check that a shrinking corpus satisfies.
+
+Recommended, and offered as a recommendation rather than a decision: ungate the structure check in the vault the same way the ledger gate is already ungated, taking the CLI slice first because it is free, and treat the doc-guards lane as a separate decision with its own install cost.
+
+### A correction to the framing this item was dispatched with
+
+Recorded because the wrong version is the more quotable one and would propagate.
+
+The engine's `scripts/docs/backlog_status_check.py` carries an in-file comment saying the gate runs "UNGATED on every pull request including docs-only ones". **In the engine that sentence is true of both halves**, not just the number-space gate: the CLI step is ungated and the pytest module rides the ungated doc-guards lane. The same comment already qualifies itself, noting that the pytest guard "rides a lane that a curated allowlist could silently drop it from."
+
+It is the **vault** where that sentence would be true of the gate and false of the test, and the ported copy on the open PR 1497 branch already says so in its own words, ending with a warning not to read the engine's paragraph as cover for the vault. The value this item adds over that comment is that a comment in a file is not a tracked row: nothing schedules it, and the port that carries it can merge without the CI change it describes.
+
+### What was NOT verified
+
+- No CI run was observed. The gating was read out of both workflow files at `origin/main`; a source read shows which branch exists, not that a given run took it. No skipped-step log from a real vault docs-only pull request was pulled.
+- The vault's `changes` job allowlist was read as allowlisting `^docs/`; the exact filter was not exercised against a sample changed-file list, so "a PR touching only `docs/BACKLOG.md` sets `code=false`" is taken from the filter's own comment rather than from a run.
+- Whether the vault's copy of `tests/test_backlog_status_check.py` would pass unchanged against the vault's ledger was not run. The port is mid-flight.
+- The engine's 2026-08-01, 2026-08-04 and 2026-08-11 incidents are quoted from the engine workflow's own comments. The pull requests named there were not opened and read.
+- Nothing was changed in either repository. This item is a filing.
+
+**Duplicate search.** #1250 is the move this rides with and carries the phase plan. #1754 and #1755 are its other two filed gaps and concern the allocator and the public stub; neither touches CI gating. #1470 concerns the ledger gate's fetch depth, which is the same step and a different failure. Searched `docs-only`, `changes.outputs.code`, `Ledger gate`, `backlog_status_check`, `DOC_GUARDS`, `short-circuit`, `min-items`.
+
+**Source.** Found during the vault status-checker port, PR 1497 on `wshallwshall/MessageFoundry-vault`, which was **open** when this was filed and touches only the two ported files, not `ci.yml`. Both workflows, both copies of the status checker, the vault's ported test file and the engine's doc-guards list were read at `origin/main` by the filing seat on 2026-09-12. No findings report was written; this item is the record.
