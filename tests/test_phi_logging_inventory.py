@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural drift guard for the ``docs/PHI.md`` §7 logging inventory (ASVS 16.1.1 / 16.2.3).
 
 16.1.1 scores the *inventory itself*: "all logs are inventoried, recording what events are logged, the

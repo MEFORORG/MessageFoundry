@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Centralized field-level (property) authorization for API responses (WP-9; ASVS 8.1.2 / 8.2.3).
 
 Some response properties carry PHI — the patient-identifying ``summary``, and exception text

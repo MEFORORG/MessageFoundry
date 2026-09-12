@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Self-fencing leadership lease (Workstream A2) — the always-run unit tests (no DB needed).
 
 These prove the active-passive leadership primitive without a real Postgres, against an in-memory

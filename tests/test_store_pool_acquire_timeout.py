@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1052 (ASVS 13.2.6) — every store pooled-connection borrow is BOUNDED.
 
 ``[store].connect_timeout`` bounds the login and ``[store].command_timeout`` the statement. Neither

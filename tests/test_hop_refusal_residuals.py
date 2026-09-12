@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#200 (ADR 0092) DEFERRED residuals — the posture-keyed transport-hop refusal extended to the paths
 the core shipment left OPEN:
 

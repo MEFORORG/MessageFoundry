@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The honesty gate for the DAST tier (ADR 0155), inside the required test legs.
 
 WHY THIS EXISTS AS CI RATHER THAN CONVENTION. ``docs/Secure_Build_Standards.md`` grades independent

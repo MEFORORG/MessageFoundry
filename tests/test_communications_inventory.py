@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.1.1 / 13.1.2 / 13.1.3 drift guard: the communications inventory in
 ``docs/ASVS-L2-PHASE0-CHANGES.md`` §5 and the resource-management tables in
 ``docs/CONNECTIONS.md`` must stay complete and true at HEAD.

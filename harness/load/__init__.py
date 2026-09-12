@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Headless, asyncio load-testing engine for the MessageFoundry engine.
 
 A separate, **Qt-free** layer of the test harness (sibling to :mod:`harness.scenarios`) that drives

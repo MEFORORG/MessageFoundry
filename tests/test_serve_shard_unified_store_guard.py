@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ADR 0063 no-split-store guard is reachable from the `serve --shard` entrypoint (BACKLOG #1112).
 
 ``require_unified_store`` refuses a >1-engine-shard config on a single-file store. It had exactly two

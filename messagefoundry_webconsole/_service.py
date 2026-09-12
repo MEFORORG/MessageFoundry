@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The console's own :class:`AuthService` provider dependency.
 
 A trivial re-implementation of ``api.auth_routes._service`` (get + enabled-check reading

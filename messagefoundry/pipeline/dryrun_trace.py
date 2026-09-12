@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Traced dry-run: a ``sys.settrace`` observer around the Router/Handler run (ADR 0072).
 
 This wraps the **existing** dry-run path (:func:`messagefoundry.pipeline.dryrun.dry_run`) with a

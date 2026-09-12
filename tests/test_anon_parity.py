@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Engine ↔ tee parity (ADR 0030 §1): the shared logic files stay byte-identical, the vendored pools
 + leak tokens stay in lockstep with their sources, and the two re-encoders produce identical output
 on a golden corpus (the divergence guard the design depends on)."""

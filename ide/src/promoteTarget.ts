@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure (vscode-free) target resolution for Stage → Promote. Separated from promote.ts so the
 // "which engine URL does (environment, shard-pick) resolve to?" decision is unit-testable without
 // launching the Extension Host.

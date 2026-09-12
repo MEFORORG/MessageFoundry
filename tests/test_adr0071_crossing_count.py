@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 (B5) §6.1 crossing-count control — a LIVING Windows gate.
 
 Turns the ADR's A0/A1 driver-constant crossing-count control (§6.1: "with the driver held

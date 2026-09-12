@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Session mail, section 8: SHOWING IS NOT CONSUMING.
 
 Split out of ``test_session_mail.py`` (see ``_session_mail_harness``) so the two halves schedule on

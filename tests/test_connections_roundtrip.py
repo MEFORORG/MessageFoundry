@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#234 — connections.toml writer parity: every key the READ schema (`connections_file.py`
 `_INBOUND_KEYS`/`_OUTBOUND_KEYS`) accepts must survive the GUI/CLI writer (`connections_edit.py`).
 

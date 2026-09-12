@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0015 — WS-* SOAP outbound (mutual-TLS client cert + WS-Security / WS-Addressing).
 
 Covers: the client-cert opener + opener-selection precedence, header-stamping purity (the

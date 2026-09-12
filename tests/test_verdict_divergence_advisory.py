@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin that the verdict-divergence scan REPORTS and cannot GATE (BACKLOG #1342).
 
 ``scripts/docs/verdict_divergence_check.py`` was a working detector that ran nowhere. It reports an

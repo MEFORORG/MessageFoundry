@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live document-handle helpers (#149, ADR 0105 Phase 0). A very-large document detached from a message
 is replaced in place by a small ``mfdoc:v1:ref:<sha256>:<content-type>`` handle — a LIVE sibling of the
 ``mfdoc:v1:pruned:`` tombstone (#47), unified with #94's opaque-pointer contract. These helpers are pure

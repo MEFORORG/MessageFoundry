@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The SQL Server pool must own a thread pool wide enough for every connection in it.
 
 THE DEFECT THIS PINS. aioodbc runs every pyodbc call through

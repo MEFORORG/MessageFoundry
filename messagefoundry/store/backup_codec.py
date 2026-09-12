@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``.mfbak`` chunked AES-256-GCM archive codec (ADR 0049, #60 — DR backup at rest).
 
 The DR backup writes the consistent SQLite snapshot + the loaded config bundle as a single tar

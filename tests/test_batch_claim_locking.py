@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0058 — server-DB locking + failover cases (T6, T9). Gated on a real SQL Server / Postgres.
 
 **T6 (no-READPAST / #285 — locked head BLOCKS, never skips)** is the PR-blocking #285 gate:

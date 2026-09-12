@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Group-scoped structural editing (Tier 2.1): the SegmentGroup view over Message.
 
 An ORU carries a header (MSH/PID) followed by repeating OBR order groups, each owning its OBX

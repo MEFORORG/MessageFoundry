@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """End-to-end smoke + store connectivity — proves the deployment actually works on this box.
 
 * ``self``  — route a synthetic HL7 through the box's *real* config via :func:`dry_run` (no store, no

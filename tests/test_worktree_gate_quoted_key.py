@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1069: a QUOTED disarm key was blanked before rule 3c could see it.
 
 ``Get-ScannableSegments`` builds each segment's ``Scan`` through ``Remove-QuotedSpans``, which blanks

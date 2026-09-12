@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 7.2.4 — the SERVICE-level rotation primitive, above the store contract.
 
 ``tests/_session_rotation_contract.py`` pins the store op on all three backends. This pins the layer

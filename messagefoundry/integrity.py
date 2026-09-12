@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Startup self-attestation of the installed engine wheel — a runtime tamper tripwire.
 
 ADR 0041 (D3). ADR 0036 guards the **config dir** (an unauthorized writer can't drop a ``.py`` that

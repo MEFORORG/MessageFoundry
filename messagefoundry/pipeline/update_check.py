@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No-network MessageFoundry version-update check (#30, ADR 0026 §1).
 
 The MVP — and the only thing built — is a passive, **zero-egress** "pinned-vs-current" diff: it compares

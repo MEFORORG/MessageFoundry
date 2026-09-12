@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Process-wide logging setup for the engine service.
 
 Stdlib ``logging`` only (no structlog): a stdout stream handler with a timestamped text format by

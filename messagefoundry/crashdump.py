@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Process-level Windows crash-dump suppression for the engine (ADR 0152, Phase 0).
 
 **Why this exists.** A Windows Error Reporting (WER) crash dump of a running engine is a *full PHI

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Embedded-document strip result + per-connection cutoff resolution (#47, ADR 0042).
 
 The in-place embedded-document strip (a sibling to ``purge_message_bodies``, ADR 0042 D2) is a

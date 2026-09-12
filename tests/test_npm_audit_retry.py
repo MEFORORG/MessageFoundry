@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``npm audit`` must retry a transport failure, and must never pass without a verdict.
 
 THE DEFECT THIS EXISTS FOR. ``npm audit`` exits non-zero BOTH when the advisory database reports a

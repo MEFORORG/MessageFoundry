@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Opt-in **strict** X12 validation — the slow tier behind the tolerant ``X12Peek``/``X12Message`` hot
 path (ADR 0012, BACKLOG #32), mirroring how :mod:`messagefoundry.parsing.validate` (hl7apy) sits behind
 the python-hl7 peek for HL7 v2.
