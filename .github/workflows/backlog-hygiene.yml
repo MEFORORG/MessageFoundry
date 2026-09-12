@@ -266,8 +266,23 @@ jobs:
       - name: Every backlog citation this PR adds must name the file its item lives in
         env:
           # Hoisted, never interpolated into the script body (zizmor: template injection).
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          #
+          # THE merge_group FALLBACK IS LOAD-BEARING, NOT DEFENSIVE. This job runs on `merge_group`
+          # too, and there every `github.event.pull_request.*` field is NULL. Both SHAs therefore
+          # arrived EMPTY on every queue entry, `""..""` resolved to `HEAD...HEAD`, the checker read
+          # zero files, and this REQUIRED context went green over a check it never performed.
+          # Measured on the live queue run for PR 1050 at 2026-09-11T20:53:12Z: "scanned: ... 0 in
+          # 0 file(s)", then "OK", exit 0.
+          #
+          # Unlike the first step, this one's question DOES have a subject in a merge group: the
+          # group commit adds lines, and an added citation is exactly what this gate reads. So the
+          # header's "no subject in a merge group" reasoning covers step one and not this step.
+          # `merge_group.base_sha` is a real field and is already relied on at security.yml:708.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
+          # The checker now REFUSES an empty --base/--head with exit 2 rather than scanning nothing
+          # and reporting OK, so a future event type that carries neither field fails loudly here
+          # instead of passing silently. Do not "fix" such a failure by defaulting the SHAs.
           python3 scripts/docs/backlog_citation_check.py --base "$BASE_SHA" --head "$HEAD_SHA"
