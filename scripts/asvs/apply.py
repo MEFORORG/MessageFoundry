@@ -22,12 +22,30 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+# The sibling verifier, imported by PATH rather than as a package: `scripts/asvs` has no
+# `__init__.py`, and the vault runs these tools as bare scripts from its own working directory.
+# Inserting this file's own directory is what makes `import scorecard` resolve there as well as
+# here -- the same line, for the same reason, as `anchor_provenance.py` and `anchor_report.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from scorecard import repo_stamp  # noqa: E402
+
 VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
+
+#: How many cells one payload may write WITHOUT naming them in `--scope` (BACKLOG #1476).
+#:
+#: A POLICY NUMBER RATHER THAN A MEASUREMENT, and saying so beats inventing a derivation for it.
+#: What it is for is the gap between what a write SAYS and what it DOES: the incident behind #1476
+#: announced one cell in its subject and changed most of the record. The exact rung matters far less
+#: than the property -- a write big enough to hide a revert cannot happen until somebody types the
+#: ids. A legitimate whole-file re-verify is still available; it just has to say so.
+_SCOPE_CEILING = 10
 
 #: The banner alphabet and the general emoji planes. CLAUDE.md section 11 bans these in prose; the
 #: only sanctioned holdout is docs/BACKLOG.md, which this file is not. Fail closed rather than
@@ -113,13 +131,43 @@ _SUBTABLES = ("evidence", "absence")
 #: name-keyed fix satisfies the symptom and drops the next field anyone adds" -- and that objection
 #: is right and applies here too. Deriving means a new sub-table brings its own control with it and
 #: this line never changes, while a hand list would rot exactly as the docstring predicts.
+#:
+#: The derivation above covers the `retired_{sub}` FAMILY and nothing else, which is the whole of
+#: what a derivation can reach. The constant below is the second source, for a control that belongs
+#: to no family.
+
+
+#: A control the `_SUBTABLES` derivation cannot reach, because it is not one of a family.
+#:
+#: NAMING IT IS CORRECT HERE AND IS NOT A RELAPSE INTO THE LIST `_carried` REJECTS, because the two
+#: lists fail in opposite directions. A name list governing DATA loses the next field anyone adds,
+#: silently and forever, and an absent field reads as a valid default -- that is the 7818991d
+#: incident. A name list governing CONTROLS fails by keeping one key too many: the control is simply
+#: persisted, which is visible in the record, readable by anyone who opens it, and recoverable on
+#: the next write. Cheap and loud against expensive and silent.
+#:
+#: `anchor_repair` was the one it missed. The same function consumes it as an instruction -- it
+#: relaxes the glyph and `reviewed_by` guards for exactly one run -- and nothing reads it back, so it
+#: sat in the record FREEZING the cell: a later ordinary residual correction, authored from the live
+#: cell and therefore carrying the flag forward, is refused with "declared anchor_repair but
+#: 'residual' differs from the record". That is the #1333 freeze shape, reintroduced through a
+#: persisted control.
+_NAMED_CONTROLS = ("anchor_repair",)
+
+#: The field the writer records INSTEAD, so consuming the instruction does not destroy the evidence.
+#: `anchor_provenance._repairs_declared` counts cells that declare a repair and its docstring says
+#: nothing else in the record marks one. That reader is why this exists: plain data, carrying the
+#: date of the pass, read as an instruction by nothing.
+_REPAIR_WITNESS = "anchor_repaired_at"
+
+
 def _control_keys() -> tuple[str, ...]:
     """Computed on EVERY call, deliberately, so the derivation is a live property rather than a
     snapshot. A module-level constant holding the same tuple is byte-identical in behaviour today and
     silently stops tracking `_SUBTABLES` the moment anyone edits it -- which is precisely the rot
     `_carried`'s docstring warns a name list invites. A mutation run proved that: a hand-written
     literal matching today's value passed every test, because there was no behaviour to differ on."""
-    return tuple(f"retired_{name}" for name in _SUBTABLES)
+    return tuple(f"retired_{name}" for name in _SUBTABLES) + _NAMED_CONTROLS
 
 
 #: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
@@ -217,7 +265,35 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # listed (BACKLOG #1369). Without it a retirement declaration is consumed at :468 and then written
     # back into the record, where nothing reads it -- the instruction outliving the operation.
     _controls = _control_keys()
-    for key, value in {**(live or {}), **cell}.items():
+    merged = {**(live or {}), **cell}
+    # THE INSTRUCTION IS CONSUMED; THE FACT IT RECORDED IS KEPT (BACKLOG #1369). Dropping
+    # `anchor_repair` un-freezes the cell, and it would also destroy the only thing in the record
+    # saying a repair ever happened -- `anchor_provenance._repairs_declared` counts exactly that, and
+    # its docstring says nothing else marks one. So the control leaves as DATA: same evidence,
+    # carrying a date, read as an instruction by nothing.
+    #
+    # BOTH PATHS, AND THE SECOND ONE IS THE MIGRATION. The first version of this wrote the witness
+    # only when the PAYLOAD declared a repair, which is the rarer path and not the one the record
+    # travels. A cell already carrying a PERSISTED `anchor_repair` is normally rewritten by an
+    # ordinary payload that declares nothing -- precisely the "comes clean as it is written" route
+    # the strip depends on -- and the control was stripped there with no witness written at all.
+    # Measured before the fix, one variable between two arms: an undeclaring payload took
+    # `_repairs_declared` from 1 to 0, exit 0, nothing printed; a declaring one kept it. So the fix
+    # for #1369 quietly decayed the single counter it was chosen to preserve, on the exact path the
+    # banner advertises as the migration. Silent, green, and in the direction that looks like success.
+    #
+    # PRECEDENCE, because the two paths carry different dates and clobbering is not symmetric:
+    #   1. the PAYLOAD declares a repair -- a fresh, dated event, so it WINS and overwrites;
+    #   2. otherwise the LIVE cell carries the legacy control -- a migration, so the witness takes
+    #      the date the record ALREADY held for that cell, and FILLS ONLY. An existing
+    #      `anchor_repaired_at` on either side is newer evidence than a legacy flag with no date of
+    #      its own, so it is never overwritten by this branch.
+    # A cell that was never repaired matches neither, so this cannot manufacture a witness.
+    if cell.get("anchor_repair"):
+        merged[_REPAIR_WITNESS] = str(cell.get("last_verified", ""))
+    elif (live or {}).get("anchor_repair") and not merged.get(_REPAIR_WITNESS):
+        merged[_REPAIR_WITNESS] = str((live or {}).get("last_verified", ""))
+    for key, value in merged.items():
         if key in _ORDERED or key in _SUBTABLES or key in _controls:
             continue
         out.append(_scalar(key, value))
@@ -287,12 +363,96 @@ def main(argv: list[str] | None = None) -> int:
             "stated purpose was mechanical."
         ),
     )
+    ap.add_argument(
+        "--allow-stale-clone",
+        action="store_true",
+        help=(
+            "write even though the clone holding --scorecard reads BEHIND or DIVERGED. Refused by "
+            "default: a write from a stale base re-renders every cell landed since that base back "
+            "to its old value, and the payload cannot show you that."
+        ),
+    )
+    ap.add_argument(
+        "--scope",
+        default=None,
+        help=(
+            "comma-separated cell ids this run is allowed to write. The payload's ids must match "
+            "EXACTLY: an id the payload writes and the scope does not name is refused, and so is "
+            f"one the scope names and the payload does not carry. Required above {_SCOPE_CEILING} "
+            "cells, which is how a whole-file re-render says it is one."
+        ),
+    )
     args = ap.parse_args(argv)
     allow_verdict_change = args.allow_verdict_change
     allow_retirement = args.allow_retirement
     SCORECARD = args.scorecard
     payload = json.loads(args.payload.read_text(encoding="utf-8"))
     dry = not args.apply
+
+    # WHERE THE RECORD IS, NOT ONLY WHAT THE PAYLOAD SAYS (BACKLOG #1476). A targeted edit written
+    # from a clone whose base predates other sessions' landed cells re-renders those cells back to
+    # their old values. It has fired: a vault commit whose subject named one cell reverted an
+    # owner-approved repair on an unrelated one, byte-identically to the pre-repair state, and stood
+    # three days. No guard in this file could see it, because nothing was wrong with the payload --
+    # the writer faithfully rendered a value it should never have been holding. So ask the clone.
+    #
+    # MEASURED, AND NEVER SILENT WHEN IT CANNOT MEASURE. `repo_stamp` is a pure local read -- no
+    # fetch, no network -- so a clone that has not fetched in a week can read CURRENT and still be
+    # stale. That is exactly why `remote-knowledge` is printed beside the verdict instead of being
+    # left out: BEHIND 0 from a six-hour-old fetch and from a one-minute-old fetch are different
+    # claims. The two states refused are the two that carry the defect; every other state --
+    # NO-GIT, NO-UPSTREAM, UNRESOLVED -- is REPORTED and allowed, because a guard that refuses on
+    # states that were never the problem is a guard someone disables, and this file already says so
+    # about the verdict-move refusal.
+    stamp = repo_stamp(SCORECARD)
+    where = (
+        f"{SCORECARD} is at {stamp.ref()}: freshness={stamp.freshness} "
+        f"upstream={stamp.upstream} remote-knowledge={stamp.remote_knowledge}"
+    )
+    if (
+        stamp.freshness.startswith("BEHIND ") or stamp.freshness == "DIVERGED"
+    ) and not args.allow_stale_clone:
+        # REFUSED ON A DRY RUN TOO. A dry run from a stale clone reports a clean, plausible,
+        # wrong plan -- the cells it would revert are not in the payload and so are not in the
+        # report -- and that report is what an operator reads before reaching for --apply.
+        print(f"REFUSING: {where}")
+        print(
+            "  A write from this base would re-render every cell landed since it back to its old "
+            "value. Pull the clone, rebuild the payload from the current record, and re-run. "
+            "--allow-stale-clone overrides."
+        )
+        return 1
+    print(f"  note: {where}")
+
+    # STATED SCOPE AGAINST CELLS WRITTEN (BACKLOG #1476). This writer only ever edits the spans of
+    # the cells the payload names, so comparing "named" against "changed" INSIDE it is vacuous --
+    # they are the same set by construction. The gap that is not vacuous is between the operator's
+    # intent and the payload they were handed: a generator that emits 298 cells under a one-cell
+    # heading produces a payload this tool has no reason to doubt. `--scope` is the independent
+    # channel that states the intent, so the two can disagree out loud.
+    payload_ids = [str(c.get("id")) for c in payload]
+    if args.scope is not None:
+        declared = {s.strip() for s in args.scope.split(",") if s.strip()}
+        written = set(payload_ids)
+        unscoped, unwritten = sorted(written - declared), sorted(declared - written)
+        if unscoped or unwritten:
+            print("REFUSING: the payload's cells do not match the declared scope.")
+            # BOTH DIRECTIONS, NAMED SEPARATELY. Writing a cell nobody declared is the #1476 shape;
+            # declaring one the payload does not carry means the payload is not what its author
+            # thinks it is, which is the same mistake one step earlier.
+            if unscoped:
+                print(f"  written but NOT in --scope: {unscoped}")
+            if unwritten:
+                print(f"  in --scope but NOT written: {unwritten}")
+            return 1
+    elif len(payload_ids) > _SCOPE_CEILING:
+        print(
+            f"REFUSING: this payload writes {len(payload_ids)} cells and states no scope "
+            f"(the unstated ceiling is {_SCOPE_CEILING}). A write this size must name its cells: "
+            "re-run with --scope <id>,<id>,... A whole-file re-verify is allowed and this is how "
+            "it says so."
+        )
+        return 1
 
     live_text = SCORECARD.read_text(encoding="utf-8")
     live_cells = {x["id"]: x for x in tomllib.loads(live_text)["cell"]}
@@ -306,6 +466,25 @@ def main(argv: list[str] | None = None) -> int:
         # record that was not already in it, and an existing empty `reviewed_by` is preserved rather
         # than invented. Any difference in verdict or residual takes it out of this mode immediately.
         anchor_repair = bool(c.get("anchor_repair"))
+        if live.get("anchor_repair"):
+            # GATED ON THE RECORD, NOT ON THE PAYLOAD, and that is the whole correction. Gating on
+            # both meant the note fired only where the flag was ALSO declared -- the rare path -- and
+            # stayed silent on the ordinary rewrite, which is the one that actually migrates the
+            # cell. A conversion the operator never sees is a conversion nobody can check.
+            print(
+                f"  note: {c.get('id')} carries a PERSISTED anchor_repair in the record "
+                f"(BACKLOG #1369). This write strips the control and records {_REPAIR_WITNESS} in "
+                "its place, so the repair stays countable."
+            )
+            if anchor_repair:
+                # The extra half, only where it applies: the cell is FROZEN while the flag is set,
+                # and the freeze is invisible from the payload's side, because a payload authored by
+                # echoing the live cell carries the flag forward without anyone choosing it.
+                print(
+                    "        The payload ALSO declares it. If that was an echo of the live cell "
+                    "rather than a fresh repair, drop it and re-run -- while it is set, every "
+                    "prose field must stay byte-identical or this run refuses."
+                )
         if anchor_repair:
             # Assert byte-identity on EVERY prose-bearing field, not just the two the glyph check
             # reads. Holding only verdict+residual was sound by argument -- the writer never rewrites
@@ -437,9 +616,45 @@ def main(argv: list[str] | None = None) -> int:
     # a resolution check, because fewer anchors that all resolve is a passing state.
     for c in payload:
         was, now = live_cells[c["id"]], by_id[c["id"]]
-        lost = set(was) - set(now)
+        # A SUB-TABLE KEY THAT VANISHED BECAUSE ITS LIST WAS EMPTIED IS NOT A DROPPED KEY, and telling
+        # those two apart is the whole of BACKLOG #1363 (re-filed independently as #1484). `render()`
+        # emits no block for an empty list, so a FULL-LIST retirement loses the key on the round-trip
+        # and this pure key-set difference refused it -- sixty lines before the code that AUTHORISES a
+        # retirement is ever read. Measured both ways before the fix, with the flag, the declaration
+        # and the arithmetic all held constant: evidence 2 -> 1 exited 0 and wrote the file, absence
+        # 1 -> 0 exited 1 on "would LOSE field(s) ['absence']" and never printed RETIRING.
+        #
+        # THIS EXCUSES; IT DOES NOT AUTHORISE. The declaration and the arithmetic stay exactly where
+        # they are, in the retirement branch below, which is the only place that knows `before` and
+        # `after` and can refuse a declaration that fails to account for every removed entry. All this
+        # set does is stop the key-set guard answering FIRST, and only on the state that branch is
+        # about to examine: the flag is set AND the payload declares a retirement for THAT sub-table.
+        # Undeclared, or without the flag, the key stays in `lost` and refuses here exactly as before.
+        # That asymmetry is what #1363 says any fix must preserve -- a bare reordering of the two
+        # checks converts a loud false refusal into a quiet always-pass, which is worse than the bug.
+        #
+        # A CONTROL KEY ALREADY IN THE RECORD IS LIKEWISE NOT A DROPPED FIELD (#1369). `render`
+        # consumes controls and declines to store them, so rewriting a cell that already carries one
+        # strips it BY DESIGN -- and without this exclusion the fix for #1369 would make every such
+        # cell PERMANENTLY UNWRITABLE by this tool, which is the same unwritability #1308 had to
+        # undo once already. The strip is the point: it is what lifts the freeze.
+        excused = {sub for sub in _SUBTABLES if allow_retirement and c.get(f"retired_{sub}")}
+        lost = set(was) - set(now) - excused - set(_control_keys())
         if lost:
-            print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
+            # Name the retirement route when the lost key is a sub-table. This refusal is otherwise
+            # unanswerable for the one legitimate way to reach it -- the operator is told a key
+            # vanished, not that the tool has a flag for exactly this -- and an unanswerable refusal
+            # is what turns a guard into a speed bump, which is the reasoning the verdict-move
+            # refusal above already states in full.
+            emptied = sorted(lost & set(_SUBTABLES))
+            route = ""
+            if emptied:
+                names = " and ".join(f"'retired_{s}'" for s in emptied)
+                route = (
+                    f" If that is a RETIREMENT, declare it in the payload as {names} and "
+                    "re-run with --allow-retirement"
+                )
+            print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}{route}")
             return 1
         # ...and the same question about the VALUE rather than the key (#1242). The check above is a
         # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
