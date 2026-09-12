@@ -9964,6 +9964,43 @@ class SqlServerStore:
             (scope_json, now, user_id),
         )
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the pyodbc
+        # IntegrityError that UNIQUE(username) would raise on a background pass.
+        #
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT -- see the mechanism in postgres.py's copy.
+        #
+        # THIS BACKEND FIRES HARDEST OF THE THREE. Measured, 120 concurrent pairs, autocommit,
+        # separate connections: 97 raise (81%) against PostgreSQL's 60%, with 23 guards holding. An
+        # earlier version of this comment guessed only that locking rather than MVCC would make the
+        # interleave "differ in shape"; that was right about the mechanism and wrong about the
+        # direction, if one expected locking to serialise it away the way SQLite's file-level writer
+        # lock does (store.py's copy).
+        #
+        # The class that surfaces is `pyodbc.IntegrityError`, whose MRO carries the literal name
+        # `IntegrityError`. The residual is absorbed at the call site (`_refresh_cached_username`) by
+        # MRO name, and that predicate was verified against all three real driver classes rather than
+        # assumed -- see its comment, which records why the test is on "Integrity" and not on
+        # "IntegrityError".
+        #
+        # NO COLLATION DIVERGENCE HERE, unlike get_user_by_directory_object_id above. An earlier
+        # version of this comment claimed one, by analogy with that method -- and the analogy is
+        # backwards. The two columns are declared differently in this file's own `_SCHEMA`:
+        #     username            NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE
+        #     directory_object_id NVARCHAR(256) NULL                        -- database default
+        # BIN2 is a BINARY collation, so `other.username=?` compares byte for byte on this backend
+        # exactly as it does on SQLite and PostgreSQL. The divergence is real for the id column and
+        # imaginary for this one, which is why the cross-backend case arm runs on all three.
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+            "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+            (username, now, user_id, username, user_id),
+        )
+
     async def set_user_federated_subject(
         self, user_id: str, issuer: str, subject: str, *, now: float | None = None
     ) -> None:

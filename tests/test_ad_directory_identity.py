@@ -32,6 +32,7 @@ from messagefoundry.auth.ldap import (
     LdapAuthenticator,
     _object_guid,
     normalise_object_guid,
+    object_guid_filter_value,
 )
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -524,13 +525,19 @@ async def test_the_recycled_holder_gets_their_own_row_once_the_name_no_longer_co
         await store.close()
 
 
-async def test_a_renamed_account_keeps_its_row_and_its_original_username() -> None:
-    """The state ``_upsert_ad_user``'s docstring devotes a paragraph to, pinned rather than described.
+async def test_a_renamed_account_keeps_its_row_and_takes_the_new_name() -> None:
+    """A directory-side rename keeps the row AND refreshes the cached username (BACKLOG #1532).
 
-    Before the binding, a directory-side rename resolved to nothing and minted a SECOND account, so
-    the person silently lost the uploads and presets keyed to the first. Now the id finds the row.
-    The stored username is NOT updated -- a display and audit label, not a key -- which is what leaves
-    ``reconcile_directory_sessions`` probing a name the directory no longer answers to.
+    **This test asserted the opposite until #1532, and the history is the point.** Before the
+    binding, a rename resolved to nothing and minted a SECOND account, silently orphaning the uploads
+    and presets keyed to the first. BACKLOG #1471 made the id find the row and left the stored name
+    as created -- which is what left ``reconcile_directory_sessions`` probing a name the directory no
+    longer answers to, revoking the renamed person's sessions on a loop. #1532 re-keyed that probe and
+    made the name follow the directory that owns it.
+
+    Both halves are asserted, because each alone would pass under a wrong implementation: the row must
+    not move (a fresh row would pass a name check), and the name must move (a stale name would pass an
+    id check).
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -544,9 +551,66 @@ async def test_a_renamed_account_keeps_its_row_and_its_original_username() -> No
         )
         assert renamed.ok and renamed.identity is not None
         assert renamed.identity.user_id == first.identity.user_id, "the rename minted a second row"
-        assert await store.get_user_by_username("jsmith-married") is None
-        row = await store.get_user_by_username("jsmith")
-        assert row is not None and row.id == first.identity.user_id
+
+        row = await store.get_user_by_username("jsmith-married")
+        assert row is not None, "the login did not copy the directory's new name down"
+        assert row.id == first.identity.user_id
+        assert row.directory_object_id == GUID_A_TEXT
+        assert await store.get_user_by_username("jsmith") is None, (
+            "the old name outlived the rename"
+        )
+        # ONE directory row, not two. The id-keyed resolve is what makes that true, and the count is
+        # the control: asserting only that the new name resolves would pass on an implementation that
+        # minted a second row and left the first behind. Counted over AD rows rather than every row,
+        # because ``initialize()`` provisions a LOCAL bootstrap administrator that is not the subject.
+        ad_rows = [u for u in await store.list_users() if u.auth_provider == AuthProvider.AD.value]
+        assert len(ad_rows) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_login_renamed_onto_a_taken_name_is_refused() -> None:
+    """A rename into a name another row holds is refused by #1471's guard, BEFORE #1532's refresh.
+
+    ``username`` is ``NOT NULL UNIQUE``, so one name cannot serve two rows. **On the LOGIN path the
+    collision never reaches the refresh**: ``_complete_ad_login`` reads the row holding the presented
+    name first, finds an id that disagrees with the presented one, and refuses. That ordering is
+    BACKLOG #1471's and #1532 deliberately did not change it -- proceeding would evaluate a login for
+    one directory account while a different account's row held the name.
+
+    **So the refresh's own collision branch is reached from the RECONCILER, not from here** -- that
+    pass has no such guard, because it probes an account it has already identified. Recorded because
+    the obvious reading is that both callers reach it, and a reader who believes that will look for
+    the login-path coverage this test says does not exist.
+
+    The cost is the residual BACKLOG #1471 already states: the renamed person cannot sign in until an
+    operator removes the stale row. Fail-closed, audited, and recoverable.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        mine = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert mine.ok and mine.identity is not None
+        squatter = await service._complete_ad_login(
+            _principal("jsmith-married", GUID_B_TEXT), None, mfa_verified=True
+        )
+        assert squatter.ok and squatter.identity is not None
+
+        # The directory now renames the FIRST account onto the name the second one holds.
+        out = await service._complete_ad_login(
+            _principal("jsmith-married", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert not out.ok and out.reason == "directory_identity_conflict"
+
+        # Neither row moved, and no third row was minted.
+        still_mine = await store.get_user_by_directory_object_id(GUID_A_TEXT)
+        assert still_mine is not None and still_mine.username == "jsmith"
+        other = await store.get_user_by_username("jsmith-married")
+        assert other is not None and other.id == squatter.identity.user_id
+        ad_rows = [u for u in await store.list_users() if u.auth_provider == AuthProvider.AD.value]
+        assert len(ad_rows) == 2
     finally:
         await store.close()
 
@@ -638,3 +702,245 @@ async def test_a_like_named_local_account_is_still_refused_before_the_identity_c
         assert not out.ok and out.reason != "directory_identity_conflict"
     finally:
         await store.close()
+
+
+# --- BACKLOG #1532: the id-keyed lookup the session reconciler probes with -------------------------
+
+
+def test_the_object_guid_filter_carries_the_little_endian_bytes_escaped() -> None:
+    """``objectGUID`` has OCTET STRING syntax, so a directory does not answer ``(objectGUID=<text>)``.
+
+    The filter carries the 16 raw bytes, each escaped ``\\hh`` (RFC 4515 section 3). The bytes are
+    ``bytes_le`` -- the Microsoft layout :func:`normalise_object_guid` reads back -- so an id that
+    round-trips through the store asks about the account it came from. Asserted against the same
+    fixture pair the normaliser is tested with, which the test below proves can tell the two byte
+    orders apart.
+    """
+    value = object_guid_filter_value(GUID_A_TEXT)
+    assert value is not None
+    assert value == "".join("\\%02x" % b for b in GUID_A_BYTES)  # noqa: UP031
+
+
+def test_the_filter_bytes_normalise_back_to_the_id_they_were_built_from() -> None:
+    """The round trip, which is what makes the filter and the stored value the same identity.
+
+    A builder that emitted big-endian bytes would produce a well-formed, WRONG filter: it would
+    match nothing, every probe would read ABSENT, and the reconciler would revoke the whole estate
+    while looking like a directory outage. ``test_the_fixture_can_tell_the_two_byte_orders_apart``
+    is the control that this fixture can see that difference at all.
+    """
+    value = object_guid_filter_value(GUID_A_TEXT)
+    assert value is not None
+    raw = bytes(int(pair, 16) for pair in value.split("\\")[1:])
+    assert len(raw) == 16
+    assert normalise_object_guid(raw) == GUID_A_TEXT
+
+
+@pytest.mark.parametrize("value", ["", "not-a-guid", "12345678-1234-1234-1234", "   "])
+def test_an_unparseable_id_yields_no_filter_rather_than_a_broken_one(value: str) -> None:
+    """Refused at the builder, so a value the parser cannot read never reaches a search string.
+
+    This is also why the builder needs no ``_escape_filter`` pass: everything it returns is a
+    backslash or a hex digit, produced from 16 validated bytes. Nothing caller-supplied survives.
+    """
+    assert object_guid_filter_value(value) is None
+
+
+def test_the_id_keyed_search_asks_the_directory_by_object_guid() -> None:
+    """END TO END THROUGH THE REAL LOOKUP, the id-keyed sibling of the search test above.
+
+    Both halves fail independently: a search that filters on the wrong attribute finds nothing, and
+    one that filters correctly but drops the id out of the returned mapping leaves the caller unable
+    to tell a rename from a match.
+    """
+    entry = _FakeEntry(
+        {
+            "sAMAccountName": _FakeAttr("jsmith-married"),
+            "objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES),
+            "displayName": _FakeAttr("J Smith"),
+            "mail": _FakeAttr("jsmith@example.org"),
+            "userAccountControl": _FakeAttr("512"),
+        },
+        dn="CN=jsmith,DC=x",
+    )
+    conn = _FakeConn(entry)
+    info = _authenticator()._find_user_by_object_id(conn, GUID_A_TEXT, fallback_username="jsmith")
+    assert conn.kwargs["search_filter"] == f"(objectGUID={object_guid_filter_value(GUID_A_TEXT)})"
+    assert "objectGUID" in conn.kwargs["attributes"]
+    assert info is not None
+    assert info["object_id"] == GUID_A_TEXT
+    # THE RENAME, carried out of the lookup: the directory's CURRENT name, not the one asked with.
+    assert info["username"] == "jsmith-married"
+
+
+def test_the_id_keyed_search_keeps_the_cached_name_when_the_entry_carries_none() -> None:
+    """An absent ``sAMAccountName`` is not the directory announcing a rename to nothing.
+
+    The lookup reports the caller's cached name in that case, so the refresh downstream sees no
+    change and writes nothing -- rather than blanking a row's only human-readable label.
+    """
+    entry = _FakeEntry(
+        {
+            "objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES),
+            "userAccountControl": _FakeAttr("512"),
+        },
+        dn="CN=jsmith,DC=x",
+    )
+    info = _authenticator()._find_user_by_object_id(
+        _FakeConn(entry), GUID_A_TEXT, fallback_username="jsmith"
+    )
+    assert info is not None and info["username"] == "jsmith"
+
+
+def test_an_unparseable_stored_id_searches_nothing_rather_than_falling_back_to_a_name() -> None:
+    """A search that cannot be built is answered with "no match", never with a different question.
+
+    Falling back to the name here would report on a question the caller did not ask, and the caller
+    reads a miss as ABSENT -- which is the revocation path. Refusing to search keeps the two
+    distinguishable.
+    """
+    conn = _FakeConn(_FakeEntry({"sAMAccountName": _FakeAttr("jsmith")}))
+    info = _authenticator()._find_user_by_object_id(conn, "not-a-guid", fallback_username="jsmith")
+    assert info is None
+    assert conn.kwargs == {}, "a malformed id still reached the directory"
+
+
+def test_the_disabled_account_rejection_covers_the_id_keyed_lookup_too() -> None:
+    """ACCOUNTDISABLE (0x2) is checked in the SHARED extraction, so both lookups reject alike.
+
+    If it lived only on the name-keyed path, re-keying the reconciler's probe would have quietly
+    stopped a disabled account from being revoked -- trading the security control away to fix the
+    availability one.
+    """
+    entry = _FakeEntry(
+        {
+            "sAMAccountName": _FakeAttr("jsmith"),
+            "objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES),
+            "userAccountControl": _FakeAttr("514"),  # 512 | 0x2 = ACCOUNTDISABLE
+        },
+        dn="CN=jsmith,DC=x",
+    )
+    auth = _authenticator()
+    assert (
+        auth._find_user_by_object_id(_FakeConn(entry), GUID_A_TEXT, fallback_username="j") is None
+    )
+    assert auth._find_user(_FakeConn(entry), "jsmith") is None  # the control: same answer both ways
+
+
+class _RecordingConn:
+    """A service connection that records EVERY search, not just the last one.
+
+    **Under ``_authenticator()`` exactly ONE search is issued**, and an earlier version of this
+    docstring said two. ``_resolve_groups`` searches only when ``ad_use_nested_groups`` AND
+    ``ad_group_search_base`` are both set, and that fixture sets neither, so the group leg reads the
+    entry's ``memberOf`` without a round trip. Recording every search rather than the last still
+    matters -- it is what lets a test assert the COUNT, which is the only way to see a second,
+    unwanted lookup such as a name fallback behind an id-keyed miss.
+
+    ``entry=None`` models a search that matches nothing, which is a different question from a
+    malformed filter: a well-formed id bound to no account.
+    """
+
+    def __init__(self, entry: _FakeEntry | None) -> None:
+        self._entry = entry
+        self.entries: list[_FakeEntry] = [entry] if entry is not None else []
+        self.searches: list[dict[str, Any]] = []
+
+    def __enter__(self) -> _RecordingConn:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def search(self, **kwargs: Any) -> None:
+        self.searches.append(kwargs)
+        # Only the FIRST search (the user lookup) may match, and only when this double was given an
+        # entry. Anything after it answers empty, so the double stays a user-lookup instrument rather
+        # than a group fixture.
+        first_hit = len(self.searches) == 1 and self._entry is not None
+        self.entries = [self._entry] if first_hit else []  # type: ignore[list-item]
+
+
+def _recording_authenticator(
+    entry: _FakeEntry | None,
+) -> tuple[LdapAuthenticator, _RecordingConn]:
+    auth = _authenticator()
+    conn = _RecordingConn(entry)
+    auth._service_conn = lambda: conn  # type: ignore[method-assign]
+    return auth, conn
+
+
+def _live_entry(username: str) -> _FakeEntry:
+    return _FakeEntry(
+        {
+            "sAMAccountName": _FakeAttr(username),
+            "objectGUID": _FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES),
+            "displayName": _FakeAttr("J Smith"),
+            "mail": _FakeAttr("jsmith@example.org"),
+            "memberOf": _FakeAttr(["CN=MF-Ops,DC=x"]),
+            "userAccountControl": _FakeAttr("512"),
+        },
+        dn=f"CN={username},DC=x",
+    )
+
+
+def test_resolve_principal_asks_by_the_immutable_id_when_it_is_given_one() -> None:
+    """THE KEY CHOICE, driven through the REAL ``resolve_principal`` rather than through a double.
+
+    **This test exists because a mutation escaped without it.** The key preference used to live in
+    ``AuthService._probe_principal``, where the reconciler's tests reach it; moving it down here put
+    it behind ``_FakeLdap``, which implements its own preference -- so breaking the engine's copy
+    changed nothing any service-level test could see. A double cannot test the thing it replaces.
+    """
+    auth, conn = _recording_authenticator(_live_entry("jsmith-married"))
+    principal = auth.resolve_principal("jsmith", object_id=GUID_A_TEXT)
+    assert principal is not None
+    assert (
+        conn.searches[0]["search_filter"] == f"(objectGUID={object_guid_filter_value(GUID_A_TEXT)})"
+    )
+    # The rename is carried out: the directory's CURRENT name, not the stale one asked with.
+    assert principal.username == "jsmith-married"
+    assert principal.directory_object_id == GUID_A_TEXT
+
+
+def test_resolve_principal_asks_by_name_when_given_no_id() -> None:
+    """The other arm of the same choice -- the pair is what discriminates.
+
+    Asserting only the id arm would pass on an implementation that ignored ``username`` entirely, and
+    asserting only this one would pass on the pre-#1532 engine. The residual path a directory with no
+    readable ``objectGUID`` leaves every account on is exactly this branch.
+    """
+    auth, conn = _recording_authenticator(_live_entry("jsmith"))
+    principal = auth.resolve_principal("jsmith")
+    assert principal is not None
+    assert conn.searches[0]["search_filter"].startswith("(|(sAMAccountName=jsmith)")
+    assert "objectGUID=" not in conn.searches[0]["search_filter"]
+
+
+def test_an_id_keyed_miss_does_not_fall_back_to_the_name() -> None:
+    """A well-formed id that matches NOTHING must return None, not retry by name (BACKLOG #1532).
+
+    **This gap was measured, not imagined.** Adding ``or self._find_user(svc, username)`` to the
+    id-keyed arm of ``resolve_principal`` left 249 tests green across eight auth suites. The two
+    tests that do assert "no fallback" call ``_find_user_by_object_id`` directly -- one layer BELOW
+    the branch -- and only for a MALFORMED id, so neither can see a fallback added at the layer above.
+    The two real-authenticator tests assert only on the filter of a search that SUCCEEDS.
+
+    What that mutation would ship: AD account 'jdoe' (objectGUID G1) binds its row; AD deletes it and
+    reissues 'jdoe' to a new hire (objectGUID G2); the reconciler probes with object_id=G1, the id
+    search misses, the name search finds the NEW HIRE's enabled entry, and the probe reads PRESENT.
+    The departed operator's live session is never revoked, and the role re-diff runs against a
+    different person's group memberships. That is ADR 0079 mechanism 2 silently ending -- the exact
+    shape this whole change set is built to avoid.
+
+    Two assertions, because the first alone is satisfiable by a fallback that also misses: the result
+    must be None AND exactly one search must have been issued.
+    """
+    auth, conn = _recording_authenticator(None)  # a well-formed id bound to nobody
+
+    assert auth.resolve_principal("jsmith", object_id=GUID_B_TEXT) is None
+    assert len(conn.searches) == 1, (
+        f"the id-keyed miss issued {len(conn.searches)} searches; a second one is a name fallback, "
+        "which would resolve a reissued name to a different person and never revoke the departed one"
+    )
+    assert conn.searches[0]["search_filter"].startswith("(objectGUID=")

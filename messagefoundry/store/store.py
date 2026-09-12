@@ -8171,6 +8171,41 @@ class MessageStore:
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op instead of the IntegrityError
+        # that UNIQUE(username) would otherwise raise on a background pass.
+        #
+        # ON THIS BACKEND THE GUARD DOES HOLD UNDER CONCURRENCY, unlike PostgreSQL and SQL Server --
+        # and the REASON is not the one an earlier version of this comment gave.
+        #
+        # MEASURED: 150 concurrent pairs / 300 calls, SEPARATE CONNECTIONS per call, zero exceptions
+        # and 150 clean UPDATE 0s. SQLite serialises WRITERS AT THE FILE LEVEL, so the losing side
+        # BLOCKS until the winner commits and then re-evaluates its NOT EXISTS against committed
+        # data -- which is exactly the no-op the guard promises. Compare postgres.py's copy: there the
+        # loser's snapshot predates the winner's commit, so its guard passes and the write raises.
+        #
+        # THE EARLIER COMMENT CREDITED `self._lock` AND SAID THE PROPERTY "would be lost the moment a
+        # second process shared the file". That was wrong, and wrong in the direction that invites
+        # damage: SQLite's locks are per-connection at the OS file level, so the guarantee SURVIVES
+        # the ADR 0037 engine-shard model (N processes, ONE store) rather than dying under it. An
+        # understated guarantee is an invitation to "fix" something that is not broken.
+        # (Caveat from the measurement: separate connections in ONE process, which models separate
+        # processes for SQLite's file locking but is not literally multi-process.)
+        #
+        # The residual is still absorbed at the call site (`_refresh_cached_username`) for every
+        # backend alike -- this store must not be the reason that handler looks unnecessary.
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+                (username, now, user_id, username, user_id),
+            )
+            await self._commit()
+
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM users ORDER BY username")

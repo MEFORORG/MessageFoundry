@@ -30437,3 +30437,216 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 **Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
 
 **Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
+
+## 1532. Re-key the directory session reconciler off the immutable id, and refresh the cached username
+
+> ✅ **CLOSED 2026-09-11 -- built on branch `claude/reconciler-rekey-stack`, which STACKS ON PR 1045
+> (`claude/ad-immutable-id-1471`). It cannot merge before that one.** `_probe_principal` now probes by
+> `directory_object_id` where the row carries one, through a new `resolve_principal_by_object_id` and
+> `object_guid_filter_value` in `auth/ldap.py`; the directory's current `sAMAccountName` is copied down
+> onto `users.username` by `set_user_username` on the store protocol and all three backends, from both
+> the login path and the reconciler pass, through one shared `_refresh_cached_username`.
+>
+> **The acceptance test is `test_a_directory_rename_keeps_the_account_its_sessions_and_its_single_row`**
+> (`tests/test_ad_session_reconcile.py`): a directory-side rename over more passes than the strike
+> threshold revokes nothing, leaves exactly one AD row with its original `user_id`, and ends with the
+> new name stored.
+>
+> **Four mutations were run against the finished code and each is caught by the test that should catch
+> it** -- probe key reverted to the name, reconciler refresh deleted, login refresh deleted, and the two
+> apply loops put back in their original order. A fifth arm,
+> `test_a_genuinely_absent_account_is_still_revoked_under_the_id_keyed_probe`, is the control on the
+> fix rather than on the defect: a change that made every probe resolve would pass every rename
+> assertion and silently end ADR 0079 mechanism 2.
+>
+> **ONE MUTATION ESCAPED FIRST, AND THE ESCAPE IS THE MORE USEFUL RESULT.** The `/simplify` pass moved
+> the key preference out of `AuthService._probe_principal` down into `resolve_principal`, which is the
+> right altitude. It also moved it out of test coverage: every service-level reconciler test runs
+> against `_FakeLdap`, which implements its own preference, so breaking the engine's copy changed
+> nothing any of them could see. **A double cannot test the thing it replaces.**
+> `test_resolve_principal_asks_by_the_immutable_id_when_it_is_given_one` and its by-name twin drive the
+> real `LdapAuthenticator` over a recording connection and close that hole; the mutation now fails.
+>
+> **A SECOND DEFECT WAS FOUND IN REVIEW, IN THIS ROW'S OWN NEW CODE.** The first implementation applied
+> renames BEFORE revocations. `_apply_reconcile_revocation` audits with the name the plan captured and
+> notifies with the name it re-reads from the row, so an account renamed and role-changed in the same
+> pass -- one administrative action at many sites -- would have put the old name in the audit row and
+> the new one in the security notice. Revocations now run first, so both reads see the pre-rename name
+> and the rename still lands on the same pass. Pinned by
+> `test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name`.
+>
+> **What the green does not prove, unchanged from #1471: there is no AD in CI.** The LDAP filter
+> builder is unit-tested and round-trips against `normalise_object_guid`, and `_search_user` runs
+> against a double, but **no test here establishes that a domain controller answers an `objectGUID`
+> filter** -- only that the engine builds the RFC 4515 byte-escaped form Microsoft tooling emits, from
+> the little-endian bytes the normaliser reads back. The PostgreSQL and SQL Server legs of
+> `set_user_username` are env-gated and run only on the hosted runners.
+>
+> **Filed and built 2026-09-11.** Value **7/10** · Difficulty **4/10**. Split out of PR 1045's own
+> stated residual, where it was named by subject because no number had been allocated.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / authentication. **Priority:** P1. **Verdict:** build.
+**Severity:** an **availability** defect, not a widened grant -- fail-closed and audited throughout. On
+a first deployment wiring a directory, a person renamed in that directory would have had their engine
+sessions revoked roughly every ten minutes, indefinitely, with no administrative escape. Section 0
+(zero deployments) is why that is written in the conditional; it is not a reason to downgrade the fix.
+
+### The defect, and why it had no floor
+
+BACKLOG #1471 made a directory login resolve its row by `objectGUID`, so a renamed person keeps signing
+in to their own account. `reconcile_directory_sessions` went on probing
+`resolve_principal(user.username)` -- the name the row was created with, which the directory stopped
+answering to at the instant of the rename. That lookup returns `None`, which the reconciler reads as
+`ABSENT`, which is the same answer a **deleted or disabled** account gives.
+
+At the shipped `ad_session_recheck_seconds = 300` and `ad_session_recheck_strikes = 2` -- on whenever a
+directory is wired -- the account collects a strike per pass, and on the second pass its sessions are
+revoked and the holder is emailed a security notice. **The cycle then restarts on its own**: the
+account leaves the candidate set once it holds no live session, the person signs back in (the id still
+finds the row), and it re-enters the candidate set for the next pass.
+
+**There was no manual escape**, and PR 1045's body and CHANGELOG entry both said there was -- "until an
+administrator corrects the stored name". No such operation existed: measured against a positive control
+of `set_user_roles` (8 files), a search for a username writer returned zero across
+`messagefoundry/`. `delete_user` was the only exit, and it discards the `user_id` that
+uploaded-file ownership, the per-uploader quota and saved search presets all key on -- which is the very
+thing #1471 exists to protect. PR 1045 corrected that claim in place on 2026-09-10; this row is the fix.
+
+### Why this is not ADR 0184, and the check was run first
+
+ADR 0184 carries an open decision reading *"The reconciler: exclude bound rows, or re-key the probe?"*,
+so the question was checked before any code was written. It is a different question:
+
+| | ADR 0184's reconciler item | This row |
+| --- | --- | --- |
+| Leg | Federated (OIDC). The ADR states *"This ADR covers the federated (OIDC) leg only"* | The AD leg, which that same section puts explicitly out of scope |
+| Population | Rows carrying an `(issuer, sub)` binding | Every AD-provider row, since #1471 binds them all |
+| Blocked on | An owner trust decision about federated bind ceremony | Nothing. No ceremony, no binding created, no OIDC path touched |
+| Cost of re-keying, as priced there | One nullable column on three backends, a new LDAP attribute read and a lookup path; *"`objectGUID` is the immutable key and is read nowhere today"* | **PR 1045 paid all of it** |
+
+The ADR's other option, *exclude bound rows*, is not available here: every AD row carries a
+`directory_object_id`, so excluding them would disable ADR 0079 mechanism 2 outright -- giving up a
+security control to fix an availability one. There was no choice left to record, so this is a direct fix
+rather than an ADR.
+
+It also **discharges ADR 0184's AC-5** (*"WHILE an account carries a federated binding, THE SYSTEM SHALL
+NOT re-resolve that account from its username in `reconcile_directory_sessions`"*) as a side effect, for
+every AD row including the federated-bound ones. ADR 0184 itself is left unedited, on PR 1045's
+reasoning: it records a research pass, and re-pointing its findings would edit a finding rather than a
+pointer.
+
+### The second question: should an administrator rename or re-bind operation exist?
+
+**No, and the reasoning is recorded because it is a decision not to build.** Three operations were
+considered separately; they are not one question.
+
+1. **A rename surface -- not needed.** Once the probe is id-keyed, a rename self-heals: from the login
+   path at the next sign-in, and from the reconciler within one interval. The value an operator would
+   type is one the directory already knows, so the engine reads it instead of accepting it.
+2. **A re-bind surface (point a row at a different `directory_object_id`) -- must not exist.** That is
+   precisely the privilege transfer #1471 closed, re-introduced through a route. A row that needs a
+   different directory id is a different account.
+3. **An unbind surface (clear the id) -- must not exist.** It would return the row to name-fallback
+   adoption, which is the hole.
+
+`set_user_username` is therefore on the store protocol but reachable from **no API route**, and its
+docstring says why. The same argument governs the id: there is still no setter for
+`directory_object_id`, and this method is not a way to grow one. This is the AD-leg answer to the shape
+ADR 0184 records for `set_user_federated_subject` (*"an unbind is unrepresentable"*); that row's own
+version of the question stays open, because it is about a binding an IdP presents rather than one the
+engine reads.
+
+### The residual, stated rather than assumed away
+
+A rename **onto a name another row already holds** cannot be applied -- `username` is `NOT NULL UNIQUE`
+on all three backends. The two paths resolve it differently, and both are pinned:
+
+- **Login**: refused before the refresh is reached, by #1471's `directory_identity_conflict` guard. The
+  renamed person cannot sign in until an operator removes the stale row. That is #1471's own stated
+  residual, unchanged here.
+- **Reconciler**: no such guard -- it probes an account it has already identified -- so the refresh's
+  own collision branch runs, leaves both rows alone, and audits
+  `auth.ad_username_refresh_conflict`. It costs the renamed person nothing: they were found `PRESENT`
+  by their id, so their sessions and roles are untouched and only the display label stays stale.
+
+A directory returning **no readable `objectGUID`** leaves every row unbound and keeps the pre-#1471
+behaviour, rename wart included. The engine cannot key on an identifier it is never given;
+`auth/ldap.py` warns once per distinct shape. Pinned by
+`test_a_row_with_no_immutable_id_still_probes_by_name`.
+
+### Incidental
+
+`AuthService.directory_reconcile_enabled`'s docstring said *"at the default
+`ad_session_recheck_seconds = 0`"*. The field ships at **300**, which
+`test_reconciler_is_on_by_default` already pins. Corrected, because reading it as off-by-default makes
+every defect in this loop sound like it needs an operator to opt in first.
+
+**Related:** [#1471](#1471) is the row this completes -- it named this work by subject, unfiled.
+[ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
+is the federated sibling, untouched.
+
+## 1540. Dual-control self-approval compares usernames, which BACKLOG #1532 made mutable; key it on the immutable user_id
+
+> 🔢 **Filed 2026-09-11 by the change that caused it.** Value **7/10** · Difficulty **4/10**.
+> `ApprovalGate.approve` refuses self-approval with `if str(row["requester"]) == approver`, a
+> **username string** comparison. That was sound only while `users.username` was immutable for the
+> life of a row -- which it was, until [#1532](#1532) added `set_user_username` and made the column
+> directory-writable. The two sides of that comparison are now snapshots, taken up to
+> `[approvals].expiry_hours` apart, of a value the **directory** controls.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / authorization. **Priority:** P2. **Verdict:** build.
+**Severity:** on a first deployment that turned dual-control on, a requester renamed in the directory
+between requesting and approving would pass the self-approval refusal and release their own gated
+action. The privilege bar is *"can rename one AD account"* -- self-service, or a helpdesk delegate
+with write rights over that account -- rather than *"holds a second approver account"*. **Off by
+default** (`[approvals].enabled = False`), so no shipped configuration reaches it without an operator
+turning it on. Section 0: zero deployments, so nothing is exposed today.
+
+### The mechanism, end to end
+
+1. `guard()` persists `pending_approvals.requester = 'jdoe'` with `expires_at = now + expiry_hours`.
+2. Inside that window the directory renames `jdoe` to `jdoe2`.
+3. Either the ADR 0079 reconciler pass (within `ad_session_recheck_seconds`, 300 by default) or the
+   next sign-in copies the new name down through `_refresh_cached_username`.
+4. `POST /approvals/{id}/approve` passes `approver=identity.username`, now `'jdoe2'`.
+5. `'jdoe' == 'jdoe2'` is False. **The refusal does not fire and the requester releases their own
+   request.** Both audit rows name one person two different ways, so the trail does not show it
+   either.
+
+**The reverse failure also exists and is worth stating**, because a fix that only chased the first
+would leave it: once the rename frees `'jdoe'`, a *different* person can be given that name, and
+their attempt to approve is refused as self-approval. That direction is a false REFUSAL rather than a
+false accept, so it is less severe -- but it is the same defect.
+
+### Why the fix is not a one-line change
+
+`pending_approvals.requester` is declared `TEXT NOT NULL` on all three backends and there is **no id
+column** -- the schema comment beside it reads *"who initiated; can never self-approve (dual-control,
+2.3.5)"*. Keying the comparison on the immutable id needs a `requester_user_id` column added on
+SQLite, PostgreSQL and SQL Server, written at `guard()` time, and compared at `approve()` time, with
+the username kept as the display label. That is the shape every other ownership key in the engine
+already uses: uploads key on `uploader_id`, saved search presets were re-keyed onto `owner_user_id`
+for exactly this reason, and WebAuthn credentials key on `user_id`.
+
+Resolving `requester` to an id at comparison time instead is **not** a fix: after a rename the name
+may belong to somebody else, so the lookup would compare the wrong person.
+
+### How it was found, and the general lesson
+
+An adversarial correctness review of #1532 (five lenses, three refuters per finding). This was the
+only HIGH finding that survived 3/3 unrefuted, and it is in a file #1532 does not touch -- the defect
+is the **removal of a premise** another subsystem rested on, not a bad line of code.
+
+`store/base.py`'s own docstring stated that premise in terms: *"the engine has no other writer of this
+column after `create_user`."* #1532 made that sentence false and did not audit who was relying on it.
+**A load-bearing fact stated once is also a fact that can be invalidated once, from somewhere that
+never reads the statement.** The general form is worth more than this instance: when a change makes
+something mutable that was immutable, the work is not the writer -- it is enumerating the readers.
+
+**Related:** [#1532](#1532) is the change that caused this and the row that filed it.
