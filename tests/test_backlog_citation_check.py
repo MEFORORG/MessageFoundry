@@ -500,6 +500,15 @@ def test_an_empty_sha_is_a_usage_error_and_not_an_empty_diff(tmp_path: Path) -> 
     # THE CONTROL, and it is the half that makes the two assertions above mean anything: the same
     # binary on the same repo must still do real work when given no flags at all. Without this, a
     # checker that refused EVERYTHING would pass the two cases above.
+    #
+    # IT ASSERTS "NOT A USAGE ERROR", NOT "CLEAN", AND THE DIFFERENCE IS THE WHOLE POINT. This line
+    # first read `== 0`, which quietly asserted something else as well: that the WHOLE REPOSITORY
+    # carries no stale citation. That is not this test's subject and not this branch's to control --
+    # it went red on two pre-existing findings, one in docs/BACKLOG.md and one in the archive, that
+    # have nothing to do with the empty-string guard under test. A control must fail only when the
+    # thing it guards breaks; this one failed when somebody else's citation went stale.
+    # Exit 1 means findings, which IS real work and satisfies the control. Only exit 2 -- the usage
+    # error the two arms above assert -- would mean the checker had refused everything.
     repo_wide = _run(repo)
-    assert repo_wide.returncode == 0, repo_wide.stderr + repo_wide.stdout
+    assert repo_wide.returncode != 2, repo_wide.stderr + repo_wide.stdout
     assert "citations in scope" in repo_wide.stdout, repo_wide.stdout
