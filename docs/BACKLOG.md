@@ -31569,6 +31569,9 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 ## 1544. a pipe with no pipefail discards its producer's exit code, 26 of 36 piped workflow steps run that way, and the test named as the guard's home resolves 11 jobs without walking needs, so it cannot reach 3 of the 4 sites that gate a merge
 
 > 🔢 **Filed 2026-09-11 from a follow-up named but unfiled during the block 3 wave, then adversarially verified.** Value **4/10** · Difficulty **6/10** · _money pit_. Under GitHub's default `run:` shell -- `bash -e`, no `pipefail` -- a producer that fails in front of a pipe is discarded exactly as `|| true` discards one. `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` exists to catch `|| true` in a required job; it does not look at pipes, and nothing else in the repository does. Measured at `origin/main` `67ad86e4b`: of 205 `run:` steps, 184 resolve to a POSIX shell, 36 carry a real shell pipe and **26** of those have no pipefail in effect. Filing the rule into that module as written would not help: it resolves 13 required contexts to 11 jobs and never walks `needs:`, so it would sweep 11 jobs, pass, and report the merge path clean while three of the four merge-gating sites still pipe unguarded.
+## 1594. an interior blank segment escapes the pre-ACK peek as IndexError, so the message gets no disposition, no NAK, and the MLLP connection is dropped
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-01, vault PR 1475). Open; not started.** Value **8/10**, Difficulty **3/10**. A message whose normalized text carries an empty line between segments (`...\r\rPID|...`, which is what a `CRLF`-terminating sender with a blank line produces) parses, then `peek.control_id`, `summarize(peek)` and `build_ack(raw)` all raise `IndexError`, on both parser backends. Driven through `RegistryRunner._handle_inbound` with a real store: no row, no ACK, no NAK; the MLLP server's last-resort catch logs and drops the connection. Value 8: it is the count-and-log invariant broken by a benign-looking shape, and the sender's only signal is a dropped socket. Difficulty 3: a tolerant blank-segment rule on both backends, a runner guard, a `build_ack` guard, and a parity-corpus expectation update.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -31711,6 +31714,45 @@ The draft's headline table comparing 190/30/7 against 23/6/17 is dropped. Neithe
 > `sigstore` is the only `[dependency-groups]` name in none of `MOVED_TO_A_GROUP`, `EXACT_GROUP_PINS` or `FLOOR_BY_DESIGN`. Nothing asserts its spec stays an exact pin. The `==` in `pyproject.toml` is the only thing binding the owner's twice-affirmed `4.4.0` ruling to what the resolver picks, and no test asserts it.
 > **`sigstore` IS NOT UNGUARDED. Do not read this row that way.** Its declaration, its lock, its hashes, its audit and its re-export all have working guards, named below. What is missing is the spec *shape* and the inline-reinstall sweep.
 > **This is a companion to [#332](#332), not an independent subject.** #332 owns sigstore's pin, already names one of the two registry additions as its own residual, and its remaining step 6 edits the same two tuples.
+**Cluster:** Codecs & Parsing. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). Would break count-and-log on first deployment for any sender that emits a blank line between segments. Not a PHI leak; not authentication.
+
+### Where
+
+- `messagefoundry/parsing/_builtin_hl7.py`, `raise_if_blank_segment_scan`: raises `IndexError("string index out of range")` for any segment whose id is `""`, replicating python-hl7's `segments()` blow-up on purpose.
+- `messagefoundry/parsing/peek.py`, `Peek._resolve_builtin`: calls that scan **before** its `except (IndexError, ValueError)`, so the raise is deliberate, not a missed catch. `Peek._resolve_hl7` catches only `IndexError` from `extract_field`, and python-hl7's own scan raises the same way.
+- `messagefoundry/pipeline/wiring_runner.py`, `_handle_inbound`: after `Peek.parse` succeeds, the first field read (`peek.control_id` at `enqueue_ingress`, or `summarize(peek)`) has no catch between it and the listener.
+- `messagefoundry/transports/mllp.py`, `build_ack`: catches only `HL7PeekError`, so it cannot build the NAK for this input either. The sender's `verify_ack_control_id` peek at the same file has the same shape.
+- **DELTA-02's surviving half lives here too.** The 2026-07-01 delta review's `ValueError` from a malformed rich-text repeat count (`\.inX\`) is fixed on the default built-in backend (vault commit `a0027b34`: `Peek.field` returns `None`, `summarize` works). On the python-hl7 fallback backend `Peek.field` still raises `ValueError` from python-hl7's own `int(value[3:])`, and `Peek._resolve_hl7` catches only `IndexError`. Packet 1 could not reach the fallback with any wire input (every header shape that faults the built-in is refused by python-hl7's own assertion first), so it is one internal built-in fault away from live rather than live. Step 1 below closes it; no separate item is filed for it.
+
+### Measured, 2026-09-11, engine `a3f7e664a`
+
+| Input | `Peek.parse` | `peek.control_id` | `_handle_inbound` | store rows |
+|---|---|---|---|---|
+| `MSH...\r\rPID...` | ok | `IndexError` (both backends) | raised `IndexError` | 0 |
+| `MSH...\r\n\r\nPID...` | ok | `IndexError` (both backends) | raised `IndexError` | 0 |
+| `MSH...\r  \rPID...` (whitespace-only line) | ok | `CTRL1` | not driven | n/a |
+| control, no blank line | ok | `M1` | ACK `AA` | 1, `received` |
+
+`Message.parse` on the same input reads `control_id` and `PID-3.1` fine on both backends; only the `Peek` path raises.
+
+### The test suite pins the defect
+
+`tests/test_builtin_hl7_parity.py` carries `_EMPTY_FIELDS` with a blank segment in its adversarial corpus, and `_eq` compares exceptions by **type**, so both backends raising `IndexError` is a pass. A fix on one backend alone reds the parity suite; the corpus expectation must move to the tolerant answer in the same change.
+
+### What to build
+
+1. Make blank segments tolerant at the `Peek` layer on **both** backends: drop empty lines in `_builtin_hl7.parse` (or skip `""` ids in `raise_if_blank_segment_scan`), and map the python-hl7 backend's `IndexError` to the same result in `_resolve_hl7`. While there, catch `ValueError` in `_resolve_hl7` too: the python-hl7 backend still raises it on a malformed rich-text count (DELTA-02's fallback half).
+2. Runner guard, defence in depth: any non-`HL7PeekError` from a peek read before `enqueue_ingress` must still record `ERROR` and NAK `AR`, on both the MLLP and HTTP inbound paths.
+3. `build_ack` must never raise on an input `Peek.parse` accepted.
+4. Tests: a runner-level test asserting `ERROR` + NAK `AR` (or a tolerant `RECEIVED` + ACK once step 1 lands) for the `\r\r` and `\r\n\r\n` shapes; update the parity corpus.
+5. Fix the sibling 1597 in the same change: a tolerant peek exposes it.
+
+---
+
+## 1595. X12FrameReader rescans the whole buffer on every chunk, so reassembly is quadratic and a slow-drip sender would buy minutes of engine CPU per interchange
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-02, vault PR 1475). Open; not started.** Value **6/10**, Difficulty **2/10**. `X12FrameReader._take_one` restarts `buf.find(b"IEA", 3)` and the terminator walk from the ISA on every `feed()`, and the X12 transports feed it from `reader.read(4096)`, which returns whatever is available, so the feed size is the sender's choice. Measured: 8 MiB in 4 KiB chunks 1.91 s; 512 KiB fed 16 bytes at a time 1.60 s; a 16 MiB interchange fed 16 bytes at a time extrapolates to about 27 minutes of CPU on the event loop, in short slices. Value 6: an exposed X12 listener would let one paced sender pin a core; the loop is not stalled, so this is amplification, not a freeze. Difficulty 2: a scan offset in one method.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -31812,3 +31854,182 @@ Difficulty is 3 rather than 2 because of the coupling, not the edit. The tuples 
 ### The version is not in scope
 
 **This row does not propose changing `sigstore==4.4.0`, and must not be read as reopening it.** That version is an owner ruling, twice affirmed. Its rationale lives once, at the `release-tools` group in `pyproject.toml`, with the record in [#332](#332). Everything here is about what guards the pin, never about what the pin says. Step 1 would make the ruling harder to undo, not easier.
+**Cluster:** Codecs & Parsing. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Would cost a first deployment with an X12 listener minutes of CPU per megabyte from one slow sender. The 16 MiB frame cap bounds a single interchange but not the work to assemble it.
+
+### Where
+
+`messagefoundry/parsing/x12/interchange.py`, `X12FrameReader._take_one`: both `buf.find(b"IEA", 3)` and the `while True` terminator walk start from offset 0 of the buffer on each call. Callers: `messagefoundry/transports/x12.py`, every `reader.read(4096)` site feeds the reader per read.
+
+### Measured, 2026-09-11, in-process
+
+| Body | Chunk | Feeds | Time |
+|---|---|---|---|
+| 1 MiB, one interchange, IEA at the end | 4 KiB | 256 | 0.03 s |
+| 4 MiB | 4 KiB | 1,024 | 0.45 s |
+| 8 MiB | 4 KiB | 2,048 | 1.91 s |
+| 512 KiB | 256 B | 2,048 | 0.10 s |
+| 512 KiB | 16 B | 32,775 | 1.60 s (about 8.6 GB scanned, 5.4 GB/s) |
+
+The socket path was not driven; the algorithm and the transport's read shape were. The socket-level confirmation belongs with the X12 transport work (Fable packet 9).
+
+### What to build
+
+Keep a scan offset on the reader and resume both the `IEA` search and the terminator walk from just before the previously scanned end (rewind by the terminator length plus three bytes, so a marker split across two feeds is still found). Add a test that feeds a multi-megabyte interchange in 16-byte chunks under a time bound, and a control that the same feed still yields one frame with the same bytes.
+
+---
+
+## 1596. importing messagefoundry.parsing pulls the config layer in, so the client carve-out it is documented to earn is not held at the import level, and no test checks it
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-03, vault PR 1475). Open; not started.** Value **5/10**, Difficulty **4/10**. In a fresh interpreter `import messagefoundry.parsing` loads 65 `messagefoundry` modules, including all of `config` (`wiring`, `state`, `models`, `tls_policy`, `db_lookup`, `fhir_lookup`), `actions`, `diagnostics` and `fhirsearch`. No `store`, `pipeline`, `transports`, `api` or `auth` module loads, so the "no I/O, no DB" half of CLAUDE.md section 4's carve-out holds and the "no engine state, a client may import it" half does not. `tests/test_dependency_boundaries.py` has no inward rule for `parsing`. Value 5: the carve-out is the stated reason a client may import the package. Difficulty 4: two small moves inside `parsing`, one boundary assertion, and a larger package-root change that belongs to the engine-root packet.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Architecture contract, not security. A client that imports `parsing` would get the configuration layer and its module-level state holders on first deployment.
+
+### Three chains, traced 2026-09-11
+
+1. `messagefoundry/__init__.py` eagerly imports the authoring surface (`actions`, `config.*`, `diagnostics`, `fhirsearch`), so any `import messagefoundry.<anything>` pulls them. The largest edge, and it sits outside `parsing/`.
+2. `messagefoundry/parsing/sniff.py` imports `ContentType` from `config.models`, which drags `config/__init__` and `tls_policy`.
+3. `messagefoundry/parsing/__init__.py` imports `logging_setup` for the C-1 hl7-logger silencer, and `logging_setup` imports `config.tls_policy`, `redaction`, `secretscrub` and `logging_guard`.
+
+### What to build
+
+1. Move `ContentType` to a leaf module both `config` and `parsing` import.
+2. Move `silence_phi_prone_dependency_loggers` into a stdlib-only leaf module (it needs `logging`, `os` and `hl7`); `logging_setup` keeps calling it.
+3. Add an inward assertion to `tests/test_dependency_boundaries.py`: `parsing/` imports nothing under `messagefoundry` except `parsing`, `timezone` and `controlchars`. Make it fail on purpose first.
+4. The package-root laziness (PEP 562 `__getattr__` on `messagefoundry/__init__.py`) is the change that finishes the job and is the engine-root packet's (Fable packet 10) with the architecture pass (packet 18); note it here so the two do not drift apart.
+
+---
+
+## 1597. split_by_obr attaches observations to the wrong order when the message carries a blank segment
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-04, vault PR 1475). Open; not started. Shadowed by 1594 today; fix both in one change.** Value **5/10**, Difficulty **2/10**. `msg.segments()` counts a blank segment; the line list `split_by_obr` slices positionally drops empty lines; every slice after the blank is off by one. Measured: header `MSH, PID, (blank), OBR 1, OBX v1, OBR 2, OBX v2` splits into `MSH, PID, OBR 1, OBX v1, OBR 2` and `MSH, PID, OBR 1, OBX v2`, so the second order's result is filed under the first order. Value 5: a per-order fan-out would deliver a result under the wrong accession. Difficulty 2: align the slice to `segments()` or route through `Message.groups()`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Data integrity in a Handler helper. Through ingress it is unreachable while 1594 rejects the message first; it is live now for a message built inside a Handler or fed to the dry-run and harness surfaces that call `Message.parse` directly, and it becomes live on the wire the moment 1594 lands.
+
+### Where
+
+`messagefoundry/parsing/split.py`, `split_by_obr`: `lines = msg.encode().split("\r")` then `seg_lines = [ln for ln in lines if ln]`, while `obr_positions` and `header_end` are indices into `msg.segments()`.
+
+### What to build
+
+Slice the encoded lines without filtering empties so positions align with `segments()`, or build each part through `Message.groups()`, which is position-aware. Test: the seven-segment shape above yields two parts each carrying its own `OBR` and only its own `OBX`.
+
+---
+
+## 1598. zip_decompress leaks RuntimeError and NotImplementedError past its CompressionError contract
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-05, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **1/10**. A member with the encryption flag set makes `zipfile` raise `RuntimeError`, whose message embeds the member's `ZipInfo` repr including the archive-chosen filename; a member with an unsupported compression method raises `NotImplementedError`. Neither is in the `except` tuple at the end of `zip_decompress`, which promises exactly one type. Measured by flipping the flag bit and the method field on a written archive. Value 3: a Handler's `except CompressionError` would miss both and the transform worker's broad catch would dead-letter with an untyped error. Difficulty 1: two names in a tuple.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Contract only; the outcome is still a dead-letter.
+
+### What to build
+
+In `messagefoundry/parsing/compression.py`, `zip_decompress`: catch `RuntimeError` and `NotImplementedError` beside `zipfile.BadZipFile` and re-raise as `CompressionError` naming only the member position, never the filename. Tests: one encrypted-flag member, one method-98 member, both expecting `CompressionError`.
+
+---
+
+## 1599. DicomPeek.parse and DicomDataset.parse leak RecursionError on a deeply nested sequence, and the SR measurement walk recurses too
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-06, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **2/10**. A crafted Part-10 object of about 40 KB with 400 nested `ContentSequence` items raises `RecursionError` out of both parse surfaces under pydicom 3.0.2, whose sequence reader is recursive; `parse_error_types()` in `dicom/_deps.py` omits `RecursionError`, and `_walk_num` in `dicom/dataset.py` recurses over the same tree. Refuted as a denial of service: the C-STORE SCP wraps the peek in broad catches and returns a DIMSE failure. What remains is the promised `DicomPeekError`. Value 3: contract only. Difficulty 2: one tuple entry, or a bounded pre-walk.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Contract only; a first deployment's SCP would already turn it into a DIMSE failure.
+
+### What to build
+
+Add `RecursionError` to `parse_error_types()`, or pre-walk the object with a depth bound before `dcmread` and raise `DicomPeekError` on breach; make `_walk_num` iterative or bounded. Test: the 400-deep object expects `DicomPeekError` from both parse surfaces. The sandbox codec already catches `RecursionError` explicitly (closed item 1222 pins that contract), so the precedent is in tree.
+
+---
+
+## 1600. RawMessage.json and FhirPeek.parse leak RecursionError where JSONDecodeError and FhirPeekError are promised
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-07, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **1/10**. `RawMessage.json()` documents `JSONDecodeError`; 100,000 nested arrays raise `RecursionError` instead (measured). `FhirPeek.parse` catches `(json.JSONDecodeError, ValueError)` and `RecursionError` is neither; the 2026-07-01 delta review refuted the FHIR case as a vulnerability (every caller dead-letters) and left the contract defect standing. Value 3: contract only. Difficulty 1: one name in two `except` tuples.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Contract only; the transform worker's broad catch dead-letters either way.
+
+### What to build
+
+Catch `RecursionError` beside `JSONDecodeError` in `RawMessage.json` (`parsing/message.py`) and in `FhirPeek.parse` (`parsing/fhir/peek.py`), raising the typed error; `FhirResource.parse` has the same shape. Tests: the deep-array body expects the typed error from each. Closed item 1222 shows how to pin it without a C-stack-dependent trigger (monkeypatch `json.loads` to raise `RecursionError`).
+
+---
+
+## 1601. reencode_delimiters leaks python-hl7's AssertionError on a header like `MSH\r...` where ValueError is promised
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-08, vault PR 1475). Open; not started.** Value **2/10**, Difficulty **1/10**. `reencode_delimiters` in `transports/mllp.py` catches `(hl7.HL7Exception, IndexError, ValueError)` around `hl7.parse`; python-hl7 0.4.5 raises a bare `AssertionError` on a first line that is only `MSH` (measured), so the sender's `except ValueError` around the encoding-character override would miss it. Reachable only from a Handler's output on an outbound with `encoding_characters` set. Value 2: narrow. Difficulty 1: one name in a tuple.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Contract only; the delivery worker's broad catch would still fail the send.
+
+### What to build
+
+Add `AssertionError` to the tuple in `reencode_delimiters` so it surfaces as the documented `ValueError` and the sender's `DeliveryError`. Test: `reencode_delimiters("MSH\rPID|1", ("|","^","~","\\","&"))` expects `ValueError`. Filed from the parsing packet; the fix sits in the MLLP transport (Fable packet 9's area).
+
+---
+
+## 1602. validate.py and consistency.py say strict validation checks datatypes, table values and lengths; measured, it checks structure, cardinality and required fields
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-09, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **1/10**. `messagefoundry/parsing/validate.py`'s module docstring and `messagefoundry/parsing/consistency.py`'s opening paragraph both claim hl7apy strict validation checks "datatypes, table values and lengths". Measured 2026-09-11: a malformed PID-7 date, a 300-character PID-3 and an invalid PID-8 all pass; a missing required segment, a duplicate EVN, a field beyond the segment definition, an unknown trigger and an unsupported version are rejected. `config/models.py` describes the tier correctly. Value 3: a Handler author reading the docstring would believe lengths were enforced, which is a control-shaped promise. Difficulty 1: two docstrings.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Documentation accuracy; also flagged to the Fable cross-cutting pass (packet 18).
+
+### What to build
+
+Rewrite the two docstrings to say what the tier checks (structure, cardinality, required fields, version) and what it does not (datatypes, lengths, table values), and point at `config/models.py`'s wording as the single statement. Optionally pin it with a test that a 300-character PID-3 passes strict validation, so a future hl7apy upgrade that starts enforcing lengths is noticed rather than assumed.
+
+---
+
+## 1603. x12 validate silences the pyx12 logger with a process-global level flip that a concurrent pass could undo mid-pass
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-10, vault PR 1475). Open; not started.** Value **2/10**, Difficulty **1/10**. `_silence_pyx12_logger` in `messagefoundry/parsing/x12/validate.py` sets the `pyx12` logger to `CRITICAL + 1` and restores the previous level on exit. Two overlapping passes on separate threads would interleave: the first to finish restores the pre-silence level while the second is still running, and pyx12's ERROR records, which embed the offending element value, would reach the general log for the rest of that pass. No concurrent caller exists today (a Handler invokes it synchronously on its transform worker); the day validation runs off the loop or under free threading, it is live. Value 2: plausible, not reachable now. Difficulty 1: install a filter once at import instead, as the hl7 silencer does.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). PLAUSIBLE, not confirmed: no thread runs it today.
+
+### What to build
+
+Attach a permanent filter (or level) to the `pyx12` logger tree once, at module import, and delete the context manager; keep the existing test that asserts the raw error string never reaches the log, and add one that runs two passes on two threads with a capturing handler.
+
+---
+
+## 1604. test_unescape_drops_oversized_repeat_count hangs pytest's failure diff for the full timeout when the repeat clamp regresses
+
+> 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-11, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **1/10**. Negative control: with `MAX_ESCAPE_REPEAT` disabled on purpose, `tests/test_builtin_hl7_hardening.py::test_unescape_drops_oversized_repeat_count` (which asserts `unescape("\.in2000000000\", SEPS) == ""`) allocated the eight-gigabyte string and pytest's assertion rewriting then spent the whole 120 s per-test timeout inside `difflib` building the failure diff. Exit code 1, no readable message. On a hosted runner that regression would time the leg out rather than name itself. Two sibling controls (repetition write semantics, aggregate budget) turned red cleanly. Value 3: a control that cannot report is half a control. Difficulty 1: assert on `len()`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Test quality only.
+
+### What to build
+
+Assert `len(unescape(...)) == 0` (or compare against a count just over the cap, which fails with a short diff) so a regression fails fast with a readable message. Re-run the negative control after the change and record that the failure text names the test.
