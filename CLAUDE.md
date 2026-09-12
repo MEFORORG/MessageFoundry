@@ -558,6 +558,12 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   fired three times). Allocate it atomically with `pwsh -NoProfile -File scripts\coord\alloc.ps1
   -Kind adr -Title "<title>"`, and add the ADR's index row in the *same* commit. A `pre-commit` hook
   rejects a number you did not allocate; see [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md).
+  **Filing several items in one pass? Use `-TitlesFile <path>`, one title per line, NOT a loop.** The
+  40-odd seconds is the floor sweep, which is the same answer for every number in the run: measured
+  2026-09-12, **19 numbers in 36.6 s** against **42.5 s for one**. Each number is still claimed by its
+  own atomic create, so nothing about the collision guarantee changes. `pwsh -File` cannot bind an
+  array, so the file is the spelling that works — `-Titles "a","b"` silently binds the single string
+  `a,b` and spends one number on it.
 - **Never CITE a `#N` you have not allocated.** Allocate first, or write a reference that cannot
   resolve. While the number is unissued the citation resolves to nothing, which is honest. The day
   someone legitimately allocates it, that citation starts resolving to unrelated work, with nothing
