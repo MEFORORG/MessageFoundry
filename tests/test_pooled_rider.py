@@ -762,7 +762,7 @@ async def _seed_lease_epoch(store: Any, epoch: int) -> str | None:
     if backend == "sqlite":
         return None
     if backend == "sqlserver":
-        lease_key = "dbo:mefor_cluster_leader"
+        lease_key = "mefor_cluster_leader"
         await store._execute(
             "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
             " CREATE TABLE leader_lease ("
