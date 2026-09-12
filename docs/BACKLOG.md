@@ -10341,7 +10341,7 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 > **Filed 2026-08-08. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.2** (L1) currently scores **partial**. The pinned verb asks that data-specific access be restricted to consumers with explicit permissions to specific data items, to mitigate IDOR and BOLA. **As filed**, one PHI-bearing object family had no object-level authorization at all: `GET /uploads` listed every user's files unfiltered, and browse and delete took a `file_id` straight through to `get_meta`/`read_bytes` with no channel and no owner check.
 > **UPDATE 2026-08-11 -- THE UPLOADS HALF IS BUILT; THE ITEM STAYS OPEN.** Owner-only plus a `files:access_any` Administrator override, keyed on the immutable `uploader_id` (`Identity.user_id`), owner-ratified and recorded in [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md) Amendment A. All four routes now enforce it, including resend's SOURCE file (it previously checked only the TARGET inbound). So the three specific defects named above are fixed in the shipped code and the paragraph above describes the pre-fix state, not the current one.
 > **WHY IT IS NOT CLOSED, and none of these is a formality.** (1) The principal-narrowing axis is UNTOUCHED: `Identity.allowed_channels` still defaults to `None` (`auth/identity.py:38`) = every channel. (2) This item's own acceptance says **"Both halves need answers; neither alone closes the cell"** -- one half is answered. (3) ADR 0134 Amendment A satisfies only the SECOND clause of the master-test-plan's exit criterion 12; `GET /uploads` remains pageless, so the first clause is open. (4) The scorecard carrying the 8.2.2 verdict lives outside this repo and is not re-scored by this work.
-> **UPDATE 2026-09-03 -- THE PRINCIPAL-NARROWING AND PAGINATION LIMBS ARE BUILT; THE ITEM STAYS OPEN.** Reasons (1) and (3) above are answered and describe the pre-fix state from here on. **Reason (3):** `GET /uploads` takes `limit`/`offset` (50, 1..500 / 0.., the same bounds declared on the `/ui` twin so the console door is not the looser one), `total` still counts the whole visible set, and the window is applied AFTER the owner filter so a page's length can never encode how many of another operator's files fell inside it. `UploadStore.list_files` sorts by `(uploaded_at, file_id)` because a timestamp is not a total order and a tied file could otherwise land on two pages or none. **The exit-criterion clause COULD NOT BE VERIFIED from an engine checkout, and that is the honest status.** Reason (3) above is phrased against the master test plan's exit criterion 12, and that document is **vaulted** -- `git ls-files docs/testing` returns exactly one file here, `docs/testing/VERIFY.md`, because ADR 0160 moved the plan out and the ignore rules make its absence look like non-existence rather than misplacement. So the pagination is BUILT and its own behaviour is tested; whether it closes that clause is a question only a reader holding the plan can answer, and nobody should re-derive an answer from this row. What is independently true, and is why the work stands on its own: an unbounded listing over a PHI-bearing family is worth fixing whatever the plan says, and a prior ruling already recorded the pageless listing as a resource-consumption gap rather than an object-authorization one -- so this limb was never going to clear the 8.2.2 cell either way. **Reasons (2) and (4) still stand,** and so do the four limbs this item names that nobody has built: the audit-actor immutable-id work, the connection-flag object check plus its by-id-AND-collection parity test, the metrics-exposition scoping, and the directory-immutable identity binding (filed as `#1471` and built there; this update predates it). Reason (1) detail follows. `Identity.allowed_channels` now defaults to the EMPTY set, `_allowed_channels` resolves a NULL `channel_scope` column to no channels rather than every channel, and all-channels survives as a grant somebody typed -- the `*` token in the stored scope list, reusing the string `ad_group_channels.channel` has always used for a wildcard row. The AD sync persists `["*"]` for a wildcard group instead of collapsing to NULL, which after the flip would have inverted a deliberate estate-wide mapping into a deny-everything one. Administrators stay all-channels by role, so the first operator of a fresh install is not locked out; the console's landing page carries the unprovisioned-operator sentence, deliberately a banner and not a start-time refusal. The store was not touched: `create_user` still writes no scope, and writing none is now what denies. **Reasons (2), (3) and (4) all still stand** -- the pagination limb is untouched, and the re-score is not this work's to make.
+> **UPDATE 2026-09-03 -- THE PRINCIPAL-NARROWING AND PAGINATION LIMBS ARE BUILT; THE ITEM STAYS OPEN.** Reasons (1) and (3) above are answered and describe the pre-fix state from here on. **Reason (3):** `GET /uploads` takes `limit`/`offset` (50, 1..500 / 0.., the same bounds declared on the `/ui` twin so the console door is not the looser one), `total` still counts the whole visible set, and the window is applied AFTER the owner filter so a page's length can never encode how many of another operator's files fell inside it. `UploadStore.list_files` sorts by `(uploaded_at, file_id)` because a timestamp is not a total order and a tied file could otherwise land on two pages or none. **The exit-criterion clause COULD NOT BE VERIFIED from an engine checkout, and that is the honest status.** Reason (3) above is phrased against the master test plan's exit criterion 12, and that document is **vaulted** -- `git ls-files docs/testing` returns exactly one file here, `docs/testing/VERIFY.md`, because ADR 0160 moved the plan out and the ignore rules make its absence look like non-existence rather than misplacement. So the pagination is BUILT and its own behaviour is tested; whether it closes that clause is a question only a reader holding the plan can answer, and nobody should re-derive an answer from this row. What is independently true, and is why the work stands on its own: an unbounded listing over a PHI-bearing family is worth fixing whatever the plan says, and a prior ruling already recorded the pageless listing as a resource-consumption gap rather than an object-authorization one -- so this limb was never going to clear the 8.2.2 cell either way. **Reasons (2) and (4) still stand,** and so do the four limbs this item names that nobody has built: the audit-actor immutable-id work, the connection-flag object check plus its by-id-AND-collection parity test, the metrics-exposition scoping, and the directory-immutable identity binding (`#1143`). Reason (1) detail follows. `Identity.allowed_channels` now defaults to the EMPTY set, `_allowed_channels` resolves a NULL `channel_scope` column to no channels rather than every channel, and all-channels survives as a grant somebody typed -- the `*` token in the stored scope list, reusing the string `ad_group_channels.channel` has always used for a wildcard row. The AD sync persists `["*"]` for a wildcard group instead of collapsing to NULL, which after the flip would have inverted a deliberate estate-wide mapping into a deny-everything one. Administrators stay all-channels by role, so the first operator of a fresh install is not locked out; the console's landing page carries the unprovisioned-operator sentence, deliberately a banner and not a start-time refusal. The store was not touched: `create_user` still writes no scope, and writing none is now what denies. **Reasons (2), (3) and (4) all still stand** -- the pagination limb is untouched, and the re-score is not this work's to make.
 > Verdict: research
 > Closing-act: scorecard-rescore
 
@@ -10354,7 +10354,7 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **The research question -- HALF ANSWERED.** What is the correct authorization model for an uploaded file? The engine's whole data-scoping vocabulary is the channel, and an upload is not bound to one, so the research had to decide what a file's resource attribute even is -- uploader identity, the inbound it was injected into, both, or something the model does not yet express -- and whether owner-scoping is right for an operational console where a colleague may legitimately need to inspect a file after a shift change.
 
-**ANSWERED 2026-08-11 (owner-ratified):** the resource attribute is **uploader identity**, bound to the immutable `user_id` and not the username, with the shift-change case served by an explicit `files:access_any` Administrator override rather than by widening the default. The channel axis was rejected on the ground that `allowed_channels` defaults to every channel, so a channel-scoped rule would protect nobody on a default install -- a control resting on a false premise. **Bound on that answer:** re-keying onto `user_id` does NOT close a `sAMAccountName` recycled in the directory without a MessageFoundry `delete_user`, because `_upsert_ad_user` adopted the surviving mirror row and re-bound its id; that needed the directory-immutable binding, **built under #1471** -- `_upsert_ad_user` resolves an AD login by `users.directory_object_id` (the normalised `objectGUID`) and refuses a principal whose id disagrees with the row holding its username. A directory returning no immutable identifier still resolves by name.
+**ANSWERED 2026-08-11 (owner-ratified):** the resource attribute is **uploader identity**, bound to the immutable `user_id` and not the username, with the shift-change case served by an explicit `files:access_any` Administrator override rather than by widening the default. The channel axis was rejected on the ground that `allowed_channels` defaults to every channel, so a channel-scoped rule would protect nobody on a default install -- a control resting on a false premise. **Bound on that answer:** re-keying onto `user_id` does NOT close a `sAMAccountName` recycled in the directory without a MessageFoundry `delete_user`, because `_upsert_ad_user` adopts the surviving mirror row and re-binds its id; that needs the directory-immutable binding tracked as **#1143**.
 
 **STILL UNANSWERED, and it is what keeps this item open:** narrowing `allowed_channels` by default carries a first-run cost, because new non-admins and unmapped AD users would see an empty console until scoped, which reads as broken RBAC on day one. Both halves need answers; neither alone closes the cell.
 
@@ -14325,7 +14325,7 @@ All three inputs were read out of the code rather than taken on trust. **The mod
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Attacked the shipped claim from both directions. The artifact is real, not a similarly-named symbol: I read all 281 lines of scripts/quality/username_access_key_screen.py and all five arms of tests/test_username_access_key_screen.py, and ran the screen against the live default scope (8 candidates, 80 labels excluded) and against the #1225 preset shapes (all four reported, including the upsert write key). The four #1225 sites no longer appear in the live report, so they were re-keyed. So limbs 1-5 confirm. Then I attacked the two limbs the item words as requirements rather than description. First, "a screen catches the next one": grep over .github/, .pre-commit-config.yaml and messagefoundry/checks.py returns zero for the screen against a positive control of 1 for control_char_check, so nothing runs it where a reviewer sees it, and the single pytest arm that touches real engine source asserts only that one already-known site is still present. Second, the proof clause requiring the uploads report be REVIEWABLE: I built a modified copy in the scratchpad with "uploader" moved into LABEL_NAMES and measured api/app.py drop from 1 candidate to 0, then checked each existing assertion by hand against that copy -- all still satisfied. That is the destructive narrowing the item names, unguarded by any test. I guarded the opposite error too. The moved-anchor trap does not apply: the item deliberately cites store-method names rather than line numbers, and I keyed on callee::slot throughout. I also checked whether the screen was wired somewhere non-obvious -- tests/test_tooling_partition.py:100 places it on engine legs deliberately, which is real wiring for the presence assertion but does not make new candidates visible. The scope limb (3) I flag as weaker because the item's prototype spec was the two API modules; limbs (1) and (2) do not depend on it. Value 5 for the remainder: a real gap with an awkward workaround -- someone can run the one command by hand, which is precisely the "found by accident" mode the item exists to end -- and it ships no fix, minor severity by the item's own line. Difficulty 3: an additive CI or quality-advisory step plus a guard assertion is small on an existing seam, but choosing a surfacing shape that fails on a NEW key without turning the screen into a verdict-emitter is a design call the item constrains from both sides. Could not run the pytest suite locally (conftest import fails on a missing pydantic), so the test assertions are established by reading them plus running the screen directly; the screen is stdlib-only and ran clean. _(was 6/10 · 3/10.)_
 >
 > **Filed 2026-08-11 -- a PATTERN claim with FOUR known instances across three subsystems, not a fifth instance.** `Identity` carries an **immutable `user_id`** (`auth/identity.py:30`) and a **reassignable `username`**. A username is freed by delete-and-recreate, so anywhere the username is used as an **ACCESS KEY** a recycled account name inherits the previous holder's objects. Known instances: **#1015** (OIDC RP identity, `auth/oidc/claims.py`), **#1152** (uploaded files -- FIXED, keyed on `uploader_id`), **#1225** (saved search presets, four sites), and at least one unjudged candidate at `api/auth_routes.py:463` (`security_events_for(identity.username)`). **Nothing screens for it.**
-> **RE-KEYING ONTO `user_id` DID NOT CLOSE THE AD PATH ON ITS OWN. The binding that does shipped later, under #1471 -- read this whole paragraph before citing either half of it.** `_upsert_ad_user` (`auth/service.py`) resolved an AD principal by `sAMAccountName` and minted a fresh `user_id` **only when no mirror row survived** -- that is, only after a MessageFoundry `delete_user`. On the DEFAULT path the surviving row was adopted and **its `user_id` re-bound to the new principal**, so a deploying site that recycled a `sAMAccountName` in the directory, leaving the MessageFoundry user in place, would defeat a `user_id`-keyed check exactly as it defeats a username-keyed one. **AMENDED 2026-09-10:** the sentence that followed -- that `AdPrincipal` carries no `objectGUID`/`objectSid`, a repo-wide grep returning **zero** against `sAMAccountName` at 12 as the positive control -- was true when written and is false at HEAD. `AdPrincipal` carries the normalised `objectGUID`, `users.directory_object_id` stores it on all three backends, and `_upsert_ad_user` resolves by it, refusing a principal whose id disagrees with the row holding its username. What is still resolved by name is a directory that returns no immutable identifier at all. **Re-keying was still correct and still closes local accounts and the AD-with-delete path; it was a narrowing, and #1471 is the closure it was waiting on.**
+> **WARNING -- RE-KEYING ONTO `user_id` DOES NOT CLOSE THE AD PATH, and whoever fixes #1225 must know that before they believe they are done.** `_upsert_ad_user` (`auth/service.py`) resolves an AD principal by `sAMAccountName` and mints a fresh `user_id` **only when no mirror row survives** -- that is, only after a MessageFoundry `delete_user`. On the DEFAULT path the surviving row is adopted and **its `user_id` is re-bound to the new principal**. So a deploying site that recycles a `sAMAccountName` in the directory, leaving the MessageFoundry user in place, would defeat a `user_id`-keyed check exactly as it defeats a username-keyed one. `AdPrincipal` (`auth/ldap.py`) carries no `objectGUID`/`objectSid` -- a repo-wide grep returns **zero**, with `sAMAccountName` at 12 as the positive control -- so no better key exists today. The real close is binding AD to a directory-immutable id the way OIDC binds `(issuer, sub)`, tracked as **#1143**. **Re-keying is still correct and still closes local accounts and the AD-with-delete path; it is a narrowing, not a closure.**
 > **WHY A SCREEN AND NOT A SWEEP.** A sweep fixes today's instances; a screen catches the next one. The justification is the independent confirmation, not the count: **two sessions found this class in two different subsystems on the same day, by different routes, neither looking for it** -- and the ledger already held an older third (#1015) that both missed. A defect class that is found three times by accident and zero times on purpose is one nothing is watching for.
 > **SCOPE -- this is what makes it filable rather than vague.** **NOT** the audit `actor=` sites: `identity.username` appears **59 times** in `api/app.py` and **most are audit fields, where recording a NAME is correct** -- an audit row should say who, in the form a human reads. The defect is the username reaching a **WHERE clause, a dict key, an equality against a stored owner field, or a store method's scoping parameter**. Mechanically findable, and the two populations are cleanly separable.
 > **A PROTOTYPE EXISTS AND ITS RESULT IS THE SPEC.** An AST screen (walk `Call` keywords + positional args, `Compare` equality, `Subscript` keys; classify `actor`/`acting_user`/`by` as labels and `owner`/`uploader`/`user`/`key` as access keys) run over the two API modules reported: `api/app.py` **5939 lines scanned, 46 label sites excluded, 13 access-key candidates**; `api/auth_routes.py` **17 excluded, 2 candidates**. It found **all four** #1225 preset sites and the unjudged `security_events_for` candidate.
@@ -27089,46 +27089,7 @@ I did not survey how the fence came to be written, or whether any dispatcher has
 
 ## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
 
-> ✅ **CLOSED 2026-09-10 -- built on branch `claude/ad-immutable-id-1471` (PR 1045), open until that
-> merges.** `users.directory_object_id`
-> ships on all three backends, in-place-upgraded the way the neighbouring `oidc_*` columns are;
-> `AdPrincipal` carries the normalised `objectGUID`; and `_upsert_ad_user` resolves an AD login by that
-> id through the new `get_user_by_directory_object_id`. **The row's own acceptance test is the closing
-> evidence:** a directory-side name recycle with the MessageFoundry row left in place is REFUSED
-> (`directory_identity_conflict`, audited) and adopts nothing --
-> `tests/test_ad_directory_identity.py`, `test_a_recycled_sam_account_name_does_not_adopt_the_departed_operators_row`.
->
-> **Three limits, stated so the green is not over-read.** (1) There is no AD in CI and never has been.
-> `_find_user` itself runs against a double -- the markers sit on the `LDAPException` handlers, not on
-> the lookup -- so the attribute request and the value it carries out are both pinned; what no test
-> reaches is the bind and the wire. The recycle decision is driven at the service layer over a real
-> store. (2) A directory that returns no immutable identifier still resolves by username, and the
-> engine warns ONCE PER DISTINCT CAUSE -- absent as well as unreadable -- rather than per read, because
-> the reconciler probes that path per user per pass. (3) **A directory-side RENAME now behaves
-> differently, and it is an improvement carrying a new wart.** Before, a rename resolved to nothing and
-> minted a SECOND account, silently orphaning the uploads and presets keyed to the first -- this item's
-> own defect from the other side. Now the id finds the row and the person keeps their account, while
-> the stored username stays as created. `reconcile_directory_sessions` still probes BY USERNAME, so at
-> the shipped settings (`ad_session_recheck_seconds` 300, `ad_session_recheck_strikes` 2 -- on whenever
-> a directory is wired) a renamed account reads as absent on every probe and has its sessions revoked
-> once it reaches the strike threshold. **AND THERE IS NO ADMINISTRATIVE REMEDY: nothing writes
-> `users.username` after `create_user`**, in the store protocol, any of its three backends or the API,
-> so a renamed person would re-enter that cycle after every sign-in. Deleting the row is the only
-> escape available and it discards the `user_id` that uploads, quota and presets key on. Fail-closed
-> and audited, never a widened grant; pinned by
-> `test_a_renamed_account_keeps_its_row_and_its_original_username`.
-> **Re-keying that probe and adding a rename path are both unfiled work, named by subject rather than
-> by number:** the reconciler's username-keyed probe and a username writer, which are the ADR 0184
-> reconciler question this row never claimed.
->
-> **The first-contact rule taken, and it is the one that decides the acceptance test:** resolve by the
-> immutable id ONLY. A NULL-id row is never adopted by name, and a login whose id disagrees with the
-> row holding its username is refused rather than backfilled. Adopt-and-backfill on first sight would
-> leave the recycle window open for every account that had not signed in since the upgrade, which is
-> the hole; section 0 (zero deployments, therefore zero legacy rows) is why the strict rule costs
-> nothing.
->
-> **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
+> 🔢 **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
 > of **#1143**'s verification pass, where it was found to have been eliminated on a false premise and
 > to be the work at least seven citations across the repository are already waiting on.
 > Verdict: build
@@ -27170,13 +27131,6 @@ as done if #1143 closed as scoped: `messagefoundry/api/app.py` (`_may_access_upl
 `messagefoundry/uploads.py` (`UploadedFileMeta`), `tests/test_upload_api.py`, ADR 0136,
 `docs/SECURITY.md`, and this ledger's **#1152** and **#1225**. Re-point them here. Enumerated with
 `git grep`; treat it as at least seven and re-run the grep rather than working the list.
-
-**Re-run 2026-09-10, and the count above holds: seven sites, across eight lines.** `#1152` carries the
-citation twice (its 2026-09-03 update and its 2026-08-11 answer); the other six carry it once. All
-seven now name this item and state what shipped, rather than a fix that is still pending. **Left
-alone deliberately:** ADR 0184 and the `docs/adr/README.md` row summarising it. Those are the record
-of a research pass that DESCRIBES the four citations as they stood, so re-pointing them would edit a
-finding rather than a pointer -- and `#1143`'s own row, which is still open on its OIDC limb.
 
 **Shape of the work.** One nullable column on `users` across the three backends, following the
 `reauth_at` convention already in each (`PRAGMA table_info` guard on SQLite, `information_schema`
@@ -30437,216 +30391,3 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 **Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
 
 **Related:** [#1448](#1448) and [#1391](#1391) are the family -- an item stays open because nothing records the work that ANSWERED it. This is the sharpest variant: the answer was not work at all, it was a decision.
-
-## 1532. Re-key the directory session reconciler off the immutable id, and refresh the cached username
-
-> ✅ **CLOSED 2026-09-11 -- built on branch `claude/reconciler-rekey-stack`, which STACKS ON PR 1045
-> (`claude/ad-immutable-id-1471`). It cannot merge before that one.** `_probe_principal` now probes by
-> `directory_object_id` where the row carries one, through a new `resolve_principal_by_object_id` and
-> `object_guid_filter_value` in `auth/ldap.py`; the directory's current `sAMAccountName` is copied down
-> onto `users.username` by `set_user_username` on the store protocol and all three backends, from both
-> the login path and the reconciler pass, through one shared `_refresh_cached_username`.
->
-> **The acceptance test is `test_a_directory_rename_keeps_the_account_its_sessions_and_its_single_row`**
-> (`tests/test_ad_session_reconcile.py`): a directory-side rename over more passes than the strike
-> threshold revokes nothing, leaves exactly one AD row with its original `user_id`, and ends with the
-> new name stored.
->
-> **Four mutations were run against the finished code and each is caught by the test that should catch
-> it** -- probe key reverted to the name, reconciler refresh deleted, login refresh deleted, and the two
-> apply loops put back in their original order. A fifth arm,
-> `test_a_genuinely_absent_account_is_still_revoked_under_the_id_keyed_probe`, is the control on the
-> fix rather than on the defect: a change that made every probe resolve would pass every rename
-> assertion and silently end ADR 0079 mechanism 2.
->
-> **ONE MUTATION ESCAPED FIRST, AND THE ESCAPE IS THE MORE USEFUL RESULT.** The `/simplify` pass moved
-> the key preference out of `AuthService._probe_principal` down into `resolve_principal`, which is the
-> right altitude. It also moved it out of test coverage: every service-level reconciler test runs
-> against `_FakeLdap`, which implements its own preference, so breaking the engine's copy changed
-> nothing any of them could see. **A double cannot test the thing it replaces.**
-> `test_resolve_principal_asks_by_the_immutable_id_when_it_is_given_one` and its by-name twin drive the
-> real `LdapAuthenticator` over a recording connection and close that hole; the mutation now fails.
->
-> **A SECOND DEFECT WAS FOUND IN REVIEW, IN THIS ROW'S OWN NEW CODE.** The first implementation applied
-> renames BEFORE revocations. `_apply_reconcile_revocation` audits with the name the plan captured and
-> notifies with the name it re-reads from the row, so an account renamed and role-changed in the same
-> pass -- one administrative action at many sites -- would have put the old name in the audit row and
-> the new one in the security notice. Revocations now run first, so both reads see the pre-rename name
-> and the rename still lands on the same pass. Pinned by
-> `test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name`.
->
-> **What the green does not prove, unchanged from #1471: there is no AD in CI.** The LDAP filter
-> builder is unit-tested and round-trips against `normalise_object_guid`, and `_search_user` runs
-> against a double, but **no test here establishes that a domain controller answers an `objectGUID`
-> filter** -- only that the engine builds the RFC 4515 byte-escaped form Microsoft tooling emits, from
-> the little-endian bytes the normaliser reads back. The PostgreSQL and SQL Server legs of
-> `set_user_username` are env-gated and run only on the hosted runners.
->
-> **Filed and built 2026-09-11.** Value **7/10** · Difficulty **4/10**. Split out of PR 1045's own
-> stated residual, where it was named by subject because no number had been allocated.
-> Verdict: build
-> Research: none
-> Closing-act: code
-
-**Cluster:** Security / authentication. **Priority:** P1. **Verdict:** build.
-**Severity:** an **availability** defect, not a widened grant -- fail-closed and audited throughout. On
-a first deployment wiring a directory, a person renamed in that directory would have had their engine
-sessions revoked roughly every ten minutes, indefinitely, with no administrative escape. Section 0
-(zero deployments) is why that is written in the conditional; it is not a reason to downgrade the fix.
-
-### The defect, and why it had no floor
-
-BACKLOG #1471 made a directory login resolve its row by `objectGUID`, so a renamed person keeps signing
-in to their own account. `reconcile_directory_sessions` went on probing
-`resolve_principal(user.username)` -- the name the row was created with, which the directory stopped
-answering to at the instant of the rename. That lookup returns `None`, which the reconciler reads as
-`ABSENT`, which is the same answer a **deleted or disabled** account gives.
-
-At the shipped `ad_session_recheck_seconds = 300` and `ad_session_recheck_strikes = 2` -- on whenever a
-directory is wired -- the account collects a strike per pass, and on the second pass its sessions are
-revoked and the holder is emailed a security notice. **The cycle then restarts on its own**: the
-account leaves the candidate set once it holds no live session, the person signs back in (the id still
-finds the row), and it re-enters the candidate set for the next pass.
-
-**There was no manual escape**, and PR 1045's body and CHANGELOG entry both said there was -- "until an
-administrator corrects the stored name". No such operation existed: measured against a positive control
-of `set_user_roles` (8 files), a search for a username writer returned zero across
-`messagefoundry/`. `delete_user` was the only exit, and it discards the `user_id` that
-uploaded-file ownership, the per-uploader quota and saved search presets all key on -- which is the very
-thing #1471 exists to protect. PR 1045 corrected that claim in place on 2026-09-10; this row is the fix.
-
-### Why this is not ADR 0184, and the check was run first
-
-ADR 0184 carries an open decision reading *"The reconciler: exclude bound rows, or re-key the probe?"*,
-so the question was checked before any code was written. It is a different question:
-
-| | ADR 0184's reconciler item | This row |
-| --- | --- | --- |
-| Leg | Federated (OIDC). The ADR states *"This ADR covers the federated (OIDC) leg only"* | The AD leg, which that same section puts explicitly out of scope |
-| Population | Rows carrying an `(issuer, sub)` binding | Every AD-provider row, since #1471 binds them all |
-| Blocked on | An owner trust decision about federated bind ceremony | Nothing. No ceremony, no binding created, no OIDC path touched |
-| Cost of re-keying, as priced there | One nullable column on three backends, a new LDAP attribute read and a lookup path; *"`objectGUID` is the immutable key and is read nowhere today"* | **PR 1045 paid all of it** |
-
-The ADR's other option, *exclude bound rows*, is not available here: every AD row carries a
-`directory_object_id`, so excluding them would disable ADR 0079 mechanism 2 outright -- giving up a
-security control to fix an availability one. There was no choice left to record, so this is a direct fix
-rather than an ADR.
-
-It also **discharges ADR 0184's AC-5** (*"WHILE an account carries a federated binding, THE SYSTEM SHALL
-NOT re-resolve that account from its username in `reconcile_directory_sessions`"*) as a side effect, for
-every AD row including the federated-bound ones. ADR 0184 itself is left unedited, on PR 1045's
-reasoning: it records a research pass, and re-pointing its findings would edit a finding rather than a
-pointer.
-
-### The second question: should an administrator rename or re-bind operation exist?
-
-**No, and the reasoning is recorded because it is a decision not to build.** Three operations were
-considered separately; they are not one question.
-
-1. **A rename surface -- not needed.** Once the probe is id-keyed, a rename self-heals: from the login
-   path at the next sign-in, and from the reconciler within one interval. The value an operator would
-   type is one the directory already knows, so the engine reads it instead of accepting it.
-2. **A re-bind surface (point a row at a different `directory_object_id`) -- must not exist.** That is
-   precisely the privilege transfer #1471 closed, re-introduced through a route. A row that needs a
-   different directory id is a different account.
-3. **An unbind surface (clear the id) -- must not exist.** It would return the row to name-fallback
-   adoption, which is the hole.
-
-`set_user_username` is therefore on the store protocol but reachable from **no API route**, and its
-docstring says why. The same argument governs the id: there is still no setter for
-`directory_object_id`, and this method is not a way to grow one. This is the AD-leg answer to the shape
-ADR 0184 records for `set_user_federated_subject` (*"an unbind is unrepresentable"*); that row's own
-version of the question stays open, because it is about a binding an IdP presents rather than one the
-engine reads.
-
-### The residual, stated rather than assumed away
-
-A rename **onto a name another row already holds** cannot be applied -- `username` is `NOT NULL UNIQUE`
-on all three backends. The two paths resolve it differently, and both are pinned:
-
-- **Login**: refused before the refresh is reached, by #1471's `directory_identity_conflict` guard. The
-  renamed person cannot sign in until an operator removes the stale row. That is #1471's own stated
-  residual, unchanged here.
-- **Reconciler**: no such guard -- it probes an account it has already identified -- so the refresh's
-  own collision branch runs, leaves both rows alone, and audits
-  `auth.ad_username_refresh_conflict`. It costs the renamed person nothing: they were found `PRESENT`
-  by their id, so their sessions and roles are untouched and only the display label stays stale.
-
-A directory returning **no readable `objectGUID`** leaves every row unbound and keeps the pre-#1471
-behaviour, rename wart included. The engine cannot key on an identifier it is never given;
-`auth/ldap.py` warns once per distinct shape. Pinned by
-`test_a_row_with_no_immutable_id_still_probes_by_name`.
-
-### Incidental
-
-`AuthService.directory_reconcile_enabled`'s docstring said *"at the default
-`ad_session_recheck_seconds = 0`"*. The field ships at **300**, which
-`test_reconciler_is_on_by_default` already pins. Corrected, because reading it as off-by-default makes
-every defect in this loop sound like it needs an operator to opt in first.
-
-**Related:** [#1471](#1471) is the row this completes -- it named this work by subject, unfiled.
-[ADR 0184](adr/0184-identify-a-federated-login-by-the-idp-namespaced-subject-not-by-the-username-it-claims.md)
-is the federated sibling, untouched.
-
-## 1540. Dual-control self-approval compares usernames, which BACKLOG #1532 made mutable; key it on the immutable user_id
-
-> 🔢 **Filed 2026-09-11 by the change that caused it.** Value **7/10** · Difficulty **4/10**.
-> `ApprovalGate.approve` refuses self-approval with `if str(row["requester"]) == approver`, a
-> **username string** comparison. That was sound only while `users.username` was immutable for the
-> life of a row -- which it was, until [#1532](#1532) added `set_user_username` and made the column
-> directory-writable. The two sides of that comparison are now snapshots, taken up to
-> `[approvals].expiry_hours` apart, of a value the **directory** controls.
-> Verdict: build
-> Research: none
-> Closing-act: code
-
-**Cluster:** Security / authorization. **Priority:** P2. **Verdict:** build.
-**Severity:** on a first deployment that turned dual-control on, a requester renamed in the directory
-between requesting and approving would pass the self-approval refusal and release their own gated
-action. The privilege bar is *"can rename one AD account"* -- self-service, or a helpdesk delegate
-with write rights over that account -- rather than *"holds a second approver account"*. **Off by
-default** (`[approvals].enabled = False`), so no shipped configuration reaches it without an operator
-turning it on. Section 0: zero deployments, so nothing is exposed today.
-
-### The mechanism, end to end
-
-1. `guard()` persists `pending_approvals.requester = 'jdoe'` with `expires_at = now + expiry_hours`.
-2. Inside that window the directory renames `jdoe` to `jdoe2`.
-3. Either the ADR 0079 reconciler pass (within `ad_session_recheck_seconds`, 300 by default) or the
-   next sign-in copies the new name down through `_refresh_cached_username`.
-4. `POST /approvals/{id}/approve` passes `approver=identity.username`, now `'jdoe2'`.
-5. `'jdoe' == 'jdoe2'` is False. **The refusal does not fire and the requester releases their own
-   request.** Both audit rows name one person two different ways, so the trail does not show it
-   either.
-
-**The reverse failure also exists and is worth stating**, because a fix that only chased the first
-would leave it: once the rename frees `'jdoe'`, a *different* person can be given that name, and
-their attempt to approve is refused as self-approval. That direction is a false REFUSAL rather than a
-false accept, so it is less severe -- but it is the same defect.
-
-### Why the fix is not a one-line change
-
-`pending_approvals.requester` is declared `TEXT NOT NULL` on all three backends and there is **no id
-column** -- the schema comment beside it reads *"who initiated; can never self-approve (dual-control,
-2.3.5)"*. Keying the comparison on the immutable id needs a `requester_user_id` column added on
-SQLite, PostgreSQL and SQL Server, written at `guard()` time, and compared at `approve()` time, with
-the username kept as the display label. That is the shape every other ownership key in the engine
-already uses: uploads key on `uploader_id`, saved search presets were re-keyed onto `owner_user_id`
-for exactly this reason, and WebAuthn credentials key on `user_id`.
-
-Resolving `requester` to an id at comparison time instead is **not** a fix: after a rename the name
-may belong to somebody else, so the lookup would compare the wrong person.
-
-### How it was found, and the general lesson
-
-An adversarial correctness review of #1532 (five lenses, three refuters per finding). This was the
-only HIGH finding that survived 3/3 unrefuted, and it is in a file #1532 does not touch -- the defect
-is the **removal of a premise** another subsystem rested on, not a bad line of code.
-
-`store/base.py`'s own docstring stated that premise in terms: *"the engine has no other writer of this
-column after `create_user`."* #1532 made that sentence false and did not audit who was relying on it.
-**A load-bearing fact stated once is also a fact that can be invalidated once, from somewhere that
-never reads the statement.** The general form is worth more than this instance: when a change makes
-something mutable that was immutable, the work is not the writer -- it is enumerating the readers.
-
-**Related:** [#1532](#1532) is the change that caused this and the row that filed it.
