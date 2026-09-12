@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Census of ledger allocations by WHERE the ledger gate would still let them be committed.
 
 WHAT THIS ANSWERS. `scripts/hooks/ledger_check.py` refuses a commit that introduces an ADR or BACKLOG
@@ -19,8 +19,16 @@ never about whether anyone still wants the number:
                           point at one tree; there is nothing to recover.
     drifted-branch-held   the recorded worktree is live but has moved to another branch, and the
                           recorded branch is checked out in a DIFFERENT live worktree. THIS IS THE
-                          #1414 SHAPE: git refuses to check one branch out in two worktrees, so the
-                          two keys cannot be brought back together.
+                          #1414 SHAPE: git refuses an ORDINARY second checkout of one branch in two
+                          worktrees, so the two keys cannot be brought back together by a plain
+                          `git checkout`. That refusal is a DEFAULT rather than a law of git
+                          (BACKLOG #1039): measured, `git worktree add --force` (and `-f`) check the
+                          same branch out again and succeed, and `git checkout
+                          --ignore-other-worktrees` switches. This verdict therefore reports what the
+                          DEFAULT tooling will do, which is what a seat reading the census is about
+                          to run; it does not assert that the state is unreachable. Forcing it is not
+                          a route to prefer -- two trees on one branch also satisfies the ledger
+                          gate's branch key from both, which is the exclusivity that key rests on.
     drifted-branch-free   the recorded worktree is live and off the recorded branch, and that branch is
                           checked out nowhere (or no longer exists). One `git checkout` re-aligns it.
     orphan-branch-held    the recorded worktree is GONE, but the recorded branch is checked out in a
@@ -81,6 +89,14 @@ from pathlib import Path
 
 BACKLOG_PATH = "docs/BACKLOG.md"
 BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
+# THIS NO LONGER MATCHES THE GATE IT MODELS, AND THE DIVERGENCE IS RECORDED RATHER THAN REPAIRED HERE.
+# `numbers_on_base` below says it computes "the set the gate grandfathers", and `ledger_check.py`
+# carried this identical regex until BACKLOG #1470 replaced it with `backlog_status_check.parse_items`
+# -- the single source CLAUDE.md section 11 names. The two readings differ on a `### N.` SUB-heading
+# inside an item's body: this counts it as an allocated number, the gate does not. Measured 2026-09-10
+# over both ledger files, they return the SAME 746 ids, so the divergence is latent and this tool is
+# not wrong about anything today. Closing it means giving this script the same by-path import, which
+# is a change to a census tool and belongs to its own row rather than to #1470's gate work.
 BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 

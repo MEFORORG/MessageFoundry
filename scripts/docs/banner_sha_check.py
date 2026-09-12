@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A ledger banner claiming a commit closed an item must cite a commit that names THAT item.
 
 BACKLOG #1301. The incident: a retirement banner meant for one item was written onto another. The

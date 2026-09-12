@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the backlog CITATION gate (``scripts/docs/backlog_citation_check.py``).
 
 The gate answers a question no link checker can: ``docs/BACKLOG.md`` always resolves, so a citation

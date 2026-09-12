@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Re-run-stable **ingest time** for Handlers/Routers — the message's engine-assigned receipt timestamp.
 
 A Handler often needs "now" — e.g. defaulting an empty ``OBR-7`` to when the message arrived, or a

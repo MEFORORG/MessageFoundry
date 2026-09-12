@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Regression for SEC-006 (CWE-213): the PHI-classified ``metadata`` message property is gated by the
 field-level authorization map exactly like ``summary``/``error``.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Dual-control (maker-checker) approval workflow for high-value actions (ASVS 2.3.5).
 
 Optional and **deny-by-default** (``[approvals]``, off unless enabled). When a gated operation is

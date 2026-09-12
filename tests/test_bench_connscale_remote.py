@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """STRUCTURAL wiring tests for the DRIVER-ONLY connscale-remote tool (WS-C, ADR 0073) — the
 client-isolated two-box drive that meters ALREADY-RUNNING engines over the network and never spawns
 one. These prove it wires correctly OFFLINE on one PC: disjoint inbound/sink band validation; one

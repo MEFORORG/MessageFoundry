@@ -93,9 +93,11 @@ for the checkouts named in its allowlist:
    (`-b` / `-c`), restoring files (`checkout -- <path>`), and `reset` / `rebase` / `merge` of the
    worktree's *own* branch stay allowed. The gate can't tell a worktree's rightful session from a squatter
    (both share the cwd), so it blocks the move for both; the rightful owner's escape hatch is a **plain
-   terminal** (never gated) or a fresh worktree for the other branch (git then refuses the second checkout,
-   which is the protection you wanted). This closes the gap the old rule left open — that a worktree "may
-   switch its own branch freely."
+   terminal** (never gated) or a fresh worktree for the other branch (git then refuses an **ordinary**
+   second checkout, which is the protection you wanted — that refusal is a default rather than a law of
+   git: measured, `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get
+   past it, so it stops the accident and not a determined bypass). This closes the gap the old rule left
+   open — that a worktree "may switch its own branch freely."
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
 frictionless. Writes into any worktree, the scratchpad, or any other repo are allowed **from a session

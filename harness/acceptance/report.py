@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Render acceptance results — console summary, Markdown, CSV, and optional spreadsheet write-back.
 
 The Markdown/CSV writers are dependency-free. The spreadsheet write-back (filling the matrix

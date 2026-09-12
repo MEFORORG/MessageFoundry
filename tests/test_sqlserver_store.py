@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQL Server store behaviour — mirrors the SQLite suite, against a real SQL Server.
 
 **Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*`` connection env),
@@ -2170,6 +2170,9 @@ async def test_reference_rows_rotate_on_reencrypt_to_active(store) -> None:
 
 # --- H1: store-checked leader epoch (fencing token) ---------------------------
 
+# SqlServerCoordinator's lease key: constant, because this store ignores [store].db_schema.
+_LEASE_KEY = "mefor_cluster_leader"
+
 
 async def _seed_lease_epoch(store, lease_key: str, epoch: int) -> None:
     """Upsert the single ``leader_lease`` row to ``epoch`` (the authoritative current leader epoch). The
@@ -2196,7 +2199,7 @@ async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
     # The fence. leader_lease.leader_epoch is 5 (a standby took over + bumped). A superseded ex-leader
     # still believes it holds epoch 3 (held < current) — its FIFO claim must affect 0 rows (None) and
     # leave the head PENDING, untouched.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
@@ -2211,7 +2214,7 @@ async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
 async def test_current_epoch_claim_succeeds(store) -> None:
     # The live leader holds the SAME epoch as the lease row (held == current): its claim passes. Equality
     # is the boundary — held >= current must include equality, else the true leader could never claim.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     store.set_leader_epoch(5, lease_key=lease_key)
@@ -2230,7 +2233,7 @@ async def test_stale_then_promoted_claim_preserves_fifo_head(store) -> None:
     # FIFO survives the fence: two messages on one lane (N, N+1). A stale ex-leader is rejected (delivers
     # neither); once this node is the current leader it claims the OLDEST first (N), preserving per-lane
     # order across the would-be split-brain.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "n")], now=100.0)
     m2 = await store.enqueue_message(
@@ -2250,7 +2253,7 @@ async def test_pooled_claim_fenced_ex_leader_claims_zero_across_all_lanes(store)
     # ADR 0066 §8 row 7 (H1 pooled): the epoch guard rides the pooled claim's probe AND UPDATE, so a
     # superseded ex-leader's claim_fifo_heads matches 0 rows across ALL requested lanes in one shot —
     # and leaves every head PENDING with attempts untouched (the probe locked nothing).
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     m1 = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB_PF1", "p")], now=100.0

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Durable store/queue behaviour: enqueue, claim, retry/backoff, dead-letter,
 crash recovery, replay, and message finalization. Time is injected for determinism."""
 

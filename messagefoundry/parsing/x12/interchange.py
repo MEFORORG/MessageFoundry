@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Interchange framing for X12 — splitting one stream into complete ``ISA…IEA`` interchanges.
 
 X12-over-TCP has **no transport sentinel**: the *frame is the interchange*, bounded by the opening

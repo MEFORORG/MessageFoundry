@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """IB_DEMO_ORU — Handler (the *handler* file of the per-feed **Hybrid** config layout).
 
 The Handler stays **thin** on purpose: it filters, delegates the field-level work to the

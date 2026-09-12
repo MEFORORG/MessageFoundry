@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Dispatch gate — refuse a wave containing items a builder cannot close.
 
 **The failure this exists to prevent, measured.** On 2026-08-21 thirty items were dispatched to two

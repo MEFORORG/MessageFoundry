@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Run `messagefoundry validate --json` and surface problems in the Problems panel.
 import * as path from "node:path";
 import * as vscode from "vscode";

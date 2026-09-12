@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """File-endpoint alternate Windows / network-share credential (UNC/SMB) — BACKLOG #111, ADR 0132.
 
 CI cannot stand up a real alt-credential UNC share, so the **live** ``LogonUser`` path is a

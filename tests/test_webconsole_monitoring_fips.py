@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The web console's report-only FIPS attestation row (#73, ADR 0120).
 
 Unit-level tests for the ``_fips`` render helper on the monitoring status page. The load-bearing

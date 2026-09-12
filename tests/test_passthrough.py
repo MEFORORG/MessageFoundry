@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Internal pass-through (PT) connector — generalized re-ingress (ADR 0013, generalized).
 
 A Handler ``Send``\\ s its transformed message *into* a PT inbound (an internal inbound with its OWN

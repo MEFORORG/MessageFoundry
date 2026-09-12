@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An invalid escape sequence is a future ``SyntaxError``, and it fails at COLLECTION.
 
 Python has announced that an invalid escape sequence in a string literal becomes a

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synthetic, PHI-free FHIR-JSON fixtures shared by the codec tests (and the FHIR transport tests).
 
 NOT a test module (the leading underscore keeps pytest from collecting it). Every payload here is

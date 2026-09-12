@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0066 — the pooled StageDispatcher wired into RegistryRunner behind ``[pipeline].claim_mode``.
 
 Since issue #744 the default is ``pooled``; ``per_lane`` is the byte-identical opt-out. Three proofs

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Untracked is an INDEX fact; lost is a CONTENT fact (BACKLOG #1298).
 
 The archive dialog warns that untracked files "will be permanently discarded". It reasons from "not

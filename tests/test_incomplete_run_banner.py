@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The incomplete-run banner (BACKLOG #1230, loud-omission half).
 
 Proved in BOTH directions, because a banner that always prints and a banner that never prints are

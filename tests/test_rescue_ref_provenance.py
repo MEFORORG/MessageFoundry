@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A rescue ref must be verifiable WITHOUT the branch it names (BACKLOG #1349).
 
 A rescue ref is consulted once, in the moment the original is already gone -- so it is the one

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """content-search: a step-up-unlock GET page over the JSON search_messages handler (ADR 0046 #51),
 plus saved / layered filter presets (BACKLOG #151, ADR 0136)."""
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale system-under-test: N inbound MLLP connections, each a trivial route → handler →
 one outbound to the correlation sink (B11).
 

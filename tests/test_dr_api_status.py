@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR run-profile status surfacing (#61, ADR 0048 AC-4): a connection the DR run-profile parks below the
 threshold reports status:"filtered" on GET /connections and GET /connections/{name}/metadata — a fifth
 status value distinct from ADR 0031's "failed". A failed connection (a bad bind) stays "failed", so an

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the plan-usage collector and reader (``scripts/coord/usage-*.ps1``).
 
 Claude Code hands the account's live quota state (``rate_limits``) to a **statusLine command's stdin and

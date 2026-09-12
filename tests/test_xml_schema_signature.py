@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Opt-in XSD schema validation + XML-DSig verification for the XML codec (BACKLOG #31) — the strict
 tier behind the tolerant XmlMessage hot path."""
 

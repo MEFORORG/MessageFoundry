@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Report a `#N` backlog citation that names NO ITEM AT ALL (BACKLOG #1235).
 
 NOT `backlog_citation_check.py`, WHICH SITS BESIDE THIS FILE AND ANSWERS A DIFFERENT QUESTION.

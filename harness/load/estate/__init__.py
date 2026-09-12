@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Estate-shape load driver (#216).
 
 Drives the heterogeneous estate SUT (:mod:`harness.config.estate`) — a majority of simple

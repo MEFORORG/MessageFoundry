@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Recognition-first lens (ADR 0089 Phase A) — native ``Message``-API write idioms render as the SAME
 editable ``action`` rows as ADR 0076's wrapper vocabulary, WITHOUT the module being rewritten.
 
