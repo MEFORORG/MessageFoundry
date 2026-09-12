@@ -31263,3 +31263,314 @@ Acceptance: failed stop, delayed stop, already-stopped, timeout, and successful 
 ### Verification limits
 
 Source trace plus extracted functions with fakes across all five arms. No Windows service operation ran, so whether a particular failure leaves the process running or the registration pending deletion is reasoned from documented platform behaviour rather than measured.
+
+## 1559. restart_outbound skips the logging recovery gate, so it resumes a log-halted lane and delivers a message while both log sinks are unwritable
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **8/10** · Difficulty **3/10** · _no research_. The log-failure halt pauses an outbound lane when logging cannot record deliveries. `start_outbound` consults the recovery gate and refuses; `restart_outbound` does not consult it and resumes the same lane. Measured in both claim modes, with a real message written to disk while the guard still reported both sinks unwritable.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** delivery / logging guard. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would deliver messages that nothing can log**, which is the count-and-log invariant. The halt exists precisely so delivery stops when the disposition cannot be recorded, and one of the two doors into resumption never asks.
+
+### Measured, with the refusing arm as its own control
+
+Python 3.14.6, real `MessageStore` and real `RegistryRunner`, nothing monkeypatched beyond the log sinks.
+
+| resume path | `_outbound_paused` after | delivered to disk | message status |
+|---|---|---|---|
+| `start_outbound` | `['OB_TEST']` | no, out dir empty | `routed` |
+| `restart_outbound` | `[]` | **yes, `M1.hl7`** | `processed` |
+
+`guard.can_log()` was `False` and `guard.status()` reported `[('file','unwritable'),('stdout','unwritable')]` throughout, including after the delivery. Identical results under `pooled` and `per_lane`.
+
+The `start_outbound` arm is the control for the rig: the same rig delivered on the other arm, so an empty output directory there is a refusal rather than a dead test.
+
+### A second caller reaches it with no operator at all
+
+The alert-rule `control_action` path reaches the same ungated method, and the halt itself emits a `connection_stopped` event that such a rule can match. So the resume does not require an operator clicking Restart -- a rule configured to restart a stopped connection would close the loop automatically, resuming a lane the halt deliberately paused.
+
+### What closing looks like
+
+Put the recovery gate in front of every path that can resume delivery, not only `start_outbound`. Clear the latch after real recovery, never as a side effect of a restart. Audit the other operator paths: reload and `restart_inbound` were checked here and both correctly leave the lane paused, so the fix is narrow.
+
+Acceptance: with the latch set and revalidation false, every resume path must refuse, in both claim modes, with queued work present. After repair, every path must work. `tests/test_log_write_guard.py` already has a refusal test for the `start_outbound` door; the sibling for the restart door is what is missing.
+
+### A citation that does not resolve
+
+The engine source repeatedly cites `ADR 0162` for this control. No `docs/adr/0162-*.md` exists at `8e36efb0` -- the numbering runs 0161 then 0164. Nothing here rests on that ADR, and the dangling citation is worth repairing alongside, but it is not this item's subject.
+
+### Verification limits
+
+Real store and runner with a synthetic file outbound and forced-unwritable log sinks. No NSSM service, no syslog forwarder, and the full suite did not run.
+
+## 1560. replay of a retention-blanked body delivers an empty frame and finalizes the message PROCESSED, and flips a dead-letter row from ERROR to PROCESSED
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **8/10** · Difficulty **5/10** · _no research_. Retention blanks a delivered outbound body. Replay then re-queues that row, the real delivery worker hands the connector an empty string, and the store finalizes the message `PROCESSED`. On the dead-letter leg the message flips from `ERROR` to `PROCESSED` on the strength of that empty send.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** store / retention and replay. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site replaying an old message after retention had erased its body would transmit a zero-byte frame to the partner and record it as a successful delivery.** A real loopback MLLP receiver saw the empty frame in the probe, so this is not a store-only accounting error -- it reaches the wire.
+
+The dead-letter leg is the worse half and the source review does not state it: a delivery that permanently failed, and whose body retention then erased, is recorded as **successfully delivered** because nothing was sent.
+
+### Measured with a control
+
+Real `MessageStore` and the real `RegistryRunner._process_delivery_item`, nothing monkeypatched. The unpurged control sent the true payload; the purged arm sent an empty string and finalized `PROCESSED`. Both ordinary delivered-message replay and bulk dead-letter replay failed the same way.
+
+### The central difficulty is telling erased from empty
+
+A fix cannot simply refuse empty bodies, because a legitimately empty body is representable. The schema has to distinguish a body that was **erased by retention** from one that was always empty, and from a **shared body reference** where two rows point at one payload. Whichever way that is modelled is the substance of this item; the guard itself is easy once the distinction exists.
+
+### What closing looks like
+
+Record payload availability explicitly and refuse replay of an erased delivery atomically, before it can be claimed. Never let a message whose content no longer exists reach a connector or a success disposition. The equivalent selection paths in `postgres.py` and `sqlserver.py` were read, not run, and need the same treatment.
+
+Acceptance: ordinary and bulk dead-letter replay, mixed retained and erased rows, shared bodies, and a purge concurrent with a replay. Assert that no erased delivery reaches a connector and that no such message reaches `PROCESSED`. Keep the unpurged control in the same test -- without it an empty string proves nothing.
+
+### Verification limits
+
+SQLite only, in-memory and temp-file stores, synthetic bodies. The server backends were read. No real partner system received anything; the receiver was a loopback socket.
+
+## 1561. full restore verification builds a bare StoreSettings, so it fails a good encrypted backup and passes one whose ciphertext is unrecoverable
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **8/10** · Difficulty **4/10** · _no research_. `_full_open_check` constructs `StoreSettings(path=snap)` with no encryption configuration, so the snapshot is always opened with `IdentityCipher`. One root cause, two opposite failures: a **good** encrypted backup carrying `state` or `reference` rows FAILS with `StoreKeylessError`, and a backup whose message ciphertext has been altered PASSES.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** disaster recovery / restore verification. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would be told its encrypted backups verify when their PHI is unrecoverable, and told a good backup is broken when it is not.** A false readiness result on a backup is the kind of answer an operator acts on exactly once.
+
+### Measured, both directions, with controls
+
+Python 3.14.6 against the real code:
+
+- `StoreSettings(path=...)` as built by `_full_open_check` carries `encryption_key = None`, `key_provider = 'auto'`, and `build_store_cipher(...).encrypts = False`. The cipher class is `IdentityCipher`; the keyed control produces `AesGcmCipher`.
+- A message's at-rest `messages.raw` begins `mfenc:v2:a256gcm:` -- the positive control that it really is ciphertext.
+- Altering that ciphertext still returned `(True, 'ok')` from the full check, while a keyed `get_message` on the same row raised `CipherError`.
+
+### Which failure you get depends on the snapshot, and the common case is the silent one
+
+The FAIL arm is conditional on the snapshot carrying `state` or `reference` rows. The common case -- no such rows -- is the **silent PASS**. So the loud symptom is the rarer one, and the dangerous one is the default.
+
+The defect also reaches `BackupRunner.run_once` and `run_restore_verify`, the two surfaces an operator actually invokes. Both report PASS with `reason` None. That is what makes it a false readiness result rather than a private-helper curiosity.
+
+The FAIL arm's reason string is separately misleading: on Windows it reads as a file-lock problem, sending an operator after the wrong cause.
+
+### What closing looks like
+
+Preserve the original encryption configuration, retired keys and provider settings while substituting only the restore-copy path. Then decide what "full" verification promises: reading and authenticating retained ciphertext is the honest meaning, and a proportionate design (bounded sampling rather than decrypting every cell) may be the right answer on a large store. Whatever is chosen, say it in [ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md) and make the check deliver it.
+
+Acceptance: a valid encrypted snapshot with state and reference rows must PASS; a snapshot with a corrupted AEAD cell must FAIL; a rotation needing a retired key must PASS; a wrong key must FAIL. Structural integrity passing must not be sufficient on its own.
+
+### Verification limits
+
+Serialized synthetic databases reopened from temp files. No physical archive restore ran, and no real backup was read.
+
+## 1562. the approve path commits approved before executing and excludes cancellation, leaving a row approved with no outcome, invisible and unretryable
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **4/10** · _no research_. `ApprovalGate` transitions the row to `approved` first (deliberately, to guard a double-approve race) and then executes, with cancellation excluded from compensation. Cancelling leaves the row `approved`, no effects, only an `approval.requested` audit event, a 409 on retry **and** on reject, and the row absent from `GET /approvals`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** approvals / dual control. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator would have an approved operation that never ran, cannot be retried, cannot be rejected, and does not appear in the pending list.** There is no in-product route back to a clean state.
+
+### The cancellation source ships with the engine
+
+This is not a synthetic-executor curiosity. `RequestTimeoutMiddleware` wraps every HTTP handler in `asyncio.timeout` with a **120-second default**, and the whole defect reproduces through the real routes with only that middleware causing the cancel. Any approved operation whose execution outruns the request deadline lands in this state.
+
+### What closing looks like
+
+Separate **authorization** from **execution status**. Record an explicit interrupted or unknown-outcome state and support deliberate reconciliation from it.
+
+**Do not auto-retry.** The effects may already have occurred, and a blind rerun of an approved operation is worse than the stuck row. The ordering that commits `approved` before executing is correct and guards a real race -- keep it, and add the outcome field rather than moving the commit.
+
+Acceptance: cancel before effects, after effects, and during outcome recording. Double-approval protection and both actor identities must survive. The audit trail must distinguish approved-and-ran from approved-and-cancelled, which today it cannot -- that is an audit-completeness gap in its own right. Reconcile unfinished states at startup.
+
+### Verification limits
+
+Real routes and real gate with a synthetic executor, plus the shipped timeout middleware as the cancellation source. No real dual-control operation was executed.
+
+## 1563. both server stores hardcode disk_free_bytes=0 to mean unmeasurable, and the health reducer reads that sentinel as a critical disk failure
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. `postgres.py` and `sqlserver.py` both return `disk_free_bytes=0` with the comment that remote disk is not readily available. The web console health reducer reads zero as below its 1 GiB critical threshold.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** status / health reducer. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site on PostgreSQL or SQL Server would see a permanent engine-health "down" and a "0 B" disk-free row, with nothing wrong.** A health indicator that is always red is a health indicator nobody reads.
+
+### Measured through the real reducer
+
+Thresholds: critical 1.0 GiB, warning 5.0 GiB.
+
+| `db.disk_free_bytes` | health | reason |
+|---|---|---|
+| 0 (server sentinel) | down | low disk (db): 0.0 GiB free |
+| 2 GiB | warn | low disk (db): 2.0 GiB free |
+| 6 GiB | ok | none |
+
+### Two things wider than the source review said
+
+**SQLite is not immune.** Its `_disk_free_bytes` returns 0 from the `OSError` branch on an unreachable drive, so the same collision exists there. The difference between backends is how often each trips it, not whether the contract is ambiguous.
+
+**The reducer is not the only reader.** The same zero renders as "0 B" on the Engine Status page disk-free row, so a fix confined to the reducer would leave a wrong number on screen.
+
+### What closing looks like
+
+Represent unknown explicitly through the store and API models rather than overloading zero -- `None`, or an enum, carried end to end. **A measured zero must still alarm**; a fix that silences a genuinely full disk would be worse than the defect. Skip only the unavailable measurement, and make the page render unknown as unknown rather than as a quantity.
+
+Acceptance: both server backends report healthy without inventing capacity; a true zero still alarms; an unavailable log-drive value and a failed status probe are distinguished from each other and from a real zero.
+
+### Verification limits
+
+Real store methods and the real reducer over fake successful reads. No live PostgreSQL or SQL Server ran.
+
+## 1564. the nav alert bell derives count and worst severity from the newest 200 rows, so an older critical alert is invisible and the label does not say it truncated
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. The nav route computes both the alert count and the worst severity from the newest 200 alert rows. With 201 active alerts whose only critical is the oldest, the bell reports `count=200, severity=warning`, and the label shows no sign it truncated.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** web console / alerting. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site with a busy alert history would have its worst alert hidden by newer, less severe ones, at exactly the moment volume made the bell matter most.**
+
+### Measured through the real route
+
+    [200 warnings + 1 older critical]  rows in store: 201
+    operator GET /ui/nav-status -> alerts={"count": 200, "severity": "warning"}
+    viewer   GET /ui/nav-status -> alerts=null
+    [CONTROL 199 warnings + 1 older critical] -> severity critical restored
+
+### The count is wrong too, and that is the part that hides it
+
+The bell renders "200 active alerts" over 201 active alerts, with no truncation marker anywhere in the label. A counter that saturates silently looks like a working counter, which is why the severity error can persist unnoticed.
+
+Raising the limit only moves the threshold. The fix is a scoped aggregate -- count and maximum severity computed in the store -- not a bigger page.
+
+### The permission property a fix must not break
+
+A viewer without `monitoring:diagnose` currently receives `alerts=null`, and that was verified rather than assumed. An aggregate computed outside the permission filter would leak the existence and severity of alerts to someone who cannot see them -- a worse defect than the one being fixed. The detail query must stay bounded.
+
+Acceptance: more than 200 alerts with the worst one oldest; resolution and acknowledgement; scope isolation; and the `alerts=null` case preserved.
+
+### Verification limits
+
+Real route over a real store with synthetic alert rows. No browser rendered the label; the JavaScript was read.
+
+## 1565. tray discovery tokenizes NSSM AppParameters with str.split, so a quoted config path is lost and the absent settings imply https
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. `tray/config.py` splits the NSSM `AppParameters` string on whitespace, so a quoted `--service-config` path becomes a quote-prefixed fragment that resolves to a nonexistent file. The settings are then absent, and absent settings make `engine_serves_https()` answer True.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tray / service discovery. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site that declared `tls_terminated_upstream` would have its tray build an https URL against an engine deliberately serving plaintext behind a proxy**, and fail to reach it.
+
+### Three corrections to the source review, all measured
+
+**A quoted path with no space breaks identically.** The review scopes the defect to paths containing a space. `.split()` never removes the quote characters, so `"C:\data\instance.toml"` fails the same way. The defect is quoting, not spaces.
+
+**The same split breaks `--host` and `--port`.** A quoted value fails the host regex and `int()`, so the discovered URL is wrong by more than its scheme.
+
+**The scheme flip is the consequence, not the bug.** Misparsing loses the config file; losing the config file means no settings; no settings imply https. Each step is reasonable and the chain is wrong.
+
+### What closing looks like
+
+Parse Windows command-line quoting properly before validating anything -- `shlex` with `posix=False`, or `CommandLineToArgvW` semantics -- and handle the `--service-config=value` equals form. A naive quote-strip is as wrong as a naive split. Keep explicit tray URL overrides working.
+
+Acceptance: quoted and unquoted paths, with and without spaces; the equals form; malformed quoting; relative paths; an operator-supplied certificate; and a declared upstream-termination topology. The tray is stdlib ctypes with no PySide6, and the fix stays inside that.
+
+### Verification limits
+
+The real parser driven with synthetic `AppParameters` strings. No registry was read or written, and no service exists to discover.
+
+## 1566. both documented PowerShell install recipes run pip install after the provenance verifier exits nonzero, and a third copy has the same defect
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **2/10** · _no research_. PowerShell does not stop on a native command's nonzero exit, and neither documented block checks `$LASTEXITCODE`. With the attestation verifier returning exit 7, both blocks in `docs/INSTALL-GUIDE.md` reached `pip install`. The comments saying to install only after successful verification enforce nothing.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** install guide / supply chain. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments, and the recipes reference a release that would have to exist). Conditional: **an adopter following the documented verify-then-install path would install an artifact whose provenance check had just failed, and see no error.** The recipe's whole purpose is supply-chain integrity, so a silent pass-through defeats the reason it exists.
+
+### Three recipes, not two
+
+`docs/EARLY-ADOPTER-GUIDE.md` carries a near-copy of the first block with the identical structure and the identical reassuring comment, and restates the second inline. A fix scoped to `INSTALL-GUIDE.md` would leave a working copy of the defect in the guide aimed at the earliest adopters.
+
+### What closing looks like
+
+Check `$LASTEXITCODE` immediately after every external command and stop before installation on any failure. `$ErrorActionPreference` does not cover native exit codes, which is the trap that produced this. Also constrain the artifact glob: resolve to exactly one file and install that file, since an unvalidated wildcard feeding `pip install` is its own defect -- say what happens at zero matches and at several.
+
+Acceptance: successful verification permits install; download failure, either verifier failing, zero matches and multiple matches each prevent it. Drive it with every external command intercepted, and prove the interception worked with a positive control.
+
+### Verification limits
+
+Both blocks were extracted and run with every external command replaced by a recording fake. Nothing was downloaded and nothing was installed.
+
+## 1567. the install guide pairs pip download --no-deps with pip install --no-index, so a clean environment refuses on the first runtime dependency
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. The guide downloads with `--no-deps` and then installs with `--no-index` from that directory. The engine declares 19 runtime dependencies, none of which are present, so pip refuses on the first one.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** install guide / supply chain. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an adopter following the documented recipe in a clean environment would get a resolution failure rather than an install.** Loud rather than silent, which is why this sits below the verifier finding above.
+
+### A correction to the source review's framing
+
+It calls this "the offline install recipe". The section heading is *Verify the release before you install (supply-chain integrity)*, and the file contains no occurrence of "offline" at all. `--no-index` is there to stop pip silently substituting an index copy for the artifact just verified, not to support an air-gapped install. That distinction decides the fix.
+
+### What closing looks like
+
+Two coherent options, and the recipe should pick one and say which:
+
+1. **Verified-artifact install with normal resolution** -- install the verified file by path, letting dependencies resolve from the index. Keeps the verification meaningful and works in a clean environment.
+2. **A genuinely complete offline directory** -- download the full closure, hash-locked. The project already maintains a hash-locked `requirements.lock`, so this is reachable without inventing a new mechanism.
+
+The first matches the section's stated purpose. The second is a different feature and should be labelled as one if it is wanted.
+
+Acceptance: run the corrected recipe in a clean disposable environment; verify all dependencies resolve and that the installed engine is the exact verified artifact.
+
+### Verification limits
+
+Reasoned from pip semantics and exercised against a synthetic wheel carrying the project's real 19-entry `Requires-Dist`. The real artifact was not downloaded, so the resolver was tested against true metadata rather than the true file.
+
+## 1568. starting an outbound with no traffic removes its row from the connections table, taking away the control that would stop it
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **3/10** · _no research_. Connection table rows are built from traffic edges, not from configured connections. A configured outbound with no traffic shows a row while stopped, and loses it once started -- and the row's checkbox is the browser's only source of Start, Stop and Restart targets.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** web console / connections. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator who starts an idle outbound loses the ability to stop it from the browser**, and must use the JSON API to recover. The control vanishes precisely when it is needed, which is what raises this above cosmetic.
+
+### Measured, both directions
+
+Real list, start and stop callbacks with the real table rendering. Stopped with no traffic: a row is present. After Start succeeds with no traffic: no row. After an API Stop: the row returns.
+
+Three confirmations that the checkbox really is the only browser control path: the fragment docstring says so, bulk-control is the only route consuming the row-key decoder, and the front end has a single submitter.
+
+### What closing looks like
+
+Emit a standalone row for every configured outbound that has no traffic edge, carrying its current status. Keep the traffic-derived rows as they are.
+
+**Preserve the scope guard.** A shared outbound visible only to a scoped user must not become visible to someone who should not see it when standalone rows are added. That guard exists today and a careless fix would widen it.
+
+Acceptance: Start, then a visible running row, then a browser Stop, all without sending a message. Cover first traffic arriving, multiple inbound edges to one outbound, and a scoped user.
+
+### Verification limits
+
+Fake runner transitions with the real callbacks and rendering. No connector was started and no message was sent.
