@@ -44,11 +44,11 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Final
+from typing import Final, Literal
 
 import pytest
 
-from tests._workflow_contexts import load_workflow
+from tests._workflow_contexts import jobs_of
 
 _ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 _STATUS_CHECK: Final[Path] = _ROOT / "scripts" / "docs" / "backlog_status_check.py"
@@ -77,6 +77,7 @@ _ARCHIVE_FILE: Final[str] = _CANON_FILES[1]
 _ARCHIVE_DIR: Final[str] = Path(_ARCHIVE_FILE).parent.as_posix()
 _CANON_PATHS: Final[frozenset[str]] = frozenset({*_CANON_FILES, _ARCHIVE_DIR})
 _CANON_BASENAMES: Final[frozenset[str]] = frozenset(Path(p).name for p in _CANON_FILES)
+_CANON_STEMS: Final[frozenset[str]] = frozenset(Path(p).stem for p in _CANON_FILES)
 
 # --- token extraction ---------------------------------------------------------------------------
 #
@@ -90,16 +91,38 @@ _CANON_BASENAMES: Final[frozenset[str]] = frozenset(Path(p).name for p in _CANON
 # branch, and a pattern that escaped its dots and named no archive would have been extracted as
 # nothing at all. Measured while mutating: re-pointing that hook's archive branch made the file
 # vanish from the sweep entirely rather than reporting a changed pattern.
+#
+# `BACKLOG\(\?` IS THE THIRD ANCHOR AND IT IS NARROW ON PURPOSE. The census's pattern-hunting
+# needle opens a non-capturing group straight after the filename stem
+# (`BACKLOG(?:\\\.md|\*\\?\.?md|...)`), so neither of the other two anchors reaches it -- and that
+# is the one needle aimed at OTHER sites' regex spellings, so re-pointing it makes the census
+# under-report with nothing red. A bare `BACKLOG` anchor would reach it and is refused: the census
+# records measuring exactly that, where a bare stem matched the closing bold marker of ordinary
+# prose and reported a benchmarks handoff as a migration target.
+#
+# `^` IS IN THE PREFIX CLASS BECAUSE THE ANCHOR IS PART OF THE PATTERN. Both real consumers use
+# SEARCH semantics -- pre-commit applies a `files:` filter with `re.search`, and `grep -qE` is
+# unanchored by default -- so `^docs/(...)$` and `docs/(...)$` are different filters, the second
+# also matching `mydocs/BACKLOG.md`. An extractor that drops the `^` cannot see that edit at all.
+#
+# `[` and `]` are in both classes so a BRACKETED separator survives: the census spells its needle
+# `docs[/\\]BACKLOG\.md`, and without them the token truncates to `BACKLOG\.md` and the directory
+# -- the half a move changes -- falls out of view.
 _TOKEN: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z0-9_./\\()|*+?-]*"
-    r"(?:BACKLOG(?:-CLOSED)?\\?\.md|archive[/\\]backlog)"
-    r"[A-Za-z0-9_./\\()|*+?$-]*"
+    r"[\^A-Za-z0-9_./\\()\[\]|*+?-]*"
+    r"(?:BACKLOG(?:-CLOSED)?\\?\.md|BACKLOG\(\?|archive[/\\]backlog)"
+    r"[:A-Za-z0-9_./\\()\[\]|*+?$-]*"
 )
 #: Characters that mark a token as a REGEX rather than a path. A bare closing paren is not one of
 #: them: `-- docs/BACKLOG.md)` occurs in a remedy string, and treating it as a pattern would leave
 #: the stray paren welded to the path and make the pin unreadable.
 _META: Final[frozenset[str]] = frozenset("(|*+?$[\\")
 _TRAILING: Final[str] = ".,);:"
+
+
+def _is_pattern(tok: str) -> bool:
+    """Is this spelling a REGEX rather than a path? The one decision the classification hinges on."""
+    return bool(_META & set(tok))
 
 
 def _tokens(text: str) -> list[str]:
@@ -115,11 +138,8 @@ def _tokens(text: str) -> list[str]:
     found: list[str] = []
     for raw in _TOKEN.findall(text):
         tok = raw
-        if not (_META & set(tok)):
-            tok = tok.replace("\\", "/")
-            while tok and tok[-1] in _TRAILING:
-                tok = tok[:-1]
-            tok = tok.strip("/")
+        if not _is_pattern(tok):
+            tok = tok.replace("\\", "/").rstrip(_TRAILING).strip("/")
         if tok:
             found.append(tok)
     return found
@@ -135,21 +155,23 @@ def _python_code_strings(source: str) -> list[str]:
     parent directory as a second, independent declaration.
     """
     tree = ast.parse(source)
+    # ONLY the four node kinds that can HOLD a docstring. A duck-typed `getattr(node, "body", ...)`
+    # also matches `if`, `for`, `while`, `with` and `try`, so a ledger spelling sitting as the first
+    # statement of any of those would be dropped as prose -- a false clean, in a sweep whose stated
+    # exclusion is module and function docstrings and nothing else.
     docstrings: set[int] = set()
+    nested: set[int] = set()
     for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if (
-            isinstance(body, list)
-            and body
-            and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)
-        ):
-            docstrings.add(id(body[0].value))
-
-    nested = {
-        id(n.left) for n in ast.walk(tree) if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div)
-    }
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                docstrings.add(id(first.value))
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            nested.add(id(node.left))
     consumed: set[int] = set()
     out: list[str] = []
     for node in ast.walk(tree):
@@ -188,9 +210,16 @@ def _python_code_strings(source: str) -> list[str]:
 
 
 def _mentions_a_canonical_name(tok: str) -> bool:
-    """Does this spelling still name a ledger file, once regex escaping is folded away?"""
+    """Does this spelling still name a ledger file, once regex escaping is folded away?
+
+    STEM as well as basename, and the stem is the one that carries the weight. The census's
+    pattern-hunting needle deliberately does NOT spell ``.md`` straight after the stem -- it spells
+    the alternation of ways OTHER files spell the extension (``BACKLOG(?:\\\\\\.md|\\*...)``) -- so
+    demanding the full basename there would red on a correct needle. What a rename does break is
+    the stem, and that is what this asks.
+    """
     plain = tok.replace("\\", "")
-    return any(name in plain for name in _CANON_BASENAMES)
+    return any(name in plain for name in _CANON_BASENAMES | _CANON_STEMS)
 
 
 def _uncommented_lines(source: str) -> list[str]:
@@ -220,7 +249,12 @@ class Site:
     path: str
     #: ``both`` -- names the whole two-file namespace. ``live`` -- deliberately the open ledger
     #: only. ``archive`` -- deliberately the archive subtree only. ``pattern`` -- a regex or glob.
-    role: str
+    #:
+    #: An independent declaration of INTENT, which the extracted tokens are then checked against.
+    #: Deriving it from the tokens would make the role arms tautological, so it stays hand-written
+    #: -- and `Literal` is what stops a typo turning `[s for s in SITES if s.role == "both"]` into
+    #: an empty parameter set, which pytest reports as a skipped arm rather than a failure.
+    role: Literal["both", "live", "archive", "pattern"]
     #: Every spelling the file declares AND HOW MANY TIMES, as ``_spellings`` folds them. Pinned by
     #: content rather than by line number: an anchor keyed on a line is dead the next time the file
     #: is edited. The count is what catches a masked loss -- see ``_tokens``.
@@ -347,6 +381,19 @@ PATTERN_SITES: Final[tuple[Site, ...]] = (
     ),
 )
 
+#: BOTH registries, for the arms that apply to every site regardless of shape. Splitting the
+#: registry was the original mistake: `backlog-hygiene.yml` is labelled `pattern` and declares four
+#: PLAIN paths alongside its one regex, so while the agreement arm walked `SITES` alone, those four
+#: were never compared to `DEFAULT_SOURCES` -- move the ledger and that workflow's content pin still
+#: passes while nothing checks where it points.
+ALL_SITES: Final[tuple[Site, ...]] = (*SITES, *PATTERN_SITES)
+
+#: Which roles have an arm of their own, and which are recorded intent with no arm. Split out and
+#: asserted because `[s for s in SITES if s.role == "both"]` on a typo yields an EMPTY parameter
+#: set, and pytest reports that as a skipped arm rather than a failure.
+_ARMED_ROLES: Final[frozenset[str]] = frozenset({"both", "live"})
+_UNARMED_ROLES: Final[frozenset[str]] = frozenset({"archive", "pattern"})
+
 #: Paths that must NOT match a ledger pattern. Without these the match arm is satisfied by `.*`, and
 #: a pattern that accepts everything is indistinguishable from one that is aimed correctly.
 PATTERN_CONTROLS: Final[tuple[str, ...]] = (
@@ -357,10 +404,14 @@ PATTERN_CONTROLS: Final[tuple[str, ...]] = (
     "docs/archive/backlog/BACKLOG-CLOSED.txt",
 )
 
-#: Where the discovery sweep looks. Machinery only: `tests/` builds synthetic ledgers as fixtures,
-#: so a spelling there is a subject and not a configuration.
+#: Where the discovery sweep looks. `tests/` is out: a test builds synthetic ledgers as fixtures, so
+#: a spelling there is a subject and not a configuration, and the one real exception (the pytest-side
+#: floor) is registered by hand below. `messagefoundry/` IS in, and is green today -- its three
+#: mentions are all in docstrings or comments and extract to nothing -- because a `docs/BACKLOG.md`
+#: constant landing in a shipped module is precisely the site nobody would think to register.
 SWEEP_SCOPE: Final[tuple[str, ...]] = (
     "scripts/",
+    "messagefoundry/",
     ".github/workflows/",
     ".pre-commit-config.yaml",
 )
@@ -368,13 +419,14 @@ SWEEP_SUFFIXES: Final[tuple[str, ...]] = (".py", ".ps1", ".yml", ".yaml")
 
 
 def _tracked() -> list[str]:
+    """Tracked paths, NUL-separated. A path containing a space splits into two on whitespace."""
     out = subprocess.run(
-        ["git", "-C", str(_ROOT), "ls-files"],
+        ["git", "-C", str(_ROOT), "ls-files", "-z"],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    return out.split()
+    return [p for p in out.split("\0") if p]
 
 
 # --- the two item-count floors --------------------------------------------------------------------
@@ -391,20 +443,55 @@ def _tracked() -> list[str]:
 # nothing comparing them. This is that comparison.
 _CI_WORKFLOW: Final[str] = "ci.yml"
 _FLOOR_TEST: Final[Path] = _ROOT / "tests" / "test_backlog_status_check.py"
-_FLOOR_CONST: Final[re.Pattern[str]] = re.compile(
-    r"^_MIN_TOTAL_ITEMS\s*(?::\s*[^=]+)?=\s*(\d+)\s*$", re.M
-)
 _CI_FLOOR: Final[re.Pattern[str]] = re.compile(
     r"backlog_status_check\.py[^\n]*?--min-items\s+(\d+)"
 )
 
+#: The three integers that LOOK like this pair and are not, with the module each lives in. All are
+#: instrument-sanity floors -- they refuse a broken READ -- and the arm below pins that reading by
+#: requiring each to stay under the binding floor, so raising one into anti-narrowing territory
+#: reds and the classification above gets re-examined instead of quietly going stale.
+_SANITY_FLOORS: Final[tuple[tuple[str, str], ...]] = (
+    ("scripts/coord/dispatch_gate.py", "MIN_ITEMS"),
+    ("scripts/coord/landed_citation_screen.py", "MIN_ITEMS"),
+    ("scripts/coord/throughput.py", "DEFAULT_MIN_ITEMS"),
+)
+
+
+def _int_constant(path: Path, name: str) -> int:
+    """Read a module-level integer by AST, without importing the module.
+
+    An AST read rather than a regex because the regex needed its own tolerance for a type
+    annotation and had its own extra failure mode; rather than an import because importing a TEST
+    module executes its body a second time under a second name -- `tests` has no `__init__.py`, so
+    pytest has already imported it top-level.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    values: list[int] = []
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, int):
+            values.append(value.value)
+    assert len(values) == 1, (
+        f"expected exactly one module-level `{name} = <int>` in {path.name}, found {len(values)}: "
+        f"{values}. Two of them means the later one wins silently; none means it moved or grew an "
+        "expression, and this reader has to be re-pointed at it."
+    )
+    return values[0]
+
 
 def _ci_min_items() -> int:
     """The `--min-items` argument CI passes, read out of the workflow rather than restated here."""
-    workflow = load_workflow(_CI_WORKFLOW)
     hits: list[int] = []
-    for job in workflow.get("jobs", {}).values():
-        for step in job.get("steps", []) or []:
+    for job in jobs_of(_CI_WORKFLOW).values():
+        for step in job.get("steps") or []:
             run = step.get("run")
             if isinstance(run, str):
                 hits.extend(int(m) for m in _CI_FLOOR.findall(run))
@@ -417,12 +504,7 @@ def _ci_min_items() -> int:
 
 
 def _pinned_floor() -> int:
-    match = _FLOOR_CONST.search(_FLOOR_TEST.read_text(encoding="utf-8"))
-    assert match is not None, (
-        f"_MIN_TOTAL_ITEMS is no longer a bare integer assignment in {_FLOOR_TEST.name}. It is the "
-        "pytest-side half of the anti-narrowing floor; if it moved, re-point this reader at it."
-    )
-    return int(match.group(1))
+    return _int_constant(_FLOOR_TEST, "_MIN_TOTAL_ITEMS")
 
 
 def _live_total() -> int:
@@ -484,20 +566,27 @@ def test_the_canonical_corpus_resolves_to_a_real_ledger() -> None:
 # --- the assertions -------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("site", SITES, ids=lambda s: s.path)
+@pytest.mark.parametrize("site", ALL_SITES, ids=lambda s: s.path)
 def test_each_configured_site_still_spells_the_corpus_it_did(site: Site) -> None:
-    """Content pin. A site whose declaration changed reds HERE, naming the site and the delta."""
+    """Content pin. A site whose declaration changed reds HERE, naming the site and the delta.
+
+    ONE arm over both registries. Written twice, the two messages drifted immediately -- the
+    pattern half lost the gained/lost delta and the remedy sentence -- so the same class of drift
+    reported worse depending on which tuple a site happened to sit in.
+    """
     found = _spellings(site.path)
     expected = site.counts
     assert found == expected, (
         f"{site.path} ({site.why}) declares {sorted(found.items())}; this gate is pinned to "
         f"{sorted(expected.items())}. Gained: {sorted((found - expected).items())}. Lost: "
-        f"{sorted((expected - found).items())}. If the ledger moved, every site in SITES moves in "
-        "the SAME commit -- a partial move is the defect BACKLOG #1250 names."
+        f"{sorted((expected - found).items())}. If the ledger moved, every site moves in the SAME "
+        "commit -- a partial move is the defect BACKLOG #1250 names. A REWORDED OPERATOR MESSAGE "
+        "reds here too, and legitimately: four of backlog-hygiene.yml's five spellings live in the "
+        "advice it echoes to the author. Re-pin, and say in the commit which it was."
     )
 
 
-@pytest.mark.parametrize("site", SITES, ids=lambda s: s.path)
+@pytest.mark.parametrize("site", ALL_SITES, ids=lambda s: s.path)
 def test_no_site_names_a_path_outside_the_canonical_corpus(site: Site) -> None:
     """Agreement. Every path-shaped spelling must be one the canonical definition still names.
 
@@ -506,7 +595,7 @@ def test_no_site_names_a_path_outside_the_canonical_corpus(site: Site) -> None:
     half-moved state the whole file is about.
     """
     for tok in _spellings(site.path):
-        if _META & set(tok):
+        if _is_pattern(tok):
             # A REGEX FRAGMENT, not a path. `backlog_dependency_census.py` carries three -- the
             # needles it hunts other files' spellings WITH -- and a fragment lifted out of an
             # alternation is not a compilable pattern on its own, so it cannot be run against the
@@ -557,33 +646,29 @@ def test_a_live_only_site_names_the_open_ledger_and_no_archive(site: Site) -> No
 
 
 @pytest.mark.parametrize("site", PATTERN_SITES, ids=lambda s: s.path)
-def test_each_pattern_site_still_spells_what_it_did(site: Site) -> None:
-    found = _spellings(site.path)
-    assert found == site.counts, (
-        f"{site.path} ({site.why}) declares {sorted(found.items())}; pinned to "
-        f"{sorted(site.counts.items())}."
-    )
-
-
-@pytest.mark.parametrize("site", PATTERN_SITES, ids=lambda s: s.path)
 def test_each_pattern_actually_matches_the_real_ledger_paths(site: Site) -> None:
     """Patterns are compared by MATCHING, never by string equality.
 
     Two correct patterns for one corpus are written differently (`.*` against `.+`, the `docs/`
     prefix inside the alternation against outside it), so comparing their text reports drift that
     does not exist. Running them against the real paths asks the question the move actually poses.
+
+    ``re.search``, NOT ``re.match``, because that is what the consumers do: pre-commit applies a
+    ``files:`` filter with ``search`` and ``grep -qE`` is unanchored. Under ``match`` the leading
+    ``^`` is free -- deleting it widens the real hook to ``mydocs/BACKLOG.md`` and this arm cannot
+    tell, which also disarms the ``notdocs/`` control that is in the list for exactly that edit.
     """
-    patterns = [t for t in _spellings(site.path) if _META & set(t)]
+    patterns = [t for t in _spellings(site.path) if _is_pattern(t)]
     assert patterns, f"{site.path} is registered as a pattern site but declares no pattern"
     for raw in patterns:
-        rx = re.compile(raw if raw.startswith("^") else "^" + raw.lstrip("^"))
+        rx = re.compile(raw)
         for rel in _CANON_FILES:
-            assert rx.match(rel), (
+            assert rx.search(rel), (
                 f"{site.path}: pattern {raw!r} does not match {rel}, which DEFAULT_SOURCES names. "
                 "The gate this pattern drives would skip the ledger entirely and report green."
             )
         for control in PATTERN_CONTROLS:
-            assert not rx.match(control), (
+            assert not rx.search(control), (
                 f"{site.path}: pattern {raw!r} also matches {control!r}, which is not a ledger "
                 "file. A pattern that matches everything passes the arm above without being aimed."
             )
@@ -610,6 +695,23 @@ def test_the_registry_covers_every_file_that_configures_the_ledger() -> None:
         f"{sorted(registered - found)}. Every place the ledger's location is configured has to be "
         "in SITES or PATTERN_SITES, or a move can leave it behind with nothing reporting it."
     )
+
+
+def test_every_role_in_the_registry_either_has_an_arm_or_is_declared_without_one() -> None:
+    """A role with no arm and no declaration is a site whose intent nothing checks.
+
+    The failure this closes is silent by construction: mistype a role and its parametrized arm
+    receives an empty list, which pytest renders as a skip. The site vanishes from the run and the
+    summary line still reads green.
+    """
+    declared = _ARMED_ROLES | _UNARMED_ROLES
+    used = {s.role for s in ALL_SITES}
+    assert used <= declared, f"role(s) with no arm and no declaration: {sorted(used - declared)}"
+    for role in _ARMED_ROLES:
+        assert [s for s in SITES if s.role == role], (
+            f"the {role!r} arm has no sites left. Either every site of that role was retired, or a "
+            "role string was mistyped and its arm is now silently empty."
+        )
 
 
 def test_the_two_item_count_floors_agree_with_each_other() -> None:
@@ -639,3 +741,24 @@ def test_both_floors_are_satisfiable_by_the_ledger_parse_items_reports() -> None
         "DEFAULT_SOURCES."
     )
     assert min(ci, pinned) > 0, "a floor of zero cannot fail and is not a guard"
+
+
+@pytest.mark.parametrize("rel,name", _SANITY_FLOORS, ids=lambda v: v)
+def test_the_look_alike_floors_are_still_instrument_sanity_and_not_anti_narrowing(
+    rel: str, name: str
+) -> None:
+    """Pin the classification the comment above makes, so a sixth floor cannot make it stale quietly.
+
+    Each of these refuses a BROKEN READ and says so in its own module. What makes that true rather
+    than asserted is the value: sitting far below the binding floor, none of them can ever be the
+    number that catches the corpus shrinking. Raise one past that line and it becomes a third
+    anti-narrowing floor with nothing comparing it to the other two -- the defect this file exists
+    for, one level up.
+    """
+    value = _int_constant(_ROOT / rel, name)
+    binding = min(_ci_min_items(), _pinned_floor())
+    assert value < binding, (
+        f"{rel}:{name} is {value}, at or above the binding anti-narrowing floor of {binding}. It "
+        "is registered here as an instrument-sanity floor. If it is now meant to catch narrowing, "
+        "it joins the compared pair rather than sitting beside them unchecked."
+    )
