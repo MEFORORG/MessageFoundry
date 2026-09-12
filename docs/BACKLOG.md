@@ -31319,3 +31319,54 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 - Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
 - The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
 - Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
+
+---
+
+## 1605. the SQL Server audit append is serialised in-process only, so two engine shards over one store would fork the tamper-evidence chain and raise permanent false tamper alarms
+
+> 🔢 **Filed 2026-09-12 - not started.** Value **8/10**, Difficulty **4/10**. Fable review packet 4 finding P4-01, the measured residue of closed #1 (June H-7). `record_audit` in `messagefoundry/store/sqlserver.py` guards its read-tail-then-INSERT with `self._audit_lock`, an `asyncio.Lock` created per store instance, on the stated premise that the store is "the single audit writer per engine process". Engine sharding (`serve --shard`, ADR 0037, ADR 0063) runs one process per shard, each serving its own API, over one unified store, so that premise does not hold on the built default scaling topology. Measured at engine `2ffcf3347` against a live SQL Server 2022: two processes each appending 60 audit rows concurrently broke the chain in 3 of 3 runs; 120 rows from one process verified clean, so the in-process lock does its job and the defect is strictly cross-process. Postgres, same experiment, verified 3 of 3 because its `record_audit` takes `pg_advisory_xact_lock`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store / Operations. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). On a first sharded deployment, two operators acting through two shards' consoles, or one operator plus a shard's own retention or reload audit, would fork the chain; `verify_audit_chain`, `audit_anchor` and the CLI verify would then report tampering on every later run, indistinguishable from a real tamper without out-of-band evidence. Single-process deployments would not be affected. Not a PHI exposure.
+
+### Why the lock is in the wrong place
+
+Closed #1 recorded H-7 as fixed by "serialized under `_audit_lock`". That fix serialises one process. `api/app.py` carries 50 `record_audit` call sites and `pipeline/wiring_runner.py`, `pipeline/dr.py`, `pipeline/retention.py` and `pipeline/reference_sync.py` write audit rows from inside every shard, so two shards are two locks over one chain.
+
+The comment beside the lock gives a reason for not using a database lock: a transaction-scoped `sp_getapplock` "taken as the connection's first statement ... does not release on commit and strands under concurrent contention". `_ensure_schema` in the same file takes exactly that lock as the first statement and documents that it "auto-releases on the commit/rollback below", and the concurrent-open tests exercise it. One of the two comments is wrong (packet 4 finding P4-06), and the one that steered a control out of the database is the one to re-measure as the first step of this item.
+
+### Fix
+
+Serialise the append at the database, as Postgres does and as `_maybe_finalize` already does on SQL Server: open the transaction with a leading statement (or an explicit `BEGIN TRANSACTION`), take `sp_getapplock @LockOwner='Transaction'` on a fixed resource such as `mefor:audit_append`, then read the tail and INSERT, releasing at the existing commit. Keep the in-process lock if wanted; it is not sufficient. Record the applock-as-first-statement measurement beside both comments. Add the two-process test named in #1610, because today no test on either backend can see this lock removed.
+
+**Source:** vaulted `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md`, P4-01 and P4-06, with the two-process reproduction quoted in its part 9.
+
+---
+
+## 1610. the per-message finalize lock has no test that can fail on either server backend, and the audit-append lock has none on Postgres
+
+> 🔢 **Filed 2026-09-12 - not started.** Value **8/10**, Difficulty **3/10**. Fable review packet 4 finding P4-02, from the plan's required negative control. With the SQL Server finalize applock patched to a no-op, `tests/test_sqlserver_store.py` passed 155 of 155. With the Postgres finalize advisory lock patched out, `tests/test_postgres_store.py` passed 153 of 153. With the Postgres audit-chain advisory lock patched out, 153 of 153. Positive controls under the same patches show each lock is load-bearing: 79 of 80 fan-out messages on SQL Server and 68 of 80 on Postgres silently never finalised, with zero exceptions, and the Postgres chain forked in 2 of 2 two-process runs. Measured at engine `2ffcf3347` against live SQL Server 2022 and PostgreSQL 16.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Testing / silent-failure class. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is test coverage of two reliability controls, not engine behaviour. Its cost is that a refactor moving either lock out of the database, which is exactly the shape of the P4-01 defect, would keep every gated test green.
+
+### What the suites can and cannot see today
+
+SQL Server's `test_audit_chain_no_fork_under_concurrent_record_audit` turned red when the in-process audit lock was removed, so that one control is pinned, in one process. Disabling `verify_audit_chain` outright turned two CLI tests red on SQL Server and three on Postgres, so tamper detection itself is pinned. Nothing drives two concurrent `mark_done` calls on either backend, and nothing drives two processes. June's 2026-06-10 note was "the gated CI suite exercises none of this"; three months later the controls landed and the suites still cannot tell whether they are there.
+
+### Fix
+
+On each server backend, two tests on the gated live leg:
+
+1. Enqueue a two-destination message, claim both rows, run both `mark_done` calls under `asyncio.gather` so they take two pooled connections, and assert the message reads `PROCESSED`. Repeat enough times to be deterministic; 30 iterations was decisive on both backends here, and the whole suite still runs in under a minute.
+2. Append audit rows from two subprocesses over one store, then `verify_audit_chain()` and assert it is clean.
+
+Both must be shown to turn red with the lock removed before they are trusted; the run-only monkeypatch plugin that does that is quoted in the packet 4 findings document and can be reused as the control.
+
+**Source:** vaulted `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md`, P4-02 and part 6.
