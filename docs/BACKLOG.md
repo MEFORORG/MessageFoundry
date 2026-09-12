@@ -15912,6 +15912,9 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > pytest config about every key in the block and so covers `import_mode` and `import-mode` as well as
 > the one misspelling above; and `test_the_sibling_bare_imports_that_rule_out_importlib_are_still_present`,
 > which reds if that sibling-import population ever empties -- the one event that would make importlib
+> re-priceable. **Emptying it is the RECOMMENDED direction of travel, not a regression:** migrating
+> `import _totp_clock` to `from tests._totp_clock import ...` is the house idiom, and whoever
+> finishes that job should re-price this row rather than read the red as a defect.
 > **A THIRD DEFECT WAS FOUND AND FIXED IN THE GUARD ITSELF, and it is the same shape this module
 > exists to prevent.** The perf pass that folded the two AST walks into one left `_scan` filtering
 > the heads INLINE while the positive controls exercised only the tree-level wrappers, so the
@@ -15923,9 +15926,6 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > `test_the_detector_trips_on_a_planted_bare_import`; dropping the filter reds
 > `test_the_sibling_detector_separates_the_two_import_shapes`. The unmutated arm is what makes
 > the other two mean anything.
-> re-priceable. **Emptying it is the RECOMMENDED direction of travel, not a regression:** migrating
-> `import _totp_clock` to `from tests._totp_clock import ...` is the house idiom, and whoever
-> finishes that job should re-price this row rather than read the red as a defect.
 
 > **PARTIAL 2026-08-25 -- A GUARD LANDED, STAYS OPEN.** `tests/test_conftest_name_collision_guard.py`
 > statically walks every testpath root for a bare `import conftest`/`from conftest import` and reds on
