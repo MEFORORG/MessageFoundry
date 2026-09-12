@@ -15783,6 +15783,25 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 
 **NONE OF THIS UNBLOCKS THE MOVE.** The precondition is unchanged and it is vault-side: atomic allocation, a high-water ratchet and installed hooks, the Q5 ruling of 2026-08-13. Until those land the destination is still the weaker repository, and a better inventory of the source does not change which way that comparison runs. What this removes is a different failure -- going into the migration with a number nobody can re-derive.
 
+**AMENDMENT 2026-09-12 -- the vault-side precondition's third limb is MET, the four deferred questions are RULED, and the move now blocks on a defect nobody had measured.** The paragraph above is not retracted. The precondition is a conjunction, and this closes one limb of it rather than the move.
+
+**PHASE 0 SHIPPED.** The vault ledger gate is armed as of 2026-09-12; vault PR 1496 merged as `152b6cbeb`. That meets the **installed hooks** limb of the Q5 ruling of 2026-08-13. Measured across that merge: the payload went from **zero** occurrences of `VAULT_BACKLOG_CEILING` to **six**, and the vault's own tests went from **20 passing and 1 failing** to **21 of 21**.
+
+**THE FOUR DEFERRED QUESTIONS WERE DECIDED BY THE OWNER ON 2026-09-12.** The "DECIDE AT MOVE TIME" paragraph above requires that the choice be recorded, so it is recorded here.
+
+1. **The WHOLE ledger moves**, not only the ASVS-derived items.
+2. **The engine keeps a STUB** pointing at the vault, rather than nothing.
+3. **The already-published history is accepted and stated plainly.** It cannot be recalled and the move will not pretend otherwise.
+4. **The #1000 partition is RETIRED.** It is `PUBLIC_BACKLOG_FLOOR` in `scripts/hooks/ledger_check.py`, and the erratum block at the head of this file describes the same partition; both are in scope when the move lands.
+
+**THE MOVE NOW ADDITIONALLY BLOCKS ON #1751.** This plan treated the two ledgers' 238 shared numbers as a cheap fork echo, on a comparison of the first 60 characters of each heading. A read-only measurement at engine `origin/main` and vault `152b6cbe` shows only **47** of 228 pairs byte-identical, **87** needing a person to read two versions and choose, and **34 making contradictory STATUS claims about the same number** -- corruption already standing in both files, which a merge would launder rather than create. #1751 carries the evidence, the eleven pairs needing an owner ruling, and the 6-to-16-hour cost this plan priced at **zero**.
+
+**TWO HAZARDS THIS ITEM NEVER NAMED, both vault-side, both found by that measurement.**
+1. **The vault gate is architecturally INVERTED for this move.** It enforces a CEILING where the engine gate enforces a FLOOR, so it would refuse **561 of the 838 arriving numbers**. Arming it was necessary and is not sufficient; it has to be re-pointed before a single item moves. *The 561 reproduces from the engine side alone as a control:* 561 is exactly the count of engine numbers above the vault's maximum #354, and also exactly the count at or above #1000, the two agreeing because the engine namespace is empty between #355 and #999.
+2. **The vault has NO archive half on any ref.** The engine namespace is two files, `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`, and every gate here reads their union deliberately -- `ledger_check.py` says in its own comment that keying on one path would leave the other an unpoliced region. Moving one file and not the other splits the namespace and reintroduces exactly the collision the union exists to stop.
+
+**A LEAK-GATE CONSTRAINT, and it runs engine-ward.** The vault's ledger fails the vault's **own** publish scanner: exit **1**, over 100 finding lines, against a clean engine control at exit **0**. The engine ledger is **sanitised relative to the vault**, so the two texts are not symmetric and the move is a screened migration rather than a file copy in either direction. Nothing matched is reproduced here. **Anything moving engine-ward must be screened first; this repository is public.** #1751 carries the detail, including that the screen's population is unmeasured and the exposure must not be read as bounded.
+
 ## 1253. one control-char predicate written out seven times across six files
 
 > ✅ **SHIPPED -- verified on main 2026-08-23.** One implementation survives at `controlchars.py:67` with six real importers; the remaining `0x7F` lines are unrelated or excluded by this row's own terms. **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **1/10** · _fill-in_. I attacked the shipped claim on the two limbs that can fail independently -- consolidation and adoption -- and could not break either. Consolidation: git grep for the predicate across messagefoundry/ returns it in controlchars.py only, once as implementation (controlchars.py:67, inside a single _is_control_char) and once in the module docstring naming what it replaced; parsing/sniff.py:179 is the byte-wise allowlisted variant the item explicitly excluded and transports/rest.py:110 is the docstring prose it excluded, so both exclusions are honoured rather than folded in. Adoption: I enumerated importers rather than assuming them and got exactly the six files the item names, with seven call sites matching its own table -- config/codeset_edit.py:43/:306, config/impact.py:47/:632, transports/dicomweb.py:48/:143, transports/fhir.py:50/:179 and :202, transports/remotefile.py:67/:122 (all has_control_char), transports/rest.py:57/:112 (strip_control_chars). The reject/strip split the item warned must not be simplified is preserved: rest.py is the only strip site. tests/test_controlchars.py covers the module directly and pins the alphabet, including that chr(0x80) is deliberately NOT caught. So the seven-across-six count this item was filed over is genuinely retired, and calling it still_open would be the inverse error. What is NOT done is the closure the item's own dispatcher paragraph specifies as three coupled edits, and the recent ledger commits show the omission is real rather than merely pending: 3c1c1136 closed #1241 and #1271 as landed-by-content and 75e20d43 closed three more, while #1253 was left open. That is a doc edit, not a build. The eighth-spelling question is NOT this item's remainder: messagefoundry/logging_setup.py:70 restates the same code points as a translation table, but that is the filed subject of #1273 (docs/BACKLOG.md:10259), which also drove the collapse of controlchars.py's own two internal copies -- attributing it here would double-count. _(was 4/10 · 3/10.)_
@@ -33704,3 +33723,305 @@ Also flag a `BinOp` whose operands include a `Call` or `Name`, a `%` `BinOp`, an
 **Duplicate search.** #1583 (PR 1064) is the release wheel-smoke twin (the smoke importing the checkout) and stays separate; nothing covers the CLI self-report. Searched `PYTHONSAFEPATH`, `__file__`, `shadow`, `editable`.
 
 **Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-11.
+
+## 1751. reconcile the 228 shared-number pairs before the ledger merge: only 47 are byte-identical and 87 need a human read
+
+> 🔢 **Filed 2026-09-12 from a read-only measurement at engine `origin/main` and vault `origin/main` `152b6cbe`. Open; not started. TWO FINDINGS, and the first one is not migration cost.** Value **8/10**, Difficulty **6/10**. **34 shared numbers carry CONTRADICTORY STATUS CLAIMS across the two ledgers, and that corruption stands in both files today.** One side says an item shipped; the other lists it open with a named remainder, or declined. Both sides have been read as authoritative by somebody. Nothing could see it while the two files sat apart, and nothing would report it after a merge either: `backlog_status_check.py` verifies a banner EXISTS and does not self-contradict, never that it is TRUE, so a merged ledger inherits whichever side the merge rule picked and reads as settled. **If #1250 is abandoned outright these 34 are still wrong and still invisible, so this item outlives the migration that exposed it.** The second finding is the merge cost #1250 priced at zero: 238 numbers exist in both namespaces, only **47** pairs are byte-identical, **181** bodies differ, and **87** need a person to read two versions and choose.
+> Verdict: build
+> Research: two unknowns named below, both cheap, both to be answered before the review starts
+> Closing-act: docs, plus an owner ruling on the eleven pairs named below
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this now blocks. **Verdict:** build.
+**Severity:** no deployment axis; nothing shipped changes. The exposure is that two ledgers disagree about what was built, and the disagreement is invisible from either side alone.
+
+### The measurement, and the assumption it replaces
+
+Read-only, at engine `origin/main` and vault `origin/main` `152b6cbe`. Nothing was written to either repository.
+
+The engine namespace is **838 distinct numbers**: 601 live in this file, 237 in `docs/archive/backlog/BACKLOG-CLOSED.md`, zero overlap. The vault ledger carries **287** items, maximum #354. **238 numbers exist in both.**
+
+#1250's plan treated 228 of those 238 as the same item under a fork echo, cheap to merge. **That rested on comparing the first 60 characters of the heading, and it is wrong.** Matching headings do not imply matching bodies.
+
+| shared-number pairs | count |
+| --- | --- |
+| byte-identical | **47** |
+| bodies differ | **181** |
+| resolve by a mechanical rule | 141 (47 verbatim, 39 after a link rewrite, 17 by preferring the linkified variant, 38 by taking the engine banner) |
+| **need a person to read both and choose** | **87** |
+| true collisions, two unrelated items on one number | 10 |
+
+141 plus 87 is 228, and 228 plus 10 is 238.
+
+### Finding 1: 34 pairs contradict each other on status, and that is a defect rather than a cost
+
+This is the half worth more than the migration. **A merge would not create these. It would launder them.**
+
+**Eleven are flat verdict contradictions and need an owner ruling.** The instrument returned exactly these: **#81, #84, #95, #122, #124, #125, #127, #131, #171, #172, #226.** The sharpest subset inside them: four have the vault claiming SHIPPED against an engine ledger that still lists the item open with a named remainder, and five have the vault claiming SHIPPED against an engine ledger that DECLINED it.
+
+**Fifteen pairs carry substantive content on both sides that the other lacks**, so neither side is a superset and picking one loses work. #64, #98, #208 and #230 are among them; the count is fifteen and those four are examples, not the list.
+
+**No single merge direction is right.** The engine is the newer side on 67 of the 108 banner-differing pairs, but the vault carries the later date on 4 and the closing claim on 4 more. A rule that always preferred one repository would publish a false status.
+
+### Finding 2: 87 human decisions, at 6 to 16 hours
+
+That range is an estimate over a measured population rather than a measurement. #1250's plan costed this work at **zero**, and that is the number this corrects.
+
+### The ten true collisions fold into this item
+
+The measurement identified ten numbers where the two ledgers hold **unrelated** items: **#231 through #239, and #320.** These are not a separate pass. They touch the same file, in the same review, read by the same person, so making them their own work item would put two seats in one document.
+
+**The measured ten and the erratum at the head of this file do not agree, and the review should reconcile that.** The erratum names #232-#239, plus #248-#251, as independently allocated in the two sequences. The measured set adds **#231** and **#320** and does not include #248-#251. Whether the vault ledger IS the maintainer-internal ledger the erratum describes is not established here; if it is, the erratum is a prior and partly different record of this same divergence.
+
+### The engine ledger is SANITISED relative to the vault, so nothing moves engine-ward unscreened
+
+The vault's own publish scanner exits **1** on the vault ledger, with **over 100 finding lines**: one run reported 104 and an independent re-run 105, the difference being a header line. **The line count is not the finding.** The finding is the opposite verdict under one instrument, and the control is that the same scanner exits **0** on the engine ledger.
+
+The mechanism behind that gap is that the engine ledger was deliberately sanitised. At least two of the diverged pairs differ **precisely because** an identifier was scrubbed from the engine side and still stands on the vault side. Nothing matched is reproduced here, and nothing should be: **this repository is public.**
+
+**That is a worked example and not a census.** The population is unmeasured, and the screen that found it was tuned for constant-shaped tokens, so it would miss a plain name written as prose. Do not read the exposure as bounded at two.
+
+**The constraint that follows:** every line moving engine-ward in this reconciliation is screened before it lands, and a reviewer who resolves a pair by taking the vault text is making a publication decision rather than an editorial one.
+
+### Two unknowns to answer before the review starts
+
+1. **Nobody has checked whether the vault ledger was branched from the engine ledger at a specific commit.** A defensible common ancestor would turn some of the 87 two-way decisions into three-way merges and could cut the set materially. It is a cheap check and it belongs first, because it changes how much work there is.
+2. **Whether the vault ledger is the maintainer-internal ledger the erratum describes** (see the collisions section above). If it is, the erratum's record is prior evidence to be reconciled with the measured ten rather than left sitting beside it.
+
+### What was NOT verified
+
+- The mechanical normalisations that reduce 228 to 87 are a judgement about what is safe to rewrite, not a measurement. A stricter reading raises 87; a looser one lowers it and risks laundering a real difference.
+- The 6-to-16-hour range is an estimate.
+- No common-ancestor check was run (unknown 1 above).
+- The identifier scrub is a worked example over an unmeasured population (above).
+- Nothing in either repository was modified.
+
+### What closing looks like
+
+1. Answer the common-ancestor question. Record it and the resulting decision count before anyone reads a pair.
+2. Fix the 34 status contradictions **in place, in both ledgers**, whether or not #1250 proceeds. Send the eleven flat verdict contradictions to the owner as one list.
+3. Reconcile the 87 by hand, screening every vault-side line before it moves engine-ward.
+4. Disambiguate the ten true collisions, and reconcile the outcome with the erratum at the head of this file.
+5. Only then does #1250's move have a defined input.
+
+**Duplicate search.** #1250 is the migration this blocks and the only item naming the vault ledger as a destination; it priced this work at zero, which is why this is a separate item as well as an amendment there. #1293 is the worktree-ownership hole class, unrelated. #1480 is the append-absorbs-the-next-heading defect, a filing hazard rather than this subject. Searched `shared-number`, `reconcile`, `vault ledger`, `common ancestor`, `contradictory status`.
+
+**Source.** A read-only measurement by the Manager seat, 2026-09-12, at engine `origin/main` and vault `origin/main` `152b6cbe`. No findings report was written; this item is the record.
+
+## 1752. overlap.ps1 classifies Dirty from status porcelain without comparing content, so one CRLF artifact blocks every session in the repo from a file nobody changed
+
+> 🔢 **Filed 2026-09-12, from a gate false positive that fired, blocked a file nobody had changed, and cleared on its own the same day. Open; not started.** Value **6/10**, Difficulty **3/10**. `scripts/coord/overlap.ps1` decides a peer worktree is Dirty from `git status --porcelain` alone and never compares content. A working copy whose bytes differ from the index only in line endings therefore reports modified while producing an empty diff, and `collision_gate.ps1` turns that into a hard deny of Write and Edit on the named file for every other session while the peer is live. **The blocked session cannot tell a false positive from a real collision except by doing the content comparison the gate skipped.**
+> **AMENDED 2026-09-12, and the amendment is the more important half. The same line carries two SILENT FALSE NEGATIVES, which are worse than the false positive this item was opened for.** `$_.Substring(3).Trim('"')` at line 679 cannot recover a renamed path, and cannot recover a path containing a space. A peer holding either one reads as touching **nothing**, so two sessions collide on it with no warning at all — the exact event this tool exists to prevent. One flag closes both. The content-comparison fix originally filed here is **withdrawn**: it is forbidden by the performance budget written into the file it targets.
+> Verdict: build
+> Research: none needed; both mechanisms are measured, one fix is named below and one is withdrawn below
+> Closing-act: code
+
+**Cluster:** Coordination / gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis; no product code changes and nothing shipped is affected. The exposure is a developer-workflow gate that refuses correct work and leaves the refused session no way to appeal.
+
+### The worse half: one line drops a renamed path and a spaced path
+
+This section was added on 2026-09-12, after the item was first filed. It leads because it is the more expensive defect.
+
+The whole Dirty set is built by this line, `scripts/coord/overlap.ps1:678-679`:
+
+```powershell
+$dirty = @(& git -C $Job.Path --no-optional-locks status --porcelain 2>$null |
+    Where-Object { $_.Length -gt 3 } | ForEach-Object { $_.Substring(3).Trim('"') })
+```
+
+It assumes every porcelain line is a two-letter code, a space, then a plain path. Git's short format breaks that assumption in two ways, and the line mishandles both.
+
+Every quotation below comes from the `git status` reference git installs beside itself, at `C:\Program Files\Git\mingw64\share\doc\git-doc\git-status.html`, sections *Short Format* and *Porcelain Format Version 1*. It needs no network and no sandbox.
+
+**A rename is ONE line carrying TWO paths.** The reference gives the form as `<xy> <orig-path> -> <path>`, with the fields "separated from each other by a single space". So `Substring(3)` returns the single string `orig-path -> path`. That is not a path and matches no file on disk.
+
+**A path with a space arrives quoted and escaped.** The same paragraph says a filename with "whitespace or other nonprintable characters" is "quoted in the manner of a C string literal: surrounded by ASCII double quote (34) characters, and with interior special characters backslash-escaped". `Trim('"')` removes the two quote characters. It does not undo the backslash escaping, so the escapes survive into the Dirty set and match nothing.
+
+Measured here, in a throwaway repository, with the line's own code run against real porcelain output:
+
+| porcelain line | what line 679 yields | matches a real file |
+| --- | --- | --- |
+| `R  old.txt -> moved.txt` | `old.txt -> moved.txt` | no, and BOTH paths are lost |
+| `A  "sp ace.txt"` | `sp ace.txt` | yes, this one survives |
+| `A  "na\357\200\242me.txt"` | `na\357\200\242me.txt` | no, the escapes remain |
+
+**Scope, because the defect does not cover every move.** Only a **staged** rename or copy produces an `R` or `C` record. A plain filesystem move that was never staged shows as two separate lines, ` D old.txt` and `?? moved.txt`, and both paths come through correctly. Measured in the same repository. That narrows the blast radius and does not remove it: `git mv` stages, and so does `git add -A`, so the common way to rename a file is the broken case.
+
+**Why this outranks the false positive in the heading.** A false positive is loud. It blocks somebody, and that somebody investigates, which is how this item exists at all. A false negative is silent: the gate reports the peer as touching nothing, both sessions edit the same file, and no channel says a word. A tool built to stop silent collisions has a hole shaped exactly like a silent collision.
+
+### What fired
+
+On 2026-09-12 the collision gate named a peer worktree as holding uncommitted changes to `docs/BACKLOG.md`. It held none. (The worktree slug is omitted here deliberately: this file is public, and the slug identifies neither the mechanism nor the fix.)
+
+Two sessions took the readings independently and agreed on every one:
+
+| reading | result |
+| --- | --- |
+| `git rev-parse HEAD:docs/BACKLOG.md` | `bd232659c81fb125402ddc8a45eb6d3994a168d5` |
+| `git hash-object docs/BACKLOG.md` | `bd232659c81fb125402ddc8a45eb6d3994a168d5` |
+| `git diff` | empty |
+| `git diff --numstat` | empty |
+| `git status --porcelain` | still printing ` M` |
+
+### Root cause: CRLF, and it is the useful half
+
+Git's own warning names it: "LF will be replaced by CRLF the next time Git touches it". `hash-object` normalises line endings before hashing, so the blob id matches while the working copy's raw bytes do not. That is how one file reports modified and produces an empty diff at the same time.
+
+An index refresh printed "needs update" and could not settle it. Checking out the provably identical content did.
+
+This is a Windows-endemic artifact on a repository with mixed line endings, so it will recur. `.gitattributes` pins `eol=lf` for the lockfiles and shell scripts and does not pin `*.md`, so the ledger itself is exposed to whatever `core.autocrlf` is set to on the box.
+
+### Where the classification is made
+
+`scripts/coord/overlap.ps1` builds the Dirty list at lines 678-680 straight from porcelain output, keeping the path substring and discarding everything else. Lines 882-883 then set `MatchedDirty` by membership in that list. No content comparison happens at any point in the walk.
+
+The membership test at 882-883 runs each entry through `ConvertTo-Norm` first. That normalises separators and casing; it cannot turn `orig-path -> path` back into two paths, so the false negatives above survive it.
+
+`scripts/hooks/collision_gate.ps1` treats a live peer carrying `MatchedDirty` as a collision and emits `permissionDecision = "deny"` (line 116). A row missing the property is also treated as dirty, deliberately: the comment at lines 274-277 reasons that over-block is safe and under-block is a silent collision. That default is defensible, and it is also what makes a false Dirty maximally expensive.
+
+**That default is also a compensating control resting on a false premise, which is the sharpest reason to fix line 679.** It buys safety by over-blocking a row whose Dirty set is *absent*. It can do nothing for a row whose Dirty set is *present and incomplete*, because such a row looks answered. So the gate under-blocks in exactly the case its own comment calls unacceptable, and the comment reads as though that case were covered.
+
+### The fix for both false negatives: add one flag
+
+Read the porcelain in NUL-separated form. One flag closes the rename hole and the quoting hole together.
+
+1. Run `git status --porcelain -z` instead of `git status --porcelain`.
+2. Split the raw output on NUL rather than on newline.
+3. For a record whose code starts with `R` or `C`, take the path field **and** the field immediately after it. Add both to Dirty.
+4. Drop `.Trim('"')`. It has nothing left to do.
+
+Git documents why step 4 is safe, in the same page: under `-z`, "filenames containing special characters are not specially formatted; no quoting or backslash-escaping is performed".
+
+**Cost: zero extra processes.** This is the same single git spawn with a different flag. That matters, and the next section says why.
+
+Two cautions, both measured rather than assumed.
+
+**The `-z` field order is the REVERSE of the arrow form, so a careless port loses the same paths a different way.** The documentation is explicit: under `-z`, "the `->` is omitted from rename entries and the field order is reversed (e.g from -> to becomes to from)". Confirmed on the wire: `git status --porcelain -z` after a `git mv` emitted the bytes `R`, space, space, `moved.txt`, NUL, `old.txt`, NUL. The **new** path comes first and the original second, which is the opposite of `R  old.txt -> moved.txt`.
+
+**`-z` output has no newlines, so it is not a drop-in for the existing pipeline.** PowerShell splits a native command's output on newlines, and there are none. Measured: the whole `-z` payload arrived as **one** pipeline element of 48 characters. The `ForEach-Object` in the current line would run exactly once over the entire status. The rewrite has to split on the NUL itself.
+
+### The content-comparison fix was proposed, costed, and withdrawn
+
+This item originally recommended comparing `git hash-object <path>` against `git rev-parse HEAD:<path>` for every path porcelain called modified, and dropping the equal ones from Dirty. **That recommendation is withdrawn.** It is recorded here rather than deleted, because a withdrawn fix with its reason is worth more than a silent gap.
+
+It was withdrawn on cost, and the file it targets is the thing that forbids it. `overlap.ps1` adds one git spawn **per path reported dirty**, on top of the per-worktree spawns the walk already pays. The header block records what that budget looks like:
+
+- Line 76: at 162 worktrees the walk "took 26.1s against the gate's 16s budget and bailed on all five runs".
+- Line 91: "RE-MEASURE AFTER TOUCHING THIS LOOP, and do not answer a slow walk by raising the budget."
+
+The header goes on to say the cost is process count, and names memoisation as the term that keeps the walk flat as worktrees accumulate. That memo is keyed on three commit ids. A `hash-object` of a **working-tree** file has no commit id to key on, so it cannot join the memo and must be paid on every walk. The walk has already blown this budget once, bailing on all five runs.
+
+The withdrawal is not a ruling that the false positive should stand. It says the CRLF half needs a fix that does not spend a process per dirty path, and nobody has proposed one yet. Candidates worth costing, none measured: pin `*.md` in `.gitattributes` so the artifact stops being generated; or have `collision_gate.ps1` do the comparison for the **one** path it is about to deny on, where the cost is a single spawn against a decision already worth it.
+
+### How this was found, recorded honestly
+
+The artifact cleared on its own. A session had hit the same artifact on the same file hours earlier and read it as harmless rather than as a gate defect.
+
+**A false positive that leaves no trace is why this drifted.** Only false negatives generate feedback here: a wrongly-blocked session works around the block and moves on, so over-firing accumulates unopposed and nothing counts it. `worktree_gate.ps1` keeps a deny log at `~/.claude/hooks/worktree-gate.log` and can therefore be asked for its own false-positive rate; the collision gate has no equivalent. The only file it writes is a throttle stamp under `gate-unresolved/` for the unresolved notice, so the number of denies it has issued is not recoverable today.
+
+**The paragraph above is now half wrong about itself, and the correction is worth keeping.** It says only false negatives generate feedback. The Dirty line had been carrying two false negatives the whole time, and neither generated any feedback either, because a silent hole reports nothing to anyone. The rule holds for a gate that fires. It says nothing about a gate that stays quiet when it should not.
+
+### Who corrected what, because the correction came from the proposer
+
+The `hash-object` fix withdrawn above was proposed by the Lander seat, accepted by the dispatching seat, and filed here as the recommendation. The Lander then withdrew it, and in the same message named the rename false negative that now leads this item. So the seat that proposed the fix is the seat that refuted it, and it did so while finding a worse defect the original filing had walked straight past.
+
+Recorded because the useful part of a review record is who overturned what, not a tidy final answer. Two things follow from it. The withdrawal is stronger evidence than a third-party objection would be, since the proposer had every reason to defend it. And the original filing read line 679 closely enough to quote its line numbers while missing both defects inside it — a read aimed at one question, which answered that question and nothing else.
+
+**What the correction did NOT touch.** The porcelain-only diagnosis in the heading stands, and it was re-verified independently for this amendment: `hash-object` appears **zero** times in `overlap.ps1`, and its four `Get-Content` calls are matched by four `ConvertFrom-Json` calls, so every file read in the walk is JSON parsing rather than content comparison. Positive control for that search: `porcelain` matches **3** times in the same file, so the instrument was working when it returned zero.
+
+### What was NOT verified
+
+- Whether the named peer worktree was live at the moment of the deny. The gate blocks only on live peers, and that condition was not read at the time.
+- Whether any other file or worktree currently carries the same artifact. This is one worked example, not a census.
+- Which setting is proximate. `core.autocrlf` was not read, the missing `*.md` attribute was not tested, and nothing was changed to find out.
+- Whether either false negative has ever actually fired. Both are established from the code and from git's behaviour, not from a recovered incident. Nothing counts them, which is the point of the section above.
+- The `-z` rewrite was designed and its two hazards were measured. It was **not written**, and no gate, hook or configuration was modified in the course of this filing or this amendment.
+
+**Duplicate search.** #1293 is the worktree-ownership keying hole, a different gate with a different predicate. #1480 is the append-absorbs-the-next-heading filing hazard. #1310 is a collision-gate notice-wording fix and touches the committed-and-clean path, not the Dirty predicate. Searched `overlap`, `porcelain`, `MatchedDirty`, `collision`, `CRLF`, `autocrlf`, `hash-object`, `Substring`, `-z`, `rename`.
+
+**Method note: the answer was installed on the box the whole time.** Two seats tried to settle the rename wire format by creating a throwaway git repository, and a permission guard refused both. Neither thought to read the documentation git already ships. It is at `C:\Program Files\Git\mingw64\share\doc\git-doc\git-status.html`, it is free to read, and its Short Format section answers the question outright. **The honest coda is that the sandbox route also works** — the amending seat built the throwaway repository in its own scratchpad without a refusal and got the same answer on the wire. So the lesson is not that a sandbox was impossible. It is that nobody checked the cheap local source before concluding the question could not be settled.
+
+**Source.** Filed 2026-09-12, measured by two sessions independently, plus a source read of `scripts/coord/overlap.ps1` and `scripts/hooks/collision_gate.ps1` by the filing seat. Amended the same day: the two false negatives, the `-z` fix and the withdrawal are from a third seat's re-read of line 679, the bundled `git-status` documentation quoted above, and live porcelain output produced in a throwaway repository. No findings report was written; this item is the record.
+
+## 1753. CLAUDE.md says the PreToolUse guards deny the Bash call itself; measured twice today, bash wrote to a path where Write was hard-denied
+
+> 🔢 **Filed 2026-09-12. Open; not started. The documentation-versus-behaviour gap is real and measured; the MECHANISM behind it is not what the filing brief assumed, and the difference is recorded below rather than smoothed over.** Value **7/10**, Difficulty **4/10**. `CLAUDE.md` lines 391-392 tell every seat that the user-scope PreToolUse guards "deny the Write, Edit or Bash call itself". The guards' path-target rules are scoped to Write, Edit, MultiEdit and NotebookEdit and exit 0 for Bash, and `collision_gate.ps1` is never invoked for Bash at all. **A seat reading line 391 believes it is protected on a route that is open, and calibrates its care to a protection that is not there.**
+> Verdict: build
+> Research: two open questions named below, both cheap, both to be answered before anyone edits a guard
+> Closing-act: docs
+
+**Cluster:** Coordination / gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis; nothing shipped changes. The exposure is that a written control statement overstates what the machinery enforces, in the one document every seat reads at the start of every session.
+
+### What CLAUDE.md says
+
+The sentence begins at line 388 and names both guards. Lines 391-392, verbatim:
+
+> `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
+> Bash call itself.
+
+### What was measured, 2026-09-12
+
+Three sessions reached for a Bash route around a denied Write. Their evidence differs, and the difference matters more than the count:
+
+| session | what happened | verification status |
+| --- | --- | --- |
+| A | Write denied against `<primary>/.git/mefor-coord/`; five files then written to that same path via bash | two verified on disk by the filing seat: `HANDOFF-MERGE-QUEUE-EVICTIONS-20260912.md` and `LANDER-REPLY-1250-ledger-vault.md` |
+| B | Edit and Write denied against `docs/BACKLOG.md`; a bash route to the same file was begun and abandoned | reported. An attempt, not a write. Nothing landed |
+| C | reported reaching for Bash on the same guard | reported second-hand to the filing seat; not verified here |
+
+**Three sessions is not three confirmed writes.** One session's writes are verified on disk, one is a reported attempt that wrote nothing, and one is unverified. Two sessions finding the same gap independently is evidence the gap is real, not evidence that two sessions were careless.
+
+### The gap is real, and the mechanism is now measured
+
+The filing brief recorded that nobody had read the guard sources, and named that as the first thing to check. The filing seat read them. Five findings:
+
+1. **`worktree_gate.ps1` IS registered for Bash.** The user-scope `settings.json` registers it under three PreToolUse matchers, one of which is `Bash|PowerShell`.
+2. **And it does deny Bash calls.** Its own deny log records `tool=Bash` denies under rules 3b and 3d as recently as 2026-09-11.
+3. **But its path-target rules are scoped to the four edit tools.** Line 2789 reads `if ($tool -notin @("Write", "Edit", "MultiEdit", "NotebookEdit")) { exit 0 }`. The Bash arm above it, at line 1940, judges git verbs and git-config disarm keys. It never judges a target path.
+4. **`collision_gate.ps1` is never invoked for Bash.** It reaches the harness through an inline shim in `settings.json` whose matcher is `Edit|Write|MultiEdit|NotebookEdit`, and its own header states "Wired on Edit|Write|MultiEdit|NotebookEdit".
+5. **The guard already documents the gap correctly, in the place a blocked session actually reads.** Rule 1's deny text says the four-tool scope "is its SCOPE and not its rule -- the rule is the CONJUNCTION of one of those tools and a target path in the primary's WORKING TREE -- so a write that lands in that tree by any other route breaks the same rule; it is not permitted by this rule either, merely unobserved." The same text tells the reader not to "route around it with a shell command".
+
+**So the question the brief left open has an answer: the Bash arm is neither absent nor failing on argument parsing. The path rules exclude Bash deliberately, and the guard says so in its own refusal text.** The defect is in `CLAUDE.md`, not in the guard.
+
+This is the class `docs/Secure_Development_Standards.md` **SDS-3.7** names, a compensating control resting on a false premise. The variant here is worth stating precisely: the control behaves as designed and describes itself accurately, and the false premise sits in the separate prose that tells seats what the control covers.
+
+### A sharper root cause was proposed, and the installed guard does not support it
+
+A proposal reached the filing seat mid-filing, credited to the Lander session, which raised it against its own interest having made one of the bypasses. The claim: the guard denies `<primary>/.git/mefor-coord/` and then advises a worktree path that cannot exist, because `.git` in a linked worktree is a pointer file, so no compliant route exists and the dead end manufactures the bypass.
+
+**The dead-end geometry is real, and the filing seat verified it independently.** In a linked worktree `.git` is an ASCII text file holding a single `gitdir:` pointer into the primary's `.git/worktrees/`, not a directory; `ls .git/mefor-coord` from there returns "Not a directory"; and `git rev-parse --path-format=absolute --git-common-dir` returns the primary's `.git`, where `mefor-coord` exists and only there. (Absolute paths are omitted: this file is public.)
+
+**The installed guard does not produce that dead end, because this exact defect was already found and fixed.** Three measurements:
+
+1. `<primary>/.git/mefor-coord/` is rule 1's ONE EXEMPTION, at `worktree_gate.ps1` line 2845, added precisely for this false positive. Its comment carries the measurement: on 2026-08-05 rule 1 had fired 18 times since it began keeping receipts, and 9 of those were Write denies on mefor-coord paths from 7 distinct worktrees.
+2. The exemption hands the subtree to rule 1b, which governs it by SHAPE: `.md`, `.txt` and `.tsv` are allowed through and everything else is armed. **Both files verified on disk are `.md`, which rule 1b allows.**
+3. Rule 1b's deny text pre-empts the worktree advice explicitly: "Creating a worktree does NOT help: the same path resolves to the same shared file from there." It does not send the reader to a worktree, and its remedy is to name the file `.md` or `.txt`.
+
+**What denied session A's Write is therefore an open question, and it is the first thing to measure.** Under the installed gate an `.md` write to that path should pass. Three candidates the filing seat could not discriminate between: the deny came from the harness permission system rather than from a hook; the denied path was a non-`.md` file, and the `.md` files subsequently written by bash would have been allowed anyway; or a different gate version was live at the time.
+
+Supporting but not decisive: `worktree_gate.ps1` logged **zero** denies on 2026-09-12. The instrument reads, confirmed against entries running through 2026-09-11 in the same date format. **But the gate's own comment says the receipt is best-effort and drops records under contention**, so a zero is consistent with a deny that failed to log. Evidence, not proof.
+
+### The judgement point stands, and this item is not an absolution
+
+Even where no compliant route exists, the correct move is to stop and report rather than find a second route. Rule 1's own text asks for exactly that, in those words. Neither session acted in bad faith: both disclosed unprompted, and one raised the finding against its own interest.
+
+The weight nonetheless sits on the written control rather than on the sessions, because the document those sessions were working from told them the shell route was closed.
+
+### What closing looks like
+
+1. Correct `CLAUDE.md` lines 388-392 to say what the guards enforce: `worktree_gate.ps1` judges shell calls by git verb and config key, and judges target paths only under Write, Edit, MultiEdit and NotebookEdit; `collision_gate.ps1` is not wired for Bash at all.
+2. Answer the open question above: establish what actually denied session A's Write.
+3. Establish whether any remediation string names an impossible route. Rule 1b is correct for linked worktrees, and rule 1's option A advises a worktree correctly for its own subject, the primary's working tree. Whether a third deny path gets it wrong is unmeasured.
+4. Decide separately whether the path rules SHOULD cover Bash. That is a scope change with real cost, and this item does not ask for it.
+
+### What was NOT verified
+
+- What denied session A's Write, as above.
+- Sessions B and C were not verified by the filing seat. B is a reported attempt that wrote nothing; C is second-hand.
+- Whether the harness delivers every Bash call to the registered hook was not tested end to end. The registration and the guard sources were read, and a source read shows a path exists rather than that execution takes it.
+- No guard, hook or configuration was modified in the course of this filing.
+
+**Duplicate search.** #1752 is the sibling coordination-gate defect filed the same day and is a different predicate in a different guard. #1293 is the worktree-ownership keying hole. #1065 is a rule-3c matching fix inside `worktree_gate.ps1` and touches the Bash arm, not its scope. Searched `PreToolUse`, `collision_gate`, `worktree_gate`, `deny the Write`, `mefor-coord`, `route around`, `SDS-3.7`.
+
+**Source.** Reported by three sessions on 2026-09-12, with the dead-end proposal credited to the Lander session. The guard sources, the live hook registration and the deny log were read by the filing seat the same day. No findings report was written; this item is the record.
