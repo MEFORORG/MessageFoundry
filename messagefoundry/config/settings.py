@@ -604,9 +604,9 @@ class StoreSettings(_Section):
     # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
     # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
     acquire_timeout: float = 30.0
-    db_schema: str | None = (
-        None  # 'db_schema' avoids shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA
-    )
+    # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
+    # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
+    db_schema: str | None = None
     application_name: str = "messagefoundry"
     # Inflight-row lease TTL (seconds) for the multi-node server-DB backends (Track B Step 2). When a
     # worker claims a row it stamps owner + a lease_expires_at = now + this, and a leader sweep reclaims
@@ -775,6 +775,25 @@ class StoreSettings(_Section):
             raise ValueError(
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _db_schema_backend(self) -> StoreSettings:
+        """``db_schema`` is honoured only by Postgres, which points the pool's ``search_path`` at it.
+
+        The SQL Server store never reads it: it creates and queries every table unqualified, so the
+        names resolve against the login's default schema. Two installs on one database would share
+        the queue and the cluster election while believing they were isolated. The SQL Server
+        coordinator used to namespace its lease key by this setting, which would have elected one
+        leader per install over that one shared queue; its keys are now constant. SQLite has no
+        schemas. Refuse rather than ignore, as ``_ssl_root_cert_backend`` does. An empty string stays
+        accepted, because both Postgres readers treat it as unset."""
+        if self.db_schema and self.backend is not StoreBackend.POSTGRES:
+            raise ValueError(
+                "[store].db_schema is honoured only by the postgres backend, not "
+                f"{self.backend.value!r}, whose store never reads it. "
+                "Give each install its own database."
             )
         return self
 
