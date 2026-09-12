@@ -31290,6 +31290,7 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 - `messagefoundry/parsing/peek.py`, `Peek._resolve_builtin`: calls that scan **before** its `except (IndexError, ValueError)`, so the raise is deliberate, not a missed catch. `Peek._resolve_hl7` catches only `IndexError` from `extract_field`, and python-hl7's own scan raises the same way.
 - `messagefoundry/pipeline/wiring_runner.py`, `_handle_inbound`: after `Peek.parse` succeeds, the first field read (`peek.control_id` at `enqueue_ingress`, or `summarize(peek)`) has no catch between it and the listener.
 - `messagefoundry/transports/mllp.py`, `build_ack`: catches only `HL7PeekError`, so it cannot build the NAK for this input either. The sender's `verify_ack_control_id` peek at the same file has the same shape.
+- **DELTA-02's surviving half lives here too.** The 2026-07-01 delta review's `ValueError` from a malformed rich-text repeat count (`\.inX\`) is fixed on the default built-in backend (vault commit `a0027b34`: `Peek.field` returns `None`, `summarize` works). On the python-hl7 fallback backend `Peek.field` still raises `ValueError` from python-hl7's own `int(value[3:])`, and `Peek._resolve_hl7` catches only `IndexError`. Packet 1 could not reach the fallback with any wire input (every header shape that faults the built-in is refused by python-hl7's own assertion first), so it is one internal built-in fault away from live rather than live. Step 1 below closes it; no separate item is filed for it.
 
 ### Measured, 2026-09-11, engine `a3f7e664a`
 
