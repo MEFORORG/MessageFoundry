@@ -5,16 +5,17 @@
 **The hazard, and why nothing else catches it.** ``docs/BACKLOG.md`` and
 ``docs/archive/backlog/BACKLOG-CLOSED.md`` are named independently by several unrelated
 configuration sites -- a Python tuple, two Python string constants, a pre-commit ``files:``
-regex, a PowerShell array -- and **no** existing check compares them to each other. Each site is
+regex, a PowerShell array, a shell `grep -E` inside a CI step -- and **no** existing check
+compares them to each other. Each site is
 internally consistent, so each one reads as correct in isolation. Move the ledger and update only
 some of them and every site still passes its own tests: the pre-commit allocation gate reads one
 location while the status parser reads another, both go green, and **allocation collisions stop
 being detected**. That is the failure this file exists to make loud. BACKLOG #1250 is the move
 that will exercise it.
 
-**Four sites are covered, and that is not the whole population.** Others have reported at least
+**Five sites are covered, and that is not the whole population.** Others have reported at least
 nine separately-maintained declarations; nine is an unverified lower bound and this file does not
-census them. Read the coverage here as four named sites, never as completeness.
+census them. Read the coverage here as five named sites, never as completeness.
 
 **What is pinned, and what is deliberately not.** The canonical pair is taken from
 ``backlog_status_check.DEFAULT_SOURCES`` -- the single definition of the item namespace -- and
@@ -40,6 +41,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Final
@@ -60,22 +62,22 @@ def _load(name: str, relative: str) -> ModuleType:
     return mod
 
 
-# SITE 1 of 4 -- the single definition of the item namespace, and the reference the other three are
+# SITE 1 of 5 -- the single definition of the item namespace, and the reference the other four are
 # compared against. Nothing below re-states these paths as a literal.
 _STATUS_CHECK: Final[ModuleType] = _load(
     "backlog_status_check", "scripts/docs/backlog_status_check.py"
 )
 _CANON: Final[tuple[str, ...]] = tuple(Path(p).as_posix() for p in _STATUS_CHECK.DEFAULT_SOURCES)
 
-# SITE 2 of 4 -- the pre-commit allocation gate. It states the live ledger as a FILE and the
+# SITE 2 of 5 -- the pre-commit allocation gate. It states the live ledger as a FILE and the
 # archive as a DIRECTORY, so the comparison below is shaped to that, not forced into a pair.
 _LEDGER_CHECK: Final[ModuleType] = _load("ledger_check", "scripts/hooks/ledger_check.py")
 
-# SITE 3 of 4 -- the pre-commit `files:` regex, located by the script its `entry` runs rather than
+# SITE 3 of 5 -- the pre-commit `files:` regex, located by the script its `entry` runs rather than
 # by its hook id, so renaming the hook does not silently drop this site from the comparison.
 _PRE_COMMIT: Final[Path] = _ROOT / ".pre-commit-config.yaml"
 
-# SITE 4 of 4 -- the ALLOCATOR. It sweeps both ledger files to build the set of numbers already
+# SITE 4 of 5 -- the ALLOCATOR. It sweeps both ledger files to build the set of numbers already
 # taken, so a path it does not sweep is a region where two sessions can pick the same number and
 # merge clean. That is the same collision the gate at site 2 exists to stop, which makes a
 # disagreement between sites 2 and 4 the worst of the shapes this file screens for: the allocator
@@ -123,7 +125,7 @@ def _ledger_files_pattern() -> str:
     assert len(found) == 1, (
         f"expected exactly one .pre-commit-config.yaml hook running backlog_status_check.py, "
         f"found {len(found)}. The ledger-path comparison in this file covers that hook's `files:` "
-        f"pattern; a second one would be an uncompared fourth declaration of the ledger's location."
+        f"pattern; a second one would be one more uncompared declaration of the ledger's location."
     )
     pattern = found[0]
     assert isinstance(pattern, str) and pattern, (
@@ -133,15 +135,60 @@ def _ledger_files_pattern() -> str:
     return pattern
 
 
-# Near-miss controls for the pattern. Each one differs from a real ledger path in ONE way, and each
-# way is a property the pattern is supposed to enforce. Without these, a pattern of `.*` would pass
-# the positive assertion and pin nothing at all.
+# SITE 5 of 5 -- the CI side of the same question the pre-commit hook asks locally. Site 3 and this
+# one drifting apart IS the split BACKLOG #1250 walks into: the local gate reading one file while
+# CI reads another, both green.
+_HYGIENE: Final[str] = "backlog-hygiene.yml"
+_GREP_E: Final[re.Pattern[str]] = re.compile(r"grep\s+-qE\s+'([^']+)'")
+
+# ERE (what `grep -E` speaks) and Python `re` (what compiles the pattern below) agree on every
+# construct the real pattern uses -- anchors, alternation, groups, `.`, `+`, `*`, and `\.`. They
+# part company at backslash-LETTER escapes: `\d`, `\s`, `\b` and friends are Python classes and are
+# not ERE. Screening for those is what makes running the pattern through Python re a sound
+# substitution rather than a measurement of the wrong dialect.
+_NON_ERE_ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\[A-Za-z]")
+
+
+def _hygiene_ledger_pattern() -> str:
+    """The `grep -qE` pattern the hygiene workflow uses to ask whether a PR touched the ledger.
+
+    Located inside a parsed `run:` body rather than by scanning the raw file, so a mention in a
+    comment elsewhere in the repository cannot be picked up as the site. Requires exactly one
+    match, for the same reason the pre-commit helper does.
+    """
+    from tests._workflow_contexts import jobs_of
+
+    found: list[str] = [
+        str(m)
+        for job in jobs_of(_HYGIENE).values()
+        for step in job.get("steps", [])
+        for m in _GREP_E.findall(str(step.get("run", "")))
+        if "archive/backlog" in str(m)
+    ]
+    assert len(found) == 1, (
+        f"expected exactly one `grep -qE` over the ledger paths in {_HYGIENE}, found {len(found)}. "
+        f"Zero means the CI-side declaration moved and this comparison stopped covering it."
+    )
+    return found[0]
+
+
+# Near-miss controls for the patterns. Each one differs from a real ledger path in ONE way, and each
+# way is a property both patterns are supposed to enforce. Without these, a pattern of `.*` would
+# pass the positive assertion and pin nothing at all.
 _PATTERN_CONTROLS: Final[tuple[tuple[str, str], ...]] = (
     ("docs/BACKLOGxmd", "the dot in BACKLOG.md must be escaped, not a wildcard"),
     ("vendor/docs/BACKLOG.md", "the pattern must be anchored at the start of the path"),
     ("docs/BACKLOG.md.bak", "the pattern must be anchored at the end of the path"),
     ("docs/archive/backlog/BACKLOG-CLOSED.txt", "the archive entry must require a .md suffix"),
-    ("docs/ARCHITECTURE.md", "an unrelated doc must not select the ledger hook"),
+    ("docs/ARCHITECTURE.md", "an unrelated doc must not be taken for the ledger"),
+)
+
+# The two REGEX sites, screened together. Parametrising rather than duplicating is the point: a
+# control added for one is a control the other must also satisfy, and the local hook and the CI
+# step agreeing is exactly the property BACKLOG #1250 puts at risk.
+_PATTERN_SITES: Final[tuple[tuple[str, Callable[[], str]], ...]] = (
+    (".pre-commit-config.yaml", _ledger_files_pattern),
+    (_HYGIENE, _hygiene_ledger_pattern),
 )
 
 
@@ -210,26 +257,46 @@ def test_the_allocator_sweeps_the_same_ledger() -> None:
     )
 
 
-def test_the_pre_commit_pattern_selects_both_real_ledger_paths() -> None:
-    """The `files:` regex is RUN against the real paths -- pattern text is never compared.
+@pytest.mark.parametrize(("site", "read"), _PATTERN_SITES, ids=[s[0] for s in _PATTERN_SITES])
+def test_a_ledger_pattern_selects_both_real_ledger_paths(
+    site: str, read: Callable[[], str]
+) -> None:
+    """Each regex site is RUN against the real paths -- pattern text is never compared.
 
-    pre-commit filters staged paths with ``re.search`` over the repo-relative, forward-slash
-    spelling, so that is exactly what is applied here.
+    Both consumers apply their pattern to the repo-relative, forward-slash spelling of a changed
+    path: pre-commit filters staged files with ``re.search``, and the hygiene step greps a
+    newline-separated list of them. So that is exactly what is applied here.
     """
-    pattern = _ledger_files_pattern()
-    compiled = re.compile(pattern)
-
-    unmatched = [p for p in _CANON if not compiled.search(p)]
+    pattern = read()
+    unmatched = [p for p in _CANON if not re.compile(pattern).search(p)]
     assert not unmatched, (
-        f"the pre-commit hook pattern {pattern!r} does not select {unmatched}, so editing those "
-        f"files would not run the ledger parse gate at commit time."
+        f"the ledger pattern in {site} ({pattern!r}) does not select {unmatched}, so a change to "
+        f"those files would not be recognised as touching the ledger."
     )
 
 
 @pytest.mark.parametrize(("path", "why"), _PATTERN_CONTROLS, ids=[c[0] for c in _PATTERN_CONTROLS])
-def test_the_pre_commit_pattern_rejects_a_near_miss(path: str, why: str) -> None:
-    """Negative control: a pattern that matched everything would pass the test above and pin nothing."""
-    compiled = re.compile(_ledger_files_pattern())
-    assert not compiled.search(path), (
-        f"the pre-commit hook pattern selects {path!r}, which is not a ledger file -- {why}"
+@pytest.mark.parametrize(("site", "read"), _PATTERN_SITES, ids=[s[0] for s in _PATTERN_SITES])
+def test_a_ledger_pattern_rejects_a_near_miss(
+    site: str, read: Callable[[], str], path: str, why: str
+) -> None:
+    """Negative control: a pattern matching everything would pass the test above and pin nothing."""
+    assert not re.compile(read()).search(path), (
+        f"the ledger pattern in {site} selects {path!r}, which is not a ledger file -- {why}"
+    )
+
+
+def test_the_ci_pattern_uses_only_constructs_python_re_reads_the_same_way() -> None:
+    """The dialect check that makes the test above a sound substitution, not a wrong measurement.
+
+    The hygiene pattern is executed by ``grep -E`` and compared here by Python ``re``. The two
+    agree on everything the real pattern uses; they diverge at backslash-LETTER escapes, which are
+    Python character classes and not ERE. If one appears, the comparison above is silently reading
+    a different pattern than CI runs -- so it is screened for rather than assumed.
+    """
+    pattern = _hygiene_ledger_pattern()
+    bad = _NON_ERE_ESCAPE.findall(pattern)
+    assert not bad, (
+        f"the {_HYGIENE} ledger pattern {pattern!r} contains backslash-letter escapes {bad}, which "
+        f"grep -E does not read as Python re does. Compare it by running grep, or drop the escape."
     )
