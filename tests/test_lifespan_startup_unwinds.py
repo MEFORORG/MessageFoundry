@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1257: a startup failure after ``engine.start()`` must let the PROCESS exit.
 
 The lifespan's teardown is complete -- it stops the engine (which closes the store), both

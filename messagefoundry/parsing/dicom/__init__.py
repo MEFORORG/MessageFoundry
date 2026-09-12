@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure DICOM codec (ADR 0025) — a tolerant routing peek + a navigable dataset model + DICOM→HL7
 mapping helpers, mirroring the HL7 :mod:`messagefoundry.parsing` library and the X12
 (:mod:`messagefoundry.parsing.x12`) / FHIR (:mod:`messagefoundry.parsing.fhir`) codecs.

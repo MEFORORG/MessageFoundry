@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Invalid-credential sender auto-stop (#109, ADR 0095): on a PERMANENT credential/auth fault an
 outbound File/FTP/SFTP sender STOPs the lane IMMEDIATELY (not after a streak) and RETAINS the queued
 rows UN-ERRORED (pending/claimable, never dead-lettered) so a backlog can't repeatedly re-authenticate

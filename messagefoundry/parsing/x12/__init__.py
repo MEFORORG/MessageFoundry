@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure ASC X12 EDI codec (ADR 0012) — a tolerant routing peek, an interchange splitter/assembler, and
 a mutable message model, mirroring the HL7 :mod:`messagefoundry.parsing` library.
 

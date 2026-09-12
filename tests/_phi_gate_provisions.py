@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """What a `serve` fixture must PROVIDE to start clean, now that every instance carries patient data.
 
 BACKLOG #1279 retired `[security].handles_real_patient_data = false`. One line used to buy a quiet

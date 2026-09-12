@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The High Availability page for the /ui ops dashboard (ADR 0056, BACKLOG #1495).
 
 One page renders the whole cluster from whichever node serves it, because every node reads the same

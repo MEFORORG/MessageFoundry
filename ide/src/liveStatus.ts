@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Live per-element decorations for the CONNECTIONS view (ADR 0091 "live decorations"): an opt-in
 // (`messagefoundry.liveStatus.enabled`, default OFF) poll of the engine's `GET /connections`
 // (Permission.MONITORING_READ) that feeds status + message counts onto inbound/outbound rows via

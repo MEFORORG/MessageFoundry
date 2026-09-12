@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read the ``ci-red`` label back, and say WHICH run reddened each pull request (BACKLOG #1385).
 
 ``failure-signal.yml`` writes the label. Until this script, **nothing read it** -- a grep for

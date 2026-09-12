@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0129 / BACKLOG #142 — the process-in-place (`after_read='leave'`) processed-file dedup ledger.
 
 Covers the SQLite `processed_files` store methods (`is_file_processed` / `record_processed_file` /

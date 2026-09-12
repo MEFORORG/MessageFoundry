@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the shared TLS key-exchange policy (ASVS 11.6.2, WP-L3-10 code half)."""
 
 from __future__ import annotations

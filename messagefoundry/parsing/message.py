@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A mutable HL7 v2 message — read and set fields by path, then re-encode.
 
 Wraps a ``python-hl7`` parse. Field paths use the same ``SEG-F[.C[.S]]`` syntax as

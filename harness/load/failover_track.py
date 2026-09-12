@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-message bookkeeping the FAILOVER verdict needs — the facts aggregate counters can't give.
 
 A steady-state load run never constructs one of these (the sender/sink fast paths stay byte-identical

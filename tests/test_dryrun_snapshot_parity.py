@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI ``dryrun`` / ``dryrun --trace`` preview the engine's copy-on-Send posture (#230 P4, ADR 0104).
 
 The engine default for ``[pipeline].snapshot_on_send`` is ON (ADR 0104 §8.1) while the ``dry_run`` /

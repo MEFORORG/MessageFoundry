@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``[auth].oidc_flow_ttl_seconds`` is bounded at both ends (BACKLOG #1156, ASVS 10.1.2).
 
 Its sibling ``oidc_clock_skew_seconds`` has been validator-capped since it was introduced; this one

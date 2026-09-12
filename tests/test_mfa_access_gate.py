@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.3 / 6.3.4 — MFA as an ACCESS gate, and per-mechanism directory strength.
 
 6.3.3 moved the second factor from the step-up boundary to the front door: an MFA-pending session is

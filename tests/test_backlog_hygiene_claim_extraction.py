@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A backticked or fenced MENTION of the claim token was read as a CLAIM (BACKLOG #1296).
 
 ``backlog-hygiene.yml`` decides whether a pull request *claims* to implement a backlog item by

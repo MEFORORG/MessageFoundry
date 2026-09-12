@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Keep the two top-level ``conftest`` modules unreachable by bare name (BACKLOG #1255).
 
 ``testpaths`` names two roots and BOTH ship a ``conftest.py``; neither root is a package and nothing

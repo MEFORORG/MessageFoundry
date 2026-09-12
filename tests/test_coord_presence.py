@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the cross-surface session roster (``scripts/coord/presence.ps1``).
 
 Every test drives the REAL script as a subprocess against a throwaway git repo and a fixture config

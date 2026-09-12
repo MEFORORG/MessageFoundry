@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI dispatch for the DR ``backup`` / ``restore-verify`` subcommands (ADR 0049, #60) — the argparse
 layer over the runner primitives (``test_backup_runner`` / ``test_restore_verify`` cover those). Drives
 ``main(argv)`` end-to-end through the parser + ``_DISPATCH`` on a SQLite-backed store: JSON/human

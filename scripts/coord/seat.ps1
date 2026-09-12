@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
     Write this session's EPISODE RECORD -- the durable answer to "what was this seat doing" that
@@ -501,6 +501,101 @@ function Get-AllocationsFor {
 # Atomic write.
 # ---------------------------------------------------------------------------------------------
 
+function Resolve-SeatAgainstRoster {
+    <#
+    .SYNOPSIS
+        Resolve a declared seat label against docs/roles/seats.json. Never throws, never refuses.
+
+    .DESCRIPTION
+        WHY THIS EXISTS. This script wrote whatever -Seat it was handed straight into the record,
+        with no idea what the roster said. Measured 2026-09-10: a session declared `-Seat manager`
+        while that label was NOT in the roster at all, and the script accepted it and wrote a record
+        that renders on the fleet board as a live seat. Nothing reported a problem, because the
+        record was valid -- the same hollow-record shape as the nosid failure above, one field over.
+
+        THE CASE THAT MADE IT URGENT is the opposite one. With the Console RETIRED (BACKLOG #1529),
+        `-Seat console` would record a retired seat silently, while role-card-inject.ps1 is LOUD
+        about exactly that label. Two paths reading one roster, one of them blind, is how a reader
+        ends up holding a seat the working agreement does not run.
+
+        IT RECORDS EITHER WAY AND NEVER REFUSES, and that is deliberate rather than lax. An
+        undeclared seat renders as UNDECLARED to every other session, so refusing a declaration
+        trades a readable-but-odd record for NO record. A label may also legitimately be a spelling
+        nobody has added to the alias map yet. So this warns and records; it does not gate.
+
+        THE VERDICT IS ADDITIVE. `seat` keeps the verbatim label, because fleet.ps1 and every other
+        reader keys on it. `seatCanonical` and `seatRosterVerdict` are new fields beside it, so a
+        reader that has never heard of them is unaffected.
+    #>
+    param([string] $Label)
+
+    $out = [pscustomobject]@{
+        Canonical = $null
+        Verdict   = 'no-roster'
+        Message   = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($Label)) { $out.Verdict = 'none'; return $out }
+
+    try {
+        $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $seatsPath = Join-Path $repoRoot 'docs/roles/seats.json'
+        if (-not (Test-Path -LiteralPath $seatsPath)) { return $out }
+        $seats = Get-Content -LiteralPath $seatsPath -Raw | ConvertFrom-Json
+        $lower = $Label.Trim().ToLowerInvariant()
+        $liveList = ($seats.live -join ', ')
+
+        if ($seats.live -contains $lower) {
+            $out.Canonical = $lower; $out.Verdict = 'live'; return $out
+        }
+        if ($seats.aliases.PSObject.Properties.Name -contains $lower) {
+            $out.Canonical = $seats.aliases.$lower; $out.Verdict = 'alias'; return $out
+        }
+        if ($seats.retired.PSObject.Properties.Name -contains $lower) {
+            $out.Verdict = 'retired'
+            $out.Message = @"
+[seat] DECLARED A RETIRED SEAT: '$Label'. The record was written anyway -- no record is worse than
+an odd one -- but the roster says this seat does not run here:
+
+$($seats.retired.$lower)
+
+Re-declare with a live seat, which overwrites this one:
+
+    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <seat> -Goal "<one line>"
+
+Live seats: $liveList.
+"@
+            return $out
+        }
+        if (($seats.PSObject.Properties.Name -contains 'elsewhere') -and
+            ($seats.elsewhere.PSObject.Properties.Name -contains $lower)) {
+            $out.Verdict = 'elsewhere'
+            $out.Message = @"
+[seat] '$Label' IS NOT A SEAT IN THIS REPOSITORY. The record was written anyway.
+
+$($seats.elsewhere.$lower)
+
+This is a roster difference, not a typo and not a retirement. Live seats: $liveList.
+"@
+            return $out
+        }
+
+        $out.Verdict = 'unknown'
+        $out.Message = @"
+[seat] '$Label' MATCHES NO SEAT IN THE ROSTER. The record was written anyway, and it will render on
+the fleet board as if this were a real seat.
+
+Live seats: $liveList.
+If '$Label' is a spelling of one of those, add it to the aliases map in docs/roles/seats.json.
+"@
+        return $out
+    }
+    catch {
+        # A roster this script cannot read must not cost a session its declaration.
+        $out.Verdict = 'roster-unreadable'
+        return $out
+    }
+}
+
 function Write-RecordAtomic {
     param([string]$Path, $Object)
     $dir = Split-Path $Path -Parent
@@ -635,6 +730,14 @@ try {
         if ($parts.Count -eq 2) { $pred = [ordered]@{ boxKey = $parts[0]; sessionKey = $parts[1] } }
     }
 
+    # Resolved ONCE, before the record is built, so the record and the warning cannot disagree.
+    # Whichever label this invocation is actually about: a declaration wins, a derived label fills a
+    # vacuum, and on a plain -Record pass there is no new label and the verdict is 'none'.
+    $labelUnderTest = if ($Declare -and $Seat) { $Seat }
+                      elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
+                      else { $null }
+    $seatRoster = Resolve-SeatAgainstRoster -Label $labelUnderTest
+
     $rec = [ordered]@{
         schema           = $SCHEMA
         writerVersion    = $WRITER
@@ -655,6 +758,10 @@ try {
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
+        # The roster's verdict on whatever label this invocation recorded. ADDITIVE: `seat` below
+        # still carries the verbatim label, because every existing reader keys on it.
+        seatCanonical     = $seatRoster.Canonical
+        seatRosterVerdict = $seatRoster.Verdict
         # A DERIVED label never overwrites a DECLARED one, and never claims to be one. The order
         # here is the whole rule: declared wins, derived fills only a vacuum, prior survives both.
         seat             = if ($Declare -and $Seat) { $Seat }
@@ -691,6 +798,18 @@ try {
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec
+
+    # Said AFTER the write, so the declaration is safely recorded before anything is said about it.
+    # Not gated on -Record/-Prompt: a retired seat arriving through a hook is the same defect as one
+    # typed at the CLI, and the whole point is that no path stays silent about it.
+    #
+    # STDERR, NOT Write-Warning. Measured 2026-09-10 on pwsh 7 here: `Write-Warning` renders to
+    # STDOUT, which would make this narrate into a session's context on the -Record and -Prompt
+    # paths -- the exact thing the comment below those paths forbids. stderr is visible to a person
+    # at the CLI, stays out of stdout for anything parsing it, and is the idiom overlap.ps1 uses.
+    if ($seatRoster.Message) {
+        try { [System.Console]::Error.WriteLine($seatRoster.Message) } catch { }
+    }
 
     # -Prompt is a hook path like -Record: it must not narrate into a session's context. What the
     # session should SEE is the prompt itself, and that is the hook's line to write, not this one's.

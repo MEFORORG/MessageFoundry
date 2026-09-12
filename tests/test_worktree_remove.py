@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Execution tests for ``scripts/worktree/remove.ps1`` (BACKLOG #1037).
 
 ``remove.ps1`` is the most destructive script in ``scripts/worktree/``: it force-removes a worktree

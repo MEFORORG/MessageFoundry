@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Golden surface locks for the mounted /ui web console (Option B, ADR 0065).
 
 Two drift guards over the console's externally-observable surface, both built by mounting the real

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The docs-only CI lane must be able to FAIL, and its module list must be read from CI (#1262).
 
 The main pytest suite is skipped on a pull request touching only Markdown -- deliberately, and it is

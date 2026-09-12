@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Was an anchor's line number RIGHT AT THE COMMIT THE CELL STAMPS AS VERIFIED?
 
 BACKLOG #1344. ``scorecard.py`` answers a different question, correctly: does the token still resolve
