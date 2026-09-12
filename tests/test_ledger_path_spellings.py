@@ -5,19 +5,23 @@
 **The hazard, and why nothing else catches it.** ``docs/BACKLOG.md`` and
 ``docs/archive/backlog/BACKLOG-CLOSED.md`` are named independently by several unrelated
 configuration sites -- a Python tuple, two Python string constants, a pre-commit ``files:``
-regex -- and **no** existing check compares them to each other. Each site is internally
-consistent, so each one reads as correct in isolation. Move the ledger and update only some of
-them and every site still passes its own tests: the pre-commit allocation gate reads one
+regex, a PowerShell array -- and **no** existing check compares them to each other. Each site is
+internally consistent, so each one reads as correct in isolation. Move the ledger and update only
+some of them and every site still passes its own tests: the pre-commit allocation gate reads one
 location while the status parser reads another, both go green, and **allocation collisions stop
 being detected**. That is the failure this file exists to make loud. BACKLOG #1250 is the move
 that will exercise it.
 
+**Four sites are covered, and that is not the whole population.** Others have reported at least
+nine separately-maintained declarations; nine is an unverified lower bound and this file does not
+census them. Read the coverage here as four named sites, never as completeness.
+
 **What is pinned, and what is deliberately not.** The canonical pair is taken from
 ``backlog_status_check.DEFAULT_SOURCES`` -- the single definition of the item namespace -- and
-never from a literal here. A literal would be a fourth independent declaration of the same fact
-and would need updating in lockstep with the other three, which is the defect, not the fix. So
-this file asserts **agreement with that tuple**, plus one positive control proving the tuple
-resolves to a real ledger rather than to a spelling that happens to parse.
+never from a literal here. A literal would be one more independent declaration of the same fact
+and would need updating in lockstep with the rest, which is the defect, not the fix. So this file
+asserts **agreement with that tuple**, plus one positive control proving the tuple resolves to a
+real ledger rather than to a spelling that happens to parse.
 
 **A regex site is compared by BEHAVIOUR, never by text.** ``.pre-commit-config.yaml`` states the
 ledger as ``^docs/(BACKLOG\\.md|archive/backlog/.*\\.md)$``, which no literal grep for a path can
@@ -56,20 +60,49 @@ def _load(name: str, relative: str) -> ModuleType:
     return mod
 
 
-# SITE 1 of 3 -- the single definition of the item namespace, and the reference the other two are
+# SITE 1 of 4 -- the single definition of the item namespace, and the reference the other three are
 # compared against. Nothing below re-states these paths as a literal.
 _STATUS_CHECK: Final[ModuleType] = _load(
     "backlog_status_check", "scripts/docs/backlog_status_check.py"
 )
 _CANON: Final[tuple[str, ...]] = tuple(Path(p).as_posix() for p in _STATUS_CHECK.DEFAULT_SOURCES)
 
-# SITE 2 of 3 -- the pre-commit allocation gate. It states the live ledger as a FILE and the
+# SITE 2 of 4 -- the pre-commit allocation gate. It states the live ledger as a FILE and the
 # archive as a DIRECTORY, so the comparison below is shaped to that, not forced into a pair.
 _LEDGER_CHECK: Final[ModuleType] = _load("ledger_check", "scripts/hooks/ledger_check.py")
 
-# SITE 3 of 3 -- the pre-commit `files:` regex, located by the script its `entry` runs rather than
+# SITE 3 of 4 -- the pre-commit `files:` regex, located by the script its `entry` runs rather than
 # by its hook id, so renaming the hook does not silently drop this site from the comparison.
 _PRE_COMMIT: Final[Path] = _ROOT / ".pre-commit-config.yaml"
+
+# SITE 4 of 4 -- the ALLOCATOR. It sweeps both ledger files to build the set of numbers already
+# taken, so a path it does not sweep is a region where two sessions can pick the same number and
+# merge clean. That is the same collision the gate at site 2 exists to stop, which makes a
+# disagreement between sites 2 and 4 the worst of the shapes this file screens for: the allocator
+# would hand out a number the gate then refuses, or worse, would not see one that is taken.
+#
+# PowerShell cannot be imported, so this site is read from SOURCE TEXT. That is a weaker contract
+# than an import and it is pinned here for exactly that reason -- test_ledger_check.py already
+# carries the same coupling for the same reason.
+_ALLOC: Final[Path] = _ROOT / "scripts" / "coord" / "alloc.ps1"
+_PS_ARRAY: Final[re.Pattern[str]] = re.compile(r"\$backlogPaths\s*=\s*@\(([^)]*)\)", re.MULTILINE)
+
+
+def _allocator_ledger_paths() -> tuple[str, ...]:
+    """The paths the allocator sweeps, read out of its ``$backlogPaths`` assignment.
+
+    A rename of that variable fails loudly rather than returning an empty set. An empty set would
+    make the comparison below vacuous, and a vacuous comparison over a site that has moved is
+    indistinguishable from a site that agrees.
+    """
+    source = _ALLOC.read_text(encoding="utf-8")
+    matches = _PS_ARRAY.findall(source)
+    assert len(matches) == 1, (
+        f"expected exactly one `$backlogPaths = @(...)` assignment in scripts/coord/alloc.ps1, "
+        f"found {len(matches)}. That assignment is how the allocator states which files hold the "
+        f"taken numbers; if it was renamed, re-point this helper rather than deleting the check."
+    )
+    return tuple(re.findall(r"[\"']([^\"']+)[\"']", matches[0]))
 
 
 def _ledger_files_pattern() -> str:
@@ -159,6 +192,21 @@ def test_the_allocation_gate_names_the_same_ledger() -> None:
     assert Path(archive_file).parent.as_posix() == archive_dir, (
         f"ledger_check.BACKLOG_ARCHIVE_DIR is {archive_dir!r}, which does not contain the "
         f"canonical archive ledger {archive_file!r}."
+    )
+
+
+def test_the_allocator_sweeps_the_same_ledger() -> None:
+    """The allocator must sweep exactly the canonical pair -- no more, and no fewer.
+
+    Compared as an ordered tuple rather than a set. The order is not itself load-bearing, but a
+    set comparison would also accept a duplicated entry, and a duplicate in a sweep list is a
+    silent halving of one file's contribution that nothing else here would report.
+    """
+    swept = _allocator_ledger_paths()
+    assert swept == _CANON, (
+        f"scripts/coord/alloc.ps1 sweeps {list(swept)} for taken numbers, but "
+        f"backlog_status_check.DEFAULT_SOURCES names {list(_CANON)}. A path the allocator does "
+        f"not sweep is a region where two sessions pick the same number and merge clean."
     )
 
 
