@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """In-process rendezvous for the synchronous captured-downstream reply (ADR 0154 D3).
 
 **Every signal here is a LATENCY HINT and never an answer.** A woken waiter re-reads the store and

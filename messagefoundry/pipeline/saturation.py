@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Saturation detection — the DERIVATIVE signal for "a lane is *becoming* overloaded" (BACKLOG #93).
 
 Every shipped operational alert (``queue_buildup`` / ``message_stall`` / ADR 0014 rules) keys on an

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
     Stop hook. In a builder session it nags that lane for its own free-slot count. In the dispatcher

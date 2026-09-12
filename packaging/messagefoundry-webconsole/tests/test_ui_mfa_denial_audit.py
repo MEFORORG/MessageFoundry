@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The /ui MFA gate must audit its refusals, as the JSON plane's gate already does.
 
 BACKLOG #1197, ASVS 16.3.2. ``AuthService.audit_mfa_denied`` states the reason in its own docstring:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Message.age() / Message.length_of_stay(): derived HL7 timestamp values read from the
 conventional fields (PID-7 DOB, PV1-44/PV1-45 admit/discharge).
 

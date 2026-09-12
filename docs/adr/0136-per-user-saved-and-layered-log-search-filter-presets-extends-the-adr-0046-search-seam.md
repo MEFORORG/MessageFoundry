@@ -69,10 +69,13 @@ layering are **step-up-gated + audited**, and the content term **never round-tri
    > now the immutable `Identity.user_id`, matching the uploads model (ADR 0134 Amendment A / #1152),
    > which abandoned username-keying for exactly this reason.
    >
-   > **It is a NARROWING, not a closure.** `_upsert_ad_user` re-binds a surviving mirror row's
-   > `user_id` when a directory-side sAMAccountName is recycled without a MessageFoundry
-   > `delete_user`, so a user_id-keyed check is still defeated on that path. This closes local
-   > accounts and the AD-with-delete path; **BACKLOG #1143 is the real close.**
+   > **It was a NARROWING, not a closure, and the rest closed later.** `_upsert_ad_user` re-bound a
+   > surviving mirror row's `user_id` when a directory-side sAMAccountName was recycled without a
+   > MessageFoundry `delete_user`, so a user_id-keyed check was still defeated on that path. This
+   > record closes local accounts and the AD-with-delete path; the directory-immutable binding that
+   > closes the recycle itself shipped under **BACKLOG #1471** (`users.directory_object_id`, keyed on
+   > the normalised `objectGUID`). The one case still resolved by name is a directory that returns no
+   > immutable identifier.
    >
    > Note also that `UNIQUE(owner, name)` now collides on a different thing: two accounts that once
    > shared a recycled name previously collided on save-by-name and no longer do. That is the intended

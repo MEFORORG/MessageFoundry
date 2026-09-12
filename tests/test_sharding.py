@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """L3 per-connection sharding: shard tag, filter_registry_for_shard, shard discovery."""
 
 from __future__ import annotations

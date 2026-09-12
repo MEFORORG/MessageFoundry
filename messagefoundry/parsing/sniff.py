@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure content-sniffing helpers (ASVS 5.2.2 / 1.3.4).
 
 Cheap, side-effect-free magic-byte checks shared by the file transports (``transports/file.py``,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Freeze the tokenless ``/health`` contract the tray depends on (ADR 0113 §2, AC-2).
 
 The Windows tray service-manager polls ``GET /health`` with **no** ``Authorization`` header — that is

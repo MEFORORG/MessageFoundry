@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A role card is injected at SessionStart, so a WRONG one outranks the document that corrects it.
 
 THE FAILURE THESE TESTS PIN. `CLAUDE.md` reaches a session as context. A card reaches it at session
@@ -9,7 +9,8 @@ the working agreement does not lose the argument -- it wins it, silently, for th
 THE CARDS CAME FROM KORUS AND WERE NOT COPIED. Three ways a straight copy would have been wrong,
 each measured 2026-09-06 and each guarded below:
 
-  1. ROSTER. korus runs seven seats. Section 5's table here runs five: no Manager, no Reviewer.
+  1. ROSTER. korus runs seven seats. Section 5's table here runs five: no Reviewer. The MANAGER
+     joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529).
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -39,10 +40,14 @@ MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
 #: Section 5's table governs. FIVE seats, not korus's seven.
-EXPECTED_SEATS = frozenset({"console", "builder", "regulator", "steward", "lander"})
+EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander"})
 
 #: Live in korus, absent here. They must resolve to a card-less explanation, never to silence.
-EXPECTED_ELSEWHERE = frozenset({"manager", "reviewer"})
+EXPECTED_ELSEWHERE = frozenset({"reviewer"})
+
+#: Retired 2026-09-10. Every observed spelling is listed in `retired` ON PURPOSE: an alias must land
+#: on a live seat, so a spelling left out would resolve to "MATCHES NO SEAT" and read as a typo.
+CONSOLE_SPELLINGS = frozenset({"console", "console1", "console-1", "consul"})
 
 REQUIRED_SECTIONS = (
     "What this seat owns",
@@ -365,6 +370,83 @@ class TheHookNeverGuessesASeat(unittest.TestCase):
         source = read(HOOK)
         self.assertIn(MARKER_RELPATH, source)
         self.assertIn("KORUS_SEAT", source)
+
+
+class TheConsoleRetirementSaysTheManagerIsNotARenameOfIt(unittest.TestCase):
+    """BACKLOG #1529. The measured error: a Manager read a Console pointer as "substitute the Console".
+
+    `seats.json` used to say of the Manager label: *"A korus seat, not one here. CLAUDE.md section 5
+    runs the Console instead."* That sentence is true about which CARD resolves and says nothing
+    about which SEAT you hold, and a Manager session read it as an instruction to act as a Console.
+    It then looked for a spawn grant it does not need and an enqueue authority it does not have.
+
+    So the retirement notice must do more than retire the label. It must say the replacement is NOT
+    a rename, because the substitution is the failure and a bare "retired" invites it.
+    """
+
+    def test_every_console_spelling_resolves_to_a_retirement(self):
+        retired = seats()["retired"]
+        missing = sorted(CONSOLE_SPELLINGS - set(retired))
+        self.assertEqual(
+            [],
+            missing,
+            f"these Console spellings resolve to nothing instead of a retirement: {missing}. "
+            "A label that matches no seat reads as a misspelling, not as a roster fact.",
+        )
+
+    def test_no_console_spelling_is_live_or_an_alias(self):
+        live_or_alias = sorted(CONSOLE_SPELLINGS & (set(seats()["live"]) | set(seats()["aliases"])))
+        self.assertEqual([], live_or_alias, f"the Console is still reachable as: {live_or_alias}")
+
+    def test_the_canonical_notice_names_the_manager_and_denies_the_rename(self):
+        why = seats()["retired"]["console"]
+        self.assertIn("MANAGER", why, "the notice does not say which seat replaces it")
+        self.assertRegex(
+            why.lower(),
+            r"not a renamed console",
+            "the notice retires the label without denying the rename, which is the whole defect: "
+            "a reader who learns only that the Console is gone substitutes the Manager for it",
+        )
+
+    def test_the_notice_names_at_least_one_concrete_difference(self):
+        """A denial with no difference beside it is a slogan. Name what would actually mislead."""
+        why = seats()["retired"]["console"].lower()
+        present = [k for k in ("subagent", "spawn grant", "enqueue") if k in why]
+        self.assertTrue(
+            present,
+            "the notice denies the rename but names no difference, so a reader has nothing to "
+            "act on. Name the workers, the spawn grant, or the enqueue authority.",
+        )
+
+    def test_the_agreement_retires_the_console_rather_than_going_quiet(self):
+        """Deleting every mention would leave the stale documents unanswered and nothing to cite."""
+        text = read(AGREEMENT)
+        self.assertIn(
+            "There is no Console seat",
+            text,
+            "CLAUDE.md no longer states the retirement, so a document that routes work through a "
+            "Console has nothing contradicting it",
+        )
+        self.assertIn(
+            "NOT a renamed Console",
+            text,
+            "the agreement retires the seat without denying the rename",
+        )
+
+    def test_the_manager_card_denies_the_rename_too(self):
+        """The card outranks the agreement in a session's context, so the warning must be on it."""
+        card = read(CARD_DIR / "manager.card.md")
+        self.assertIn("not a renamed Console", card)
+
+    def test_the_scan_would_fire_on_the_wording_that_caused_this(self):
+        """Positive control. Without it, every assertion above passes against a rewritten notice."""
+        planted = "A korus seat, not one here. CLAUDE.md section 5 runs the Console instead."
+        self.assertNotRegex(
+            planted.lower(),
+            r"not a renamed console",
+            "the check cannot tell the misleading sentence from a compliant one, so it guards "
+            "nothing",
+        )
 
 
 if __name__ == "__main__":

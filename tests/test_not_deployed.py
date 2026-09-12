@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection present in the config but NOT DEPLOYED (#233, ADR 0111) — engine enforcement.
 
 ``deployed=False`` is a first-class lifecycle state: the connection stays in the graph (history,

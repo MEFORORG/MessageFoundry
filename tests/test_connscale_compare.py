@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Claim-mode A/B comparison (ADR 0066) — the per_lane-vs-pooled verdict logic, pure + hermetic."""
 
 from __future__ import annotations

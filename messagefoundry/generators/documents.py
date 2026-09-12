@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synthetic **encapsulated-document** (ED) HL7 messages for round-trip / transport tests.
 
 Real-world ORU lab/radiology results and MDM transcriptions carry a scanned PDF as a base64

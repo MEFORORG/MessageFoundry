@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-13b — MLLP-over-TLS (ADR 0002): the per-connection SSL-context builder + a real TLS round-trip."""
 
 from __future__ import annotations

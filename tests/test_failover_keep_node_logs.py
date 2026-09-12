@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the bench-only ``MEFOR_BENCH_KEEP_NODE_LOGS`` node-log sink (no live engine).
 
 The failover/shardcert harness normally writes each ``serve`` subprocess's stdout to a

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Single project-root anchoring for the whole config bundle (ADR 0050).
 
 One *logical* configuration bundle — the ``--config`` graph dir, the sibling ``environments/`` value

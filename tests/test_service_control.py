@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Windows service-control helpers: state parsing + a real missing-service query.
 
 The body moved to :mod:`messagefoundry.service` (ADR 0088); this exercises it there so the

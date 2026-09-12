@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PARTITIONED routing for the shardcert bench — the REAL hub shape.
 
 The shardcert bench has only ever modelled a BROADCAST hub: ``graph._make_router`` returns the full handler

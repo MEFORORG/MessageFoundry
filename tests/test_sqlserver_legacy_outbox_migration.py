@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The legacy SQL Server ``outbox`` table is folded into ``queue`` and DROPped (ASVS 14.2.7).
 
 **What was actually wrong.** The table was recreated by `_SCHEMA` on every open and read by nothing:

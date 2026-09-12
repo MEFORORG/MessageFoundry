@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
     // acquireVsCodeApi() may be called only ONCE per webview context. With retainContextWhenHidden the
     // script can re-run against a RETAINED window (after a hide/show or an html reassignment); a SECOND
     // call throws "an instance of the VS Code API has already been acquired" — and it would die HERE, at

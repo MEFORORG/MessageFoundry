@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the mid-task steering injection (``scripts/hooks/steer-inject.ps1``).
 
 The hook reads a note any process on the box can write and puts it in front of a session inside a

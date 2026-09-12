@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Report OPEN backlog items whose code-side subject already exists on `origin/main` (BACKLOG #1426).
 
 WHAT EVERY OTHER LEDGER SCREEN READS, AND WHY THAT IS NOT ENOUGH. `backlog_status_check.py` asks

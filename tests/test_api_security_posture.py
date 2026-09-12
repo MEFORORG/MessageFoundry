@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0118 AC-5 — the read-only ``GET /security/posture`` view.
 
 The web console shows the EFFECTIVE ``[security]`` posture (the switch values, any active loosenings, and

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """/ui uploaded-logs page smoke tests (BACKLOG #125/#126, ADR 0134).
 
 The console reaches the engine through the seam-v7 CoreHandlers; these drive the cookie flow end to

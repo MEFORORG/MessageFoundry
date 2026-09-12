@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Minimal, self-contained MLLP codec for the tee relay — **vendored, not imported from the engine**.
 
 The relay is a standalone application with no ``messagefoundry`` dependency, so the ~100 lines of MLLP

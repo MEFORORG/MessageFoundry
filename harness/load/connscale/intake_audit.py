@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The intake audit (BACKLOG #1292) -- a PER-MESSAGE discriminator for an ``engine_read`` shortfall.
 
 WHAT IT IS FOR. ``harness.load.connscale.runner._reconcile`` fails a step with

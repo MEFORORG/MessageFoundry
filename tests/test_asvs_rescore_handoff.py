@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Does the re-score handoff check find a missing banner flip without inventing ones?
 
 BACKLOG #1328, remaining limb. The screen compares a cell's re-score date against the date its item's

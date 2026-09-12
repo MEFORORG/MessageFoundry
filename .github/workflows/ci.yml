@@ -133,9 +133,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           # Only `origin/main` needs fetching: the gate reads it (`git show origin/main:…`, `ls-tree`) and
-          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine and no
-          # deepening is required -- see the long note in ledger_check.py's tree-access section for why
-          # three-dot was wrong here, and why its failure was silent.
+          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine -- see
+          # the long note in ledger_check.py's tree-access section for why three-dot was wrong here, and
+          # why its failure was silent.
+          #
+          # ***THE DEPTH IS NOT DECORATION ANY MORE (BACKLOG #1470). DO NOT TRIM IT TO 1.*** The gate's
+          # REVERSE arm -- the one that refuses a commit deleting a `## N.` item heading -- reads the
+          # PARENTS of HEAD, and on a `pull_request` HEAD's first parent is the base tip. Its objects
+          # arrive only because of this deepen. At `--depth=1` that parent is unreadable, and the arm
+          # would go silent rather than red: the gate now REFUSES when no parent is readable, precisely
+          # so that a shallower fetch fails loudly instead of quietly checking nothing.
           git fetch --no-tags --depth=200 origin main
           python scripts/hooks/ledger_check.py --ci
 

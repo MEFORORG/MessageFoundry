@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cluster coordination seam (active-passive HA — Track B Steps 3-7).
 
 Active-passive HA runs the engine as a leader plus one or more hot standbys against one shared
@@ -774,6 +774,8 @@ class DbCoordinator:
         self._lock_key = f"{db_schema or 'public'}:mefor_cluster_nodes"
         # The leadership-lease KEY (the single leader_lease row's primary key). Schema-namespaced so two
         # deployments sharing one database via different schemas elect leaders independently.
+        # Right HERE only because search_path separates the tables. SqlServerCoordinator's keys are
+        # deliberately constant; do not mirror these there (StoreSettings._db_schema_backend says why).
         self._lease_key = f"{db_schema or 'public'}:mefor_cluster_leader"
         self._host = socket.gethostname()
         self._pid = os.getpid()
@@ -1559,11 +1561,7 @@ def build_coordinator(
         or getattr(store, "_owner", None)
         or default_node_id()
     )
-    # Reach the store's configured schema (duck-typed) so the coordinator's nodes-DDL advisory lock is
-    # namespaced identically to the store's own lock keys. Defaults to 'public' inside DbCoordinator
-    # when the store has no _settings (a non-Postgres path never reaches here).
     settings = getattr(store, "_settings", None)
-    db_schema = getattr(settings, "db_schema", None)
     # The SQL Server store ALSO exposes a `_pool` (aioodbc), but DbCoordinator drives the asyncpg API, so
     # dispatch a SQL Server store to its own active-passive coordinator instead. Backend is duck-typed off
     # the settings enum's value (no StoreBackend import → no config dependency here); the import is local
@@ -1596,6 +1594,9 @@ def build_coordinator(
         ),
         acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
         promotable=getattr(cluster_settings, "promotable", True),
-        db_schema=db_schema,
+        # The store's schema (duck-typed), so the nodes-DDL advisory lock is namespaced identically to
+        # the store's own lock keys; 'public' inside DbCoordinator when unset. Read on this path only:
+        # the SQL Server store ignores db_schema (StoreSettings._db_schema_backend).
+        db_schema=getattr(settings, "db_schema", None),
         alert_sink=alert_sink,  # #145: failover-transition alerts
     )

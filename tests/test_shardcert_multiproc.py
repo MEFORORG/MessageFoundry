@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Offline round-trip for the WS-C MULTI-PROCESS SIZING drive (PR-C1, ADR 0073).
 
 The two-box drive of PR-B is ONE sender proc + ONE sink proc, both below the ~450-500 msg/s target, so

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SMART Backend Services token provider for the FHIR/REST outbound (ADR 0024).
 
 A real SMART-secured FHIR server (Epic, Oracle Health) does **not** accept a long-lived static

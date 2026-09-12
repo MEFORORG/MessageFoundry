@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Negative controls for the required merge contexts that had none (BACKLOG #1000).
 
 A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Thirteen contexts are the entire
@@ -772,8 +772,8 @@ _REF_WIDENING = (
 )
 
 
-def _gitleaks_scan_command() -> str:
-    """The gitleaks scan step's `run:` body, selected by WHAT IT RUNS rather than by its label.
+def _gitleaks_scan_step() -> dict[str, Any]:
+    """The gitleaks scan STEP, selected by WHAT IT RUNS rather than by its label.
 
     The step's `name:` is prose and was itself renamed by the change these controls arrived with. A
     selector keyed on it turns a later wording tweak into `has no step named like ...` on a required
@@ -781,16 +781,19 @@ def _gitleaks_scan_command() -> str:
     of them. `gitleaks detect` is the shipped configuration and is what they are actually about.
     """
     steps = jobs_of("security.yml")["gitleaks"].get("steps", [])
-    scans = [
-        str(s.get("run", ""))
-        for s in steps
-        if re.search(r"\bgitleaks\s+detect\b", str(s.get("run", "")))
+    scans: list[dict[str, Any]] = [
+        s for s in steps if re.search(r"\bgitleaks\s+detect\b", str(s.get("run", "")))
     ]
     assert len(scans) == 1, (
         f"expected exactly ONE `gitleaks detect` step in the gitleaks job, found {len(scans)}; these "
         "controls assert the scope of THAT step and cannot pick between several"
     )
     return scans[0]
+
+
+def _gitleaks_scan_command() -> str:
+    """That step's `run:` body. The scope controls below read the command and nothing else."""
+    return str(_gitleaks_scan_step().get("run", ""))
 
 
 def _log_opts_of(command: str) -> str | None:
@@ -966,6 +969,346 @@ def test_a_commit_on_an_unmerged_branch_is_outside_the_shipped_scope(tmp_path: P
         f"a commit on an unmerged branch is still inside {scope!r}. A branch nobody has reviewed can "
         "red this required context and freeze the merge queue."
     )
+
+
+# ===================================================================================================
+# `gitleaks (secret scan)` a THIRD time -- whether it walked anything at all (BACKLOG #1481). The
+# allowlist block above asks what the scanner may skip inside the diffs it reads; the scope block asks
+# whose diffs it reads. This asks the question underneath both: a range is a thing that can resolve
+# EMPTY, and on an empty one the scanner reports `0 commits scanned` and exits 0. A gate that cannot
+# tell FOUND NOTHING from LOOKED AT NOTHING is the class this whole file indexes, arriving inside a
+# required context it already covers twice.
+#
+# TWO READERS, NOT ONE, and the separation is the point rather than a tidiness preference. The range
+# guard is gitleaks-specific -- it is measured against the scanner's OWN wording, and no shared
+# abstraction can know another scanner's. The pipefail half is general: it applies to any piped step
+# in any job, and it is applied here to every piped step of THIS job, which is one door short of the
+# required-jobs sweep in tests/test_security_posture.py where the general rule belongs. Widening it
+# to every required job is a real follow-up and is NOT done here; it is named by subject rather than
+# by a number nobody has allocated.
+# ===================================================================================================
+#: A `set` line ENABLING `pipefail`, in every spelling this repo writes -- `-o`, `-eo`, `-euo`. The
+#: leading `-` is required, so `set +o pipefail` -- which DISABLES it -- is correctly not a match.
+_PIPEFAIL = re.compile(r"^set\s+-[-\w]*\s*pipefail\b")
+
+#: Tokens `shlex` yields that are shell punctuation rather than operands. `shlex` keeps a punctuation
+#: run together, so `|` and `||` are DIFFERENT tokens and a pipe test needs no regex and no quote
+#: handling. Only `|` and `&&` occur in this job today; the rest are here because an operand run ends
+#: at any of them, and the control below pins that stop with a row whose verdict flips without it.
+_SHELL_PUNCTUATION = frozenset({"|", "||", "&&", ";", ";;", "&", "{", "}", "(", ")"})
+
+#: A redirect, in both shapes `shlex` produces: `>` and `2>>` split from their operand, and `>file`
+#: joined to it. `2>&1` matches with an operand of `&1`, which names no file -- see `_captured_files`.
+_REDIRECT = re.compile(r"^[0-9]*>>?(?P<file>.*)$")
+
+#: The two reports the range guard exists to tell apart, in the scanner's own wording.
+#:
+#: THE GUARD IS RUN AGAINST THESE RATHER THAN SPELL-CHECKED, and that is the difference between
+#: asserting a property and asserting a string. A pattern is a guard when it matches the walked report
+#: and refuses the empty one, however it is written -- so a later rewrite in a different but correct
+#: spelling stays green, while `[0-9]+ commits scanned` goes red for the reason that matters.
+#: Both wordings are the pinned 8.18.4 binary's, as recorded in BACKLOG #1481.
+_WALKED_REPORT = "1:23AM INF 3 commits scanned."
+_EMPTY_REPORT = "1:23AM INF 0 commits scanned."
+
+
+def _executable_lines(body: str) -> list[list[str]]:
+    """Each non-comment line of a `run:` body, split the way a shell splits it.
+
+    `comments=True` strips comments on its own and a blank or comment-only line tokenises to `[]`, so
+    there is no hand-rolled "drop lines starting with #" here. `_log_opts_of` above records why that
+    matters: two copies of that normaliser are free to drift apart.
+
+    CONTINUATIONS ARE JOINED FIRST, and that is borrowed rather than invented.
+    `tests/test_ci_faulthandler_belts.py` and `tests/test_ci_engine_step_excludes_webconsole.py` both
+    carry a `_logical_lines` doing this, the second recording that leaving them un-joined was measured
+    wrong in BOTH directions -- a false green and a false alarm. THIS IS A THIRD COPY of that reducer
+    and it ought to be one shared helper in `tests/_workflow_contexts.py`; that extraction spans three
+    modules each carrying its own measurement prose, and it is not done here.
+    """
+    joined = re.sub(r"\\\n[ \t]*", " ", body)
+    lines: list[list[str]] = []
+    for raw in joined.splitlines():
+        words = shlex.split(raw, comments=True)
+        if words:
+            lines.append(words)
+    return lines
+
+
+def _operands(words: list[str]) -> list[str]:
+    """The operand run at the head of `words`: flags dropped, stopping at shell punctuation."""
+    taken: list[str] = []
+    for word in words:
+        if word in _SHELL_PUNCTUATION:
+            break
+        if not word.startswith("-"):
+            taken.append(word)
+    return taken
+
+
+def _captured_files(words: list[str]) -> set[str]:
+    """Files this line writes a command's own output into -- `tee FILE`, `> FILE`, `2>> FILE`.
+
+    Both capture shapes are read because either is a legitimate way to keep the scanner's report, and
+    a detector that knew only `tee` would demand one spelling of a thing it does not care about.
+    """
+    files: set[str] = set()
+    for i, word in enumerate(words):
+        if word == "tee" or word.endswith("/tee"):
+            files.update(_operands(words[i + 1 :]))
+            continue
+        redirect = _REDIRECT.match(word)
+        if redirect is None:
+            continue
+        target = redirect["file"] or (words[i + 1] if i + 1 < len(words) else "")
+        if target and not target.startswith("&"):  # `2>&1` duplicates a descriptor, names no file
+            files.add(target)
+    return files
+
+
+def _count_checks(words: list[str]) -> list[tuple[str, str, bool]]:
+    """Each `grep` on this line reading the scanner's count line back.
+
+    Returns `(pattern, file, refuses_the_empty_report)`. The third element is MEASURED -- the pattern
+    is run against the scanner's own two reports -- rather than inferred from how it is spelled. A
+    check matching `0 commits scanned` as well is satisfied by exactly the run it exists to refuse,
+    and that is how a guard becomes decoration with nobody having deleted it.
+
+    A pattern Python cannot compile raises here rather than being folded into "toothless": the
+    traceback then names the pattern and its position, and such a pattern is not an ERE `grep` would
+    take either. Two unrelated defects sharing one message is what that fold would buy.
+    """
+    checks: list[tuple[str, str, bool]] = []
+    for i, word in enumerate(words):
+        if word != "grep" and not word.endswith("/grep"):
+            continue
+        operands = _operands(words[i + 1 :])
+        for j, operand in enumerate(operands):
+            if "commits scanned" not in operand:
+                continue
+            refuses = bool(re.search(operand, _WALKED_REPORT)) and not re.search(
+                operand, _EMPTY_REPORT
+            )
+            checks.append((operand, operands[j + 1] if j + 1 < len(operands) else "", refuses))
+            break
+    return checks
+
+
+def _pipes(step: dict[str, Any]) -> bool:
+    """Does an executable line of this step carry a REAL pipe?
+
+    `shlex` keeps a punctuation run together, so `||` is a single token distinct from `|`. That is
+    why this is a token test and not a regex: `x || true` and `x | y` are told apart for free, and a
+    `|` inside a quoted argument never reaches here as its own token.
+    """
+    return any("|" in words for words in _executable_lines(str(step.get("run", ""))))
+
+
+def _missing_pipefail(step: dict[str, Any]) -> str | None:
+    """Why this step's exit code is its LAST command's rather than its pipeline's. None when it is not.
+
+    General by construction -- it reads any step, and nothing in it is gitleaks-shaped.
+    """
+    lines = _executable_lines(str(step.get("run", "")))
+    if any(_PIPEFAIL.match(" ".join(words)) for words in lines):
+        return None
+    shell = str(step.get("shell", ""))
+    shortcut = (
+        f" The step declares `shell: {shell}`, and THAT IS NOT THE FIX: naming a shell makes GitHub "
+        "substitute `bash --noprofile --norc -eo pipefail`, so the step would acquire pipefail as a "
+        "side effect of naming the shell it already used -- and the next edit to delete that key as "
+        "redundant takes the guarantee with it."
+        if shell
+        else ""
+    )
+    return (
+        "no explicit `set -o pipefail` on an executable line. The default `run:` shell here is "
+        "`bash -e` WITHOUT it, and a pipeline's status is its LAST command's -- so a non-zero exit "
+        "from the command that matters is discarded and the step reports success." + shortcut
+    )
+
+
+def _unguarded_range(step: dict[str, Any]) -> list[str]:
+    """Why a GREEN run of this step could mean it walked nothing. Empty means it could not."""
+    lines = _executable_lines(str(step.get("run", "")))
+    captured = {f for words in lines for f in _captured_files(words)}
+    checks = [c for words in lines for c in _count_checks(words)]
+    guards = [target for _pattern, target, refuses in checks if refuses]
+    toothless = [pattern for pattern, _target, refuses in checks if not refuses]
+    reasons: list[str] = []
+
+    if not captured:
+        reasons.append(
+            "the scan's own output is captured nowhere, so no count can be read back and the step "
+            "cannot tell an empty range from a clean one"
+        )
+    if toothless:
+        reasons.append(
+            f"a count check that does not refuse `0 commits scanned` -- {toothless}. It passes on "
+            "exactly the run it exists to refuse."
+        )
+    if not guards:
+        reasons.append(
+            "nothing asserts the scanner reported a NON-ZERO `N commits scanned`, so a range that "
+            "resolved empty exits 0 and reads in the checks UI as a clean scan"
+        )
+    else:
+        orphans = sorted(set(guards) - captured)
+        if orphans:
+            reasons.append(
+                f"the guard reads {orphans}, which nothing in this step writes. It would fail closed "
+                "today, and it is reading a file rather than the scan's report."
+            )
+    return reasons
+
+
+def test_the_gitleaks_scan_asserts_it_walked_a_non_empty_range() -> None:
+    """PLANTED BY THE SCANNER ITSELF: `0 commits scanned`, exit 0, a green tick.
+
+    Measured 2026-09-07 on the pinned 8.18.4 binary (BACKLOG #1481): `--log-opts HEAD..HEAD` reports
+    `0 commits scanned` and exits **0**, while `--log-opts HEAD` over the same tree reports 2 and
+    exits 1 on a planted secret. Nothing downstream tells the first from a clean scan -- the checks
+    UI renders one green tick for both, on a REQUIRED secret gate.
+
+    THE SHIPPED RANGE IS A LITERAL AND IS MEASURED SAFE, which is why this is a guard and not an
+    incident report. It is for the next edit to that flag: the step's own comment records that an
+    event-aware range was declined partly because not every trigger carries a base SHA, and on a
+    trigger with no base a range built from one is exactly the empty range.
+
+    IT READS THE SCANNER'S REPORT AND NEVER RECOMPUTES ITS SUBJECT. A `git rev-list --count` over the
+    same range would be a SECOND copy of it -- free to agree today, to drift tomorrow, and to go on
+    passing after the flag it guards has changed. That is the second-definition defect #1479 removed
+    from this job's header, and it must not come back in as the fix for this one.
+    """
+    reasons = _unguarded_range(_gitleaks_scan_step())
+    print(f"[#1481] range guard: {len(reasons)} vacuous-pass reason(s) on the shipped scan step")
+    assert not reasons, (
+        "this required secret gate can report SUCCESS having walked zero commits:\n  "
+        + "\n  ".join(reasons)
+    )
+
+
+def test_every_piped_step_in_the_gitleaks_job_sets_pipefail_explicitly() -> None:
+    """THE SAME VACUOUS PASS ONE LAYER DOWN, over the WHOLE JOB rather than the one step that needed it.
+
+    Reading the scanner's count back needs the scan piped into `tee`, and a pipe discards the exit
+    code that matters: the default `run:` shell is `bash -e` -- `-e` WITHOUT `pipefail` -- so a
+    findings-exit of 1 would be replaced by `tee`'s 0 and the gate would go green on a run that found
+    secrets. The capture and the `set` line have to land together, or the fix installs a worse defect
+    than the one it closes.
+
+    IT COVERS THE INSTALL STEP TOO, and that is not scope creep -- it is where the class was found.
+    That step selects the checksum line with `grep ... | sha256sum -c -`. Without pipefail a `grep`
+    matching NOTHING (a renamed asset) is discarded and the step's status is `sha256sum`'s, which
+    happens to refuse empty input. Safe by the downstream tool, not by design, inside a required gate
+    whose whole purpose is verifying those bytes.
+
+    `shell: bash` IS REJECTED RATHER THAN OVERLOOKED. It makes GitHub substitute `bash --noprofile
+    --norc -eo pipefail`, which buys the same semantics invisibly -- the step acquires pipefail as a
+    side effect of naming the shell it was already using, a reader cannot see that error semantics
+    changed, and a later edit removing the key as redundant reinstates the defect while looking like a
+    cleanup. Explicit is the local idiom as well as the legible one; the census is in BACKLOG #1481.
+
+    THE REMAINING SCOPE IS STATED RATHER THAN IMPLIED: this is one job. Every required job is the
+    right home for the rule, and `tests/test_security_posture.py::test_required_jobs_have_no_neutered
+    _steps` is the sweep it belongs in -- a pipe without pipefail is `|| true` spelled differently.
+    Not done here.
+    """
+    steps = jobs_of("security.yml")["gitleaks"].get("steps", [])
+    piped = [s for s in steps if _pipes(s)]
+    print(f"[#1481] {len(piped)} of {len(steps)} steps in the gitleaks job carry a pipe")
+    assert piped, (
+        "no step in the gitleaks job pipes at all, so this control asserts nothing. If the pipes were "
+        "removed deliberately, re-point it; an empty scan must not read as a pass."
+    )
+    offenders = [
+        f"{step.get('name') or '<unnamed step>'} -- {why}"
+        for step in piped
+        if (why := _missing_pipefail(step))
+    ]
+    assert not offenders, (
+        "a piped step in a REQUIRED job discards the exit code that matters:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_vacuous_pass_detector_fires_on_each_half_and_holds_on_the_rest() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL, and the ASYMMETRY that decides whether it is worth having.
+
+    "The shipped step is guarded" and "the reader matches nothing" are the same green. The first row
+    is the EXACT command `main` carried before this change, so the readers are shown reddening on the
+    real defect rather than a fabricated one, and the two halves are shown reddening SEPARATELY --
+    two readers that fired together for either defect would be one control wearing two names.
+
+    EVERY ROW IS SYNTHETIC, DELIBERATELY. This control must stay GREEN while the shipped guard is
+    neutered, or the neutering run cannot distinguish "the guard is gone" from "the reader is broken".
+
+    The green rows are the other half. A legitimate step may spell `pipefail` three ways, may capture
+    with `tee` or a redirect, may name its log anything, and may chain the guard onto the capture line
+    -- and a reader flagging any of those would be "fixed" by deleting the guard, which reinstates
+    exactly the defect it exists to catch.
+    """
+
+    def kinds(run: str, **step: str) -> set[str]:
+        body: dict[str, Any] = {"run": run, **step}
+        found = {"guard"} if _unguarded_range(body) else set()
+        if _missing_pipefail(body):
+            found.add("pipefail")
+        return found
+
+    scan = "gitleaks detect --config .gitleaks.toml --log-opts HEAD --redact --verbose --no-banner"
+    capture = f"{scan} 2>&1 | tee gitleaks-scan.log"
+    guard = "grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log"
+
+    # --- RED: the shapes that can pass having scanned nothing --------------------------------------
+    assert kinds(scan) == {"pipefail", "guard"}, "the readers cannot see the command this replaced"
+    assert kinds(f"{capture}\n{guard}") == {"pipefail"}, "a missing `set` line is not reported"
+    assert kinds(f"set -o pipefail\n{capture}") == {"guard"}, (
+        "a missing range guard is not reported"
+    )
+    assert kinds(f"{capture}\n{guard}", shell="bash") == {"pipefail"}, (
+        "`shell: bash` was accepted as the pipefail guarantee; it is the shortcut this rejects"
+    )
+    assert kinds(f"# set -o pipefail\n{capture}\n{guard}") == {"pipefail"}, (
+        "pipefail was read out of a COMMENT, so the reader counts the rationale as the guard"
+    )
+    assert kinds(f"set +o pipefail\n{capture}\n{guard}") == {"pipefail"}, (
+        "`set +o pipefail` DISABLES it and was read as enabling it"
+    )
+    zero_ok = "grep -qE '[0-9]+ commits scanned' gitleaks-scan.log"
+    assert kinds(f"set -o pipefail\n{capture}\n{zero_ok}") == {"guard"}, (
+        "a guard whose pattern also matches `0 commits scanned` passed as a guard"
+    )
+    elsewhere = "grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' some-other.log"
+    assert kinds(f"set -o pipefail\n{capture}\n{elsewhere}") == {"guard"}, (
+        "a guard reading a file the step never writes passed as a guard"
+    )
+    # THE ROW THAT PINS THE STOP-AT-PUNCTUATION IN `_operands`. Without that break, `tee` collects
+    # every later word on the line -- including `some-other.log` past the `&&` -- so the orphan
+    # disappears and this row goes green while the step reads a file the scan never wrote.
+    assert kinds(f"set -o pipefail\n{capture} && {elsewhere}") == {"guard"}, (
+        "an operand run that crosses `&&` swallowed the guard's own file as a capture"
+    )
+    # THE ROW THAT PINS THE `&` FILTER IN `_captured_files`, asserted on the REASON and not the kind:
+    # read as a file named `&1`, a step that keeps no log at all would look captured.
+    nothing_kept = _unguarded_range({"run": f"set -o pipefail\n{scan} 2>&1\n{guard}"})
+    assert any("captured nowhere" in why for why in nothing_kept), nothing_kept
+
+    # --- GREEN: legitimate spellings the readers must not demand a rewrite of ----------------------
+    assert kinds(f"set -euo pipefail\n{capture}\n{guard}") == set()
+    assert kinds(f"set -eo pipefail\n{capture}\n{guard}") == set()
+    assert kinds(f"set -o pipefail\n{scan} | tee gitleaks-scan.log\n{guard}") == set()
+    assert kinds(
+        f"set -o pipefail\n{scan} > scan.txt\ngrep -qE '[1-9][0-9]* commits scanned' scan.txt"
+    ) == (set())
+    assert kinds(f"set -o pipefail\n{capture} && {guard}") == set(), (
+        "a guard chained onto the capture line was not seen"
+    )
+    assert kinds(
+        f"set -o pipefail\n{capture}\ngrep -E -q '[1-9] commits scanned' gitleaks-scan.log"
+    ) == (set())
+    # A line continuation is joined before splitting, so a re-wrapped capture is still one command.
+    assert kinds(f"set -o pipefail\n{scan} 2>&1 \\\n  | tee gitleaks-scan.log\n{guard}") == set()
 
 
 # ===================================================================================================

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#200 (ADR 0092) residual: the off-box log/audit forwarder brought under the shared hop gradient.
 
 ``[logging].forward_*`` (ADR 0080) ships a copy of every log record — and, via ``emit_audit_tee``, of

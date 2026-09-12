@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The five shipped operator docs carry no warning sign (U+26A0) -- BACKLOG #1265, first slice.
 
 CLAUDE.md section 11 rules U+26A0 decoration rather than a sixth holdout (owner-ruled 2026-08-14)

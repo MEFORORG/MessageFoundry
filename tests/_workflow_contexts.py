@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Resolve branch-protection status-check CONTEXTS to the jobs that report them.
 
 Shared by ``test_required_contexts.py`` (does every in-repo claim about the required set agree?) and

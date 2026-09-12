@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-021 (CWE-494): the adopter scaffold must harden the live, unhashed transitive resolve.
 
 The generated ``requirements.txt`` pins only the engine, so ``pip install -r requirements.txt``

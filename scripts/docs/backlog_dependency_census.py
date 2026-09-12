@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Enumerate what depends on ``docs/BACKLOG.md``, and HOW, so a move is not blind (BACKLOG #1250).
 
 WHAT THIS IS FOR. #1250 records an owner ruling that the backlog belongs in the vault and, in the

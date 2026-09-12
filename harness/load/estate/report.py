@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The estate report — the achieved demo SHAPE keyed by connection count (#216).
 
 Where the connscale report is a 6-wall curve, the estate report answers one question honestly: did the

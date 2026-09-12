@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Production SQL Server implementation of the :class:`~messagefoundry.store.base.Store` protocol.
 
 Runs the full ADR-0001 staged pipeline (ingress -> routed -> outbound) + ADR-0013 query/response on a
@@ -1407,6 +1407,12 @@ _SCHEMA: list[str] = [
         -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
         -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
         oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
+        -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID).
+        -- SIZED rather than MAX for this file's ordinary reason (256 is its dominant width), though
+        -- nothing here needs it as an index key: the column carries NO uniqueness constraint, so the
+        -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
+        -- GUID is 36 characters, so the width is slack, not a bound.
+        directory_object_id NVARCHAR(256) NULL,
         password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -1428,6 +1434,12 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
         ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+    # Directory-immutable identity binding (BACKLOG #1471): COL_LENGTH-gated ADD on a pre-existing
+    # users table. NULL on existing rows = "no directory binding", and such a row is REFUSED rather
+    # than adopted by an AD login presenting an objectGUID -- not byte-identical to before, and that
+    # is the item. No backfill exists; nothing has ever held the directory's identifier.
+    """IF COL_LENGTH('users','directory_object_id') IS NULL
+        ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -1723,6 +1735,23 @@ def _build_pool_executor(settings: StoreSettings) -> ThreadPoolExecutor:
         max_workers=maxsize + 4,
         thread_name_prefix="mefor-sqlserver",
     )
+
+
+def _probed_grant(value: Any) -> bool | None:
+    """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
+    read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
+
+    ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` each return **NULL** — not 0 —
+    when the name they are asked about does not resolve *for this caller*: an unknown or renamed role,
+    a principal the caller cannot see, a permission name this server version does not carry. Folding
+    that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
+    clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
+    :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
+    the other door. ``True``/``False`` from a driver that returns booleans still compares equal to
+    ``1``/``0``, so this keeps working on such a driver."""
+    if value is None:
+        return None
+    return bool(value == 1)
 
 
 class SqlServerStore:
@@ -2965,7 +2994,17 @@ class SqlServerStore:
 
         ``HAS_PERMS_BY_NAME`` covers the grants that are permissions rather than roles (``CONTROL
         SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
-        than by role membership is still seen."""
+        than by role membership is still seen.
+
+        **A NULL column is NOT READ, and a read that is not complete is never ``OBSERVED``** (BACKLOG
+        #1234). All three built-ins answer NULL when the name does not resolve for the caller, so the
+        argument above — *an empty enumeration must not render as a clean bill of health* — was
+        defeated by its own replacement until this arm distinguished the three states. Any probed
+        grant that reads NULL makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named
+        grant by grant in the detail, because the documented grant is then genuinely UNVERIFIED: a
+        role that was never read is not a role the principal does not hold. Grants that DID read as
+        held are still reported, since a partial read can only understate an over-grant, never invent
+        one."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
@@ -2985,12 +3024,53 @@ class SqlServerStore:
                 status=StorePrivilegeStatus.UNOBSERVABLE,
                 detail="the privilege query returned no row",
             )
-        server_roles = tuple(
-            name for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES) if row[f"srv_{i}"] == 1
-        )
-        database_roles = tuple(
-            name for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES) if row[f"dbr_{i}"] == 1
-        )
+        database = str(row["db_name"] or self._settings.database or "")
+        # Three-way, never two: held / not held / NOT READ. See _probed_grant for why a NULL folded to
+        # False is a false-clean rather than a rounding error.
+        unread: list[str] = []
+        held_server: list[str] = []
+        for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
+            grant = _probed_grant(row[f"srv_{i}"])
+            if grant is None:
+                unread.append(f"server role {name}")
+            elif grant:
+                held_server.append(name)
+        held_database: list[str] = []
+        for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
+            grant = _probed_grant(row[f"dbr_{i}"])
+            if grant is None:
+                unread.append(f"database role {name}")
+            elif grant:
+                held_database.append(name)
+        control_server = _probed_grant(row["control_server"])
+        if control_server is None:
+            unread.append("CONTROL SERVER")
+        control_database = _probed_grant(row["control_db"])
+        if control_database is None:
+            unread.append(f"CONTROL on database {database}")
+        server_roles = tuple(held_server)
+        database_roles = tuple(held_database)
+        if unread:
+            probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
+            held_labels = [f"server role {r}" for r in server_roles]
+            held_labels += [f"database role {r}" for r in database_roles]
+            # The catalog enumeration below is skipped deliberately: it is additive only, and widening
+            # a report already saying the read was incomplete buys nothing an operator can act on.
+            return StorePrivilegeReport(
+                backend=self.backend,
+                status=StorePrivilegeStatus.UNOBSERVABLE,
+                principal=str(row["login_name"] or ""),
+                database=database,
+                server_roles=server_roles,
+                database_roles=database_roles,
+                detail=(
+                    f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
+                    f" so they were NOT READ and must not be reported as absent: {', '.join(unread)}"
+                    " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
+                    " does not resolve for this caller); what DID read as held:"
+                    f" {', '.join(held_labels) or 'nothing'}"
+                ),
+            )
         note = (
             "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
@@ -3009,7 +3089,6 @@ class SqlServerStore:
             database_roles = tuple(
                 dict.fromkeys(database_roles + tuple(str(r["role_name"]) for r in extra))
             )
-        database = str(row["db_name"] or self._settings.database or "")
         return StorePrivilegeReport(
             backend=self.backend,
             status=StorePrivilegeStatus.OBSERVED,
@@ -3020,8 +3099,9 @@ class SqlServerStore:
             excess=sqlserver_excess(
                 server_roles=server_roles,
                 database_roles=database_roles,
-                control_server=row["control_server"] == 1,
-                control_database=row["control_db"] == 1,
+                # Narrowed to plain bools by the unread guard above — neither can still be None here.
+                control_server=bool(control_server),
+                control_database=bool(control_database),
                 database=database,
             ),
             detail=f"database user {str(row['db_user'] or '')!r}; {note}",
@@ -9474,14 +9554,15 @@ class SqlServerStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        directory_object_id: str | None = None,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+            " must_change_password, failed_attempts, locked_until, directory_object_id)"
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)",
             (
                 user_id,
                 username,
@@ -9494,6 +9575,7 @@ class SqlServerStore:
                 password_hash,
                 now if password_hash is not None else None,
                 1 if must_change_password else 0,
+                directory_object_id,
             ),
         )
 
@@ -9503,6 +9585,17 @@ class SqlServerStore:
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
+        return UserRecord.from_mapping(d) if d else None
+
+    async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
+        # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
+        # rather than the recyclable sAMAccountName. NOTE, as with get_user_by_federated_subject
+        # below, that the comparison is the DATABASE's and this column carries no explicit COLLATE:
+        # under a case-insensitive server default two ids differing only in case would match here.
+        # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
+        # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
+        # perform is the property a reader would assume.
+        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
