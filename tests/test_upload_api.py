@@ -776,11 +776,12 @@ async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
     row, because the engine would consider it the owner. Synthetic HL7 only.
 
     SCOPE OF THIS TEST, stated so a green is not over-read. It pins the LOCAL delete-and-recreate
-    path, where a new ``user_id`` is genuinely minted. ``_upsert_ad_user`` mints one only when NO
-    mirror row survives — i.e. also only after a delete — so on the DEFAULT AD path (a
-    ``sAMAccountName`` recycled in the directory with the MessageFoundry row left in place) the
-    existing row is adopted and its ``user_id`` is RE-BOUND. That case is NOT covered here and is not
-    closeable by this key; it needs the directory-immutable binding tracked as BACKLOG #1143.
+    path, where a new ``user_id`` is genuinely minted. The DEFAULT AD path — a ``sAMAccountName``
+    recycled in the directory with the MessageFoundry row left in place — is NOT covered here: it
+    used to adopt the surviving row and RE-BIND its ``user_id``, and since BACKLOG #1471
+    ``_upsert_ad_user`` resolves by the directory's immutable id and refuses that pairing instead.
+    That decision is tested in ``tests/test_ad_directory_identity.py``, by
+    ``test_a_recycled_sam_account_name_does_not_adopt_the_departed_operators_row``.
     """
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app

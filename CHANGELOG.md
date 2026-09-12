@@ -62,6 +62,28 @@ All notable changes to MessageFoundry are documented here. The format follows
   and BACKLOG #1279.
 
 ### Changed
+- **An Active Directory login is now identified by the directory's immutable id, not by
+  `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
+  person. The engine resolved an AD principal by that name, so a recycle without a matching
+  MessageFoundry `delete_user` adopted the departed operator's row and re-bound its `user_id` -- the
+  value uploaded-file ownership, the per-uploader quota and saved search presets all key on. Nothing
+  reported it. `AdPrincipal` now carries the normalised `objectGUID`, `users.directory_object_id`
+  stores it on all three store backends (nullable, in-place upgraded, no index), and `_upsert_ad_user`
+  resolves by that id. **A login whose id disagrees with the row holding its username is refused and
+  audited (`directory_identity_conflict`), never adopted or backfilled** -- backfilling on first sight
+  would leave the recycle window open for every account that had not signed in yet. A directory that
+  returns no immutable identifier still resolves by username, and the engine warns once per distinct
+  cause -- the attribute absent, or present in a shape it cannot read -- so a site on that path is
+  told rather than left to assume the control is running. **One behaviour change worth planning
+  for, and it has no remedy today:** a directory-side rename now keeps the account instead of
+  minting a second one, and the stored username stays as created, so the username-keyed
+  `reconcile_directory_sessions` reads a renamed account as absent and revokes its sessions once it
+  reaches `ad_session_recheck_strikes`. **Nothing writes `users.username` after account creation** --
+  not the store protocol, any of its three backends, or the API -- so a renamed person would re-enter
+  that cycle after every sign-in rather than being fixed by an administrator. Deleting the row is the
+  only escape available, and it discards the `user_id` that uploads, quota and presets key on.
+  Re-keying the probe and adding a rename path are both the ADR 0184 reconciler question.
+  ([BACKLOG #1471](docs/BACKLOG.md))
 - **Web console engine UI seam `93ba1f10b9dccfc8` -> `b93f38d097f97a45`.** `SecurityPosture` gained the
   additive `store_privilege` object above, and `StorePrivilegeView` joins the discovered surface.
   Additive with a default, so an older console ignores it; the seam still moves because the golden seam

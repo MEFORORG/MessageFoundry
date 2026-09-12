@@ -88,8 +88,16 @@ def test_the_1414_shape_is_reported_as_drifted_branch_held() -> None:
     """The item's instance A, fabricated because the live registry holds none of it.
 
     Entitlement is recorded to tree A; A has moved to another branch; the recorded branch is checked
-    out in tree B. Git refuses to check one branch out in two worktrees, so the two keys cannot be
-    brought back together -- which is the whole of BACKLOG #1414.
+    out in tree B. Git refuses an ORDINARY second checkout of one branch in two worktrees, so the two
+    keys cannot be brought back together by a plain `git checkout` -- which is the whole of BACKLOG
+    #1414.
+
+    That refusal is a DEFAULT rather than a law of git (BACKLOG #1039): measured, `git worktree add
+    --force` (and `-f`) check the same branch out again and succeed, and `git checkout
+    --ignore-other-worktrees` switches. The verdict is named for what the DEFAULT tooling does, which
+    is what the seat reading the census is about to run. Forcing it is not the recovery -- two trees
+    on one branch both satisfy the ledger gate's branch key, which is the exclusivity that key rests
+    on. The route the module documents is an alias branch off the held one.
     """
     claim = _claim("C:/tree/a", "recorded")
     trees = [_wt("C:/tree/a", "somewhere-else"), _wt("C:/tree/b", "recorded")]
@@ -416,7 +424,7 @@ def test_the_rig_cannot_reach_the_real_registry(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
 def test_For_records_the_named_worktree_and_its_branch(tmp_path: Path) -> None:
-    """The third limb closed at birth: the Console allocates, the Builder's tree is recorded."""
+    """The third limb closed at birth: the Manager allocates, the Builder's tree is recorded."""
     repo = _alloc_rig(tmp_path)
     builder = tmp_path / "builder"
     out = _alloc(repo, "-Kind", "backlog", "-Title", "builders item", "-For", str(builder))
