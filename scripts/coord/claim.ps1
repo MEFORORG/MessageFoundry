@@ -32,10 +32,15 @@
     earlier was labelled STALE and recommended for release.
 
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
-    <git-common-dir>/mefor-coord/claims/.history: the key, the releasing worktree and branch, the
-    prior holder, its branch and note, when the claim was taken, and whether -Force was used. The
-    record is written BEFORE the claim file is removed and the release is refused if it cannot be
-    written -- a release nobody can trace is the outcome this will not produce (BACKLOG #1068).
+    <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
+    the tree the command was actually invoked FROM (`invoked_from`, BACKLOG #1358), the prior holder,
+    its branch and note, when the claim was taken, and whether -Force was used. The record is written
+    BEFORE the claim file is removed and the release is refused if it cannot be written -- a release
+    nobody can trace is the outcome this will not produce (BACKLOG #1068).
+
+    `released_by` and `invoked_from` answer different questions and routinely differ: the first is the
+    tree the claim is held in the name of, the second is where the operator's shell was. Read them as a
+    PAIR -- a release where they diverge was performed on another tree's behalf.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\claim.ps1 -Take 105 -Note "corepoint xml importer"
@@ -101,6 +106,25 @@ if ($AsWorktree) {
     $holder = $holderTop.Trim()
 }
 
+# WHERE THE SHELL IS STANDING -- a THIRD question, and the one nothing recorded (BACKLOG #1358).
+#
+# $repo answers *where this copy of the script lives*; $holder answers *who the claim is for*. Neither
+# answers *who ran this*, and inside a single checkout all three are the same directory, which is why
+# the gap stayed invisible for as long as it did.
+#
+# Returns $null rather than a guess when the shell is not inside a repository at all. An empty string
+# would land in the release record looking like a tree whose path is "", and a record that invents a
+# value is the failure this whole item is about.
+#
+# THIS IS NOT A RE-ANCHORING (BACKLOG #1060). Nothing here decides where the registry lives, who owns a
+# claim, or which tree a release is judged against -- every one of those still comes from $PSScriptRoot
+# by way of $repo/$holder. This value is written down and never acted on.
+function Get-CallerTree {
+    $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if (-not $top) { return $null }
+    return $top.Trim()
+}
+
 # ONE divergence test, three call sites (BACKLOG #1358). The note used to be written inline at the very
 # end of the script, which put it after the `-Take` success block and therefore made it UNREACHABLE from
 # `-Release` -- the script stated the release rule at claim time and went silent at the moment the
@@ -114,9 +138,11 @@ if ($AsWorktree) {
 # tree the operator is not standing in -- so once `-AsWorktree` names the tree they ARE standing in, there
 # is no divergence left to warn about and firing anyway would be a false alarm on the correct usage.
 function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
-    $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    # Get-CallerTree, not a second copy of the same read: the note and the release record must agree
+    # about where the shell was, and two spellings of one question is how they stop agreeing.
+    $cwdTop = Get-CallerTree
     if (-not $cwdTop) { return }
-    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $a = ($cwdTop -replace '\\', '/').TrimEnd('/')
     $b = ($holder -replace '\\', '/').TrimEnd('/')
     if ($a -ieq $b) { return }
     Write-Host "  NOTE: your shell is in $a, but this claim is recorded against $b," -ForegroundColor Yellow
@@ -476,6 +502,9 @@ if ($Release) {
     # failed -- which the catch below corrects in the same ledger. Refusing when the record cannot be
     # written is safe because a release is always retryable: the claim stays where it was.
     #
+    # Read ONCE and shared with the release-failed record below, so a single release can never write two
+    # lines that disagree about where its operator was standing.
+    $invokedFrom = Get-CallerTree
     # ConvertTo-Stamp on every field carried over from the claim file, not just the timestamp:
     # ConvertFrom-Json date-coerces ANY ISO-8601-shaped string, and note/branch/worktree are free text.
     $record = [ordered]@{
@@ -484,6 +513,25 @@ if ($Release) {
         key             = $Release
         released_by     = $holder
         released_branch = $branch
+        # THE ACTOR (BACKLOG #1358), read as a pair with released_by per the header. WHY A RECORD AND
+        # NOT A WARNING: a misdirected -Take is refused by the commit gate at the point of use, and
+        # nothing anywhere re-reads a release record, so a wrong actor here is never contradicted.
+        #
+        # ALWAYS WRITTEN, including when it equals released_by, and $null when the shell was not inside a
+        # repository. Omitting it on the ordinary same-tree release would make absence mean two things --
+        # "the caller was the holder" and "this record predates the field" -- and a reader cannot tell
+        # those apart, which is the ambiguity the field exists to remove.
+        #
+        # -AsWorktree MAKES THIS SHARPER RATHER THAN REDUNDANT (measured 2026-09-10, BACKLOG #1346's
+        # flag). `-Release <key> -AsWorktree <holder>` re-aims the ownership test at the named tree, so a
+        # checkout that holds nothing can release another's claim WITHOUT -Force: prior_holder,
+        # released_by and released_branch all name the holder and `force` stays false, so the line is
+        # indistinguishable from that holder releasing its own claim routinely. This field is the only
+        # one that says otherwise.
+        #
+        # The caller's BRANCH is deliberately not recorded beside it: the item asks which seat acted, and
+        # the tree answers that.
+        invoked_from    = $invokedFrom
         prior_holder    = ConvertTo-Stamp $info.Claim.worktree
         prior_branch    = ConvertTo-Stamp $info.Claim.branch
         # The note is what a later reader judges the release BY -- it is the field that was stale and
@@ -509,11 +557,14 @@ if ($Release) {
         # The line above says a release happened; it did not. Correct it in the same ledger rather than
         # leave a record that is now false.
         Add-HistoryLine ([ordered]@{
-                ts          = (Get-Date).ToString("o")
-                event       = "release-failed"
-                key         = $Release
-                released_by = $holder
-                reason      = $_.Exception.Message
+                ts           = (Get-Date).ToString("o")
+                event        = "release-failed"
+                key          = $Release
+                released_by  = $holder
+                # Same reason as the record above, and the correction is the half a reader is MORE
+                # likely to act on: it is the line that says the ledger's previous sentence is false.
+                invoked_from = $invokedFrom
+                reason       = $_.Exception.Message
             } | ConvertTo-Json -Compress) | Out-Null
         throw
     }
