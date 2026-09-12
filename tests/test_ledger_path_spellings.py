@@ -40,6 +40,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -82,9 +83,16 @@ _CANON_BASENAMES: Final[frozenset[str]] = frozenset(Path(p).name for p in _CANON
 # Deliberately greedy on both sides of the anchor: a spelling that carries a directory must arrive
 # WITH its directory, because the directory is the half a move changes. Regex metacharacters are
 # admitted so a pattern site's needle survives extraction intact.
+#
+# THE OPTIONAL BACKSLASH BEFORE THE DOT IS NOT COSMETIC. A regex site spells the file
+# `BACKLOG\.md`, and an anchor written `BACKLOG\.md` (meaning a literal dot) does NOT match that --
+# so before this was added, `.pre-commit-config.yaml` was found only through its `archive/backlog`
+# branch, and a pattern that escaped its dots and named no archive would have been extracted as
+# nothing at all. Measured while mutating: re-pointing that hook's archive branch made the file
+# vanish from the sweep entirely rather than reporting a changed pattern.
 _TOKEN: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9_./\\()|*+?-]*"
-    r"(?:BACKLOG\.md|BACKLOG-CLOSED\.md|archive[/\\]backlog)"
+    r"(?:BACKLOG(?:-CLOSED)?\\?\.md|archive[/\\]backlog)"
     r"[A-Za-z0-9_./\\()|*+?$-]*"
 )
 #: Characters that mark a token as a REGEX rather than a path. A bare closing paren is not one of
@@ -94,9 +102,17 @@ _META: Final[frozenset[str]] = frozenset("(|*+?$[\\")
 _TRAILING: Final[str] = ".,);:"
 
 
-def _tokens(text: str) -> set[str]:
-    """Every ledger spelling in ``text``, folded to a comparable form."""
-    found: set[str] = set()
+def _tokens(text: str) -> list[str]:
+    """Every ledger spelling in ``text``, folded to a comparable form. Repeats are KEPT.
+
+    Counting rather than de-duplicating is what makes the pin able to see a masked loss. Measured
+    while building this file: ``scripts/coord/alloc.ps1`` names the archive twice -- once in the
+    array the allocator sweeps and once in a ``Write-Host`` banner -- so deleting the SWEEP's copy
+    leaves the set of distinct spellings unchanged and the mutation went undetected. The count
+    drops from two to one and reds. The cost is accepted: an unrelated edit that adds or removes a
+    mention also reds, and the failure message says exactly which token moved and by how much.
+    """
+    found: list[str] = []
     for raw in _TOKEN.findall(text):
         tok = raw
         if not (_META & set(tok)):
@@ -105,7 +121,7 @@ def _tokens(text: str) -> set[str]:
                 tok = tok[:-1]
             tok = tok.strip("/")
         if tok:
-            found.add(tok)
+            found.append(tok)
     return found
 
 
@@ -171,12 +187,18 @@ def _python_code_strings(source: str) -> list[str]:
     return out
 
 
+def _mentions_a_canonical_name(tok: str) -> bool:
+    """Does this spelling still name a ledger file, once regex escaping is folded away?"""
+    plain = tok.replace("\\", "")
+    return any(name in plain for name in _CANON_BASENAMES)
+
+
 def _uncommented_lines(source: str) -> list[str]:
     return [ln for ln in source.splitlines() if not ln.strip().startswith("#")]
 
 
-def _spellings(rel: str) -> set[str]:
-    """The ledger spellings a tracked file declares in code, keyed by repo-relative path."""
+def _spellings(rel: str) -> Counter[str]:
+    """The ledger spellings a tracked file declares in code, with their multiplicity."""
     path = _ROOT / rel
     source = path.read_text(encoding="utf-8", errors="replace")
     if rel.endswith(".py"):
@@ -185,7 +207,7 @@ def _spellings(rel: str) -> set[str]:
         chunks = _uncommented_lines(source)
     else:  # pragma: no cover - the registry and the sweep admit no other suffix
         raise AssertionError(f"no extractor for {rel}")
-    return {tok for chunk in chunks for tok in _tokens(chunk)}
+    return Counter(tok for chunk in chunks for tok in _tokens(chunk))
 
 
 # --- the registry -------------------------------------------------------------------------------
@@ -197,92 +219,106 @@ class Site:
 
     path: str
     #: ``both`` -- names the whole two-file namespace. ``live`` -- deliberately the open ledger
-    #: only. ``archive`` -- deliberately the archive subtree only. ``name`` -- basenames only, which
-    #: pin the filename and not the directory.
+    #: only. ``archive`` -- deliberately the archive subtree only. ``pattern`` -- a regex or glob.
     role: str
-    #: Every spelling the file declares, as ``_spellings`` folds them. Pinned by content rather than
-    #: by line number: an anchor keyed on a line is dead the next time the file is edited.
-    tokens: tuple[str, ...]
+    #: Every spelling the file declares AND HOW MANY TIMES, as ``_spellings`` folds them. Pinned by
+    #: content rather than by line number: an anchor keyed on a line is dead the next time the file
+    #: is edited. The count is what catches a masked loss -- see ``_tokens``.
+    tokens: tuple[tuple[str, int], ...]
     why: str
+
+    @property
+    def counts(self) -> Counter[str]:
+        return Counter(dict(self.tokens))
 
 
 SITES: Final[tuple[Site, ...]] = (
     Site(
         "scripts/docs/backlog_status_check.py",
         "both",
-        ("BACKLOG.md", "docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("BACKLOG.md", 1), ("docs/BACKLOG.md", 1), ("docs/archive/backlog/BACKLOG-CLOSED.md", 1)),
         "DEFAULT_SOURCES -- the single definition of item status, and the anchor for this file",
     ),
     Site(
         "scripts/hooks/ledger_check.py",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog"),
+        (("docs/BACKLOG.md", 4), ("docs/archive/backlog", 1)),
         "BACKLOG_PATH + BACKLOG_ARCHIVE_DIR -- the pre-commit number-reuse gate",
     ),
     Site(
         "scripts/coord/alloc_strand_sweep.py",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog"),
+        (("docs/BACKLOG.md", 1), ("docs/archive/backlog", 1)),
         "BACKLOG_PATH + BACKLOG_ARCHIVE_DIR -- models the gate's arithmetic over all refs",
     ),
     Site(
         "scripts/docs/backlog_dependency_census.py",
         "both",
-        ("BACKLOG-CLOSED.md", "docs/BACKLOG.md", "docs/archive/backlog"),
-        "LEDGER_PATH + ARCHIVE_DIR -- the census that scopes the #1250 move itself",
+        (
+            (")BACKLOG\\.md", 1),
+            ("*BACKLOG\\.md(?", 1),
+            ("BACKLOG-CLOSED.md", 1),
+            ("BACKLOG\\.md", 1),
+            ("docs/BACKLOG.md", 2),
+            ("docs/archive/backlog", 1),
+        ),
+        "LEDGER_PATH + ARCHIVE_DIR, plus the three REGEX NEEDLES it hunts other sites with -- the "
+        "census that scopes the #1250 move itself. The fragments are pinned as they extract; a "
+        "needle lifted out of an alternation is not a tidy path and pretending otherwise would "
+        "hide which spelling actually moved",
     ),
     Site(
         "scripts/asvs/rescore_handoff_check.py",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("docs/BACKLOG.md", 1), ("docs/archive/backlog/BACKLOG-CLOSED.md", 1)),
         "inline default for --backlog, not a named constant",
     ),
     Site(
         "scripts/docs/banner_sha_check.py",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("docs/BACKLOG.md", 1), ("docs/archive/backlog/BACKLOG-CLOSED.md", 1)),
         "argparse fallback built by Path division -- invisible to a literal grep",
     ),
     Site(
         "scripts/docs/citation_line_check.py",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("docs/BACKLOG.md", 1), ("docs/archive/backlog/BACKLOG-CLOSED.md", 1)),
         "argparse fallback built by Path division -- invisible to a literal grep",
     ),
     Site(
         "scripts/coord/alloc.ps1",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("docs/BACKLOG.md", 3), ("docs/archive/backlog/BACKLOG-CLOSED.md", 2)),
         "$backlogPaths -- the allocator's all-refs sweep for the next free number",
     ),
     Site(
         "scripts/worktree/remove.ps1",
         "both",
-        ("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md"),
+        (("docs/BACKLOG.md", 1), ("docs/archive/backlog/BACKLOG-CLOSED.md", 1)),
         "the landed-item probe before a worktree is removed",
     ),
     Site(
         "scripts/docs/deferral_resolution_screen.py",
         "live",
-        ("docs/BACKLOG.md",),
+        (("docs/BACKLOG.md", 1),),
         "DEFAULT_BACKLOG -- screens OPEN rows, so the archive is out of scope by design",
     ),
     Site(
         "scripts/docs/verdict_divergence_check.py",
         "live",
-        ("docs/BACKLOG.md",),
+        (("docs/BACKLOG.md", 1),),
         "--backlog default -- verdict vocabulary is checked on the open ledger",
     ),
     Site(
         "scripts/docs/subject_exists_screen.py",
         "live",
-        ("docs/BACKLOG.md",),
+        (("docs/BACKLOG.md", 5),),
         "the `source` default, plus the screen's own instrument self-test",
     ),
     Site(
         "scripts/docs/link_check.py",
         "archive",
-        ("docs/archive/backlog",),
+        (("docs/archive/backlog", 1),),
         "the --subtree help example; names the archive half only",
     ),
 )
@@ -295,17 +331,17 @@ PATTERN_SITES: Final[tuple[Site, ...]] = (
     Site(
         ".pre-commit-config.yaml",
         "pattern",
-        ("docs/(BACKLOG\\.md|archive/backlog/.*\\.md)$",),
+        (("docs/(BACKLOG\\.md|archive/backlog/.*\\.md)$", 1),),
         "the `files:` filter on the backlog-parses hook",
     ),
     Site(
         ".github/workflows/backlog-hygiene.yml",
         "pattern",
         (
-            "(docs/BACKLOG\\.md|docs/archive/backlog/.+\\.md)$",
-            "BACKLOG.md",
-            "docs/BACKLOG.md",
-            "docs/archive/backlog",
+            ("(docs/BACKLOG\\.md|docs/archive/backlog/.+\\.md)$", 1),
+            ("BACKLOG.md", 1),
+            ("docs/BACKLOG.md", 2),
+            ("docs/archive/backlog", 2),
         ),
         "the grep -qE alternation deciding whether a PR touched the ledger",
     ),
@@ -452,20 +488,36 @@ def test_the_canonical_corpus_resolves_to_a_real_ledger() -> None:
 def test_each_configured_site_still_spells_the_corpus_it_did(site: Site) -> None:
     """Content pin. A site whose declaration changed reds HERE, naming the site and the delta."""
     found = _spellings(site.path)
-    expected = set(site.tokens)
+    expected = site.counts
     assert found == expected, (
-        f"{site.path} ({site.why}) declares {sorted(found)}; this gate is pinned to "
-        f"{sorted(expected)}. Added: {sorted(found - expected)}. Removed: "
-        f"{sorted(expected - found)}. If the ledger moved, every site in SITES moves in the SAME "
-        "commit -- a partial move is the defect BACKLOG #1250 names."
+        f"{site.path} ({site.why}) declares {sorted(found.items())}; this gate is pinned to "
+        f"{sorted(expected.items())}. Gained: {sorted((found - expected).items())}. Lost: "
+        f"{sorted((expected - found).items())}. If the ledger moved, every site in SITES moves in "
+        "the SAME commit -- a partial move is the defect BACKLOG #1250 names."
     )
 
 
 @pytest.mark.parametrize("site", SITES, ids=lambda s: s.path)
 def test_no_site_names_a_path_outside_the_canonical_corpus(site: Site) -> None:
-    """Agreement. Every path-shaped spelling must be one the canonical definition still names."""
-    for tok in site.tokens:
-        if "/" in tok:
+    """Agreement. Every path-shaped spelling must be one the canonical definition still names.
+
+    Read from the TREE, not from the pin above. A pin compared only against itself is a tautology;
+    this arm is what fires when ``DEFAULT_SOURCES`` moves and a site does not, which is the
+    half-moved state the whole file is about.
+    """
+    for tok in _spellings(site.path):
+        if _META & set(tok):
+            # A REGEX FRAGMENT, not a path. `backlog_dependency_census.py` carries three -- the
+            # needles it hunts other files' spellings WITH -- and a fragment lifted out of an
+            # alternation is not a compilable pattern on its own, so it cannot be run against the
+            # real paths the way a whole `files:` filter can. What it can be asked is whether it
+            # still NAMES a canonical file, which is the half a rename breaks.
+            assert _mentions_a_canonical_name(tok), (
+                f"{site.path} carries the pattern fragment {tok!r}, which no longer names any of "
+                f"{sorted(_CANON_BASENAMES)}. A needle aimed at the old filename finds nothing and "
+                "reports it as a clean tree."
+            )
+        elif "/" in tok:
             assert tok in _CANON_PATHS, (
                 f"{site.path} names {tok!r}, which DEFAULT_SOURCES no longer covers "
                 f"({sorted(_CANON_PATHS)}). Either the ledger moved and this site did not, or this "
@@ -485,8 +537,9 @@ def test_a_whole_namespace_site_names_both_halves(site: Site) -> None:
     A site that quietly loses its archive half keeps working, keeps passing, and starts issuing
     numbers already used by retired items -- the silent collision the ledger gate exists to stop.
     """
-    assert _LIVE in site.tokens, f"{site.path} no longer names {_LIVE}"
-    assert _ARCHIVE_FILE in site.tokens or _ARCHIVE_DIR in site.tokens, (
+    found = set(_spellings(site.path))
+    assert _LIVE in found, f"{site.path} no longer names {_LIVE}; it declares {sorted(found)}"
+    assert _ARCHIVE_FILE in found or _ARCHIVE_DIR in found, (
         f"{site.path} claims the whole item namespace but names neither {_ARCHIVE_FILE} nor "
         f"{_ARCHIVE_DIR}. Retired items live there; a sweep that misses them re-issues their "
         "numbers."
@@ -496,17 +549,19 @@ def test_a_whole_namespace_site_names_both_halves(site: Site) -> None:
 @pytest.mark.parametrize("site", [s for s in SITES if s.role == "live"], ids=lambda s: s.path)
 def test_a_live_only_site_names_the_open_ledger_and_no_archive(site: Site) -> None:
     """These read OPEN rows on purpose. Recorded so the omission is a decision, not an oversight."""
-    assert site.tokens == (_LIVE,), (
+    found = set(_spellings(site.path))
+    assert found == {_LIVE}, (
         f"{site.path} is registered as reading the open ledger only, but declares "
-        f"{sorted(site.tokens)}. If it grew an archive half it is now a whole-namespace site."
+        f"{sorted(found)}. If it grew an archive half it is now a whole-namespace site."
     )
 
 
 @pytest.mark.parametrize("site", PATTERN_SITES, ids=lambda s: s.path)
 def test_each_pattern_site_still_spells_what_it_did(site: Site) -> None:
     found = _spellings(site.path)
-    assert found == set(site.tokens), (
-        f"{site.path} ({site.why}) declares {sorted(found)}; pinned to {sorted(site.tokens)}."
+    assert found == site.counts, (
+        f"{site.path} ({site.why}) declares {sorted(found.items())}; pinned to "
+        f"{sorted(site.counts.items())}."
     )
 
 
@@ -518,7 +573,7 @@ def test_each_pattern_actually_matches_the_real_ledger_paths(site: Site) -> None
     prefix inside the alternation against outside it), so comparing their text reports drift that
     does not exist. Running them against the real paths asks the question the move actually poses.
     """
-    patterns = [t for t in site.tokens if _META & set(t)]
+    patterns = [t for t in _spellings(site.path) if _META & set(t)]
     assert patterns, f"{site.path} is registered as a pattern site but declares no pattern"
     for raw in patterns:
         rx = re.compile(raw if raw.startswith("^") else "^" + raw.lstrip("^"))
