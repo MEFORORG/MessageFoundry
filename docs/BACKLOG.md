@@ -31572,6 +31572,9 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 ## 1594. an interior blank segment escapes the pre-ACK peek as IndexError, so the message gets no disposition, no NAK, and the MLLP connection is dropped
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-01, vault PR 1475). Open; not started.** Value **8/10**, Difficulty **3/10**. A message whose normalized text carries an empty line between segments (`...\r\rPID|...`, which is what a `CRLF`-terminating sender with a blank line produces) parses, then `peek.control_id`, `summarize(peek)` and `build_ack(raw)` all raise `IndexError`, on both parser backends. Driven through `RegistryRunner._handle_inbound` with a real store: no row, no ACK, no NAK; the MLLP server's last-resort catch logs and drops the connection. Value 8: it is the count-and-log invariant broken by a benign-looking shape, and the sender's only signal is a dropped socket. Difficulty 3: a tolerant blank-segment rule on both backends, a runner guard, a `build_ack` guard, and a parity-corpus expectation update.
+## 1606. a TLS MLLP listener counts a connection only after its handshake, so unhandshaken sockets sit outside max_connections and outlive stop()
+
+> 🔢 **Filed 2026-09-12 from Fable review packet 2, finding P2-04; a residual of June review H-2.** Value **6/10**, Difficulty **2/10**. `MLLPSource.start()` calls `asyncio.start_server(..., ssl=ctx)` with no `ssl_handshake_timeout`, so asyncio's default of 60 seconds applies; `_on_client` runs only after the handshake, and only then does the connection join `_clients` and count in `_active`. `stop()` closes `_clients` only. Value 6: the TLS listener is the one a site is told to use off loopback, and an unauthenticated peer could hold as many half-open connections as the process has descriptors, none counted, and each reload would pay its full grace for them and leave them behind. Difficulty 2: one keyword argument, one call in `stop()`, one test.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32075,3 +32078,23 @@ On each server backend, two tests on the gated live leg:
 Both must be shown to turn red with the lock removed before they are trusted; the run-only monkeypatch plugin that does that is quoted in the packet 4 findings document and can be reused as the control.
 
 **Source:** vaulted `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md`, P4-02 and part 6.
+**Cluster:** Connections & Transports. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). In the shipped code at `2ffcf3347`. The mechanism is confirmed; the exhaustion magnitude was not driven to the limit. On a Linux host at a default descriptor limit a first deployment would see the accept loop refuse everything; on Windows the cost is memory per SSL object.
+
+### Measured at `2ffcf3347`
+
+| Probe | Result |
+|---|---|
+| TLS listener, `max_connections` 1; five raw TCP connections opened and held with no ClientHello, after 1 s | `_active` 0, `_clients` empty, all five sockets open |
+| A sixth connection, a real TLS client | delivered a message and was acknowledged: the five never counted |
+| `stop()` | took 5.00 s, logged the `wait_closed()` abandonment, and all five sockets were still open afterwards |
+
+### The fix
+
+1. Pass `ssl_handshake_timeout` to `start_server` (10 seconds is generous for MLLP).
+2. In `stop()`, call `self._server.close_clients()` (Python 3.13 and later) so unhandshaken transports close too; or wrap the protocol factory so pre-handshake transports are tracked in `_clients`.
+3. A test that opens a raw socket against a TLS listener and asserts it is closed within the handshake timeout and that `stop()` closes it. Nothing in the covering suites opens a raw socket against a TLS listener today.
+
+### Provenance
+
+`docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (maintainer-internal), P2-04. June `FULL-REVIEW-2026-06-10.md` H-2 (fixed for handshaken connections; this is the remainder).
