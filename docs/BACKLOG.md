@@ -15848,6 +15848,85 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 
 ## 1255. two testpaths ship a top-level conftest each, so a bare import conftest binds to whichever loaded first
 
+> ✅ **CLOSED 2026-09-10 -- THE LAST OPEN OPTION IS MEASURED AND REJECTED, SO THE LANDED GUARD IS THE
+> FIX.** This row stayed open on one unresolved question: whether `--import-mode=importlib` (option A)
+> could replace the guard. It cannot. Measured on this tree at `817db9651`, **both testpaths in one
+> process**, pytest 9.1.1 / CPython 3.14.6 / Windows, bare `pytest` with the project root on
+> `sys.path` exactly as CI's `pip install -e .` puts it there. **Baseline: 17,782 collected (17,289
+> engine + 493 web), ZERO errors. Under importlib: 17,613 collected, collection INTERRUPTED.** All
+> three structural options are now measured and every one is worse than the status quo, so nothing
+> here is workable and the row closes on `tests/test_conftest_name_collision_guard.py`.
+> **THE INI KEY THIS ROW NAMES DOES NOT EXIST, AND ITS ABSENCE IS SILENT -- read this before anyone
+> "adopts option A".** `importmode` is not a pytest ini option: `--import-mode` is registered with
+> `group.addoption` in `_pytest/main.py` and never with `addini`. Writing `importmode = "importlib"`
+> under `[tool.pytest.ini_options]` emits `PytestConfigWarning: Unknown config option: importmode`
+> and **changes nothing** -- that run collected 17,782 with zero errors, identical to baseline, in
+> the DEFAULT prepend mode. A warning is not a failure, so that spelling ships a no-op that reads as
+> adoption. Pinned by `test_pyproject_carries_no_dead_importmode_key`. The working routes are
+> `addopts` and the CLI flag; **nothing is set in `pyproject.toml` -- this row ships no config change.**
+> **THE BREAKAGE IS REAL BUT IT IS NOT THE ONE THIS ROW PREDICTED, AND THAT CORRECTION IS THE
+> DURABLE PART.** The row says importlib breaks the files doing `from tests.X import ...` (it counts
+> 36; the census here is 73). **It does not break them: ZERO such failures.** `tests/conftest.py` --
+> the row's own named casualty -- loaded clean, and a lone such module collected 39/39 under
+> importlib. They survive because the editable install puts the project root on `sys.path`, so
+> `tests` resolves as a PEP 420 namespace package whatever the import mode. **What actually breaks
+> is a population this row never names: bare SIBLING imports of helpers inside a test root**
+> (`import _totp_clock`, `from adr0075_batch_harness import ...`), which work today only because
+> prepend puts the test root ITSELF on `sys.path`. importlib puts nothing there.
+> **AND THE FAILING SET IS ORDER-DEPENDENT, WHICH IS WHY THE REPORTED NUMBER IS NOT THE REAL ONE.**
+> pytest reported 10 errored files; an AST census finds **34 module-level importers across 12
+> helper modules** -- plus 4 files that import a helper only inside a FUNCTION BODY, so they
+> cannot produce a collection error at all and would break later, at test-call time. Those 4 are
+> `tests/test_step_up.py` (`_totp_clock`), `tests/test_audit_offbox_tee.py` (`_cipher_registry`),
+> `tests/test_install_gate_wiring.py` (`test_gate_installed_parity`) and
+> `packaging/messagefoundry-webconsole/tests/test_webui.py` (`_soft_webauthn` -- the 13th helper,
+> which appears in no module-level import anywhere). **An earlier draft of this row said 38 and
+> attributed the whole gap to collection order. That was wrong, and the correction STRENGTHENS
+> the verdict rather than weakening it:** `tests/test_audit_offbox_tee.py` sorts EARLY, ahead of
+> the rescuer named below, and still did not error -- which only the module-level/nested split
+> explains. **34 is also what makes the observed 10 fall out exactly:** of the 34, precisely
+> those sorting before the rescuer are the 10 pytest reported -- set-equal, nothing unexplained
+> on either side. The 24-file gap is not pytest truncating -- `tests/test_ci_tooling_gate.py:36`
+> calls
+> `sys.path.insert(0, <the tests dir>)` at import time, collection is alphabetical, that file sorts
+> immediately after the last failure, and **every consumer collected after it accidentally works off
+> another module's global side effect.** Proven two-armed: `tests/test_mfa.py` alone under importlib
+> is a collection ERROR; preceded by `tests/test_ci_tooling_gate.py` it collects 44; alone under
+> prepend it collects 17. Same file, same flag, opposite verdict. **CI runs `-n 4 --dist loadfile`,
+> so per-worker order would decide which files break -- a per-run, per-worker failing set is
+> strictly worse than the latent collision this row was filed for.**
+> **WHAT THIS CLOSE RESTS ON, STATED PRECISELY SO THE RESIDUAL IS VISIBLE RATHER THAN RETIRED.**
+> It rests on COMPLETE `--collect-only` runs over BOTH testpaths in one process, in both arms,
+> plus the landed guard. It does NOT rest on an executed full-suite run: that was started and
+> stopped at 23 percent with zero failures, killed because it was serial (no xdist in that venv,
+> roughly three hours projected) and its port-binding tests would have collided with sibling
+> sessions. Collection is the right instrument for THIS question -- import binding happens at
+> collection, which is where the defect lives and reported -- but it is not the same evidence as
+> a green suite, and this row does not claim it is. **If you hold that a close needs the executed
+> run, RE-RUN IT** -- `pytest -q` over both testpaths, ideally with `-n auto --dist loadfile`.
+> That is a cheap confirmation and it is welcome. What should NOT be repeated is the importlib
+> measurement itself, which is recorded here once precisely so nobody re-derives it (SDS-3.5; the
+> guard's module docstring carries only the DECISION and cites this row for the evidence, because
+> a second copy of a measurement rots silently when nothing points at it). Two tests pin the
+> premises instead of prose: `test_every_pytest_ini_key_is_a_registered_option`, which asks the live
+> pytest config about every key in the block and so covers `import_mode` and `import-mode` as well as
+> the one misspelling above; and `test_the_sibling_bare_imports_that_rule_out_importlib_are_still_present`,
+> which reds if that sibling-import population ever empties -- the one event that would make importlib
+> re-priceable. **Emptying it is the RECOMMENDED direction of travel, not a regression:** migrating
+> `import _totp_clock` to `from tests._totp_clock import ...` is the house idiom, and whoever
+> finishes that job should re-price this row rather than read the red as a defect.
+> **A THIRD DEFECT WAS FOUND AND FIXED IN THE GUARD ITSELF, and it is the same shape this module
+> exists to prevent.** The perf pass that folded the two AST walks into one left `_scan` filtering
+> the heads INLINE while the positive controls exercised only the tree-level wrappers, so the
+> production path and its controls had come apart: mistyping the literal (`"confest"`) or dropping
+> the `head in local` filter would have left EVERY control green over a guard that had stopped
+> detecting -- *a dead detector reads exactly like a clean tree*, this module's own rule, turned
+> on the module. Both callers now share `conftest_hits` / `sibling_hits`. **Proven by mutation
+> rather than asserted:** unmutated, 0 controls fail; mistyping the literal reds
+> `test_the_detector_trips_on_a_planted_bare_import`; dropping the filter reds
+> `test_the_sibling_detector_separates_the_two_import_shapes`. The unmutated arm is what makes
+> the other two mean anything.
+
 > **PARTIAL 2026-08-25 -- A GUARD LANDED, STAYS OPEN.** `tests/test_conftest_name_collision_guard.py`
 > statically walks every testpath root for a bare `import conftest`/`from conftest import` and reds on
 > one; nothing does that today, so it is a regression guard, not a fix for a present-tense defect --
@@ -15861,7 +15940,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > reproduce in a sandbox on pytest 9.1.1 -- a sandbox isn't the real 691-file tree, so that needs
 > re-measuring before anyone adopts or dismisses it, and switching import semantics for 691 files on
 > an unreproduced premise is exactly what landing the guard alone avoids needing right now.
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Every precondition re-verifies at HEAD: no importmode at pyproject.toml:317, neither test root carries an __init__.py, and the collision is still untripped (zero bare conftest imports), so the trap is latent exactly as filed. Difficulty is above a plain additive edit because option B changes pytest module naming for roughly 680 files and the item's own rule is that the only honest check is a both-testpaths full-suite run. _(was 6/10 · 2/10.)_
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Every precondition re-verifies at HEAD: no importmode at pyproject.toml:317, neither test root carries an __init__.py, and the collision is still untripped (zero bare conftest imports), so the trap is latent exactly as filed. Difficulty is above a plain additive edit because option B changes pytest module naming for roughly 680 files and the item's own rule is that the only honest check is a both-testpaths full-suite run. _(was 6/10 · 2/10.)_
 >
 > **THE FAILURE MODE IS WORSE THAN FILED, AND THE FIX IS A DECISION RATHER THAN A TASK. Measured 2026-08-15; verified independently here.** This item describes the signature as an `AttributeError` naming a module path from the wrong package -- i.e. failing loudly-ish. **It can fail SILENTLY instead.**
 > **THE TWO CONFTESTS SHARE EIGHT TOP-LEVEL NAMES** -- `_Baseline`, `_QuiesceNullHandler`, `_allow_insecure_config_source_in_tests`, `_quiesce_background_loggers_at_teardown`, `_quiesce_baseline`, `_quiesce_targets`, `_restore_baseline`, `_tolerate_logging_on_closed_capture_streams` -- **the logging-quiesce machinery, duplicated in both trees.** So a mis-bound `import conftest` **does not necessarily raise: it can SUCCEED and return the WRONG IMPLEMENTATION.** That is the shape this project keeps meeting -- **a resolution that lands on something plausible from the wrong subject** -- and it is strictly worse than the documented signature.
@@ -15873,7 +15952,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > **VERIFICATION MUST BE A FULL-SUITE RUN, and this is not conservatism.** The defect is about what happens when **BOTH trees are collected**, so **any check that runs one tree passes by construction.** That is this item's own *"invisible in isolation"* point applied to its own fix.
 > **PARKED ON VERIFICATION COST, NOT ON DIRECTION.** A latent defect whose fix changes the import semantics of **674 test files** should not land on a fleet that cannot currently measure its own pool, and the honest check is the long one.
 > **INSTRUMENT CAUTION FOR WHOEVER RE-MEASURES THE SHARED NAMES:** the first attempt used `grep -oP` and **died on this box's locale** (*"supports only unibyte and UTF-8 locales"*) -- **it printed NOTHING, which reads exactly like "no shared names".** Redone with an AST walk. **A failed instrument that prints nothing is indistinguishable from a clean result.**
-> 🔢 **Filed 2026-08-14 - not started. LATENT, not live: no caller trips it at `origin/main` today.** `pyproject.toml` sets `testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]`. **Both directories contain a `conftest.py` and NEITHER contains an `__init__.py`**, so both claim the same top-level module name `conftest`. In a full run only one wins `sys.modules`, and a bare `import conftest` in either tree silently binds to it.
+> **Filed 2026-08-14 - not started. LATENT, not live: no caller trips it at `origin/main` today.** `pyproject.toml` sets `testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]`. **Both directories contain a `conftest.py` and NEITHER contains an `__init__.py`**, so both claim the same top-level module name `conftest`. In a full run only one wins `sys.modules`, and a bare `import conftest` in either tree silently binds to it.
 > **THE FAILURE IS INVISIBLE IN ISOLATION, WHICH IS THE WHOLE DEFECT.** Run either tree alone and the import resolves to that tree's own `conftest` and passes. Run both -- which is what `pytest` does by default, and what CI does -- and one tree's import silently resolves to the OTHER tree's module. The observed signature is an `AttributeError` naming a module path from the *wrong* package, not an `ImportError`, so it reads as a missing attribute rather than a mis-bound import.
 > Verdict: build
 > Closing-act: code
@@ -16242,7 +16321,13 @@ A FIELD ALMOST NOBODY READS.***
 re-score, **not** a reason to build the version that cannot fire.
 ## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
 
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Fleet tooling with no deployment axis, but silent under-delivery of wake-ups is self-concealing and cost seats a day of divided investigation, so worth is mid-range. Difficulty 4 because the remainder is undiminished: read the roster selection source, instrument send-side per-firing results, and re-measure, which is the only thing that separates a roster fault from a send fault, and it must be done against files that are not tracked in this repository. _(was 7/10 · 4/10.)_
+> ⛔ **CLOSED 2026-09-11 as INVALID -- owner ruling.** Verbatim, on the seat clock: *"I'm not using the tick, so mark it as invalid"*, extended to this row and `#1267` by the follow-up ruling to **close all three and delete the watchdog**. `#1266` closed on the same reason at `73f0c6af4`. **THE REASON IS THE SUBJECT, NOT THE ANALYSIS: THE SEAT CLOCK IS NOT IN USE.** A defect in a tool nobody runs is not worth tracking. **This is NOT a finding that the work below was wrong** -- that is a weaker and different claim, and the owner did not make it. The 112-firing census, the collapse-and-recover shape, the quantised-versus-ragged discriminator and the 2026-08-24 re-measurement on the correct `note` population all stand exactly as written. **Anyone tempted to re-file this must first establish that the clock is in use again.**
+>
+> **THIS ROW REACHES NOTHING BEYOND THE SEAT CLOCK, AND THAT WAS CHECKED BEFORE CLOSING IT, BECAUSE IT IS THE PARENT OF `#1266` AND `#1267`.** Both of its two stated fixes are clock-local: the **DOC** half is the tick rubric inside the unversioned `seat-tick.ps1` and was already fixed 2026-08-14; the **CODE** half is the clock's own roster selection. **The one line that appeared to reach further does not.** The 2026-08-23 amendment re-sited the CODE half to `scripts/coord/mail.ps1:352`, the `-To all` broadcast branch -- which **is** in this repository and **is** used by seat mail generally -- and **the 2026-08-24 amendment below refutes that siting from a full census of 16,747 mailbox files: the clock never sends `kind=broadcast`, ZERO of 605 broadcasts is a tick, and ticks default to `note`.** So the `mail.ps1` broadcast fanout is not this row's subject, and no open defect claim against it survives here. **Pursuing the broadcast fanout on its own merits is a new subject, not a revival of this one.**
+>
+> **CORROBORATED FROM OUTSIDE THE LEDGER, 2026-09-11.** Both `MEFOR-Seat-Clock` scheduled tasks on the owner's machine read **Disabled**, measured against a positive control of 211 tasks enumerated. That is independent of the ruling and agrees with it.
+>
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Fleet tooling with no deployment axis, but silent under-delivery of wake-ups is self-concealing and cost seats a day of divided investigation, so worth is mid-range. Difficulty 4 because the remainder is undiminished: read the roster selection source, instrument send-side per-firing results, and re-measure, which is the only thing that separates a roster fault from a send fault, and it must be done against files that are not tracked in this repository. _(was 7/10 · 4/10.)_
 >
 > **Filed 2026-08-14 - not started. Found by three seats independently, each holding one face of it, and none able to see it alone.** The coordination clock wakes seats on a timer. **Its cadence is healthy and its fanout is not**, and the two are indistinguishable from inside any single seat.
 > **THE CLOCK IS NOT THE DEFECT. MEASURED: 112 firings, cadence ~10.0 minutes.** No firing was late.
@@ -16592,7 +16677,13 @@ denominator.
 measurement from this row's subject and it is named here rather than performed.*
 ## 1267. the tick rubric asks only about cadence, so it cannot express a fanout fault and its change-test conceals a stoppage
 
-> 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The artefact is not in the repo at all, so I went to the live file the item names: %USERPROFILE%\.claude\mefor-usage\seat-tick.ps1 (39113 bytes, mtime 2026-08-20 13:25, plain ASCII, verified with `file` + xxd so a null grep is not an encoding artifact). What I found refutes "fully shipped" in both directions. The shipped part is real but incidental: a comment at :277-285 records a 2026-08-20 owner-instructed REWRITE that deleted the entire diagnostic rubric -- "QUANTISED", "FANOUT", "DELIVERY fault", "Act only if something actually changed", "Waking is not a reason to do work" all return 0 hits, and the body is now a 357-char bare wake-up (seat-tick.bodylen reads 357). So the offending sentences are gone. But they were removed for an unrelated reason (do not spend a turn analysing the tick), and the item's actual deliverables did not land. The replacement question is absent; the tick still carries a pending/change test ("Nothing pending -> do nothing") of the same shape the item says is compatible with total stoppage; and the Verdict's explicit second half, a check that the prose cannot silently revert, does not exist -- the three guards at :313, :324 and :347-357 assert the opening marker, the length cap, and length CHANGE, none of which can see a semantic revert. I also checked for relocation rather than assuming deletion: grep -rli "quantised" over the checkout hits only docs/BACKLOG.md, harness/load/connscale/probe.py (unrelated) and a pygments file in .venv, and "FANOUT SKIP" appears in the repo only inside #1267/#1266 prose, so the rubric was not moved into roles/ or docs/. The shared prerequisite is independently disproven from the state files themselves rather than from the item's claim about them. Item is still open in the live ledger (banner is the open numeral at docs/BACKLOG.md:9976) and absent from BACKLOG-CLOSED.md. Value drops from the filed 5 because the two worst sentences are genuinely gone and severity is none with no deployment axis; difficulty stays low and if anything fell -- the near-miss that dominated this item was the 2000-char cap with 40 chars of headroom, and headroom is now 1643, so the fleet-killing edit hazard is much reduced. Not cannot_determine: I could read the evidence, it just lives outside version control. _(was 5/10 · 2/10.)_
+> ⛔ **CLOSED 2026-09-11 as INVALID -- owner ruling.** Verbatim, on the seat clock: *"I'm not using the tick, so mark it as invalid"*, extended to this row and `#1264` by the follow-up ruling to **close all three and delete the watchdog**. `#1266` closed on the same reason at `73f0c6af4`, and the note left there -- that this row's artefact is the same unused `seat-tick.ps1`, that the owner's reason reads as though it invalidates this row too, and that no seat may extend a ruling on its own -- **is now answered: the owner extended it.** **THE REASON IS THE SUBJECT, NOT THE ANALYSIS: THE SEAT CLOCK IS NOT IN USE.** A rubric nobody receives cannot misdirect anybody.
+>
+> **NOTHING BELOW IS RETRACTED, AND LIMB B IS THE PART WORTH SAVING.** The concealing question -- *"Act only if something actually changed. Waking is not a reason to do work"* against the better *"is there anything I can advance WITHOUT approval?"* -- was confirmed verbatim in a live tick and then fired on its own author ten minutes after they drafted it. **That finding is about how a wake-up prompt should be WORDED, not about this clock**, so it outlives the artefact. It is recorded here rather than re-filed: **no number was allocated for it and none should be** unless a seat-waking prompt is built again. Limb A stays retracted on its own terms, and limb C stays as filed.
+>
+> **THE 2000-CHARACTER CAP HAZARD CLOSES WITH THE ROW AND IS NOT A LOOSE END.** The near-miss that dominated this item -- a 3536-char draft against a 2000-char cap, worse than the 3395-char edit that killed every seat's clock for 35 minutes -- is a hazard of EDITING a tick body. With the clock out of use there is no edit to make and no fleet to kill.
+>
+> **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The artefact is not in the repo at all, so I went to the live file the item names: %USERPROFILE%\.claude\mefor-usage\seat-tick.ps1 (39113 bytes, mtime 2026-08-20 13:25, plain ASCII, verified with `file` + xxd so a null grep is not an encoding artifact). What I found refutes "fully shipped" in both directions. The shipped part is real but incidental: a comment at :277-285 records a 2026-08-20 owner-instructed REWRITE that deleted the entire diagnostic rubric -- "QUANTISED", "FANOUT", "DELIVERY fault", "Act only if something actually changed", "Waking is not a reason to do work" all return 0 hits, and the body is now a 357-char bare wake-up (seat-tick.bodylen reads 357). So the offending sentences are gone. But they were removed for an unrelated reason (do not spend a turn analysing the tick), and the item's actual deliverables did not land. The replacement question is absent; the tick still carries a pending/change test ("Nothing pending -> do nothing") of the same shape the item says is compatible with total stoppage; and the Verdict's explicit second half, a check that the prose cannot silently revert, does not exist -- the three guards at :313, :324 and :347-357 assert the opening marker, the length cap, and length CHANGE, none of which can see a semantic revert. I also checked for relocation rather than assuming deletion: grep -rli "quantised" over the checkout hits only docs/BACKLOG.md, harness/load/connscale/probe.py (unrelated) and a pygments file in .venv, and "FANOUT SKIP" appears in the repo only inside #1267/#1266 prose, so the rubric was not moved into roles/ or docs/. The shared prerequisite is independently disproven from the state files themselves rather than from the item's claim about them. Item is still open in the live ledger (banner is the open numeral at docs/BACKLOG.md:9976) and absent from BACKLOG-CLOSED.md. Value drops from the filed 5 because the two worst sentences are genuinely gone and severity is none with no deployment axis; difficulty stays low and if anything fell -- the near-miss that dominated this item was the 2000-char cap with 40 chars of headroom, and headroom is now 1643, so the fleet-killing edit hazard is much reduced. Not cannot_determine: I could read the evidence, it just lives outside version control. _(was 5/10 · 2/10.)_
 >
 > **Filed 2026-08-14. The text lives in the RUNNING CLOCK'S OWN SEND, not in `roles/` and not in the roster code -- different owner and different fix from #1266, which is why these are two items and must not be merged.** Both halves below are about one block of prose that every seat receives on every tick.
 > **RETRACTED IN PART, SAME DAY, BEFORE THIS ITEM WAS EVER READ BY ANYONE ELSE -- LIMB A WAS ALREADY FIXED WHEN I FILED IT. Limb A is struck; LIMB B IS CONFIRMED LIVE. The retraction is kept in place rather than deleted, because how it happened is worth more than the item.**
@@ -16741,6 +16832,20 @@ measurement from this row's subject and it is named here rather than performed.*
 **SCOPE NOTE, NOT A SEPARATE ITEM:** *the emitted vocabulary grew after this row was written.* **`STALE(no-live-session)` at `seat-tick.ps1:654` and the `(roster-blind)` suffix at `:767` are absent from the exclusion list here.** *The list is INCOMPLETE rather than wrong; build against the vocabulary as it stands and say so.*
 
 ***THE PIN-THE-PATH RULE IS RIGHT AND ITS EVIDENCE IS STALE, WHICH STRENGTHENS IT.*** *The two decoys this row names are gone; **three exist today, all under a live lane's scratchpad, one in a directory called `ticktest`.*** **Newest-wins would today land in a live lane's test fixture.** *Keep the rule exactly as stated.*
+
+***AMENDED 2026-09-11 -- THE ALARM THIS ROW SHIPPED HAS BEEN DELETED. THE ROW STAYS CLOSED AND ITS
+BANNER IS NOT RE-FLIPPED.***
+
+*`scripts/coord/seat_clock_alarm.py` and `tests/test_coord_seat_clock_alarm.py` were removed on the
+owner's 2026-09-11 ruling that the seat clock is not in use -- the same ruling that closed* `#1264`,
+`#1266` *and* `#1267` *as invalid.* **The alarm shipped and it worked; what went away is the clock it
+watched.** *So the SHIPPED banner above stays true as the record of what landed at* `0ba326a12` *(PR
+557), and this paragraph is why a reader will not find the file.*
+
+***THE RETIRED GLYPH WAS CONSIDERED AND DELIBERATELY NOT APPLIED.*** *It is the ledger's marker for
+built-then-removed, which is now literally this row. But the owner ruled on the seat clock, not on
+this item, and a Builder does not re-flip a banner on its own reading.* **Left for the Lander, named
+here so the choice is visible rather than silent.**
 
 **Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
@@ -24448,7 +24553,7 @@ git show origin/main:harness/load/connscale/runner.py | sed -n '1143,1156p' # sa
 
 **What:** the usage watcher is a cron. **Measured 2026-08-31: `usage-collect.ps1` and `usage.ps1` make ZERO model calls**, and `usage.ps1` says so in its own comment, because a headless coordinator has to be able to read it. It writes `latest.json`, the current snapshot per account, and appends to `history.jsonl`. There are two files because a RATE needs two samples: one snapshot can only say where you are, never how fast you are getting there.
 
-Four things read those files, and none can interrupt anything: `usage.ps1` on demand, the usage statusline continuously and at zero token cost because a statusline runs outside the model, a `SessionStart` hook that injects into a starting session, and `seat_clock_alarm.py`, which PRINTS.
+Three things read those files, and none can interrupt anything: `usage.ps1` on demand, the usage statusline continuously and at zero token cost because a statusline runs outside the model, and a `SessionStart` hook that injects into a starting session. *(There were FOUR when this was measured 2026-08-31. The fourth, `seat_clock_alarm.py`, also only PRINTED, and it was DELETED 2026-09-11 with the rest of the seat-clock cluster -- see* `#1264`*. Its removal takes nothing from the argument below, which turns on the readers being unable to INTERRUPT, not on how many of them there are.)*
 
 **THE TWO HALVES OF ITS JOB COME OUT DIFFERENTLY, and the difference generalises.**
 
@@ -29102,6 +29207,11 @@ the defect fails proves nothing about the guard.
 pinned to. That is a **pre-existing** per-root defect, not one this change introduces, and it is
 unfiled. Named here so it is not lost; it is not this row's scope.
 
+**MOOT 2026-09-11 -- THAT FILE WAS DELETED**, with the rest of the seat-clock cluster, on the owner's
+ruling that the tick is not in use (see `#1264`). **The `:76` citation above no longer resolves**, and
+it is kept only as the record of a finding that died with its subject; **do not re-file it.** The
+`CLAUDE_CONFIG_DIR` question itself is untouched -- it simply no longer has this instance.
+
 ---
 
 ## 1493. a line-anchored zizmor suppression goes stale when an unrelated pull request inserts lines above it
@@ -30615,7 +30725,7 @@ Naming the test module in `ci.yml` is not wiring the tool. `ci.yml` names `tests
 
 ## 1526. dispatch_gate.py dies with UnicodeEncodeError partway through its own output on a stock Windows console, exiting non-zero in a way that reads as a refusal
 
-> 🔢 **Filed 2026-09-10. Reproducer is one item.** Value **5/10** · Difficulty **1/10** · _quick win_. `scripts/coord/dispatch_gate.py` prints each item's note with `print(f"  #{num}: {note}")` at :1122. A note quotes the row's own declaration, and a ledger row may carry a status glyph, so the glyph reaches stdout. On a stock Windows cp1252 console that raises `UnicodeEncodeError` and the process dies **partway through the listing**.
+> 🚧 **Built 2026-09-10 on branch `claude/dispatch-gate-cp1252-1526` (PR #1026); open until that merges, when the Lander flips this banner (`CLOSING_SEAT["code"]`).** Value **5/10** · Difficulty **1/10** · _quick win_. All three asked-for parts landed. (1) `dispatch_gate.main` now hardens stdout the same way `backlog_status_check.main` already does for the identical BACKLOG #1030 hazard -- `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`, guarded by `hasattr`. (2) A print failure that still gets past the hardening (a stream `reconfigure` cannot help) now exits under its own code, `EXIT_PRINT_FAILURE = 3`, never Python's default-handler 1 that a `--refuse` fence also returns -- chosen over "N of M items listed" bookkeeping because tracking a partial count across five independent print loops buys precision for a path the hardening should already have closed. (3) `tests/test_coord_dispatch_gate.py` adds a cp1252 subprocess regression test modelled on `test_asvs_tally_lint.py`'s, plus an in-process test driving a stream with no `reconfigure` to prove `EXIT_PRINT_FAILURE` fires and is distinct from 0 and 1. Verified against the PRE-fix file before writing the test: the identical fixture ledger raised `UnicodeEncodeError: 'charmap' codec can't encode character '⛔' in position 84` from the exact `print(f"  #{num}: {note}")` line this row names, and exited 1; the fixed file exits 0 clean on the same input.
 > Verdict: fix
 > Research: none
 > Closing-act: code
@@ -31501,6 +31611,117 @@ Two independent parts, either useful alone:
 ### Not done here
 
 No profiling was run with the machine quiet, and the `git grep` figure comes from one attempt under the same contention as everything else -- it is evidence that a different technique is much cheaper, not a calibrated target. Nobody has checked whether `scripts/coord/alloc_strand_sweep.py`, which carries a second implementation of the same sweep in Python, has the same cost shape.
+
+
+
+---
+
+## 1537. Scope the net-helper signing secrets to a protected GitHub Environment
+
+> 🚧 **Filed and built 2026-09-11 by a Builder. Open until the owner protects the environment: a merge alone does NOT close it.** The code half is a `net-helper sign` job that names the `net-helper-signing` environment. The owner half is a repository setting that admits only `main` to that environment and requires a reviewer, with both secrets kept there and nowhere else. No certificate exists yet, so nothing can leak today. Value **8/10** · Difficulty **2/10**. Value 8: once a key exists, any account that can push a branch could otherwise read it and sign binaries as the Foundation. Difficulty 2: one workflow split and one repository setting.
+> **Owner ruling, 2026-09-11: add required reviewers to the `net-helper-signing` environment.** It settles the question this row left open and adds a step to the owner half. It does not close the row, which stays open until the owner has made the setting. The section "Owner ruling 2026-09-11" below gives the reasoning.
+> Verdict: build
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** CI / release signing. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no signing certificate exists. If a key were configured
+without the owner half, any account that can push a branch could read it.
+
+### A guard inside a workflow cannot bind a branch's own copy of that workflow
+
+Measured at `7f86243b4`:
+
+- `.github/workflows/net-helper.yml` has an unrestricted `workflow_dispatch:` trigger.
+- Its sign step's only gate is `if: env.HAS_SIGNING_CREDENTIAL == 'true' && github.ref == 'refs/heads/main'`.
+- No job names an `environment:`, so both signing secrets could only be repository or organization secrets.
+- `gh api repos/MEFORORG/MessageFoundry/environments` returned no environments on 2026-09-11.
+- The sign step was `skipped` in main's last run of the workflow, run 34563466891, so no signing secret was
+  visible to it then.
+
+A push to a branch, a pull request from one, or a manual dispatch on one would run that branch's own copy of
+the workflow, with the guard deleted if it chose. The workflow header's paragraph "THE ENVIRONMENT PROTECTS
+THE KEY" gives the mechanism.
+
+### Two halves, and only the owner's closes it
+
+| Half | Who | State at filing |
+|---|---|---|
+| A `sign` job that names `net-helper-signing`, runs only on `main`, and holds the only secret references, pinned by `tests/test_net_helper_signing_scope.py` | Builder, in code | Built in the pull request that files this row |
+| Protect `net-helper-signing` so it admits only `main` and requires a reviewer, and keep both secrets in it and nowhere else | Owner, as a repository setting | Not done |
+
+The code half changes nothing about who can read a repository secret. A run that names a missing
+environment creates it with no rule, so the merge configures nothing.
+
+### Owner ruling 2026-09-11: required reviewers on the environment, not a review rule on `main`
+
+The branch rule admits whatever is merged to `main`, and `main` requires no approving review:
+`required_approving_review_count` read `0` from `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
+on 2026-09-11. So with the branch rule alone, a pull request that edits the workflow could reach the key once
+it merges.
+
+The owner ruled: **add required reviewers to the `net-helper-signing` environment.** Their reasoning:
+
+- Required reviewers on the environment put a person between a branch and the signing key, and they do it
+  without touching branch protection on `main`.
+- So the standing ruling of 2026-08-29, that sessions push and land their own pull requests, keeps working
+  everywhere else.
+- Raising `required_approving_review_count` on `main` would close the same hole, but it would stop sessions
+  landing their own pull requests. The owner declined it for that reason.
+
+The ruling adds a step to the owner half. On the Settings page for `net-helper-signing`, under **Deployment
+protection rules**, select **Required reviewers**, enter the reviewer, and click **Save protection rules**.
+
+**The reviewer must be an account no session can act as.** GitHub's REST documentation says a required
+reviewer can approve a waiting job through
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments` with a `repo`-scoped token. So a
+session holding the reviewer's credential could approve its own signing run. That comes from the
+documentation and is not measured, because no signing run has waited yet. **Prevent self-review** does not
+settle it. It stops the account that started a run from approving it, and nobody has measured which account
+starts a run on `main` after a queued merge. Which person reviews is the owner's choice.
+
+### Decided and recorded, so nobody re-opens them as new
+
+- **A separate job.** Once the rule admits only `main`, a job that names the environment fails on any other
+  ref, and the build runs for pull requests.
+- **Permissions.** The `build` job keeps `contents: read` for its checkout. The `sign` job drops to none,
+  because `download-artifact` at the pinned SHA calls the GitHub API only when given a token. That was read
+  in its source, not measured in a run.
+- **Action pins.** Every `uses:` was already pinned by commit SHA. The new `actions/download-artifact` pin
+  equals the `v8.0.1` tag.
+- **A tripwire, not built.** The build job could fail whenever a signing secret is visible outside the
+  environment. That needs a secret reference in a job with no environment, the pattern this change removes.
+  zizmor's `secrets-outside-env` audit flags that pattern only under the auditor persona, which the zizmor
+  gate does not use. In the one state it detects, the tripwire would also hand the key to the build runner.
+
+### Related, outside this row, and not allocated
+
+A review pass on 2026-09-11 reported these. Only the in-repository facts were re-read by the Builder.
+
+- `release.yml` publishes to PyPI with `id-token: write`, has a `workflow_dispatch:` trigger, and names no
+  `environment:`. The pass reported that PyPI's trusted-publisher check accepts any ref when the publisher
+  names no environment. That PyPI half was not verified here.
+- Nothing re-checks the environment's branch rule after this row closes.
+- `MEFOR_FORBIDDEN_TOKENS` is a repository secret, and the scanners that read it must run on refs other
+  than `main`, so an environment cannot hold it.
+- Found while recording the owner ruling, from GitHub's documentation: only repository admins can configure
+  an environment. So neither the branch rule nor the reviewer binds a session that holds an admin
+  credential, because that session could change the rules.
+
+### How the Lander confirms the owner half before flipping this banner
+
+Run the read-only commands in `net-helper/README.md`, under "Protect the environment before either secret
+exists". The row closes when every one prints what its comment says.
+
+Those commands predate the owner ruling and do not check the reviewer, so run this one too:
+
+```
+# at least one name, and none that a session signs in as
+gh api repos/MEFORORG/MessageFoundry/environments/net-helper-signing --jq '.protection_rules[] | select(.type == "required_reviewers") | .reviewers[].reviewer | .login // .slug'
+```
+
+The jq path follows GitHub's OpenAPI description and has not run against a configured environment. An empty
+result may mean a wrong path rather than no reviewer, so confirm it on the environment's Settings page.
 
 
 
