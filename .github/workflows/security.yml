@@ -651,6 +651,14 @@ jobs:
           # this runs inside a REQUIRED gate. The sbomqs step in this same file already had the answer
           # (download the release's own checksums file and sha256sum -c it), so this was unfinished
           # scope rather than an accepted risk. Mirroring that shape exactly.
+          # `set -o pipefail` for the reason the scan step below carries it, and this step is
+          # where the class was FOUND: the checksum line is selected with
+          # `grep ... | sha256sum -c -`, so without it a `grep` that matches NOTHING -- a renamed
+          # asset -- is discarded and this step's status is `sha256sum`'s. That happens to fail,
+          # because `sha256sum -c -` refuses empty input. Safe by the downstream tool rather than
+          # by design, inside a required gate whose whole job is verifying those bytes. Explicit,
+          # never `shell: bash` -- see the scan step (BACKLOG #1481).
+          set -o pipefail
           VER=8.18.4
           asset="gitleaks_${VER}_linux_x64.tar.gz"
           base="https://github.com/gitleaks/gitleaks/releases/download/v${VER}"
@@ -694,9 +702,15 @@ jobs:
         # `scan_forbidden.py`; relocating secret detection there is the obvious follow-up and is NOT
         # done here. Coverage of the MERGE PATH is unchanged: this workflow also runs on `pull_request`
         # (where checkout resolves the merge ref, so HEAD's ancestors are the base plus the pull
-        # request's own commits) and on `push: branches: [main]` (where HEAD is `main`'s full history).
-        # Under `merge_group`, HEAD is the queue commit. So every path by which content can reach
-        # `main` is still walked in full.
+        # request's own commits) and under `merge_group`, where HEAD is the queue commit. So every
+        # path by which content can reach `main` is still walked in full.
+        #
+        # THIS PARAGRAPH ALSO NAMED A `push: branches: [main]` ARM, which was REMOVED on 2026-09-08 --
+        # the `merge_group` comment in the `on:` block records where that arm's coverage went. The
+        # sentence is corrected here rather than quietly deleted, because the shape is the lesson: a
+        # comment that describes the trigger set is a SECOND definition of it, free to go stale the
+        # moment the first one moves. That is the rule tests/test_security_posture.py enforces on this
+        # file's header (BACKLOG #1079), arriving one level down in a step body, where no test looks.
         #
         # WHAT SCOPING DOES NOT FIX, said plainly so nobody reads it as more than it is: HEAD's
         # ancestry on a pull request INCLUDES all of `main`, so a secret that actually merges still
@@ -704,13 +718,47 @@ jobs:
         # allowlist entry or a history rewrite -- never a per-pull-request workaround.
         #
         # `HEAD` RATHER THAN AN EVENT-DEPENDENT RANGE, and the real reason is not the one you would
-        # guess: only TWO of the five triggers above carry a base SHA at all (`pull_request.base.sha`
-        # and `merge_group.base_sha`). `push`, `schedule` and `workflow_dispatch` carry none, so a
-        # range needs a three-way fallback AND would drop the post-merge sweep of `main`'s own
-        # history. The template-injection objection -- an expression interpolated into a `run:` body --
+        # guess: not every trigger above carries a base SHA. `pull_request` and `merge_group` do
+        # (`pull_request.base.sha` and `merge_group.base_sha`); the others carry none, so a range needs
+        # a fallback for them -- and on a trigger with no base, whatever the fallback picks is what
+        # gets graded. READ THE `on:` BLOCK for the live set; this paragraph used to count them and
+        # went stale in a day. The template-injection objection -- an expression interpolated into a `run:` body --
         # is NOT the reason: this repo already hoists base SHAs into a step `env:` for exactly that
         # (backlog-hygiene.yml, precommit-replay.yml), so a range would have been reachable.
-        run: gitleaks detect --config .gitleaks.toml --log-opts HEAD --redact --verbose --no-banner
+        run: |
+          # `set -o pipefail` EXPLICITLY, AND NOT BY WRITING `shell: bash` (BACKLOG #1481). The scan
+          # is piped into `tee` below so its own report can be read back, and GitHub's default `run:`
+          # shell here is `bash -e` WITHOUT pipefail. A pipeline's status is its LAST command's, so
+          # without this line a findings-exit of 1 is discarded by `tee` and this required gate
+          # reports success on a run that found secrets.
+          #
+          # THE SHORTCUT IS REJECTED RATHER THAN OVERLOOKED. Naming `shell: bash` makes GitHub
+          # substitute `bash --noprofile --norc -eo pipefail`, so the step would acquire pipefail as a
+          # side effect of naming the shell it was already using -- and a later edit deleting that key
+          # as redundant would take the guarantee with it, invisibly. Explicit is both the local
+          # idiom and the legible one; BACKLOG #1481 carries the census and is the copy allowed
+          # to age. Repeating a number here would be a second definition of it.
+          set -o pipefail
+          # `2>&1` because the count read back below is one of the scanner's own log lines, which go
+          # to STDERR, while `--verbose` findings go to stdout. Merging is correct under either
+          # reading of that split: a stdout-only pipe that captured no count would red every clean
+          # run, which is the one failure direction a required gate must not acquire by accident.
+          gitleaks detect --config .gitleaks.toml --log-opts HEAD --redact --verbose --no-banner 2>&1 | tee gitleaks-scan.log
+          # THE RANGE MUST HAVE WALKED SOMETHING. A range is a thing that can resolve EMPTY, and an
+          # empty one makes the scanner report `0 commits scanned` and exit 0 -- a green tick nothing
+          # downstream can tell from a clean scan. `--log-opts HEAD` above is a LITERAL and is measured
+          # safe on every trigger this workflow declares, including a two-parent merge-queue HEAD; the
+          # guard is for the NEXT edit to it. The comment above explains that an event-aware range was
+          # declined partly because not every trigger carries a base SHA -- and on a trigger with no
+          # base, a range built from one is exactly the empty range.
+          #
+          # IT READS THE SCANNER'S OWN REPORT AND NEVER RECOMPUTES ITS SUBJECT. `git rev-list --count`
+          # over the same range would be a SECOND copy of it, free to agree today and drift tomorrow,
+          # and to go on passing after the flag it guards has changed -- the same second-definition
+          # defect BACKLOG #1479 removed from this job's header. A count printed by the scanner cannot
+          # drift from what the scanner did. The tee'd log is also what a reader sees on a failure
+          # here: `0 commits scanned` sits directly above the refusal, so the diagnosis is in the log.
+          grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
 
   semgrep:
     name: semgrep (project SAST rules)
