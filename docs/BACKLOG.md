@@ -31812,3 +31812,461 @@ Difficulty is 3 rather than 2 because of the coupling, not the edit. The tuples 
 ### The version is not in scope
 
 **This row does not propose changing `sigstore==4.4.0`, and must not be read as reopening it.** That version is an owner ruling, twice affirmed. Its rationale lives once, at the `release-tools` group in `pyproject.toml`, with the record in [#332](#332). Everything here is about what guards the pin, never about what the pin says. Step 1 would make the ruling harder to undo, not easier.
+
+## 1678. a failed upload write leaves a body outside every uploads sweep
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-01, vault PR 1489). Open; not started.** Value **6/10**, Difficulty **2/10**. `messagefoundry/uploads.py` `_atomic_write_text` writes the temp file and then `os.replace`s it with no cleanup if the write raises; `UploadStore.save` writes the blob and then the sidecar with no cleanup if the second write fails. Measured at engine `fa7bc9e3e` by making the blob write fail half-way, and separately by making the sidecar's `os.replace` fail: `save` raised, and the uploads root was left holding a `.<id>.blob.<hex>.tmp` in the first case and a sidecar-less `<id>.blob` in the second. `list_files` returned zero, `prune_expired` ten years later removed zero, `reseal_to_active` returned zeros, because every sweep walks `_iter_sidecars`, which yields `.meta` names only.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI / uploads. **Priority:** P1. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). Disk-full is the realistic trigger and the blob is the large write. Under the identity cipher the leftover holds base64 of the plaintext upload; under a configured key it holds ciphertext that `rotate-key` would never re-seal and that `ResealResult.skipped` does not count. A first deployment that hit this would keep a partial patient message beside its uploads for the life of the directory, outside the retention window the module promises.
+
+### What closing looks like
+
+1. Unlink the temp file in a `finally` when `os.replace` did not run; unlink the blob when the sidecar write fails.
+2. A sweep (in `prune_expired` or at store open) for `.*.tmp` older than a few minutes and for any `.blob` with no sidecar, counted in the prune result.
+3. A test that fails the second write and asserts the directory is clean afterwards.
+
+**Duplicate search.** None. #1112 (open) is the cross-shard quota ledger and #1169 (open) the strict-ciphertext read, both adjacent and neither covering this; #1224 (closed) is the prune audit actor. Searched `.tmp`, `orphan`, `prune_expired`, `reseal`, `_atomic_write_text`, `uploads_dir`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-01. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1679. the startup attestation's fail-closed mode is a no-op when its baseline is missing, stripped or shadowed
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-02, vault PR 1489). Open; not started.** Value **6/10**, Difficulty **3/10**. `messagefoundry/integrity.py` `attest_engine` returns a no-op result for an absent or empty `RECORD` and for a `RECORD` with no first-party `.py` rows (the third editable-install signal), and `_record_relpath` skips any loaded file outside the install root, so `checked` can be zero with `attested=True`. `run_startup_attestation` acts only on `result.drift`. Measured at engine `fa7bc9e3e` with the fabricated-install shape `tests/test_startup_attestation.py` uses, all under `[integrity].fail_closed_on_drift=true`. Positive control: a tampered module with `RECORD` untouched raised `IntegrityError`, one audit row, one alert. The same tampered module with `RECORD` deleted: no raise, `no_record=True`, zero rows, zero alerts, a DEBUG line. With `RECORD`'s package rows removed: no raise, classified editable. With a clean `RECORD` but the package loaded from a directory outside the install root: `attested=True checked=0 drift=0` and the INFO line `startup integrity: 0 engine file(s) attested clean`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security / integrity. **Priority:** P1. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). The module's stated adversary has venv-write and restart rights, and that actor can delete or rewrite the baseline as easily as a module; a re-sealed `RECORD` passes clean, and neither ADR 0041 D3 nor the docstring says the baseline sits in the same trust domain as the code. The shadow shape needs no venv write at all, only a `messagefoundry/` directory the service's working directory resolves before site-packages (#1677 seen from the control's side).
+
+### What closing looks like
+
+1. Under `fail_closed_on_drift`, treat a missing or row-less `RECORD` on a distribution with no `direct_url.json` editable flag as drift rather than editable.
+2. Treat `attested=True` with `checked == 0` as drift.
+3. Log the no-op posture at WARNING and write the `startup_integrity` audit row for it.
+4. Add the four shapes as tests.
+5. State in ADR 0041 D3 and the module docstring that the control detects an inconsistent edit and not a consistent one.
+
+**Duplicate search.** None. #54 (closed) built the control; #1432 and #1438 (closed) and #1442 (open) are the asset and line-ending halves; #1134 (open) cites a recorded digest in this module. Searched `fail_closed_on_drift`, `attest_engine`, `RECORD baseline`, `no_record`, `shadow`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-02. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1680. service.py elevates bare cmd.exe, net and powershell.exe from the operator's launch directory
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-03, vault PR 1489). Open; not started.** Value **6/10**, Difficulty **2/10**. `messagefoundry/service.py` `control_service` and `control_service_ex` hand `"cmd.exe"` and `/c net stop "<name>" & net start "<name>"` to `ShellExecute` with the `runas` verb and no directory; `install_service` does the same with a bare `"powershell.exe"`; `service_state` runs a bare `sc`. Measured at engine `fa7bc9e3e` on Windows 11: with a `net.cmd` planted in a temporary directory and that directory as the working directory, `cmd.exe /c net stop "MessageFoundry"` and the `restart` chain both ran the planted script (with the `NoDefaultCurrentDirectoryInExePath` variable this session's shell sets removed, which is the Windows default); `ShellExecuteW` with a null `lpDirectory` started its child in the caller's working directory. The elevation step itself was not driven, because it needs a UAC prompt accepted; Microsoft documents a null `lpDirectory` as "the current working directory is used" for `runas` as for `open`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security / Windows deployment. **Priority:** P1. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). The module docstring says both elevated forms run a "System32-only `net` command" and "neither elevates user-writable code"; no executable is pinned. `service_status.py`, the read-only sibling, pins `%SystemRoot%\System32\sc.exe` for exactly this hijack and carries a stricter name guard, so the elevated path has the weaker of two drifting copies. The launch directory of the tray or of `messagefoundry service restart` is an ordinary directory; a config repository an unprivileged contributor can push a root-level `net.cmd` into is one. A first deployment whose operator ran the service control from such a checkout would see the expected UAC prompt and, on accepting it, run the planted script as administrator.
+
+### What closing looks like
+
+1. Resolve every executable to an absolute System32 path from `%SystemRoot%` the way `service_status._sc_path` does, and pass that directory as `lpDirectory`.
+2. Import the one guard and parser from `service_status.py` instead of carrying a second copy.
+3. A test that the argument string names an absolute path; make the docstring true.
+4. Fold in the `$`-anchored guards admitting a trailing line feed (cmd drops the rest), which the packet deliberately did not file alone.
+
+**Duplicate search.** None for the executable resolution. PR 1064's proposed item on the two status parsers' substring search is the read-side half of the same duplication and stays separate. Searched `ShellExecute`, `System32`, `net.exe`, `net.cmd`, `PATH hijack`, `control_service`, `install_service`, `_runas`, `_SAFE_SERVICE_NAME`, `parse_service_state`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-03. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1681. the Corepoint importer's JSON and flat paths emit a live field-write stub the validated path removed as unsafe
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-04, vault PR 1489). Open; not started.** Value **5/10**, Difficulty **2/10**. `messagefoundry/corepoint_import.py` `_generate_steps` emits the stub whenever `stub_path` is set. `_decline`, on the validated role-parsed path, passes `None` with a comment saying exactly why the stub is unsafe; `_map_action` (the superseded JSON layer) and `_map_statement` (the fallback for an export whose `@Data` carries no span markup) still pass the recovered target, and `parse_any` keeps that layer live for any input not starting with `<`. Measured at engine `fa7bc9e3e`: a JSON export with one unrecognised action class targeting `PV2-3` generated `msg.set("PV2-3", msg.field("PV2-3") or "")`; against a synthetic ADT with no PV2 that line raised `KeyError`, and with the target changed to `PID-30` it grew the PID segment from six fields to thirty-one.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** importer. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). A generated handler deployed from either layer would dead-letter every message lacking the target segment and pad the segment of every message that has it.
+
+### What closing looks like
+
+1. Pass no stub target from `_map_action` and `_map_statement`, carrying the recovered field in the marker text as `_decline` does.
+2. Delete the stub emission.
+3. A test that a generated module holds no `msg.set` for an unmapped action on either input layer.
+
+**Duplicate search.** None. #105 (open) is the importer feature item and its partial-build record. Searched `stub_path`, `passthrough`, `msg.set(p`, `corepoint_import`, `import corepoint`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-04. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1682. the Corepoint importer recurses once per sibling branch marker
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-05, vault PR 1489). Open; not started.** Value **3/10**, Difficulty **1/10**. `_split_branches` in `messagefoundry/corepoint_import.py` recurses on `steps[i + 1:]` once per marker it splits at, so it is both recursive and quadratic in width, while `_MAX_NESTING` bounds depth only. Measured at engine `fa7bc9e3e`: an `<If>` body holding 1,500 bare `<Line Data="Else"/>` lines raised `RecursionError`; 900 parsed; the same for `Catch` under `<Try>`, and the render path recurses the same way. The module promises that a structural problem is reported and never raised as an uncaught traceback.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** importer / untrusted input. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). A crafted or merely wide export takes the CLI down with a raw traceback instead of the structural error the module promises.
+
+### What closing looks like
+
+1. Rewrite `_split_branches` as a loop.
+2. Have the CLI map `RecursionError` with the other structural errors (with the `import corepoint` `OSError` item from the same packet, P10b-07).
+
+Sibling of #1599 and #1600, the `RecursionError` leaks on the DICOM and FHIR parsers.
+
+**Duplicate search.** None. Searched `_split_branches`, `RecursionError`, `_MAX_NESTING`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-05. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1683. _lit and _comment_text render values the generated Corepoint module cannot carry
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-06, vault PR 1489). Open; not started.** Value **3/10**, Difficulty **1/10**. `_lit` in `messagefoundry/corepoint_import.py` is `json.dumps`, whose escaping is a valid Python literal for BMP text and not for astral text (surrogate pairs) or for JSON scalars (`true`, `false`, `null`, `NaN`). Measured at engine `fa7bc9e3e`, three runs: a literal containing a code point outside the Basic Multilingual Plane rendered as two lone surrogates whose `encode("utf-8")` raises; a JSON `"default": null` rendered as `default=null`, a `NameError` at import; a NUL in a JSON class name produced a module `compile` refuses.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** importer. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). The surrogate shape reaches both input layers through any quoted `ItemCopy`/`ItemAppend` literal and would fail at delivery for every message once deployed; the other two are JSON-layer only and fail at import.
+
+### What closing looks like
+
+1. Render strings with `repr()` (or `ensure_ascii=False` plus a surrogate check).
+2. Refuse non-string scalars with `CorepointImportError`.
+3. Strip C0 controls in `_comment_text`.
+4. Three fixtures, one per shape.
+
+**Duplicate search.** None. Searched `_lit`, `json.dumps`, `surrogate`, `non-BMP`, `NUL`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-06. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1684. import corepoint prints a raw traceback on an OSError its own docstring says it maps
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-07, vault PR 1489). Open; not started.** Value **2/10**, Difficulty **1/10**. The module docstring for `import_corepoint` says it raises `OSError` on a filesystem failure and that "the CLI maps both to a clean error". `_import` in `messagefoundry/__main__.py` catches only `CorepointImportError`. Measured at engine `fa7bc9e3e`: `--out` pointing at an existing file, `FileExistsError` escaped `import_corepoint`, and the traceback printed raw, because the last-resort excepthook is installed only by `serve` (#1674).
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CLI. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). A stated contract the handler does not keep.
+
+### What closing looks like
+
+1. Catch `OSError` and `RecursionError` in `_import` and route through `_emit_error` (the `RecursionError` half is #1682's).
+
+**Duplicate search.** None. #1674 (the last-resort hook installed only by `serve`) is the general case; this is the handler's own stated contract. Searched `import corepoint`, `_import`, `_emit_error`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-07. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1685. scrub_credentials leaks the tail of a brace-quoted ODBC password and of a quoted value with spaces
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-08, vault PR 1489). Open; not started.** Value **4/10**, Difficulty **1/10**. `messagefoundry/secretscrub.py`'s value classes stop at `;`, whitespace and quotes. Braces are the documented ODBC form for a password carrying `;`, which is the connection-string shape the SQL Server store builds. Measured at engine `fa7bc9e3e`: `PWD={Pa;ss}word}` scrubbed to `PWD=<redacted>;ss}word}`; `ad_bind_password='my secret pass'` to `ad_bind_password=<redacted> secret pass'`. Nine other shapes scrubbed cleanly in the same run. #1478 (open), the module's own item, lists three residuals and neither of these.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI / logging. **Priority:** P2. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). Most of a password survives the scrub on the two value shapes an operator is most likely to need.
+
+### What closing looks like
+
+1. When the value opens with `{` consume to the matching `}`; when it opens with a quote consume to the matching quote; then fall back to the current class.
+2. Add both shapes to the fixture table.
+
+**Duplicate search.** None for these shapes. #1478 (open) and #1475 (open) are the vocabulary and its derivation; PR 1064's #1547 is the DSN pattern's cost. Searched `secretscrub`, `scrub_credentials`, `PWD={`, `brace`, `value class`, `ODBC`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-08. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1686. convert_hl7_timestamp silently resolves an ambiguous or non-existent local time
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10b (finding P10b-09, vault PR 1489). Open; not started.** Value **3/10**, Difficulty **1/10**. `messagefoundry/timezone.py` attaches the source zone with `datetime.replace(tzinfo=...)`, so `fold=0` decides both cases and nothing documents it. Measured at engine `fa7bc9e3e`: `20261101013000` from `America/New_York` (01:30 on the fall-back day, which occurs twice) converted to `053000+0000`, the daylight reading; `20260308023000` (02:30 on the spring-forward day, which does not exist) converted to `073000+0000`. No error, no signal. The module's own `hl7_now` docstring says a bare local stamp is ambiguous across a fall-back.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transforms. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). A migration comparing output against Corepoint's would differ by an hour for one hour a year, with nothing saying why.
+
+### What closing looks like
+
+1. Document the choice.
+2. Offer a strict keyword that raises on an ambiguous or non-existent input.
+
+**Duplicate search.** None. #1196 (open) is the `hl7_now` offset stamp, already built; #59 (closed) built the helpers. Searched `convert_hl7_timestamp`, `fold`, `ambiguous`, `fall-back`, `spring-forward`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10B-ROOTREST-2026-09-11-FINDINGS.md` (vault PR 1489), finding P10b-09. The same proposal is on engine PR 1078 as `docs/backlog-proposals/fable-packet10b-rootrest.md`.
+
+## 1687. a Handler that returns a value the partitioner does not recognise is silently FILTERED in every mode, and a test pins the drop
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-01, vault PR 1488). Open; not started.** Value **7/10**, Difficulty **2/10**. `pipeline/dryrun.py` `_partition` turns any return that `config/wiring.py` `handler_result_items` does not recognise as a container into a single item, matches it against `Send`, `SetState` and `SetMeta`, and drops it; `_sandbox_codec.py` `_enc_item` describes the same item as `{"o": "other"}` so `mode=subprocess` agrees. Measured at engine `70063ab55`: `dry_run` reported `FILTERED` with no error for handlers returning `msg`, `msg.encode()`, a `dict` and a `(str, Message)` tuple; the live `RegistryRunner` in the default pooled mode finalized the message `filtered` with events `received`/`routed`/`transformed`, nothing delivered, and zero WARNING-or-above log records. `messagefoundry check` passes such a fixture unless a sidecar demands otherwise. `tests/test_dryrun.py::test_a_bare_message_return_still_drops_and_never_raises` pins the drop.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** correctness / data loss. **Priority:** P1. **Verdict:** build (small).
+**Severity:** High, conditional (sec. 0): silent non-delivery of an entire feed, recorded as deliberate filtering, with no operator signal and a green pre-deploy gate. Medium likelihood: an author slip; two shipped texts, `transports/x12.py`'s module docstring and `docs/CONNECTIONS.md`'s X12 inbound section, still say a Handler's returned payload is "written back verbatim", and returning the transformed message is the Mirth idiom this engine positions against.
+
+### Relation to closed #341
+
+That item widened `_partition` to any non-`str` iterable under an owner ruling of WIDEN, not raise, for containers. Its closing note records that a bare `Message` "still drops silently rather than newly raising, because the gate is `isinstance(..., Iterable)` and never a duck-typed `list(result)`". That is a mechanism reason (no duck-typed `list()`), not a ruling that the drop is correct; the item's own "why it is not merely cosmetic" paragraph makes this item's argument. **Owner check before building:** confirm whether the #341 note was meant as a ruling.
+
+### What closing looks like
+
+1. In `_partition`, after materialisation, raise `ValueError` for any non-`None` item that is not a `Send`, `SetState` or `SetMeta`, naming the handler and the type; apply the identical rule in `_enc_item` so the two modes cannot diverge (the #341 build constraint). The live path already routes a transform-stage `ValueError` to the internal-error policy (`ERROR` dead-letter, replayable); dry-run reports `ERROR`; `check` goes red. No duck-typed `list()` is involved, so the `Message.__getitem__` concern in #341 does not arise.
+2. Rewrite the pinning test to assert the raise, and add the live-runner case.
+3. Correct the two "written back verbatim" texts in the same change.
+
+**Duplicate search.** No open item. #341 (closed) is the container half and scoped this out. Searched both ledgers for `_partition`, `handler_result_items`, `return msg`, `bare Message`, `returns its Message`, `FILTERED` with `silent`/`indistinguishable`/`accept-and-drop`.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-01. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1688. two of the three M-7 pins stay green with the router-stage fail-closed deleted, because a downstream path produces the same ERROR
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-02, vault PR 1488). Open; not started.** Value **4/10**, Difficulty **1/10**. Negative control at engine `70063ab55`: with `route_only`'s `raise ValueError(...)` for an unknown handler replaced by `pass`, `tests/test_dryrun.py::test_route_only_unknown_handler_raises` went red and `test_router_to_unknown_handler_is_error` (the dry-run pin), `tests/test_wiring_engine.py::test_inbound_unknown_handler_dead_letters_at_ingress` (the runner pin) and all of `tests/test_checks.py` stayed green. In dry-run, `transform_one`'s `registry.handlers[name]` raises `KeyError`, which `dry_run` maps to `ERROR` with the name in the text. In the runner, a routed row is committed for the ghost handler and the transform worker's missing-handler branch dead-letters it; the test asserts `ERROR` and no delivered file, and nothing about the stage.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test quality. **Priority:** P2. **Verdict:** build (small).
+**Severity:** Medium as a test gap, no deployment axis. The router-stage fail-closed exists so no routed row is ever committed for a handler that cannot run; a regression that removed it would keep both integration pins green, and the one unit pin is the kind of test a refactor of `route_only` rewrites.
+
+### What closing looks like
+
+1. Make the dry-run pin assert the error text contains the router-stage message (`returned unknown handler`), not merely the ghost name.
+2. Make the runner pin assert the dead row's stage is `ingress` and that no `routed` row was created for the message, or assert on the recorded error text. Rename the runner test only if the stage assertion is added.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `M-7`, `unknown handler`, `route_only`, `dead_letters_at_ingress`.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-02. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1689. dry-run does not apply the ingress guards the live handler applies before routing, so check passes fixtures the engine would NAK
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (findings P11-04 and P11-09, vault PR 1488). Open; not started.** Value **5/10**, Difficulty **3/10**. The runner's `_handle_inbound` decodes with the connection's `encoding` and `errors="strict"`, rejects a NUL in the decoded text (added in vault commit `522fe9f0`, 2026-07-13), enforces the 16 MiB ceiling and runs strict validation under a timeout with `ERROR` plus `AE` on expiry. `pipeline/dryrun.py` `dry_run` calls `normalize(raw)` with the `utf-8`/`replace` defaults, has no NUL or size guard, and calls `validate` inline with no timeout; the CLI's `read_messages` decodes through `split_batch`, also `utf-8`/`replace`, while the file source it claims to mirror decodes with the declared encoding and `errors="strict"`. `_dry_run_raw` decodes bytes as strict UTF-8 outside any `try`. Measured at engine `70063ab55`: a NUL in PID-5 previewed `RECEIVED` with one delivery; a latin-1 fixture came back with U+FFFD in place of the byte; non-UTF-8 bytes on a non-HL7 inbound raised `UnicodeDecodeError` out of `dry_run`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** dry-run and gate fidelity. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). A deploying site would use `check` and the Test Bench to decide a feed is ready; a fixture that previews `RECEIVED` and NAKs on the first live message is a gate that lies, and the encoding case leaves the preview looking routed and transformed.
+
+### What closing looks like
+
+1. Thread the inbound's `encoding` into `dry_run` and `read_messages` (strict; a failure is an `ERROR` result with the runner's text).
+2. Add the NUL and size guards before `Peek.parse`; run strict validation under the connection's timeout; wrap `_dry_run_raw`'s decode.
+3. Extract the runner's post-decode guard sequence into one function the runner and `dry_run` both call, so a fourth copy of the rule cannot drift either.
+4. A parity test that drives one synthetic message through both `dry_run` and a `RegistryRunner` and compares dispositions for each guard.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `read_messages`, `split_messages`, `NUL`, `normalize`, `dry-run`/`dryrun` with `encoding`/`latin`/`fixture`, `diverge`/`parity` with `dry-run`. #1128 (open, ASVS 5.2.2 file-content validation) mentions `read_messages` in passing and does not cover this.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), findings P11-04 and P11-09. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1690. dry-run reports a message whose every Send was declined as FILTERED; the live path records NOT_DEPLOYED, and the .expect vocabulary cannot say so
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-03, vault PR 1488). Open; not started.** Value **4/10**, Difficulty **1/10**. `disposition_for` maps a routed outcome with no deliveries to `FILTERED` unconditionally; `DryRunResult` carries no `declined` field and `dry_run` drops `RouteOutcome.declined`. The store's finalizer returns `NOT_DEPLOYED` when a `not_deployed` event was recorded in the handoff (pinned by `tests/test_not_deployed.py`). `checks.py` `_DRYRUN_DISPOSITIONS` is `{RECEIVED, UNROUTED, FILTERED, ERROR}`. Measured at engine `70063ab55`: a handler sending only to an outbound with `deployed=False` previewed `FILTERED` with no `declined` attribute while `route_message` returned `declined=['out']`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** dry-run and gate fidelity. **Priority:** P2. **Verdict:** build (small).
+**Severity:** Medium, no deployment axis. #233 ruled that a decline must not be indistinguishable from an intentional filter; the pre-deploy gate collapses them again, and `checks.py`'s own comment works around it by excluding not-deployed feeds from the cross-product rather than reporting the truth. Packet 14 handed the same observation here from the `verify` side; the `verify smoke.disposition` half is its own item from packet 14 (P14-09).
+
+### What closing looks like
+
+1. Add `declined: list[str]` to `DryRunResult` and populate it in both `dry_run` paths.
+2. Give `disposition_for` a `NOT_DEPLOYED` branch for a routed outcome with no deliveries and a non-empty `declined`.
+3. Add `NOT_DEPLOYED` to `_DRYRUN_DISPOSITIONS`; emit `declined` in the `dryrun` CLI's JSON.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `NOT_DEPLOYED` with `dryrun`/`check`/`expect`, `disposition_for`, `declined`. #233 (closed) built the live disposition and did not touch dry-run.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-03. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1691. dry-run ignores stream_threshold_bytes: a Handler previews against the original OBX-5 document and runs live against the mfdoc: skeleton
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-05, vault PR 1488). Open; not started.** Value **3/10**, Difficulty **2/10**. On a streaming inbound the runner's `_detach_documents` replaces each qualifying OBX-5.5 with an `mfdoc:v1:ref:` handle and `enqueue_ingress` receives the skeleton, so the Router and every Handler see the handle. `dry_run` has no detach step. Measured at engine `70063ab55`: an inbound with `stream_threshold_bytes=1` and a synthetic ORU carrying a base64 ED document; the handler saw the base64 in dry-run and `dry_run` reported `RECEIVED`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** dry-run and gate fidelity. **Priority:** P3. **Verdict:** build or document.
+**Severity:** Low to Medium, conditional (sec. 0). Opt-in only, `stream_threshold_bytes` defaults to `None`; but a site that enables streaming for a document feed would find every Handler that reads OBX-5 previewing one thing and delivering another, and the difference is exactly the bytes the feature keeps out of the pipeline.
+
+### What closing looks like
+
+1. Either apply the detach in dry-run against an in-memory attachment stub (the handle is a SHA-256 of the verbatim base64, so it is deterministic) so the preview shows the skeleton, or refuse to preview an over-threshold fixture on a streaming inbound with an explicit `ERROR` naming the reason.
+2. Document the choice beside `stream_threshold_bytes` in `docs/CONNECTIONS.md`.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `stream_threshold`, `mfdoc`, `detach` with `dry-run`. #149 (closed) built the streaming path; #1127 (open, ASVS 5.1.1 inventory) mentions the setting in passing.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-05. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1692. DryRunResult.meta_ops has never been populated, and the dryrun CLI prints neither metadata ops nor declines
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-06, vault PR 1488). Open; not started.** Value **3/10**, Difficulty **1/10**. `dry_run` and `_dry_run_raw` build `DryRunResult` without `meta_ops=outcome.meta_ops`; the field has been empty since `MetaOpPreview` arrived in vault commit `bc31c4c7` (2026-07-10), whose docstring says the CLI gates the value behind `--show-phi`. The CLI's output dict has no `meta_ops` and no `declined` key. Measured at engine `70063ab55`: `transform_one` returned one `MetaOpPreview` and `dry_run` on the same graph returned `meta_ops == []`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** dry-run and gate fidelity. **Priority:** P3. **Verdict:** build (small).
+**Severity:** Low, no deployment axis. A preview omission: a Handler's `SetMeta` writes are invisible to the Test Bench and the CLI.
+
+### What closing looks like
+
+1. Populate `meta_ops` in both `dry_run` paths.
+2. Emit it in the CLI under the same `--show-phi` gate as `state_ops`; emit `declined` beside it once #1690 lands.
+3. Correct the `MetaOpPreview` docstring.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `meta_ops`, `MetaOpPreview`, `SetMeta` with `dryrun`. #150 (closed, ADR 0081) built `SetMeta`.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-06. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1693. under [sandbox].mode=subprocess, a worker whose bootstrap cannot succeed dead-letters every message on its inbound, one spawn attempt per message, with no alert and the runner reporting healthy
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-07, vault PR 1488). Open; not started.** Value **5/10**, Difficulty **3/10**. `_sandbox_for` builds the session lazily and `SandboxSession._live_worker` spawns on first dispatch; `_spawn` raises `SandboxError` on a `bootfail` reply, an EOF, or `startup_seconds` (30 s) elapsing, and the router worker's catch-all routes it to `_apply_router_internal_error` as a content fault: `dead_letter_now` under the default `CONTINUE`. Nothing at `start()` spawns or verifies a child, and no branch distinguishes "the worker could not start" from "the Router raised". Measured at engine `70063ab55` with a `RegistryRunner`, `SandboxPolicy(mode=SUBPROCESS)` and a config source that does not exist: three synthetic messages all finalized `error`, each with one WARNING, the alert sink received no call, `degraded_connections()` was empty. The bootstrap failed fast here; a child that hangs in `load_config` would hold each message for `startup_seconds` first.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** sandbox and operator signal. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). Count-and-log holds: every message is `ERROR` and replayable. But the operator signal is per-message and identical to a Router bug, the lane keeps acknowledging, and a site that flips the sandbox on with a config directory the service account cannot read, or a `mem_mb` too small for its config, would dead-letter a whole feed with every connection showing green.
+
+### What closing looks like
+
+1. Spawn each inbound's worker at `start()` and on reload, where the runner already knows the config source, and treat a bootstrap failure as a startup fault: a degraded connection with the reason, which the API and console already render, or a refusal to start under `[security].enforcement=ENFORCE`.
+2. Independently, classify a `SandboxError` raised by `_spawn` as an infrastructure fault rather than content: stop the lane with a `connection_stopped` alert and release the row, the shape the credential-fault policy already uses.
+3. A runner-level test that injects a failing bootstrap and asserts the alert and the retained row.
+
+**Duplicate search.** No open or closed item covers the failure mode. #1278 (open, sandbox-by-default) lists `startup_seconds` among the costs the flip arms and notes the first message pays it; #1458 (open) is the per-inbound worker-tree cost. Neither names a bootstrap that never succeeds. Searched both ledgers for `_sandbox_for`, `startup_seconds`, `bootfail`, `bootstrap`, `sandbox worker did not start`.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-07. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1694. the traced dry-run reports routed_to: [] for a Router that returns a tuple or set
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 11 (finding P11-08, vault PR 1488). Open; not started.** Value **2/10**, Difficulty **1/10**. `pipeline/dryrun_trace.py` `_routed_from` handles `str` and `list` only, while `dryrun._handler_names` accepts any non-`str` iterable, so the message-level `handlers` is right and the router invocation's `routed_to` is empty with no `lazy_result` flag (that flag covers one-shot iterators only). Measured at engine `70063ab55`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** dry-run and gate fidelity. **Priority:** P3. **Verdict:** build (small).
+**Severity:** Low, no deployment axis. Trace-only; the disposition is byte-identical.
+
+### What closing looks like
+
+1. Reuse `_handler_names`' rule in `_routed_from`, keeping the iterator carve-out.
+2. Add the tuple case to `tests/test_dryrun_trace.py`.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `routed_to`, `_routed_from`, `trace` with `tuple`. #341 (closed) touched the handler half of the tracer only.
+
+**Source.** `docs/reviews/FABLE-PACKET-11-PIPELINEREST-2026-09-11-FINDINGS.md` (vault PR 1488), finding P11-08. The same proposal is on engine PR 1077 as `docs/backlog-proposals/fable-packet11-pipelinerest.md`.
+
+## 1695. the VS Code extension cannot connect to a stock engine because it has no way to trust the minted self-signed certificate
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 12 (finding P12-01, vault PR 1491). Open; not started.** Value **7/10**, Difficulty **3/10**. Since ADR 0172 (Accepted 2026-08-22, shipped under #1276) the engine always serves TLS, minting a self-signed certificate beside the store when none is configured. The extension's engine client (`ide/src/engineClient.ts` `tlsOptions`) pins a `TLSv1.2` floor and otherwise relies on Node's default CA set, and its default `messagefoundry.engineUrl` is `http://127.0.0.1:8765`. Measured 2026-09-12 against a default-posture engine started from the tree at `70063ab55`: the extension's https request fails with `DEPTH_ZERO_SELF_SIGNED_CERT`, its default http request fails with `ECONNRESET`, and a control with verification disabled returns 200. The http failure is reported as "engine not reachable ... start it" while the engine is running.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** IDE / client TLS. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0): reachability, not disclosure. Promote, sign-in, live status and every authenticated command would fail on a fresh install at defaults. #1179's research names "client scheme agreement across tray, apiclient, harness and IDE" as unallocated work; this is the IDE's share of it. The harness's `--insecure` records the same wall (`harness/__main__.py`).
+
+### What closing looks like
+
+1. Either read the generated certificate path from the service TOML the extension already reads (`messagefoundry.serviceConfig`) and pass it as the request's `ca`, or implement trust-on-first-use with the certificate fingerprint stored in `SecretStorage` keyed by engine URL behind an explicit confirmation that names the fingerprint.
+2. In both cases: change the default `engineUrl` to `https://127.0.0.1:8765`, and make `networkError` distinguish a TLS-trust failure from a refused connection so the message offers the remedy.
+3. A unit test for the trust decision (the `engine-target.test.ts` pattern) and a note in `ide/README.md`.
+4. Whether VS Code's `http.systemCertificates` would make an OS-store import work is unmeasured; measure it in the same change.
+
+**Duplicate search.** No item carries the IDE trust seam. #1179 (open, ASVS 12.3.3 research) records the three cleartext client defaults and the absent IDE CA seam as deliberately open, and cannot be closed by a builder; #1276 part B holds the client-pin decision. Searched `engineUrl`, `DEPTH_ZERO`, `self-signed` with `IDE`/`extension`, `tlsOptions`.
+
+**Source.** `docs/reviews/FABLE-PACKET-12-CLIENTS-2026-09-11-FINDINGS.md` (vault PR 1491), finding P12-01. The same proposal is on engine PR 1079 as `docs/backlog-proposals/FABLE-PACKET-12-CLIENTS.md`.
+
+## 1696. the harness scenario runner still false-passes against a prior run, because control ids are deterministic and the M-32 fix keys on them
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 12 (finding P12-02, vault PR 1491). Open; not started.** Value **5/10**, Difficulty **2/10**. June's M-32 was fixed in `f25f8fac` by filtering the dead-letter list to "this run's" control ids, and low-23 by querying `/messages` per control id. Both keys are deterministic: `messagefoundry/generators/_core.py` `control_id("ADT","A01",1)` returns `MEFORADTA0100001` on every run and `generate_message` is byte-identical across calls (measured 2026-09-12). So the rows a prior run of the same scenario left in a long-lived database carry exactly the ids the next run looks for. Measured: `harness/scenarios.py` `_verify_dead_letter` called with a client returning only a prior run's two rows, and nothing sent, returned `ok=True` with the detail "2/2 of this run's messages dead-lettered"; `_verify_disposition` behaves the same. The pinning test `tests/test_harness_scenarios.py::test_verify_dead_letter_ignores_preexisting_rows` uses foreign ids (`OTHER1`, `OTHER2`) for its stale rows, a shape the generator never produces, so it certifies the fix against the wrong case; a negative control that removed the id filter turned it red, so the test can see the filter go but not the filter fail.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** harness / test quality. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, no deployment axis. A pass/fail instrument that can report success without the engine doing anything. The June row's "CI masks regressions" half does not hold: no workflow runs `python -m harness --scenario`; the runner is a manual instrument against a running engine, which is the case the row named.
+
+### What closing looks like
+
+1. Make each run distinguishable: pass a per-run nonce as the generator `seed` and match on the ids it produces, or snapshot the matching ids before sending and require new ids after.
+2. Rewrite the pinning test so its stale rows carry the ids a prior run of the same scenario produces. Apply the same to `_verify_disposition`.
+3. Consider the same question for the load and failover verifications in `harness/load/`, which packet 12b will read.
+
+**Duplicate search.** No open or closed item. Searched `M-32`, `control_id(`, `_verify_dead_letter`, `ignores_preexisting_rows`, `deterministic` with `harness`.
+
+**Source.** `docs/reviews/FABLE-PACKET-12-CLIENTS-2026-09-11-FINDINGS.md` (vault PR 1491), finding P12-02. The same proposal is on engine PR 1079 as `docs/backlog-proposals/FABLE-PACKET-12-CLIENTS.md`.
+
+## 1697. the client dependency rule is broken in eight harness files and nothing enforces it for any client; MLLP framing has no client-importable home
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 12 (finding P12-04, vault PR 1491). Open; not started.** Value **5/10**, Difficulty **3/10**. `CLAUDE.md` section 4 and `harness/CLAUDE.md` allow a client to import `parsing/` and nothing else from the engine. Measured at engine `70063ab55`: eleven direct imports of `messagefoundry.transports.mllp`, `messagefoundry.config`, `config.models`, `config.wiring` and `pipeline.sharding` across `harness/mllp.py`, `harness/scenarios.py`, `harness/load/sender.py`, `harness/load/sink.py`, `harness/load/shardcert.py`, `harness/reconcile/__main__.py`, `harness/reconcile/capture.py` and `samples/send_mllp.py`. In a fresh interpreter `import harness.scenarios` loads 119 engine modules including `transports`. `tests/test_dependency_boundaries.py` forbids only `fastapi`, `pyside6`, `messagefoundry.api` and `messagefoundry.console` from the five engine packages and has no inward rule, so Signal 1 is documented rather than enforced for every client (#1596 recorded the same gap for `parsing/`). The recurring need is one thing: MLLP framing (`frame`, `MLLPDecoder`, `build_ack`) and the `AckMode` enum have no client-importable home.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** architecture / dependency boundaries. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, no deployment axis. A governing invariant for parallel work, broken and unchecked.
+
+### Related detail for whoever touches harness/monitor.py
+
+Its "Purge" button calls purge-all with no confirmation (June's M-28, moved with the rehomed widgets); no `EngineClient` step-up or MFA handler is wired under `harness/`, and a 401 inside `_poll` becomes a status line with no re-sign-in; `harness/_console_widgets.py` line 11 still says calls run synchronously on the GUI thread while the code runs them on a worker.
+
+### What closing looks like
+
+1. Move MLLP framing and `AckMode` into a leaf module that imports nothing from `transports/`, `config/` or the package root (under `parsing/`, or a new `messagefoundry/mllpcodec.py`), re-export from the current homes, and rewrite the eight import sites.
+2. Add an inward assertion to `tests/test_dependency_boundaries.py` that `harness/`, `tee/`, `samples/` and `messagefoundry_webconsole/` import nothing from `messagefoundry.{store,pipeline,transports,config}` except a named allow-list (the web console's `_ui_seam` and `auth` imports are a designed, golden-pinned seam under ADR 0065 and #1220 and belong on that list). Land it with #1596's inward rule for `parsing/` and with the walk-floor guard from packet 18 (filed in this pass), because all of them edit the same test.
+3. `harness/load/shardcert.py` deliberately runs the loader and the sharding planner and needs its own allow-list entry or a ruling; packet 12b owns that file.
+
+**Duplicate search.** #1596 (PR 1066) is the `parsing/` inward rule and #1615 (PR 1071) the console package name; neither covers the harness sites or the framing home. Searched `harness/mllp.py`, `MLLPDecoder`, `AckMode`, `inward`, `client carve-out`.
+
+**Source.** `docs/reviews/FABLE-PACKET-12-CLIENTS-2026-09-11-FINDINGS.md` (vault PR 1491), finding P12-04. The same proposal is on engine PR 1079 as `docs/backlog-proposals/FABLE-PACKET-12-CLIENTS.md`.
+
+## 1698. the release job fetches sbomqs with a same-origin checksum and runs it inside the signing identity before the Sigstore step
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **6/10**, Difficulty **2/10**. `release.yml` downloads the `sbomqs` tarball and its `checksums.txt` from the same upstream GitHub release, compares one against the other, installs the binary with `sudo` and runs it, all inside the `release` job that holds `id-token: write`, `contents: write` and `attestations: write`, and before the Sigstore sign step. The checksum proves the two files match each other, not who published them.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** release / supply chain. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0, and no compromise is claimed). Conditional: a replaced upstream release asset would execute with the identity that signs and publishes the next release, so a backdoored wheel would carry a valid Sigstore bundle and valid SLSA provenance. The sign step's own comment names this hazard for the pip installs beside it; this step is the same class through a different route.
+
+### Why the existing rule does not see it
+
+`tests/test_ci_venv_pinning.py` has a release-asset download rule that requires `sha256sum -c` and forbids `curl | tar`. It is scoped to the blocking jobs of `security.yml` and does not read `release.yml`. Its scoping reason, that an advisory job cannot turn a required context green, is about contexts; the hazard here is the identity the job holds, and `continue-on-error` on the step changes nothing about what the step executes.
+
+### What closing looks like
+
+1. Pin the asset's SHA-256 in the workflow, the way `install-service.ps1` pins NSSM, or verify the upstream's signature over the checksums, or move SBOM scoring out of the signing job entirely (`security.yml` already scores the same SBOM shape in a job with no publishing scopes).
+2. Extend the pinning test's download rule to `release.yml`, keyed on the job's permissions rather than on whether the job is required.
+3. Acceptance: a workflow-shape test that fails when any step in a job holding `id-token: write` fetches an executable without an in-repo pin or signature verification. Do not test by publishing.
+
+**Duplicate search.** #332 covers the pip-installed signing toolchain and mentions neither `sbomqs`, `curl` nor `goreleaser`; its step 6 (PR 1039) hash-locks build and cyclonedx-bom and does not touch this step. #1485 (closed) names `sbomqs` only as a docs-placement note. `BACKLOG-CLOSED.md` has no match.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 1. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1699. nothing pins the H-13 log-directory ACL: deleting the call leaves every test green and the Windows smoke never reads the DACL it produced
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **6/10**, Difficulty **2/10**. With the `Set-SecureDataDirAcl -Path $DataDir` call in `install-service.ps1` replaced by a comment, six service and install test files reported 113 passed, 89 skipped, zero red. No test references the call. `windows-service-smoke` runs the installer and never runs `icacls` against the log directory; its only mention of the function is a comment.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install / test coverage. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0). Conditional: a refactor that dropped or reordered the call would ship green, and a first deployment would have world-readable service logs again, which is the June H-13 finding the call was written to close.
+
+### Measured, with the fix beside it
+
+The fix itself works: extracted from the live script and run against a temp directory, it stripped the inherited `Users:(RX)` entry and left `SYSTEM` and `Administrators` only, and an unelevated reader was then denied the log file. What is missing is the witness.
+
+### What closing looks like
+
+1. In `windows-service-smoke`, after the install step, run `icacls` on `C:\ProgramData\MessageFoundry\logs` and assert that no `S-1-5-32-545`, `S-1-5-11` or `S-1-1-0` ACE is present and that the run-as account holds M.
+2. A static assertion in `tests/test_service_install_manifest.py` that the call exists on the default path and is ordered after `ObjectName` is set.
+3. Acceptance: the smoke goes red with the call removed; the manifest test goes red with the call moved before `ObjectName`.
+
+The config-directory ACL is indirectly witnessed already (the config-source guard refuses to start otherwise); the data and log directory has no such witness, because the service account is granted M either way.
+
+**Duplicate search.** #1553 (PR 1064) covers the `-AllowLocalSystem` rerun leaving the old account without access and asks for execution coverage of the account branches; it does not ask for a DACL assertion, and this could ship in the same change. #224 (closed) is the least-privilege default; #44 (closed) is the key-file DACL.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 2. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
