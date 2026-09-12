@@ -90,6 +90,7 @@ tests/test_install_gate_allowlist_merge.py
 tests/test_install_gate_records_the_install.py
 tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
+tests/test_coord_seat_roster_verdict.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
 tests/test_coord_unbacked_check.py
