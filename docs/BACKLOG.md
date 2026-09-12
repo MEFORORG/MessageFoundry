@@ -15848,6 +15848,85 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 
 ## 1255. two testpaths ship a top-level conftest each, so a bare import conftest binds to whichever loaded first
 
+> ✅ **CLOSED 2026-09-10 -- THE LAST OPEN OPTION IS MEASURED AND REJECTED, SO THE LANDED GUARD IS THE
+> FIX.** This row stayed open on one unresolved question: whether `--import-mode=importlib` (option A)
+> could replace the guard. It cannot. Measured on this tree at `817db9651`, **both testpaths in one
+> process**, pytest 9.1.1 / CPython 3.14.6 / Windows, bare `pytest` with the project root on
+> `sys.path` exactly as CI's `pip install -e .` puts it there. **Baseline: 17,782 collected (17,289
+> engine + 493 web), ZERO errors. Under importlib: 17,613 collected, collection INTERRUPTED.** All
+> three structural options are now measured and every one is worse than the status quo, so nothing
+> here is workable and the row closes on `tests/test_conftest_name_collision_guard.py`.
+> **THE INI KEY THIS ROW NAMES DOES NOT EXIST, AND ITS ABSENCE IS SILENT -- read this before anyone
+> "adopts option A".** `importmode` is not a pytest ini option: `--import-mode` is registered with
+> `group.addoption` in `_pytest/main.py` and never with `addini`. Writing `importmode = "importlib"`
+> under `[tool.pytest.ini_options]` emits `PytestConfigWarning: Unknown config option: importmode`
+> and **changes nothing** -- that run collected 17,782 with zero errors, identical to baseline, in
+> the DEFAULT prepend mode. A warning is not a failure, so that spelling ships a no-op that reads as
+> adoption. Pinned by `test_pyproject_carries_no_dead_importmode_key`. The working routes are
+> `addopts` and the CLI flag; **nothing is set in `pyproject.toml` -- this row ships no config change.**
+> **THE BREAKAGE IS REAL BUT IT IS NOT THE ONE THIS ROW PREDICTED, AND THAT CORRECTION IS THE
+> DURABLE PART.** The row says importlib breaks the files doing `from tests.X import ...` (it counts
+> 36; the census here is 73). **It does not break them: ZERO such failures.** `tests/conftest.py` --
+> the row's own named casualty -- loaded clean, and a lone such module collected 39/39 under
+> importlib. They survive because the editable install puts the project root on `sys.path`, so
+> `tests` resolves as a PEP 420 namespace package whatever the import mode. **What actually breaks
+> is a population this row never names: bare SIBLING imports of helpers inside a test root**
+> (`import _totp_clock`, `from adr0075_batch_harness import ...`), which work today only because
+> prepend puts the test root ITSELF on `sys.path`. importlib puts nothing there.
+> **AND THE FAILING SET IS ORDER-DEPENDENT, WHICH IS WHY THE REPORTED NUMBER IS NOT THE REAL ONE.**
+> pytest reported 10 errored files; an AST census finds **34 module-level importers across 12
+> helper modules** -- plus 4 files that import a helper only inside a FUNCTION BODY, so they
+> cannot produce a collection error at all and would break later, at test-call time. Those 4 are
+> `tests/test_step_up.py` (`_totp_clock`), `tests/test_audit_offbox_tee.py` (`_cipher_registry`),
+> `tests/test_install_gate_wiring.py` (`test_gate_installed_parity`) and
+> `packaging/messagefoundry-webconsole/tests/test_webui.py` (`_soft_webauthn` -- the 13th helper,
+> which appears in no module-level import anywhere). **An earlier draft of this row said 38 and
+> attributed the whole gap to collection order. That was wrong, and the correction STRENGTHENS
+> the verdict rather than weakening it:** `tests/test_audit_offbox_tee.py` sorts EARLY, ahead of
+> the rescuer named below, and still did not error -- which only the module-level/nested split
+> explains. **34 is also what makes the observed 10 fall out exactly:** of the 34, precisely
+> those sorting before the rescuer are the 10 pytest reported -- set-equal, nothing unexplained
+> on either side. The 24-file gap is not pytest truncating -- `tests/test_ci_tooling_gate.py:36`
+> calls
+> `sys.path.insert(0, <the tests dir>)` at import time, collection is alphabetical, that file sorts
+> immediately after the last failure, and **every consumer collected after it accidentally works off
+> another module's global side effect.** Proven two-armed: `tests/test_mfa.py` alone under importlib
+> is a collection ERROR; preceded by `tests/test_ci_tooling_gate.py` it collects 44; alone under
+> prepend it collects 17. Same file, same flag, opposite verdict. **CI runs `-n 4 --dist loadfile`,
+> so per-worker order would decide which files break -- a per-run, per-worker failing set is
+> strictly worse than the latent collision this row was filed for.**
+> **WHAT THIS CLOSE RESTS ON, STATED PRECISELY SO THE RESIDUAL IS VISIBLE RATHER THAN RETIRED.**
+> It rests on COMPLETE `--collect-only` runs over BOTH testpaths in one process, in both arms,
+> plus the landed guard. It does NOT rest on an executed full-suite run: that was started and
+> stopped at 23 percent with zero failures, killed because it was serial (no xdist in that venv,
+> roughly three hours projected) and its port-binding tests would have collided with sibling
+> sessions. Collection is the right instrument for THIS question -- import binding happens at
+> collection, which is where the defect lives and reported -- but it is not the same evidence as
+> a green suite, and this row does not claim it is. **If you hold that a close needs the executed
+> run, RE-RUN IT** -- `pytest -q` over both testpaths, ideally with `-n auto --dist loadfile`.
+> That is a cheap confirmation and it is welcome. What should NOT be repeated is the importlib
+> measurement itself, which is recorded here once precisely so nobody re-derives it (SDS-3.5; the
+> guard's module docstring carries only the DECISION and cites this row for the evidence, because
+> a second copy of a measurement rots silently when nothing points at it). Two tests pin the
+> premises instead of prose: `test_every_pytest_ini_key_is_a_registered_option`, which asks the live
+> pytest config about every key in the block and so covers `import_mode` and `import-mode` as well as
+> the one misspelling above; and `test_the_sibling_bare_imports_that_rule_out_importlib_are_still_present`,
+> which reds if that sibling-import population ever empties -- the one event that would make importlib
+> re-priceable. **Emptying it is the RECOMMENDED direction of travel, not a regression:** migrating
+> `import _totp_clock` to `from tests._totp_clock import ...` is the house idiom, and whoever
+> finishes that job should re-price this row rather than read the red as a defect.
+> **A THIRD DEFECT WAS FOUND AND FIXED IN THE GUARD ITSELF, and it is the same shape this module
+> exists to prevent.** The perf pass that folded the two AST walks into one left `_scan` filtering
+> the heads INLINE while the positive controls exercised only the tree-level wrappers, so the
+> production path and its controls had come apart: mistyping the literal (`"confest"`) or dropping
+> the `head in local` filter would have left EVERY control green over a guard that had stopped
+> detecting -- *a dead detector reads exactly like a clean tree*, this module's own rule, turned
+> on the module. Both callers now share `conftest_hits` / `sibling_hits`. **Proven by mutation
+> rather than asserted:** unmutated, 0 controls fail; mistyping the literal reds
+> `test_the_detector_trips_on_a_planted_bare_import`; dropping the filter reds
+> `test_the_sibling_detector_separates_the_two_import_shapes`. The unmutated arm is what makes
+> the other two mean anything.
+
 > **PARTIAL 2026-08-25 -- A GUARD LANDED, STAYS OPEN.** `tests/test_conftest_name_collision_guard.py`
 > statically walks every testpath root for a bare `import conftest`/`from conftest import` and reds on
 > one; nothing does that today, so it is a regression guard, not a fix for a present-tense defect --
@@ -15861,7 +15940,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > reproduce in a sandbox on pytest 9.1.1 -- a sandbox isn't the real 691-file tree, so that needs
 > re-measuring before anyone adopts or dismisses it, and switching import semantics for 691 files on
 > an unreproduced premise is exactly what landing the guard alone avoids needing right now.
-> 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Every precondition re-verifies at HEAD: no importmode at pyproject.toml:317, neither test root carries an __init__.py, and the collision is still untripped (zero bare conftest imports), so the trap is latent exactly as filed. Difficulty is above a plain additive edit because option B changes pytest module naming for roughly 680 files and the item's own rule is that the only honest check is a both-testpaths full-suite run. _(was 6/10 · 2/10.)_
+> **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Every precondition re-verifies at HEAD: no importmode at pyproject.toml:317, neither test root carries an __init__.py, and the collision is still untripped (zero bare conftest imports), so the trap is latent exactly as filed. Difficulty is above a plain additive edit because option B changes pytest module naming for roughly 680 files and the item's own rule is that the only honest check is a both-testpaths full-suite run. _(was 6/10 · 2/10.)_
 >
 > **THE FAILURE MODE IS WORSE THAN FILED, AND THE FIX IS A DECISION RATHER THAN A TASK. Measured 2026-08-15; verified independently here.** This item describes the signature as an `AttributeError` naming a module path from the wrong package -- i.e. failing loudly-ish. **It can fail SILENTLY instead.**
 > **THE TWO CONFTESTS SHARE EIGHT TOP-LEVEL NAMES** -- `_Baseline`, `_QuiesceNullHandler`, `_allow_insecure_config_source_in_tests`, `_quiesce_background_loggers_at_teardown`, `_quiesce_baseline`, `_quiesce_targets`, `_restore_baseline`, `_tolerate_logging_on_closed_capture_streams` -- **the logging-quiesce machinery, duplicated in both trees.** So a mis-bound `import conftest` **does not necessarily raise: it can SUCCEED and return the WRONG IMPLEMENTATION.** That is the shape this project keeps meeting -- **a resolution that lands on something plausible from the wrong subject** -- and it is strictly worse than the documented signature.
@@ -15873,7 +15952,7 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 > **VERIFICATION MUST BE A FULL-SUITE RUN, and this is not conservatism.** The defect is about what happens when **BOTH trees are collected**, so **any check that runs one tree passes by construction.** That is this item's own *"invisible in isolation"* point applied to its own fix.
 > **PARKED ON VERIFICATION COST, NOT ON DIRECTION.** A latent defect whose fix changes the import semantics of **674 test files** should not land on a fleet that cannot currently measure its own pool, and the honest check is the long one.
 > **INSTRUMENT CAUTION FOR WHOEVER RE-MEASURES THE SHARED NAMES:** the first attempt used `grep -oP` and **died on this box's locale** (*"supports only unibyte and UTF-8 locales"*) -- **it printed NOTHING, which reads exactly like "no shared names".** Redone with an AST walk. **A failed instrument that prints nothing is indistinguishable from a clean result.**
-> 🔢 **Filed 2026-08-14 - not started. LATENT, not live: no caller trips it at `origin/main` today.** `pyproject.toml` sets `testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]`. **Both directories contain a `conftest.py` and NEITHER contains an `__init__.py`**, so both claim the same top-level module name `conftest`. In a full run only one wins `sys.modules`, and a bare `import conftest` in either tree silently binds to it.
+> **Filed 2026-08-14 - not started. LATENT, not live: no caller trips it at `origin/main` today.** `pyproject.toml` sets `testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]`. **Both directories contain a `conftest.py` and NEITHER contains an `__init__.py`**, so both claim the same top-level module name `conftest`. In a full run only one wins `sys.modules`, and a bare `import conftest` in either tree silently binds to it.
 > **THE FAILURE IS INVISIBLE IN ISOLATION, WHICH IS THE WHOLE DEFECT.** Run either tree alone and the import resolves to that tree's own `conftest` and passes. Run both -- which is what `pytest` does by default, and what CI does -- and one tree's import silently resolves to the OTHER tree's module. The observed signature is an `AttributeError` naming a module path from the *wrong* package, not an `ImportError`, so it reads as a missing attribute rather than a mis-bound import.
 > Verdict: build
 > Closing-act: code
