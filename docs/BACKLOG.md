@@ -3471,68 +3471,7 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 > *The ruling was made today and lived only in the owner queue record; this row is the surface that
 > governs `release.yml:255`, so it belongs here.*
 >
-> 🚧 **Status 2026-09-10 — STEP 6 IS BUILT AND PUSHED; THE PARAGRAPH BELOW IS THE PRE-STEP-6 RECORD AND IS KEPT
-> RATHER THAN DELETED, because it is what a reader needs to check this work against.** `build==1.5.0` and
-> `cyclonedx-bom~=7.3.1` left their inline `pip install` lines and joined the EXISTING `release-tools` group, so
-> all three release tools now install from `ci/locks/release-tools.lock` with `--require-hashes`. The lock grew
-> from **31 requirements / 193 hashes to 65 / 383**. Both halves of the byte-identical pair moved in one commit,
-> and `test_sbom_install_is_byte_identical_in_release_and_security` moved with them: it now compares each SBOM
-> step's **whole install prologue**, located by the step that runs `cyclonedx_py environment`, because after the
-> move no line names `cyclonedx-bom` and the line that replaced it is one `release.yml` runs at five sites.
-> The DEP-1 membership pin this item asked for is in `tests/test_dep1_lock_resync_lockstep.py`.
-> **The step-6 decision this item did NOT pre-decide: one group, not a third one.** The three tools run at the
-> same trust level, so a second lock would be another artifact to export, diff, resync and audit for a
-> separation nobody acts on. ADR 0034 had predicted a third group; that prediction is corrected in place there.
-> *(An earlier draft of this sentence said the three run "in the same job, on the same runner". They do not, and
-> the error is worth naming because it also reached ADR 0034: the three `build` sites are in THREE jobs --
-> `release`, `release-webconsole`, `release-harness` -- all holding `id-token: write`, with
-> `attestations: write` only on the first. Read each job's own `permissions:` block; do not trust a copy.)*
->
-> **THE CONTAMINATION THIS ITEM'S DIFFICULTY NOTE PREDICTED DID FIRE, and it was accepted rather than absent —
-> read this before re-deriving it.** Control first, on the unchanged tree, with the LOCAL `uv 0.11.25` rather
-> than CI's pinned `0.12.0`: all seven DEP-1 artifacts re-exported **byte-identically**, and the instrument was
-> then shown to work in the other direction too (a deliberately corrupted lock read dirty, and the re-export
-> restored it). So the local resolver agrees with CI's on this tree. After the change: the four runtime exports
-> and `ci-scanners.lock` stay byte-identical, and **`ci-quality.lock` moves by one requirement — `chardet`
-> 7.4.3 -> 5.2.0.** Cause: `cyclonedx-bom` declares `chardet<6.0,>=5.1`, `diff-cover` declares `chardet>=3.0.0`,
-> and uv resolves one version per package across every group. **This is NOT the `semgrep` excluded-by-decision
-> case, and the criterion is what separates them:** `semgrep` was excluded because its group downgraded the
-> shipped otel runtime in **all four** DEP-1 artifacts — the product, the SBOM, and what `pip-audit` calls
-> runtime. This moves one ADVISORY-only CI lock, on an undeclared transitive whose version was never a decision
-> this repo made in either direction, and 5.2.0 is inside both tools' declared ranges. Checked against OSV with
-> a positive control (`requests==2.19.0` returned 10 advisories): **neither `chardet` version carries a known
-> advisory**, and `pip-audit` runs over `ci-quality.lock` every security run, so a future one fails closed.
-> `[tool.uv] conflicts` was tried as the alternative and is **worse**: it did not undo the downgrade AND it
-> leaked eight lines into each of `requirements.lock` and the two container image locks. Measured, then reverted.
->
-> **CORRECTION 2026-09-11, naming the claim it replaces, because that claim was published on PR 1039 and in an
-> earlier draft of this row.** The superseded sentence read: *"The `cyclonedx-bom` half IS partly covered:
-> `security.yml`'s `sbom` job runs on every PR and executes the byte-identical command."* **That is FALSE, and it
-> came from the dispatch brief rather than from the tree.** The `sbom` job carries
-> `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`, so it never runs on
-> `pull_request`; it is additionally `continue-on-error: true` and is not a required context, so it cannot fail
-> anything even when it does run. Measured on PR 1039's own head: `SBOMs (CycloneDX, multi-ecosystem)` reported
-> **`skipped`**. The shape worth recognising is a coverage claim adopted from a brief and never put to the
-> workflow file.
->
-> **WHAT WAS NOT VERIFIED: the install command itself, in BOTH halves.** All **six** sites running
-> `pip install --require-hashes -r ci/locks/release-tools.lock` are gated away from `pull_request` — the five in
-> `release.yml` by `on: push: tags:` + `workflow_dispatch`, and `security.yml`'s one by the `if:` above. **So
-> nothing in PR CI executes the changed command in the form this work introduces, and both halves are
-> unexercised, not one.** First execution is whichever comes first: the **nightly `0 6 * * *` run of
-> `security.yml` on `main` after merge**, a manual **`workflow_dispatch` of `security.yml`** (ADR 0034's
-> documented pre-tag dry-run — which must be DISPATCHED, it does not happen by itself), or a **tag push**
-> running `release.yml`. **Read one of those logs before the next tag.**
->
-> **WHAT WAS VERIFIED, kept beside it so the two are not confused.** PR CI does exercise the *artifacts*, just
-> not the install. On PR 1039's head the ungated `pip-audit` job re-exported all seven DEP-1 artifacts under
-> **CI's pinned `uv==0.12.0`** and passed `git diff --exit-code` — which independently confirms that the local
-> `uv 0.11.25` control recorded above produced byte-identical output, retiring the contamination risk this
-> item's difficulty note flagged. The same job audited `ci/locks/release-tools.lock` (all 65 requirements) and
-> `ci/locks/ci-quality.lock` (carrying the downgraded `chardet`) clean. **Lock correctness is checked in PR CI;
-> lock INSTALLATION is not.**
->
-> **PRE-STEP-6 RECORD, kept verbatim.** **WHY THIS ITEM IS STILL OPEN, in one place:** **step 6 only** — the version is settled and steps 1-5 are done. Step 6 is (`build` and
+> **WHY THIS ITEM IS STILL OPEN, in one place:** **step 6 only** — the version is settled and steps 1-5 are done. Step 6 is (`build` and
 > `cyclonedx-bom` into the same group), which was never started. Step 6's constraint is unchanged and
 > load-bearing: `cyclonedx-bom` is half of a byte-identical pair — `release.yml:326` and
 > `security.yml:367` both read `python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, and
