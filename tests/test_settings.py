@@ -1400,7 +1400,11 @@ def test_vip_default_grace_is_held_to_the_same_bound(tmp_path: Path) -> None:
         tmp_path / "messagefoundry.toml",
         _VIP_PG
         + "[cluster]\nenabled = true\nheartbeat_seconds = 1\nleader_fence_timeout_seconds = 2\n"
-        + "leader_lease_ttl_seconds = 3\n[cluster.vip]\nenabled = true\n"
+        # The renew clamp must fit this tightened pair's own margin (3 - 2 - a 0.4 fence tick = 0.6),
+        # or ClusterSettings._renew_fits_the_margin refuses the config first and this test would be
+        # asserting on the wrong refusal. Named here so the fence/TTL values stay the subject.
+        + "leader_lease_ttl_seconds = 3\nlease_renew_timeout_seconds = 0.5\n[cluster.vip]\n"
+        + "enabled = true\n"
         + _VIP_USABLE
         + "prefix = 24\n",
     )
