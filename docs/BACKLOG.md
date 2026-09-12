@@ -31574,3 +31574,577 @@ Acceptance: Start, then a visible running row, then a browser Stop, all without 
 ### Verification limits
 
 Fake runner transitions with the real callbacks and rendering. No connector was started and no message was sent.
+
+## 1569. password-only login clears the shared MFA failure counter before the second factor succeeds, so the account lockout never fires
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. The password leg records login success and clears the shared account failure counter before computing the remaining second-factor requirement. Four wrong MFA codes left `failed_attempts=4`; a fresh correct-password login returned `mfa_required=true` and reset the count to zero.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** authn / lockout. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a password holder would defeat the account-level MFA lockout by starting a fresh pending session between batches of guesses.** Per-IP and global rate limits still apply, so this is not unlimited-rate guessing -- it defeats the one control that counts failures per account.
+
+### What closing looks like
+
+Keep second-factor failures across a password-only login. Either separate the counters, or clear the shared one only after the required factors have all succeeded. A full successful login must still reset what it should.
+
+Acceptance: alternate wrong MFA attempts with valid password logins, across separate sessions and separate client addresses, and require the account to reach its configured lockout threshold.
+
+### Verification limits
+
+Reproduced in-process against the real HTTP handlers with an in-memory store. No browser and no live directory.
+
+## 1570. the backup codec passes unsigned 32-bit declared lengths straight to read(), before key matching and before authentication
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. The header-length and frame-length readers hand an attacker-declared 32-bit value to `read()` with no cap. Guarded in-memory streams intercepted requests for 4,294,967,295 bytes on both paths. The manifest read in `dr_backup.py` is also unbounded.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** disaster recovery / archive parsing. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site verifying or restoring an influenced archive would allocate on a declared length before anything authenticated it.** The header path runs before key matching, and the frame path can reuse a legitimate header without knowing its key, so **authentication cannot protect memory consumed before authentication runs**.
+
+### What closing looks like
+
+Cap header, frame, chunk, manifest and cumulative decoded output before reading, and reject an impossible length rather than attempting it. Derive the caps from what the writer side actually produces, so a legitimate archive at the boundary still restores.
+
+Acceptance: oversized declarations against short and long streams; exact boundary values; malformed headers; tampered frames; an oversized manifest. Assert rejection **before** a large read, not after.
+
+### Verification limits
+
+Guarded streams intercepted the read sizes; no large buffer was ever allocated, which is also why this could be measured safely. The manifest path was read, not driven.
+
+## 1571. support-bundle config and status summaries put raw exception text into JSON that the bundle redactor never sees
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **3/10** · _no research_. The configuration and status summaries place exception strings directly into the bundle's JSON members. The bundle redacts its log member, and the logging filters cover the log stream, but neither reaches these summaries. Synthetic credentials survived verbatim into both dictionaries.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** support bundle / PHI. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator who created and shared a bundle after a sensitive failure would carry credentials or patient identifiers outside the secured environment.** Config loading wraps arbitrary module exception text, so the summary cannot assume its input is safe.
+
+### What closing looks like
+
+Emit fixed diagnostic codes plus the exception **type**, and keep arbitrary exception strings out of anything shareable. Heuristic redaction applied late is the weaker answer: it cannot guarantee removal of a secret shape nobody anticipated, and this is a sink where the content is already known to be arbitrary.
+
+Acceptance: inject synthetic credentials and patient identifiers through **every** summary failure branch, then inspect every archive member including the manifest claims, not only the log.
+
+### Verification limits
+
+Real summary functions with synthetic exceptions. No real bundle was assembled from a real store.
+
+## 1572. the diagnostic redactor hardcodes the default HL7 separators, so a custom-delimiter message keeps its identifiers through every logging filter
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **4/10** · _no research_. The parser honours the delimiters MSH declares; the redactor recognises only the defaults. A synthetic message using `*` as the field separator and `$` as the component separator kept its record identifier and name through exception rendering, support redaction, and the installed four-filter logging chain.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / PHI redaction. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site receiving supported custom-delimiter messages would have patient identifiers reach its logs unredacted** whenever such a message entered diagnostic text. This is a defensive-layer defect: it does not establish that ordinary processing logs message bodies.
+
+### Coordinate with the redaction performance work
+
+Broadening the delimiter set makes the scan match more, so this must be designed alongside the credential-scrubber cost work rather than after it. The two touch the same boundary and a fix for one can undo the other.
+
+The alternative worth weighing is not to widen the patterns at all: detect a structured body and replace it wholesale with a fixed diagnostic. That is cheaper to reason about and cannot be defeated by a delimiter nobody anticipated.
+
+Acceptance: custom-delimiter messages through exception rendering, the final logging chain and the support path. Synthetic identifiers must disappear without adding a superlinear scan.
+
+### Verification limits
+
+Real parser and real redactor with synthetic messages. Reproduced independently twice.
+
+## 1573. Invoke-Nssm joins every argument into its failure message, so a failed credential call throws the service-account password
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **2/10** · _no research_. The NSSM wrapper builds its failure message by joining every argument it was given, and the service-account password is one of those arguments during credential configuration. Two independent in-memory extractions with a command returning exit code 7 produced a thrown message containing the synthetic password.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install / secrets. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an installer failure on a password-backed service account would print that password into the console, any transcript, and any captured output.** Passwordless virtual accounts do not take that branch, which is the default path.
+
+**SecureString conversion does not help here.** The value is plaintext by the time it reaches the argument list, so the protection ends before the failure message is built.
+
+### What closing looks like
+
+Report the operation and the exit code without the arguments. Then check every stream, not just the throw: `Write-Error`, verbose output, transcripts, and the `$Error` records. Redact before constructing any message rather than filtering afterwards.
+
+Acceptance: force the credential command to fail and assert the synthetic password appears in no output stream and no error record.
+
+### Verification limits
+
+The real function was extracted with the PowerShell parser and driven with a fake command. No NSSM process ran and no service operation was performed.
+
+## 1574. the db_lookup read-only predicate admits SELECT INTO and WITH followed by DELETE, so it is not read-only authority
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **4/10** · _no research_. The predicate guarding `db_lookup` accepts `SELECT INTO` and a `WITH` expression followed by `DELETE`. Both passed the real predicate. Trusted authored SQL and a database account with write privilege are prerequisites, so this is not remote SQL injection.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** egress / database lookup. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a handler's live lookup could write to the source database**, which breaks the read-only carve-out that makes `db_lookup` an acceptable exception to transform purity. The carve-out is written as "live, read-only"; a leading-token test cannot deliver the second half.
+
+### What closing looks like
+
+Enforce read-only **authority** at the database boundary -- a read-only connection or transaction per dialect -- and treat the statement-shape test as defence in depth rather than the control. Then correct any doc or docstring that claims more than the predicate can meet.
+
+Acceptance: write-shaped `SELECT` and `WITH` forms, multiple statements, and comment-prefixed statements, on each supported lookup backend with disposable fixtures. Confirm the account itself cannot write.
+
+### Verification limits
+
+The predicate was driven directly with synthetic statements. No live database ran, so the connection-level control is proposed rather than measured.
+
+## 1575. the new bounded reader accepts a truncated HTTP reply that the former unsized read rejected, and REST._post reports it as success
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. A real `HTTPResponse` declaring `Content-Length: 100` with a two-byte body raised `IncompleteRead` under the former unsized read. Under the new sized read it returns `{}`, and `REST._post` returned `('{}', 200, {})`. This is a regression introduced by the egress memory-bound fix.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / egress framing. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would record an incomplete captured reply as a successful delivery.** The declared length is the only signal that the peer did not finish, and the sized read discards it.
+
+**The byte ceiling must survive the fix.** It closed a real memory-exhaustion path and is working as intended. The two properties are independent: bound the bytes **and** check that the declared length arrived.
+
+### What closing looks like
+
+Keep the cap and compare what was read against the declared length, handling fixed-length, chunked and EOF-delimited replies distinctly. `http.client` exposes the declared length, so the check is available without re-reading.
+
+Acceptance: real HTTP-parser memory streams for early EOF, a complete body, and an oversized body. Enumerate every caller of the shared reader and say which would accept a truncated reply today.
+
+### Verification limits
+
+Real `HTTPResponse` objects over `io.BytesIO`. No network peer.
+
+## 1576. safe_text redacts before it truncates, so a linear redaction still runs on an unbounded input from a negative acknowledgment
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. The HL7 field-run scan is linear now and holds -- an attempt to break it across five input classes, 21 shapes and sizes to 4 MiB found nothing superlinear. What remains is the input: `safe_text` calls the redactor **before** truncating, MSA-3 is read with no bound, and the logging path hands a whole rendered traceback in with no ceiling at all.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / diagnostics. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a configured outbound peer could impose 0.62 to 1.91 seconds of event-loop time per negative acknowledgment** at the 16 MiB parse cap, depending on character mix. Linear work on an unbounded input is still unbounded work.
+
+**This is not the quadratic defect reopening.** That fix is sound and must stay. This is the second half of the same boundary: bounding the input rather than the algorithm.
+
+### Do not fix it by truncating first
+
+Cutting the text at a whitespace or delimiter boundary before redaction strands a fragment below the two-delimiter threshold the redactor needs, and the patient name survives into the log. That was reproduced twice, independently, against the shipped redactor. Prefer moving this rendering off the event loop, the way the listener already offloads strict validation, or bound the source field at read time rather than the rendered text at log time.
+
+Acceptance: a long negative acknowledgment through the real delivery path, asserting both event-loop responsiveness and that no identifier escapes. Keep a control that a normal-length message still redacts fully.
+
+### Verification limits
+
+Timed against the real functions on one machine. No live MLLP peer sent the acknowledgment.
+
+## 1577. the tray probe and the shared apiclient buffer an HTTP reply with no ceiling, outside the egress bound the engine now enforces
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **3/10** · _no research_. The engine's outbound reads are bounded by the shared reader. Two sibling HTTP sinks in the same wheel are not: the tray health probe returns `response.json()` on a client built with no body cap, and the shared apiclient has the same shape at several readers. 67,108,888 bytes -- four times the engine's own 16 MiB ceiling -- were buffered through the real probe at its shipped timeout, which still returned OK.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** clients / bounded reads. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a local process squatting the engine port, or a compromised engine host, would drive the tray's memory through repeated polls**, because the poller calls the probe on a repeating schedule and the probe's own classifier explicitly models a non-engine server answering that port.
+
+The probe's docstring already names an unbounded **request URL** on this hop and argues it is proportionate. It says nothing about the **response body**, so this is an absence rather than a considered acceptance.
+
+### What closing looks like
+
+Reuse the shared bounded reader, or its limits, in the tray and the apiclient. The apiclient is what the harness, the verifier and the tray controller all use, so one fix covers several callers. The tray is stdlib ctypes with no PySide6, and the fix stays inside that.
+
+Acceptance: an oversized reply on each client path must be refused within a bounded allocation; a normal reply must still parse.
+
+### Verification limits
+
+The real probe with a synthetic oversized reply. No engine was running; the server was a local stub.
+
+## 1578. the vendored cla-assistant-lite bundle is 1.18 MB of third-party JavaScript outside every dependency gate in this repository
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **4/10** · _no research_. A workflow runs a local path action whose entire implementation is one vendored bundle of 1,179,882 bytes. Its README records the upstream project and commit it was vendored from. No lockfile covers it, so neither the npm audit gate nor the Python advisory scan can see it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** supply chain / CI. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments; this runs in CI, not in the product). Conditional: **a vulnerability in that bundle would not be reported by any gate this repository runs**, and the bundle executes in a workflow with repository context. The upstream action is separately known to be archived, which is why it was vendored.
+
+### What closing looks like
+
+Bring it under a gate. Either record its provenance and contents in a form the advisory tooling can read, or replace the vendored bundle with a pinned upstream reference, or rebuild it from a locked source tree. Whichever is chosen, the property to establish is that a future advisory against its dependencies reaches somebody.
+
+Acceptance: demonstrate that a known-vulnerable dependency inside that bundle would be reported. A gate whose success cannot be distinguished from its absence is the thing to avoid here.
+
+### Verification limits
+
+File size and README provenance were read. The bundle's dependency closure was not enumerated, and no advisory was queried against it.
+
+## 1579. the batch delivery body claims extra members the dispatcher never learns about, so a completion fault strands them until startup recovery
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **5/10** · _no research_. The batch path claims additional members internally while the pooled dispatcher knows only the original head, so a failure at batch completion leaves those claims outside recovery ownership. One injected completion fault gave `[('done',1),('inflight',1)]` after a healthy retry, two transport sends, and an idle lane.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** delivery / batch claim ownership. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would have a batch member sit undelivered until the next startup recovery** after a single transient store fault. Not lost -- `reset_stale_inflight` does recover it -- but delayed by however long the process runs.
+
+**The per-lane arm is worse and the source review missed it.** Under `per_lane` the same fault is swallowed and nothing is re-pended, so **all** members sit in-flight, head included, with a live worker sitting over them. Pooled leaked one row of two; per-lane leaked two of two. A fix aimed only at the dispatcher would leave the worse arm standing.
+
+### What closing looks like
+
+Give one recovery owner responsibility for every claimed batch member. At-least-once permits a repeated transport send after an uncertain completion -- the measured recovery cost one duplicate send for two messages, which is allowed. **Do not drift into promising exactly-once** while fixing this.
+
+Acceptance: inject faults after the extra claim and during completion, through the real dispatcher, in both claim modes. Require every member to recover without a restart, with no abandoned in-flight rows.
+
+### Verification limits
+
+Real store and real dispatcher with a recording connector and an injected store fault. SQLite only.
+
+## 1580. pass-through completion markers enter ordinary outbound replay, where no delivery worker can drain them and the parent stays ROUTED
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **4/10** · _no research_. Pass-through completion inserts an empty-body marker row. Replay selects rows by status, so those markers become pending outbound work. Their targets are inbound-only names, and the engine registers only outbound names with the startup sweep, so nothing drains them.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** store / replay. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site that replayed pass-through traffic would accumulate pending rows nothing can drain**, and on a mixed parent the ordinary redelivery finishes while the parent stays `ROUTED` until the startup sweep marks it `ERROR`.
+
+**The mixed-parent case is the sharp one.** A message that was actually delivered ends up recorded as an error. That is a false disposition, which is the count-and-log invariant pointing the wrong way -- worse than the undrainable rows themselves.
+
+### What closing looks like
+
+Identify bookkeeping markers explicitly and exclude them from ordinary outbound replay. If pass-through retransmission is to be supported at all, it must create real child ingress work carrying a body, not a marker.
+
+Acceptance: pass-through-only and mixed parents; normal and bulk dead replay; depth caps; restart. Never create pending empty-body outbound work for an inbound-only target, and require every parent to reach a truthful final state.
+
+### Verification limits
+
+Real store with synthetic pass-through traffic. The equivalent replay code in the server backends was read, not run.
+
+## 1581. the ZIP codec keys members by filename in a dictionary, so a duplicate name silently discards the earlier payload
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. The archive codec's admission contract states that it does not silently lose members, and then assigns each body into a dictionary keyed by filename. Two members named `message.txt` with distinct bodies returned only the second.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** parsing / archives. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a handler unpacking a partner archive would receive only the last member of each repeated name, with no error.** The code contradicts its own stated contract, which is what makes this worth the two lines.
+
+### No test could have caught it, and that is the more useful finding
+
+The existing test builds its fixture from a **dictionary**, which structurally cannot express duplicate names. The test shape forecloses the entire defect class. Any regression test here must build members from an ordered list or from separate writes.
+
+### What closing looks like
+
+Reject duplicate member names for the whole archive before returning anything, keeping the existing mapping interface. Preserving occurrences instead would change the return contract, so rejection is the smaller change and matches the stated admission rule.
+
+Acceptance: duplicates with identical and with differing bodies, built from separate writes. Require whole-archive rejection, and keep unique-name decoding plus the existing size and type checks passing.
+
+### Verification limits
+
+Real codec with in-memory archives. Other archive paths in `parsing/` were not audited for the same shape.
+
+## 1582. the outbound batch success test asserts pending depth rather than terminal state, so a no-op completion still passes it
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. The test claims final completion but checks only pending depth and dead-letter count. With the batch completion replaced by a no-op it still passed, leaving three rows in-flight and three messages routed. The negative control -- a no-op connector send -- correctly failed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tests / delivery. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments; this is a test defect, not a product one). Conditional: **a completion failure would evade this test**, which is why the batch-ownership defect could exist under a green suite.
+
+### What closing looks like
+
+Retain the message identifiers and assert their terminal message and queue states, plus zero pending and zero in-flight. Keep the connector-send negative control that already works.
+
+Pair it with the batch-ownership fix: the mutation that must fail is a no-op completion, and the fault that must be survived is a completion-store error through the real dispatcher.
+
+Acceptance: the real implementation passes; a no-op completion fails. Both arms are required -- a test that only passes proves nothing about what it would catch.
+
+### Verification limits
+
+Mutation run per-process against the real runner and store. The wider suite was not swept for the same shape, so whether this is one weak test or a pattern is unestablished.
+
+## 1583. the release wheel smoke runs python -c from the checkout, so the source tree shadows the installed wheel and the tag-version gate cannot fail
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **7/10** · Difficulty **2/10** · _no research_. The release job installs the wheel into a clean environment, then runs `python -c` from the repository root. For `python -c`, `sys.path[0]` is the empty string, meaning the current directory, so the checkout's own package wins. A deliberately broken wheel still printed a version and exited 0.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** release / artifact verification. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments, and no defective artifact is claimed). Conditional: **a release would ship an incomplete wheel with its smoke check green**, because the check validates the checkout rather than the artifact.
+
+### The control arm is the finding
+
+A broken wheel installed into a throwaway environment raised from a source-free directory and exited 1. From a directory holding intact source, the same command printed the source version and exited 0. Without that pair, a passing smoke test is indistinguishable from a working one.
+
+### Two consequences beyond the smoke check
+
+**The tag-versus-version gate is defeated too.** That gate consumes the same shadowed value, and the tag is cut from the same source the shadow reads, so it cannot fail on a wheel carrying the wrong version.
+
+**The shadow takes the whole package tree**, not just the version module. A missing force-included file would be equally invisible.
+
+### What closing looks like
+
+Run the smoke in isolated mode and assert the imported module's path lies inside the installed environment, then compare installed distribution metadata against the tag. Measured: `-I`, `-P` and `PYTHONSAFEPATH` each resolve correctly; **`-E` alone is a silent no-op** here, which is the trap.
+
+Acceptance: keep an intact checkout present, and require a deliberately broken wheel and a version-mismatched wheel each to fail.
+
+### Verification limits
+
+Throwaway wheels and venvs under the system temp directory. No release ran and nothing was published.
+
+## 1584. the release publish guards test the tag ref without the event, so a manual dispatch on a tag can publish despite the dry-run promise
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **2/10** · _no research_. The workflow header promises that a manual dispatch builds inspection artifacts without creating a release or publishing. The publication guards test the tag reference and not the event type, and a `workflow_dispatch` can target a tag, so those guards are satisfied.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** release / trigger guards. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments, nothing published). Conditional: **an operator expecting the documented dry run could invoke a real publication** by dispatching against a release tag. The promise is what makes this a defect rather than a trap -- the header states the behaviour the guards do not deliver.
+
+### What closing looks like
+
+Require the intended event **and** the matching ref on every step that mutates something outside the run: release creation, release edit, asset upload, and each publish. Keep the repository-variable gates for optional distributions.
+
+Acceptance: evaluate push-on-tag, dispatch-on-branch and dispatch-on-tag against every mutation step, with fake contexts. Do not test by publishing.
+
+### Verification limits
+
+Guard expressions were evaluated against synthetic contexts. No dispatch ran, and the live environment protection rules on the publishing jobs were not inspected -- if a protected environment with reviewers stands in front, the practical severity is lower than the guard logic alone suggests, and that is worth establishing before the fix.
+
+## 1585. the harness declares an unbounded engine dependency while importing messagefoundry.apiclient, so resolution accepts an engine that lacks it
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **4/10** · Difficulty **3/10** · _no research_. The harness package declares its engine dependency with no version constraint while the harness imports `messagefoundry.apiclient`. An older engine version satisfying that bare requirement does not contain the package.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** packaging / harness. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an environment retaining an older engine would satisfy the harness's dependency and then fail at import.** A resolution-time refusal is the correct place to catch that.
+
+### What closing looks like
+
+Generate an exact or floored engine requirement from the harness's own version source at build time, and assert it in the built wheel's metadata rather than in the source tree. Check first whether that plumbing exists -- if the version reaches metadata as a static string, adding generation is most of the work.
+
+The web console has the same unbounded-dependency shape, and its release checklist already says the ranges are unset. Consider whether one mechanism serves both rather than two bespoke fixes.
+
+Acceptance: read the built wheel's dependency metadata; install against a deliberately mismatched engine in a clean environment and require refusal; then a matched pair must import and launch.
+
+### Verification limits
+
+Requirement parsing against the declared specifier. No wheel was built and nothing was installed from an index.
+
+## 1586. SQLite runs its startup migrations outside a transaction, so an interrupted ADD COLUMN leaves the column and skips its backfill forever
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. Startup runs the schema script, the migration and the commit with no enclosing transaction. Under the driver's default isolation, `ALTER TABLE ADD COLUMN` commits on its own, so a later failure leaves the column present and the next run's column-missing guard skips the paired backfill permanently.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** store / migrations. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site interrupted mid-upgrade would run on with unfilled account columns and no error**, and a null claim timestamp reads as "never claimed" to the account logic.
+
+### Measured, with the fix as its own control
+
+`db.in_transaction` was `False` after the unprotected ADD and `True` under an explicit transaction. Faulting after each ADD and rerunning left both columns null; the same fault under an explicit transaction restored both values. So the remedy is demonstrated, not just proposed.
+
+### SQLite is the odd one out, which is the strongest argument for the fix
+
+Both server backends already wrap their schema work in a transaction and roll back a partial batch. This is a per-backend inconsistency rather than a design position.
+
+### Reachability, stated honestly
+
+Fresh databases already carry these columns and never take this path. Whether any database in existence would run this particular migration is unestablished. The durable value is the **shape**: a schema change paired with a guarded backfill, outside a transaction, is a reusable hazard and the next such migration inherits it.
+
+Acceptance: interrupt after each column addition, reopen twice, and require the values to match a clean migration. A failed startup must not leave an owned connection behind.
+
+### Verification limits
+
+Real migration methods against an in-memory database with injected faults. Fault injection models an interruption; it is not a disk-crash test.
+
+## 1587. a backup that failed verification keeps its canonical filename and consumes a retention slot, displacing an older good copy
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **6/10** · Difficulty **3/10** · _no research_. A verification failure leaves the bad archive under its normal name. Pruning counts files by name and keeps the newest N without consulting verification results. With `keep=2`, a good archive, then a failed one, then a good one deleted the first.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** disaster recovery / retention. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site would retain fewer usable recovery points than it configured**, and repeated verification failures would displace every older good backup in turn. The count looks right; the contents do not.
+
+### The fix is a naming split, not a deletion
+
+Failed archives have diagnostic value and deleting them to tidy the count would hide the failure. Publish the canonical name only after verification passes, and keep incomplete and failed output under an excluded name. Check whether an in-progress suffix convention already exists to reuse rather than inventing one.
+
+Define what qualifies when verification is explicitly disabled, since "good" has no meaning there without a decision.
+
+### The test that should have caught it asserts the opposite of its name
+
+The existing test named for excluding failed backups creates only good ones, so it has never exercised the sequence. A regression test must inject a real verification failure between two good backups.
+
+Acceptance: good, failed, good with `keep=2`; repeated failures; an interrupted write. Both usable recovery points must survive, and failed diagnostic files must never occupy a good-backup slot.
+
+### Verification limits
+
+The real pruning method against fake paths whose removal set an in-memory flag. No file was deleted and no real backup or restore ran.
+
+## 1588. SQL Server state keys inherit database collation, so a case-insensitive server can merge two keys the Python cache holds apart
+
+> 🔢 **Filed 2026-09-11 -- not started, and its decisive experiment has not been run.** Value **5/10** · Difficulty **5/10** · _research_. The state table's namespace and key columns inherit the database collation and the merge statement compares them with a bare equality. On a case-insensitive collation two spellings can match one row while the process cache keys them exactly. The update keeps the stored spelling, and encryption binds the value to the incoming key, so a reload binds to a different key than the write did.
+> Verdict: research
+> Research: needed
+> Closing-act: code
+
+**Cluster:** store / SQL Server state. **Priority:** P2. **Verdict:** research.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **a deploying site on a case-insensitive SQL Server could write transform state under one spelling and be unable to decrypt it on reload.**
+
+### What is measured and what is not, kept apart deliberately
+
+**Measured:** the Python half. Fed a row modelling the post-merge state, the real cache-publishing and reload methods produced two live spellings before reload, a single surviving value after an unencrypted reload, and a cipher error under key-bound encryption. The matching-key control loaded cleanly.
+
+**Not measured:** the merge itself. No SQL Server ran and none can here. That the database collapses two keys is an inference from the statement text plus documented collation semantics.
+
+**The one decisive experiment** is to run that merge against a disposable case-insensitive database and observe whether two spellings become one row. Until then this item is research, and it should not be built from the Python half alone.
+
+### What closing looks like
+
+Make persisted key identity, database uniqueness, cache identity and the encryption binding agree, with explicit comparison rather than the database default. Do not assume a collation change recovers values already overwritten -- detect and report inconsistent rows instead of claiming automatic repair.
+
+Acceptance: after the experiment, case-distinct namespaces and keys with encryption enabled, through reload and convergence, including whitespace and Unicode equality cases.
+
+### Verification limits
+
+Real cipher and real cache methods over a simulated row. SQLite and PostgreSQL were not shown to share this, and their comparison semantics differ, so do not generalise the fix across backends without checking each.
+
+## 1589. the FHIR resolver accepts dot-only identifiers, so Patient/. and Patient/.. reach URL construction unrejected
+
+> 🔢 **Filed 2026-09-11 -- not started, and the question it turns on is open.** Value **3/10** · Difficulty **2/10** · _research_. The resolver accepts `.` and `..` as resource identifiers and builds a path from them. Whether that changes the addressed resource after URL normalisation was not established.
+> Verdict: research
+> Research: needed
+> Closing-act: code
+
+**Cluster:** transports / FHIR. **Priority:** P3. **Verdict:** research.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional and **unestablished**: no destination-access bypass was demonstrated. A dot segment that normalises away is harmless; one that walks up a path before the allowlist runs would not be. The difference is the whole item.
+
+### The question to settle first
+
+Does a dot-only identifier change the final addressed URL after client-side normalisation, and does the host and path allowlist run before or after that normalisation? Answer that before proposing anything, because the fix is trivial either way and the severity is not.
+
+### What closing looks like
+
+Reject dot-only identifiers at the resolver if they can change the target, and reject them anyway as a cheap input-validation improvement if they cannot -- a resource identifier that is only dots is never legitimate. Say which reason applies, so the item records what was learned rather than only what was changed.
+
+Acceptance: dot-only and dot-containing identifiers through URL construction and the allowlist, asserting the final target.
+
+### Verification limits
+
+Source reading only. No FHIR server was contacted and no request was made.
+
+## 1590. the web console upload route omits the fresh step-up its API twin requires, and no record says which policy is intended
+
+> 🔢 **Filed 2026-09-11 -- not started, and this needs a policy decision before a build.** Value **4/10** · Difficulty **3/10** · _research_. The web console upload route uses an ordinary permission check where the corresponding API route requires a fresh step-up. The divergence appears deliberate, but nothing records the intent.
+> Verdict: research
+> Research: needed
+> Closing-act: code
+
+**Cluster:** authn / web console parity. **Priority:** P3. **Verdict:** research.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional and narrow: **the browser path would accept an upload that the JSON path would challenge.** No exploit was demonstrated and both paths still require the permission.
+
+### Why this is research rather than a build
+
+If fresh proof is required, the upload content has to survive the challenge flow, which is real design work rather than adding a dependency. If it is not required, the right outcome is a written rationale beside the route, so the next reader does not re-raise it. Either way the missing artifact is the decision, not the code.
+
+An adjacent closed item covers the identical shape on a different route, which suggests the pattern has been considered before and is worth reading before deciding.
+
+Acceptance: once the policy is settled, assert the intended behaviour on both routes, and check whether any other console route diverges from its API twin on step-up.
+
+### Verification limits
+
+Both routes were read. No upload was performed.
+
+## 1591. logging_guard emits recovery notices directly, so a stream error keeps its text and any embedded newline out of the scrubbers
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **4/10** · Difficulty **3/10** · _no research_. The logging guard writes its recovery notices directly rather than through the filter chain. A synthetic stream error containing a secret and a newline preserved both in the emitted notice.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** logging / diagnostics. **Priority:** P3. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional and bounded: **a notice would carry operating-system error text unscrubbed, and an embedded newline could forge a log line.** The text originates in local filesystem or socket errors rather than message content, so this is a defence-in-depth gap rather than a path an outsider drives -- and that limit should stay on the item rather than being quietly dropped.
+
+### The recursion problem is the reason it bypasses the filters
+
+A notice exists because logging failed. Routing it through the filter chain risks the filter itself raising, which is how a logging failure becomes a crash. So the fix cannot simply reuse the chain: it needs scrubbing that cannot recurse -- a small, allocation-light, exception-free transform applied inline.
+
+Newline neutralisation is separate from secret scrubbing and cheaper; do it regardless.
+
+Acceptance: a notice carrying a synthetic secret and an embedded newline must emit neither. Force the scrubber itself to raise and require the notice still to be emitted rather than lost.
+
+### Verification limits
+
+Synthetic error objects through the real notice path. Whether any real error source carries attacker-influenced text is unestablished, and the item says so.
+
+## 1592. the setup and packaging documents state a default-off web console and a resolver compatibility range that the code does not have
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **2/10** · _no research_. Two documents say the web console defaults off; the shipped settings default it on, verified by importing the models and printing the values. Two more claim a dependency compatibility range; the console's metadata declares a bare dependency and startup checks an interface identifier instead. The console's own release checklist already says the ranges are unset, so the corpus contradicts itself.
+> Verdict: build
+> Research: none
+> Closing-act: doc
+
+**Cluster:** documentation / setup. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an adopter would expect a JSON-only engine and get an operator console at `/ui`, and would expect resolution to refuse a mismatched pair when nothing does.**
+
+### Two lines are worse than a wrong default, and they are the reason this is P2
+
+A release checklist and a package document both instruct the reader to verify that the engine **refuses** a bare start when the console package is absent. The default posture no longer does that: it warns and continues with exit 0. Only an **explicit** enable refuses. A releaser running that step sees success and cannot tell it from the check passing. That is a compensating step resting on a false premise, which is the shape the standards forbid.
+
+### What closing looks like
+
+State the current setting name, its default, and the three distinct behaviours: default-on with the package present, default-on with it absent (warn and continue), explicit-on with it absent (refuse). Describe independent versioning and the interface handshake honestly, and say plainly that dependency metadata does not enforce a range. Fix the checklist steps in the same change.
+
+Acceptance: every documented value and example cross-checked against the parsed defaults and the startup branches.
+
+### Verification limits
+
+Defaults were imported and printed rather than read off the source, and the three startup behaviours were exercised through existing tests. No packaging index was queried.
+
+## 1593. the operations and architecture documents deny built SFTP timeouts and Vault key-provider support and misstate CLI and TOML contracts
+
+> 🔢 **Filed 2026-09-11 -- not started.** Value **5/10** · Difficulty **3/10** · _no research_. Four separate claims contradict the code: connection guidance says SFTP operations are unbounded where banner, authentication and channel timeouts exist; service and configuration guidance calls native Vault key-provider support absent where a Transit provider ships; the configuration guide says unknown CLI flags are ignored where the parser exits 2; and it says connection configuration is always Python where the loader reads an optional TOML file.
+> Verdict: build
+> Research: none
+> Closing-act: doc
+
+**Cluster:** documentation / operations. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0 -- zero deployments). Conditional: **an operator would configure against contracts the engine does not have** -- expecting an unbounded transfer to be bounded, or a built key provider to be unavailable.
+
+### Three traps a careless correction walks into
+
+**Do not merge key provider with cipher provider.** They are different layers and the corrected text must keep them apart; conflating them would be a worse error than the current omission.
+
+**Do not imply a channel element.** Connection **transport config** may be data; routing and handling **logic** stays code-first Python, and the TOML entries desugar through the same factories into a flat endpoint list. A newcomer must not be able to read the corrected sentence as "a TOML entry defines a channel".
+
+**Do not state one rule for three surfaces.** An unknown CLI flag, an unknown environment variable and an unknown TOML key very plausibly behave differently. Check each and say each, rather than generalising from the one that was measured.
+
+### A separate correction in the same family
+
+The architecture page lists redaction, MLLP TLS and retention as unbuilt. They are built. Say so **with their activation conditions**, and do not let "built" read as "always on" or "sound" -- two findings in this same wave are defects inside the redaction path, so a correction that implies redaction is complete would be false in a more damaging direction than the current text.
+
+Acceptance: trace each corrected statement to a current setting, call site or factory. State a load-bearing fact once and link to it rather than repeating it across pages.
+
+### Verification limits
+
+Documents and code were read and the CLI parser was exercised. No SFTP peer, no Vault instance and no live transfer.
