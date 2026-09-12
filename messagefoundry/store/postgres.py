@@ -564,6 +564,12 @@ _SCHEMA: list[str] = [
         last_totp_step       INTEGER,
         oidc_issuer          TEXT,
         oidc_subject         TEXT,
+        -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID).
+        -- An AD login resolves this row by it, because sAMAccountName is recyclable. NULL = no
+        -- directory binding, and such a row is never adopted by a login that presents an id.
+        -- Unconstrained on purpose: the resolver never writes a second row for an id it has seen,
+        -- and UNIQUE(username) is what refuses a racing double-create.
+        directory_object_id  TEXT,
         password_claimed_at  DOUBLE PRECISION
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
@@ -1154,6 +1160,12 @@ class PostgresStore:
             ("last_totp_step", "INTEGER"),
             ("oidc_issuer", "TEXT"),
             ("oidc_subject", "TEXT"),
+            # Directory-immutable identity binding (BACKLOG #1471): NULL on existing rows = "no
+            # directory binding". NOT byte-identical to before, deliberately — an AD login presenting
+            # an objectGUID refuses such a row rather than adopting it by name, which is the recycle
+            # window the item exists to close. No backfill exists: nothing has ever held the
+            # directory's identifier.
+            ("directory_object_id", "TEXT"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -6402,14 +6414,15 @@ class PostgresStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        directory_object_id: str | None = None,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL)",
+            " must_change_password, failed_attempts, locked_until, directory_object_id)"
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)",
             user_id,
             username,
             auth_provider,
@@ -6420,6 +6433,7 @@ class PostgresStore:
             password_hash,
             now if password_hash is not None else None,
             must_change_password,
+            directory_object_id,
         )
 
     async def get_user(self, user_id: str) -> UserRecord | None:
@@ -6428,6 +6442,12 @@ class PostgresStore:
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE username=$1", username)
+        return UserRecord.from_mapping(dict(d)) if d else None
+
+    async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
+        # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
+        # rather than the recyclable sAMAccountName. A lookup, not a scan: it is on the sign-in path.
+        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=$1", object_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:

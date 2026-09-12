@@ -18,6 +18,7 @@ import textwrap
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -504,6 +505,7 @@ def test_build_coordinator_threads_store_schema_into_lock_key() -> None:
     assert isinstance(coord, DbCoordinator)
     assert coord.node_id == "host:1:abcd1234"  # reuses store._owner
     assert coord._lock_key == "tenant_a:mefor_cluster_nodes"  # store schema threaded through
+    assert coord.lease_key() == "tenant_a:mefor_cluster_leader"  # ...into the lease key too
 
 
 def test_build_coordinator_threads_leader_preference_knobs() -> None:
@@ -1161,54 +1163,40 @@ async def test_state_convergence_runner_isolates_errors() -> None:
 # --- build_coordinator backend dispatch (no DB; stub stores) ----------------
 
 
+def _dispatch_store(backend: str, db_schema: str | None = None) -> SimpleNamespace:
+    """A stub store build_coordinator dispatches on ``backend``, carrying ``db_schema``."""
+    settings = SimpleNamespace(backend=SimpleNamespace(value=backend), db_schema=db_schema)
+    return SimpleNamespace(_pool=object(), _owner="host:1:abcd", _settings=settings)
+
+
 def test_build_coordinator_dispatches_sqlserver_to_its_own_coordinator() -> None:
     # A SQL Server store ALSO exposes a `_pool` (aioodbc), but DbCoordinator drives asyncpg — so it must
     # be dispatched to SqlServerCoordinator, not the (crashing) DbCoordinator path. Stub store; no DB.
-    from messagefoundry.pipeline.cluster import build_coordinator
     from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
-    class _Backend:
-        value = "sqlserver"
-
-    class _Settings:
-        backend = _Backend()
-        db_schema = None
-
-    class _Store:
-        _pool = object()
-        _owner = "host:1:abcd"
-        _settings = _Settings()
-
-    class _Cluster:
-        enabled = True
-        node_id = None
-
-    coord = build_coordinator(_Store(), _Cluster())
+    coord = build_coordinator(_dispatch_store("sqlserver"), ClusterSettings(enabled=True))
     assert isinstance(coord, SqlServerCoordinator)
     assert coord.node_id == "host:1:abcd"  # reuses store._owner as the node id
 
 
 def test_build_coordinator_postgres_still_gets_dbcoordinator() -> None:
     # Dispatch must NOT regress the Postgres path: a non-sqlserver store with a pool still gets DbCoordinator.
-    from messagefoundry.pipeline.cluster import DbCoordinator, build_coordinator
+    coord = build_coordinator(_dispatch_store("postgres"), ClusterSettings(enabled=True))
+    assert isinstance(coord, DbCoordinator)
 
-    class _Backend:
-        value = "postgres"
 
-    class _Settings:
-        backend = _Backend()
-        db_schema = None
+def test_sqlserver_lease_identity_ignores_db_schema() -> None:
+    # Installs differing only in db_schema share every SQL Server table, so they must share one lease
+    # and one DDL lock. The reasoning: StoreSettings._db_schema_backend.
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
-    class _Store:
-        _pool = object()
-        _owner = "host:2:beef"
-        _settings = _Settings()
-
-    class _Cluster:
-        enabled = True
-        node_id = None
-
-    assert isinstance(build_coordinator(_Store(), _Cluster()), DbCoordinator)
+    coords = [
+        build_coordinator(_dispatch_store("sqlserver", schema), ClusterSettings(enabled=True))
+        for schema in (None, "tenant_a", "tenant_b")
+    ]
+    assert all(isinstance(c, SqlServerCoordinator) for c in coords)
+    assert {c.lease_key() for c in coords} == {"mefor_cluster_leader"}
+    assert {c._lock_key for c in coords} == {"mefor_cluster_nodes"}
 
 
 # --- ADR 0096: SqlServerCoordinator leader preference (DB-free unit) ---------
@@ -1219,12 +1207,7 @@ async def test_sqlserver_non_promotable_claim_touches_no_db() -> None:
     # not-held BEFORE issuing any store query (the DbCoordinator path is proven in test_cluster_lease).
     from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
-    class _Settings:
-        db_schema = None
-
     class _Store:
-        _settings = _Settings()
-
         async def _fetchone(self, *a: object, **k: object) -> object:
             raise AssertionError("non-promotable node must not query the store to claim")
 
@@ -1242,13 +1225,7 @@ async def test_sqlserver_non_promotable_claim_touches_no_db() -> None:
 def test_sqlserver_coordinator_stores_leader_preference_knobs() -> None:
     from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
-    class _Settings:
-        db_schema = None
-
-    class _Store:
-        _settings = _Settings()
-
-    coord = SqlServerCoordinator(_Store(), "N", acquire_delay_seconds=5.0, promotable=False)
+    coord = SqlServerCoordinator(object(), "N", acquire_delay_seconds=5.0, promotable=False)
     assert coord._acquire_delay == 5.0 and coord._promotable is False
 
 
@@ -1271,12 +1248,7 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
     # (The DbCoordinator half is proven against the fake lease pool in tests/test_cluster_lease.py.)
     from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
-    class _Settings:
-        db_schema = None
-
     class _Store:
-        _settings = _Settings()
-
         def __init__(self) -> None:
             self.executed: list[str] = []
 
