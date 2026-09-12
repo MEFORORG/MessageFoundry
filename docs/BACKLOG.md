@@ -30676,7 +30676,7 @@ The blast radius is also not one row: one ruling reached three artifacts, and **
 
 1. A dated **resolution marker** an owner ruling can leave, that a row's deferral can be checked against. The shape matters more than the mechanism: it has to be written where a gate can read it, which conversation is not.
 2. A screen reporting any open row whose `Verdict` defers to a condition, with the age of the deferral. That set is small and it is currently unenumerable.
-3. Decide whether `Verdict: owner-ruling` rows -- **33 open today** -- are the same population or a different one.
+3. Decide whether `Verdict: owner-ruling` rows -- ~~**33 open today**~~ **8 open today** -- are the same population or a different one. *(Count corrected 2026-09-10 while building this item: 33 is the open `Closing-act: owner-ruling` count, a different field on an adjacent banner line. Measured at `817db9651` with `parse_items`, raw grep agreeing: `Verdict: owner-ruling` is 9 rows, 8 open; `Closing-act: owner-ruling` is 35 rows, 33 open. **Answered: they are different populations** -- the screen reads the `Verdict` field and the prose Verdict statement, and deliberately not `Closing-act`, which says who CLOSES the row rather than that the row is waiting.)*
 
 **Do not build "remind people to update rows".** The defect is that deciding leaves no mark; a fix that depends on someone remembering re-creates it.
 
