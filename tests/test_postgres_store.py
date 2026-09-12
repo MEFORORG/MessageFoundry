@@ -817,6 +817,107 @@ async def test_totp_store_contract(store) -> None:
     await _assert_totp_contract(store)
 
 
+async def test_directory_identity_store_contract(store) -> None:
+    """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real Postgres backend.
+
+    The method shipped on all three backends with no backend-level test on any of them, and it is
+    the read the whole sAMAccountName-recycle defence resolves through. The shared body is the same
+    one the SQLite and SQL Server suites run, so a Postgres-only drift fails here rather than
+    passing three separately-worded tests.
+
+    What this leg executes that no other does: the ``$1`` placeholder binding around the lookup.
+    Postgres is the only backend of the three using numbered parameters, and a renumbered
+    placeholder is exactly the class of regression that reads correct in the SQL text.
+    """
+    from tests._directory_identity_store_contract import _assert_directory_identity_contract
+
+    await _assert_directory_identity_contract(store)
+
+
+async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
+    """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
+
+    ``=`` on TEXT under any DETERMINISTIC collation is byte equality, and the column declares none
+    of its own, so this holds regardless of the server's ``LC_COLLATE``. SQLite agrees. **SQL Server
+    does not**: it delegates to the database collation and a ``_CI_`` default would match, which is
+    a genuine cross-backend divergence -- pinned in that suite, recorded at ``store/sqlserver.py``.
+    """
+    from tests._directory_identity_store_contract import (
+        _assert_directory_id_compare_is_byte_exact,
+    )
+
+    await _assert_directory_id_compare_is_byte_exact(store)
+
+
+async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
+    """The layer under the lookup, on the real Postgres backend.
+
+    ``directory_object_id`` carries no uniqueness constraint here, unlike ``(oidc_issuer,
+    oidc_subject)`` which this schema backs with a PARTIAL ``ux_users_federated_subject``. The
+    reason the asymmetry is safe is ``UNIQUE(username)``, stated in the schema comment and asserted
+    nowhere. Both halves are pinned so a unique index added to one backend's schema and not the
+    other two cannot split the three stores quietly.
+    """
+    from tests._directory_identity_store_contract import (
+        _assert_the_binding_column_is_unconstrained_and_username_is_not,
+    )
+
+    await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
+
+
+async def _users_columns(store) -> set[str]:
+    async with store._pool.acquire() as conn:
+        return {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+            )
+        }
+
+
+async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
+    """The guarded ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471 database.
+
+    Driven against a table that really lacks the column: the fixture's table has it from CREATE
+    TABLE, so without dropping it first the ALTER branch is unexercised and deleting the migration
+    would still pass. The marker row goes too -- with it current, ADR 0064's fast-path skips the
+    whole batch and this would assert nothing.
+
+    The ADD carries NO backfill, deliberately. Nothing in the store has ever held the directory's
+    identifier, so the only value on that schema to seed from is the recyclable username, and
+    adopting a row on the strength of a name is the window the item closes.
+    """
+    from tests._directory_identity_store_contract import BOUND_GUID
+
+    async with store._pool.acquire() as conn:
+        await conn.execute("ALTER TABLE users DROP COLUMN directory_object_id")
+        await conn.execute("DELETE FROM schema_meta")
+    assert "directory_object_id" not in await _users_columns(store)  # positive control
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert "directory_object_id" in await _users_columns(store)
+
+    # The restored column is a working binding column, not just a name in the catalogue.
+    await store.create_user(
+        user_id="dir-upgrade",
+        username="upgraded",
+        auth_provider="ad",
+        directory_object_id=BOUND_GUID,
+        now=1.0,
+    )
+    found = await store.get_user_by_directory_object_id(BOUND_GUID)
+    assert found is not None and found.id == "dir-upgrade"
+
+    # Second full run against an already-migrated table: the information_schema guard must skip the
+    # ADD rather than raise "column already exists", and must not disturb the bound row.
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM schema_meta")
+    assert await store._ensure_schema() is True
+    assert "directory_object_id" in await _users_columns(store)
+    again = await store.get_user_by_directory_object_id(BOUND_GUID)
+    assert again is not None and again.id == "dir-upgrade"
+
+
 async def test_mark_session_reauthed_reanchors_client(store) -> None:
     """WP-L3-13: mark_session_reauthed(client=) re-anchors the session's client address via COALESCE;
     a None client leaves it unchanged while still refreshing reauth_at. Exercises the new COALESCE

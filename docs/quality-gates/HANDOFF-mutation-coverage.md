@@ -232,7 +232,9 @@ Add the cron to the workflow's `on:` block, then the job:
 2. If available, run `actionlint .github/workflows/quality-advisory.yml` (catches YAML/expression breaks that
    zizmor misses).
 3. Commit — **avoid the literal word "checkout" in the commit message / PR body** (worktree-gate rule 3), and
-   **omit the `Co-Authored-By` trailer** (the CLA bot fails on it).
+   **omit the `Co-Authored-By` trailer** — a standing owner preference, and the project turns it
+   off at source via `attribution` in `.claude/settings.json`. If one appears in a message you are
+   about to commit, your session is reading a stale or user-scope setting; remove it by hand.
 4. Push → open/append the PR → confirm on **the PR's own run** that the job runs (the jobs are non-required,
    so a red one blocks nothing). Iterate on failures — that's the CI-verify loop.
 
