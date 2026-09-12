@@ -300,7 +300,28 @@ is not thereby retired; this section binds on seats and rules, not on the machin
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a diff it has not read. Arm auto-merge. |
+| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+
+**The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
+Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
+the fix is re-placing an existing, already-reviewed row at a vacant numeric slot. Forbidden the
+moment code is touched or a choice about what an item *says* is required -- those go back to the
+authoring session, because a peer writing to another session's branch is how two sessions silently
+collide.
+
+**The filename is necessary and not sufficient.** Two sessions editing one item's *body* also
+conflict in `docs/BACKLOG.md` and that is a CONTENT conflict. The discriminator is whether the
+resolution decides *where a row sits* or *what it says*.
+
+*Why the line sits there.* The standing objection is separation of duties: the Lander's value is
+being a second reader, and authoring plus landing the same change means nobody checked it. That
+holds for content and not for position -- re-placing a reviewed row creates nothing new, and it is
+verifiable without judgement: `merge-tree` exit 0 paired with a self-merge control (0) and the PR's
+own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledger gate green, the
+`parse_items` count up by exactly the expected number, and both items present and whole.
+*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one shape, and
+#1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
+new session to it.
 
 **NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds nothing. The owner starts each
 Manager, in a desktop instance, and a Manager's workers are subagents in its own process.** That is
@@ -494,6 +515,12 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   with clear messages. Direct pushes to `main` stay blocked by the harness.
 - Commits at logical stops are Claude's own judgment. Commit coherent, tested, one-layer changes and
   narrate each. Respect the ledger gate: never `--no-verify`, never a rename workaround.
+- **Omit the `Co-Authored-By` trailer and the PR-body byline.** Standing owner preference, restated
+  2026-09-11. The project turns both off at source with `attribution` in
+  [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
+  Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
+  message you are about to commit, your session is reading a stale or user-scope setting, so remove
+  it by hand.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
   measurement rather than a contract. Write the message to a uniquely-named file **inside your own
@@ -859,6 +886,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
+  (section 5). The project turns them off at source in `.claude/settings.json`.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
   `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.
