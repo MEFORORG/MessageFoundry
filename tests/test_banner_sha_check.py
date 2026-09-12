@@ -155,3 +155,105 @@ def test_the_clean_run_still_states_its_coverage(repo: Path, tmp_path: Path, cap
     assert rc == 0
     assert "examined 1 closing-claim sha" in out
     assert "1 name their own item" in out
+
+
+def test_advisory_downgrades_a_finding_and_never_the_empty_population_refusal(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #1525. `--advisory` is what lets this run in a job that must not gate a merge.
+
+    BOTH HALVES, because the second is the one that matters: a flag that also swallowed the
+    no-ledger-to-read refusal would install a step incapable of failing for the reason it exists,
+    and the run that read nothing would render exactly like the run that found nothing.
+    """
+    sha = _commit(repo, "fix(x): something (BACKLOG #999) (#42)", "a.txt")
+    led = _ledger(tmp_path, f"## 123. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    mod = _load()
+    assert mod.main([str(led), "--repo", str(repo)]) == 1
+    assert mod.main([str(led), "--repo", str(repo), "--advisory"]) == 0
+    absent = str(tmp_path / "no-such-ledger.md")
+    assert mod.main([absent, "--repo", str(repo)]) == 2
+    assert mod.main([absent, "--repo", str(repo), "--advisory"]) == 2
+
+
+# ------------------------------------------------------------------------------------------------
+# The house multi-item form (BACKLOG #1347, limb A). Paired like everything above: the widening has
+# to make a SIBLING agree, and it must not start reading a squash suffix as an item.
+# ------------------------------------------------------------------------------------------------
+
+#: The commit that misled two seats into holding three claims for landed work. Named in #1347 as its
+#: control, and kept verbatim here so the fixture is the measured case rather than a stand-in.
+HOUSE_SUBJECT = "feat(x): four things at once (BACKLOG #1319, #1322, #1323, #1331) (#547)"
+
+
+def test_a_banner_citing_a_SIBLING_of_a_multi_item_commit_agrees(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST NOT FIRE. #1323 is the third number in the parenthetical, and the prefix appears once.
+
+    Before the widening this reported a disagreement against #1319 -- the failure direction #1347
+    calls the expensive one, because a correct banner on landed work reads as citing another item.
+    """
+    sha = _commit(repo, HOUSE_SUBJECT, "a.txt")
+    led = _ledger(tmp_path, f"## 1323. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    report = _load().scan([led], repo)
+    assert report.findings == [], report
+    assert report.agreed == 1
+
+
+def test_the_squash_suffix_of_a_multi_item_commit_is_not_read_as_an_item(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST FIRE, and on the right number. `(#547)` is the pull request a squash-merge appended.
+
+    This is the twin of the arm above and the reason the scope is the parenthetical rather than
+    "every #N after the token": that rule calls 641 subjects multi-item against a true 38 of 1070,
+    and it would report item #547 as closed by a commit that says nothing about it.
+    """
+    sha = _commit(repo, HOUSE_SUBJECT, "a.txt")
+    led = _ledger(tmp_path, f"## 547. an item\n\n> {CLOSED} **SHIPPED in `{sha}`.**\n\nprose\n")
+    report = _load().scan([led], repo)
+    assert len(report.findings) == 1, report
+    assert "547" not in report.findings[0].names
+    assert report.findings[0].names == ["1319", "1322", "1323", "1331"]
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("fix(x): one thing (BACKLOG #1040) (#547)", ["1040"]),
+        (HOUSE_SUBJECT, ["1319", "1322", "1323", "1331"]),
+        ("docs(backlog): two records (BACKLOG #1136, #1474) (#958)", ["1136", "1474"]),
+        ("fix(x): a thing (BACKLOG #1171, ASVS 11.4.1) (#123)", ["1171"]),
+        ("fix(x): something (#999)", []),
+        ("feat(console): step-up UX (WP-L3-16, ASVS 7.5.3) (#319)", []),
+        ("chore: bare token BACKLOG #71, #72 with no parenthetical", ["71", "72"]),
+        ("backlog: close #1307 and #1320 -- both writers landed (#581)", ["1307", "1320"]),
+        # The two subjects where the existing copies of this rule OVER-REACH and this one does not.
+        ("fix: see #547 and (BACKLOG #1040)", ["1040"]),
+        ("(BACKLOG #1040) #547", ["1040"]),
+    ],
+)
+def test_the_citation_extractor_matches_the_two_rules_already_in_the_repo(
+    subject: str, expected: list[str]
+) -> None:
+    """The extractor's contract, stated as the cases the two existing copies of this rule were
+    written against -- scripts/coord/claim-adjudicate.ps1 and .github/workflows/backlog-hygiene.yml.
+
+    The `docs(backlog):` row is not filler: `backlog` appears there in a conventional-commit scope
+    with `re.I` in play, so a rule that did not stop at the parenthesis would start its run on the
+    wrong token.
+
+    THE `backlog:` ROW PINS A DECISION RATHER THAN AN ACCIDENT. That conventional-commit TYPE opens a
+    governing run, so those numbers are read as items -- which is why the real-ledger finding count
+    moved 32 to 37 rather than down. Both existing copies of this rule behave the same way. Recorded
+    here so a later reader meets it as a pinned property instead of rediscovering it as a surprise.
+
+    THE LAST TWO ROWS ARE WHERE THE THREE IMPLEMENTATIONS DISAGREE, executed rather than assumed.
+    `fix: see #547 and (BACKLOG #1040)` returns both numbers under backlog-hygiene.yml's pipeline,
+    whose chunk runs from the line start to the `)`; and `(BACKLOG #1040) #547` answers TRUE for 547
+    under claim-adjudicate.ps1, whose `[^(]*?` crosses the `)`. This function refuses both, because
+    stopping at the nearest parenthesis on EITHER side is the only one of the three boundaries that
+    keeps narrowing 3's promise. Pinning them here is what stops a later "harmonisation" quietly
+    adopting one of the looser forms."""
+    assert _load().cited_items(subject) == expected

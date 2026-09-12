@@ -47,6 +47,13 @@ squash-merge APPENDS the PR number in exactly that form. Measured on real closin
 A bare-``#N`` needle therefore cannot tell "this commit closed item 1106" from "this commit was merged
 by PR 1106", and it would manufacture agreement as readily as disagreement.
 
+A BARE ``#N`` THE ``BACKLOG`` TOKEN GOVERNS IS A DIFFERENT CASE, AND IT WAS BEING MISSED (BACKLOG
+#1347). The house form writes the prefix once and the siblings bare, so a four-item commit cites four
+items and the first reading of this check saw one. A sibling's correct closing banner then read as
+citing a different item -- a false alarm on work that landed months ago, which is the direction this
+file says is WRONG rather than merely noisy. :func:`cited_items` carries the fix and the measurement;
+the governing scope is the parenthetical, which is what keeps the squash suffix out.
+
 THE THIRD BUCKET IS THE ONE THAT MAKES THIS SHIPPABLE
 ------------------------------------------------------
 Three outcomes, not two, and the middle one is the whole design:
@@ -122,8 +129,84 @@ _SHA = re.compile(r"`([0-9a-f]{7,40})`")
 #: A line offering this item's own closing evidence, as opposed to mentioning a commit in passing.
 _CLOSING_CLAIM = re.compile(r"\b(SHIPPED|DONE|CLOSED|RETIRED|LANDED|FIXED|MERGED)\b", re.I)
 
-#: The ONLY unambiguous item citation in a commit subject. A bare `#N` is a PR as often as an item.
-_ITEM_CITATION = re.compile(r"BACKLOG\s+#(\d+)", re.I)
+#: A `BACKLOG` token and everything up to the nearest parenthesis on either side. The item numbers
+#: this check will read live inside that run and nowhere else.
+_BACKLOG_RUN = re.compile(r"\bBACKLOG\b[^()]*", re.I)
+
+#: A `#N` token, read ONLY out of a run above -- never out of a whole subject.
+_HASH_N = re.compile(r"#(\d+)")
+
+
+def cited_items(subject: str) -> list[str]:
+    """Every BACKLOG item number a commit subject cites, in order, without duplicates.
+
+    THE HOUSE FORM WRITES THE PREFIX ONCE AND THE SIBLINGS BARE (BACKLOG #1347):
+    ``(BACKLOG #1319, #1322, #1323, #1331)`` declares FOUR items. Taking only the number directly
+    after the token returned 1319 alone, so a sibling's correct closing banner read as citing a
+    different item -- a visible false alarm on work that landed months ago.
+
+    THE SCOPING IDEA IS TAKEN FROM THE TWO COPIES ALREADY HERE; THE BOUNDARY IS TIGHTER THAN EITHER,
+    AND SAYING SO IS THE POINT. Both carry the measurement and the reasoning:
+    scripts/coord/claim-adjudicate.ps1 (``Get-Citations``) and .github/workflows/backlog-hygiene.yml
+    (the ``items=`` pipeline, which splits on ``)`` to get its scope without a regex). An unscoped
+    "every ``#N`` after the token" rule inflates by about 17x -- 641 subjects called multi-item
+    against 38 of 1070 -- because a squash-merge APPENDS the pull-request number as a trailing group,
+    and ``(BACKLOG #1040) (#547)`` is one item and one pull request.
+
+    **THE THREE DO NOT AGREE EVERYWHERE, AND CLAIMING THEY DID WOULD BE THE DEFECT #1347 IS ABOUT.**
+    Each draws the boundary differently, and both existing copies over-reach where this one does not.
+    Executed, not reasoned about::
+
+        "fix: see #547 and (BACKLOG #1040)"
+            the YAML pipeline  -> ['547', '1040']   its chunk runs from the line START to the ')'
+            this function      -> ['1040']
+
+        "(BACKLOG #1040) #547"
+            the PowerShell     -> TRUE for 547      its `[^(]*?` crosses the ')'
+            this function      -> ['1040']
+
+    Stopping at the nearest parenthesis on EITHER side is the tightest of the three and is the one
+    that holds narrowing 3's promise, so it is what this uses. Making all four implementations
+    (``scripts/hooks/claim_check.py`` is a fourth) agree is real work in three languages and is not
+    this item: the affordable shape is a shared conformance corpus of subjects plus one test per
+    language, which would have caught both rows above. Filed as a subject, not a number.
+
+    THE SCOPE IS EXPRESSED AS "UP TO THE NEAREST PARENTHESIS", which covers both shapes in one pass:
+
+        ``(BACKLOG #1040) (#547)``           -> ['1040']     the squash suffix is out of the run
+        ``(BACKLOG #1319, #1322, #1331)``    -> three items   siblings are in
+        ``... BACKLOG #1136, #1474 ...``     -> both          a bare token with no parenthetical
+        ``(BACKLOG #1171, ASVS 11.4.1)``     -> ['1171']      a comma before a non-item
+        ``fix(x): something (#999)``         -> []            no token, so nothing is decidable
+
+    Narrowing 3 in the module docstring is UNCHANGED by this: a bare ``#N`` is still only read when a
+    ``BACKLOG`` token governs it. What moved is how far that token's governance reaches.
+
+    WHAT THE WIDENING ACTUALLY DID TO THE REAL LEDGERS, measured at ``817db9651`` over 175 examined
+    shas, because the useful number is not the one the row predicted:
+
+        agreed        69 -> 76     siblings, including #1347's own control ``df8acc95``
+        undecidable   74 -> 62
+        findings      32 -> 37
+
+    **THE COUNT WENT UP, AND THAT IS THE HONEST RESULT RATHER THAN A REGRESSION.** Three findings
+    went away -- the sibling false alarms this was built for -- and eight arrived, every one of them
+    a subject that was previously UNDECIDABLE and now decides. They share a shape: ``backlog:`` used
+    as a conventional-commit TYPE, as in ``backlog: close #1091 -- ...``. The token governs the
+    numbers after it, so those subjects now name items instead of naming nothing, and a banner citing
+    one as its own closing evidence reports as the disagreement it is. Triaging them is BACKLOG
+    #1525's fourth arm, which exists for exactly this.
+
+    **THE RESIDUAL, NAMED SO THE GREEN IS NOT READ WIDER.** In a ``backlog:``-typed subject with no
+    parenthetical, a trailing PULL-REQUEST number would now read as an item -- the ambiguity
+    narrowing 3 exists to avoid, reachable again through the commit type. It is left standing because
+    both existing copies of this rule have it and #1347's whole finding is that a THIRD, silently
+    different rule is the defect. The two copies are membership tests asking about one known number,
+    so the shape rarely surfaces there; enumerating is what exposes it.
+    """
+    return list(
+        dict.fromkeys(n for run in _BACKLOG_RUN.findall(subject) for n in _HASH_N.findall(run))
+    )
 
 
 def _load_parser():  # type: ignore[no-untyped-def]
@@ -199,7 +282,7 @@ def scan(paths: list[Path], repo: Path) -> Report:
                         unresolved += 1
                         continue
                     examined += 1
-                    cited = _ITEM_CITATION.findall(subject)  # narrowing 3
+                    cited = cited_items(subject)  # narrowing 3
                     if not cited:
                         undecidable += 1
                     elif str(item.num) in cited:
@@ -217,6 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("paths", nargs="*", type=Path)
     ap.add_argument("--repo", type=Path, default=_ROOT)
+    ap.add_argument(
+        "--advisory",
+        action="store_true",
+        help="report findings without failing; a MALFUNCTION still exits 2",
+    )
     args = ap.parse_args(argv)
 
     paths = args.paths or [
@@ -254,7 +342,10 @@ def main(argv: list[str] | None = None) -> int:
             "Both corrupt two items in opposite directions."
         )
         print("")
-    return 1
+    # `--advisory` downgrades a FINDING and nothing else. The empty-population refusal above is a
+    # MALFUNCTION -- what running from the wrong directory looks like -- and still exits 2, so a scan
+    # that read nothing stays distinguishable from one that found nothing.
+    return 0 if args.advisory else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

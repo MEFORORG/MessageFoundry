@@ -271,3 +271,53 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/docs/backlog_citation_check.py --base "$BASE_SHA" --head "$HEAD_SHA"
+
+  prose-anchor:
+    # BACKLOG #1315. A bare `path:line` in the ledger asserts nothing an independent reference could
+    # check, and it does not FAIL when the code moves -- it resolves to a line that still exists and
+    # says something else. `scripts/docs/prose_anchor_check.py` refuses a citation THIS PR ADDS to
+    # docs/BACKLOG.md unless the sentence names a symbol or pins the base commit it was read against.
+    #
+    # A SEPARATE JOB, NOT A STEP IN THE JOB ABOVE, AND THE DIFFERENCE IS WHO DECIDES. That job's
+    # `name:` IS a required status-check context, so a step added there BLOCKS A MERGE from the
+    # moment it lands. This repository's own rule is that making a check RUN is a Builder's call and
+    # making one BLOCK is the owner's -- quality-advisory.yml's `verdict-divergence` job states it in
+    # those words, and BACKLOG #353 sits unbuilt on the same reasoning. So this reports as its own
+    # context, goes RED on a finding rather than hiding behind continue-on-error, and gates nothing
+    # until someone adds it to branch protection. Promotion stays available and untaken.
+    #
+    # IT IS DELIBERATELY ABSENT FROM .github/required-contexts.txt. Adding it there without adding it
+    # to the server first is exactly the lie that file exists to prevent, and the order is written
+    # down in that file: protection first, then the line, then the pinned count -- in one PR.
+    #
+    # NO `continue-on-error` AND NO `|| true`, ON PURPOSE. Its finding is actionable by the author in
+    # the diff under review -- name a symbol, or pin a commit -- which is the property that separates
+    # a check worth going red from one that has to be advisory.
+    #
+    # DIFF-SCOPED, WHICH IS WHAT MAKES IT WIRABLE AT ALL: docs/BACKLOG.md carries about 3,001 naked
+    # citations today, so a corpus-wide rule would be red for everyone on day one and get deleted --
+    # the reasoning the citation gate above already records. The existing rows are NOT retrofitted;
+    # #1315's own measurement is that they are not rotting, only unverifiable, and the fix for that
+    # is the convention holding from here on.
+    name: a new path-line citation in BACKLOG.md must be findable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # ON PULL REQUESTS ONLY. The question is "what did THIS pull request write", which has no subject
+    # in a merge group -- every `github.event.pull_request.*` field is null there. The job above
+    # keeps its merge_group trigger because it holds a required context that must report in the
+    # queue; this one holds none, so triggering it there would run it against empty shas.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Three-dot diff needs the merge base, and it cannot be computed on a shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Every path:line citation this PR adds must carry a symbol or a pinned commit
+        env:
+          # Hoisted, never interpolated into the script body (zizmor: template injection).
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/docs/prose_anchor_check.py --base "$BASE_SHA" --head "$HEAD_SHA"

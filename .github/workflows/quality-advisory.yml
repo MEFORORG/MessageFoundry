@@ -1019,3 +1019,214 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python3 scripts/quality/liveness.py verify --needs-json "$NEEDS_JSON"
+
+  # ====================================================================================================
+  # BACKLOG #1525 -- three more working detectors that ran nowhere.
+  #
+  # `dangling-citations` above fixed this for ONE tool. Three shipped into the same state and stayed
+  # there: `citation_line_check.py`, `banner_sha_check.py` and `subject_exists_screen.py` were each
+  # built, tested and closed as shipped, and a repo-wide `git grep` found each named in exactly three
+  # places -- docs/BACKLOG.md, its own test, and tests/tooling_manifest.txt. Naming a tool's TEST in
+  # ci.yml is not wiring the TOOL: every case in those tests drives a fixture, which is the shape that
+  # cannot hold the defect (SDS-3.8).
+  #
+  # THE SAME FOUR THINGS KEEP ALL THREE ADVISORY, stated once here rather than three times below:
+  #   1. this workflow holds no required context and must never be promoted
+  #      (.github/required-contexts.txt records that, and tests/test_quality_advisory_invariants.py
+  #      pins it);
+  #   2. each tool's finding-shaped exit is downgraded to 0 -- by `--advisory` where the tool has one,
+  #      and see the subject-exists job for the one that deliberately does not;
+  #   3. `continue-on-error: true`, so even a tool's empty-population REFUSAL cannot fail the job;
+  #   4. none of them is in `liveness`'s `needs`, so none can redden the one job built to go red.
+  # tests/test_ledger_detector_advisory.py pins 2, 3 and 4 per job.
+  #
+  # OFF PULL REQUESTS, ON THE NIGHTLY CRON AND ON DISPATCH, for the slot-pressure reasoning the
+  # `clone` job states and the `dangling-citations` job reuses. What these three produce is a TRIAGE
+  # REPORT over the whole ledger corpus, not a verdict on one diff, and a day's latency on a report
+  # costs nothing. Three more runners on every pull request would not.
+  #
+  # THE CHECKOUT DEPTH IS LOAD-BEARING ON TWO OF THE THREE, and getting it wrong is the exact
+  # dead-gate shape the `liveness` job above was built for -- its comment records three instances,
+  # one of them a shallow fetch that destroyed diff-cover's merge base while the empty report read as
+  # clean. `banner_sha_check.py` resolves each cited sha with `git log -1`, and
+  # `subject_exists_screen.py` probes `origin/main`; the default shallow checkout fetches ONE ref, so
+  # both would answer "unresolvable" for everything and print a reassuring summary. Both therefore
+  # take `fetch-depth: 0`. `citation_line_check.py` reads files and asks git nothing, so it does not.
+  # ====================================================================================================
+
+  citation-line-drift:
+    # `scripts/docs/citation_line_check.py` reports a `path:line` citation whose prose names a symbol
+    # that is somewhere else in the same file. Run by hand at 817db9651: 204 of the 309 checkable
+    # citations DRIFT, which is why this runs against a baseline.
+    #
+    # THE BASELINE IS WHAT MAKES A GREEN LEG MEAN SOMETHING. Without it the tool reports the same 204
+    # every night and the leg becomes wallpaper; with it, a run separates a drift somebody just wrote
+    # from the backlog of drift that was already here. The 204 are recorded in
+    # scripts/docs/citation_line_baseline.txt, which says in its own header that an entry means a
+    # human has SEEN the drift, never that the citation is correct. Re-anchoring them is BACKLOG
+    # #1525's third and fourth arms and a separate scoped pass.
+    name: drifted path-line citations (advisory)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report path:line citations that point at the wrong line (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== path:line citations in both ledgers whose named symbol is elsewhere in the file =="
+          echo "== advisory: this reports, it never gates a merge =="
+          TOOL_STATUS=0
+          python3 scripts/docs/citation_line_check.py --advisory --baseline --max-report 0 \
+            > citation-line.txt 2>&1 || TOOL_STATUS=$?
+          cat citation-line.txt
+          {
+            echo "## Drifted path:line citations"
+            echo ""
+            echo "Advisory only. A DRIFTED citation resolves to a line that exists and says something"
+            echo "else, which this project treats as the worse failure. The NEW section is the one to"
+            echo "read: everything else is the baselined population. A new key is not always a new"
+            echo "citation -- moving the code under one that agreed yesterday produces one too, and"
+            echo "that citation is now genuinely wrong. See BACKLOG item 1525."
+            echo ""
+            echo '```'
+            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+            # ENTIRELY, so truncate rather than silently lose the whole summary.
+            head -c 200000 citation-line.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Citation-line scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means a malfunction rather than a finding -- most likely an unreadable ledger or an unreadable baseline. See the job log."
+          fi
+          # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
+          # broken scan distinguishable from a clean one.
+          exit "$TOOL_STATUS"
+
+  banner-sha-agreement:
+    # `scripts/docs/banner_sha_check.py` reports a CLOSED item whose closing banner cites a commit
+    # whose subject names a DIFFERENT item. One edit of that shape corrupts two items in opposite
+    # directions and every other ledger gate passes over it.
+    #
+    # THE FINDINGS ARE "THINGS TO LOOK AT", NEVER "DEFECTS", and the tool's own docstring triages the
+    # three classes. That is the second reason this is advisory rather than blocking: a legitimate
+    # cross-reference on a line containing the word "shipped" is indistinguishable, to any reading of
+    # a commit subject, from a transposed banner.
+    name: banner-vs-commit item agreement (advisory)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # REQUIRED, NOT TIDINESS: the tool resolves every cited sha with `git log -1`. On the
+          # default shallow checkout each one comes back unresolvable, which the tool counts and does
+          # NOT report -- so the run prints a clean summary having examined nothing.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Report banners whose cited commit names another item (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== closed items whose closing sha names a different BACKLOG item =="
+          echo "== advisory: this reports, it never gates a merge =="
+          TOOL_STATUS=0
+          python3 scripts/docs/banner_sha_check.py --advisory > banner-sha.txt 2>&1 || TOOL_STATUS=$?
+          cat banner-sha.txt
+          {
+            echo "## Banner-vs-commit item agreement"
+            echo ""
+            echo "Advisory only. A reported row is a DISAGREEMENT this tool cannot adjudicate: either"
+            echo "the banner sits under the wrong item or the citation is wrong. Some are neither --"
+            echo "an already-satisfied item legitimately cites another item's commit as its closing"
+            echo "evidence. The coverage line is part of the result: a run that examined nothing and a"
+            echo "run that examined everything must not read alike. See BACKLOG item 1525."
+            echo ""
+            echo '```'
+            # Capped for the same reason as every other summary block in this file.
+            head -c 200000 banner-sha.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # THE COVERAGE LINE IS CHECKED, NOT MERELY PRINTED. `examined 0` is what a shallow checkout
+          # produces, and it renders as a clean run. This is the positive control the summary cannot
+          # give itself.
+          if grep -q "examined 0 closing-claim sha" banner-sha.txt; then
+            echo "::warning title=Banner-sha scan examined nothing::every cited sha was unresolvable, which is what a shallow checkout looks like. Check fetch-depth on this job."
+          fi
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Banner-sha scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means a malfunction rather than a finding. See the job log."
+          fi
+          exit "$TOOL_STATUS"
+
+  subject-exists:
+    # `scripts/docs/subject_exists_screen.py` reports an OPEN item whose code-side subject already
+    # exists on `origin/main` -- the row that reads as work to do and is already done. BACKLOG #1426
+    # repaired it; it still ran nowhere, which is the half this job closes.
+    #
+    # IT TAKES NO `--advisory`, AND THAT IS THE DECISION RATHER THAN AN OVERSIGHT. The flag exists on
+    # its two siblings to downgrade a FINDING, and this screen has none to downgrade: candidates
+    # always exit 0, and its only non-zero exits are a broken extractor, an unresolvable ref and a
+    # known-true ledger control that failed to fire. Every one of those is the screen malfunctioning,
+    # which is exactly what #1426 was, and a flag able to swallow them would be the defect wearing the
+    # word "advisory". Its absence also fails LOUDLY: argparse rejects an unknown option with exit 2,
+    # so adding `--advisory` to the line below reddens this step instead of quietly gating nothing.
+    #
+    # BOTH OF ITS LEDGER CONTROLS HAVE RETIRED, AND THE STEP SAYS SO RATHER THAN LETTING IT PASS.
+    # Measured 2026-09-10: #1229 and #1040 are no longer OPEN, so the screen prints "RETIRED as a
+    # control -- not evidence either way" for each and still exits 0. It is plainly firing (131
+    # candidates over 303 open rows), but nothing in the run PROVES it can still find a known-true
+    # row. Choosing replacement controls is a judgement over the live ledger and belongs to BACKLOG
+    # #1525's triage arms; until then the warning below is what keeps the gap visible.
+    name: open items already done on main (advisory)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # REQUIRED, NOT TIDINESS: the screen probes `origin/main` for ancestry and greps its file
+          # content. The default shallow checkout fetches one ref and creates no `origin/main`
+          # remote-tracking ref at all, so the tool exits 2 before it screens anything.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Report open items whose subject already exists on main (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== open backlog rows whose code-side subject is already on origin/main =="
+          echo "== advisory: this reports, it never gates a merge. THIS TOOL FLIPS NOTHING. =="
+          TOOL_STATUS=0
+          # The probe cap is explicit rather than defaulted: symbol probes are one `git grep` each,
+          # and the number SKIPPED by the cap is reported on every run, so the coverage of a capped
+          # run is visible instead of implied.
+          python3 scripts/docs/subject_exists_screen.py --max-symbol-probes 400 \
+            > subject-exists.txt 2>&1 || TOOL_STATUS=$?
+          cat subject-exists.txt
+          {
+            echo "## Open items whose subject already exists on main"
+            echo ""
+            echo "Advisory only. A CANDIDATE is a row for a person to read, never a verdict: the"
+            echo "screen locates a signal and cannot adjudicate it. Read the controls line first --"
+            echo "a screen whose known-true controls did not fire has empty findings that mean"
+            echo "nothing. See BACKLOG items 1426 and 1525."
+            echo ""
+            echo '```'
+            # Capped for the same reason as every other summary block in this file.
+            head -c 200000 subject-exists.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ! grep -q "FIRED as expected" subject-exists.txt; then
+            echo "::warning title=No ledger control fired::every known-true control has retired or failed, so this run's findings carry no proof the screen can still see a real hit. See BACKLOG item 1525."
+          fi
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Subject-exists screen did not complete::the screen exited ${TOOL_STATUS}, which means a broken control, an unresolvable ref or an unreadable ledger -- never a finding. See the job log."
+          fi
+          exit "$TOOL_STATUS"

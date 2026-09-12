@@ -185,3 +185,5 @@ tests/test_worktree_venv_constraint.py
 tests/test_worktree_venv_extras_parity.py
 tests/test_write_share_denominator.py
 tests/test_zizmor_config_hygiene.py
+tests/test_ledger_detector_advisory.py
+tests/test_prose_anchor_check.py

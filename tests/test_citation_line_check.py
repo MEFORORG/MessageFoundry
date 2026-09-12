@@ -159,3 +159,81 @@ def test_the_underscore_requirement_survived_moving_out_of_the_regex() -> None:
     assert is_symbol("scan_text()")
     assert not is_symbol("client"), "a bare prose word must not read as a symbol"
     assert not is_symbol("Users"), "a path fragment must not read as a symbol"
+
+
+# ------------------------------------------------------------------------------------------------
+# The baseline and the advisory flag (BACKLOG #1525). Each arm is one half of a pair: the tool has to
+# be able to FAIL for its exit codes to mean anything, and it has to stay quiet on the 204 already
+# here or the leg it was wired into becomes wallpaper.
+# ------------------------------------------------------------------------------------------------
+
+
+def _baseline(tmp_path: Path, *keys: str) -> Path:
+    p = tmp_path / "baseline.txt"
+    p.write_text("# a comment line\n" + "\n".join(keys) + "\n", encoding="utf-8")
+    return p
+
+
+def test_the_drift_key_omits_the_actual_line_and_the_ledger_file(tree: Path) -> None:
+    """THE PROPERTY THE WHOLE BASELINE RESTS ON. An actual line moves on every refactor and a ledger
+    file changes when an item is archived, so either inside the key would retire entries wholesale
+    and re-report the same drift as new -- on a change that touched no citation."""
+    led = _ledger(tree, "The guard `_the_real_symbol` lives at `pkg/mod.py:5`.\n")
+    drift = _load().scan([led], tree).drifted[0]
+    assert drift.key == "pkg/mod.py:5::_the_real_symbol"
+    assert "41" not in drift.key, "the actual line must not be in the key"
+    assert "LEDGER" not in drift.key, "the ledger file must not be in the key"
+
+
+def test_a_baselined_drift_does_not_fail_and_an_unbaselined_one_does(tree: Path) -> None:
+    """MUST NOT FIRE then MUST FIRE, on one fixture with one variable: the baseline's contents."""
+    led = _ledger(tree, "The guard `_the_real_symbol` lives at `pkg/mod.py:5`.\n")
+    mod = _load()
+    known = _baseline(tree, "pkg/mod.py:5::_the_real_symbol")
+    assert mod.main([str(led), "--root", str(tree), "--baseline", str(known)]) == 0
+    empty = _baseline(tree)
+    assert mod.main([str(led), "--root", str(tree), "--baseline", str(empty)]) == 1
+
+
+def test_advisory_downgrades_a_finding_and_never_a_malfunction(tree: Path) -> None:
+    """THE TWO HALVES OF THE FLAG'S CONTRACT, and the second is the one worth a test.
+
+    A flag that also swallowed the empty-population refusal would install a step that cannot fail for
+    the reason it exists -- decoration reading as coverage, which is the class BACKLOG #1525 is about.
+    """
+    led = _ledger(tree, "The guard `_the_real_symbol` lives at `pkg/mod.py:5`.\n")
+    mod = _load()
+    assert mod.main([str(led), "--root", str(tree)]) == 1
+    assert mod.main([str(led), "--root", str(tree), "--advisory"]) == 0
+    missing = tree / "no-such-baseline.txt"
+    assert mod.main([str(led), "--root", str(tree), "--baseline", str(missing)]) == 2
+    assert mod.main([str(led), "--root", str(tree), "--baseline", str(missing), "--advisory"]) == 2
+
+
+def test_a_retired_baseline_key_is_reported_and_does_not_fail(tree: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """A key nobody reports any more is either a fixed citation or a screen that stopped seeing it.
+    Those are opposite facts, and only printing the line lets a reader notice the second one."""
+    led = _ledger(tree, "Nothing cited here.\n")
+    rc = _load().main(
+        [str(led), "--root", str(tree), "--baseline", str(_baseline(tree, "pkg/mod.py:5::gone"))]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NO LONGER REPORTED" in out and "pkg/mod.py:5::gone" in out
+
+
+def test_the_shipped_baseline_covers_the_shipped_ledgers(capsys) -> None:  # type: ignore[no-untyped-def]
+    """THE ARM THAT WOULD HAVE CAUGHT A BASELINE GENERATED AGAINST THE WRONG TREE, and the one that
+    keeps the wired leg honest: the nightly job runs exactly this invocation, so a drift added to
+    either ledger without a baseline entry is a NEW key there too.
+
+    It asserts a PROPERTY, never a count. Pinning "204" here would redden on every legitimate
+    re-anchoring, which is the anti-metric rule in docs/Code_Quality_Standards.md."""
+    mod = _load()
+    rc = mod.main(["--max-report", "0", "--baseline", str(mod.DEFAULT_BASELINE)])
+    out = capsys.readouterr().out
+    assert "path:line citation(s)" in out, "positive control: the scan must have read the ledgers"
+    assert rc == 0, (
+        "the shipped baseline no longer covers the drifts in the tracked ledgers. Read the NEW "
+        "section of the output: re-anchor each citation, or add its key to the baseline file."
+    )
