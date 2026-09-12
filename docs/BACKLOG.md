@@ -31319,3 +31319,207 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 - Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
 - The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
 - Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
+## 1608. the ACK-after-commit invariant holds in the runner but has no test: a deliberate break that ACKs AA when the ingress commit fails left 140 covering tests green
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-01, vault PR 1477). Open; not started.** Value **8/10**, Difficulty **1/10**. `RegistryRunner._handle_inbound` commits through `enqueue_ingress` and only then builds the `AA` ACK, which is the engine's reliability invariant. Negative control: the handler was mutated to return the `AA` ACK when `enqueue_ingress` raises, and 140 tests across `test_wiring_engine`, `test_staged_pipeline`, `test_ack_capture_runner`, `test_nonhl7_ingress_size_cap` and `test_ingress_document_detach` stayed green. A positive control against a store whose `enqueue_ingress` raises returned `MSA|AA` with zero rows on the mutated tree and raised on the real one, so the mutation was live. No test in any suite that references `enqueue_ingress` fails it and asserts on the ACK. Value 8: the store's own atomicity is pinned (three sibling controls each turned the right test red), so a regression can only come from the runner, and item 1594's runner guard will be written in exactly this window. Difficulty 1: two tests.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). Test coverage of the invariant that makes count-and-log true; the shipped code honours it today. A regression would let a first deployment acknowledge a message the store never held, which is loss.
+
+### Where
+
+- `messagefoundry/pipeline/wiring_runner.py`, `_handle_inbound`: `enqueue_ingress` then `build_ack(peek, code="AA")`. The HTTP twin `_handle_inbound_http` returns the committed `message_id` after the same call.
+- `tests/test_wiring_engine.py` covers the NAK branches (decode, NUL, parse, strict) by disposition and ACK code, and never fails the commit itself.
+
+### Measured, 2026-09-11, engine `2ffcf3347`
+
+| Tree | `store.enqueue_ingress` raises | `_handle_inbound` returned | rows |
+|---|---|---|---|
+| real | `RuntimeError` | raised `RuntimeError` | 0 |
+| mutated (control D) | `RuntimeError` | `MSA\|AA` | 0 |
+| mutated, 140 covering tests | n/a | all green | n/a |
+
+Controls A to C (route-handoff idempotency, premature finalize, handoff atomicity) each reddened the test written for them, so the store side is live; the runner side is the gap.
+
+### What to build
+
+1. `test_wiring_engine.py`: monkeypatch `store.enqueue_ingress` to raise on the MLLP inbound; assert the handler does not return an `AA` ACK (raise, or an `AE` NAK once a guard exists), and assert zero `messages` rows.
+2. The same for `_handle_inbound_http`: assert it returns `None` (no receipt id) and zero rows.
+3. The same shape for `record_received` raising on an error branch: assert no ACK of any code is returned and nothing is committed.
+4. Land these before or with item 1594's runner guard, and make each fail on purpose first.
+
+---
+
+## 1609. in the default pooled claim mode a dead stage claimer is never respawned, so its whole stage stops draining while intake keeps acknowledging and status reads healthy
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-02, vault PR 1477). Open; not started.** Value **6/10**, Difficulty **3/10**. `StageDispatcher._on_task_done` logs a claimer or sweep task that exits with an exception and returns; its own docstring says respawning "is still not implemented" and calls the result a known gap. `pooled_claimers_per_stage` defaults to 1, so one claimer is the whole stage. Measured by injection: the INGRESS claimer died, was not respawned, five further messages were acknowledged `AA`, all six sat at `received` with six pending ingress rows, and `runner.running`, `degraded_connections()` and `dispatcher.running` all read healthy. The OUTBOUND claimer wedged the same way at `routed`. The per-lane opt-out mode respawns all three of its worker kinds through `_on_worker_done` and `_on_inbound_worker_done`, so the shipped default is the unsupervised one. Value 6: the impact is June's H-1 one level up (every lane of a stage, silently, with intake still ACKing); reachability is low, because the store claim, the serializer body and the sweep are each guarded and were measured to survive, so only the dispatcher's own await-free bookkeeping can kill the loop. Difficulty 3: a respawn under the same guard the per-lane callbacks use, a re-seed of the partition's ready set, and a degraded flag the status surfaces already render.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Pipeline & Reliability. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). PLAUSIBLE reachability: no wire input was found that raises in the unguarded region. If one existed, a first deployment on the default mode would stop routing every connection while acknowledging every message, with one log line as the only signal.
+
+### Where
+
+- `messagefoundry/pipeline/stage_dispatcher.py`, `_on_task_done`: the claimer and sweep done-callback; logs at ERROR, no respawn, no status change.
+- `_claimer_loop` has no `try` of its own; `_claim_and_dispatch` guards the `claim_fifo_heads` call and then runs the per-lane bookkeeping (`self._states[lane]`, slot arithmetic, episode stamps, `_spawn_serializer`) unguarded.
+- `messagefoundry/pipeline/wiring_runner.py`, `_on_worker_done` and `_on_inbound_worker_done`: the per-lane respawn pattern to mirror.
+
+### Measured, 2026-09-11, engine `2ffcf3347`, pooled mode, one claimer per stage
+
+| Stage killed | respawned | ACKs after death | messages | queue | status |
+|---|---|---|---|---|---|
+| ingress | no | 5 x `AA` | 6 `received` | 6 ingress pending | running, not degraded |
+| outbound | no | 5 x `AA` | 6 `routed` | 6 outbound pending | running, not degraded |
+
+Controls in the same run: an injected fault in the serializer body re-pended the head with backoff and both messages delivered; an injected sweep fault was logged and the sweep continued. Per-lane mode: delivery, router and transform workers each died, respawned, logged the respawn, and delivered end to end afterward.
+
+### What to build
+
+1. In `_on_task_done`, when the runner is running, the stop event is clear and the task exited with an exception, spawn a replacement claimer (or sweep) for the same partition and re-seed its ready set from the lane provider, mirroring `_on_worker_done`.
+2. Surface a claimer death on the runner's status (the same degraded shape connections use), so `/status` and the console show it even if the respawn also fails.
+3. Test: kill a claimer by injection on a running runner, assert a replacement task exists and that a message enqueued afterward reaches its outbound. The probe that measured this row is a working draft; see also the test row filed beside this one for the per-lane siblings.
+
+---
+
+## 1611. in-flight recovery is restart-only: a transient store fault between a committed claim and its handoff strands the row in flight, a reload does not recover it, and the stall alert cannot see it
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-03, vault PR 1477). Open; not started.** Value **7/10**, Difficulty **4/10**. The claim is its own committed transaction; the handoff that follows is guarded by `except Exception` in every worker, which logs and backs off but never re-pends the head it claimed. `reset_stale_inflight` runs from `Engine.start()` and the cluster promotion path only. `list_fifo_lanes` and `pending_depth` select `status='pending'`, so neither the pooled sweep nor the buildup and stall alerts see an in-flight row. Measured: one injected `route_handoff` fault in `per_lane` mode left the message `received` with its ingress row `inflight`, the worker alive, for the whole window; `reload()` left it in flight; only stop, `reset_stale_inflight` and start delivered it. In `pooled` mode the T17 path re-pended the head and it delivered, but with `reschedule_claimed` faulting once too the row stranded the same way. Value 7: a first deployment would meet this on the first SQLite busy-timeout during a handoff; nothing is lost or duplicated, but one acknowledged message would sit unrouted, overtaken by its successors, until a service restart, with the stall alert reading healthy. Difficulty 4: a best-effort re-pend in the per-lane except paths, a periodic age-gated reclaim for single-node stores, an in-flight age on the stall instrument, and two comments.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Pipeline & Reliability. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). At-least-once holds through a restart; between restarts the failure is an indefinite, alert-invisible stall of one message, and its per-lane FIFO position is lost on recovery.
+
+### Where
+
+- `messagefoundry/pipeline/wiring_runner.py`: `_router_worker`, `_transform_worker`, `_response_worker`, `_delivery_worker`; each `except Exception` logs and calls `_stop_or_sleep`, and the claimed head is left `inflight`.
+- `messagefoundry/pipeline/stage_dispatcher.py`, `_run_lane`: the T17 re-pend through `reschedule_claimed` is best-effort and says so; a second fault leaves the row in flight.
+- `messagefoundry/store/store.py`: `list_fifo_lanes` and `pending_depth` read pending rows only; `reset_stale_inflight` is the sole in-flight recovery on SQLite.
+- `messagefoundry/pipeline/engine.py`: `reload_detail` never calls `reset_stale_inflight`; the comments in the runner at the "inbound not in registry" branches of the router and transform bodies say "on the next start/reload", which is not true of reload.
+- The SQL Server half is already described in the engine's own comment above the leader-maintenance block in `Engine.start()` and tracked under ADR 0157 (item 1497 carries the unbuilt increments); the single-node SQLite case is the same property and was not tracked before this row.
+
+### Measured, 2026-09-11, engine `2ffcf3347`, SQLite
+
+| Mode | Injected | Delivered in 4 s | After reload | After stop + reset + start |
+|---|---|---|---|---|
+| per_lane | `route_handoff` raises once | no; `received`, ingress `inflight` 1, worker alive | still in flight | delivered, `processed` |
+| pooled | `route_handoff` raises once | yes (T17 re-pend, `reschedule_claimed` 1 call) | n/a | n/a |
+| pooled | `route_handoff` and `reschedule_claimed` each raise once | no; ingress `inflight` 1 | still in flight | delivered, `processed` |
+
+With one row claimed in flight, `pending_depth` on that lane read 0.
+
+### What to build
+
+1. In each per-lane worker's `except Exception`, before the backoff, best-effort `reschedule_claimed([head.id], now + backoff)` for the row that was claimed, mirroring T17; a failure there is logged and left for step 2.
+2. A periodic, age-gated stale-in-flight reclaim for single-node stores: a row in flight longer than a bound with no live owner is re-pended, the single-node analogue of the Postgres lease reclaim. As the cheap interim, run `reset_stale_inflight` (owner-scoped) at the end of a successful `reload()`.
+3. Make `pending_depth` (or a sibling read) report the oldest in-flight age, and let the stall alert fire on it.
+4. Correct the two runner comments that say reload recovers in-flight rows.
+5. Tests: the three measured rows above as failure-injection tests on a running runner, asserting delivery without a restart once steps 1 and 2 land.
+
+---
+
+## 1612. ingress and routed rows for an inbound removed before a restart sit pending forever, with no dead-letter, no warning, and no alert able to see them
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-04, vault PR 1477). Open; not started.** Value **5/10**, Difficulty **2/10**. `Engine._start_graph` sweeps rows for missing destinations and missing handlers after `reset_stale_inflight`, and nothing sweeps rows for a missing channel. The pooled lane provider for the ingress and routed stages is the live registry's inbound set, so a removed channel's lane is never claimed or swept; the per-lane worker re-pends the row retry-forever and exits. The buildup and stall checks iterate registry lanes, so `pending_depth` is never asked about the orphan channel. Measured: two messages acknowledged on `mllp_in`, then a restart with `mllp_in` removed; both sweeps returned 0, both messages stayed `received` with two pending ingress rows, no warning was logged, nothing was degraded. Value 5: June's H-5 closed this shape for outbounds by dead-lettering with a reason so the rows are visible and replayable; the ingress stage kept the retention half of that fix and not the visibility half, so a renamed inbound (the naming convention invites renames) leaves every message acknowledged under the old name looking "in progress" forever. Difficulty 2: one more sweep beside the two that exist, or a startup warning plus an orphan-lane pass in the buildup check.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Pipeline & Reliability. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). No loss: the rows are retained and drain if the inbound is re-added. The defect is that an operator has no signal and the console shows the messages as in progress.
+
+### Where
+
+- `messagefoundry/pipeline/engine.py`, `_start_graph`: calls `dead_letter_missing_destinations` and `dead_letter_missing_handlers`; no channel sweep.
+- `messagefoundry/pipeline/wiring_runner.py`, `_pooled_lane_provider`: ingress and routed lanes are `set(self.registry.inbound)`; `_process_ingress_item` and `_process_routed_item` "inbound not in registry" branches re-pend retry-forever and return STOPPED; the comment at the reload step 2b documents the retention as intended.
+- `messagefoundry/store/store.py`: `dead_letter_missing_destinations` and `dead_letter_missing_handlers` are the two existing sweeps to mirror.
+
+### Measured, 2026-09-11, engine `2ffcf3347`
+
+| Step | messages | queue | sweeps | warnings | degraded |
+|---|---|---|---|---|---|
+| two ACKed on `mllp_in`, runner not started | 2 `received` | ingress pending 2 | n/a | none | n/a |
+| restart with `mllp_in` removed, 1 s | 2 `received` | ingress pending 2 | destinations 0, handlers 0 | none | none |
+
+`pending_depth("mllp_in", ingress)` read 2 when asked directly; nothing asks.
+
+### What to build
+
+1. Preferred: a `dead_letter_missing_channels` sweep in the store, called from `_start_graph` beside the other two, dead-lettering ingress, routed and response rows whose `channel_id` is absent from the registry with the reason "inbound removed from registry" (message ERROR, replayable once restored), exactly H-5's shape.
+2. If retention is preferred instead, at minimum a startup WARNING with the count per orphan channel, and include orphan lanes in the buildup sweep so the stall alert fires.
+3. Test: enqueue on a channel, restart without it, assert the chosen outcome (dead-lettered with the reason, or warned and alertable).
+
+---
+
+## 1613. a mistyped inbound encoding passes config validation and start, then every message on that inbound raises LookupError out of both handlers with no disposition and no NAK
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-05, vault PR 1477). Open; not started.** Value **5/10**, Difficulty **1/10**. The inbound `encoding` setting reaches `normalize(raw, encoding=..., errors="strict")` and `raw.decode(encoding)` in `_handle_inbound` and `_handle_inbound_http`, whose `except` catches `UnicodeDecodeError` only; nothing in `config/wiring.py`, `build_check_registry` or `build_source` calls `codecs.lookup` on it. Measured: `encoding="utf-99"` passed `build_check`, `start()` reported running with nothing degraded, and a well-formed synthetic ADT raised `LookupError: unknown encoding: utf-99` from both handlers with zero rows and no ACK; the MLLP server's last-resort catch would then drop the sender's connection on every message. `latin-1` and `utf-16` behaved correctly (accept, and decode-error NAK `AR` respectively). Value 5: not attacker-influenced, but a one-character config error would silently lose every message on that connection until the partner complained, with the engine reporting the connection healthy; June's neighbouring config-typo rows (M-22, M-23) surfaced as loud tracebacks and were graded Medium. Difficulty 1: a `codecs.lookup` at load, and one name in two `except` tuples.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Count-and-log broken on every message of one connection by a config typo; recoverable by fixing the setting, but nothing points at it.
+
+### Where
+
+- `messagefoundry/pipeline/wiring_runner.py`, `_handle_inbound` and `_handle_inbound_http`: the decode `try` around `normalize` / `raw.decode`, `except UnicodeDecodeError` only.
+- `messagefoundry/config/wiring.py`, `inbound()` and the connector factories: `encoding` is passed through as a string with no validation.
+- `build_check_registry` constructs every connector and would be the natural place to refuse an unknown codec before any bind.
+
+### Measured, 2026-09-11, engine `2ffcf3347`
+
+| `encoding` | `build_check` | `start()` | `_handle_inbound` | ACK | rows |
+|---|---|---|---|---|---|
+| `utf-99` | passes | running, not degraded | raised `LookupError` | none | 0 |
+| `latin-1` | passes | running | returned | `AA` | 1 |
+| `utf-16` (UTF-8 bytes) | passes | running | returned | `AR` | 1, ERROR |
+
+The HTTP handler escaped identically and returned no receipt id.
+
+### What to build
+
+1. Validate `encoding` with `codecs.lookup` in `inbound()` (and the outbound factories that take one) and in `build_check_registry`, raising `WiringError` naming the connection and the value, so a typo fails at load, at reload and at `check`.
+2. Defence in depth: add `LookupError` to the decode `except` in both handlers, recording ERROR with the lossless latin-1 view of the bytes and NAKing `AR`, the same path a decode error takes.
+3. Tests: `build_check` refuses `utf-99`; with the guard bypassed, the handler records ERROR and NAKs rather than raising.
+
+---
+
+## 1614. the supervision paths packet 3 had to measure by hand have no tests: router and transform respawn, a pooled claimer death, and a transient handoff fault with the worker alive
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-08, vault PR 1477). Open; not started.** Value **4/10**, Difficulty **2/10**. No test exercises `_on_inbound_worker_done` (the router and transform respawn); `tests/test_task_resilience.py` covers the delivery worker only, and its respawn test calls `_on_worker_done` by hand rather than through the task's done-callback, so the wiring itself is unpinned. No test exercises a pooled claimer or sweep death. No test covers a transient handoff fault with the worker still alive and no restart; the existing `reset_stale_inflight` tests simulate a crash instead. Each of these was measured by injection during the review and the probe is a working draft. Value 4: June's `xc: concurrency` verdict was needs-attention on exactly these paths, and the move to adequate rests on measurements no test repeats. Difficulty 2: three failure-injection tests on a running runner.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Test coverage only; the measured behaviour today is respawn for the per-lane workers and no respawn for the pooled claimer.
+
+### What to build
+
+1. `test_task_resilience.py`: for each of router, transform and delivery in `per_lane` mode, make the worker task die (inject a raise into the backoff sleep after an injected claim fault, keyed on the claim's `stage` so the right worker takes it), assert the task in the runner's dict is a new, live task, assert the "exited unexpectedly; respawning" log line, and assert a message enqueued afterward delivers.
+2. Pooled: kill the ingress claimer by injection; assert whatever the claimer-respawn row above decides (today: one ERROR line, no respawn, healthy status), so the decision is pinned either way.
+3. Pooled and per-lane: inject one `route_handoff` fault on a running runner and assert the message still delivers without a restart once the in-flight recovery row lands; until then, assert the measured strand so the fix has a red test to turn green.
+4. Make each fail on purpose first; two of the probes that fed this row were blind on their first run (the root logger level filtered the records, and an untargeted injection hit the wrong worker), so the instrument check is part of the work.
+
+---
+
+## 1615. the dependency-boundary test forbids the retired console package name, not the live web console package
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-09, vault PR 1477). Open; not started.** Value **3/10**, Difficulty **1/10**. `tests/test_dependency_boundaries.py` lists `messagefoundry.console` in `_FORBIDDEN`; the operator console is the top-level package `messagefoundry_webconsole` (ADR 0065), which the rule does not name, and `starlette` and `uvicorn` are not listed beside `fastapi`. Measured: importing `pipeline.engine` and `pipeline.wiring_runner` in a fresh interpreter loads 141 `messagefoundry` modules and none of the forbidden or web-console packages, so this is a gap in the guard, not a violation. The test itself is otherwise real: an AST walk with relative imports resolved, asserting an empty violation list, so it would catch a `fastapi` import; it would not catch a `messagefoundry_webconsole` one. Value 3: the one-way dependency rule is the governing invariant for parallel work and this is its cheapest hole. Difficulty 1: names in a tuple.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). Architecture guard only. Sibling of item 1596, which adds the inward rule for `parsing/` to the same test.
+
+### What to build
+
+Add `messagefoundry_webconsole` to `_FORBIDDEN`, and `starlette` and `uvicorn` beside `fastapi`. Make it fail on purpose first with a throwaway import in an engine module, then remove the import. Land with or after item 1596 so the two edits to the same tuple do not conflict.
