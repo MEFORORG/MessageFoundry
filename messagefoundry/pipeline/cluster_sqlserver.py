@@ -26,7 +26,7 @@ caching) are copied verbatim and only the DB layer differs:
   analog of PG's ``pg_advisory_xact_lock``.
 
 It is duck-typed on the store (``store._acquire`` / ``store._applock`` / ``store._fetchone`` /
-``store._fetchall`` / ``store._execute`` / ``store._settings``) so this module imports cleanly without
+``store._fetchall`` / ``store._execute``) so this module imports cleanly without
 the optional ``aioodbc`` extra and never hard-imports the concrete store.
 
 .. note::
@@ -144,11 +144,11 @@ class SqlServerCoordinator:
         # re-promoted ex-leader is not fenced out of claim_ready or any terminal resolve.
         self._leadership_lock = asyncio.Lock()
         self._monotonic = monotonic
-        # Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two
-        # deployments sharing one database via different schemas don't contend / co-elect.
-        schema = getattr(getattr(store, "_settings", None), "db_schema", None) or "dbo"
-        self._lock_key = f"{schema}:mefor_cluster_nodes"
-        self._lease_key = f"{schema}:mefor_cluster_leader"
+        # Constant, NOT schema-namespaced like DbCoordinator's: this store never reads db_schema, so
+        # installs sharing one database share these tables and must share this election and DDL lock.
+        # The reasoning, and the refusal that enforces it: StoreSettings._db_schema_backend.
+        self._lock_key = "mefor_cluster_nodes"
+        self._lease_key = "mefor_cluster_leader"
         self._host = socket.gethostname()
         self._pid = os.getpid()
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -429,9 +429,21 @@ class SqlServerCoordinator:
         # is made on a value that crossed an await, so a stepdown interleaving here would be undone by
         # this tick's own stale result. Mirrors DbCoordinator._maintain_leadership.
         async with self._leadership_lock:
+            # ADR 0157 Inc 0: read the baseline BEFORE the claim is issued, not after it returns. The
+            # lease expiry it races is stamped on the DB clock inside this round trip, so a baseline
+            # taken afterwards is later than the DB's own by the whole trip and the detection margin
+            # is short by an amount nothing measures. Reading it first can only fence EARLIER, the
+            # conservative direction. In lockstep with DbCoordinator._maintain_leadership, whose
+            # docstring carries the full argument.
+            #
+            # It matters MORE here: this backend has no clamp on the round trip. DbCoordinator passes
+            # asyncpg a per-statement timeout; _fetchone below inherits the ODBC connection's
+            # [store].command_timeout (30 s, the stock lease TTL itself), and a per-statement override
+            # would have to live in store/sqlserver.py. That clamp is an open ADR 0157 Inc 0 residual.
+            issued_at = self._monotonic()
             held = await self._claim_or_renew_lease()
             if held:
-                self._last_renew_ok = self._monotonic()  # stamp for the fence watchdog
+                self._last_renew_ok = issued_at  # stamp for the fence watchdog
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)

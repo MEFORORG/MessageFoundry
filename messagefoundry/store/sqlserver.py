@@ -1407,6 +1407,12 @@ _SCHEMA: list[str] = [
         -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
         -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
         oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
+        -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID).
+        -- SIZED rather than MAX for this file's ordinary reason (256 is its dominant width), though
+        -- nothing here needs it as an index key: the column carries NO uniqueness constraint, so the
+        -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
+        -- GUID is 36 characters, so the width is slack, not a bound.
+        directory_object_id NVARCHAR(256) NULL,
         password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -1428,6 +1434,12 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
         ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+    # Directory-immutable identity binding (BACKLOG #1471): COL_LENGTH-gated ADD on a pre-existing
+    # users table. NULL on existing rows = "no directory binding", and such a row is REFUSED rather
+    # than adopted by an AD login presenting an objectGUID -- not byte-identical to before, and that
+    # is the item. No backfill exists; nothing has ever held the directory's identifier.
+    """IF COL_LENGTH('users','directory_object_id') IS NULL
+        ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -9542,14 +9554,15 @@ class SqlServerStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        directory_object_id: str | None = None,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+            " must_change_password, failed_attempts, locked_until, directory_object_id)"
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)",
             (
                 user_id,
                 username,
@@ -9562,6 +9575,7 @@ class SqlServerStore:
                 password_hash,
                 now if password_hash is not None else None,
                 1 if must_change_password else 0,
+                directory_object_id,
             ),
         )
 
@@ -9571,6 +9585,17 @@ class SqlServerStore:
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
+        return UserRecord.from_mapping(d) if d else None
+
+    async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
+        # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
+        # rather than the recyclable sAMAccountName. NOTE, as with get_user_by_federated_subject
+        # below, that the comparison is the DATABASE's and this column carries no explicit COLLATE:
+        # under a case-insensitive server default two ids differing only in case would match here.
+        # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
+        # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
+        # perform is the property a reader would assume.
+        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
