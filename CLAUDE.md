@@ -515,6 +515,12 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   with clear messages. Direct pushes to `main` stay blocked by the harness.
 - Commits at logical stops are Claude's own judgment. Commit coherent, tested, one-layer changes and
   narrate each. Respect the ledger gate: never `--no-verify`, never a rename workaround.
+- **Omit the `Co-Authored-By` trailer and the PR-body byline.** Standing owner preference, restated
+  2026-09-11. The project turns both off at source with `attribution` in
+  [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
+  Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
+  message you are about to commit, your session is reading a stale or user-scope setting, so remove
+  it by hand.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
   measurement rather than a contract. Write the message to a uniquely-named file **inside your own
@@ -895,6 +901,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
+  (section 5). The project turns them off at source in `.claude/settings.json`.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
   `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.

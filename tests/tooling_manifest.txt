@@ -55,6 +55,7 @@ tests/test_ci_venv_pinning.py
 tests/test_citation_line_check.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
+tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_strand_sweep.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_durability_hook_provenance.py
