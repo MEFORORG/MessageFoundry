@@ -31319,3 +31319,250 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 - Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
 - The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
 - Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
+
+## 1544. a pipe with no pipefail discards its producer's exit code, 26 of 36 piped workflow steps run that way, and the test named as the guard's home resolves 11 jobs without walking needs, so it cannot reach 3 of the 4 sites that gate a merge
+
+> 🔢 **Filed 2026-09-11 from a follow-up named but unfiled during the block 3 wave, then adversarially verified.** Value **4/10** · Difficulty **6/10** · _money pit_. Under GitHub's default `run:` shell -- `bash -e`, no `pipefail` -- a producer that fails in front of a pipe is discarded exactly as `|| true` discards one. `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` exists to catch `|| true` in a required job; it does not look at pipes, and nothing else in the repository does. Measured at `origin/main` `67ad86e4b`: of 205 `run:` steps, 184 resolve to a POSIX shell, 36 carry a real shell pipe and **26** of those have no pipefail in effect. Filing the rule into that module as written would not help: it resolves 13 required contexts to 11 jobs and never walks `needs:`, so it would sweep 11 jobs, pass, and report the merge path clean while three of the four merge-gating sites still pipe unguarded.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / merge-path integrity. **Priority:** P3. **Verdict:** build, scoped.
+
+**Severity:** no deployment axis (section 0). This is repository CI tooling only. No engine behaviour, no shipped artifact, no PHI. The merge-path exposure is a gate that could report green over a step whose producer failed.
+
+A pipeline's exit status is its last command's. Under GitHub's default `run:` shell, `bash -e` without `pipefail`, a producer that fails in front of a pipe is discarded exactly as `|| true` discards one. `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` exists to catch `|| true` in a required job. It does not look at pipes, and nothing else in the repository does either.
+
+### Nothing screens for this, and no filed row proposes a screen
+
+Eighteen tracked files mention `pipefail` at `origin/main`. Thirteen are workflows, one is `docs/BACKLOG.md`, one is `scripts/ci/retry-native-crash.sh` setting it for itself, and three are tests that mention it in prose or use it to run a script under test. No script, hook, or workflow counts or gates on it.
+
+The ledger agrees. Over 511 live items and 237 archived, only [#1481](#1481) and [#1313](#1313) mention `pipefail`, and the archive mentions it zero times.
+
+### The count is 36 piped steps, not the 23 or the 30 anyone has published
+
+Measured at `origin/main` `67ad86e4b`, over the 28 files in `.github/workflows`:
+
+| | count |
+| --- | --- |
+| `run:` steps | 205 |
+| of those, resolving to a POSIX shell | 184 |
+| of those, carrying a real shell pipe | **36** |
+| of those, with pipefail in effect | 10 |
+| of those, **without** | **26** |
+
+Fifteen steps are PowerShell and are excluded. Six more sit in `ci.yml`'s `ide` job and `ingress-rate-probe.yml`'s `probe`, whose runner only exists at run time. All six carry zero pipes, so the ambiguity cannot move the answer.
+
+"With pipefail in effect" means two different things, and a screen must tell them apart. Nine steps execute `set -o pipefail`. One more declares `shell: bash`, which GitHub substitutes as `bash --noprofile --norc -eo pipefail {0}`.
+
+**Detecting a shell pipe is the hard part of this row, and three earlier passes returned three different numbers.** A detector that blanks quoted text cannot see `x="$(a | b)"`, which is this corpus's most common pipe idiom. The count here comes from a shell state machine put through a 25-case two-way battery. The quote-blanking design scores 15 of 25 on that same battery, failing in both directions.
+
+### State the denominator, because the ledger already carries a different one
+
+[#1481](#1481) records, measured over the same glob, that 12 workflows set `pipefail` explicitly and 3 files use `shell: bash` at all. Both figures reproduce here exactly, which is the best external check this row has on its own instrument.
+
+That is a **file** count. This row's 26 is a **step** count over pipe-carrying steps only. Filing "26 without pipefail" beside "12 workflows set pipefail" without naming the unit reads as a regression that did not happen.
+
+### The proposed home cannot reach three of the four merge-gating sites
+
+`_required_jobs()` builds from `required_contexts()` and resolves each context to one job. It does not walk `needs:`. The whole module contains one occurrence of the string `needs`, inside an assert message.
+
+Live branch protection returns 13 contexts, matching the checked-in `.github/required-contexts.txt` exactly. Those resolve to 11 jobs. Adding the transitive `needs:` closure gives 19 jobs whose failure can fail a required context.
+
+The 26 unprotected steps split like this:
+
+| where the step sits | count |
+| --- | --- |
+| a job whose `name:` is a required context | 1 |
+| a job reached through a required job's `needs:` | 3 |
+| off the merge path | 22 |
+
+Filing the rule into `test_required_jobs_have_no_neutered_steps` as written would sweep 11 jobs, pass, and report the merge path clean while `changes`, `sqlserver-store` and `load-test-sqlserver` still pipe unguarded. A guard that passes over the sites it was written for is worse than none, because it also closes the row.
+
+### The four merge-gating sites, and what each one actually risks
+
+| file | job | step | how it gates | what a swallowed status costs |
+| --- | --- | --- | --- | --- |
+| security.yml | `gitleaks` | Install gitleaks (pinned + checksum-verified) | the `gitleaks (secret scan)` context directly | nothing. Safe by last command, measured below |
+| ci.yml | `changes` | (unnamed) | needed by `test`, a required context, and by `CI gate` | nothing. All 8 pipes are `echo "$changed" | grep -q` conditions, and `echo` on a variable cannot fail |
+| ci.yml | `sqlserver-store` | Install Microsoft ODBC Driver 18 + sqlcmd | `CI gate`, and only when `serverdb` is true | **real.** A failed `curl` writes an empty apt source and returns 0 |
+| ci.yml | `load-test-sqlserver` | Install Microsoft ODBC Driver 18 + sqlcmd | `CI gate`, and only on schedule, dispatch or merge_group | **real.** Same body |
+
+The draft said these three gate only through the `CI gate` roll-up. That is wrong for `changes`, which `test` also needs, and `test`'s name matches three required contexts.
+
+The two SQL Server legs are conditional. `load-test-sqlserver` does not run on an ordinary pull request at all.
+
+### Two shapes must not be edited, and one of them covers the required site
+
+**Four of the 26 are already safe by their last command.** The shape is `grep " ${asset}$" <checksums> | sha256sum -c -`, and it covers the one directly-required site. A grep that matches nothing hands `sha256sum` empty stdin, and it exits 1:
+
+```
+$ bash -e -c 'grep " nosuch.tar.gz$" <<< "$sums" | sha256sum -c -; echo REACHED-NEXT-LINE'
+sha256sum: 'standard input': no properly formatted SHA256 checksum lines found
+exit 1, REACHED-NEXT-LINE not printed
+```
+
+Adding pipefail there changes nothing. Doing it to satisfy a guard is churn in a supply-chain verification step.
+
+**`release.yml`'s leak gate is a deliberate non-pipefail step, and a test pins it that way.** `tests/test_release_pipeline.py::_run_leak_gate` runs it under `bash -e` on purpose, and its docstring says adding `-o pipefail` "would test a shell the release never uses, and would paper over the precise blindness this section exists to detect." [#1313](#1313) carries the measurement behind that. A screen that flags it would be arguing with a decision already made and tested.
+
+### A blanket edit would break the `changes` job, and break it silently
+
+Adding pipefail converts an early-exit pipeline into a SIGPIPE failure once the producer outruns the pipe buffer. Measured with the job's real shape, first line matching:
+
+```
+$ set -o pipefail; if echo "$changed" | grep -qE '^(messagefoundry/store/)'; then TRUE else FALSE
+  57,010 bytes -> TRUE
+  64,610 bytes -> TRUE
+  66,510 bytes -> FALSE      <- flips at the 65,536-byte pipe buffer
+  72,210 bytes -> FALSE
+```
+
+Without pipefail the same sweep returns TRUE at every size.
+
+The consequence is worse than a red. These eight pipelines sit in `if` conditions, where errexit is suppressed, so the job exits 0 and writes `serverdb=false`. `sqlserver-store` gates on that output, so it would skip. `.github/required-contexts.txt` records, verified on a real run, that `CI gate` returns success with all six such legs skipped. The result is a green merge over store changes that no suite tested.
+
+**The hazard is latent, not current.** It needs roughly 1,550 changed paths. Over the 49 commits reachable in this shallow clone the median changed-file list is 148 bytes and the maximum is 51,849, which is 21 percent under the threshold. The whole tree is 93,193 bytes, so a crossing payload is producible.
+
+### What to build
+
+1. **Fix the three `curl ... | sudo tee` steps first**, independent of any guard. They are the only measured consequence in the set. A failed fetch leaves an empty source list, and the step's own retry loop then reports `"::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."` The diagnostic points away from the fault.
+2. **Scope the screen to the merge-gating closure**, not to all 205 steps. It must walk `needs:` from each required context's job. That closure is 19 jobs today.
+3. **Resolve the shell before judging a step.** Step `shell:`, then job `defaults.run.shell`, then workflow, then runner OS. A step declaring `shell: bash` already has pipefail. A PowerShell step is out of scope.
+4. **Do not reuse `_gating_text`.** It strips `$( ... )` on purpose, and that is safe for neutering but not for pipes. Applied to the 36 piped steps, it hides every pipe in 5 of them.
+5. **Give it a liveness receipt and an allowlist with reasons.** The existing module's `assert scanned_steps > 0` is the pattern. The allowlist holds the four `sha256sum` pipelines, the leak gate, and the eight `grep -q` conditions, each with the measurement that justifies it.
+
+### Do not
+
+Do not write `shell: bash` to acquire pipefail. [#1481](#1481) carries that reasoning and the repository's own count of which idiom it uses.
+
+### One adjacent defect found while measuring
+
+`ingress-rate-probe.yml`'s `Sweep` step declares `shell: bash` and opens with `set -uo pipefail   # NOT -e: a probe that cannot start must not lose the rows already taken`. The `shell: bash` substitution imposes `-e`, and `set -uo pipefail` cannot clear it. Only `set +e` can:
+
+```
+$ bash -eo pipefail -c 'set -uo pipefail; false; echo REACHED-AFTER-FAILURE'
+exit=1, REACHED-AFTER-FAILURE not printed
+$ bash -eo pipefail -c 'set +e; false; echo REACHED-AFTER-FAILURE'
+REACHED-AFTER-FAILURE, exit=0
+```
+
+The step runs with `-e` on, against its own comment's stated intent. The job is not required, so nothing gates on it. It is the same hidden-substitution hazard measured in the opposite direction.
+
+### Value and difficulty
+
+**Value 4.** The measured harm is three steps, two of them merge-gating, where a failed fetch is reported as a runner-mirror fault. That is a real cost paid in misdiagnosis. It is bounded: the one directly-required site is already safe, and 22 of the 26 sites are off the merge path.
+
+**Difficulty 6.** This is not a quick win. A correct screen needs a shell tokenizer, a `needs:` walk, shell resolution, and an allowlist with reasons. Three earlier passes over this same corpus published three different pipe counts, which is direct evidence that the detection is harder than it looks.
+
+### What this row does not establish
+
+The draft's headline table comparing 190/30/7 against 23/6/17 is dropped. Neither column reproduced. The "7 versus 6" pipefail gap is dropped with it; its population was never stated and no population I could build returns either number.
+
+## 1545. Nothing asserts sigstore's dependency-group spec stays an exact pin, so a floor at the declaration would unbind the owner's 4.4.0 ruling from the resolver
+
+> 🔢 **Filed 2026-09-11 from a PR 1039 report, reconciled against three adversarial verifications. One half of the report was cut and the severity framing was rebuilt.** Value **4/10** · Difficulty **3/10** · _fill-in_. Everything below is measured at `origin/main` = `67ad86e4b`, not at a worktree HEAD.
+> `sigstore` is the only `[dependency-groups]` name in none of `MOVED_TO_A_GROUP`, `EXACT_GROUP_PINS` or `FLOOR_BY_DESIGN`. Nothing asserts its spec stays an exact pin. The `==` in `pyproject.toml` is the only thing binding the owner's twice-affirmed `4.4.0` ruling to what the resolver picks, and no test asserts it.
+> **`sigstore` IS NOT UNGUARDED. Do not read this row that way.** Its declaration, its lock, its hashes, its audit and its re-export all have working guards, named below. What is missing is the spec *shape* and the inline-reinstall sweep.
+> **This is a companion to [#332](#332), not an independent subject.** #332 owns sigstore's pin, already names one of the two registry additions as its own residual, and its remaining step 6 edits the same two tuples.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / supply chain. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (section 0). Build-time only, with no engine behaviour, no store, no PHI surface and no pull-request reachability, since the release job runs on a tag push. What holds it above trivial is that `release.yml:399` installs from the lock and `python -m sigstore sign` runs at `:402`, three lines down past a comment, in a job holding `id-token: write`.
+
+### What is guarded, and what is not
+
+The report this row came from read as "sigstore has no pin guard". That is false, and the correction matters, because a reader deciding severity needs to know which failures are already covered.
+
+| Failure | Guard | Covered |
+| --- | --- | --- |
+| The declaration disappears from `pyproject.toml` | `test_the_ci_toolchain_groups_actually_raise_the_examined_count` asserts a name SET that lists `"sigstore"` (`tests/test_new_dependency_check.py:416`) | yes |
+| The lock stops pinning it, or loses its hashes | `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` (`tests/test_ci_venv_pinning.py:994`) | yes |
+| The lock stops being installed with `--require-hashes` | the same test | yes |
+| The lock goes unaudited | `pip-audit -r ci/locks/release-tools.lock` in `security.yml` | yes |
+| The lock stops being re-derived | `security.yml` DEP-1 export plus byte-diff, and `dependabot-lock-resync.yml:140,152,156` | yes |
+| **The group spec becomes a floor** | none | **no** |
+| **A second, inline install is added beside the lock install** | none | **no** |
+
+### The floor is the sharp half
+
+Rewriting the spec to `sigstore>=4.4.0` generates no test case anywhere. `test_moved_tool_pins_are_exact_not_floors` is parametrized over `EXACT_GROUP_PINS` and `test_floored_group_pins_stay_declared` over `FLOOR_BY_DESIGN`. Neither tuple holds `sigstore`, so neither runs for it.
+
+The one sigstore spec assertion inspects the *exported lock*, matching `^sigstore==`. That is structurally blind to the difference. The `EXACT_GROUP_PINS` docstring records the check that settles it: rewriting all three scanner specs to `>=` re-locked, re-exported byte-identically, and passed every guard in the repository. Attributed to that docstring, not re-measured here.
+
+What makes this worth filing is what the `==` is holding up. The version is an owner ruling, given 2026-08-22 and re-affirmed 2026-09-03. #332 built two things to make it stick: the pin itself, and `ignore: sigstore >=4.5.0` in `.github/dependabot.yml`. Measured: **no test asserts the version**. The `4.4.0` literal appears in `tests/` only in prose.
+
+So the ruling rests on one character that nothing checks. The `ignore` entry blunts the bot path but not a human `uv lock`, because `dependabot.yml` constrains only Dependabot's own pull requests.
+
+One correction to the report, because it pointed the wrong way. It said DEP-1's byte-diff would push back on a floor. It would not, on the path that matters: `dependabot-lock-resync.yml` re-exports `release-tools.lock` and `git add`s it automatically, so the gate stays green. That workflow's own comment block calls the seven artifacts out by name.
+
+### The inline reinstall is the second half
+
+Add one line to `release.yml`'s signing step, right after the lock install:
+
+```yaml
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m pip install "sigstore==4.5.0"
+```
+
+Measured, by evaluating the guards' own predicates against that line:
+
+| Guard | Why it does not fire |
+| --- | --- |
+| `test_release_path_pip_installs_name_a_version` | a blanket scan, but `_needs_a_pin("sigstore==4.5.0")` is `False` because the target carries `==`. Its non-vacuity floor is `>= 8` against 10 install lines today, and adding one moves the count up. |
+| `test_no_moved_tool_is_reinstalled_inline` | sweeps all 28 workflows, but only for `MOVED_TO_A_GROUP` names. The identical line naming `bandit` yields an offender; the one naming `sigstore` yields none. |
+| `test_release_toolchain_pin_is_present` | parametrized over `RELEASE_PINNED_TOOLS`, which no longer carries a sigstore row. No case is generated. |
+| `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` | asserts a substring is present. A second install removes no substring. |
+| the `LOCK_INSTALLED_TOOLCHAINS` tests | carry no row for `release.yml`. |
+| `.github/dependabot.yml`'s `ignore` | no Dependabot ecosystem parses a `run:` block. |
+
+Read that as "at least these do not fire". I enumerated the pytest suite in `tests/test_ci_venv_pinning.py` by symbol and the workflow-level gates. I did not check zizmor, Scorecard, or any non-pytest linter.
+
+An inline floor **is** caught, so only the pinned shape slips through. `_PIN_OPS` is `("==", "~=")` and excludes `>=` by design.
+
+### Two lock install sites are outside the fourth registry
+
+Joining every `ci/locks/*.lock` install across all 28 workflows against `LOCK_INSTALLED_TOOLCHAINS`:
+
+```
+workflow                     lock                           sites  registered
+quality-advisory.yml         ci/locks/ci-quality.lock       2      2
+security.yml                 ci/locks/ci-scanners.lock      3      3
+zizmor.yml                   ci/locks/ci-scanners.lock      1      1
+release.yml                  ci/locks/release-tools.lock    1      NOT REGISTERED
+required-workflow-state.yml  ci/locks/ci-scanners.lock      2      NOT REGISTERED
+```
+
+Three exact agreements are the control. Both uncovered sites use `--require-hashes` today. What is missing is anything that would notice if one stopped, and the exact-count check that stops one of a pair being deleted silently.
+
+The `release.yml` row is **#332's already-named residual**, not new here.
+
+### Why this belongs with #332
+
+#332's banner states the item is open for "step 6 only", which is moving `build` and `cyclonedx-bom` into the same group. `MOVED_TO_A_GROUP`'s docstring defines its population as tools that moved from an inline pin into a PEP 735 group. So step 6 requires adding both names to `MOVED_TO_A_GROUP` and `EXACT_GROUP_PINS`. That is the same two tuples this row edits.
+
+The same banner also declares "steps 2, 3 and 5 are done". Step 5 required the guard to be re-pointed rather than deleted, and it was. This row narrows that claim rather than contradicting it: the replacement covers deletion of the lock install, and does not cover spec shape or a second install.
+
+Land the two together, and correct that line in the same commit. Filing this as an unrelated subject would leave the qualification in one place and #332's claim standing in another.
+
+### What to build
+
+1. Add `"sigstore"` to `MOVED_TO_A_GROUP` and to `EXACT_GROUP_PINS`, each with its reason in the comment style the surrounding entries use. **This is the one edit that closes the floor.**
+2. Add `("release.yml", "ci/locks/release-tools.lock", 1)` and `("required-workflow-state.yml", "ci/locks/ci-scanners.lock", 2)` to `LOCK_INSTALLED_TOOLCHAINS`.
+3. Inject each regression once and confirm the new guard reds, rather than trusting that it would.
+
+A correction to the draft's rationale for step 2. It claimed that row would be the first check to red on a floor. It would not. `test_each_group_pin_reaches_its_own_lock` gates its version assertion on `"==" in spec`, so a floor skips that branch and only the name-presence assertion runs. Step 2 is worth doing for the DEP-1 and site-count coverage. Step 1 is what holds the ruling.
+
+Measured green against the tree as it stands: no inline sigstore install exists in any workflow, `sigstore==4.4.0` satisfies the exact-pin pattern, `security.yml` carries the exact `uv export --only-group release-tools` line the DEP-1 assertion requires, `release-tools.lock` pins `sigstore==4.4.0`, and both uncovered sites already use `--require-hashes`.
+
+Difficulty is 3 rather than 2 because of the coupling, not the edit. The tuples are one line each. Coordinating with #332's step 6 and correcting its banner in the same commit is the real cost, alongside the explanatory comment each entry in that file carries.
+
+### One completeness claim this falsifies
+
+`FLOOR_BY_DESIGN`'s docstring says reading it and `EXACT_GROUP_PINS` together "tells you every group spec's intended shape — so 'floor by design' can never be mistaken for 'floor nobody noticed'". `sigstore` is in neither, so today the two tables do not tell you that. Worth fixing in the same pass, since step 1 restores the property.
+
+### The version is not in scope
+
+**This row does not propose changing `sigstore==4.4.0`, and must not be read as reopening it.** That version is an owner ruling, twice affirmed. Its rationale lives once, at the `release-tools` group in `pyproject.toml`, with the record in [#332](#332). Everything here is about what guards the pin, never about what the pin says. Step 1 would make the ruling harder to undo, not easier.
