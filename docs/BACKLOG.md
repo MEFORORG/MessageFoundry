@@ -31943,6 +31943,10 @@ Controls A to C (route-handoff idempotency, premature finalize, handoff atomicit
 ## 1609. in the default pooled claim mode a dead stage claimer is never respawned, so its whole stage stops draining while intake keeps acknowledging and status reads healthy
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-02, vault PR 1477). Open; not started.** Value **6/10**, Difficulty **3/10**. `StageDispatcher._on_task_done` logs a claimer or sweep task that exits with an exception and returns; its own docstring says respawning "is still not implemented" and calls the result a known gap. `pooled_claimers_per_stage` defaults to 1, so one claimer is the whole stage. Measured by injection: the INGRESS claimer died, was not respawned, five further messages were acknowledged `AA`, all six sat at `received` with six pending ingress rows, and `runner.running`, `degraded_connections()` and `dispatcher.running` all read healthy. The OUTBOUND claimer wedged the same way at `routed`. The per-lane opt-out mode respawns all three of its worker kinds through `_on_worker_done` and `_on_inbound_worker_done`, so the shipped default is the unsupervised one. Value 6: the impact is June's H-1 one level up (every lane of a stage, silently, with intake still ACKing); reachability is low, because the store claim, the serializer body and the sweep are each guarded and were measured to survive, so only the dispatcher's own await-free bookkeeping can kill the loop. Difficulty 3: a respawn under the same guard the per-lane callbacks use, a re-seed of the partition's ready set, and a degraded flag the status surfaces already render.
+
+## 1617. the MLLP listener writes its ACK with an unbounded drain, so a peer that never reads pins its connection slot and stop() takes 15 seconds and abandons the socket
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-01, vault PR 1476). Open; not started.** Value **7/10**, Difficulty **2/10**. June's M-14, re-measured and still standing. `_on_client` in `transports/mllp.py` awaits `writer.drain()` with no bound after every ACK. Measured at engine `2ffcf3347`: a peer that stopped reading took 54 replies before the drain blocked, `receive_timeout` never fired, two such senders held both of `max_connections` 2 while a third was torn down, and `stop()` took 15.04 s (three 5 s graces) and abandoned the socket.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -31968,6 +31972,26 @@ Controls A to C (route-handoff idempotency, premature finalize, handoff atomicit
 ## 1597. split_by_obr attaches observations to the wrong order when the message carries a blank segment
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-04, vault PR 1475). Open; not started. Shadowed by 1594 today; fix both in one change.** Value **5/10**, Difficulty **2/10**. `msg.segments()` counts a blank segment; the line list `split_by_obr` slices positionally drops empty lines; every slice after the blank is off by one. Measured: header `MSH, PID, (blank), OBR 1, OBX v1, OBR 2, OBX v2` splits into `MSH, PID, OBR 1, OBX v1, OBR 2` and `MSH, PID, OBR 1, OBX v2`, so the second order's result is filed under the first order. Value 5: a per-order fan-out would deliver a result under the wrong accession. Difficulty 2: align the slice to `segments()` or route through `Message.groups()`.
+**Cluster:** Connections & Transports. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). No message is lost. A site exposing the listener would find one non-reading sender able to refuse every other sender for as long as it holds `max_connections` sockets, and every shutdown or reload would pay the full grace on each.
+
+### The read timeout does not cover the write
+
+`receive_timeout` bounds the wait for the next frame. The ACK write sits after that wait, and `writer.drain()` blocks once the peer's receive window fills. Nothing bounds it, so the handler task, its `_active` slot and the socket all outlive the peer's cooperation. `stop()` closes `_clients` and waits its grace per handler; a handler blocked in `drain()` does not observe the close until the grace expires.
+
+### What closing looks like
+
+1. Wrap the drain in `wait_for(writer.drain(), receive_timeout)` and emit a `write_timeout` connection event on expiry, then drop the connection.
+2. In `stop()`, call `transport.abort()` on any writer that still has a buffer, so the grace is not paid for a peer that will never read.
+3. A raw-socket test: a client that sends frames and never reads, asserting the slot is released within the timeout and that `stop()` returns promptly.
+
+**Duplicate search.** No match in either ledger on `writer.drain`, `unbounded drain`, `ACK write`, `M-14`, `max_connections`. Packet 9's P9-10 files the same shape for the X12 and TCP sources; the two items should land as siblings.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-01, carries the raw-socket reproduction.
+
+## 1618. FileDestination publishes without fsync, so a crash after the outbox marks the row delivered can leave an empty file that is never re-delivered
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-02, vault PR 1476). Open; not started.** Value **6/10**, Difficulty **2/10**. June's M-16, re-measured and still standing. `_write` in `transports/file.py` does `fdopen`, write, close, then link or replace. Zero `os.fsync` calls were counted across four deliveries on both publish paths at engine `2ffcf3347`, and the copy fallback does not fsync either. The docstring's "atomic" is a visibility claim that reads as a durability claim.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32017,6 +32041,26 @@ Controls in the same run: an injected fault in the serializer body re-pended the
 ## 1611. in-flight recovery is restart-only: a transient store fault between a committed claim and its handoff strands the row in flight, a reload does not recover it, and the stall alert cannot see it
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-03, vault PR 1477). Open; not started.** Value **7/10**, Difficulty **4/10**. The claim is its own committed transaction; the handoff that follows is guarded by `except Exception` in every worker, which logs and backs off but never re-pends the head it claimed. `reset_stale_inflight` runs from `Engine.start()` and the cluster promotion path only. `list_fifo_lanes` and `pending_depth` select `status='pending'`, so neither the pooled sweep nor the buildup and stall alerts see an in-flight row. Measured: one injected `route_handoff` fault in `per_lane` mode left the message `received` with its ingress row `inflight`, the worker alive, for the whole window; `reload()` left it in flight; only stop, `reset_stale_inflight` and start delivered it. In `pooled` mode the T17 path re-pended the head and it delivered, but with `reschedule_claimed` faulting once too the row stranded the same way. Value 7: a first deployment would meet this on the first SQLite busy-timeout during a handoff; nothing is lost or duplicated, but one acknowledged message would sit unrouted, overtaken by its successors, until a service restart, with the stall alert reading healthy. Difficulty 4: a best-effort re-pend in the per-lane except paths, a periodic age-gated reclaim for single-node stores, an in-flight age on the stall instrument, and two comments.
+**Cluster:** Connections & Transports. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). A power loss between the close and the page-cache flush would leave a zero-length or partial file under the final name while the store says the row was delivered. At-least-once delivery ends at the outbox row, so nothing would re-send it.
+
+### Atomic rename is not durable write
+
+The rename makes the final name appear all at once. It says nothing about whether the bytes behind it reached the disk. Without `fsync` on the file before the rename, and on the directory after it on POSIX, the ordering the docstring promises holds only in the page cache.
+
+### What closing looks like
+
+1. `flush` and `os.fsync` the file before closing it, on both the link and the replace path.
+2. On POSIX, fsync the directory after the rename.
+3. A test that counts `os.fsync` calls per delivery and asserts at least one on each path.
+
+**Duplicate search.** The `fsync` hits in both ledgers are #320 (CI speed) and the closed store group-commit items (#63, #90, #217); none is the file destination.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-02.
+
+## 1619. the MLLP last-resort catch answers a store outage by dropping the connection with no NAK and records it as framing_error
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-03, vault PR 1476). Open; not started.** Value **6/10**, Difficulty **4/10**. The tail of packet 1's P1-01 (#1594) and the arm DELTA-02 named. The `except Exception` arm in `_on_client` logs, emits `framing_error`, and breaks; the runner's `enqueue_ingress` and `_record` calls sit outside any `try`. Measured at engine `2ffcf3347`: `IndexError`, `ValueError` and `RuntimeError("database is locked")` each returned zero bytes to the sender and recorded `established`, `framing_error`.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32067,6 +32111,26 @@ With one row claimed in flight, `pending_depth` on that lane read 0.
 ## 1612. ingress and routed rows for an inbound removed before a restart sit pending forever, with no dead-letter, no warning, and no alert able to see them
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-04, vault PR 1477). Open; not started.** Value **5/10**, Difficulty **2/10**. `Engine._start_graph` sweeps rows for missing destinations and missing handlers after `reset_stale_inflight`, and nothing sweeps rows for a missing channel. The pooled lane provider for the ingress and routed stages is the live registry's inbound set, so a removed channel's lane is never claimed or swept; the per-lane worker re-pends the row retry-forever and exits. The buildup and stall checks iterate registry lanes, so `pending_depth` is never asked about the orphan channel. Measured: two messages acknowledged on `mllp_in`, then a restart with `mllp_in` removed; both sweeps returned 0, both messages stayed `received` with two pending ingress rows, no warning was logged, nothing was degraded. Value 5: June's H-5 closed this shape for outbounds by dead-lettering with a reason so the rows are visible and replayable; the ingress stage kept the retention half of that fix and not the visibility half, so a renamed inbound (the naming convention invites renames) leaves every message acknowledged under the old name looking "in progress" forever. Difficulty 2: one more sweep beside the two that exist, or a startup warning plus an orphan-lane pass in the buildup check.
+**Cluster:** Connections & Transports. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). Nothing is accepted and dropped: the sender gets no ACK, so it retries. But during a store outage every persistent sender would lose its socket per message in a hot reconnect loop, and the event log would blame framing for a store fault.
+
+### Two halves, two packets
+
+The transport half: the last-resort arm should emit `handler_error`, not `framing_error`, and attempt one defensively built transient NAK (`AR` or `AE`) before dropping. The runner half is packet 3's area: wrap the ingress commit and NAK `AE` on a store exception. #1594 carries the runner-side guard for the parse escape; this item is the arm behind it. Re-measure both before building, since the packet 1 and packet 3 items may already have moved the runner side.
+
+### What closing looks like
+
+1. The transport arm emits `handler_error` and sends a transient NAK when it can build one.
+2. The runner wraps `enqueue_ingress` and `_record` and NAKs on a store exception.
+3. Extend `test_mllp_handler_exception_is_caught_and_redacted` to assert the event kind and the NAK bytes.
+
+**Duplicate search.** No match on `framing_error`, `last-resort`, `store outage`. #1594 (PR 1066) is the parse-side escape this arm catches; cited, not duplicated.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-03.
+
+## 1620. FileSource.stop() waits without bound for a blocked share call, and a batch file's hand-offs cannot be interrupted
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-05, vault PR 1476). Open; not started.** Value **5/10**, Difficulty **3/10**. The residual of June's M-17. `stop()` gathers the poll task with no timeout; every share touch is an uncancellable `to_thread` call; `_emit` has no stop check between a batch file's hand-offs; and the runner's plain `stop()` awaits each source serially and without bound (the demote path bounds it). Measured at engine `2ffcf3347`: with the directory listing blocked for 6 s, `stop()` had not returned after 2 s.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32112,6 +32176,27 @@ Add `RecursionError` to `parse_error_types()`, or pre-walk the object with a dep
 ## 1613. a mistyped inbound encoding passes config validation and start, then every message on that inbound raises LookupError out of both handlers with no disposition and no NAK
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-05, vault PR 1477). Open; not started.** Value **5/10**, Difficulty **1/10**. The inbound `encoding` setting reaches `normalize(raw, encoding=..., errors="strict")` and `raw.decode(encoding)` in `_handle_inbound` and `_handle_inbound_http`, whose `except` catches `UnicodeDecodeError` only; nothing in `config/wiring.py`, `build_check_registry` or `build_source` calls `codecs.lookup` on it. Measured: `encoding="utf-99"` passed `build_check`, `start()` reported running with nothing degraded, and a well-formed synthetic ADT raised `LookupError: unknown encoding: utf-99` from both handlers with zero rows and no ACK; the MLLP server's last-resort catch would then drop the sender's connection on every message. `latin-1` and `utf-16` behaved correctly (accept, and decode-error NAK `AR` respectively). Value 5: not attacker-influenced, but a one-character config error would silently lose every message on that connection until the partner complained, with the engine reporting the connection healthy; June's neighbouring config-typo rows (M-22, M-23) surfaced as loud tracebacks and were graded Medium. Difficulty 1: a `codecs.lookup` at load, and one name in two `except` tuples.
+**Cluster:** Connections & Transports. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). A reload during a share outage would block for the operating system's own timeout while holding the reload lock, and a shutdown would wait the same.
+
+### The credential context already has the give-up arm
+
+`test_close_gives_up_on_a_wedged_worker_and_says_so` pins a bounded give-up for the credential context. The poll task has no such arm, so the same wedge on a listing or a read is unbounded.
+
+### What closing looks like
+
+1. In `stop()`, wait a bounded time for the poll task, then cancel it and log that a share call was abandoned.
+2. A stop check in `_emit` between a batch file's hand-offs.
+3. The runner half (a bounded, parallel `source.stop()` on the plain stop path) is packet 3's; cross-check its items before building.
+4. A blocked-listing test asserting `stop()` returns within the bound.
+
+**Duplicate search.** No match on `FileSource.stop`, `blocked share`, `dead share`, `M-17`; the one `FileSource.stop` hit is #1128 (ASVS research), which cites the function for another reason.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-05.
+
+## 1621. the file source's four quarantine arms record nothing in the store while the MLLP over-cap arm records a connection event
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-06, vault PR 1476). Open; not started.** Value **4/10**, Difficulty **2/10**. The oversize half of June's M-15. The oversize, gunzip-failure, content-mismatch and scanner-rejection arms in `transports/file.py` move the file to `.error` and log; the module never references `on_connection_event`, although the runner injects it on every source. MLLP's `frame_oversize` reaches the store.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32158,6 +32243,87 @@ The HTTP handler escaped identically and returned no receipt id.
 ## 1614. the supervision paths packet 3 had to measure by hand have no tests: router and transform respawn, a pooled claimer death, and a transient handoff fault with the worker alive
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-08, vault PR 1477). Open; not started.** Value **4/10**, Difficulty **2/10**. No test exercises `_on_inbound_worker_done` (the router and transform respawn); `tests/test_task_resilience.py` covers the delivery worker only, and its respawn test calls `_on_worker_done` by hand rather than through the task's done-callback, so the wiring itself is unpinned. No test exercises a pooled claimer or sweep death. No test covers a transient handoff fault with the worker still alive and no restart; the existing `reset_stale_inflight` tests simulate a crash instead. Each of these was measured by injection during the review and the probe is a working draft. Value 4: June's `xc: concurrency` verdict was needs-attention on exactly these paths, and the move to adequate rests on measurements no test repeats. Difficulty 2: three failure-injection tests on a running runner.
+**Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Visibility, not loss: the file is kept in quarantine. The only record of a quarantined drop would be a log line, invisible to the web console and to the alert sinks that read connection events.
+
+### What closing looks like
+
+1. One emit per arm: `file_oversize`, `file_decompress_failed`, `file_content_mismatch`, `file_scan_rejected`.
+2. Extend the event vocabulary in `store/base.py` and the console filter.
+3. One test per arm asserting the event reaches the injected callback.
+
+Packet 9's P9-11 (REMOTEFILE quarantine records) was handed to this item by name; cover the remote file source's arms in the same change.
+
+**Duplicate search.** No match on `quarantine` with `event`, `file_oversize`, `on_connection_event`; the vault's `quarantine` hits are #204's scan-hook seam, which is the scanner, not its record.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-06.
+
+## 1622. the _claim_unique copy fallback publishes an empty file at the final name before the content lands, on the filesystems it exists for
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-07, vault PR 1476). Open; not started.** Value **4/10**, Difficulty **3/10**. A side effect of June's low-5. The fallback claims the final name with `O_CREAT | O_EXCL` and then fills it with `copyfileobj`; the docstrings promise an atomic publish. Measured at engine `2ffcf3347`: the final name was present at size 0 when the copy began and reached its 100,000-byte payload only afterwards.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). The fallback exists for filesystems without hard links (FAT, exFAT, some SMB shares). A downstream poller on one of those would pick up empty or partial files under the final name.
+
+### What closing looks like
+
+1. On Windows, use `os.rename` (no-clobber, atomic) as the first fallback.
+2. For the POSIX residual, either a second temp file plus a claim marker, or an honest docstring that says the fallback is not atomic.
+3. A test asserting the final name never exists at less than the payload size.
+
+**Duplicate search.** Closed #1046 fixed the inbound archive move's exists-check by adopting the `O_EXCL` claim this item is about; it is the neighbour, not the same defect. No other match on `_claim_unique`, `copy fallback`, `zero-length`.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-07.
+
+## 1623. render_filename and the verify_ack_control_id peek leak IndexError on a blank segment past the DeliveryError contract
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (findings P2-08 and P2-09, vault PR 1476). Open; not started.** Value **4/10**, Difficulty **1/10**. `render_filename` catches `HL7PeekError` and then reads `peek.field`, which raises `IndexError` on a blank segment; the `verify_ack_control_id` peek catches `HL7PeekError` only. Both measured at engine `2ffcf3347`. The third site packet 1 found, `reencode_delimiters` and `AssertionError`, is #1601 and is not restated here.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). Each escapes `send()` as an internal error rather than a `DeliveryError`, so the delivery worker dead-letters it as unclassified. The two `IndexError` sites go live the moment #1594 lets a blank-segment message past the pre-ACK peek.
+
+### What closing looks like
+
+1. Widen the catch tuple at both sites to include `IndexError`.
+2. One test per site with a blank interior segment.
+3. Land beside #1601 or after it; the three sites share one contract.
+
+**Duplicate search.** #1601 (PR 1066) covers the `reencode_delimiters` half only. No other match on `render_filename`, `verify_ack_control_id`, `peek.field`, `blank segment` outside PR 1066.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), findings P2-08 and P2-09.
+
+## 1624. the connector contract in transports/base.py under-specifies stop(), the registry overwrites silently, and the plugin claim is false as written
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-10, vault PR 1476). Open; not started.** Value **4/10**, Difficulty **3/10**. The ABC does not state that `stop()` must be bounded, close peers, or be idempotent; it does not state never-accept-and-drop or the handler-raises contract; the event vocabulary lives in `store/base.py` and the console filter rather than beside the connectors. `register_source` overwrites an existing name silently (measured). `ConnectorType("kafka")` raises, so "adding a transport never touches the channel model" and "Plugins may register additional values" are false as written.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis for the prose. The silent overwrite would let a loaded plugin replace a built-in connector with no diagnostic.
+
+### What closing looks like
+
+1. Docstrings on the ABC stating the `stop()` bounds, peer closing, idempotency, never-accept-and-drop and the handler-raises contract.
+2. A `frozenset` of the event vocabulary in `transports/base.py` that the store and the console import.
+3. `register_source` and `register_destination` refuse a duplicate name unless `replace=True`.
+4. An owner decision on opening the `ConnectorType` enum versus correcting the two claims; either way, the text and the code must agree.
+
+Packet 18 (documentation accuracy) was flagged with the two false claims; its pass-2 proposals should cite this item rather than file the prose alone.
+
+**Duplicate search.** No match on `register_source` with `overwrite`, `Plugins may register`, `extension point` in the connector sense, `ConnectorType(`.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-10.
+
+## 1625. the file source logs file names at WARNING while its own docstring says a file name can embed an MRN, and logs a raw exception where MLLP scrubs
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 2 (finding P2-11, vault PR 1476; graded PLAUSIBLE). Open; not started.** Value **3/10**, Difficulty **2/10**. Eight `path.name` WARNING sites in `transports/file.py` sit against the `_file_key` docstring's own premise that a partner may name drops by MRN. The handler-failure arm logs `exc` where `transports/mllp.py` uses `safe_exc`.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32174,6 +32340,20 @@ Add `AssertionError` to the tuple in `reencode_delimiters` so it surfaces as the
 ## 1602. validate.py and consistency.py say strict validation checks datatypes, table values and lengths; measured, it checks structure, cardinality and required fields
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-09, vault PR 1475). Open; not started.** Value **3/10**, Difficulty **1/10**. `messagefoundry/parsing/validate.py`'s module docstring and `messagefoundry/parsing/consistency.py`'s opening paragraph both claim hl7apy strict validation checks "datatypes, table values and lengths". Measured 2026-09-11: a malformed PID-7 date, a 300-character PID-3 and an invalid PID-8 all pass; a missing required segment, a duplicate EVN, a field beyond the segment definition, an unknown trigger and an unsupported version are rejected. `config/models.py` describes the tier correctly. Value 3: a Handler author reading the docstring would believe lengths were enforced, which is a control-shaped promise. Difficulty 1: two docstrings.
+**Severity:** conditional (sec. 0). A partner naming drops by MRN would put the MRN in the service log on every quarantine or failure.
+
+### Two halves, one of them conditional on a ruling
+
+1. `safe_exc` on the handler-failure arm, unconditionally.
+2. A `safe_name` helper for the eight WARNING sites, conditional on packet 18's PHI ruling on logged file names. If the ruling goes the other way, close that half as declined in the same PR and say why.
+
+**Duplicate search.** No match on `path.name` with `WARNING`, `safe_name`, `file name` with `MRN`. Packet 18's pass-2 proposals mention the same sites; the Manager should point them here.
+
+**Source.** `docs/reviews/FABLE-PACKET-2-TRANSPORTS-2026-09-11-FINDINGS.md` (vault PR 1476), finding P2-11.
+
+## 1626. [store].connect_timeout is inert on SQL Server because the DSN keyword the store emits is not one ODBC Driver 18 reads
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 4 (finding P4-03 and the H-6b residual, vault PR 1478). Open; not started.** Value **6/10**, Difficulty **2/10**. `connection_string` in `store/sqlserver.py` emits `Connection Timeout=<n>`; the Microsoft ODBC driver ignores that keyword, and the login timeout it was meant to set is the `pyodbc.connect` argument `timeout=` (`SQL_ATTR_LOGIN_TIMEOUT`). Measured with pyodbc 5.3.0 and ODBC Driver 18 against a black-hole address: DSN `Connection Timeout=2` failed after 15.1 s, DSN `LoginTimeout=2` 15.1 s, no timeout 15.1 s, `pyodbc.connect(timeout=2)` 2.1 s. The 15.1 s is the operating system's TCP connect timeout.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32190,6 +32370,26 @@ Rewrite the two docstrings to say what the tier checks (structure, cardinality, 
 ## 1603. x12 validate silences the pyx12 logger with a process-global level flip that a concurrent pass could undo mid-pass
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-10, vault PR 1475). Open; not started.** Value **2/10**, Difficulty **1/10**. `_silence_pyx12_logger` in `messagefoundry/parsing/x12/validate.py` sets the `pyx12` logger to `CRITICAL + 1` and restores the previous level on exit. Two overlapping passes on separate threads would interleave: the first to finish restores the pre-silence level while the second is still running, and pyx12's ERROR records, which embed the offending element value, would reach the general log for the rest of that pass. No concurrent caller exists today (a Handler invokes it synchronously on its transform worker); the day validation runs off the loop or under free threading, it is live. Value 2: plausible, not reachable now. Difficulty 1: install a filter once at import instead, as the hl7 silencer does.
+**Cluster:** Store / Operations. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0); not a PHI exposure. Every SQL Server connect is affected: the pool, the RCSI probe, the sync-handoff connections and the claim holders. A first deployment would wait the operating system's timeout on an unreachable server regardless of the configured value, and closed #100 (MultiSubnetFailover) reasons about reconnect speed on the assumption the setting works.
+
+### The second half of June's H-6
+
+Closed #1 recorded H-6 as fixed on the strength of the statement-timeout half. The `_acquire` docstring says the keyword is the login timeout, and `docs/CONFIGURATION.md` documents the setting as effective for `serve` with a 15 s default; both are wrong for SQL Server (the doc row is flagged to packet 18). Postgres already passes `timeout=settings.connect_timeout` to `asyncpg.create_pool`.
+
+### What closing looks like
+
+1. Pass `timeout=settings.connect_timeout` to `aioodbc.create_pool`, `aioodbc.connect` and the direct `pyodbc.connect` calls (`aioodbc` forwards keyword arguments).
+2. Correct the `_acquire` docstring and the configuration row.
+3. A plain-leg test asserting the keyword argument reaches the pool factory.
+
+**Duplicate search.** No match on `connect_timeout` with SQL Server, `Connection Timeout`, `login timeout`, `LOGIN_TIMEOUT`, `H-6`; closed #1 and closed #100 are the two mentions and neither files this.
+
+**Source.** `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md` (vault PR 1478), part 2 (H-6b) and finding P4-03.
+
+## 1627. a server store open() that fails after connecting leaks the pool on Postgres and the dedicated executor on SQL Server, so a restart loop would exhaust the database's connection limit
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 4 (findings P4-04 and P4-07 and the M-6 Postgres residual, vault PR 1478). Open; not started.** Value **7/10**, Difficulty **2/10**. `PostgresStore.open` creates the pool, then runs `_ensure_schema`, `checkpoint_cipher_invocations`, `_encrypt_existing_rows`, `_load_audit_chain_meta`, `_load_state_cache` and `_load_reference_cache` with no `try`/`except`. `SqlServerStore.open` has the guard (citing M-6) but does not shut down the `ThreadPoolExecutor` it built for that pool. Measured at engine `2ffcf3347` against PostgreSQL 16 with `_load_reference_cache` patched to raise: three `open()` attempts took `pg_stat_activity` backends for the store's application name from 0 to 3.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32221,6 +32421,22 @@ Attach a permanent filter (or level) to the `pyx12` logger tree once, at module 
 ## 1615. the dependency-boundary test forbids the retired console package name, not the live web console package
 
 > 🔢 **Filed 2026-09-12 by Fable review packet 3 (finding P3-09, vault PR 1477). Open; not started.** Value **3/10**, Difficulty **1/10**. `tests/test_dependency_boundaries.py` lists `messagefoundry.console` in `_FORBIDDEN`; the operator console is the top-level package `messagefoundry_webconsole` (ADR 0065), which the rule does not name, and `starlette` and `uvicorn` are not listed beside `fastapi`. Measured: importing `pipeline.engine` and `pipeline.wiring_runner` in a fresh interpreter loads 141 `messagefoundry` modules and none of the forbidden or web-console packages, so this is a gap in the guard, not a violation. The test itself is otherwise real: an AST walk with relative imports resolved, asserting an empty violation list, so it would catch a `fastapi` import; it would not catch a `messagefoundry_webconsole` one. Value 3: the one-way dependency rule is the governing invariant for parallel work and this is its cheapest hole. Difficulty 1: names in a tuple.
+**Cluster:** Store / Operations. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0); not a PHI exposure. A Windows service under NSSM restart-on-failure, or a supervisor respawning engine shards, against a Postgres whose initialisation raises (a denied `CREATE`, a stuck `statement_timeout`, a keyless open against keyed rows) would consume one server backend per attempt until `max_connections` (100 by default) is reached, taking every other client of that server with it.
+
+### What closing looks like
+
+1. Postgres: wrap the post-pool steps as SQL Server does, `await pool.close()` on exception, re-raise.
+2. SQL Server: `executor.shutdown(wait=False)` in the existing `except`.
+3. One test per backend injecting a failure after the pool exists and asserting the pool (and executor) is closed.
+
+**Duplicate search.** No match on `PostgresStore.open`, `pool leak`, `pool.close`, `executor`, `M-6`, `first-open`; closed #1 records the SQL Server half of M-6 and nothing names the Postgres twin.
+
+**Source.** `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md` (vault PR 1478), part 2 (M-6), findings P4-04 and P4-07.
+
+## 1628. the SQL Server finalize path deadlocks under locking READ COMMITTED, which is the mode a deployment would run in when the login cannot enable RCSI
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 4 (finding P4-05 and the H-8 residual, vault PR 1478). Open; not started.** Value **6/10**, Difficulty **3/10**. `mark_done`, `mark_failed`, `cancel_queued` and their batch forms update the caller's own queue row, then `_maybe_finalize` takes the per-message applock and scans every row of the message. Under RCSI, which `_ensure_database_options` enables at `open()`, 60 of 60 concurrent fan-out finalisations succeeded. Under locking READ COMMITTED, 29 of 30 failed: 26 as `sp_getapplock` return code -3 (deadlock victim) and 3 as error 40001 on the scan, each leaving the message unfinalised.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32273,3 +32489,989 @@ Both must be shown to turn red with the lock removed before they are trusted; th
 ### What to build
 
 Add `messagefoundry_webconsole` to `_FORBIDDEN`, and `starlette` and `uvicorn` beside `fastapi`. Make it fail on purpose first with a throwaway import in an engine module, then remove the import. Land with or after item 1596 so the two edits to the same tuple do not conflict.
+**Cluster:** Store / Operations. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0); not a PHI exposure. `_ensure_database_options` degrades to a warning when `ALTER DATABASE` is denied, and `require_rcsi_for_pooled` fails closed only for the pooled claim mode. A least-privilege login, which the store's own privilege preflight exists to support, is exactly the principal without `ALTER DATABASE`. CI runs as `sa` and cannot reach this branch, so `test_rcsi_enabled_after_open` and `test_require_rcsi_for_pooled_passes_on_healthy_db` can only ever pass there.
+
+### The lock order is row then applock, and the scan needs the sibling's row
+
+Under locking read committed the finalize scan needs a shared lock on the sibling's row, which the sibling holds exclusively while waiting on the applock. Two workers finishing one message's two destinations at once form the cycle.
+
+### Two acceptable end states
+
+1. Take the finalize applock before the caller's own row `UPDATE`, so the order is applock then row and no cycle exists. Survives both isolation modes.
+2. Fail closed at `open()` when RCSI is off, as pooled mode already does. Migration cost is zero, so this is the simpler correct end state.
+
+Either way, add a live-leg test that opens with the open-time RCSI enable disabled and RCSI off, and runs the concurrent finalize.
+
+**Duplicate search.** No match on `_maybe_finalize`, `deadlock` with `finalize`, `RCSI`, `READ_COMMITTED_SNAPSHOT`, `H-8`, `1205`, `40001`; closed #1 records H-8 as fixed by RCSI-at-open plus the applock, and the residue is the denied-ALTER branch it did not consider. #1610 (PR 1069) is the missing test for the finalize lock, not this deadlock.
+
+**Source.** `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md` (vault PR 1478), part 2 (H-8) and finding P4-05, both failure shapes quoted.
+
+## 1629. the SQL Server and Postgres store test fixtures are not exception-safe between open() and yield, so one setup failure leaks a pool per test and hides the real cause
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 4 (finding P4-08, vault PR 1478). Open; not started.** Value **4/10**, Difficulty **1/10**. In `tests/test_postgres_store.py` the `store` fixture calls `PostgresStore.open`, then `TRUNCATE`, then two cache loads, then `yield`; `close()` runs only after a successful yield. `tests/test_sqlserver_store.py` has the same shape. Measured against a database carrying an older schema: 153 setup errors, the first a real `UndefinedColumnError` and the remaining 152 `TooManyConnectionsError` at `max_connections=100`, so the true cause was visible in one of 153 reports.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI reliability / harness fixtures. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0); test infrastructure only. SQL Server's default session limit hides the same leak.
+
+### What closing looks like
+
+1. `try`/`finally` around everything after `open()` in both fixtures, or `contextlib.aclosing`.
+2. A control that injects a failure into the post-open step and asserts the next test's setup still connects.
+
+**Duplicate search.** No match for these fixtures. Open #1515 is the same shape for `test_harness_monitor`'s server fixture and should be cross-cited; searched `fixture` with `leak`, `TooManyConnections`, `too many clients`, `max_connections`.
+
+**Source.** `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md` (vault PR 1478), finding P4-08.
+
+## 1630. SQLite store: the inline transaction path is not cancel-safe, so a cancelled stage handoff leaves the writer connection mid-transaction and the next writer commits the half-body
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-01, vault PR 1483). Open; not started.** Value **8/10**, Difficulty **3/10**. `store/store.py` `_run_grouped` (the inline path every grouped writer takes when group commit is off, the shipped default) and every explicit-`BEGIN` writer in the file roll back on `except Exception`. `asyncio.CancelledError` derives from `BaseException`, so a cancel delivered inside the body releases `self._lock` with the transaction open and every statement up to the cancel applied. Measured at engine `2ffcf3347`: a `route_handoff` cancelled after its guarded ingress-row `DELETE` was committed by the next writer, leaving a `received` message with no queue row that no worker would ever see, and `reset_stale_inflight` recovered 0; a `transform_handoff` cancelled after one of two outbound rows was inserted delivered to one destination and finalized `PROCESSED`; an `enqueue_ingress` cancelled between its two inserts left a phantom `received` row. On a keyed (AES-GCM) store, `close()` alone commits the half-body, because its first act is the GCM invocation settlement write.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store & Reliability. **Priority:** P1. **Verdict:** build.
+**Severity:** high, conditional (sec. 0). A first deployment stopping the service while a backlog drains would lose messages from the pipeline with the store reporting them `received` or `processed`: no `ERROR`, no dead letter, no alert, no NAK. Reachable with no fault injection: `RegistryRunner._teardown_body` cancels every worker and pooled serializer, then the connection-event drainer flush and `Engine.stop()`'s `store.close()` each write on the same connection before it closes; the H-2 shutdown grace and a reload's quiesce cancel an MLLP handler blocked in `enqueue_ingress` the same way. Under group commit the same cancel is safe (the committer owns the transaction); group commit is off by default.
+
+### The next writer is the next borrower
+
+Python's `sqlite3` in its default transaction mode lets the next statement without an explicit `BEGIN` join the open transaction, and that writer's `commit()` commits both. A writer that does start with `BEGIN` fails once instead (`cannot start a transaction within a transaction`), and its own rollback then discards the half-body, which is packet 3's P3-03 strand (#1611) for that writer's row. Closed #348 (ADR 0159) fixed the SQL Server twin and scoped SQLite out with "one writer connection under an `asyncio.Lock` and no pool, so there is no next borrower"; the measurement above refutes the scoping.
+
+### What closing looks like
+
+1. In `_run_grouped`'s inline path and in every explicit-`BEGIN` writer: `except BaseException: await self._db.rollback(); raise`, keeping the `_AbortMember` arm first. aiosqlite serializes the rollback behind the in-flight statement on its worker thread, so the ordering is safe.
+2. Store-level tests that cancel a task inside `route_handoff`, `transform_handoff` and `enqueue_ingress` and assert, from a second connection, that the pre-cancel rows are intact after one further write and after `close()`, with the keyed-store `close()` case explicit.
+3. Consider a debug assertion at lock acquisition that the writer is not already `in_transaction`.
+4. Update ADR 0159's scope statement and the comment at `stage_dispatcher.py` `stop()` ("leaves its claimed rows INFLIGHT"), which hold on SQLite only when nothing writes before the connection closes.
+
+**Duplicate search.** No open item. Closed #348 is the SQL Server twin (see above). Closed #1494 fixed the same exception-class mistake in `_release_leadership`. Searched both ledgers for `CancelledError`, `cancel-safe`, `open transaction`, `BaseException`, `_run_grouped`, `rollback`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-01. The same proposal is on engine PR 1072 as `docs/backlog-proposals/fable-packet5-storecore.md`.
+
+## 1631. SQLite store: seventeen implicit-transaction writers still lack rollback-on-error (June M-1), so a mid-body statement failure is committed by the next writer
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-02, vault PR 1483). Open; not started.** Value **6/10**, Difficulty **3/10**. June's M-1 re-measured. June's fix shape (an explicit `BEGIN` with except-rollback) reached the grouped writers via `_run_grouped` and six standalone writers, and never reached the rest. An AST census over every `MessageStore` method that commits found seventeen with two or more statements and no rollback path: `claim_ready`, `claim_next_fifo`, `claim_next_fifo_batch`, `dead_letter_missing_destinations`, `dead_letter_missing_handlers`, `replay`, `cancel_queued`, `record_audit`, `upsert_alert_instance`, `_add_cipher_invocations_locked`, `reserve_upload_quota`, `consume_recovery_code_hash`, `consume_totp_step`, `purge_reference_snapshots`, `purge_state`, `prune_processed_files`, and the on-open cipher migration loops. Measured: `cancel_queued` with its event insert failing after the `UPDATE` was committed by the next writer as one row `cancelled` with no `cancelled` event and no finalize; `replay` with the status flip failing re-pended the dead row while the message stayed `error`; `claim_next_fifo` with its post-flip `SELECT` failing left the row `inflight` with no owner until a restart; a real `NOT NULL` failure in `record_audit` made the next `route_handoff` raise `cannot start a transaction within a transaction`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store & Reliability. **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). The triggers are ordinary (`SQLITE_FULL`, a busy timeout past 5 s, a constraint violation); each would become either a silent half-write or one spurious failure of the next handoff.
+
+### What closing looks like
+
+1. One `_txn()` async context manager (`BEGIN`, commit on success, rollback on `BaseException`) applied to every writer above, matching the writers that already carry it; the claim paths keep their standalone commit.
+2. One test per multi-statement writer that injects a failure after its first mutation and asserts, from a second connection and after one further write, that nothing was committed.
+
+**Duplicate search.** No item covers the set. Open #1111 (ASVS 2.3.3 research) notes in passing that `cancel_queued` lacks the rollback guard `replay_dead` has; cross-link it. Searched both ledgers for `rollback-on-error`, `open transaction`, `implicit transaction`, `M-1`, `cancel_queued`, `claim_next_fifo`, `record_audit`, `_txn`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-02.
+
+## 1632. SQLite group commit: a poisoned member rejects every co-batched sibling, stranding up to group_commit_max_batch lanes in flight until a restart
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-03, vault PR 1483). Open; not started.** Value **5/10**, Difficulty **3/10**. Packet 3's handed-over "group commit as a P3-03 amplifier". `_GroupCommitter._flush` rolls the whole batch back when any member raises and rejects every other member's future with `RuntimeError("group commit rolled back (sibling member failed)")`; its docstring says each caller re-runs. The per-lane router and transform workers catch that under `except Exception`, log and back off, and never re-pend the claimed head (#1611), and nothing in `pipeline/` matches the error. Measured with `window_ms=50`: three concurrent `route_handoff`s with one poisoned member left all three ingress rows `inflight` from a fresh connection; a re-run of the two healthy members succeeded, so the store's guard is idempotent and the re-run would have worked had anyone issued it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store & Reliability. **Priority:** P3. **Verdict:** build.
+**Severity:** medium, bounded by reach and conditional (sec. 0): group commit is off by default. A site that turns it on would convert every transient store fault into a multi-lane stall invisible to `pending_depth` and the stall alert.
+
+### What closing looks like
+
+1. Store half: on a group rollback, re-run the healthy members inline under the lock, each in its own transaction, before rejecting anything, so only the member whose body raised sees an exception.
+2. Runner half is #1611's fix (re-pend the head on any handoff exception).
+3. A test with two healthy members and one poisoned one asserting the healthy rows commit.
+
+**Duplicate search.** No match. Searched both ledgers for `group commit`, `group-commit`, `sibling`, `poison`, `rolled back`, `P3-03`, `reschedule_claimed`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-03.
+
+## 1633. store-level guarantees asserted only by reading: the inline ACK gate, every-stage recovery, the read pool snapshot, and the no-row replay guard at the store
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-04, vault PR 1483). Open; not started.** Value **5/10**, Difficulty **2/10**. From nine negative controls over the 24 SQLite store suites (342 tests). Four deliberate breaks stayed green: (B) `enqueue_ingress` on the inline path made to swallow a body failure and return the id anyway, the store half of #1608 (the grouped path is pinned by `test_ack_gate_rejected_on_group_rollback`; the shipped default path is not); (C) `reset_stale_inflight` made to skip one stage, because `test_reset_stale_inflight_recovers_all_stages` seeds only ingress and outbound rows and so pins two of the four stages its name claims; (E) `replay`'s rowcount guard removed (the June M-2 regression), which no store suite catches and only the API route test `test_replay_no_deliveries_is_409_and_preserves_error` reaches; (I) the read pool's deferred read transaction removed, so a multi-statement read no longer sees one snapshot. Five other controls turned the right tests red, so the suites are live where they cover.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Tests / Store. **Priority:** P2. **Verdict:** build (tests only).
+**Severity:** no deployment axis; a test gap on the engine's most load-bearing claim. Ships nothing.
+
+### What closing looks like
+
+Four tests:
+
+1. `enqueue_ingress` with a body failure on the inline path raises and leaves zero rows (from a second connection).
+2. `reset_stale_inflight` seeds one in-flight row at each of the four `Stage` values and asserts all four recover.
+3. `replay` on an `ERROR`, a `FILTERED`, an `UNROUTED` and a Step-B `FILTERED` message returns 0 with status and error untouched, at the store.
+4. A pooled multi-statement read observes one snapshot while the writer commits between its statements.
+
+**Duplicate search.** No match at the store. #1608 (PR 1071) is the runner-side ACK test and should cross-link; #1594 (PR 1066) carries a runner guard, not a store test. Searched both ledgers for `P3-01`, `ACK-after-commit`, `recovers all stages`, `negative control`, `enqueue_ingress`, `read pool`, `query_only`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-04 and part 6.
+
+## 1634. _secure_file runs icacls synchronously on the event loop (June low-3 store half): about 21 ms per call at open() and once per DR backup in snapshot_to, plus four other engine callers
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-06, vault PR 1483). Open; not started.** Value **3/10**, Difficulty **1/10**. June's low-3 re-measured. `_secure_file` is `subprocess.run(["icacls", ...])` with no `to_thread`. `open()` calls it for the DB, WAL and SHM files (before the API serves and before any listener binds, so unobservable); `snapshot_to` calls it once per DR backup on the loop; `api/app.py` calls it in a request handler and the three `config/*_edit.py` writers call it on their write path. Measured at 21 to 28 ms per call. Closed #1 names "low-3 store half" in its title; the shipped call is still synchronous.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store / ops. **Priority:** P4. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). One 21 ms stall of every in-flight ACK and claim per backup, per config write and per key-protect request.
+
+### What closing looks like
+
+`await asyncio.to_thread(_secure_file, path)` at every async call site, or an async wrapper in `store.py` the callers share.
+
+**Duplicate search.** Closed #1 titles the store half but did not move the call; #1142 and #1183 (open, ASVS research) mention `icacls` only as a trust-anchor mechanism; closed #44 is the DACL content, not the call's placement. Searched both ledgers for `icacls`, `_secure_file`, `to_thread`, `low-3`, `event loop`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-06.
+
+## 1635. SQLite read pool: the deferred-read BEGIN sits outside its try, so one cancellation landing on it poisons a pooled read connection for the life of the process
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 5 (finding P5-05, vault PR 1483). Open; not started.** Value **5/10**, Difficulty **1/10**. `store/store.py` `_read` issues `BEGIN` on a borrowed read connection before the `try` whose `except BaseException` issues `ROLLBACK`. aiosqlite completes the `BEGIN` on its worker thread whether or not the awaiting task survives, so a cancel on that await returns the connection to the pool inside an open transaction. Measured at engine `2ffcf3347`: the next borrower's `BEGIN` raised `cannot start a transaction within a transaction`, and so did every later one, because that failing `BEGIN` is also outside the `try` and the rollback never runs. With the shipped pool of four, one such cancel fails one read in four until restart, with an error text that names no cause.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Store & Reliability. **Priority:** P3. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0): rare per event and permanent per process. Reachable from any cancel that lands on a pooled read's `BEGIN`: the pooled dispatcher's `stop()` cancelling the sweep loop mid `list_fifo_lanes`, a worker cancel while it sits in `pending_depth`, or a `wait_for` around a store read. The exposure is the demote and reload paths, where the store keeps serving.
+
+### What closing looks like
+
+1. Move the `BEGIN` inside the `try`, or on any `BaseException` after `pool.get()` issue a best-effort `ROLLBACK` before `put_nowait`.
+2. A test that cancels a read mid-`BEGIN` and asserts the next borrower succeeds.
+
+**Duplicate search.** No match. Searched both ledgers for `read pool`, `query_only`, `lockfree-reads`, `_read()`, `cannot start a transaction`, `CancelledError`.
+
+**Source.** `docs/reviews/FABLE-PACKET-5-STORECORE-2026-09-11-FINDINGS.md` (vault PR 1483), finding P5-05.
+
+## 1636. the account-lockout counter is a read-modify-write race, so parallel wrong passwords or codes never lock the account
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 6 (finding P6-01, vault PR 1479). Open; not started.** Value **8/10**, Difficulty **3/10**. June's H-10, re-measured and still standing: 24 parallel wrong passwords leave `failed_attempts` at 1 and no lock, and `record_login_failure` is unchanged since vault `546d96ad`. `_login_local` reads the row before the argon2 verify, `_register_failure` computes `prior + 1` in Python, and all three store backends write the value absolutely; `verify_mfa` feeds the same method, so the TOTP and recovery-code legs race the same way.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / auth. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). On a first deployment the per-account guessing bound would fall from 5 per 15 minutes to the sliding window alone (10 per minute per address, 60 overall), with no lockout notice. `docs/SECURITY.md` control 1 claims "5 consecutive failures"; that sentence is false as shipped (flagged to packet 18).
+
+### One compound finding, three items
+
+This item, the second-factor counter reset (the next item) and the disabled-mirror login are one question: whether the engine has a working brake on repeated authentication attempts. Packet 6's section 5 argues the set's severity (High) from the set. Land the three together or in order.
+
+### What closing looks like
+
+1. An atomic increment that returns the new count, on all three backends (or the `consume_totp_step` lock shape).
+2. A concurrent test in the `test_mfa.py` shape: N parallel failures, assert the lock.
+3. Correct `SECURITY.md` control 1 to what the code then does.
+
+**Duplicate search.** No match. Searched `lockout`, `failed_attempts`, `record_login_failure`, `_register_failure`, `read-modify-write`, `H-10`, `parallel` and `concurrent login`; nearest are #1140 (timing), #1131 (6.1.1 docs) and #1236 (sole-administrator recovery), none of which names the race.
+
+**Source.** `docs/reviews/FABLE-PACKET-6-AUTH-2026-09-11-FINDINGS.md` (vault PR 1479), finding P6-01.
+
+## 1637. an engine-disabled directory mirror row still completes Kerberos or OIDC login with a success audit and a live session
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 6 (finding P6-02, vault PR 1479). Open; not started.** Value **5/10**, Difficulty **2/10**. The unfixed half of June's M-18. The directory bit is checked in `auth/ldap.py` since vault `d8103aa6`; but `_complete_ad_login` checks provider and directory id on the existing row and never `disabled`, no caller or route does either, and only `identity_for_token` refuses later. An engine-disabled AD mirror row therefore completes a directory login with a `login_success` audit row and a live session.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / auth. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). No authorization is gained, because `identity_for_token` refuses the session on its first use. What a first deployment would carry is a false `auth.login_success` row, a live session-inventory row, and continued role, scope and e-mail resync for a disabled account, with no reconciler clean-up.
+
+### What closing looks like
+
+1. Refuse on `existing.disabled` in `_complete_ad_login`, and after the id-keyed lookup in `_upsert_ad_user`, audited as `login_failed` with reason `disabled`.
+2. A test for each of the Kerberos and OIDC legs.
+
+**Duplicate search.** No match. Searched `disabled` with `_complete_ad_login`, `M-18`, `AD-disable`, `engine-disabled`; #1471 and #1256 touch the same function for identity binding, #1532 (PR 1048) covers the directory side of the reconciler. The CISO register's "AD-disable" open item is this defect.
+
+**Source.** `docs/reviews/FABLE-PACKET-6-AUTH-2026-09-11-FINDINGS.md` (vault PR 1479), finding P6-02.
+
+## 1638. a password-only login resets the second factor's failure counter, and a directory re-login clears a second-factor lock
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 6 (finding P6-03, vault PR 1479). Open; not started.** Value **6/10**, Difficulty **2/10**. `_login_local` and `_complete_ad_login` call `record_login_success` (which zeroes `failed_attempts` and `locked_until`) before the second factor is proven; `_complete_ad_login` also never refuses a locked account. Measured at engine `2ffcf3347`: three cycles of login plus four wrong codes never lock; five wrong codes lock a directory account and one re-login clears the lock.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / auth. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). On a first deployment, TOTP and recovery-code guessing by a holder of the first factor would be bounded by the sliding window only, against a documented claim that the lockout covers those legs. The `docs/SECURITY.md` lockout-asymmetry note ("Local accounts only") is also false as shipped (flagged to packet 18).
+
+### What closing looks like
+
+1. Clear failures only when the session becomes fully authenticated, not at the password step.
+2. Refuse a locked account in `_complete_ad_login`.
+3. Two tests: the cycle that never locks, and the re-login that clears a lock.
+
+**Duplicate search.** No match. Searched `verify_mfa`, `record_login_success`, `mfa` with `lock`, `second factor` with `lock`, `counter`, `reset`; #1022 and #1144 are adjacent and neither names the reset.
+
+**Source.** `docs/reviews/FABLE-PACKET-6-AUTH-2026-09-11-FINDINGS.md` (vault PR 1479), finding P6-03.
+
+## 1639. the directory disabled-bit check fails open when userAccountControl is unreadable, on login and in the reconciler
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 6 (finding P6-04, vault PR 1479). Open; not started.** Value **4/10**, Difficulty **1/10**. `auth/ldap.py` guards the disabled-bit test on `uac and uac.isdigit()`, so an absent or non-numeric `userAccountControl` attribute passes as enabled; `_probe_principal` relies on the same `None`. A bind account that cannot read the attribute therefore sees every principal as enabled.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / auth. **Priority:** P3. **Verdict:** build.
+**Severity:** configuration-plane, conditional (sec. 0). A restricted bind account would let a directory-disabled principal sign in and keep its sessions through the reconciler.
+
+### What closing looks like
+
+1. Refuse on an undetermined attribute, on login and in the reconciler.
+2. Warn once per shape, as the objectGUID reader already does.
+3. A test with the attribute absent and one with it non-numeric.
+
+**Duplicate search.** No match. Searched `userAccountControl`, `ACCOUNTDISABLE`, `0x2`, `fail open` with `ldap`, `_find_user`; #1140 (ASVS research) mentions the constant only.
+
+**Source.** `docs/reviews/FABLE-PACKET-6-AUTH-2026-09-11-FINDINGS.md` (vault PR 1479), finding P6-04.
+
+## 1640. the M-5 summary-access coalescer is never flushed at lifespan shutdown, so the open hour window of PHI-summary access audit is dropped on every clean restart
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-01, vault PR 1481). Open; not started.** Value **6/10**, Difficulty **1/10**. `_SummaryAuditCoalescer.flush` documents itself as called at engine shutdown and nothing calls it; the lifespan `finally` in `create_managed_app` stops the engine and both notifiers without touching `app.state.summary_auditor`. Measured at engine `2ffcf3347`: one `GET /messages` on a lifespan-managed app, then a clean shutdown, left zero `summary_access` rows. The existing test flushes by hand, so it tests the method, not the wiring.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit completeness / PHI accountability. **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A first deployment restarted within an hour of a bulk census fetch would hold no `summary_access` row for it; the control M-5 built to make a harvest visible would lose the window that held it.
+
+### What closing looks like
+
+1. Flush the coalescer in the lifespan `finally` before `engine.stop()`, guarded like the reaper.
+2. A lifespan-to-shutdown test asserting the row lands.
+
+**Duplicate search.** No match in either ledger or on the 190 remote heads searched by `summary_auditor`, `SummaryAuditCoalescer`, `summary_access` with `flush`, `coalesc`. Related: #1197 (ASVS 16.3.2 research).
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-01.
+
+## 1641. the ungated purge path writes no audit row of its own, so a cancelled delivery queue is attributed only by the gate's grant row, with no outcome, no client, and nothing on the console path
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-02, vault PR 1481). Open; not started.** Value **6/10**, Difficulty **1/10**. `purge_connection` calls `cancel_queued` and returns; the M-4 siblings write a row with the count when PHI moved. The web console calls the handler through the seam and its gate audits denials only, so the browser path leaves no grant row either. Measured under an enabled `AuthService` at engine `2ffcf3347`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit completeness / PHI accountability. **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). On a first deployment an operator could cancel every queued delivery to a partner and the chain would show `auth.permission_granted` for the path with no count, indistinguishable from a 409 that changed nothing, or nothing at all from the browser.
+
+### What closing looks like
+
+1. A `connection_purge` row with connection, scope and `cancelled` count, written in the handler body so both the JSON and the console path carry it.
+2. A test on each path.
+
+The console half was also handed to packets 12 and 17; their pass-2 proposals should cite this item.
+
+**Duplicate search.** No match by `purge` with `audit`, `cancel_queued`, `connection_purge`, `purge_connection` in either ledger or on any remote head. Related: #1111 and #1113 (dual control research), #1197 (console grant row).
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-02.
+
+## 1642. connection start, stop and restart write no audit row in the handler, and the console path leaves none
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-03, vault PR 1481). Open; not started.** Value **4/10**, Difficulty **1/10**. The connection-event log records the transition without an actor; the JSON path has only the gate's grant row; the browser path has neither.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit completeness. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). An investigator could see that a feed stopped and not who stopped it.
+
+### What closing looks like
+
+1. One `connection_control` row from `_dual_role_control` with action, name, role and `running`.
+2. A test on each of the three actions.
+
+**Duplicate search.** No match by `start_connection`, `stop_connection`, `CONNECTIONS_CONTROL` with `audit` in either ledger or on any remote head; closed #115 is the auto-start toggle.
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-03.
+
+## 1643. seven audit writes in api/ have no test that can see them removed
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-04, vault PR 1481). Open; not started.** Value **4/10**, Difficulty **1/10**. `config_reload_check`, `connection_credential_test`, `connection_flag_set`, `preset.create`, `preset.delete`, `preset.list` and `upload.create` are named by no file under `tests/`. Negative control: deleting the `preset.create` write left 80 preset tests green; deleting `message_view` turned its test red, so the method is live where it covers.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test quality / audit completeness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis for the tests themselves; the writes they should pin are shipped controls.
+
+### What closing looks like
+
+One assertion per action that the row is written with the expected actor.
+
+**Duplicate search.** No match by any of the seven action names in either ledger or on any remote head.
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-04 and part 6.
+
+## 1644. authorization grant, denial and MFA-denial audit rows carry a NULL client though written from a request, against the ADR 0150 contract
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-05, vault PR 1481). Open; not started.** Value **4/10**, Difficulty **1/10**. `require` and `authorize_ws` have the request in hand; `audit_permission_granted`, `audit_permission_denied` and `audit_mfa_denied` in `auth/service.py` take no `client`. `docs/PHI.md` section 6 says a NULL client never means unknown.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit attribution / ADR 0150. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). An investigator would have no host for any authorization decision on a first deployment, on the rows the shipped default writes for every authenticated request.
+
+### What closing looks like
+
+1. Add a `client` parameter to the three service methods.
+2. Pass `client_ip(request)` from both callers in `api/security.py`.
+3. A test per row kind. Two packages, one change; the service-side half was also handed to packet 6.
+
+**Duplicate search.** No match by `permission_granted` with `client`, `grant row` with `address`, `ADR 0150` with `granted`. Related: #1421 (grant trail cost), #1224 (a different NULL-client site, closed).
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-05.
+
+## 1645. the shared apiclient still sends the retired audit_summary flag that no route reads
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-06, vault PR 1481). Open; not started.** Value **2/10**, Difficulty **1/10**. `apiclient/client.py` `list_messages` and `list_dead_letters` still send `audit_summary`; no route reads it since M-5 made summary auditing unconditional. A client author reads a parameter saying summary auditing is opt-in, which is the M-5 defect shape surviving in the client contract and the harness.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** API client contract / M-5 residue. **Priority:** P4. **Verdict:** build.
+**Severity:** no exposure; a contract defect. Migration cost is zero.
+
+### What closing looks like
+
+Delete `audit_summary` from both client methods and from `test_audit_summary_skips_when_no_summaries`.
+
+**Duplicate search.** No match by `audit_summary` in either ledger or on any remote head.
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-06.
+
+## 1646. an approval-released dead-letter replay writes no dead_letter_replay row, while the released config reload was given parity
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 7 (finding P7-07, vault PR 1481). Open; not started.** Value **3/10**, Difficulty **1/10**. `approval.approved` attributes both identities and the count, but the executor's `_replay` writes no `dead_letter_replay` row, where `_record_reload_audit` was given parity with the inline route. An auditor filtering on the action name would miss the release.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit completeness / dual control. **Priority:** P4. **Verdict:** build.
+**Severity:** low, conditional (sec. 0).
+
+### What closing looks like
+
+In `_replay`, when `requeued > 0`, write the inline route's row with the requester as actor and `client` NULL, as `_record_reload_audit` documents; add the test.
+
+**Duplicate search.** No match by `_replay` with `executor`, `approval` with `dead_letter_replay`, `executor` with `parity` in either ledger or on any remote head; #1111 and #1113 discuss the approval boundary, not this row.
+
+**Source.** `docs/reviews/FABLE-PACKET-7-API-2026-09-11-FINDINGS.md` (vault PR 1481), finding P7-07.
+
+## 1647. the Windows config-source trust check trusts the directory owner unconditionally, so a low-privilege owner passes CONFIG-2
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-01, vault PR 1482). Open; not started.** Value **6/10**, Difficulty **2/10**. June's M-21 shape on the platform `docs/SERVICE.md` and the NSSM scripts target. `config/wiring.py` `_evaluate_config_dacl` adds `owner_sid` to the trusted set unconditionally. The POSIX branch of `_assert_safe_config_source` refuses a file owned by any uid other than the effective uid (root exempt); the Windows branch has no equivalent, and `test_owner_only_dacl_passes` pins the pass with an owner SID that differs from the self SID. Measured on the pure policy at engine `2ffcf3347`: an owner-only DACL with a low-privilege owner SID and a different self SID returns no refusal; the same SID as a non-owner with write is refused.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / config-source trust. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). A first Windows deployment whose config directory was created by a non-administrator account (an unzip, a `git clone` under a user profile) and whose service runs as a gMSA would pass the check, and that owner can rewrite the executed `.py` files or grant themselves write through WRITE_DAC, which an owner holds implicitly. Medium rather than High because the installer's documented ACL step would prevent the shape; the check exists to catch the site that skipped the step.
+
+### What closing looks like
+
+1. Refuse when `owner_sid` is neither `self_sid` nor SYSTEM nor Administrators (mirror the POSIX rule; root exempt becomes admin exempt).
+2. Update `test_owner_only_dacl_passes` to use `owner == self`, and add a foreign-owner refusal test.
+3. Keep CREATOR OWNER and OWNER RIGHTS as they are, since they alias the now-checked owner.
+
+**Duplicate search.** No match on `owner_sid`, `foreign owner`, `owned by uid`, `_evaluate_config_dacl`, SEC-003; the `DACL` hits are key-file, sandbox and installer items. #1183 (ASVS research) cites the function only.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-01.
+
+## 1648. serve, validate and check accept a config directory that declares no connections with no diagnostic, and only reload refuses: the second half of June M-24
+
+> 🔢 **Filed 2026-09-12 by Fable review packets 8 and 10 (findings P8-02 and P10-05, vault PRs 1482 and 1484), which each proposed it and asked to be merged. Open; not started.** Value **6/10**, Difficulty **2/10**. `Engine.reload_detail` is the only empty-graph refusal. `load_config`, `Registry.validate`, `validate_config`, `build_check_registry` and the API lifespan's `load_config` then `add_registry` have none. Measured at engine `2ffcf3347`: an existing empty directory, and the same directory holding only `_helpers.py` and a `.py.bak`, pass `validate_config` (`[]`), `run_checks` (`ok  validate: no problems`, `PASS`, exit 0), and an engine start that reports running with 0 inbounds.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Config loading / fail-loud. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). A wrong service `AppDirectory`, a renamed feed file, or a checkout of the wrong branch would take every interface down while the engine, the API and the commit gate all report healthy. June's M-24 named two halves; the nonexistent-directory half landed and this one did not.
+
+### The rule is agreed; it lives in one of four places
+
+The reload refusal shows the engine already treats an empty graph as an error. `serve`'s initial load is `load_config` plus `add_registry`, not `reload`, so the startup path never sees the rule.
+
+### What closing looks like
+
+1. Move the empty-graph rule into `Registry.validate`, so `load_config` and the engine start refuse.
+2. Mirror it as a diagnostic in `validate_config`, so the IDE and `check` see it; `_check_validate` treats it as a required failure unless `--allow-empty-config` is passed.
+3. Drop the reload-only copy.
+4. A directory that must legitimately be empty (a config repository being scaffolded) uses `messagefoundry init`, which the gate already handles.
+5. One test per entry point.
+
+**Duplicate search.** No match on `empty graph`, `empty config`, `declares no connections`, `zero modules`, `M-24`; #337 (closed) is unrelated. Packets 14 and 17 (pass 2) mention the empty config case in their proposals; the Manager should point them here.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-02 and part 2 (M-24); `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-05.
+
+## 1649. an env() reference nested in a headers table is never resolved and is sent to the partner as its repr, default included
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-03, vault PR 1482). Open; not started.** Value **6/10**, Difficulty **2/10**. `resolve_env_settings` resolves top-level `EnvRef` values only. `Rest`, `FHIR`, `Soap` and `Http` accept a `headers` mapping; nothing in the factories, `build_outbound_connection` or `_build_check_connectors` refuses an `EnvRef` inside it; `RestDestination._build_headers` does `str(v)` on each value. Measured at engine `2ffcf3347`: a `Rest` outbound with a header value of `env("partner_key", default="FALLBACK-SECRET")` passes `build_check_registry`, and `_build_headers` yields the header as the `EnvRef` repr with the default inside it. The `_hoist_body_secrets` docstring describes this exact hazard and closes it for SOAP body secrets only.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / secret disclosure. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). A first deployment that wrote a partner key this way would send a broken header on every delivery, and if the reference carried a fallback, would send that fallback to the partner in cleartext inside the header. The delivery would then dead-letter or retry on the partner's 401 with nothing naming the cause. Reachable only from config, but it moves a configured secret off the box, and the redaction apparatus exists to prevent that class.
+
+### What closing looks like
+
+1. Refuse an `EnvRef` inside any nested mapping at `build_outbound_connection` (and `parse_env_setting` for the TOML form) with a message pointing at the typed credential fields, or resolve nested references in `resolve_env_settings`.
+2. A factory-level test that every `headers`-taking factory rejects (or resolves) it.
+
+**Duplicate search.** Closed #1207 fixed the display half of the same object (that is how the shape was observed in a real config); closed #1206 names nested env resolution as a route-onward and does not file it. No open item.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-03.
+
+## 1650. connections.toml scalar settings are never checked against the factory signature, so a quoted number passes every gate and dodges the port-collision check
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-04, vault PR 1482). Open; not started.** Value **5/10**, Difficulty **3/10**. `connections_file._build_spec` calls the factory with the decoded table; the factories are plain functions whose annotations (`port: int | EnvRef`, `max_frame_bytes: int | None`, `persistent: bool`) are not enforced at runtime. A census of the 19 factories found zero direct type checks in 14 of them; `Registry.port_collisions` keeps only `int` ports. Measured at engine `2ffcf3347`: a TOML inbound with `port = "2575"`, `max_frame_bytes = "16"`, `receive_timeout = "60"`, `max_connections = "256"` and an outbound with `timeout_seconds = "30"`, `persistent = "yes"` passes `validate_config`, `load_config` (port stored as the string), `port_collisions()` (empty) and `build_check_registry`. The runtime consequence is `PLAUSIBLE` by read: a string frame cap would raise `TypeError` on the first frame, a string timeout inside `wait_for`, and `persistent = "yes"` would silently mean True.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Config loading / fail-loud. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). A first deployment would hit a runtime error on the first frame or a silently-true flag, with `validate` and `check` green. #1613 (PR 1071, the `encoding` instance) is one member of this class; this item is the general boundary.
+
+### What closing looks like
+
+1. Validate the decoded `[settings]` table against the factory signature's annotations in `_build_spec` (`connection_schema.py` already introspects them with `eval_str=True`, so the type map exists), coercing an `int`-annotated TOML string with a clear `WiringError` rather than accepting it.
+2. A runtime type check for the numeric guards in the factories that have none, on both surfaces.
+3. Tests for a quoted port, a quoted frame cap and a string boolean.
+
+**Duplicate search.** #1613 (PR 1071) is the sibling instance and should land beside this; closed #12 did `content_type` alone; #1217 (PR 1034) is the `retry_max_attempts` floor; PR 1031 is the service TOML, not `connections.toml`. Searched `coerc`, `wrong-typed`, `isinstance`, `typed settings`, `factory signature`.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-04.
+
+## 1651. the connections.toml named cast bool turns false, 0 and no from MEFOR_VALUE_* into True
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-05, vault PR 1482). Open; not started.** Value **5/10**, Difficulty **1/10**. `_NAMED_CASTS["bool"]` is Python's `bool()`; `MEFOR_VALUE_*` values are always strings, so any non-empty value resolves to `True`. Measured at engine `2ffcf3347`: `{ env = "flag", cast = "bool" }` resolved against `"false"`, `"0"`, `"no"` and `"False"` yields `True` every time, with no error. A TOML value-file entry can be a real boolean, so the defect fires exactly when the value comes from the environment, which is where the docs say per-host values go.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Config loading / fail-loud. **Priority:** P2. **Verdict:** build.
+**Severity:** conditional (sec. 0). A first deployment that steered a boolean knob per environment (`tls_verify`, `persistent`, `no_ack`, `simulate`) through `MEFOR_VALUE_*` would get the opposite of what the variable says, silently, with `validate` and `check` green.
+
+### What closing looks like
+
+1. Replace the cast with a strict parser accepting `true`, `false`, `1`, `0`, `yes`, `no` case-insensitively and raising `WiringError` on anything else.
+2. A test for each accepted spelling and one refused value. `test_bad_named_cast_rejected` covers only an unknown cast name today.
+
+**Duplicate search.** No match on `cast` with `bool`, `named cast`, `bool cast`, `MEFOR_VALUE_` with a boolean.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-05.
+
+## 1652. a malformed environments/<env>.toml at reload escapes as a raw TOMLDecodeError: a 500 from /config/reload and no audit row
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-06, vault PR 1482). Open; not started.** Value **4/10**, Difficulty **1/10**. `engine.py` `reload` runs `self._env_values = dict(self._env_values_provider())` unguarded; the provider is `tomllib.load` on the value file. `api/app.py` `reload_config` catches `ConfigReloadDenied`, `FileNotFoundError` and `WiringError` only, and writes its audit row inside those arms. The serve-start path guards the same call; the reload path, added by the M-23 fix, does not. Measured at engine `2ffcf3347`: with the value file edited to an unterminated string, `reload` raises `TOMLDecodeError` (a `ValueError` subclass, not a `WiringError`); the live graph is untouched.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Config loading / reload. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). An operator following M-23's own remedy (edit the value file, promote) would get an opaque 500 from `/config/reload` for a one-character TOML error, and the failure would be absent from the audit trail June's low-7 asked to be complete. The graph is safe; the operator is not told why.
+
+### What closing looks like
+
+1. Wrap the provider call and raise `WiringError` naming the value file's path (never its contents).
+2. A test with a broken value file at reload asserting 422 and the `config_reload_failed` audit row.
+
+**Duplicate search.** No match for the reload path; the `TOMLDecodeError` hits are #1412 and #1091 (scorecard tooling).
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-06.
+
+## 1653. an env() reference on send_min_interval_seconds in connections.toml crashes validate and load with a raw TypeError
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-07, vault PR 1482). Open; not started.** Value **3/10**, Difficulty **1/10**. `build_outbound_connection` compares `send_pace < 0` before resolution; `_build_spec` catches `TypeError` only around the factory call, and `validate_config` catches only `WiringError` around `load_connections_file`. Code-first hits the same comparison but `_exec_module` wraps it as a `WiringError`, so the two surfaces diverge. Measured at engine `2ffcf3347`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Config loading / fail-loud. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). `check` would exit with a traceback instead of a diagnostic.
+
+### What closing looks like
+
+1. Skip the sign check when the value is an `EnvRef`; the build-check pass sees the resolved number.
+2. Widen `validate_config`'s TOML arm to wrap unexpected exceptions as diagnostics.
+3. A test with the reference on the TOML surface.
+
+**Duplicate search.** The `send_min_interval` hits are the #82 pacing family; none is the `EnvRef` comparison.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-07.
+
+## 1654. the Windows config-source check fails open on a Win32 API error, and its only test asserts a stub
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-08, vault PR 1482). Open; not started.** Value **4/10**, Difficulty **1/10**. `_assert_safe_config_source_windows` logs a WARNING and continues on a non-zero `GetNamedSecurityInfoW`, on an unresolvable owner SID, and on an unenumerable ACE, justified as "never brick a service that started fine before this change", which is a migration cost section 0 says is zero. `test_api_error_fails_open_with_warning` monkeypatches the whole function with a stub that logs its own warning, so it asserts the stub. Negative control F: with the branch made fail-closed, the test stayed green.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security / config-source trust. **Priority:** P3. **Verdict:** build.
+**Severity:** conditional (sec. 0). An API failure on a first Windows deployment would silently disable the check with one WARNING line, and the suite would stay green if the branch were removed.
+
+### What closing looks like
+
+1. Fail closed on an API error under the same escape variable that already downgrades a refusal (`MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`), which is the documented shape for an operator who must proceed.
+2. Make the test drive the real branch by patching `GetNamedSecurityInfoW` to return non-zero.
+
+**Duplicate search.** No match; the `fail-open` hits on PRs 1052 and 1040 are other subjects.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-08 and part 6 (control F).
+
+## 1655. File(sort=...) accepts any string and a typo silently falls back to name order
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (finding P8-09, vault PR 1482). Open; not started.** Value **2/10**, Difficulty **1/10**. `transports/file.py` tests `self.sort == "mtime"` with no else-branch validation, unlike `after_read`, which refuses an unknown value at build. Measured at engine `2ffcf3347`: `sort="mtiem"` passes `build_check_registry`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Connections & Transports. **Priority:** P4. **Verdict:** build.
+**Severity:** conditional (sec. 0). A site relying on modification-time order would process by name with no error.
+
+### What closing looks like
+
+Validate at the factory and at connector build as `after_read` does; one test.
+
+**Duplicate search.** No match; the `mtime` hits are timestamps, not the sort knob.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), finding P8-09.
+
+## 1656. validate_config and Registry.validate are hand-kept mirrors with no parity test, and a custom cast raising a non-ValueError escapes raw
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 8 (findings P8-10 and P8-11, vault PR 1482). Open; not started.** Value **3/10**, Difficulty **2/10**. Each of the two validators carries the router-reference, `accepts=` and port-collision rules as separate code; the empty-graph rule is in neither; nothing asserts they agree. Separately (the M-22 residual, code-first only), a custom `cast=` callable that raises anything but `ValueError` or `TypeError` escapes `resolve_env_settings` raw.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P4. **Verdict:** build.
+**Severity:** conditional (sec. 0); guard gaps, not live defects.
+
+### What closing looks like
+
+1. Have `validate_config` call a shared rule list that `Registry.validate` raises on, and add one parity test over a fixture set.
+2. Catch `Exception` in the cast arm and report the exception class, value withheld.
+
+**Duplicate search.** No match on `validate_config` with `mirror`, `two validators`, `custom cast`.
+
+**Source.** `docs/reviews/FABLE-PACKET-8-CONFIG-2026-09-11-FINDINGS.md` (vault PR 1482), findings P8-10 and P8-11.
+
+## 1657. the HTTP listener commits a body that stops short of its Content-Length and answers 202
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-01, vault PR 1480). Open; not started.** Value **6/10**, Difficulty **1/10**. `transports/http_listener.py` `_read_exactly` returns `exc.partial` on `IncompleteReadError`, so a POST that declares 100 bytes and delivers 40 before the peer closes is committed to ingress and acknowledged 202. Measured at engine `2ffcf3347`: one commit, body length 40.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / http listener. **Priority:** P1. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A partner drop mid-body would leave a truncated message recorded as received, and the partner's retry would add the complete one beside it.
+
+### What closing looks like
+
+1. Raise `HttpRequestError(400, ..., kind="framing_error")` on the short read.
+2. A short-body test asserting zero commits and the 400.
+
+**Duplicate search.** No match on `IncompleteReadError`, `readexactly`, `_read_exactly`, `truncated body`, `partial body`; the `Content-Length` hits are ASVS research on other subjects.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-01.
+
+## 1658. db_lookup's read-only gate admits a no-semicolon chained T-SQL write, and the unsafe-db-lookup lint misses every statement composed before the call (with #1574)
+
+> 🔢 **Filed 2026-09-12 by Fable review packets 9 and 10 (findings P9-02 and P10-12, vault PRs 1480 and 1484), which asked to be filed together. Open; not started.** Value **7/10**, Difficulty **3/10**. Two shipped controls that claim to hold the `db_lookup` read-only line fail on the ordinary shape. Gate: `transports/database.py` `_require_read_only` accepts any statement beginning `SELECT` or `WITH` and refuses only a chained `;`; T-SQL needs no semicolon between statements, so a composed statement carrying a chained `UPDATE` after the closing quote passed the gate (the `;` shape was refused). The CTE-prefixed write and `SELECT INTO` shapes are already #1574 (PR 1064); this item carries the no-semicolon residual. Lint: `checks.py` `_unsafe_lookup_hit` hands only the call's own statement expression to `_is_dynamic_string`. Thirteen one-handler modules measured: six composition shapes flagged (f-string, nested call, `+`, `%`, `.format`, keyword form) and six missed (assign-then-pass by `%` or f-string, an `+=` build, a `dedent()` wrap, a `.join()`, a conditional expression), in advisory and in `--strict-handler-security` mode alike.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / database (ADR 0010); checks / unsafe-db-lookup. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0); raised from Medium after P10-12. The gate defect is `CONFIRMED` and attacker reachability is `PLAUSIBLE`: the statement is a literal in every shipped demonstration, so message content reaches the SQL text only through a Handler author's composed statement, and the lint that was supposed to discourage exactly that misses the two-step form, which is the natural way to write a longer statement and the form a `dedent` or a `join` produces. A composed write would double-apply on an at-least-once replay, the harm ADR 0010 names. This item and #1574 close together; neither is complete without the other.
+
+### What closing looks like
+
+1. Gate (with #1574): refuse a top-level `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `INTO` or `EXEC` token outside literals and comments, and enforce read-only authority at the database boundary as #1574 proposes; two tests, one for the no-semicolon shape.
+2. Lint: resolve a `Name` argument to its last assignment in the same function body (a single-assignment walk over `ast.Assign` and `ast.AugAssign`), apply `_is_dynamic_string` there, treat `AugAssign` with a non-constant right side as dynamic; unwrap a `Call` whose single argument is dynamic (`dedent`, `strip`, `join` on a list holding a non-constant); descend into `IfExp` branches. Add the thirteen-arm table as the test.
+3. Recommend a `db_datareader`-class login in `docs/CONNECTIONS.md`.
+
+**Duplicate search.** #1574 (PR 1064) is the read-only predicate for the CTE and `SELECT INTO` shapes; cited, not re-filed. No match on `unsafe-db-lookup`, `_unsafe_lookup_hit`, `_is_dynamic_string`, `no semicolon`; closed #154 is unrelated.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-02; `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-12.
+
+## 1659. the forward proxy host is a credential-bearing egress target the allow-list never checks
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-03, vault PR 1480). Open; not started.** Value **6/10**, Difficulty **1/10**. `_CREDENTIAL_EGRESS_URL_KEYS` names the two token endpoints and states that every second host that receives a credential must ride `[egress].allowed_http`; `proxy_url` (per connection, or the `[egress].proxy_url` default the runner copies in) is such a host and has no arm. Measured at engine `2ffcf3347`: `deny_by_default` with only the data host listed and `proxy_url` at an unlisted host passed `check_egress_allowed`, and the built `RestDestination` carried `Proxy-Authorization` and a `ProxyHandler` for that host.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** pipeline / egress gate (ADR 0126). **Priority:** P1. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). The proxy credential would leave for any host on first delivery; for a permitted cleartext `http` destination the PHI request would follow. `proxy_url` is operator configuration (config module, `connections.toml`, `env()`), never attacker input, which holds this at Medium as it held DELTA-04.
+
+### What closing looks like
+
+1. Add `proxy_url` to the table (skipping the `default` sentinel) so the existing structural test covers it, on both the outbound and the lookup arm.
+2. Correct the `docs/SECURITY.md` sentence that says every credential-bearing host is gated.
+
+**Duplicate search.** The `proxy_url` hits are #1208 (parameter-to-setting mapping), closed #112 (the proxy feature) and closed #1207 (URL userinfo redaction); none is the gate.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-03.
+
+## 1660. the token-endpoint opener ignores the connection and instance trust anchor
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-04, vault PR 1480). Open; not started.** Value **5/10**, Difficulty **2/10**. `SmartBackendTokenProvider` and `OAuth2ClientCredentialsProvider` build their opener without a `trust_anchor`. Measured at engine `2ffcf3347` with a synthetic CA as `tls_ca_file` on FHIR+SMART, REST+OAuth2 and FhirLookup+SMART: the data-hop context held that one CA; the token-hop opener was the shared default with the OS store's 88 roots.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / smart, http_auth (ADR 0093). **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). An internal-CA authorization server would fail every mint with an opaque `URLError`, and a `pinned` trust-anchor mode would not be honoured on the credential-bearing hop.
+
+### What closing looks like
+
+1. Thread the resolved anchor (per token host) into both providers.
+2. Extend `test_every_http_family_destination_honours_the_internal_ca` to the token opener.
+
+**Duplicate search.** No match on `token endpoint` with `trust`, `anchor` or `tls_ca_file`, or `token hop`; #1158 is the destination-binding limb.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-04.
+
+## 1661. the DATABASE connector carries the driver's message, and its embedded values, into error text and logs
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-06, vault PR 1480). Open; not started.** Value **6/10**, Difficulty **2/10**. `_classify_db_error(state, str(exc))` builds the delivery error from the whole ODBC message, and `DatabaseSource._poll_once` logs the raw exception at WARNING on handler and mark failures. SQL Server 2627, 2601, 245 and 2628 and PostgreSQL 23505 embed the offending value ("The duplicate key value is (...)", "Key (mrn)=(...) already exists"). Measured at engine `2ffcf3347`: a 23505-shaped text kept the value through `safe_exc` (197 characters, under the 200-character truncation); a 2601-shaped text lost it only to truncation, not redaction; the source's log lines apply neither.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / database, PHI. **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A duplicate delivery onto an MRN-keyed index is the routine failure, so the MRN would reach `last_error`, `message_events.detail`, the `connection_error` webhook and the general log on a first deployment.
+
+### What closing looks like
+
+1. Carry the SQLSTATE and the driver error number only into the delivery error.
+2. Log `safe_exc(exc)` in the source.
+3. A fake-driver test asserting value-free text on both paths.
+
+**Duplicate search.** No match on `duplicate key value`, `driver message`, `_classify_db_error`; the `str(exc)` hit is #1412 (a scorecard tool).
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-06.
+
+## 1662. a DATABASE source row that cannot become a body is never marked or recorded and starves the poll ceiling
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-07, vault PR 1480). Open; not started.** Value **4/10**, Difficulty **2/10**. `_poll_once` catches the `ValueError` or `TypeError` from `_body`, logs at ERROR and continues; the row stays in the predicate. Measured at engine `2ffcf3347` with `poll_max_rows=1` and a non-decodable row sorting first: three polls handled nothing, the good row behind it was never reached, nothing was marked or recorded. With the default ceiling the same needs 500 such rows, and one row logs at ERROR every poll forever.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / database. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). The count-and-log invariant says every received message is recorded with a disposition; a row the source cannot decode is received and never recorded.
+
+### What closing looks like
+
+1. Record an `ERROR` disposition or a connection event and mark the row, or quarantine it.
+2. At minimum, exclude a skipped row from the ceiling's budget as the file sources do.
+3. A test with a poisoned first row asserting the good row behind it is reached.
+
+**Duplicate search.** No match on `skipping row`, `body_column`; the `poll_max_rows` hit is #1518 (doc accuracy).
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-07.
+
+## 1663. RestDestination lacks the ValueError arm its siblings have, so a Handler-stamped header escapes send()
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-08, vault PR 1480). Open; not started.** Value **4/10**, Difficulty **1/10**. `outbound_headers_from_metadata` strips control characters but not non-Latin-1 ones, and `_HEADER_NAME_TOKEN` is `$`-anchored so a name ending in a newline matches; `http.client.putheader` raises `UnicodeEncodeError` or `ValueError`, and `transports/rest.py` `_post` has no `ValueError` arm where `fhir.py` and `dicomweb.py` do. Measured at engine `2ffcf3347`: a CJK header value escaped `RestDestination.send()` as `UnicodeEncodeError`; the same on `FhirDestination` was a permanent `NegativeAckError`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / rest. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). The worker dead-letters the message as "internal error" or, under `InternalErrorPolicy.STOP`, halts the outbound.
+
+### What closing looks like
+
+1. Add the `(ValueError, http.client.InvalidURL)` arm to `_post`.
+2. Anchor `_HEADER_NAME_TOKEN` with `\Z`.
+3. Refuse or encode a non-Latin-1 header value in `outbound_headers_from_metadata`.
+4. A test per site.
+
+**Duplicate search.** No match on `_HEADER_NAME_TOKEN`, `UnicodeEncodeError` in a header sink; closed #68 built the dynamic headers, closed #1241 screened operator config values, and neither covers the Handler-stamped path.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-08.
+
+## 1664. signing-key material without a PEM header is echoed whole by the construction error
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-09, vault PR 1480). Open; not started.** Value **4/10**, Difficulty **1/10**. `_read_key_material` treats any value lacking `-----BEGIN` as a path and raises `SigningError` with the value's repr in the message, so an `env()` value that resolved to a bare base64 key body is printed in full into `check` output, the reload error, the connection metadata error field and the log. Measured at engine `2ffcf3347` with a synthetic blob, which appeared verbatim in the message.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / signing. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). A configuration mistake would put private-key material into four places the redactor does not cover.
+
+### What closing looks like
+
+Name the setting rather than the value when it is long or not an existing file, as `direct.py` `_read_file` does; one test.
+
+**Duplicate search.** No match on `signing-key file`, `_read_key_material`, `could not read the signing`.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-09.
+
+## 1665. X12 and TCP sources write replies with an unbounded drain, and the X12 source emits no connection events
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-10, vault PR 1480). Open; not started.** Value **4/10**, Difficulty **2/10**. `transports/x12.py` and `transports/tcp.py` `_on_client` await `writer.drain()` unbounded on a Handler reply (June's M-14; 1617 measured it on MLLP), and `X12Source` has no `_emit_event` call, so allow-list refusals, capacity refusals, over-cap interchanges and peer resets record nothing where TCP and MLLP record an event (the 1621 shape).
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / x12, tcp. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). Same shape as 1617 with a smaller reply surface.
+
+### What closing looks like
+
+1. `wait_for` the drain as the destinations do, on both sources.
+2. Add the four emissions to `X12Source`.
+3. One test per source.
+
+**Duplicate search.** No match on `writer.drain()` for these sources, `X12Source` with events; 1617 is the MLLP sibling.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-10.
+
+## 1666. DatabaseLookupExecutor drops the per-connection attestation
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-12, vault PR 1480). Open; not started.** Value **3/10**, Difficulty **1/10**. Its `__init__` calls `_build_dsn(dict(s), read_only=True)` without `attested=`, so a `DatabaseLookup` with `trust_server_certificate=true` cannot be attested per connection as the destination and source can. Measured at engine `2ffcf3347`: the executor-shaped call was refused and the destination-shaped call on identical settings was permitted. Fail-closed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** transports / database. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). A configuration the docs say is attestable is refused on one of the three database surfaces.
+
+### What closing looks like
+
+Thread `tls_hop_attested` from the spec settings; one test. (The executor's uncapped `fetchall()` is packet 16's, handed there separately.)
+
+**Duplicate search.** The `DatabaseLookupExecutor` hits (#1052, #1114, #1178, #1234) are pools, pacing, TLS delegation and a probe.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-12.
+
+## 1667. test_source_follower_real_poll_issues_no_sql cannot fail for the reason it names
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 9 (finding P9-13, vault PR 1480). Open; not started.** Value **3/10**, Difficulty **1/10**. The test's poison pool raises `AssertionError` from `acquire`, but `DatabaseSource._run` catches every exception from `_poll_once` and logs it, so with `_may_poll` forced to `True` the test stayed green while the sibling spy-based test went red (negative control E). The third test-that-cannot-fail found across packets 3, 4 and 9.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tests / database. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis; a test that asserts nothing about the behaviour it names.
+
+### What closing looks like
+
+Assert on the poison pool's call count, or raise a `BaseException` subclass from it; show the test red with `_may_poll` forced before trusting it.
+
+**Duplicate search.** No match on the test name or `poison pool`.
+
+**Source.** `docs/reviews/FABLE-PACKET-9-EGRESS-2026-09-11-FINDINGS.md` (vault PR 1480), finding P9-13 and part 6.
+
+## 1668. dryrun and check print a handler exception's text unredacted on the default path
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-01, vault PR 1484). Open; not started.** Value **6/10**, Difficulty **1/10**. The residual of June's H-12. `__main__.py` `_dryrun` emits `"error": result.error` beside the gated `summary`, `raw`, `payload` and `state_ops` fields; the same `result.error` reaches `checks.py` `_check_dryrun` and from there the `check` stdout line, and `pipeline/dryrun_trace.py` emits it on `--trace`. The code comment beside the emission says the field "can also quote field values; that's tracked separately as low-8"; no item exists. Measured at engine `2ffcf3347` with a synthetic handler that raises with `PID-5` and `PID-3` in its message: `dryrun`, `dryrun --trace` and `check --messages` each printed the synthetic name and MRN on stdout, under the stderr note that bodies are redacted. `messagefoundry.redaction.redact` on that string returns the redacted form, so the existing chokepoint would close it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI / CLI. **Priority:** P1. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). `dryrun` is the tool an author reaches for when a handler is raising, and a raise that quotes a field is the most common debugging idiom. A first deployment whose author debugged a captured message through `dryrun` and redirected the output would put a patient name and MRN into that file, and the `check` gate would put it into a CI log on every commit whose fixture makes a handler raise. June graded H-12 High because the summary printed on every message; this prints only when the exception quotes a field, so Medium, with the High argument recorded in the finding.
+
+### The suite cannot see it
+
+`test_dryrun_redacts_bodies_by_default` asserts against the sample handler, which never raises, so `error` is `null` in that run. The advisory `raise-fstring` lint did not flag the probe handler either, because it flags only f-strings (1676).
+
+### What closing looks like
+
+1. In `_dryrun` and the trace path, emit `result.error` only under `show_phi`, else `safe_text(result.error)` (`safe_exc` where the exception object is available).
+2. In `_check_dryrun`, pass every `result.error` through `safe_text` before it enters the detail string.
+3. A test with a handler that raises with a field value, asserting the PID-derived tokens are absent from `dryrun`, `dryrun --trace` and `check` stdout.
+
+**Duplicate search.** No match on `low-8`, `last_error`, `error text`, `result.error`, `dryrun` with `redact`; #1571 (PR 1064) is the support-bundle sibling, not this surface; #1437 and #1576 concern `redact` cost and ordering and do not block this.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-01.
+
+## 1669. audit-verify and audit-anchor accept a zero-byte database, write a schema into it, and exit 0 on verified-nothing
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-02, vault PR 1484). Open; not started.** Value **6/10**, Difficulty **2/10**. June's M-31 through a different door. `__main__.py` `_audit_verify` and `_audit_anchor` guard with `Path(settings.store.path).exists()`, and `open_store` then runs the schema migration on whatever it opens. Measured at engine `2ffcf3347`: a zero-byte file at `--db` produced `warning: the audit log is empty` on stderr, `OK: verified 0 audit row(s)` on stdout, exit 0, and the file grew to 372,736 bytes. A real store with no audit rows also exits 0.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security / audit / CLI. **Priority:** P1. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A scheduled compliance job reads the exit code and nothing else; a zero-byte file is what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind. A first deployment with such a job would report OK forever while the real audit log went unchecked, and the verifier would have initialised a schema into a file that was supposed to be evidence.
+
+### What closing looks like
+
+1. Open the store read-only for both subcommands (a `mode=ro` SQLite URI, or `readonly=True` on `open_store` that skips migration).
+2. Refuse a file with no `audit_log` table as exit 2.
+3. Make "verified 0 rows" a distinct non-zero exit unless `--allow-empty` is passed.
+4. Tests for the zero-byte file and the empty log.
+
+**Duplicate search.** #328 (open) is the truncated-tail external anchor, adjacent and different; #1441 (open) is the logging handler for non-serve subcommands. No match on `zero-byte`, `verified 0`, `empty file` with `audit`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-02.
+
+## 1670. a failed store open leaks the aiosqlite connection and hangs the process at exit
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-03, vault PR 1484). Open; not started.** Value **6/10**, Difficulty **2/10**. `store/store.py` `MessageStore.open` raises `sqlite3.DatabaseError: file is not a database` from its first `PRAGMA` after `aiosqlite.connect` succeeded, and nothing closes `db` on the way out; the CLI's `try/finally: await store.close()` covers only a store that finished opening. Measured at engine `2ffcf3347` with a nine-byte text file at `--db`: the traceback printed, then the process stayed alive; two hung `audit-verify` processes were measured at 319 seconds and killed by hand. `faulthandler` shows the main thread in `threading._shutdown` with the aiosqlite worker thread still parked. A directory at `--db` fails differently (`unable to open database file`, raw traceback, exit 1, 1674) and does not hang.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** store / CLI. **Priority:** P1. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A scheduled job pointed at the wrong file would neither pass nor fail; it would accumulate hung processes, one per schedule tick. Every subcommand that opens the store this way (`audit-anchor`, `rekey-audit`, `backup`, `restore-verify`) shares the root cause.
+
+### What closing looks like
+
+1. Store half (packet 5's file): in `MessageStore.open`, wrap everything after `aiosqlite.connect` so any exception closes `db` before re-raising.
+2. CLI half: catch `sqlite3.DatabaseError` and `sqlite3.OperationalError` around `open_store` in the store-opening subcommands and exit 2 with a one-line reason.
+3. A test with a non-database file asserting exit 2 and a clean interpreter exit.
+
+**Duplicate search.** No match on `file is not a database`, `aiosqlite` with `leak`, `worker thread` with `exit`, `hang`; the one closed hit is a pytest-only py3.11 relay hang, unrelated.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-03.
+
+## 1671. the check dryrun gate reports zero runs as a clean required pass
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-04, vault PR 1484). Open; not started.** Value **5/10**, Difficulty **1/10**. `checks.py` `_check_dryrun` cross-products an unmapped fixture against `deployed_inbounds` only (correct, ADR 0111); when that list is empty the loop runs zero times, `errors` stays empty, and the function returns `ok=True, required=True`. Measured at engine `2ffcf3347`: one inbound with `deployed=False`, a handler that raises unconditionally, one fixture; `check` printed `ok  dryrun: 0 run(s) clean across 1 message(s)` and `PASS`, exit 0. Control: the same fixture against a deployed config is `FAIL dryrun: 1/2 run(s) failed`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** gates. **Priority:** P2. **Verdict:** build.
+**Severity:** medium, conditional (sec. 0). A site marking feeds not-deployed during a staged rollout would find its fixtures silently stop being exercised while the gate kept reporting clean. `test_check_dryrun_skips_a_not_deployed_inbound` keeps one deployed inbound, so it does not cover the zero case.
+
+### What closing looks like
+
+1. When `total == 0` and `message_sets` is non-empty, return `skipped=True` with a detail saying why (`N fixture(s), 0 deployed inbound(s) to run them against`), or fail if the caller asked for a gate and nothing could run.
+2. The zero-run test.
+
+**Duplicate search.** No match on `0 run`, `zero runs`, `deployed=False` with `fixture`, `not-deployed`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-04.
+
+## 1672. the serve non-loopback gate and --allow-insecure-bind describe a cleartext hop that ADR 0172's minting encrypts
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-06, vault PR 1484). Open; not started.** Value **3/10**, Difficulty **2/10**. `__main__.py` `_serve`'s non-loopback block keys on `settings.api.tls_enabled`, which `config/settings.py` defines as `bool(self.tls_cert_file)`; the unconditional `ensure_api_tls_material` call that mints a self-signed pair when no cert file is configured runs about 1,350 lines later. Measured at engine `2ffcf3347`: `serve --host 0.0.0.0` with no cert file is refused as cleartext, exit 2; with `--allow-insecure-bind` under the default `enforce` it is refused as "a PHI cleartext bind"; under `enforcement=warn` the suite's own test shows the flag path warns "NO TLS ... cleartext" and then serves, over the minted pair.
+> Verdict: decide, then build
+> Research: none
+> Closing-act: code
+
+**Cluster:** docs / serve. **Priority:** P3. **Verdict:** decide, then build.
+**Severity:** low; the direction is fail-closed in every branch measured, so this is an accuracy defect with a design question attached, not an exposure. An operator reading either message would believe the hop is cleartext, and one who saw the warning and an https listener would not know which to trust.
+
+### The design question first
+
+ADR 0172 says remote exposure is a separate, later question and calls the minted pair a placeholder. Decide whether a minted placeholder permits a remote bind at all. Then either evaluate the gate after minting and rename the flag to what it now means (for example `--allow-remote-bind-on-self-signed`), or keep the refusal and reword both messages and the help to say the placeholder is not accepted for exposure. The docs half is packet 18's.
+
+**Duplicate search.** No match on `allow-insecure-bind` with `0172`, `cleartext hop` in this sense; #1593 (PR 1064) is unrelated; closed #200 and #1392 predate the minting.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-06.
+
+## 1673. text-mode CLI errors print to stdout
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-07, vault PR 1484). Open; not started.** Value **2/10**, Difficulty **1/10**. `__main__.py` `_emit_error` prints `error: ...` to stdout in the non-JSON mode. The JSON mode's `{"error": ...}` on stdout is a deliberate contract for the IDE; the text mode inherits it by accident. Measured at engine `2ffcf3347`: `dryrun` without `--inbound` against the samples printed its ambiguity error on stdout with stderr suppressed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CLI. **Priority:** P3. **Verdict:** build.
+**Severity:** low; a script that captures stdout for the report gets error text in it.
+
+### What closing looks like
+
+`file=sys.stderr` on the text branch; document that JSON errors stay on stdout; one test.
+
+**Duplicate search.** No match on `_emit_error`, `stdout` with `error:`; #1221 and the cp1252 items concern encoding, not the stream.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-07.
+
+## 1674. the redacting last-resort excepthook is installed only by serve
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-08, vault PR 1484). Open; not started.** Value **4/10**, Difficulty **1/10**. `last_resort.py` states the ASVS 16.5.4 guarantee that an unhandled error can never escape as a raw traceback; `install_excepthook` is called inside `_serve`, and `main()` dispatches the other 32 subcommands with no guard. Measured at engine `2ffcf3347`: `audit-verify --db <directory>` printed a `sqlite3.OperationalError` traceback and exited 1. No message content was in that traceback; the guarantee is what is broken.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI / CLI. **Priority:** P3. **Verdict:** build.
+**Severity:** low, conditional (sec. 0). The subcommands that touch the store (`dryrun`, `audit-verify`, `backup`) are the ones whose uncaught exceptions could carry a field value.
+
+### What closing looks like
+
+Install the hooks in `main()` before dispatch, or wrap the dispatch in a catch that routes through `safe_exc` and exits 2; a test that an uncaught exception in a non-serve subcommand prints no traceback.
+
+**Duplicate search.** #1441 (open) is the missing root logging handler on the same subcommands and should be cross-cited; closed #1055 is the sandbox-reader thread's excepthook. No match on `install_excepthook` with `main()`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-08.
+
+## 1675. make the package root lazy: the root half of packet 1's P1-03, which #1596 hands to this packet
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-09, vault PR 1484). Open; not started.** Value **4/10**, Difficulty **3/10**. The package root eagerly imports `config.wiring` and the whole authoring surface. Measured at engine `2ffcf3347`: seven root imports (`parsing`, the root itself, `parsing.peek`, `lens`, `checks`, `logging_setup`, `redaction`) each load 65 or 66 modules, 14 under `config`, in 207 to 409 ms; `--version`, `lens schema --json` and `hl7schema --json` each take 335 to 399 ms against a 104 ms interpreter floor. With the root stubbed, `import messagefoundry.parsing` is 51 modules; with `parsing` stubbed too, `peek` needs 5 modules in 33 ms.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** architecture. **Priority:** P2. **Verdict:** build.
+**Severity:** low; no deployment axis. The IDE pays the root cost on each `lens parse`, and every client and quick subcommand pays it once.
+
+### Two halves, two items
+
+#1596 (PR 1066) carries packet 1's two parsing-side edges and names the package-root laziness as this packet's. The root fix is worth 14 modules and most of the 240 ms; it does not on its own deliver the purity `parsing/` is documented to have. Both are needed; land them so neither claims the other's result.
+
+### What closing looks like
+
+1. A PEP 562 `__getattr__` in `messagefoundry/__init__.py` over a name-to-module map for the roughly 90 names in `__all__`, with `__version__` kept eager.
+2. A `TYPE_CHECKING` block keeping the static imports so mypy strict still types config authors' code.
+3. One test asserting the root import stays under a module count.
+
+**Duplicate search.** #1596 (PR 1066) is the parsing-side half and explicitly defers this half. No other match on `PEP 562`, `__getattr__`, `lazy` with `root`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-09.
+
+## 1676. the raise-fstring lint misses concatenation, percent and format raises
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-10, vault PR 1484). Open; not started.** Value **3/10**, Difficulty **1/10**. `checks.py` `_check_raise_fstring` tests `isinstance(first, ast.JoinedStr)` only. The probe handler in 1668 built its message with `+`, and `check` reported `skip raise-fstring (advisory): no f-string raises`. Measured at engine `2ffcf3347`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** gates / advisory. **Priority:** P3. **Verdict:** build.
+**Severity:** low; advisory only, so no gate effect. It is the lint that would have warned the 1668 author.
+
+### What closing looks like
+
+Also flag a `BinOp` whose operands include a `Call` or `Name`, a `%` `BinOp`, and a `.format` call as the first argument; one test per shape.
+
+**Duplicate search.** No match on `raise-fstring`, `JoinedStr`, `_check_raise_fstring`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-10.
+
+## 1677. --version should report which tree answered, because cwd can shadow the editable install
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 10 (finding P10-11, vault PR 1484). Open; not started.** Value **4/10**, Difficulty **1/10**. From an engine worktree, `messagefoundry.__file__` resolves to that worktree under `-m`, under `-c` and under `PYTHONSAFEPATH=1`, because the venv's editable `.pth` points there. From a directory holding another tracked copy of the package (the vault carries one), the identical interpreter resolves it to that copy, because the working directory precedes the `.pth` entry. Packet 4 was bitten by exactly this and measured against the wrong tree with no error. Nothing the package prints says which tree answered.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** low; no deployment axis. An instrument that trusts a run without knowing which tree produced it reports a self-consistent wrong answer.
+
+### What closing looks like
+
+1. Have `--version` print the package's resolved directory on a second line, so any instrument's log shows which tree answered.
+2. Review and CI instruments set `PYTHONSAFEPATH=1` and print `__file__` before trusting a run; record that in the review plan and the CI docs.
+
+**Duplicate search.** #1583 (PR 1064) is the release wheel-smoke twin (the smoke importing the checkout) and stays separate; nothing covers the CLI self-report. Searched `PYTHONSAFEPATH`, `__file__`, `shadow`, `editable`.
+
+**Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-11.
