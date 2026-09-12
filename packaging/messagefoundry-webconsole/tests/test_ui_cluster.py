@@ -442,6 +442,9 @@ async def test_a_monitoring_reader_sees_the_page_but_cannot_reach_the_control(
         live = await c.get("/ui/cluster/live")
         assert live.status_code == 200
         assert 'id="ha-live"' in live.text and "<html" not in live.text
+        # The page swaps this fragment in every 5 seconds and the fragment reads the permission for
+        # itself, so the page's refusal above holds only until the first refresh unless this does.
+        assert not _offers(live.text, CONFIRM)
         # Listed in the nav, so the page is reachable from every other page.
         assert 'href="/ui/cluster"' in (await c.get("/ui/status")).text
         # The gate behind the disabled buttons refuses the same caller on every control route.
@@ -489,6 +492,11 @@ async def test_a_stepdown_through_the_console_reaches_the_engine_and_redirects(
         cross = await c.post("/ui/cluster/stepdown", headers={"Sec-Fetch-Site": "cross-site"})
         assert cross.status_code == 403
         assert coord.step_down_calls == 0
+
+        # The other half of the operator test: each route offers the control when the caller holds
+        # cluster:control, or the fragment would take it away on the page's first 5-second refresh.
+        for path in ("/ui/cluster", "/ui/cluster/live"):
+            assert _offers((await c.get(path)).text, CONFIRM), path
 
         confirm = await c.get(CONFIRM)
         assert confirm.status_code == 200

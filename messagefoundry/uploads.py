@@ -144,12 +144,14 @@ class UploadedFileMeta:
     frees the name, and recreating it mints a different ``user_id``. Keying either the ownership
     check or the budget on the name would hand a recycled account the departed operator's files.
 
-    **The id is immutable per ROW, which is not the same as per PERSON on AD.** ``_upsert_ad_user``
-    resolves by ``sAMAccountName`` and mints a new ``user_id`` only when no mirror row survives, so a
-    directory-side rename/recycle WITHOUT a MessageFoundry ``delete_user`` re-binds the EXISTING id
-    to the new principal. A deploying site on AD would need the directory-immutable binding tracked
-    as BACKLOG #1143 for that case; this field closes the local-account path and the AD path that
-    goes through a delete."""
+    **The id is immutable per ROW, and on AD it is now per PERSON too (BACKLOG #1471).**
+    ``_upsert_ad_user`` used to resolve by ``sAMAccountName`` and mint a new ``user_id`` only when no
+    mirror row survived, so a directory-side recycle WITHOUT a MessageFoundry ``delete_user`` re-bound
+    the EXISTING id to the new principal and this field followed it. It now resolves by the
+    directory's immutable id (``users.directory_object_id``), and refuses a principal whose id
+    disagrees with the row holding its username, so a recycled name gets a new ``user_id``. The
+    remaining gap is a directory that returns no immutable identifier at all, where name resolution
+    still applies."""
 
     file_id: str
     filename: str

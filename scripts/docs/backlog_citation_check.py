@@ -330,6 +330,31 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --base and --head must be given together", file=sys.stderr)
         return 2
 
+    # AN EMPTY SHA IS A USAGE ERROR, NOT AN EMPTY DIFF, AND THE DIFFERENCE IS THE WHOLE POINT.
+    # The guard above tests `is None`, which two EMPTY STRINGS satisfy -- so `--base "" --head ""`
+    # reached the scan, `""...""` resolved to `HEAD...HEAD`, nothing was read, and this tool printed
+    # OK at exit 0. That is not a clean scan; it is a scan that never happened, rendered identically.
+    #
+    # It was not hypothetical. `.github/workflows/backlog-hygiene.yml` passes
+    # `github.event.pull_request.base.sha`, and on a `merge_group` event every `pull_request.*` field
+    # is null, so both arrived empty on EVERY queue entry. Measured on the live queue run for PR 1050
+    # at 2026-09-11T20:53:12Z: `BASE_SHA:` and `HEAD_SHA:` blank, "scanned: ... 0 in 0 file(s)",
+    # required context GREEN. This module already refuses an empty namespace on exactly this
+    # reasoning; the argument side lacked the same care.
+    #
+    # THE ASYMMETRIC CASE IS WORSE AND IS ALSO CLOSED HERE: `--base "" --head origin/main` resolved to
+    # `HEAD...origin/main` and scanned a WRONG scope rather than an empty one, still at exit 0.
+    for flag, value in (("--base", args.base), ("--head", args.head)):
+        if value is not None and not value.strip():
+            print(
+                f"ERROR: {flag} was given as an empty string. A missing revision is a usage error, "
+                "not an empty diff -- an empty range would scan nothing and report OK, which is "
+                "indistinguishable from a clean pass. Pass a real revision or pass neither flag "
+                "for the repo-wide report.",
+                file=sys.stderr,
+            )
+            return 2
+
     root = repo_root()
     ledger_labels = [p.as_posix() for p in LEDGER_SOURCES]
     sources: list[tuple[str, str]] = []

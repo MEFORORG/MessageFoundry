@@ -242,15 +242,52 @@ two things:
 
 ## Signing
 
-The `net-helper` workflow signs the binary on `main` when these repository secrets are set. Without them
-the build still passes, and the job summary marks the artifact as an unsigned development build. The
-workflow's header records the full signing policy, including what to change if the certificate's private
-key cannot be exported.
+The `net-helper` workflow signs the binary on `main` when the `net-helper-signing` environment holds these
+secrets. A separate `net-helper sign` job does the signing and uploads the result as its own artifact,
+`mefor-net-helper-signed`. Without the secrets the build still passes, and the job summary marks the
+artifact as an unsigned development build. The workflow's header records the full signing policy, including
+what to change if the certificate's private key cannot be exported.
 
-| Repository secret | Holds |
+| Environment secret | Holds |
 |---|---|
 | `NET_HELPER_SIGNING_PFX_BASE64` | The code-signing certificate and its private key, as a base64-encoded PFX. |
 | `NET_HELPER_SIGNING_PFX_PASSWORD` | The PFX password. |
+
+### Protect the environment before either secret exists
+
+Only a repository administrator can protect the environment. A secret placed before these steps would be
+readable from any branch, and the workflow's header explains why.
+
+1. Open the repository's **Settings**, then **Environments**, and open `net-helper-signing`. Create it if
+   it is not listed. A run on `main` creates it with no rule and no secrets, so finding it there proves
+   nothing.
+2. Under **Deployment branches and tags**, choose **Selected branches and tags**.
+3. Click **Add deployment branch or tag rule**, set **Ref type** to **Branch**, and enter the name pattern
+   `main`. Add no other rule.
+4. Add both secrets under **Environment secrets**.
+5. Confirm that neither name exists as a repository secret, or as an organization secret this repository
+   can read. A secret of the same name at either level would be readable from any branch, even with the
+   environment protected.
+
+The rule admits whatever is merged to `main`. When this was written, on 2026-09-11, branch protection on
+`main` required no approving review. So a pull request that edits the workflow could still reach the key
+once it merges. **Required reviewers** on the environment would make each signing run wait for a person to
+approve it. Whether that is worth the wait is the owner's decision.
+
+These read-only commands check steps 2 to 5. The comment above each one says what a correct setup prints.
+
+```
+# custom_branch_policies is true and protected_branches is false
+gh api repos/MEFORORG/MessageFoundry/environments/net-helper-signing --jq .deployment_branch_policy
+# exactly one rule, named main, of type branch
+gh api --paginate repos/MEFORORG/MessageFoundry/environments/net-helper-signing/deployment-branch-policies --jq '.branch_policies[] | {name, type}'
+# both secret names
+gh api --paginate repos/MEFORORG/MessageFoundry/environments/net-helper-signing/secrets --jq '.secrets[].name'
+# neither secret name
+gh api --paginate repos/MEFORORG/MessageFoundry/actions/secrets --jq '.secrets[].name'
+# neither secret name
+gh api --paginate repos/MEFORORG/MessageFoundry/actions/organization-secrets --jq '.secrets[].name'
+```
 
 ## Known limits
 
