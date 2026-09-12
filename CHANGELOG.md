@@ -279,6 +279,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   migrating, because a key that is refused now was doing nothing before.
 
 ### Security
+- **The web console's step-up actions would have refused an MFA-pending session without the audit
+  row the console's other MFA refusals write.** `require_ui_step_up` and `require_ui_step_up_action` switched off
+  `require_ui`'s second-factor gate to keep their `/ui/reauth?next=` continuation, then refused a
+  pending session with a bare redirect of their own. On a first deployment with
+  `[security].require_mfa` on, which is the default, a stolen password-only session cookie would have
+  probed all 42 step-up route gates and left no `auth.mfa_denied` row. The same switch put the
+  permission check first, so the refusal would also have shown which of those permissions the account
+  holds, and it spent the account's admin-write budget before refusing. The gate now refuses, audits
+  and orders its checks as it does on every other `/ui` route. Only where it sends the browser
+  differs. The JSON API was never affected. ([BACKLOG #1542](docs/BACKLOG.md))
 - **The web console's message editor would have opened the raw body to a custom role holding
   `messages:edit` without `messages:view_raw`.** `GET /ui/messages/{id}/edit` and
   `POST /ui/messages/{id}/edit-resend` gated on `messages:edit` alone, while the JSON handler they
