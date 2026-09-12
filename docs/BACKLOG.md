@@ -30865,6 +30865,100 @@ brought to it.
 
 ---
 
+## 1531. bring seat-tick.ps1 and seats.json under version control -- owner ruling on where the seat clock lives
+
+> ⛔ **CLOSED 2026-09-11 as INVALID -- owner ruling. THE QUESTION THIS ROW ASKS IS MOOT: a clock nobody runs needs no home.** The owner ruled on the seat clock the same day. Verbatim, as `#1266` carries it: *"close 1266 as an invalid issue"*, and on scope: *"I'm not using the tick, so mark it as invalid"*. This row asks WHERE `seat-tick.ps1` and `seats.json` should live. That is a question about a tool in use, and the ruling removes the use. **Filing a row and closing it inside one day is not a contradiction here.** Earlier on 2026-09-11 the owner answered this row's question -- bring both files under `scripts/coord/` -- and the closing ruling then voided the answer. `#1266` records that sequence at the deliverable line it supersedes.
+>
+> **THE CLOSURE IS CARRIED ELSEWHERE, AND A READER WANTS THOSE PULL REQUESTS RATHER THAN THIS ROW.** PR **1050** closes `#1266`. PR **1053** closes `#1264` and `#1267` and deletes the watchdog. This row ships nothing and closes only itself.
+>
+> **THE PRECONDITION IT EXISTS TO CLEAR HAS NO DEPENDANTS LEFT.** The two rows named below as blocked on a version-control ruling are `#1266` and `#1267`, and both close on the same reason. A precondition that nothing waits behind is not a precondition. **Nothing in the ledger now waits on this decision, so there is no ruling left to give.**
+>
+> **RETIRED CITATION -- THIS ROW CITES `scripts/coord/seat_clock_alarm.py` TWICE AND PR 1053 DELETES THAT FILE.** The old claim is named here rather than removed, because a retraction does not chase a claim somebody already read. It read: that a tracked, reviewed file in this repository says at `:56` that the emitter is not in this repository and pins `_MEFOR` at `:76` to `%USERPROFILE%\.claude\mefor-usage`, so both of its inputs default to files nothing tracks -- offered as evidence that `#1269` went around this gap rather than closing it. **It was true when taken, on 2026-09-10.** PR 1053 removes `scripts/coord/seat_clock_alarm.py` (+0/-277) and `tests/test_coord_seat_clock_alarm.py` (+0/-345), so from that merge there is no file to read and both anchors resolve to nothing. **Do not re-verify them against a checkout. They are history, and a checkout that cannot find them is agreeing with this line, not contradicting it.**
+>
+> **THE FOUR MEASUREMENTS BELOW ARE A RECORD, NOT A LIVE ASK.** They were taken 2026-09-10 and they held: neither file is tracked, both live machine-global and unversioned, the edit is outside every worktree, and the clock's scheduled tasks were already off. They cost real work and they stay. **Measurement 4 now reads as the cause rather than as a difficulty:** the tasks are disabled because the clock is not in use, which is the ruling. The row measured the symptom and filed a question about the tool instead.
+>
+> **`Closing-act` STAYS `owner-ruling`, WHICH IS NOT A STALE FIELD.** The vocabulary is fixed at `scripts/coord/dispatch_gate.py:28` -- `code | scorecard-rescore | owner-ruling | banner-only` -- and carries no value for an invalid close. The act that closed this row *was* an owner ruling, so the filed value is the correct one and no new token was invented to say so.
+>
+> **Filed 2026-09-10. Not started. One ruling, not a build.** Value **6/10** · Difficulty **2/10**. The seat clock's script and its roster are untracked machine-global files. Editing either is a write outside every worktree, which git cannot undo, so CLAUDE.md section 5 forbids a builder from making it and the installed `worktree_gate.ps1` refuses the tool call. Two open rows name that precondition in their own text, and neither can be dispatched until an owner rules on where the files should live. Value 6 because the block is permanent rather than slow -- nothing in the ledger can clear it, so those rows sit open indefinitely, and the one row that shipped did so by pinning a path into files nothing tracks. Difficulty 2 because the decision is one choice between two named destinations, and the move itself is a copy, a commit and an install step.
+> Verdict: owner-ruling
+> Research: none -- the measurements are in the body
+> Closing-act: owner-ruling
+
+**Cluster:** fleet coordination / seat clock. **Priority:** P2. **Verdict:** owner ruling -- this repository under `scripts/coord/`, the MessageFoundry-vault, or neither with the `#1247` receipt pattern instead.
+**Severity:** no deployment axis (sec. 0). Fleet tooling only -- no engine behaviour, no shipped artifact, no PHI.
+
+### Four measurements, taken 2026-09-10 in a worktree of this clone
+
+**HISTORY, NOT A LIVE ASK -- see the closing banner.** These four held on 2026-09-10 and they are kept for that reason. Nothing below is a request.
+
+**1. Neither file is in this repository.**
+
+```
+ls scripts/coord/seat-tick.ps1     -> No such file or directory
+git ls-files | grep -i seat-tick   -> zero      (control: 2201 files tracked)
+git grep -l seat-tick              -> docs/BACKLOG.md,
+                                      docs/BACKLOG-RESCORE-2026-08-20-FINDINGS.md,
+                                      scripts/coord/seat_clock_alarm.py
+                                      -- three references, no source
+```
+
+`docs/roles/seats.json` is tracked and is **not** this file. It is the 3,041-byte seat roster that CLAUDE.md section 5 governs and `tests/test_role_cards.py` pins. The clock's `seats.json` is a different 12,304-byte file keyed by absolute worktree path. **A reader who greps for `seats.json` finds the tracked one and concludes the roster is versioned.**
+
+**2. Both live machine-global and unversioned.**
+
+```
+~/.claude/mefor-usage/seat-tick.ps1   52,615 bytes   mtime 2026-08-21 23:55
+~/.claude/mefor-usage/seats.json      12,304 bytes   mtime 2026-08-29 15:37
+~/.claude/mefor-usage/.git            No such file or directory
+```
+
+That directory versions by filename suffix instead: **36 of its 72 entries** carry `.bak-`, `.deleted-`, `.superseded-`, `.removed-bak` or a `.pre-<sha>-` tag, including three generations of `seat-tick.ps1` and seven of `seats.json`. #1266 already named the same signature from one file; the count is the population behind it.
+
+**3. So the edit is outside every worktree, and a builder must not make it.** CLAUDE.md section 5: *"What needs the owner is an action git cannot undo. Examples: writing outside the worktree ... A Builder cannot ask, so it must not take one."* The harness agrees independently -- `worktree_gate.ps1` is installed at `~/.claude/hooks/worktree_gate.ps1` (232,455 bytes, mtime 2026-09-05 10:29) and denies the Write, Edit or Bash call itself. **Not tested here, deliberately: the test is the forbidden action.**
+
+**4. And the clock is switched off, so the one apply-time check cannot be run.**
+
+```
+Get-ScheduledTask, TaskName matching MEFOR:
+  MEFOR-Seat-Clock         Disabled
+  MEFOR-Seat-Clock-Core3   Disabled
+  MEFOR-Boards-Refresh     Disabled
+~/.claude/mefor-usage/seat-tick.last, leading stamp -> 2026-09-05T15:40:37.6331088Z
+```
+
+Five days with no tick. [#1267](#1267) calls its apply-time check **non-negotiable** and quotes the file's own comment for it: *"MEASURE THE BODY LENGTH AFTER ANY EDIT, AND THEN RUN THE CLOCK AND READ THE HEARTBEAT. A live fire is the only check that covers this."* **The check guarding the 2,000-character tick-body cap -- the cap whose breach killed the fleet clock for 35 minutes -- cannot be performed on a disabled task.**
+
+### Which rows this unblocks, each verified against the ledger today
+
+| Row | Status | What ties it here |
+| --- | --- | --- |
+| [#1266](#1266) | open, **DEMAND-GATE** | its own text: *"THEREFORE THE FIRST DELIVERABLE IS VERSION CONTROL, NOT THE LOG. Bring `seat-tick.ps1` and `seats.json` under version control -- this repo under `scripts/coord/`, or the vault."* Its re-score adds that the fixes *"sit behind the version-control precondition."* |
+| [#1267](#1267) | open | #1266 names it in the same sentence: *"`#1267` is blocked identically because its fix is a rewrite of the tick body: the exact edit that caused the 35-minute outage."* #1267's own re-score opens *"The artefact is not in the repo at all."* |
+
+**BOTH ROWS IN THAT TABLE NOW CLOSE AS INVALID ON THE SAME RULING, so the table records what tied them here and unblocks nothing.** `#1266` closes on PR 1050, `#1267` on PR 1053.
+
+**Two further rows were briefed to this filing as blocked and the ledger does not support either. Recorded rather than dropped, so nobody re-derives them.**
+
+- **[#1264](#1264) is not blocked here.** Its doc half was applied inside the untracked file and is done. Its remaining code half is the roster and fanout selection, and its own 2026-08-23 amendment puts that at `scripts/coord/mail.ps1:352` -- **in this repository** -- and calls the row's *"must be done against files that are not tracked in this repository"* sentence **FALSE** in those words. **Not blocked is not the same as closeable, and #1264 is easy to misread as closeable.** Its 2026-08-23 pass ends *"RECOMMEND CLOSING AS NOT REPRODUCIBLE"*; its **2026-08-24** pass overturns exactly that, because the closing census keyed on `kind=broadcast` and the clock never sends that kind, so **on the correct population the signature reproduces at 324 of 731 firings** and *"the `NOT REPRODUCIBLE` verdict is an artefact of the wrong needle."* **The later pass sits ABOVE the recommendation it refutes**, so a reader who scrolls to the end of #1264 finds the withdrawn verdict last and closes a row that reports a live fault. **And the 2026-08-24 pass anchors its finding at `seat-tick.ps1:743`** -- a line no checkout can resolve. **The measurement keeping #1264 open cannot be re-verified from this repository, which is this row's subject turned on the row next door.**
+- **[#1269](#1269) is closed.** `parse_items` reports it not open, its banner is the closed check, it landed at `0ba326a12` on PR #557, and it was verified on main at `f6c96b3b1`. **It hit this wall and went around it**, which is the sharper evidence rather than a correction: the alarm it shipped, `scripts/coord/seat_clock_alarm.py`, says at :56 that *"THE EMITTER IS NOT IN THIS REPOSITORY"* and pins `_MEFOR` at :76 to `%USERPROFILE%\.claude\mefor-usage`, so a tracked and reviewed file in this repository defaults **both** of its inputs to files nothing tracks. **Closing a row around the gap does not close the gap, and it removes the row that would have reported it.** **CITATION RETIRED 2026-09-11 -- PR 1053 deletes `scripts/coord/seat_clock_alarm.py` and its test, so the `:56` and `:76` anchors in this bullet no longer resolve.** The claim is kept as written because it was measured, and the closing banner names it.
+
+### #1264 and #1266 are one defect from two angles, so do not dispatch them together
+
+Both rows carry the same census: 112 firings on 2026-08-14 at a 10.0-minute cadence, recipients per firing ranging 1 to 11 with a median of 2, 53 of 112 firings reaching exactly one seat, and the same collapse-and-recover run -- 10,10,10,10,9,11,11, then 2,5,3,3,6,2,2,2, then back to ten and eleven. #1267 states in its own first line that it is a different owner and a different fix from #1266 and must not be merged with it. **Nothing says that about #1264 and #1266, and the shared numbers are why it needs saying.** Once #1266 is unblocked, dispatch one of the pair and have it read the other first.
+
+### What the ruling has to answer
+
+**SUPERSEDED 2026-09-11 -- NONE OF THE FOUR IS STILL AN OPEN QUESTION.** The ruling that closes this row answers all of them at once: the clock is not in use, so it needs no home, `seats.json` needs no destination, no fallback pattern applies, and the scheduled tasks stay off. Kept as the record of what a ruling would have had to cover.
+
+1. **Where.** `scripts/coord/` in this repository, beside `mail.ps1`, `seat.ps1` and the alarm that already points at these files -- or the MessageFoundry-vault.
+2. **What happens to `seats.json`**, which carries absolute worktree paths and account names for a live fleet. That half is the argument for the vault, and it can be ruled separately from the script.
+3. **The fallback, if the answer is neither.** #1266 already names it: the `#1247` pattern -- back up the bytes, write a receipt naming who wrote it and from where, and refuse to overwrite an unrecognised copy. `worktree_gate.ps1` ships that pattern today and its receipt sits beside it as `worktree_gate.ps1.receipt.json`.
+4. **Whether the clock's scheduled tasks come back.** Measurement 4 says the live fire #1267 requires cannot be run while they are disabled. A ruling that moves the files and leaves the tasks off hands the next builder a check it cannot perform.
+
+**This row does not ask anyone to move a file.** Moving it is the decision. A builder that moved it on its own authority would be taking exactly the action this row exists to get ruled on.
+
+**AND NOBODY SHOULD MOVE ONE NOW EITHER, FOR A DIFFERENT REASON.** The row closed before it was ruled on, so there is no decision to carry out. **Anyone tempted to re-file this must first establish that the seat clock is in use again** -- the same bar `#1266` sets, and for the same reason.
+
 ## 1533. cla.yml keyed its concurrency group on github.ref under pull_request_target, so every open pull request shared one group and each push cancelled the required cla check on an unrelated PR
 
 > 🚧 **Built 2026-09-11 (PR 1046); open until that merges, when the Lander flips this banner.** One-line key change in `.github/workflows/cla.yml` -- `github.ref` becomes `github.event.pull_request.number` on the `pull_request_target` arm -- plus `tests/test_workflow_concurrency_keys.py`, which holds the invariant over all 28 workflow files. Value **8/10** · Difficulty **2/10**. Value 8: `cla` is a required context, 25 of the last 61 `pull_request_target` runs were cancelled, and 17 open pull requests carried a cancelled `cla` when this was filed. Difficulty 2: the fix is one expression; establishing that it was the cause, and that nothing else shares the shape, was the work.
