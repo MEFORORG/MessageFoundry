@@ -1,5 +1,7 @@
 [build-system]
-requires = ["hatchling"]
+# EXACT `==`, in lockstep with the engine's table. The reason is stated once, above that table in the
+# root pyproject.toml.
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 # Second distribution: the MessageFoundry WEB CONSOLE (ADR 0065, Option B). Published alongside the
