@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The PHI retention classification the startup gate is generated from (ASVS 14.2.7).
 
 **Why a constant rather than a hand-typed tuple in `__main__.py`.** This cell broke once because a new

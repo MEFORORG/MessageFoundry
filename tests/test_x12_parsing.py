@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure X12 codec (messagefoundry.parsing.x12) — delimiters, peek, interchange framing, message,
 integrity, and the console-carve-out import-purity guard (ADR 0012)."""
 

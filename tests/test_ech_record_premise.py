@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guards for the ECH record (BACKLOG #1011, ADR 0139, SDS-3.7 / CLAUDE.md section 11).
 
 Three invariants, each of which was VIOLATED at base commit ``b52fd844`` and each of which was

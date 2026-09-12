@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR control RBAC + endpoints (#61, ADR 0048). POST /dr/activate and /dr/release are gated by the
 dedicated dr:operate permission (held by ADMINISTRATOR, NOT a reuse of connections:control): an OPERATOR
 (who holds connections:control but NOT dr:operate) is denied 403 and the denial is audited; an

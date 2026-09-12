@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Durable message store + queue (SQLite WAL, transactional inbox/outbox).
 
 The store *is* the queue. ``enqueue_message`` persists the inbound message and one
@@ -857,6 +857,25 @@ class UserRecord:
     # subsequent one, so a reassigned username cannot hand the account to a new subject.
     oidc_issuer: str | None = None
     oidc_subject: str | None = None
+    # THE DIRECTORY'S IMMUTABLE IDENTIFIER FOR THIS ACCOUNT (BACKLOG #1471): the normalised AD
+    # ``objectGUID``, which is what an AD login resolves this row by. A ``sAMAccountName`` is
+    # RECYCLABLE — a deleted account's name can be reissued to a different person — so resolving a
+    # directory login by name let the new holder adopt the departed operator's row, and with it the
+    # ``user_id`` that uploaded-file ownership, the per-uploader quota and saved search presets all
+    # key on. This column is what those checks ultimately rest on; it is the OIDC ``(issuer, sub)``
+    # binding one column over, for the directory leg.
+    #
+    # NULL = this row carries no directory binding: a local account, or an AD account resolved
+    # against a directory that returns no such attribute. A NULL is NEVER adopted by a login that
+    # presents an id — auth/service.py refuses that pairing rather than backfilling it, because
+    # backfilling on first sight leaves the recycle window open for exactly the accounts that have
+    # not logged in yet.
+    #
+    # Carries NO uniqueness constraint, deliberately: the resolver never writes a second row for an
+    # id it has already seen (it resolves to the existing one), and the UNIQUE on ``username`` is
+    # what refuses a racing double-create. That also keeps SQL Server's 1700-byte index-key limit
+    # out of the question, which the sized ``oidc_*`` columns above had to work around.
+    directory_object_id: str | None = None
     # Credential claim (BACKLOG #1245): when the holder set their OWN credential through authenticated
     # self-service rotation. NULL = never claimed. It records a claim, NOT continuing control — an admin
     # reset legitimately takes control away and deliberately leaves this stamp alone. Monotonic by
@@ -910,6 +929,12 @@ class UserRecord:
             totp_enrolled_at=_opt_float(d.get("totp_enrolled_at")),
             oidc_issuer=d.get("oidc_issuer"),
             oidc_subject=d.get("oidc_subject"),
+            # A ``.get()`` like its oidc_* neighbours, and UNLIKE the two hard subscripts below
+            # (BACKLOG #1471). Those decode a missing key into a value that silently RETIRES or
+            # UN-NOTIFIES an account, so they fail loudly instead. A missing key here decodes to
+            # NULL, which means "no directory binding", and an unbound row is one the AD resolver
+            # REFUSES to adopt — the quiet direction is the closed one.
+            directory_object_id=d.get("directory_object_id"),
             # Hard subscript, deliberately unlike its .get() neighbours (BACKLOG #1245): a missing key
             # would decode as None, None means "never claimed", and an account read that way would be
             # retired. Failing loudly on a mapping that lacks the column beats silently retiring a
@@ -1866,6 +1891,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_totp_step       INTEGER,              -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
     oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
     oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
+    directory_object_id  TEXT,                 -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID); what an AD login resolves this row by, because sAMAccountName is recyclable. NULL = no directory binding, and an unbound row is never adopted by a login presenting an id
     password_claimed_at  REAL                  -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
 );
 
@@ -3322,6 +3348,14 @@ class MessageStore:
             ("last_totp_step", "INTEGER"),
             ("oidc_issuer", "TEXT"),
             ("oidc_subject", "TEXT"),
+            # Directory-immutable identity binding (BACKLOG #1471): a pre-existing DB's users predate
+            # the column. NULL on existing rows = "no directory binding", and that is NOT
+            # byte-identical to before — an AD login presenting an objectGUID refuses such a row
+            # instead of adopting it by name. That is the point of the item: adopt-and-backfill on
+            # first sight would leave the recycle window open for every account that has not logged
+            # in since the upgrade. No backfill is possible anyway; nothing in the store has ever
+            # held the directory's identifier.
+            ("directory_object_id", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -8077,6 +8111,7 @@ class MessageStore:
         email: str | None = None,
         password_hash: str | None = None,
         must_change_password: bool = False,
+        directory_object_id: str | None = None,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
@@ -8084,8 +8119,8 @@ class MessageStore:
             await self._db.execute(
                 "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
                 " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-                " must_change_password, failed_attempts, locked_until)"
-                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL)",
+                " must_change_password, failed_attempts, locked_until, directory_object_id)"
+                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)",
                 (
                     user_id,
                     username,
@@ -8098,6 +8133,7 @@ class MessageStore:
                     password_hash,
                     now if password_hash is not None else None,
                     1 if must_change_password else 0,
+                    directory_object_id,
                 ),
             )
             await self._commit()
@@ -8116,6 +8152,16 @@ class MessageStore:
             cur = await db.execute(
                 "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
             )
+            row = await cur.fetchone()
+        return UserRecord.from_mapping(dict(row)) if row else None
+
+    async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
+        # BACKLOG #1471. The AD login's identification read: it asks the directory's IMMUTABLE id
+        # which row this is, where the only available question used to be the recyclable name.
+        # A lookup rather than a scan for the reason get_user_by_federated_subject gives: it sits on
+        # the sign-in path, and list_users() would make every directory login O(accounts).
+        async with self._read() as db:
+            cur = await db.execute("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 

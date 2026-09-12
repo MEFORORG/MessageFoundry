@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Config-dir FileSystemWatcher (ADR 0091 follow-through): an EXTERNAL edit to the config — a git
 // pull, a checkout, another tool writing connections.toml or a code set — now refreshes the
 // CONNECTIONS tree, Problems, and Translation Tables without a manual refresh. Events funnel into

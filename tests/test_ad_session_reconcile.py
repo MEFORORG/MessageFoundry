@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0079 mechanism 2 — directory session reconciliation.
 
 Disabling an account in AD does not terminate its live engine session; this reconciler re-resolves

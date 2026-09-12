@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR-1 sub-test A — the DR snapshot under a CONCURRENT WRITER (contention path, SQLite-local, no rig).
 
 The existing consistency test (``tests/test_backup_runner.py::test_snapshot_is_consistent_and_nonmutating``)

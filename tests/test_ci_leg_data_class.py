@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A CI leg that weakens TLS must also stop enforcing — the two are mutually exclusive.
 
 THE DEFECT THIS EXISTS FOR. The ``load test (smoke, sqlserver)`` legs were RED for four consecutive

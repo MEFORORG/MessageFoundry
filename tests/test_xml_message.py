@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure XML/SOAP codec (messagefoundry.parsing.xml) — hardened lxml parse (XXE / entity-expansion /
 external-DTD all refused), namespace-aware XPath read/set round-trip, and the console-carve-out
 import-purity guard (BACKLOG #31)."""

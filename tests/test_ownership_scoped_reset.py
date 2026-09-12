@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Ownership-scoped crash recovery (ADR 0073), SQLite store level.
 
 ``reset_stale_inflight(owned=OwnedLanes(...))`` must recover exactly the caller's config-graph

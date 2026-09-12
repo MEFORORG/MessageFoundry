@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Service settings: TOML + env + CLI loading with CLI > env > file > default precedence."""
 
 from __future__ import annotations
@@ -582,7 +582,7 @@ def test_sqlserver_settings_load(tmp_path: Path) -> None:
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "sqlserver"\nserver = "sql01.hospital.local"\n'
         'database = "MessageFoundry"\nusername = "mefor_svc"\nencrypt = true\n'
-        'trust_server_certificate = false\npool_size = 8\ndb_schema = "mf"\n',
+        "trust_server_certificate = false\npool_size = 8\n",
     )
     s = load_settings(config_path=cfg, environ={"MEFOR_STORE_PASSWORD": "s3cret"})
     assert s.store.backend is StoreBackend.SQLSERVER
@@ -591,7 +591,7 @@ def test_sqlserver_settings_load(tmp_path: Path) -> None:
     assert s.store.password == "s3cret"  # secret comes from env, not the file
     assert s.store.port == 1433  # default
     assert s.store.encrypt is True and s.store.trust_server_certificate is False
-    assert s.store.pool_size == 8 and s.store.db_schema == "mf"
+    assert s.store.pool_size == 8
 
 
 def test_sqlserver_missing_server_database_rejected(tmp_path: Path) -> None:
@@ -628,12 +628,33 @@ def test_sqlserver_env_coercion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
             "MEFOR_STORE_AUTH": "entra",
             "MEFOR_STORE_PORT": "14330",
             "MEFOR_STORE_ENCRYPT": "false",
-            "MEFOR_STORE_DB_SCHEMA": "audit",
         }
     )
     assert s.store.port == 14330  # str -> int
     assert s.store.encrypt is False  # str -> bool
-    assert s.store.auth is SqlAuth.ENTRA and s.store.db_schema == "audit"
+    assert s.store.auth is SqlAuth.ENTRA
+
+
+@pytest.mark.parametrize(
+    "backend_toml",
+    ['backend = "sqlserver"\nserver = "s"\ndatabase = "d"\nauth = "integrated"\n', ""],
+    ids=["sqlserver", "sqlite"],
+)
+def test_db_schema_refused_off_postgres(tmp_path: Path, backend_toml: str) -> None:
+    # Neither store reads db_schema, so load refuses it rather than let it imply isolation.
+    cfg = _write(tmp_path / "messagefoundry.toml", f'[store]\n{backend_toml}db_schema = "mf"\n')
+    with pytest.raises(ValidationError, match="db_schema"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_db_schema_accepted_on_postgres(tmp_path: Path) -> None:
+    # Postgres honours it (the pool's search_path), including from MEFOR_STORE_DB_SCHEMA.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n',
+    )
+    s = load_settings(config_path=cfg, environ={"MEFOR_STORE_DB_SCHEMA": "mefor"})
+    assert s.store.backend is StoreBackend.POSTGRES and s.store.db_schema == "mefor"
 
 
 def test_sqlite_default_unaffected_by_new_fields(

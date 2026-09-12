@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #327 — the private-path `.gitignore` rules are a control, so they get a test.
 
 Since the publish deny-list was retired, **the `.gitignore` rules are the sole mechanism** keeping

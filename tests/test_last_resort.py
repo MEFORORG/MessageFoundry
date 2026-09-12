@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-19: process-level last-resort error handling (ASVS 16.5.4).
 
 Verifies the asyncio loop handler + sys.excepthook + threading.excepthook route an otherwise-unhandled

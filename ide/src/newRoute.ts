@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // "New Route Wizard" — a stepped webview that builds an end-to-end interface in one go:
 // Inbound connection -> Router -> Handler -> Outbound connection, all wired (router returns the
 // handler; handler Sends to the OB), generated into a single config module. Required fields are

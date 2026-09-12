@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Parity report for ``tee compare`` (#14) — composes correlate + compare into a PHI-safe summary.
 
 :func:`build_report` correlates MEFOR outputs to Corepoint outputs (:mod:`tee.correlate`) and diffs each

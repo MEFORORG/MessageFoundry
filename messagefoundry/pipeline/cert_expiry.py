@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """TLS-certificate expiry monitor (Q5c / ADR 0002).
 
 Now that native off-loopback TLS is the supported posture, a **silently expired** API or MLLP

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.7.1 (BACKLOG #285): operator-supplied trust-anchor integrity — the read-only ACL preflight,
 the optional SHA-256 pin, the anchor-changed audit event, and dormant-when-unconfigured."""
 

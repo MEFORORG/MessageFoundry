@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Bench-gated per-delivery phase timing (attribute the ~83 ms outbound delivery ceiling).
 
 The rig measured a ~83 ms/delivery outbound ceiling with every tier idle; static analysis exonerated

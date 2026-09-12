@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The estate run orchestrator (#216) — drive the calibrated heterogeneous shape, read the achieved one.
 
 Parallels :func:`~harness.load.connscale.runner.run_connscale`, but drives a HETEROGENEOUS estate at an

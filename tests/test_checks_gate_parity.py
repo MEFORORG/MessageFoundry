@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0118 AC-7 — the gate-parity safety net.
 
 The [security] section only RE-SOURCES the posture switches (a desugar into the internal fields the

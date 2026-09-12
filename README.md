@@ -191,7 +191,7 @@ Then open the admin console in a browser (install the web console alongside the 
 MessageFoundry is licensed under the **GNU Affero General Public License v3.0 or later**
 (`AGPL-3.0-or-later`) — see [LICENSE](https://github.com/MEFORORG/MessageFoundry/blob/main/LICENSE). Running a modified version as a network service
 triggers the AGPL's §13 source-offer obligation. A separately-licensed commercial edition is planned
-by **MessageFoundry Organization** under the standard open-core model — see
+by **MessageFoundry Foundation, LLC** under the standard open-core model — see
 [COMMERCIAL-LICENSE.md](https://github.com/MEFORORG/MessageFoundry/blob/main/COMMERCIAL-LICENSE.md) (terms pending legal review). See [NOTICE](https://github.com/MEFORORG/MessageFoundry/blob/main/NOTICE)
 for copyright and attribution.
 

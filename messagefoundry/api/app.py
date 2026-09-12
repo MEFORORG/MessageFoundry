@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Localhost FastAPI surface for the console.
 
 This is the *only* boundary a client uses, so in-process / local-daemon / remote
@@ -4141,15 +4141,21 @@ def create_app(
         (``uploads.py`` ``save()``), so ownership and the budget can never disagree about who a file
         belongs to — a recycled account is neither billed for nor able to read the old files.
 
-        **WHAT THIS DOES NOT REACH, and it is the primary enterprise path.** ``_upsert_ad_user``
-        (``auth/service.py``) resolves an AD principal by ``sAMAccountName`` and mints a fresh
-        ``user_id`` ONLY when no mirror row survives — i.e. only after a MessageFoundry
-        ``delete_user``. On the DEFAULT path the surviving row is adopted and **its ``user_id`` is
-        re-bound**, so a deploying site that recycles a ``sAMAccountName`` in the directory without
-        also deleting the MessageFoundry user would give the new person the old person's id, and this
-        check would match. No better key exists here: ``AdPrincipal`` carries no ``objectGUID`` or
-        ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
-        ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
+        **THE AD PATH IS NOW REACHED TOO, and it used to be the hole under this check (BACKLOG
+        #1471).** ``_upsert_ad_user`` (``auth/service.py``) resolved an AD principal by
+        ``sAMAccountName`` and minted a fresh ``user_id`` ONLY when no mirror row survived — i.e. only
+        after a MessageFoundry ``delete_user`` — so on the DEFAULT path a directory-side name recycle
+        adopted the surviving row, **re-bound its ``user_id``**, and this check then matched for the
+        new person. It now resolves an AD login by the directory's IMMUTABLE id (the normalised
+        ``objectGUID``, carried on ``AdPrincipal`` and stored in ``users.directory_object_id``), and a
+        principal whose id disagrees with the row holding its username is refused rather than handed
+        the row. A recycled name therefore gets a new ``user_id``, which is what this check needs.
+
+        **The residual, stated because it is what a reader would otherwise assume away:** a directory
+        that returns no immutable identifier at all still resolves by name, because the engine cannot
+        key on an identifier it is not given. The LDAP layer warns once per distinct cause -- absent
+        as well as unreadable -- so a site on that path is told, rather than left to assume a control
+        is running for it.
 
         The channel axis is deliberately NOT used, and ONE of its two original reasons has since
         expired. The surviving one is decisive on its own: an uploaded file carries no channel at

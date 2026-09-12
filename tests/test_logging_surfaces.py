@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """S7b logging surfaces — runtime verbosity control + redacted log-tail viewer (#171, ADR 0130).
 
 Covers the ``set_runtime_level`` helper (validate + apply, ephemeral), the ``GET``/``PATCH

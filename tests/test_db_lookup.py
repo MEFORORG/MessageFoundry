@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for handler-callable live db_lookup (ADR 0010).
 
 Covers the accessor + active-runner indirection (config/db_lookup.py), the pooled executor against a

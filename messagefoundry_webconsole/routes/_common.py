@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Small route helpers shared by the admin/account modules (moved from ``api.auth_routes``).
 
 ``_form_pairs`` is the stdlib urlencoded-form parser (no python-multipart dep) shared by every

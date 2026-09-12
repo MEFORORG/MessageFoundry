@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #37 (runtime + restart half) — a problem connection must not crash the engine or block
 its restart. The startup-isolation half lives in test_startup_fault_isolation.py (ADR 0031); this
 covers the two remaining runtime modes:

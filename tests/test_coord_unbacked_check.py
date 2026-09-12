@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The unbacked-work check must answer the question it is read as answering.
 
 Every test here pins a mistake that was actually made, not one that was imagined.

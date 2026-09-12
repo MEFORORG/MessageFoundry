@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synchronous, handler-callable **live** FHIR read (the FHIR analog of :func:`db_lookup`, ADR 0043).
 
 :func:`fhir_lookup` runs a **live, read-only** FHIR read — a read-by-id ``GET {base}/Patient/123`` or a

@@ -19,7 +19,7 @@ description = "Test harness for MessageFoundry — synthetic-only send/receive (
 readme = "README.md"
 requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
-authors = [{ name = "MessageFoundry Organization and contributors" }]
+authors = [{ name = "MessageFoundry Foundation, LLC and contributors" }]
 keywords = ["hl7", "healthcare", "integration", "load-testing", "failover", "mllp", "testing"]
 classifiers = [
     "Development Status :: 4 - Beta",  # Early Access (lockstep with the engine)

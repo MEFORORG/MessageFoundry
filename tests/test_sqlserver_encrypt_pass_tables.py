@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every ciphered (table, column) the SQL Server backend sweeps must name a table it actually creates.
 
 **This guard exists because CI cannot catch the defect any other way.** `_encrypt_existing_rows`

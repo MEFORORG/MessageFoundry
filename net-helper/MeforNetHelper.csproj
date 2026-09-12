@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
@@ -29,9 +29,9 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Deterministic>true</Deterministic>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <Company>MessageFoundry Organization</Company>
+    <Company>MessageFoundry Foundation, LLC</Company>
     <Product>MessageFoundry</Product>
-    <Copyright>Copyright (C) 2026 MessageFoundry Organization and contributors</Copyright>
+    <Copyright>Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors</Copyright>
   </PropertyGroup>
 
   <ItemGroup>

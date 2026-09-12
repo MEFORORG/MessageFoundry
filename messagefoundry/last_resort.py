@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Process-level last-resort error handling (ASVS 16.5.4).
 
 Per-request (the API catch-all 500) and per-lane (the pipeline workers + framed listeners) handlers

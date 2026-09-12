@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Parallel-run reconciliation harness — compare MessageFoundry's output against Corepoint's.
 
 During the migration's shadow phase, the same inbound message is processed by both engines; this package

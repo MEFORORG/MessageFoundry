@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the collision gate (``scripts/hooks/collision_gate.ps1``) and its installer.
 
 The gate refuses to edit a file another LIVE session is already changing. Worktrees stop two sessions

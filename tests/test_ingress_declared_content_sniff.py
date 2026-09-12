@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 5.2.2 (BACKLOG #1109): the declared-content-type sniff on the NETWORK-LISTENER sources.
 
 The file sources have run ``_content_matches_declared`` since the 5.2.2 hardening

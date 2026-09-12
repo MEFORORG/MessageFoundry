@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Generic outbound HTTP auth on the REST/SOAP/FHIR destinations (BACKLOG #65, ADR 0024 amendment).
 
 Covers the two built modes: (1) OAuth2 client-credentials with a SYMMETRIC secret — fetches + caches a

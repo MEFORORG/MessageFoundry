@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the landed-citation screen -- the tool that asks the tree instead of the banner.
 
 **THE WEIGHT HERE IS ON THE CONTROLS, NOT ON THE ROWS.** A screen of this shape has two degenerate

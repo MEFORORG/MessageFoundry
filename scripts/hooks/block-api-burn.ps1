@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # PreToolUse guard: deny GitHub CLI commands that POLL in a loop and burn the shared API rate limit.
 # Reads the tool-call JSON on stdin; if the command watches a run or a PR in a polling loop it
 # returns a "deny" decision naming the single-shot command to use instead. Anything else passes

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the WIRING of the announce hook -- the anti-no-op class.
 
 ``test_announce_hook.py`` pins what the hook says. This module pins something the repo had no test
