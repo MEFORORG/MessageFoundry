@@ -1,10 +1,20 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0)
 
-> **Increments 1, 4 and 5 are BUILT.** C1 (terminal writes only, fail-open) and C6 (yes, bounded,
-> abandon-don't-await) were decided by the owner. Inc 0, 2 and 3 are **not** built — and Inc 2's
-> premise is wrong as written; see the Increments section.
+> **Increments 0, 1, 4 and 5 are BUILT.** C1 (terminal writes only, fail-open) and C6 (yes, bounded,
+> abandon-don't-await) were decided by the owner.
+>
+> **Inc 3 is not built**, and it is gated on an empirical question nobody has run: whether a coroutine
+> cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. See the Increments
+> section for the question and where it has to be answered.
+>
+> **Inc 2 is not built, and was RE-SPECIFIED on 2026-09-10** (BACKLOG #1497) from the owner-blind age
+> sweep this ADR warned against to a scoped in-flight recovery at graph re-start. The original
+> paragraph is kept below with the rewrite under it; read the rewrite, not the paragraph.
+>
+> **Inc 0 shipped with three deviations from its own paragraph** — the check's subject, refuse-rather-
+> than-warn, and a Postgres-only clamp. Each is recorded with its reason at the increment.
 >
 > Three clauses were corrected during implementation, each because the drafted version was
 > **strand-direction** — the one outcome the at-least-once invariant forbids:
@@ -301,12 +311,75 @@ exception**. Any bound goes *inside*, guarding only the source phase.
 
 Each is independently shippable and ships with the test that would fail before it.
 
-**Inc 0 — make the margin real.** Clamp the lease renew's own statement timeout well below
-`(ttl − fence)` instead of inheriting `command_timeout`; capture `t_issue` *before* the renew and stamp
-the fence baseline from it rather than after the round trip; config-load warning when
-`command_timeout >= (ttl − fence)` — noting it fires on **stock defaults today** (30 vs 30), so ship it
-with a defaults change or rely on the clamp alone.
+**Inc 0 — make the margin real. BUILT 2026-09-10 (BACKLOG #1497).** Clamp the lease renew's own
+statement timeout well below `(ttl − fence)` instead of inheriting `command_timeout`; capture
+`t_issue` *before* the renew and stamp the fence baseline from it rather than after the round trip;
+config-load warning when `command_timeout >= (ttl − fence)` — noting it fires on **stock defaults
+today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone.
 *Test:* slow-renew fixture asserting the detection margin stays positive.
+
+> **What shipped, and three places it differs from the paragraph above.** As built: the baseline is
+> read before the claim is issued in both coordinators' `_maintain_leadership`; a new
+> `[cluster].lease_renew_timeout_seconds` (**derived from the margin** when unset — half of it, capped
+> at 5.0 s, so 4.5 at the shipped 10/20/30) is passed to asyncpg as the claim's own per-statement
+> `timeout=`; and `ClusterSettings._renew_fits_the_margin` refuses a config at load.
+> `tests/test_adr0157_inc0_margin.py` carries the slow-renew fixture with an executed control arm
+> (the same `_check_fence`, driven from the pre-Inc-0 baseline, showing the two-leader window), plus
+> a mutation-confirmed red for each of the four changes.
+>
+> 1. **The check's SUBJECT is the clamp, not `command_timeout`.** Once the renew stops inheriting
+>    `command_timeout`, a check written against `command_timeout` is a control resting on a premise
+>    its own increment made false. The rule is `lease_renew_timeout_seconds < (ttl − fence −
+>    fence_tick)`; at the shipped 10/20/30 that margin is 9.0 s and the derived 4.5 sits inside it, so
+>    **a stock configuration loads with no error and no warning**. That was the condition for shipping
+>    the check at all: one that fires on every install trains operators to ignore it, and an ignored
+>    check withdraws the caution its absence would have preserved. See 4: a *stock* install was not a
+>    wide enough condition, and the first cut of this increment failed it.
+> 2. **It REFUSES rather than warning.** The paragraph above specified a warning because the check as
+>    drafted fired on stock defaults, and a hard failure on every install is unshippable. Once the
+>    defaults pass cleanly that constraint is gone, the three neighbouring `[cluster]` validators all
+>    raise, and — CLAUDE.md §0 — with zero deployments a breaking default costs nothing to change.
+> 3. **The clamp is POSTGRES-ONLY, and that is a named residual, not an oversight.** The SQL Server
+>    coordinator's renew still inherits `[store].command_timeout` from the ODBC connection; a
+>    per-statement override there lives in `store/sqlserver.py`, which was held by other in-flight
+>    work. `build_coordinator` therefore does not pass the clamp to `SqlServerCoordinator` at all —
+>    naming a bound that does not bind is the defect in 1, one level down. The **baseline stamp** did
+>    land on both coordinators, and on SQL Server it is currently the only thing keeping the margin
+>    real, which is why it was not scoped to Postgres with the clamp.
+> 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
+>    increment, before merge.** The first cut shipped a constant 5.0 and it refused **this
+>    repository's own failover configurations** at config load: `harness/load/profiles/failover.toml`
+>    (fence 4.0 / TTL 6.0, margin 1.2 s) and `tests/_failover_load_support.py` (fence 3.0 / TTL 5.0,
+>    margin 1.4 s). Both `messagefoundry serve` subprocesses of a failover load run would have aborted
+>    before the scenario started, because `harness/load/failover.py::_node_env` exports the fence
+>    timeout and the lease TTL and no clamp. Deviation 1's condition — *a stock install loads cleanly*
+>    — was met and was **not wide enough**: it tests one point in a two-dimensional space, and every
+>    legitimate tight pair sat outside it. The shipped `EARLY-ADOPTER-GUIDE.md` makes that concrete by
+>    telling operators to lower all three timings **proportionally**; under a constant 5.0 *every*
+>    proportional lowering past the stock values was refused, so the first operator to follow the
+>    shipped advice would have hit the guard and turned it off. A guard that refuses valid
+>    configurations does not get tightened, it gets deleted.
+>
+>    The fix is arithmetic, not a weakening: unset now means `min(5.0, 0.5 × margin)`. A constant
+>    cannot be right here, because the clamp's only requirement is `clamp < margin` and the margin is
+>    a function of the fence/TTL pair. The 0.5 is deliberately the same fraction as
+>    `pipeline.cluster._DEMOTE_BUDGET_FRACTION`, off the same margin: the teardown and a still-in-
+>    flight renew are **concurrent**, both start at the fence moment, so each takes half and each is
+>    strictly inside. An **explicitly set** clamp is still checked and still refused — never silently
+>    shrunk to fit, which would make the check accept everything — and a fence/TTL pair with **no
+>    margin at all** (`ttl − fence − fence_tick <= 0`, which `_fence_ordering` accepts: fence 4.0 /
+>    TTL 4.5 orders fine and leaves −0.3) is refused before the clamp is resolved, naming the pair
+>    rather than blaming the clamp. The derived value falls through the same check rather than
+>    returning early, so a mis-retuned derivation is a refusal and not a silently oversized clamp.
+>
+> **What the baseline stamp is worth, stated once because the rest of this ADR still says otherwise in
+> places now corrected.** The margin is `(t_exec + ttl) − (baseline + fence + fence_tick)`. With the
+> baseline stamped at `t_return` the round trip's return leg subtracts from it directly and can drive
+> it negative; with the baseline at `t_issue <= t_exec` it cancels, leaving `ttl − fence − fence_tick`
+> as a floor whatever the round trip costs. So the clamp does **not** widen the detection margin. What
+> it bounds is a different window: how long a renew this node issued *before* it self-fenced can still
+> be in flight, re-extending the very lease it is standing down from. That is a liveness cost — a
+> standby waits out an extension nobody wanted — not a split-brain one.
 
 **Inc 1 — Postgres: fence every claim path + every terminal resolve. BUILT.** `_EPOCH_GUARD_CLAIM`
 onto `claim_ready`; `_EPOCH_GUARD_RESOLVE` onto the eight terminal resolves (`dead_letter_now`,
@@ -347,6 +420,61 @@ rather than claiming a proof.
 > `RegistryRunner.reload()` is a quiesce-and-swap that calls no recovery — and the right fix is a scoped
 > reset there. An age sweep on SQL Server has **no populated `owner` column** to discriminate with, so it
 > would re-pend rows a live leader is actively working. Re-scope before building.
+
+### Inc 2, RE-SPECIFIED — scoped in-flight recovery at graph re-start (2026-09-10, BACKLOG #1497)
+
+**This replaces the "periodic sweep" paragraph above. The paragraph is kept, not deleted, because other
+documents quote it; the warning immediately above it is what made this rewrite necessary.** Nothing was
+built here — this increment is specification only, and it remains open.
+
+**The defect, re-stated in one sentence.** A row left INFLIGHT by a graph re-start is never recovered on
+SQL Server, because `reload()` calls no recovery and the backend has no periodic sweep to fall back on.
+
+**Verified against the tree, 2026-09-10.** `RegistryRunner.reload` quiesces every inbound source, swaps
+the registry, restarts listeners, re-arms workers and reconciles outbounds. It calls neither
+`reset_stale_inflight` nor `recover_on_promotion`, and `reclaim_expired_leases` has zero definitions in
+`store/sqlserver.py`. On Postgres that costs latency and nothing else; on SQL Server the only recovery
+is the on-promotion `reset_stale_inflight`, so a row stranded by a reload waits for the next promotion.
+
+**The code already says both things, and one of them is wrong.** Two comments in `wiring_runner.py`
+call `reset_stale_inflight` *"startup/DR-only"*; two others promise the tail is *"recovered in order by
+`reset_stale_inflight` on the next start/reload"*. The second spelling is false today. It is also the
+premise the cooperative-stop paths lean on, which makes correcting the comments part of this increment
+rather than a tidy-up beside it — the comments are how the next reader concludes the strand cannot
+happen.
+
+**What to build.**
+
+1. A **scoped** reset invoked from `reload()`, recovering only rows this runner's own quiesce left
+   INFLIGHT — bounded to the inbound/outbound names in the *old* registry, and run while intake is
+   already quiesced, before step 2's listener restart.
+2. It reaches the store through a **new, distinct capability**, never by satisfying the existing
+   `hasattr(self.store, "reclaim_expired_leases")` gate. Satisfying that gate makes
+   `_leader_maintenance` non-None, the promotion path's `if` wins, the unconditional
+   `reset_stale_inflight` becomes dead code, and `recover_on_promotion` calls a method SQL Server does
+   not have. That trap is recorded under *"Why this and not the alternatives"* above and it has not
+   moved.
+3. **Correct the two `"next start/reload"` comments in the same change.** Either they become true
+   because this ships, or they say `start` alone. Leaving them is the compensating-control-on-a-false-
+   premise defect CLAUDE.md §11 forbids.
+
+**What NOT to build, and why the scoping is the whole point.** No owner-blind age sweep. SQL Server's
+claims write `owner = NULL`, so an age predicate has nothing to discriminate with and would re-pend
+rows a live leader is mid-delivery — converting a bounded strand into unbounded duplication on every
+long-held lane. Scoping to the re-starting graph's own rows removes the need for a discriminator
+entirely: the runner knows which lanes it just quiesced. It also removes the **cutoff setting** the old
+specification required (*"sized above the longest legitimate claim-to-terminal hold"*), which was a
+number nobody could size without the same information the scope already carries — and a `[cluster]`- or
+`[store]`-scoped setting is invisible to the posture completeness floor (Consequence 8).
+
+**What this does NOT close.** A row stranded by a **crash** rather than a reload is still recovered only
+at the next promotion on SQL Server. This increment is about the re-start path, which is the one that
+happens on a healthy node with no HA event at all. Say so rather than letting a green acceptance
+criterion read as "SQL Server now recovers in-flight rows".
+
+**Sequencing is unchanged.** Inc 2 still blocks Inc 3: GAP 1's *recovery closure* criterion — after a
+fenced write the row is resolved within a bounded time — cannot pass on SQL Server until some recovery
+path exists. Re-scoping narrows what Inc 2 builds; it does not make Inc 3 independent.
 
 **Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only). BUILT.** The enum lands
 **here**: `_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change
@@ -501,9 +629,11 @@ fires while the lease is still valid; (b) lease already expired when the fence f
 frozen relative to the DB clock; (d) node self-fenced but the lease still live with no successor — writes
 must still **land**. No case may produce a strand; duplicates permitted.
 
-Plus `command_timeout >= leader_lease_ttl_seconds` (the stock 30/30 collision) with a stalled renew:
-assert the config warning fires and the fence still rejects post-claim writes — i.e. Inc 1 holds where
-Inc 5's timing argument does not.
+Plus the stalled-renew case. **The stock 30/30 `command_timeout` collision this line was written
+against is gone on Postgres** — Inc 0 stopped the renew inheriting `command_timeout` — but the case it
+was probing is not: a renew that stalls past the fence must still leave the fence rejecting post-claim
+writes, i.e. Inc 1 holds where Inc 5's timing argument does not. **On SQL Server the collision itself
+still stands**, since that renew still inherits `command_timeout`; construct it there.
 
 **Standing gate, every increment:** `ruff check` + `ruff format --check`, `mypy` strict, `pytest`, and the
 Windows CI legs. Local pytest **silently skips** the Postgres and SQL Server legs, so a green local run
