@@ -120,6 +120,7 @@ tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_merge_gate_controls.py
 tests/test_negative_controls.py
+tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py

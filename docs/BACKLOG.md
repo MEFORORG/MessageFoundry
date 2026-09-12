@@ -31585,6 +31585,117 @@ No profiling was run with the machine quiet, and the `git grep` figure comes fro
 
 ---
 
+## 1537. Scope the net-helper signing secrets to a protected GitHub Environment
+
+> 🚧 **Filed and built 2026-09-11 by a Builder. Open until the owner protects the environment: a merge alone does NOT close it.** The code half is a `net-helper sign` job that names the `net-helper-signing` environment. The owner half is a repository setting that admits only `main` to that environment and requires a reviewer, with both secrets kept there and nowhere else. No certificate exists yet, so nothing can leak today. Value **8/10** · Difficulty **2/10**. Value 8: once a key exists, any account that can push a branch could otherwise read it and sign binaries as the Foundation. Difficulty 2: one workflow split and one repository setting.
+> **Owner ruling, 2026-09-11: add required reviewers to the `net-helper-signing` environment.** It settles the question this row left open and adds a step to the owner half. It does not close the row, which stays open until the owner has made the setting. The section "Owner ruling 2026-09-11" below gives the reasoning.
+> Verdict: build
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** CI / release signing. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no signing certificate exists. If a key were configured
+without the owner half, any account that can push a branch could read it.
+
+### A guard inside a workflow cannot bind a branch's own copy of that workflow
+
+Measured at `7f86243b4`:
+
+- `.github/workflows/net-helper.yml` has an unrestricted `workflow_dispatch:` trigger.
+- Its sign step's only gate is `if: env.HAS_SIGNING_CREDENTIAL == 'true' && github.ref == 'refs/heads/main'`.
+- No job names an `environment:`, so both signing secrets could only be repository or organization secrets.
+- `gh api repos/MEFORORG/MessageFoundry/environments` returned no environments on 2026-09-11.
+- The sign step was `skipped` in main's last run of the workflow, run 34563466891, so no signing secret was
+  visible to it then.
+
+A push to a branch, a pull request from one, or a manual dispatch on one would run that branch's own copy of
+the workflow, with the guard deleted if it chose. The workflow header's paragraph "THE ENVIRONMENT PROTECTS
+THE KEY" gives the mechanism.
+
+### Two halves, and only the owner's closes it
+
+| Half | Who | State at filing |
+|---|---|---|
+| A `sign` job that names `net-helper-signing`, runs only on `main`, and holds the only secret references, pinned by `tests/test_net_helper_signing_scope.py` | Builder, in code | Built in the pull request that files this row |
+| Protect `net-helper-signing` so it admits only `main` and requires a reviewer, and keep both secrets in it and nowhere else | Owner, as a repository setting | Not done |
+
+The code half changes nothing about who can read a repository secret. A run that names a missing
+environment creates it with no rule, so the merge configures nothing.
+
+### Owner ruling 2026-09-11: required reviewers on the environment, not a review rule on `main`
+
+The branch rule admits whatever is merged to `main`, and `main` requires no approving review:
+`required_approving_review_count` read `0` from `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`
+on 2026-09-11. So with the branch rule alone, a pull request that edits the workflow could reach the key once
+it merges.
+
+The owner ruled: **add required reviewers to the `net-helper-signing` environment.** Their reasoning:
+
+- Required reviewers on the environment put a person between a branch and the signing key, and they do it
+  without touching branch protection on `main`.
+- So the standing ruling of 2026-08-29, that sessions push and land their own pull requests, keeps working
+  everywhere else.
+- Raising `required_approving_review_count` on `main` would close the same hole, but it would stop sessions
+  landing their own pull requests. The owner declined it for that reason.
+
+The ruling adds a step to the owner half. On the Settings page for `net-helper-signing`, under **Deployment
+protection rules**, select **Required reviewers**, enter the reviewer, and click **Save protection rules**.
+
+**The reviewer must be an account no session can act as.** GitHub's REST documentation says a required
+reviewer can approve a waiting job through
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments` with a `repo`-scoped token. So a
+session holding the reviewer's credential could approve its own signing run. That comes from the
+documentation and is not measured, because no signing run has waited yet. **Prevent self-review** does not
+settle it. It stops the account that started a run from approving it, and nobody has measured which account
+starts a run on `main` after a queued merge. Which person reviews is the owner's choice.
+
+### Decided and recorded, so nobody re-opens them as new
+
+- **A separate job.** Once the rule admits only `main`, a job that names the environment fails on any other
+  ref, and the build runs for pull requests.
+- **Permissions.** The `build` job keeps `contents: read` for its checkout. The `sign` job drops to none,
+  because `download-artifact` at the pinned SHA calls the GitHub API only when given a token. That was read
+  in its source, not measured in a run.
+- **Action pins.** Every `uses:` was already pinned by commit SHA. The new `actions/download-artifact` pin
+  equals the `v8.0.1` tag.
+- **A tripwire, not built.** The build job could fail whenever a signing secret is visible outside the
+  environment. That needs a secret reference in a job with no environment, the pattern this change removes.
+  zizmor's `secrets-outside-env` audit flags that pattern only under the auditor persona, which the zizmor
+  gate does not use. In the one state it detects, the tripwire would also hand the key to the build runner.
+
+### Related, outside this row, and not allocated
+
+A review pass on 2026-09-11 reported these. Only the in-repository facts were re-read by the Builder.
+
+- `release.yml` publishes to PyPI with `id-token: write`, has a `workflow_dispatch:` trigger, and names no
+  `environment:`. The pass reported that PyPI's trusted-publisher check accepts any ref when the publisher
+  names no environment. That PyPI half was not verified here.
+- Nothing re-checks the environment's branch rule after this row closes.
+- `MEFOR_FORBIDDEN_TOKENS` is a repository secret, and the scanners that read it must run on refs other
+  than `main`, so an environment cannot hold it.
+- Found while recording the owner ruling, from GitHub's documentation: only repository admins can configure
+  an environment. So neither the branch rule nor the reviewer binds a session that holds an admin
+  credential, because that session could change the rules.
+
+### How the Lander confirms the owner half before flipping this banner
+
+Run the read-only commands in `net-helper/README.md`, under "Protect the environment before either secret
+exists". The row closes when every one prints what its comment says.
+
+Those commands predate the owner ruling and do not check the reviewer, so run this one too:
+
+```
+# at least one name, and none that a session signs in as
+gh api repos/MEFORORG/MessageFoundry/environments/net-helper-signing --jq '.protection_rules[] | select(.type == "required_reviewers") | .reviewers[].reviewer | .login // .slug'
+```
+
+The jq path follows GitHub's OpenAPI description and has not run against a configured environment. An empty
+result may mean a wrong path rather than no reviewer, so confirm it on the environment's Settings page.
+
+
+
+---
+
 ## 1541. the SQL Server cluster coordinator namespaced its lease key by a db_schema its store never reads, so two installs on one database would elect two leaders over one queue
 
 > 🚧 **Built 2026-09-11 by a Builder on branch `claude/sqlserver-lease-schema`, PR 1056, in branch commits `cce2db39c` and `7bb408d8b`. Open until that PR merges, when the Lander flips this banner.** Value **7/10**, Difficulty **2/10**. `SqlServerCoordinator` built its leadership lease key and its DDL applock name from `[store].db_schema`. The SQL Server store never reads that setting, so the key split by schema while the tables it guards stayed shared. The fix makes both keys constant on SQL Server and refuses `db_schema` at load on every backend but Postgres. Value 7: the failure is two leaders over one queue, though only under one misconfiguration. Difficulty 2: two constants, one validator and one doc row.
