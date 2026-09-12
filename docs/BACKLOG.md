@@ -10354,7 +10354,7 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 > **Filed 2026-08-08. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.2** (L1) currently scores **partial**. The pinned verb asks that data-specific access be restricted to consumers with explicit permissions to specific data items, to mitigate IDOR and BOLA. **As filed**, one PHI-bearing object family had no object-level authorization at all: `GET /uploads` listed every user's files unfiltered, and browse and delete took a `file_id` straight through to `get_meta`/`read_bytes` with no channel and no owner check.
 > **UPDATE 2026-08-11 -- THE UPLOADS HALF IS BUILT; THE ITEM STAYS OPEN.** Owner-only plus a `files:access_any` Administrator override, keyed on the immutable `uploader_id` (`Identity.user_id`), owner-ratified and recorded in [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md) Amendment A. All four routes now enforce it, including resend's SOURCE file (it previously checked only the TARGET inbound). So the three specific defects named above are fixed in the shipped code and the paragraph above describes the pre-fix state, not the current one.
 > **WHY IT IS NOT CLOSED, and none of these is a formality.** (1) The principal-narrowing axis is UNTOUCHED: `Identity.allowed_channels` still defaults to `None` (`auth/identity.py:38`) = every channel. (2) This item's own acceptance says **"Both halves need answers; neither alone closes the cell"** -- one half is answered. (3) ADR 0134 Amendment A satisfies only the SECOND clause of the master-test-plan's exit criterion 12; `GET /uploads` remains pageless, so the first clause is open. (4) The scorecard carrying the 8.2.2 verdict lives outside this repo and is not re-scored by this work.
-> **UPDATE 2026-09-03 -- THE PRINCIPAL-NARROWING AND PAGINATION LIMBS ARE BUILT; THE ITEM STAYS OPEN.** Reasons (1) and (3) above are answered and describe the pre-fix state from here on. **Reason (3):** `GET /uploads` takes `limit`/`offset` (50, 1..500 / 0.., the same bounds declared on the `/ui` twin so the console door is not the looser one), `total` still counts the whole visible set, and the window is applied AFTER the owner filter so a page's length can never encode how many of another operator's files fell inside it. `UploadStore.list_files` sorts by `(uploaded_at, file_id)` because a timestamp is not a total order and a tied file could otherwise land on two pages or none. **The exit-criterion clause COULD NOT BE VERIFIED from an engine checkout, and that is the honest status.** Reason (3) above is phrased against the master test plan's exit criterion 12, and that document is **vaulted** -- `git ls-files docs/testing` returns exactly one file here, `docs/testing/VERIFY.md`, because ADR 0160 moved the plan out and the ignore rules make its absence look like non-existence rather than misplacement. So the pagination is BUILT and its own behaviour is tested; whether it closes that clause is a question only a reader holding the plan can answer, and nobody should re-derive an answer from this row. What is independently true, and is why the work stands on its own: an unbounded listing over a PHI-bearing family is worth fixing whatever the plan says, and a prior ruling already recorded the pageless listing as a resource-consumption gap rather than an object-authorization one -- so this limb was never going to clear the 8.2.2 cell either way. **Reasons (2) and (4) still stand,** and so do the four limbs this item names that nobody has built: the audit-actor immutable-id work, the connection-flag object check plus its by-id-AND-collection parity test, the metrics-exposition scoping, and the directory-immutable identity binding (`#1143`). Reason (1) detail follows. `Identity.allowed_channels` now defaults to the EMPTY set, `_allowed_channels` resolves a NULL `channel_scope` column to no channels rather than every channel, and all-channels survives as a grant somebody typed -- the `*` token in the stored scope list, reusing the string `ad_group_channels.channel` has always used for a wildcard row. The AD sync persists `["*"]` for a wildcard group instead of collapsing to NULL, which after the flip would have inverted a deliberate estate-wide mapping into a deny-everything one. Administrators stay all-channels by role, so the first operator of a fresh install is not locked out; the console's landing page carries the unprovisioned-operator sentence, deliberately a banner and not a start-time refusal. The store was not touched: `create_user` still writes no scope, and writing none is now what denies. **Reasons (2), (3) and (4) all still stand** -- the pagination limb is untouched, and the re-score is not this work's to make.
+> **UPDATE 2026-09-03 -- THE PRINCIPAL-NARROWING AND PAGINATION LIMBS ARE BUILT; THE ITEM STAYS OPEN.** Reasons (1) and (3) above are answered and describe the pre-fix state from here on. **Reason (3):** `GET /uploads` takes `limit`/`offset` (50, 1..500 / 0.., the same bounds declared on the `/ui` twin so the console door is not the looser one), `total` still counts the whole visible set, and the window is applied AFTER the owner filter so a page's length can never encode how many of another operator's files fell inside it. `UploadStore.list_files` sorts by `(uploaded_at, file_id)` because a timestamp is not a total order and a tied file could otherwise land on two pages or none. **The exit-criterion clause COULD NOT BE VERIFIED from an engine checkout, and that is the honest status.** Reason (3) above is phrased against the master test plan's exit criterion 12, and that document is **vaulted** -- `git ls-files docs/testing` returns exactly one file here, `docs/testing/VERIFY.md`, because ADR 0160 moved the plan out and the ignore rules make its absence look like non-existence rather than misplacement. So the pagination is BUILT and its own behaviour is tested; whether it closes that clause is a question only a reader holding the plan can answer, and nobody should re-derive an answer from this row. What is independently true, and is why the work stands on its own: an unbounded listing over a PHI-bearing family is worth fixing whatever the plan says, and a prior ruling already recorded the pageless listing as a resource-consumption gap rather than an object-authorization one -- so this limb was never going to clear the 8.2.2 cell either way. **Reasons (2) and (4) still stand,** and so do the four limbs this item names that nobody has built: the audit-actor immutable-id work, the connection-flag object check plus its by-id-AND-collection parity test, the metrics-exposition scoping, and the directory-immutable identity binding (filed as `#1471` and built there; this update predates it). Reason (1) detail follows. `Identity.allowed_channels` now defaults to the EMPTY set, `_allowed_channels` resolves a NULL `channel_scope` column to no channels rather than every channel, and all-channels survives as a grant somebody typed -- the `*` token in the stored scope list, reusing the string `ad_group_channels.channel` has always used for a wildcard row. The AD sync persists `["*"]` for a wildcard group instead of collapsing to NULL, which after the flip would have inverted a deliberate estate-wide mapping into a deny-everything one. Administrators stay all-channels by role, so the first operator of a fresh install is not locked out; the console's landing page carries the unprovisioned-operator sentence, deliberately a banner and not a start-time refusal. The store was not touched: `create_user` still writes no scope, and writing none is now what denies. **Reasons (2), (3) and (4) all still stand** -- the pagination limb is untouched, and the re-score is not this work's to make.
 > Verdict: research
 > Closing-act: scorecard-rescore
 
@@ -10367,7 +10367,7 @@ Interpreter named rather than assumed, since the extra-gated coverage hazard abo
 
 **The research question -- HALF ANSWERED.** What is the correct authorization model for an uploaded file? The engine's whole data-scoping vocabulary is the channel, and an upload is not bound to one, so the research had to decide what a file's resource attribute even is -- uploader identity, the inbound it was injected into, both, or something the model does not yet express -- and whether owner-scoping is right for an operational console where a colleague may legitimately need to inspect a file after a shift change.
 
-**ANSWERED 2026-08-11 (owner-ratified):** the resource attribute is **uploader identity**, bound to the immutable `user_id` and not the username, with the shift-change case served by an explicit `files:access_any` Administrator override rather than by widening the default. The channel axis was rejected on the ground that `allowed_channels` defaults to every channel, so a channel-scoped rule would protect nobody on a default install -- a control resting on a false premise. **Bound on that answer:** re-keying onto `user_id` does NOT close a `sAMAccountName` recycled in the directory without a MessageFoundry `delete_user`, because `_upsert_ad_user` adopts the surviving mirror row and re-binds its id; that needs the directory-immutable binding tracked as **#1143**.
+**ANSWERED 2026-08-11 (owner-ratified):** the resource attribute is **uploader identity**, bound to the immutable `user_id` and not the username, with the shift-change case served by an explicit `files:access_any` Administrator override rather than by widening the default. The channel axis was rejected on the ground that `allowed_channels` defaults to every channel, so a channel-scoped rule would protect nobody on a default install -- a control resting on a false premise. **Bound on that answer:** re-keying onto `user_id` does NOT close a `sAMAccountName` recycled in the directory without a MessageFoundry `delete_user`, because `_upsert_ad_user` adopted the surviving mirror row and re-bound its id; that needed the directory-immutable binding, **built under #1471** -- `_upsert_ad_user` resolves an AD login by `users.directory_object_id` (the normalised `objectGUID`) and refuses a principal whose id disagrees with the row holding its username. A directory returning no immutable identifier still resolves by name.
 
 **STILL UNANSWERED, and it is what keeps this item open:** narrowing `allowed_channels` by default carries a first-run cost, because new non-admins and unmapped AD users would see an empty console until scoped, which reads as broken RBAC on day one. Both halves need answers; neither alone closes the cell.
 
@@ -14338,7 +14338,7 @@ All three inputs were read out of the code rather than taken on trust. **The mod
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Attacked the shipped claim from both directions. The artifact is real, not a similarly-named symbol: I read all 281 lines of scripts/quality/username_access_key_screen.py and all five arms of tests/test_username_access_key_screen.py, and ran the screen against the live default scope (8 candidates, 80 labels excluded) and against the #1225 preset shapes (all four reported, including the upsert write key). The four #1225 sites no longer appear in the live report, so they were re-keyed. So limbs 1-5 confirm. Then I attacked the two limbs the item words as requirements rather than description. First, "a screen catches the next one": grep over .github/, .pre-commit-config.yaml and messagefoundry/checks.py returns zero for the screen against a positive control of 1 for control_char_check, so nothing runs it where a reviewer sees it, and the single pytest arm that touches real engine source asserts only that one already-known site is still present. Second, the proof clause requiring the uploads report be REVIEWABLE: I built a modified copy in the scratchpad with "uploader" moved into LABEL_NAMES and measured api/app.py drop from 1 candidate to 0, then checked each existing assertion by hand against that copy -- all still satisfied. That is the destructive narrowing the item names, unguarded by any test. I guarded the opposite error too. The moved-anchor trap does not apply: the item deliberately cites store-method names rather than line numbers, and I keyed on callee::slot throughout. I also checked whether the screen was wired somewhere non-obvious -- tests/test_tooling_partition.py:100 places it on engine legs deliberately, which is real wiring for the presence assertion but does not make new candidates visible. The scope limb (3) I flag as weaker because the item's prototype spec was the two API modules; limbs (1) and (2) do not depend on it. Value 5 for the remainder: a real gap with an awkward workaround -- someone can run the one command by hand, which is precisely the "found by accident" mode the item exists to end -- and it ships no fix, minor severity by the item's own line. Difficulty 3: an additive CI or quality-advisory step plus a guard assertion is small on an existing seam, but choosing a surfacing shape that fails on a NEW key without turning the screen into a verdict-emitter is a design call the item constrains from both sides. Could not run the pytest suite locally (conftest import fails on a missing pydantic), so the test assertions are established by reading them plus running the screen directly; the screen is stdlib-only and ran clean. _(was 6/10 · 3/10.)_
 >
 > **Filed 2026-08-11 -- a PATTERN claim with FOUR known instances across three subsystems, not a fifth instance.** `Identity` carries an **immutable `user_id`** (`auth/identity.py:30`) and a **reassignable `username`**. A username is freed by delete-and-recreate, so anywhere the username is used as an **ACCESS KEY** a recycled account name inherits the previous holder's objects. Known instances: **#1015** (OIDC RP identity, `auth/oidc/claims.py`), **#1152** (uploaded files -- FIXED, keyed on `uploader_id`), **#1225** (saved search presets, four sites), and at least one unjudged candidate at `api/auth_routes.py:463` (`security_events_for(identity.username)`). **Nothing screens for it.**
-> **WARNING -- RE-KEYING ONTO `user_id` DOES NOT CLOSE THE AD PATH, and whoever fixes #1225 must know that before they believe they are done.** `_upsert_ad_user` (`auth/service.py`) resolves an AD principal by `sAMAccountName` and mints a fresh `user_id` **only when no mirror row survives** -- that is, only after a MessageFoundry `delete_user`. On the DEFAULT path the surviving row is adopted and **its `user_id` is re-bound to the new principal**. So a deploying site that recycles a `sAMAccountName` in the directory, leaving the MessageFoundry user in place, would defeat a `user_id`-keyed check exactly as it defeats a username-keyed one. `AdPrincipal` (`auth/ldap.py`) carries no `objectGUID`/`objectSid` -- a repo-wide grep returns **zero**, with `sAMAccountName` at 12 as the positive control -- so no better key exists today. The real close is binding AD to a directory-immutable id the way OIDC binds `(issuer, sub)`, tracked as **#1143**. **Re-keying is still correct and still closes local accounts and the AD-with-delete path; it is a narrowing, not a closure.**
+> **RE-KEYING ONTO `user_id` DID NOT CLOSE THE AD PATH ON ITS OWN. The binding that does shipped later, under #1471 -- read this whole paragraph before citing either half of it.** `_upsert_ad_user` (`auth/service.py`) resolved an AD principal by `sAMAccountName` and minted a fresh `user_id` **only when no mirror row survived** -- that is, only after a MessageFoundry `delete_user`. On the DEFAULT path the surviving row was adopted and **its `user_id` re-bound to the new principal**, so a deploying site that recycled a `sAMAccountName` in the directory, leaving the MessageFoundry user in place, would defeat a `user_id`-keyed check exactly as it defeats a username-keyed one. **AMENDED 2026-09-10:** the sentence that followed -- that `AdPrincipal` carries no `objectGUID`/`objectSid`, a repo-wide grep returning **zero** against `sAMAccountName` at 12 as the positive control -- was true when written and is false at HEAD. `AdPrincipal` carries the normalised `objectGUID`, `users.directory_object_id` stores it on all three backends, and `_upsert_ad_user` resolves by it, refusing a principal whose id disagrees with the row holding its username. What is still resolved by name is a directory that returns no immutable identifier at all. **Re-keying was still correct and still closes local accounts and the AD-with-delete path; it was a narrowing, and #1471 is the closure it was waiting on.**
 > **WHY A SCREEN AND NOT A SWEEP.** A sweep fixes today's instances; a screen catches the next one. The justification is the independent confirmation, not the count: **two sessions found this class in two different subsystems on the same day, by different routes, neither looking for it** -- and the ledger already held an older third (#1015) that both missed. A defect class that is found three times by accident and zero times on purpose is one nothing is watching for.
 > **SCOPE -- this is what makes it filable rather than vague.** **NOT** the audit `actor=` sites: `identity.username` appears **59 times** in `api/app.py` and **most are audit fields, where recording a NAME is correct** -- an audit row should say who, in the form a human reads. The defect is the username reaching a **WHERE clause, a dict key, an equality against a stored owner field, or a store method's scoping parameter**. Mechanically findable, and the two populations are cleanly separable.
 > **A PROTOTYPE EXISTS AND ITS RESULT IS THE SPEC.** An AST screen (walk `Call` keywords + positional args, `Compare` equality, `Subscript` keys; classify `actor`/`acting_user`/`by` as labels and `owner`/`uploader`/`user`/`key` as access keys) run over the two API modules reported: `api/app.py` **5939 lines scanned, 46 label sites excluded, 13 access-key candidates**; `api/auth_routes.py` **17 excluded, 2 candidates**. It found **all four** #1225 preset sites and the unjudged `security_events_for` candidate.
@@ -27229,7 +27229,46 @@ I did not survey how the fence came to be written, or whether any dispatcher has
 
 ## 1471. bind an AD account to a directory-immutable identifier, the way OIDC binds (issuer, sub)
 
-> 🔢 **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
+> ✅ **CLOSED 2026-09-10 -- built on branch `claude/ad-immutable-id-1471` (PR 1045), open until that
+> merges.** `users.directory_object_id`
+> ships on all three backends, in-place-upgraded the way the neighbouring `oidc_*` columns are;
+> `AdPrincipal` carries the normalised `objectGUID`; and `_upsert_ad_user` resolves an AD login by that
+> id through the new `get_user_by_directory_object_id`. **The row's own acceptance test is the closing
+> evidence:** a directory-side name recycle with the MessageFoundry row left in place is REFUSED
+> (`directory_identity_conflict`, audited) and adopts nothing --
+> `tests/test_ad_directory_identity.py`, `test_a_recycled_sam_account_name_does_not_adopt_the_departed_operators_row`.
+>
+> **Three limits, stated so the green is not over-read.** (1) There is no AD in CI and never has been.
+> `_find_user` itself runs against a double -- the markers sit on the `LDAPException` handlers, not on
+> the lookup -- so the attribute request and the value it carries out are both pinned; what no test
+> reaches is the bind and the wire. The recycle decision is driven at the service layer over a real
+> store. (2) A directory that returns no immutable identifier still resolves by username, and the
+> engine warns ONCE PER DISTINCT CAUSE -- absent as well as unreadable -- rather than per read, because
+> the reconciler probes that path per user per pass. (3) **A directory-side RENAME now behaves
+> differently, and it is an improvement carrying a new wart.** Before, a rename resolved to nothing and
+> minted a SECOND account, silently orphaning the uploads and presets keyed to the first -- this item's
+> own defect from the other side. Now the id finds the row and the person keeps their account, while
+> the stored username stays as created. `reconcile_directory_sessions` still probes BY USERNAME, so at
+> the shipped settings (`ad_session_recheck_seconds` 300, `ad_session_recheck_strikes` 2 -- on whenever
+> a directory is wired) a renamed account reads as absent on every probe and has its sessions revoked
+> once it reaches the strike threshold. **AND THERE IS NO ADMINISTRATIVE REMEDY: nothing writes
+> `users.username` after `create_user`**, in the store protocol, any of its three backends or the API,
+> so a renamed person would re-enter that cycle after every sign-in. Deleting the row is the only
+> escape available and it discards the `user_id` that uploads, quota and presets key on. Fail-closed
+> and audited, never a widened grant; pinned by
+> `test_a_renamed_account_keeps_its_row_and_its_original_username`.
+> **Re-keying that probe and adding a rename path are both unfiled work, named by subject rather than
+> by number:** the reconciler's username-keyed probe and a username writer, which are the ADR 0184
+> reconciler question this row never claimed.
+>
+> **The first-contact rule taken, and it is the one that decides the acceptance test:** resolve by the
+> immutable id ONLY. A NULL-id row is never adopted by name, and a login whose id disagrees with the
+> row holding its username is refused rather than backfilled. Adopt-and-backfill on first sight would
+> leave the recycle window open for every account that had not signed in since the upgrade, which is
+> the hole; section 0 (zero deployments, therefore zero legacy rows) is why the strict rule costs
+> nothing.
+>
+> **Filed 2026-09-06 -- not started.** Value **7/10** · Difficulty **5/10** · _quick win_. Split out
 > of **#1143**'s verification pass, where it was found to have been eliminated on a false premise and
 > to be the work at least seven citations across the repository are already waiting on.
 > Verdict: build
@@ -27271,6 +27310,13 @@ as done if #1143 closed as scoped: `messagefoundry/api/app.py` (`_may_access_upl
 `messagefoundry/uploads.py` (`UploadedFileMeta`), `tests/test_upload_api.py`, ADR 0136,
 `docs/SECURITY.md`, and this ledger's **#1152** and **#1225**. Re-point them here. Enumerated with
 `git grep`; treat it as at least seven and re-run the grep rather than working the list.
+
+**Re-run 2026-09-10, and the count above holds: seven sites, across eight lines.** `#1152` carries the
+citation twice (its 2026-09-03 update and its 2026-08-11 answer); the other six carry it once. All
+seven now name this item and state what shipped, rather than a fix that is still pending. **Left
+alone deliberately:** ADR 0184 and the `docs/adr/README.md` row summarising it. Those are the record
+of a research pass that DESCRIBES the four citations as they stood, so re-pointing them would edit a
+finding rather than a pointer -- and `#1143`'s own row, which is still open on its OIDC limb.
 
 **Shape of the work.** One nullable column on `users` across the three backends, following the
 `reauth_at` convention already in each (`PRAGMA table_info` guard on SQLite, `information_schema`
@@ -31204,6 +31250,119 @@ the run-level fields in opposite directions -- one reporting a re-run as 8m48s l
 median re-run lifetime of 478s -- and the two figures agreed with each other closely enough to look like
 confirmation. They were the same artifact.
 
+## 1534. Batch the adr branch of alloc.ps1 so it stops spawning one git ls-tree per ref
+
+> 🚧 **Filed 2026-09-11 -- the code fix ships in this PR.** Value **6/10** · Difficulty **2/10** · _quick win_. `Get-Floor`'s ADR branch swept `docs/adr/` with one `git ls-tree` per ref, which is one PROCESS per ref, and this clone carries 7,196 of them. A single ADR allocation measured 322.4s and 359.7s here; the session that reported it lost over 17 minutes and two tool timeouts before its number came back. The backlog branch of the same function had already been batched for exactly this reason, and its own comment records the cost it was avoiding at a tenth the ref count. The ADR branch never received that fix. Deduping the refs to their 434 distinct `docs/adr` trees and listing each once takes **17s** and returns the same floor and the same next number. **The 5.3s figure this row carried until 2026-09-11 belonged to a stage 2 that has since been REVERTED** -- it scanned raw tree bytes through the PowerShell pipeline, and adversarial review measured it losing 7 ADR numbers under console code page 932 and 17 under 936/950, plus every ADR not stored as a regular file. See the comment in `Get-Floor`'s adr branch; the saving was always the dedupe, never the reader.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger allocator. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI, and no deploying site would ever meet it. The cost falls entirely on this repository's own sessions: every seat that files an ADR pays it, and a seat whose turn dies mid-allocation leaves behind the question of whether a number was burned.
+
+### The refs grew and the shape did not
+
+`for-each-ref refs/heads refs/remotes` returned 7,196 entries on 2026-09-11. The backlog branch's own comment dates its batching to roughly 550 refs and to a `git show` per ref costing about 34s -- so the defect is not that the per-ref shape was ever wrong, it is that its cost is linear in a number that grew thirteenfold while nobody re-measured it. A clone with few refs cannot see this at all, which is why no test caught it and why the guard added with this row counts PROCESSES rather than seconds.
+
+### Measured 2026-09-11, paired, on this clone
+
+Both arms are `-ShowFloor -Kind adr`, which computes the identical floor without advancing the ratchet or spending a number. The pre-fix script was kept beside the new one so both resolve `$PSScriptRoot` to the same checkout.
+
+| arm | elapsed | floor | next |
+|---|---|---|---|
+| before, first run | 359.7s | 187 | 188 |
+| before, paired run | 322.4s | 187 | 188 |
+| after, paired run (byte scan, REVERTED) | 5.3s | 187 | 188 |
+| after, shipped (ls-tree per distinct tree) | 17s | 187 | 188 |
+
+`alloc.ps1 -List` reported the same holdings before and after, and the registry kept its 34 ADR records and its `.floor-highwater` of 186 across every run above. Allocation stays a test-and-set on an exclusive `CreateNew`; this row changed only how the floor is READ.
+
+### What the batching is, and the TWO shapes that were rejected
+
+**The saving is the dedupe, not the reader.** One `cat-file --batch-check` resolves every `<ref>:docs/adr` spec at once and 7,199 specs collapse to **434 distinct trees**, a 16x cut in processes. Each distinct tree is then listed with `git ls-tree --name-only` -- the same spelling the pre-fix code used, just no longer once per ref.
+
+Two faster stage-2 spellings were built, measured and reverted, and **both failed the same way: silently, by losing a name, which is a number that then reads as free.**
+
+1. **`git rev-list --objects`** dedupes by OBJECT, so two ADR files with byte-identical content print one of their two names. `0150-alpha.md` and `0151-beta.md` sharing a blob printed one name.
+2. **Scanning raw tree bytes** through the pipeline, anchored on `(?:100644|100755) `, broke twice over. A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native output with `[Console]::OutputEncoding` -- the OEM console code page on Windows. Under a DBCS page a lead byte ending one entry's id consumes the `1` that starts the next entry's `100644`. Measured on this clone: **cp932 lost 7 of 181 numbers, cp936/949/950 lost 17**, while utf-8 and cp1252 lost none. End to end on a fixture with `chcp` set before pwsh started, the floor fell from 999 to 100. Separately, the mode literal admitted regular files only, so an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to its replacement became invisible.
+
+The comment that shipped the byte scan argued that no multi-byte decode could swallow an ASCII byte. That is true of UTF-8 and false of DBCS, and no test disagreed because every runner here is cp437 or UTF-8.
+
+**`git rev-list --objects` over those trees was measured and rejected.** It produces the same listing as text in one process, but it dedupes by OBJECT: a tree holding `0150-alpha.md` and `0151-beta.md` with byte-identical content printed ONE name, so 0151 read as free. Re-issuing a number that is already on disk is the single failure this allocator exists to prevent. `tests/test_coord_alloc_floor.py` holds that case, the side-branch case, and a `GIT_TRACE` process count that fails if the sweep starts scaling with the ref count again.
+
+The batched set was compared against a per-tree `ls-tree` sweep of all 434 trees before the change was accepted: identical, 181 numbers, max 0187.
+
+### Not fixed here, and both are separate subjects rather than cited numbers
+
+1. **The backlog branch is now slow too, for the same reason its comment predicted.** A `-Kind backlog` allocation took 1m59s on 2026-09-11. Its ref resolution is already batched, so the cost has moved to reading the distinct `BACKLOG.md` blobs -- a much bigger file, and many more distinct versions at 7,196 refs than at 550. That is a different fix in the same function and is not attempted here.
+2. **The ADR branch has no working-tree term.** The backlog branch reads both of its paths off disk to catch "a number written to a file but committed nowhere"; the ADR branch has never done so, so a hand-created `docs/adr/NNNN-*.md` that no registry claim covers is invisible to the floor. Pre-existing, unchanged by this row, and deliberately left alone rather than widened into a speed fix.
+
+Item 1 above is now filed as **#1535**, on the failure mode rather than on the timing.
+
+## 1535. The backlog floor sweep sits near the 120s default timeout, and its failure is silent
+
+> 🚧 **Filed 2026-09-11; the code fix ships in the same pull request, banner left OPEN for the Lander.** Value **5/10** · Difficulty **3/10**. **Built:** stage 2 no longer ships blob bodies to PowerShell. `git grep` applies the heading pattern in C over the same distinct blob oids, chunked 128 at a time. Measured paired in one process over one stage-1 snapshot of 1,527 blobs: the old `cat-file` read took 176.7s and 24,822,305 pipeline lines, the new grep 38.0s and 530,758 lines across 12 processes, and `Compare-Object` on the two number sets is **empty in both directions** -- 858 numbers, max 1538, SubFloorMax 354 on each. A real `-Kind backlog` allocation ran into a 120-second foreground ceiling in another worktree, was killed, and left NO claim file -- so it looked like the script had done nothing. Backgrounded, the same command completed and issued its number. The sweep's own cost lands within a few seconds of that ceiling, which is the worst place for it: it passes on a quiet machine and fails on a busy one, so the latency problem presents as flakiness. **The failure is safe, not corrupting** -- see the probe below -- so this row is about a silent coin flip and a wasted number, not about a broken ledger.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger allocator. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nothing here is engine behaviour, a shipped artifact, or PHI. The cost is to this repository's own sessions, and it falls on the kind most of them call: backlog numbers run to #1535 where ADR numbers run to #187.
+
+This is the follow-up to [#1534](#1534-batch-the-adr-branch-of-allocps1-so-it-stops-spawning-one-git-ls-tree-per-ref), which fixed the ADR branch only. **It is a different defect needing a different technique.** The backlog branch's ref resolution is already batched; #1534's per-ref process defect is not present here.
+
+### Read the timings as a range, and know why there is no clean number
+
+**Every wall-clock figure below was taken on a machine carrying up to thirteen live sessions, several of them sweeping the same 7,196 refs.** Two sessions measuring this concurrently discovered they had been inflating each other: `Get-Process pwsh,git` showed two heavy sweeps started twelve seconds apart, carrying 122.6 and 109.7 CPU-seconds. One session retracted its figures on that basis; the readings here are recorded with the same caveat rather than presented as constants.
+
+| reading | condition |
+|---|---|
+| 1m37.7s | a real allocation, both known concurrent sweeps stopped -- the quietest reading taken |
+| 1m59s | a real allocation, under load |
+| 150.5s, 283.6s | `-ShowFloor`, back to back, under load |
+| 179.6s | `-ShowFloor`, under load |
+| over 120s, killed | a real allocation against a foreground ceiling |
+| "well inside one call" | a real allocation in a third worktree, no stopwatch |
+
+So: **minutes, varying by at least twofold, with the quietest reading about 98 seconds against a 120-second ceiling.** Anyone re-scoping this should re-measure with the machine to themselves rather than trusting a row of this table.
+
+**The one result here that survives its own confounders is the pair 150.5s then 283.6s.** It is a negative result, and it needs no clean conditions to do its work: a cache-warming explanation predicts each repeated sweep is faster than the last, and run 2 being nearly twice run 1 refutes that outright. Contention cannot manufacture that shape, only add to it. Treat it as the reason not to reach for "the first run is just cold".
+
+**AND ASK FOR A FRACTION, NOT A DURATION.** The discriminating question is not "how long does a quiet run take" but **what proportion of the 120-second ceiling it consumes**. A quiet pass at 98s and a quiet pass at 40s are the same green and mean opposite things: the first is a coin flip waiting for a busy afternoon, the second is real headroom. A re-measurement that reports only "it passed" has not answered this row.
+
+### The cause is a byte volume, which contention cannot distort
+
+The sweep resolves `<ref>:docs/BACKLOG.md` and the archive path for every ref, then reads each distinct blob. Measured on this clone: 7,206 refs resolve to **1,516 distinct blobs**, averaging about 2.8 MB, so stage 2 streams roughly **4.2 GB** through PowerShell's per-line object pipeline. Of the ~111s that took in one profiled run, only about **13s was git** -- the rest was PowerShell building one pipeline object per line and running a regex on each. The batching comment beside that code records ~190 distinct blobs at ~550 refs when it was written, so the object count has grown about eightfold and each object is far larger.
+
+Deduping harder does not rescue this: the 1,516 blobs are already distinct. **The fix is to stop shipping blob bodies to PowerShell at all** and let git do the filtering -- a batched `git grep -h -E '^#{2,3} [0-9]+\.' <commits> -- docs/BACKLOG.md docs/archive/backlog/BACKLOG-CLOSED.md`, chunked to stay under the 8,191-byte Windows command-line limit. One profiled attempt did the whole sweep in about 21s across 30 processes and returned the same maximum. A `StreamReader`/`ReadToEnd` rewrite does **not** work: it needs a 4.2 GB string and deadlocks against stdin.
+
+### The failure is silent, and it is safe -- both halves were checked
+
+**Attribution, because a later reader will otherwise get this backwards.** The session that hit the timeout reported exactly two things: the kill left no claim file, so the failure is silent; and a re-run that succeeds burns a number. Both are confirmed below. **It did not claim ledger corruption and was not walked back on one.** The zero-byte hypothesis below is *this row's*, not theirs -- their process died during the sweep and could not have reached that state.
+
+It is written up because it was the CAUTIOUS reading, and the cautious reading is the one that normally escapes testing: doubting "it is probably fine" looks reckless, so nobody spends a probe on it. A hard kill is not an exception, so it can land in the narrow window after `CreateNew` takes the number and before the JSON is written, leaving a claim file that exists and is **zero bytes**. Probed against a throwaway checkout:
+
+| question | result |
+|---|---|
+| is the number still treated as taken? | **yes** -- floor rose to it; the registry term parses the FILENAME, not the contents |
+| does the next allocation re-issue it? | **no** -- it issued the next number up |
+| does `-List` break on it? | no -- it skips the file silently, so the orphan is invisible rather than fatal |
+
+So neither kill window can re-issue a live number. The cost is a permanently orphaned number, which this script's own doctrine calls the cheap outcome: *"holes are free, collisions are not."* **Do not write this row up as a ledger-corruption risk.** What it actually is: a caller on a default timeout gets a kill with no output and no claim file, concludes nothing happened, and re-runs -- paying a second full sweep and burning a number.
+
+### What a build is
+
+Two independent parts, either useful alone:
+
+1. **Cut the sweep cost** with the git-side filtering above, so the path is not sitting on a timeout boundary at all. This is the part that makes the rest moot.
+2. **Make the failure legible.** The sweep prints nothing while it runs, so a killed caller cannot tell a slow sweep from a hung one. Progress on stderr, or a printed elapsed time, would turn a silent kill into a diagnosable one.
+
+### Not done here
+
+No profiling was run with the machine quiet, and the `git grep` figure comes from one attempt under the same contention as everything else -- it is evidence that a different technique is much cheaper, not a calibrated target. Nobody has checked whether `scripts/coord/alloc_strand_sweep.py`, which carries a second implementation of the same sweep in Python, has the same cost shape.
+
+
+
 ---
 
 ## 1541. the SQL Server cluster coordinator namespaced its lease key by a db_schema its store never reads, so two installs on one database would elect two leaders over one queue
@@ -31273,6 +31432,253 @@ PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignor
 - Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
 - The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
 - Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
+
+## 1544. a pipe with no pipefail discards its producer's exit code, 26 of 36 piped workflow steps run that way, and the test named as the guard's home resolves 11 jobs without walking needs, so it cannot reach 3 of the 4 sites that gate a merge
+
+> 🔢 **Filed 2026-09-11 from a follow-up named but unfiled during the block 3 wave, then adversarially verified.** Value **4/10** · Difficulty **6/10** · _money pit_. Under GitHub's default `run:` shell -- `bash -e`, no `pipefail` -- a producer that fails in front of a pipe is discarded exactly as `|| true` discards one. `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` exists to catch `|| true` in a required job; it does not look at pipes, and nothing else in the repository does. Measured at `origin/main` `67ad86e4b`: of 205 `run:` steps, 184 resolve to a POSIX shell, 36 carry a real shell pipe and **26** of those have no pipefail in effect. Filing the rule into that module as written would not help: it resolves 13 required contexts to 11 jobs and never walks `needs:`, so it would sweep 11 jobs, pass, and report the merge path clean while three of the four merge-gating sites still pipe unguarded.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / merge-path integrity. **Priority:** P3. **Verdict:** build, scoped.
+
+**Severity:** no deployment axis (section 0). This is repository CI tooling only. No engine behaviour, no shipped artifact, no PHI. The merge-path exposure is a gate that could report green over a step whose producer failed.
+
+A pipeline's exit status is its last command's. Under GitHub's default `run:` shell, `bash -e` without `pipefail`, a producer that fails in front of a pipe is discarded exactly as `|| true` discards one. `tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps` exists to catch `|| true` in a required job. It does not look at pipes, and nothing else in the repository does either.
+
+### Nothing screens for this, and no filed row proposes a screen
+
+Eighteen tracked files mention `pipefail` at `origin/main`. Thirteen are workflows, one is `docs/BACKLOG.md`, one is `scripts/ci/retry-native-crash.sh` setting it for itself, and three are tests that mention it in prose or use it to run a script under test. No script, hook, or workflow counts or gates on it.
+
+The ledger agrees. Over 511 live items and 237 archived, only [#1481](#1481) and [#1313](#1313) mention `pipefail`, and the archive mentions it zero times.
+
+### The count is 36 piped steps, not the 23 or the 30 anyone has published
+
+Measured at `origin/main` `67ad86e4b`, over the 28 files in `.github/workflows`:
+
+| | count |
+| --- | --- |
+| `run:` steps | 205 |
+| of those, resolving to a POSIX shell | 184 |
+| of those, carrying a real shell pipe | **36** |
+| of those, with pipefail in effect | 10 |
+| of those, **without** | **26** |
+
+Fifteen steps are PowerShell and are excluded. Six more sit in `ci.yml`'s `ide` job and `ingress-rate-probe.yml`'s `probe`, whose runner only exists at run time. All six carry zero pipes, so the ambiguity cannot move the answer.
+
+"With pipefail in effect" means two different things, and a screen must tell them apart. Nine steps execute `set -o pipefail`. One more declares `shell: bash`, which GitHub substitutes as `bash --noprofile --norc -eo pipefail {0}`.
+
+**Detecting a shell pipe is the hard part of this row, and three earlier passes returned three different numbers.** A detector that blanks quoted text cannot see `x="$(a | b)"`, which is this corpus's most common pipe idiom. The count here comes from a shell state machine put through a 25-case two-way battery. The quote-blanking design scores 15 of 25 on that same battery, failing in both directions.
+
+### State the denominator, because the ledger already carries a different one
+
+[#1481](#1481) records, measured over the same glob, that 12 workflows set `pipefail` explicitly and 3 files use `shell: bash` at all. Both figures reproduce here exactly, which is the best external check this row has on its own instrument.
+
+That is a **file** count. This row's 26 is a **step** count over pipe-carrying steps only. Filing "26 without pipefail" beside "12 workflows set pipefail" without naming the unit reads as a regression that did not happen.
+
+### The proposed home cannot reach three of the four merge-gating sites
+
+`_required_jobs()` builds from `required_contexts()` and resolves each context to one job. It does not walk `needs:`. The whole module contains one occurrence of the string `needs`, inside an assert message.
+
+Live branch protection returns 13 contexts, matching the checked-in `.github/required-contexts.txt` exactly. Those resolve to 11 jobs. Adding the transitive `needs:` closure gives 19 jobs whose failure can fail a required context.
+
+The 26 unprotected steps split like this:
+
+| where the step sits | count |
+| --- | --- |
+| a job whose `name:` is a required context | 1 |
+| a job reached through a required job's `needs:` | 3 |
+| off the merge path | 22 |
+
+Filing the rule into `test_required_jobs_have_no_neutered_steps` as written would sweep 11 jobs, pass, and report the merge path clean while `changes`, `sqlserver-store` and `load-test-sqlserver` still pipe unguarded. A guard that passes over the sites it was written for is worse than none, because it also closes the row.
+
+### The four merge-gating sites, and what each one actually risks
+
+| file | job | step | how it gates | what a swallowed status costs |
+| --- | --- | --- | --- | --- |
+| security.yml | `gitleaks` | Install gitleaks (pinned + checksum-verified) | the `gitleaks (secret scan)` context directly | nothing. Safe by last command, measured below |
+| ci.yml | `changes` | (unnamed) | needed by `test`, a required context, and by `CI gate` | nothing. All 8 pipes are `echo "$changed" | grep -q` conditions, and `echo` on a variable cannot fail |
+| ci.yml | `sqlserver-store` | Install Microsoft ODBC Driver 18 + sqlcmd | `CI gate`, and only when `serverdb` is true | **real.** A failed `curl` writes an empty apt source and returns 0 |
+| ci.yml | `load-test-sqlserver` | Install Microsoft ODBC Driver 18 + sqlcmd | `CI gate`, and only on schedule, dispatch or merge_group | **real.** Same body |
+
+The draft said these three gate only through the `CI gate` roll-up. That is wrong for `changes`, which `test` also needs, and `test`'s name matches three required contexts.
+
+The two SQL Server legs are conditional. `load-test-sqlserver` does not run on an ordinary pull request at all.
+
+### Two shapes must not be edited, and one of them covers the required site
+
+**Four of the 26 are already safe by their last command.** The shape is `grep " ${asset}$" <checksums> | sha256sum -c -`, and it covers the one directly-required site. A grep that matches nothing hands `sha256sum` empty stdin, and it exits 1:
+
+```
+$ bash -e -c 'grep " nosuch.tar.gz$" <<< "$sums" | sha256sum -c -; echo REACHED-NEXT-LINE'
+sha256sum: 'standard input': no properly formatted SHA256 checksum lines found
+exit 1, REACHED-NEXT-LINE not printed
+```
+
+Adding pipefail there changes nothing. Doing it to satisfy a guard is churn in a supply-chain verification step.
+
+**`release.yml`'s leak gate is a deliberate non-pipefail step, and a test pins it that way.** `tests/test_release_pipeline.py::_run_leak_gate` runs it under `bash -e` on purpose, and its docstring says adding `-o pipefail` "would test a shell the release never uses, and would paper over the precise blindness this section exists to detect." [#1313](#1313) carries the measurement behind that. A screen that flags it would be arguing with a decision already made and tested.
+
+### A blanket edit would break the `changes` job, and break it silently
+
+Adding pipefail converts an early-exit pipeline into a SIGPIPE failure once the producer outruns the pipe buffer. Measured with the job's real shape, first line matching:
+
+```
+$ set -o pipefail; if echo "$changed" | grep -qE '^(messagefoundry/store/)'; then TRUE else FALSE
+  57,010 bytes -> TRUE
+  64,610 bytes -> TRUE
+  66,510 bytes -> FALSE      <- flips at the 65,536-byte pipe buffer
+  72,210 bytes -> FALSE
+```
+
+Without pipefail the same sweep returns TRUE at every size.
+
+The consequence is worse than a red. These eight pipelines sit in `if` conditions, where errexit is suppressed, so the job exits 0 and writes `serverdb=false`. `sqlserver-store` gates on that output, so it would skip. `.github/required-contexts.txt` records, verified on a real run, that `CI gate` returns success with all six such legs skipped. The result is a green merge over store changes that no suite tested.
+
+**The hazard is latent, not current.** It needs roughly 1,550 changed paths. Over the 49 commits reachable in this shallow clone the median changed-file list is 148 bytes and the maximum is 51,849, which is 21 percent under the threshold. The whole tree is 93,193 bytes, so a crossing payload is producible.
+
+### What to build
+
+1. **Fix the three `curl ... | sudo tee` steps first**, independent of any guard. They are the only measured consequence in the set. A failed fetch leaves an empty source list, and the step's own retry loop then reports `"::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."` The diagnostic points away from the fault.
+2. **Scope the screen to the merge-gating closure**, not to all 205 steps. It must walk `needs:` from each required context's job. That closure is 19 jobs today.
+3. **Resolve the shell before judging a step.** Step `shell:`, then job `defaults.run.shell`, then workflow, then runner OS. A step declaring `shell: bash` already has pipefail. A PowerShell step is out of scope.
+4. **Do not reuse `_gating_text`.** It strips `$( ... )` on purpose, and that is safe for neutering but not for pipes. Applied to the 36 piped steps, it hides every pipe in 5 of them.
+5. **Give it a liveness receipt and an allowlist with reasons.** The existing module's `assert scanned_steps > 0` is the pattern. The allowlist holds the four `sha256sum` pipelines, the leak gate, and the eight `grep -q` conditions, each with the measurement that justifies it.
+
+### Do not
+
+Do not write `shell: bash` to acquire pipefail. [#1481](#1481) carries that reasoning and the repository's own count of which idiom it uses.
+
+### One adjacent defect found while measuring
+
+`ingress-rate-probe.yml`'s `Sweep` step declares `shell: bash` and opens with `set -uo pipefail   # NOT -e: a probe that cannot start must not lose the rows already taken`. The `shell: bash` substitution imposes `-e`, and `set -uo pipefail` cannot clear it. Only `set +e` can:
+
+```
+$ bash -eo pipefail -c 'set -uo pipefail; false; echo REACHED-AFTER-FAILURE'
+exit=1, REACHED-AFTER-FAILURE not printed
+$ bash -eo pipefail -c 'set +e; false; echo REACHED-AFTER-FAILURE'
+REACHED-AFTER-FAILURE, exit=0
+```
+
+The step runs with `-e` on, against its own comment's stated intent. The job is not required, so nothing gates on it. It is the same hidden-substitution hazard measured in the opposite direction.
+
+### Value and difficulty
+
+**Value 4.** The measured harm is three steps, two of them merge-gating, where a failed fetch is reported as a runner-mirror fault. That is a real cost paid in misdiagnosis. It is bounded: the one directly-required site is already safe, and 22 of the 26 sites are off the merge path.
+
+**Difficulty 6.** This is not a quick win. A correct screen needs a shell tokenizer, a `needs:` walk, shell resolution, and an allowlist with reasons. Three earlier passes over this same corpus published three different pipe counts, which is direct evidence that the detection is harder than it looks.
+
+### What this row does not establish
+
+The draft's headline table comparing 190/30/7 against 23/6/17 is dropped. Neither column reproduced. The "7 versus 6" pipefail gap is dropped with it; its population was never stated and no population I could build returns either number.
+
+## 1545. Nothing asserts sigstore's dependency-group spec stays an exact pin, so a floor at the declaration would unbind the owner's 4.4.0 ruling from the resolver
+
+> 🔢 **Filed 2026-09-11 from a PR 1039 report, reconciled against three adversarial verifications. One half of the report was cut and the severity framing was rebuilt.** Value **4/10** · Difficulty **3/10** · _fill-in_. Everything below is measured at `origin/main` = `67ad86e4b`, not at a worktree HEAD.
+> `sigstore` is the only `[dependency-groups]` name in none of `MOVED_TO_A_GROUP`, `EXACT_GROUP_PINS` or `FLOOR_BY_DESIGN`. Nothing asserts its spec stays an exact pin. The `==` in `pyproject.toml` is the only thing binding the owner's twice-affirmed `4.4.0` ruling to what the resolver picks, and no test asserts it.
+> **`sigstore` IS NOT UNGUARDED. Do not read this row that way.** Its declaration, its lock, its hashes, its audit and its re-export all have working guards, named below. What is missing is the spec *shape* and the inline-reinstall sweep.
+> **This is a companion to [#332](#332), not an independent subject.** #332 owns sigstore's pin, already names one of the two registry additions as its own residual, and its remaining step 6 edits the same two tuples.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** CI gates / supply chain. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (section 0). Build-time only, with no engine behaviour, no store, no PHI surface and no pull-request reachability, since the release job runs on a tag push. What holds it above trivial is that `release.yml:399` installs from the lock and `python -m sigstore sign` runs at `:402`, three lines down past a comment, in a job holding `id-token: write`.
+
+### What is guarded, and what is not
+
+The report this row came from read as "sigstore has no pin guard". That is false, and the correction matters, because a reader deciding severity needs to know which failures are already covered.
+
+| Failure | Guard | Covered |
+| --- | --- | --- |
+| The declaration disappears from `pyproject.toml` | `test_the_ci_toolchain_groups_actually_raise_the_examined_count` asserts a name SET that lists `"sigstore"` (`tests/test_new_dependency_check.py:416`) | yes |
+| The lock stops pinning it, or loses its hashes | `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` (`tests/test_ci_venv_pinning.py:994`) | yes |
+| The lock stops being installed with `--require-hashes` | the same test | yes |
+| The lock goes unaudited | `pip-audit -r ci/locks/release-tools.lock` in `security.yml` | yes |
+| The lock stops being re-derived | `security.yml` DEP-1 export plus byte-diff, and `dependabot-lock-resync.yml:140,152,156` | yes |
+| **The group spec becomes a floor** | none | **no** |
+| **A second, inline install is added beside the lock install** | none | **no** |
+
+### The floor is the sharp half
+
+Rewriting the spec to `sigstore>=4.4.0` generates no test case anywhere. `test_moved_tool_pins_are_exact_not_floors` is parametrized over `EXACT_GROUP_PINS` and `test_floored_group_pins_stay_declared` over `FLOOR_BY_DESIGN`. Neither tuple holds `sigstore`, so neither runs for it.
+
+The one sigstore spec assertion inspects the *exported lock*, matching `^sigstore==`. That is structurally blind to the difference. The `EXACT_GROUP_PINS` docstring records the check that settles it: rewriting all three scanner specs to `>=` re-locked, re-exported byte-identically, and passed every guard in the repository. Attributed to that docstring, not re-measured here.
+
+What makes this worth filing is what the `==` is holding up. The version is an owner ruling, given 2026-08-22 and re-affirmed 2026-09-03. #332 built two things to make it stick: the pin itself, and `ignore: sigstore >=4.5.0` in `.github/dependabot.yml`. Measured: **no test asserts the version**. The `4.4.0` literal appears in `tests/` only in prose.
+
+So the ruling rests on one character that nothing checks. The `ignore` entry blunts the bot path but not a human `uv lock`, because `dependabot.yml` constrains only Dependabot's own pull requests.
+
+One correction to the report, because it pointed the wrong way. It said DEP-1's byte-diff would push back on a floor. It would not, on the path that matters: `dependabot-lock-resync.yml` re-exports `release-tools.lock` and `git add`s it automatically, so the gate stays green. That workflow's own comment block calls the seven artifacts out by name.
+
+### The inline reinstall is the second half
+
+Add one line to `release.yml`'s signing step, right after the lock install:
+
+```yaml
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m pip install "sigstore==4.5.0"
+```
+
+Measured, by evaluating the guards' own predicates against that line:
+
+| Guard | Why it does not fire |
+| --- | --- |
+| `test_release_path_pip_installs_name_a_version` | a blanket scan, but `_needs_a_pin("sigstore==4.5.0")` is `False` because the target carries `==`. Its non-vacuity floor is `>= 8` against 10 install lines today, and adding one moves the count up. |
+| `test_no_moved_tool_is_reinstalled_inline` | sweeps all 28 workflows, but only for `MOVED_TO_A_GROUP` names. The identical line naming `bandit` yields an offender; the one naming `sigstore` yields none. |
+| `test_release_toolchain_pin_is_present` | parametrized over `RELEASE_PINNED_TOOLS`, which no longer carries a sigstore row. No case is generated. |
+| `test_the_release_signing_toolchain_is_installed_from_a_hashed_lock` | asserts a substring is present. A second install removes no substring. |
+| the `LOCK_INSTALLED_TOOLCHAINS` tests | carry no row for `release.yml`. |
+| `.github/dependabot.yml`'s `ignore` | no Dependabot ecosystem parses a `run:` block. |
+
+Read that as "at least these do not fire". I enumerated the pytest suite in `tests/test_ci_venv_pinning.py` by symbol and the workflow-level gates. I did not check zizmor, Scorecard, or any non-pytest linter.
+
+An inline floor **is** caught, so only the pinned shape slips through. `_PIN_OPS` is `("==", "~=")` and excludes `>=` by design.
+
+### Two lock install sites are outside the fourth registry
+
+Joining every `ci/locks/*.lock` install across all 28 workflows against `LOCK_INSTALLED_TOOLCHAINS`:
+
+```
+workflow                     lock                           sites  registered
+quality-advisory.yml         ci/locks/ci-quality.lock       2      2
+security.yml                 ci/locks/ci-scanners.lock      3      3
+zizmor.yml                   ci/locks/ci-scanners.lock      1      1
+release.yml                  ci/locks/release-tools.lock    1      NOT REGISTERED
+required-workflow-state.yml  ci/locks/ci-scanners.lock      2      NOT REGISTERED
+```
+
+Three exact agreements are the control. Both uncovered sites use `--require-hashes` today. What is missing is anything that would notice if one stopped, and the exact-count check that stops one of a pair being deleted silently.
+
+The `release.yml` row is **#332's already-named residual**, not new here.
+
+### Why this belongs with #332
+
+#332's banner states the item is open for "step 6 only", which is moving `build` and `cyclonedx-bom` into the same group. `MOVED_TO_A_GROUP`'s docstring defines its population as tools that moved from an inline pin into a PEP 735 group. So step 6 requires adding both names to `MOVED_TO_A_GROUP` and `EXACT_GROUP_PINS`. That is the same two tuples this row edits.
+
+The same banner also declares "steps 2, 3 and 5 are done". Step 5 required the guard to be re-pointed rather than deleted, and it was. This row narrows that claim rather than contradicting it: the replacement covers deletion of the lock install, and does not cover spec shape or a second install.
+
+Land the two together, and correct that line in the same commit. Filing this as an unrelated subject would leave the qualification in one place and #332's claim standing in another.
+
+### What to build
+
+1. Add `"sigstore"` to `MOVED_TO_A_GROUP` and to `EXACT_GROUP_PINS`, each with its reason in the comment style the surrounding entries use. **This is the one edit that closes the floor.**
+2. Add `("release.yml", "ci/locks/release-tools.lock", 1)` and `("required-workflow-state.yml", "ci/locks/ci-scanners.lock", 2)` to `LOCK_INSTALLED_TOOLCHAINS`.
+3. Inject each regression once and confirm the new guard reds, rather than trusting that it would.
+
+A correction to the draft's rationale for step 2. It claimed that row would be the first check to red on a floor. It would not. `test_each_group_pin_reaches_its_own_lock` gates its version assertion on `"==" in spec`, so a floor skips that branch and only the name-presence assertion runs. Step 2 is worth doing for the DEP-1 and site-count coverage. Step 1 is what holds the ruling.
+
+Measured green against the tree as it stands: no inline sigstore install exists in any workflow, `sigstore==4.4.0` satisfies the exact-pin pattern, `security.yml` carries the exact `uv export --only-group release-tools` line the DEP-1 assertion requires, `release-tools.lock` pins `sigstore==4.4.0`, and both uncovered sites already use `--require-hashes`.
+
+Difficulty is 3 rather than 2 because of the coupling, not the edit. The tuples are one line each. Coordinating with #332's step 6 and correcting its banner in the same commit is the real cost, alongside the explanatory comment each entry in that file carries.
+
+### One completeness claim this falsifies
+
+`FLOOR_BY_DESIGN`'s docstring says reading it and `EXACT_GROUP_PINS` together "tells you every group spec's intended shape — so 'floor by design' can never be mistaken for 'floor nobody noticed'". `sigstore` is in neither, so today the two tables do not tell you that. Worth fixing in the same pass, since step 1 restores the property.
+
+### The version is not in scope
+
+**This row does not propose changing `sigstore==4.4.0`, and must not be read as reopening it.** That version is an owner ruling, twice affirmed. Its rationale lives once, at the `release-tools` group in `pyproject.toml`, with the record in [#332](#332). Everything here is about what guards the pin, never about what the pin says. Step 1 would make the ruling harder to undo, not easier.
 
 ## 1547. the DSN credential scrubber is quadratic on a delimiter-free run, and one unauthenticated request target stalls the event loop through access logging
 
