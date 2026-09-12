@@ -16870,6 +16870,45 @@ measurement from this row's subject and it is named here rather than performed.*
 > indicate the cap of 1 is sometimes short, and only their FAILED lines were read. **Do not treat the
 > ADR 0070 block as proven-covered on the strength of this note.** (d) Anything before
 > 2026-09-01T22:10:56Z.
+>
+> **PARTIAL 2026-09-10, HARNESS HALF ONLY. THIS ITEM STAYS OPEN, and an open item is the EXPECTED
+> outcome of that change, not a missed closure.** The 2026-09-09 amendment named two cheap harness
+> fixes and both landed.
+>
+> **(1) The sweep stand-in now reaches the operator PAUSE / RESUME block.** Nine phase waits there
+> took `_wait_lane` directly. Six sites whose subject is the WORK rather than the phase took a NEW
+> `_wait_lane_until`, which polls an arbitrary predicate and stands in on the SAME per-lane budget,
+> with the same cap and the same warning. That second instrument is the sibling this item warned a
+> mechanical substitution would leave uncovered: `_wait_lane` disables its stand-in whenever IDLE is
+> a target, and terminal IDLE is exactly what the stranding produces, so the phase wait SUCCEEDS and
+> the dispatch assertion after it fails on a message that was never sent.
+>
+> **(2) `claim_lock_timeouts` now prints on the expiry report's COUNTERS line**, beside
+> `empty_claims` / `busy_violations` / `processing_lanes` / `slots_free`, and the verdict names which
+> empty route has evidence. The verdict states a zero as **NOT ESTABLISHED**, never as an absence of
+> contention, because that counter covers one route on one backend. Placement is pinned, not just
+> presence: an assertion that only searched the whole dump went GREEN against a report the field had
+> been deleted from, because the verdict sentence quotes the same number.
+>
+> **THREE SITES ARE DELIBERATELY KEPT ON A BARE `_wait_until`, each with the reason in a comment
+> beside it.** At `test_pause_while_processing_defers_then_mark_ready_cannot_drain`'s wait for PAUSED,
+> and throughout `test_pause_while_claiming_empty_routes_to_paused`, **IDLE is the DEFECT under
+> test** -- a stand-in would re-ready the lane in the one state that proves the bug. At
+> `test_resume_resweeps_backed_off_head_then_drains`'s `IDLE and lane in _timer_deadline` wait, the
+> stand-in's own trigger condition IS the legitimate intermediate state that wait polls through.
+>
+> **WHAT REMAINS IS THE HALF THIS ITEM CALLS WORSE, UNCHANGED.** The READPAST / `FOR UPDATE SKIP
+> LOCKED` head-of-line skip still emits nothing on either backend, and nothing above touches
+> `store/sqlserver.py`, `store/postgres.py` or `store/store.py`. Closing needs benchmark hardware
+> (claim-path latency before and after, at a stated N on a stated box, per PR #670's own commit body)
+> plus a live SQL Server -- or an owner ruling splitting the store half into its own number. Neither
+> was available to the session that landed the harness half.
+>
+> **AN UNRECONCILED TENSION, REPORTED RATHER THAN RESOLVED.** The 2026-09-09 amendment's verdict reads
+> **"HARNESS RACE, NOT A PRODUCT DEFECT"**, which sits against this row's own title and its P2 build
+> verdict. Nobody has reconciled the two, and the session that landed the harness half was scoped away
+> from doing so. Whoever takes the store half should settle it first: if that verdict holds, the
+> remaining work is smaller than the title claims.
 
 **Cluster:** Store / dispatcher observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no live exposure -- zero deployments (§0), and the production sweep recovers the lane. Would cost a deploying site stalled lanes recovered only on a sweep interval, with **no log line at all** on one route and **DEBUG-only** on the other, on **both** server backends.
