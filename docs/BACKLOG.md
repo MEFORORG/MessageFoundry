@@ -32270,3 +32270,367 @@ The config-directory ACL is indirectly witnessed already (the config-source guar
 **Duplicate search.** #1553 (PR 1064) covers the `-AllowLocalSystem` rerun leaving the old account without access and asks for execution coverage of the account branches; it does not ask for a DACL assertion, and this could ship in the same change. #224 (closed) is the least-privilege default; #44 (closed) is the key-file DACL.
 
 **Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 2. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1700. the web console's single-connection purge step-up gate has no test that would catch its removal, and the golden write-actions file records the registry's claim rather than the route's enforcement
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 12 (finding P12-03, vault PR 1491). Open; not started.** Value **5/10**, Difficulty **2/10**. `POST /ui/connections/{name}/purge/{scope}` (`messagefoundry_webconsole/routes/connection_writes.py` `ui_purge_connection`) is gated by `require_ui_step_up`. Negative control on 2026-09-12: that dependency downgraded to `require_ui`, then `test_webui.py -k "stale or purge"` (23 passed), then `test_golden_surface.py`, `test_ui_hardening.py` and `tests/test_webconsole_seam_snapshot.py` (46 passed) -- 69 tests green with the gate gone. The four purge tests assert a permission refusal, a cross-site refusal, a cookie-on-JSON-route refusal, and that a fresh login reaches the handler; none sends the request with a stale step-up window. `packaging/messagefoundry-webconsole/tests/golden/ui_write_actions.txt` records `step_up=1` for the purge path, but that value comes from `register_ui_action`, a separate call from the route's dependency, so the record stays `step_up=1` while enforcement is gone.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** web console / test quality. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, no deployment axis for the tests themselves. An untested step-up on a PHI-delivery-cancelling action, and an SDS-3.7 shape in the golden record: the record asserts a control the record cannot see. The console calls `core.purge_connection` in-process through the ADR 0065 seam, so the JSON API's own `require_step_up(MESSAGES_PURGE)` never runs for a browser purge; the console gate is the only step-up control on that path.
+
+### What closing looks like
+
+1. One stale-window test for the purge path asserting the 303 to `/ui/reauth?next=...` and that `purge_connection` was not reached, modelled on `test_stale_stepup_bounces_body_less_action_via_reauth`.
+2. Make the golden generator derive `step_up` from the route's resolved dependencies rather than from the registry, so the record and the enforcement cannot disagree, and add a test that the two agree for every registered action.
+
+**Duplicate search.** No open or closed item. The existing stale-window tests cover user delete, edit-resend, the upload family and cluster stepdown, not purge. Searched `ui_purge_connection`, `step_up=1`, `ui_write_actions`, `register_ui_action`, `stale` with `purge`.
+
+**Source.** `docs/reviews/FABLE-PACKET-12-CLIENTS-2026-09-11-FINDINGS.md` (vault PR 1491), finding P12-03. The same proposal is on engine PR 1079 as `docs/backlog-proposals/FABLE-PACKET-12-CLIENTS.md`.
+
+## 1701. the harness and console wheel smoke steps read the version out of the filename and never install or import the wheel
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **6/10**, Difficulty **2/10**. `release.yml`'s "Smoke-check the harness wheel" and "Smoke-check the console wheel" steps derive `built` from `glob('*-dist/*.whl')[0]` with a regex over the filename and compare it to the tag. Neither creates a venv from the wheel, imports the package, or reads its `RECORD`. Only the engine's smoke installs its wheel, and #1583 records that even that one imports the checkout.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** release / artifact verification. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure (sec. 0, and no defective artifact is claimed). Conditional: a release would attach, and with the publish variable set would publish, a harness or console wheel that does not import, with both smoke steps green. Hatchling writes the filename from the version module regardless of what the force-include found, so a moved or empty package tree changes nothing in the name.
+
+### What closing looks like
+
+1. For each second wheel: `python -I -m venv`, install the wheel, import the package with `PYTHONSAFEPATH=1` from a source-free directory, assert the module's `__file__` lies inside the venv, and compare `importlib.metadata.version(...)` to the tag.
+2. Have `tests/test_release_pipeline.py` count one install-and-import per wheel-building job, the way it already counts PEP 440 compares per job.
+3. Acceptance: keep an intact checkout present and require a wheel with an empty package tree to fail each smoke.
+
+**Duplicate search.** #1583 (PR 1064) is the engine smoke's checkout-shadow defect and its fix does not touch the second wheels; the fix here should share its isolated-mode pattern. #1585 is the harness's unbounded dependency specifier; #1193 is the console's provenance under ASVS 15.2.4 and does not name the smoke.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 3. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1702. the harness wheel ships harness/CLAUDE.md through a whole-directory force-include
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **3/10**, Difficulty **1/10**. A real build of `packaging/messagefoundry-harness` produced 101 members including `harness/CLAUDE.md`, the nested Claude Code conventions file. The engine sdist, engine wheel and console wheel were built on the same tree and are package-only. Ruled out in the same run: `__pycache__` does not ship -- thirteen cache directories were created under `harness/` and a rebuild carried zero `.pyc` members, so hatchling's default exclusions hold under force-include.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** packaging / published-artifact integrity. **Priority:** P3. **Verdict:** build.
+**Severity:** no live exposure (sec. 0). Conditional: a published harness wheel would carry maintainer process text. Nothing in that file is PHI or a secret and the root `CLAUDE.md` is public in the same repository, so this is "ship only intended content", not a leak.
+
+### What closing looks like
+
+1. An `exclude` for `CLAUDE.md` under the harness wheel target.
+2. A wheel-content allowlist test for both second wheels mirroring the engine sdist one in `tests/test_release_pipeline.py`, so the next non-package file under `harness/` or `messagefoundry_webconsole/` is caught before a tag.
+
+**Duplicate search.** No open or closed item mentions the harness wheel's contents; #1192 (open) is about engine subcommands in the engine wheel.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 4. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1703. alloc.ps1 is not re-entrant: a re-run for the same worktree and title issues a second number instead of returning the claim it already wrote
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **5/10**, Difficulty **2/10**. Registry records 1607 and 1608 carry the identical title and the identical worktree, 53 seconds apart; the item was filed as 1608 and 1607 has no heading on any ref. The claim file is written before the announcement is printed, so a process killed in between leaves a claim its caller never hears about, and the allocation loop has no lookup for an existing claim by the same owner and title.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / ledger allocator. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is one burned number per kill, paid by this repository's own sessions, and it is highest exactly when the machine is loaded enough to kill a sweep.
+
+### Why the existing instruments do not see it
+
+`alloc_strand_sweep.py` classifies claims by whether their recorded worktree and branch can still commit; here both keys are aligned, so the record reads as healthy. `scripts/worktree/remove.ps1` refuses to remove a worktree holding a claim with no landed heading, which is the first time anyone is told, and by then the number has been re-filed under the next one. `claim.ps1` does not share the exposure: re-taking a key you already hold refreshes it.
+
+### What closing looks like
+
+1. Before the `CreateNew` loop, scan the registry directory for a record whose `worktree` equals the owner tree and whose `title` equals `-Title`, and return that number with a note instead of issuing a new one. A directory read, no sweep.
+2. A test that a second invocation with the same title and owner returns the first number.
+
+**Duplicate search.** #1535 records a kill that left no claim (the sweep died first) and says so explicitly. #1534 is the per-ref process cost. #1282 and #1293 are about a deleted worktree. #1039 is about `worktree add --force`. None covers a claim written and then re-issued.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 5. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1704. uninstall-service.ps1 says only logs and the store remain; a logon right, an orphaned config ACE, a stripped inheritance and the cached NSSM binary also remain
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **3/10**, Difficulty **2/10**. The uninstaller removes the service registration and prints that the logs and store under the data directory are left in place; `docs/SERVICE.md` says the same. Also left, unmentioned: the SeServiceLogonRight grant made for the virtual account, the `NT SERVICE\<name>:(OI)(CI)RX` entry on the config directory (an unresolvable SID once the service is deleted), the inheritance strip applied by `-LockConfigDir`, and `bin\nssm.exe` under the data directory. The WER keys are documented as persistent elsewhere in the same document but not in its uninstall section.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Windows service install / removal. **Priority:** P3. **Verdict:** build.
+**Severity:** no live exposure (sec. 0). Conditional: an operator would believe a host was returned to its pre-install state while a logon right and an orphaned ACE remain. Each leftover is minor; the defect is the completeness claim (SDS-3.6).
+
+### What closing looks like
+
+1. Print an inventory of what is left at the end of uninstall.
+2. Offer `-RemoveLogonRight` and `-RestoreConfigAcl` switches for the two that need elevation to undo.
+3. Correct the docstring and the `SERVICE.md` uninstall section in the same change.
+4. Acceptance: drive the uninstaller with fakes and assert the inventory names every leftover the installer creates; assert the two switches issue the reverse operations.
+
+**Duplicate search.** #1558 (PR 1064) is the uninstaller's swallowed stop status and re-reads nothing about what remains. #99 is gMSA hardening.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 6. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1705. security.yml's header names CodeQL as a required context and every job but two as required, and the live set disagrees on both
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 13 (vault PR 1486). Open; not started.** Value **2/10**, Difficulty **1/10**. The header says every job except `sbom` and `trivy` is a required context; `released-line-audit` is advisory by its own comment. It says CodeQL "IS a required context"; the live branch protection read during the packet has 13 contexts and no CodeQL, `.github/required-contexts.txt` matches those 13 exactly, and #1384 records the CodeQL contexts as deliberately not required.
+> Verdict: build
+> Research: none
+> Closing-act: doc
+
+**Cluster:** CI / documentation accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no live exposure (sec. 0). Conditional: a reader weakening a gate on the strength of the header would be wrong about which gates block. No control rests on the header: `tests/test_security_posture.py` reads the checked-in required set.
+
+### What closing looks like
+
+1. Replace both enumerations with a pointer to `.github/required-contexts.txt` (SDS-3.5: state a load-bearing fact once and link to it). One comment edit. Do not write the count into the header; it moves.
+
+**Duplicate search.** #1384 and #1404 are about the checked-in file drifting from the server and do not name the workflow header.
+
+**Source.** `docs/reviews/FABLE-PACKET-13-RELEASE-2026-09-11-FINDINGS.md` (vault PR 1486), proposal 7. The same proposal is on engine PR 1075 as `docs/backlog-proposals/fable-packet13-release.md`.
+
+## 1706. anonymizer: _skip_obx5 exempts every non-textual OBX-2, so an embedded ED document and untyped free text in OBX-5 pass anonymize_checked as clean
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-01, vault PR 1487). Open; not started.** Value **8/10**, Difficulty **3/10**. `messagefoundry/anon/hl7.py` `_skip_obx5` skips the OBX-5 `FREETEXT` rule for any OBX whose OBX-2 is not one of `TX`, `FT`, `ST`, `CF`. Meant for numeric results, the exemption reaches `ED` (the ADR 0028 base64 carriage the engine's own `generators/documents.py` produces), `RP`, `CWE`/`CE` with a free-text component, and an **empty** OBX-2. OBX-5 is a mapped path, and the structural detectors run over unmapped fields only, so neither layer of `anonymize_checked` can see the skipped value. Measured at engine `70063ab55`: OBX-2 `ED` with a base64 document, OBX-2 empty with a name and MRN in prose, OBX-2 `NM` with a name and phone, and OBX-2 `CWE` with a name in the text component were all emitted with the values intact and the coverage report silent about OBX-5.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0). A first adopter running the tee's `anonymize-captures` over a real ORU or MDM feed with embedded reports would write those reports verbatim into a dataset the tool has just certified shareable. An embedded PDF is the most PHI-dense field an HL7 message carries.
+
+### The closed item's premise is false for exactly these cases
+
+BACKLOG #331 (closed) records as its residual analysis that "OBX-5/NTE-3 default to a blunt full-redact ... so the highest-risk residual is not this one". The code makes that false for the four shapes above (SDS-3.7). `test_obx5_freetext_only_when_value_type_textual` certifies the `NM` exemption, and no test feeds `ED`, an empty OBX-2, or free text under a non-textual type.
+
+### What closing looks like
+
+1. Invert the rule: a short allowlist of value types safe to preserve (`NM`, `SN`, `DT`, `TM`, `TS`, `ID`, `IS`, and `CE`/`CWE` only when their text components are empty); everything else, including `ED`, `RP` and an absent OBX-2, is textual and redacted.
+2. Tests for `ED`, empty OBX-2, `NM`-with-text and `CWE`-with-text.
+3. Correct #331's residual note.
+4. Apply the same change to `tee/anon/hl7.py`, which is a non-parity seam the parity test will not carry.
+
+**Duplicate search.** No open item. #331 (closed) built the structural detectors and scoped OBX-5 out on the premise above. #94 (open, DEMAND-GATE) is BLOB offload of OBX-5 documents, unrelated. Searched both ledgers for `_skip_obx5`, `OBX-2`, `OBX-5 ED`, `encapsulated`, `anon`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-01. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1707. verify self smoke reports PASS when the synthetic message routes nowhere and delivers nowhere, and an empty config directory is SKIP with a self-contradicting reason
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-02, vault PR 1487). Open; not started.** Value **6/10**, Difficulty **2/10**. `messagefoundry/verify/smoke.py` `smoke_self` fails only on `DryRunResult.error`, which `pipeline/dryrun.py` sets for a parse failure, a strict-validation failure or a router/handler exception. `UNROUTED`, `FILTERED` and a not-deployed sole destination return `error=None`. Measured at engine `70063ab55`: a router returning `[]` is `PASS disposition=unrouted, handlers=0, deliveries=0`; a handler returning `None` is `PASS ... deliveries=0`; a sole outbound `deployed=False` is `PASS ... deliveries=0`; a config directory with zero modules is `SKIP config has multiple inbound connections; choose one: ` with an empty list. Negative control: making the `result.error` arm return PASS left all 17 smoke tests green, so the FAIL branch has no covering test either.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P1. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). `docs/testing/VERIFY.md` says the self smoke "proves your routers/handlers load and route a message cleanly" and the package docstring says the tool answers "does a message actually flow?". A deploying site with a router matching nothing, or a sole outbound not yet deployed, would read a green acceptance report. Same family as #1671 (`check` reporting zero runs as a clean pass) and #1669 (`audit-verify` on a fresh database).
+
+### What closing looks like
+
+1. PASS only when `len(result.deliveries) >= 1`; otherwise FAIL naming the disposition and the two counts.
+2. Check `len(reg.inbound) == 0` before `dry_run` and FAIL as "config loaded no inbound connection".
+3. Tests for unrouted, filtered and dry-run error.
+
+The `select_inbound` wording belongs with #1648, the `serve`/`validate`/`check` empty-directory item.
+
+**Duplicate search.** No open or closed item. #1648 and #1671 are the CLI siblings of the same family and stay separate. Searched both ledgers for `smoke.self`, `smoke_self`, `self smoke`, `dry-run routing`, `empty config`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-02. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1708. verify store.connect creates the SQLite store it then reports PASS against, and host.writable creates directories on the box
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-03, vault PR 1487). Open; not started.** Value **5/10**, Difficulty **2/10**. `messagefoundry/verify/smoke.py` `check_store_connectivity` opens the configured store through `open_store`, whose schema-ensure creates the file; `verify/checks.py` `check_writable_dir` calls `mkdir(parents=True)` before probing. Measured at engine `70063ab55`: with the store file absent the check returned PASS and left a 372,736-byte database behind; with the parent directory absent it returned FAIL; `check_writable_dir` on a three-level missing path returned MANUAL and created all three levels. `docs/testing/VERIFY.md` introduces the default run as side-effect-free.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). Two halves. A mistyped `[store].path` reads PASS because the check creates whatever it is pointed at, so the row cannot fail for the reason its title names. And a first deployment's operator running `verify` as an administrator on a fresh box would leave an administrator-owned store and directories at the configured path before starting the service under another identity, which is the identity gap the check's own PASS text warns about, manufactured by the check.
+
+### What closing looks like
+
+1. For SQLite, refuse to create: open with the `mode=ro` URI, or test `Path.exists()` and FAIL ("no store at <path>; run `serve` once, or check `[store].path`").
+2. Never `mkdir` in `check_writable_dir`; FAIL when the directory is absent.
+3. Tests asserting the file and directory do not exist after the check.
+4. Say in `VERIFY.md` which sections write.
+
+**Duplicate search.** #43 (closed) is the calling-user caveat text, not the side effect. Searched both ledgers for `store.connect`, `check_store_connectivity`, `verify creates`, `side-effect`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-03. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1709. support bundle: config-summary.json and status.json carry raw exception text that never passes through the redactor
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-04, vault PR 1487). Open; not started.** Value **5/10**, Difficulty **2/10**. `messagefoundry/support/bundle.py` `config_summary` writes `str(exc)` of any exception raised while loading the config into the bundle; `status_snapshot` writes the store-open failure the same way. Only `app-log.txt` goes through `redact_log_text`. Measured at engine `70063ab55`: a config module raising at import with a host and a secret literal in its message put both into `config-summary.json` verbatim. A `SyntaxError` was clean (basename and line only). The SQLite store limb was clean; the server-backend limbs (asyncpg names the user on an authentication failure and the host tuple on a refused connection) could not be measured, neither driver extra being installed.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). The bundle exists to leave the box and its manifest asserts "no secrets". A config that fails to load is exactly when a bundle is wanted. An operator module raising with connection details, or a factory validation error echoing its `input` (the pydantic hazard `verify/runner.py::_settings_error_detail` already guards against), would ship them. `store/privilege.py` already wraps a store exception in `redact_log_line`; the bundle does not.
+
+### What closing looks like
+
+1. Route both strings through `redact_log_line` and bound them (the `safe_text` shape).
+2. One test per member with a synthetic secret in the raised message.
+3. Until then, name the two unredacted members in the manifest's `phi_contract`.
+
+**Duplicate search.** No open or closed item. #1183 (open, ASVS 13.3.2 research) names "log, support bundle, error text" as the cell's verb surface and records the redactor's secret vocabulary; it does not name these two members. Searched both ledgers for `config-summary`, `config_summary`, `db_error`, `support bundle exception`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-04. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1710. anonymizer: an opt-in require_full_coverage, and surface the coverage report on the clean path
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-05, vault PR 1487). Open; not started.** Value **5/10**, Difficulty **3/10**. `anonymize_checked` raises only on `report.hits`; the unmapped-field coverage report built under #331 reaches the caller only inside a `LeakError` or through the optional `on_report` hook. The structural detectors are, by design, a dashed SSN, a punctuated NANP phone and an `MR`/`MRN`-typed CX. Measured at engine `70063ab55`: a `ZPD` segment carrying a name, an eight-digit DOB and an undashed SSN was emitted clean; a name in PV1-3 was emitted; a bare ten-digit phone in NK1-8 was emitted; a dashed SSN in GT1-17 was refused. The coverage list also carries PID-1 and PID-8 on every message.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). `CLAUDE.md` section 9 says "fail-closed" without qualification and the function's docstring says it is "how you earn the right to write a dataset". A first adopter with a Z-segment or a site-specific field would get a clean verdict and no visible report. #331's narrow-detector choice is not contested; what is missing is a way to make the coverage report binding.
+
+### What closing looks like
+
+1. `require_full_coverage: bool = False` on `anonymize_checked` that refuses when any unmapped field outside a small benign set (set ids, sex, patient class) is present.
+2. Emit the coverage clause on the clean path (INFO on the tee CLI).
+3. State the real fail-closed scope in `CLAUDE.md` section 9 and `docs/PHI.md`.
+
+**Duplicate search.** #331 (closed) built the report and the detectors and left the report advisory. No open item. Searched both ledgers for `unmapped field`, `unmapped_fields`, `require_full_coverage`, `coverage clause`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-05. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1711. bundle and log redactor: add narrow shape passes for FHIR JSON, DICOM tag dumps and XML
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-06, vault PR 1487). Open; not started.** Value **5/10**, Difficulty **3/10**. `support/redact.py` delegates PHI to `messagefoundry/redaction.py`, whose passes are HL7 segment, HL7 field run, date run and multi-token name run. Measured at engine `70063ab55` with synthetic values: FHIR JSON (`"family"`/`"given"` split into single quoted tokens, an identifier value) leaked the given name and the MRN; a DICOM `PatientName=...^... PatientID=...` line leaked both; XML leaked the MRN; a bare `MRN <digits>` in prose leaked. HL7 was clean and X12 over-redacted (the safe direction).
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). The engine is documented payload-agnostic, the DICOM and FHIR transports raise with peer-supplied text, and the bundle and `GET /logs/tail` are the two artefacts designed to leave the box. `redaction.py` declares a single-token residual; structured payloads produce single tokens by construction, so the residual is the ordinary case for three of the four non-HL7 formats. The primary control (never log a body) still stands.
+
+### What closing looks like
+
+1. Label-anchored passes in the shared redactor: JSON keys from a small PHI vocabulary (`family`, `given`, `name`, `birthDate`, `identifier` values, `telecom`, `address`), DICOM `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels, and XML elements with the same vocabulary.
+2. One fixture per shape with a positive control, in the pattern `tests/test_log_redaction_secret_domain.py` already uses.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `redact FHIR`, `redact X12`, `redact DICOM`, `non-HL7 redact`, `redactor JSON`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-06. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1712. tray: the poll thread dies on the first exception from poll_once, freezing the icon with no signal
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-07, vault PR 1487). Open; not started.** Value **3/10**, Difficulty **1/10**. `messagefoundry/tray/poller.py` `_run` guards only the `on_update` callback; `poll_once` runs outside the `try`. Measured at engine `70063ab55`: a `scm_reader` injected to raise `OSError` on its second call left the poll thread dead after one update, with the only output on the thread's stderr excepthook, which under `pythonw` goes nowhere.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). June's "no long-lived task survived its first unexpected exception" shape in miniature. The readers are documented never to raise and in practice only a `ctypes` load failure would; the guard costs one `try`.
+
+### What closing looks like
+
+1. Wrap `poll_once` in the supervisory `try`, `log.exception`, publish an `UNKNOWN` snapshot.
+2. A poller test that injects a raising reader and asserts the thread survives and a later tick recovers.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `poll thread`, `poll_once`, `mefor-tray-poller`, `poller exception`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-07. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1713. verify host.console names a retired console and a missing extra, and host.noflash greps a source-text token
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-08, vault PR 1487). Open; not started.** Value **3/10**, Difficulty **1/10**. `messagefoundry/verify/checks.py` `check_console_importable` reports `PySide6` presence as "Console importable" and, when absent, "install the [console] extra". `pyproject.toml` has no `console` extra; the PySide6 operator console was retired (#103, ADR 0088) and the operator console is the web console at `/ui`. `check_console_no_window` reads `messagefoundry/service.py` as text and passes on the substring `CREATE_NO_WINDOW`, which the file's own comment satisfies on its own.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). Both rows are MANUAL or SKIP so the exit code is unaffected; a deploying operator following the row would look for an extra that does not exist.
+
+### What closing looks like
+
+1. Delete `host.console` or re-point it at the web console (in live mode, probe `/ui` the way `tray/probe.py` does).
+2. For `host.noflash`, import `messagefoundry.service` and check `_NO_WINDOW != 0` on win32 instead of grepping source.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `host.console`, `[console] extra`, `check_console_importable`, `host.noflash`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-08. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1714. verify smoke.disposition does not know NOT_DEPLOYED
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-09, vault PR 1487). Open; not started.** Value **2/10**, Difficulty **1/10**. `store/store.py` `MessageStatus` carries `NOT_DEPLOYED` (#233). `verify/smoke.py` `check_smoke_disposition`'s terminal set and `_classify_disposition`'s dead-letter set both omit it, so a live smoke whose destinations are all `deployed=False` would poll for the full timeout and then FAIL with "did not reach a terminal disposition" when it had.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). Right verdict, wrong reason, fifteen seconds late.
+
+### What closing looks like
+
+1. Add `NOT_DEPLOYED` to both sets with its own FAIL text; one `_classify_disposition` case.
+
+The dry-run half of the same blind spot is #1690.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `NOT_DEPLOYED verify`, `smoke.disposition`, `check_smoke_disposition`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-09. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1715. tray classify_health accepts any 200 JSON object with a status key as the engine
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-10, vault PR 1487). Open; not started.** Value **2/10**, Difficulty **1/10**. `messagefoundry/tray/probe.py` `classify_health` returns `OK` for a 200 whose body is a dict with a `status` key. The tokenless `/health` body is `status`, `version` (null) and `observed_client` (null) because ASVS 13.4.6 withholds the version from an unauthenticated caller, so the engine gives the tray nothing distinctive by design. `{"status":"ok"}` is the commonest health body in the industry, so `FOREIGN` ("Port in use by another program") is reachable only for non-JSON responders.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Ops & Deployment. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). Cosmetic; the tray is a status hint.
+
+### What closing looks like
+
+1. Key on the exact tokenless key set (`status`, `version`, `observed_client`).
+2. Say in `tray/state.py` that `FOREIGN` is best-effort.
+
+**Duplicate search.** No open or closed item. Searched both ledgers for `classify_health`, `foreign health`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-10. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1716. test fixtures that certify through the wrong control: the bundle suite's MEFOR_ fixtures, the tray's import layering, and the rules file's wheel claim
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 14 (finding P14-11, vault PR 1487). Open; not started.** Value **3/10**, Difficulty **2/10**. Negative control at engine `70063ab55`: with `_MEFOR_SECRET` in `support/redact.py` replaced by a never-matching pattern, `tests/test_support_bundle.py::test_redact_mefor_secret_keeps_name` and `test_log_tail_redacted_no_phi_no_secret` stayed green -- their fixtures are pure-alphanumeric and 24 or more characters, which `_LONG_B64` sweeps regardless (the #1183 shape the module docstring warns about); only the secret-domain family test went red. Separately, nothing pins the tray's import layering (`tests/test_dependency_boundaries.py` has no `tray` rule; `test_tray_boundary.py` pins the render model only), and `tests/test_semgrep_handler_rules.py::test_rules_file_ships_in_the_package` resolves the rules file through the source tree in an editable install rather than a built wheel.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Quality & Testing. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, no deployment axis. The live controls exist elsewhere in each case; these are tests that would stay green through a regression they name.
+
+### What closing looks like
+
+1. Hyphenated fixtures under 24 characters in the bundle suite.
+2. A fresh-interpreter import assertion for `tray/` in the pattern of `test_verify_does_not_import_the_generators`.
+3. Either a built-wheel content check for the rules file or a comment pointing at `integrity.py`'s runtime attestation as the real control (#1701 owns the wheel-smoke question).
+
+**Duplicate search.** #1183 (open) is the earlier instance of the backstop-satisfied fixture and was fixed for the bearer case. No open item covers these three. Searched both ledgers for `_LONG_B64`, `backstop`, `tray boundary`, `dependency boundary tray`, `rules file wheel`.
+
+**Source.** `docs/reviews/FABLE-PACKET-14-OPS-2026-09-11-FINDINGS.md` (vault PR 1487), finding P14-11. The same proposal is on engine PR 1076 as `docs/backlog-proposals/fable-packet14-ops.md`.
+
+## 1717. DR: the engine backs up and verifies a .mfbak archive and has no way to restore one
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 15 (finding P15-01, vault PR 1490). Open; not started.** Value **8/10**, Difficulty **4/10**. The CLI ships `backup` and `restore-verify` and no `restore`; `pipeline/dr.py` `activate` verifies the cold-seed archive into a temporary directory, discards it, and serves from whatever store the box opened at boot, then records a `dr_seed` audit marker naming the archive. `docs/adr/0048` and `docs/CONFIGURATION.md` say the engine "cold-seeds the store from a `.mfbak` archive"; `docs/EARLY-ADOPTER-GUIDE.md` section 10 says "No existing repo doc covers this" and gives a `sqlite3 .backup` recipe that predates the archive format. Measured at engine `70063ab55` by read of the dispatch table, `dr.py` (no extract, copy or rename of the verified snapshot anywhere in the file) and the three documents. ADR 0049 built the artifact and the verify primitive; ADR 0048 consumes the verify and defers "the restore mechanic" back to ADR 0049. Neither built it.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Admin & Deployment / DR. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0). A first deployment following the docs would hold nightly archives that verify `PASS` and, on the day it needed one, would have no tool and no procedure that turns an archive back into a store; a DR activation's audit row would record a "verified cold seed" for a store that was never seeded from it.
+
+### What closing looks like
+
+1. A `messagefoundry restore <archive> --to <store-path> [--config-to <dir>]` subcommand: resolve the decrypt keyring through `resolve_decrypt_keys`, stream the tar through the bounded `_extract_member` reader, refuse an existing destination, and leave `reset_stale_inflight` to the next open (ADR 0049 AC-11).
+2. Have `activate` call it when the DR store is absent or empty, or refuse with the restore step named; stop recording "verified cold seed" for an archive that was not loaded.
+3. Rewrite guide section 10 around the shipped surface, and correct ADR 0048 and the `[dr]` table.
+
+**Duplicate search.** No item. #60 (closed) built backup plus restore-verify and names no restore follow-up; #61 (closed) built activation on the premise that #60 owns the restore mechanic; #102 (closed) is the server-DB attestation gate; #155 (open, demand-gate) is a server-move runbook that cites section 10 as already covering restore. Needles: `messagefoundry restore`, `restore command`, `cold seed`, `extract .mfbak`, `decrypt .mfbak`, `restore path`, `restore-verify`.
+
+**Source.** `docs/reviews/FABLE-PACKET-15-DATAINTEGRITY-2026-09-11-FINDINGS.md` (vault PR 1490), finding P15-01. The same proposal is on engine PR 1080 as `docs/backlog-proposals/fable-packet15-dataintegrity.md`.
