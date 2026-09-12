@@ -41,9 +41,37 @@ reaches `docs/adr/README.md`, so the ADR becomes invisible. Three had already be
 ```powershell
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr      -Title "Worktree gate"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -Title "Ledger allocator"
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -TitlesFile .\titles.txt   # one title per line
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # read-only: allocates nothing
 ```
+
+**Filing several items at once: use `-TitlesFile`, one title per line.** The 40-odd seconds an
+allocation costs is the **floor sweep**, and the floor is the same answer for the second number as for
+the first, so N numbers from one sweep cost about what one costs. Measured on this clone 2026-09-12
+with a ten-session fleet running: **19 numbers in 36.6 s**, against **42.5 s for a single number** the
+same afternoon — the serial loop it replaced would have spent about 12 minutes on the same 19. Blank
+lines are skipped, lines beginning `#` are comments, and whitespace is trimmed.
+
+*One title per number, and the script refuses a duplicate.* The title is what a sibling session reads
+to learn what a number is for, so a repeated one tells it nothing — and two records with the identical
+title and worktree are exactly the shape [#1703](BACKLOG.md) is filed against, which the strand sweep
+reads as healthy and nobody can separate afterwards. There is deliberately no `-Count N` spelling.
+
+*It does not weaken the mutual exclusion.* Each number is still taken by its own atomic `CreateNew`
+against its own claim file, with the same "IOException means a sibling got it" arm. Only the scan's
+**starting point** is shared, and that was never the guard.
+
+*A partial run prints what it claimed before it throws.* Numbers are never reclaimed, so those exist
+whether or not you hear about them; a silent throw is how a permanent hole gets made.
+
+> **`pwsh -File` cannot bind an array, which is why the supported spelling is a FILE.** Under `-File`
+> every argument arrives as a string, so `-Titles "a","b"` binds **one** element, the literal `a,b`.
+> Measured 2026-09-12: it allocated a single number titled `dup,dup`, and both validators saw a
+> one-element list and passed — a silent failure that **spends numbers**, which is the one thing this
+> script must never do by accident. The `-Titles` array parameter is kept for a dot-sourced or
+> `-Command` caller and splits its elements on newlines; for an ordinary `-File` invocation, use
+> `-TitlesFile`.
 
 `-ShowFloor` prints the computed floor, **the paths it swept**, the sub-partition maximum and the number
 it would issue next — without claiming anything. Use it to answer "what can the floor see" instead of

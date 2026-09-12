@@ -56,10 +56,35 @@
     prevent is a claim born pointing somewhere the gate will never accept -- and a silent typo would
     reproduce that exactly.
 
+    -Titles ISSUES SEVERAL NUMBERS FROM ONE FLOOR SWEEP, AND THE COST IT REMOVES IS THE SWEEP, NOT THE
+    CLAIM. Read the process counts above: every one of them is spent computing the floor, and the floor
+    is the same answer for the second number as for the first. Measured on this clone 2026-09-12, a
+    ten-session fleet running: one backlog allocation 42.5 seconds wall. A filing seat with 26 items to
+    write therefore paid about 18 minutes to learn one number 26 times.
+
+    IT DOES NOT WEAKEN THE MUTUAL EXCLUSION, AND THAT IS THE PROPERTY TO CHECK BEFORE BELIEVING IT.
+    Each number is still taken by its own atomic CreateNew against its own claim file, in the same loop,
+    with the same IOException-means-a-sibling-got-it arm. What is shared is only the STARTING POINT of
+    the scan, which was never the guard: a stale start is exactly the case CreateNew exists to absorb,
+    and a sibling that takes #1730 while this run is walking toward it still makes this run skip it.
+    So the concurrency argument is unchanged, and the saving is real.
+
+    ONE TITLE PER NUMBER, DELIBERATELY. There is no "-Count 26" spelling that would issue 26 numbers
+    under one repeated title, because the title is what a sibling session reads to find out what a
+    number is for, and 26 identical titles tell it nothing. It would also manufacture the exact shape
+    BACKLOG #1703 is filed against -- two registry records with the identical title and worktree, which
+    the strand sweep reads as healthy and nobody can tell apart afterwards.
+
+    PARTIAL FAILURE IS REPORTED, NOT ROLLED BACK. If the scan exhausts its window part-way through a
+    -Titles run, the numbers already claimed STAY claimed and are printed before the throw. Numbers are
+    never reclaimed (see above), so the honest thing is to say which ones exist; a caller that loses the
+    list has created the permanent holes this script's whole design is about.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Ledger allocator"
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Builder's item" -For C:\path\to\builder\worktree
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Titles "first item", "second item", "third item"
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
 #>
 [CmdletBinding()]
@@ -67,6 +92,23 @@ param(
     [ValidateSet("adr", "backlog")]
     [string]$Kind = "adr",
     [string]$Title,
+    # Allocate one number PER TITLE, from a single floor sweep. See the -Titles discussion in
+    # .DESCRIPTION: the sweep is the whole cost, each number is still claimed by its own atomic
+    # CreateNew, and a partial run prints what it managed to claim before it throws.
+    #
+    # ***`pwsh -File` CANNOT BIND AN ARRAY, AND THAT IS WHY -TitlesFile EXISTS.*** Under `-File` every
+    # argument arrives as a STRING: `-Titles "a","b"` binds ONE element, the literal `a,b`. Measured
+    # 2026-09-12 -- it allocated a single number titled `dup,dup` and both validators below saw a
+    # one-element list and passed. The failure is silent and it SPENDS NUMBERS, which is the one thing
+    # this script must never do by accident, so the array spelling is kept only for a dot-sourced or
+    # `-Command` caller and the supported spelling for an ordinary `-File` invocation is -TitlesFile.
+    # Elements are split on newlines for the same reason: it is the one separator a heredoc gives you
+    # and a title never contains.
+    [string[]]$Titles,
+    # Path to a UTF-8 file holding ONE TITLE PER LINE -- the supported way to allocate several numbers
+    # at once, because `-File` cannot bind -Titles as an array (see above). Blank lines are skipped;
+    # leading and trailing whitespace is trimmed. A line beginning `#` is a comment.
+    [string]$TitlesFile,
     # Show what this worktree currently holds, and exit.
     [switch]$List,
     # Print the computed floor and the paths it swept, then exit WITHOUT allocating.
@@ -124,7 +166,41 @@ if ($List) {
 }
 
 # -ShowFloor allocates nothing, so there is no claim for a title to be recorded against.
-if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorded with the claim, so a sibling session can see what the number is for)." }
+$multi = [bool]($Titles -or $TitlesFile)
+if ($Title -and $multi) { throw "Pass -Title, or -Titles/-TitlesFile, not both. The multi spellings allocate one number per title from a single floor sweep; -Title allocates one." }
+if ($Titles -and $TitlesFile) { throw "Pass -Titles or -TitlesFile, not both." }
+if (-not $Title -and -not $multi -and -not $ShowFloor) { throw "-Title (or -TitlesFile) is required (it is recorded with the claim, so a sibling session can see what the number is for)." }
+
+# ONE LIST FROM HERE DOWN, so the allocation loop has a single shape and the -Title path cannot drift
+# from the multi path.
+if ($TitlesFile) {
+    if (-not (Test-Path -LiteralPath $TitlesFile)) { throw "-TitlesFile does not exist: $TitlesFile. Refusing to allocate rather than guess how many numbers you wanted." }
+    $rawTitles = @(Get-Content -LiteralPath $TitlesFile -Encoding UTF8)
+} else {
+    # Split on newlines as well as taking the elements, so a heredoc-fed single argument works under
+    # `pwsh -File`, which collapses an array to one string. See the -Titles parameter comment.
+    $rawTitles = @($Titles) | ForEach-Object { $_ -split "`r?`n" }
+}
+$titleList = @(
+    if ($multi) {
+        $rawTitles | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" -and -not $_.StartsWith("#") }
+    } else {
+        $Title
+    }
+)
+
+if ($titleList.Count -eq 0) { throw "No titles were read. Every number must carry what it is for." }
+# A blank or whitespace-only title is refused rather than recorded: an empty title in the registry is
+# the same as no title, and both the strand sweep and #1703's re-entrancy lookup key on it.
+foreach ($t in $titleList) {
+    if ([string]::IsNullOrWhiteSpace($t)) { throw "A blank title was passed. Every number must carry what it is for." }
+}
+if ($multi -and ($titleList.Count -ne (@($titleList | Select-Object -Unique)).Count)) {
+    throw "A duplicate title was passed. One title per number: two records with the identical title and worktree are the shape BACKLOG #1703 is filed against, and nothing can tell them apart afterwards."
+}
+if ($multi) {
+    Write-Host "Allocating $($titleList.Count) $Kind number(s) from one floor sweep." -ForegroundColor Cyan
+}
 
 # `git branch --show-current` prints NOTHING on a detached HEAD, so `& git ...` yields $null (not "")
 # -- calling .Trim() on it here threw *before* the detached-HEAD fallback below could run. Null-check first.
@@ -596,68 +672,93 @@ reduction is deliberate, delete $boundaryMark and say why in the PR.
 else {
     $start = $observed + 1
 }
-for ($i = $start; $i -lt $start + 500; $i++) {
-    $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
-    $file = Join-Path $alloc "$name.json"
-    try {
-        # ATOMIC test-and-set. 'CreateNew' + FileShare::None throws IOException if a sibling got here
-        # first -- that throw IS the mutual exclusion.
-        $fs = [System.IO.File]::Open($file, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    } catch [System.IO.IOException] {
-        continue    # taken by a sibling session; try the next number
-    }
-    try {
-        $claim = [ordered]@{
-            number   = $name
-            kind     = $Kind
-            title    = $Title
-            branch   = $ownerBranch
-            worktree = $ownerRepo
-            claimed  = (Get-Date).ToString("o")
-        } | ConvertTo-Json -Compress
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
-        $fs.Write($bytes, 0, $bytes.Length)
-    } finally {
-        $fs.Dispose()
-    }
+# RESUME THE SCAN RATHER THAN RESTART IT, and note why that is safe. $next only ever moves forward, so
+# a -Titles run does not re-probe numbers it has just taken. It is an optimisation and not a guard: the
+# guard is the CreateNew below, which still absorbs a sibling that took a number this run is walking
+# toward. Restarting from $start every time would also be correct, just slower.
+$next = $start
+$issued = [System.Collections.Generic.List[object]]::new()
 
-    Write-Host ""
+foreach ($thisTitle in $titleList) {
+    $claimedThis = $false
+    for ($i = $next; $i -lt $start + 500; $i++) {
+        $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
+        $file = Join-Path $alloc "$name.json"
+        try {
+            # ATOMIC test-and-set. 'CreateNew' + FileShare::None throws IOException if a sibling got here
+            # first -- that throw IS the mutual exclusion.
+            $fs = [System.IO.File]::Open($file, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            continue    # taken by a sibling session; try the next number
+        }
+        try {
+            $claim = [ordered]@{
+                number   = $name
+                kind     = $Kind
+                title    = $thisTitle
+                branch   = $ownerBranch
+                worktree = $ownerRepo
+                claimed  = (Get-Date).ToString("o")
+            } | ConvertTo-Json -Compress
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            $fs.Dispose()
+        }
+        $issued.Add([pscustomobject]@{ Name = $name; Title = $thisTitle })
+        $next = $i + 1
+        $claimedThis = $true
+        break
+    }
+    if (-not $claimedThis) {
+        # PRINT WHAT WAS TAKEN BEFORE THROWING. Numbers are never reclaimed, so these exist whether or
+        # not the caller hears about them; a silent throw here is how a permanent hole gets made.
+        if ($issued.Count -gt 0) {
+            Write-Host ""
+            Write-Host "PARTIAL: these numbers WERE allocated before the failure and are yours to file:" -ForegroundColor Yellow
+            foreach ($row in $issued) { Write-Host "  $($row.Name)  $($row.Title)" -ForegroundColor Yellow }
+        }
+        throw "No free $Kind number found in 500 tries starting at $start -- the registry looks wrong."
+    }
+}
+
+Write-Host ""
+foreach ($row in $issued) {
+    $name = $row.Name
     if ($Kind -eq "adr") {
-        $slug = ($Title.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+        $slug = ($row.Title.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
         Write-Host "ALLOCATED ADR $name" -ForegroundColor Green
         Write-Host "  file  : docs/adr/$name-$slug.md"
         Write-Host "  index : add its row to docs/adr/README.md in the SAME commit (the gate checks)."
     } else {
         Write-Host "ALLOCATED BACKLOG #$name" -ForegroundColor Green
-        Write-Host "  heading : ## $name. $Title"
+        Write-Host "  heading : ## $name. $($row.Title)"
         Write-Host "  file    : docs/BACKLOG.md"
     }
-    Write-Host "  claimed by: $ownerRepo [$ownerBranch]"
+}
+Write-Host "  claimed by: $ownerRepo [$ownerBranch]"
 
-    # -For is a deliberate redirection, so the surprise note below (which fires on the ACCIDENTAL kind)
-    # would be noise. Say the useful thing instead: which tree has to do the committing.
-    if ($For) {
-        Write-Host "  -For: recorded to the named worktree, NOT the one this ran in. Commit from" -ForegroundColor Yellow
-        Write-Host "        $ownerRepo -- the gate will refuse it anywhere else." -ForegroundColor Yellow
-    }
-
-    # SAY IT AT THE POINT OF USE when the shell is standing somewhere else (BACKLOG #1060). Anchoring is
-    # now correct, but it is also SURPRISING: a caller who runs this by absolute path from worktree A gets
-    # a claim recorded to worktree B, and the only other place that fact surfaces is the ledger gate
-    # refusing a commit later, elsewhere, with a message about the wrong thing. One line here turns a
-    # deferred, misdirected refusal into an immediate, accurate note. Silent on the ordinary same-tree
-    # invocation, so it stays worth reading.
-    $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
-    if ($cwdTop -and -not $For) {
-        $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
-        $b = ($repo -replace '\\', '/').TrimEnd('/')
-        if ($a -ine $b) {
-            Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the claim is recorded" -ForegroundColor Yellow
-            Write-Host "        to $b. COMMIT FROM THERE -- the ledger gate keys entitlement on the worktree" -ForegroundColor Yellow
-            Write-Host "        named above and will refuse the commit anywhere else." -ForegroundColor Yellow
-        }
-    }
-    exit 0
+# -For is a deliberate redirection, so the surprise note below (which fires on the ACCIDENTAL kind)
+# would be noise. Say the useful thing instead: which tree has to do the committing.
+if ($For) {
+    Write-Host "  -For: recorded to the named worktree, NOT the one this ran in. Commit from" -ForegroundColor Yellow
+    Write-Host "        $ownerRepo -- the gate will refuse it anywhere else." -ForegroundColor Yellow
 }
 
-throw "No free $Kind number found in 500 tries starting at $start -- the registry looks wrong."
+# SAY IT AT THE POINT OF USE when the shell is standing somewhere else (BACKLOG #1060). Anchoring is
+# now correct, but it is also SURPRISING: a caller who runs this by absolute path from worktree A gets
+# a claim recorded to worktree B, and the only other place that fact surfaces is the ledger gate
+# refusing a commit later, elsewhere, with a message about the wrong thing. One line here turns a
+# deferred, misdirected refusal into an immediate, accurate note. Silent on the ordinary same-tree
+# invocation, so it stays worth reading.
+$cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+if ($cwdTop -and -not $For) {
+    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $b = ($repo -replace '\\', '/').TrimEnd('/')
+    if ($a -ine $b) {
+        Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the claim is recorded" -ForegroundColor Yellow
+        Write-Host "        to $b. COMMIT FROM THERE -- the ledger gate keys entitlement on the worktree" -ForegroundColor Yellow
+        Write-Host "        named above and will refuse the commit anywhere else." -ForegroundColor Yellow
+    }
+}
+exit 0
