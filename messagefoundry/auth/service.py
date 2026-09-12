@@ -256,9 +256,12 @@ class LoginOutcome:
     #: minimum (BACKLOG #1144), and reporting False there would tell a JSON client no factor is needed
     #: seconds before the gate refuses it with ``X-MFA-Required: 1``.
     mfa_required: bool = False
-    #: A CLOSED-SET reject slug for the federated path (ADR 0142), so the browser layer can pick an
-    #: allow-listed error code without parsing ``error`` (free prose) or seeing any IdP-supplied text.
-    #: Always ``None`` on the local/AD/Kerberos paths, which have no such mapping.
+    #: A CLOSED-SET reject slug, so the browser layer can pick an allow-listed error code without
+    #: parsing ``error`` (free prose) or seeing any IdP-supplied text. Introduced for the federated
+    #: path (ADR 0142) and **no longer federated-only**: the directory-identity refusal (BACKLOG
+    #: #1471) is reached by every directory mechanism, Kerberos included, so this line used to say
+    #: "always ``None`` on the local/AD/Kerberos paths" and stopped being true. A slug the browser
+    #: layer's map does not know collapses to its generic code, which is the safe default.
     reason: str | None = None
 
 
@@ -1644,7 +1647,47 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
-        user = await self._upsert_ad_user(principal, client=client)
+        if existing is not None and existing.directory_object_id != principal.directory_object_id:
+            # BACKLOG #1471. THE ROW HOLDING THIS NAME MUST AGREE WITH THE PRESENTED IDENTITY.
+            #
+            # **THIS IS NOT WHAT CLOSES THE RECYCLE** -- say so plainly, because the obvious reading
+            # is wrong and would send the next reader looking for the control in the wrong place.
+            # ``_upsert_ad_user`` no longer ASKS by name, so a reissued ``sAMAccountName`` presenting
+            # a new id misses the id lookup and gets its own row whether or not this branch exists.
+            # What this branch does is narrower, and both halves are load-bearing:
+            #
+            #   - it refuses an id-LESS login against a BOUND row, the one state where the name
+            #     fallback below could still adopt somebody else's account. An identity that cannot
+            #     be checked is not an identity that matches;
+            #   - it turns the ``UNIQUE(username)`` collision that a recycle would otherwise hit into
+            #     an ordered, audited refusal instead of an integrity error surfacing as a 500 -- the
+            #     same move the federated bind makes forty lines below.
+            #
+            # The third state it catches is an UNBOUND row meeting a login that presents an id: a row
+            # that predates the column. Refused rather than backfilled, because adopt-and-backfill on
+            # first sight leaves the window open for every account that has not signed in since the
+            # column landed, which is the hole. (Section 0: zero deployments, so there are none.)
+            #
+            # THE COST, STATED: a site whose directory stops returning ``objectGUID`` refuses every
+            # AD login for an already-bound account until the attribute is readable again, and a
+            # recycled name needs an administrator to remove the stale MessageFoundry row before the
+            # new holder can sign in. Both are audited, loud, and recoverable; the alternative failure
+            # is silent privilege transfer.
+            #
+            # Audited in the shape of the ``local_account_conflict`` refusal above rather than
+            # through ``_directory_reject_audit``: this is the same decision point, it is reached by
+            # every directory mechanism including the one that passes no ``mech``, and the reason
+            # slug is a closed-set literal either way. No directory-supplied text is stored.
+            await self._audit(
+                "auth.login_failed",
+                actor=principal.username,
+                detail=_json({"provider": "ad", "reason": "directory_identity_conflict"}),
+                client=client,
+            )
+            return LoginOutcome(
+                ok=False, error="account conflict", reason="directory_identity_conflict"
+            )
+        user = await self._upsert_ad_user(principal, by_name=existing, client=client)
         if (
             federated_subject is not None
             and (
@@ -1831,9 +1874,74 @@ class AuthService:
         return await self._store.get_user(user.id) or user
 
     async def _upsert_ad_user(
-        self, principal: AdPrincipal, *, client: str | None = None
+        self,
+        principal: AdPrincipal,
+        *,
+        by_name: UserRecord | None,
+        client: str | None = None,
     ) -> UserRecord:
-        existing = await self._store.get_user_by_username(principal.username)
+        """Resolve the mirror row for a directory principal, creating it on first sight.
+
+        **IDENTIFIES BY THE DIRECTORY'S IMMUTABLE ID, NOT BY THE NAME (BACKLOG #1471).** A
+        ``sAMAccountName`` is a label a directory may free and reissue; ``objectGUID`` is minted once
+        per account object and survives a rename or an OU move. So a principal carrying an id is
+        resolved by that id, and a reissued name that presents a different id misses and gets its own
+        row with its own ``user_id`` -- which is what keeps uploaded-file ownership, the per-uploader
+        quota and saved search presets pointed at the person who earned them.
+
+        ``by_name`` is the row holding ``principal.username``, which the caller has already read and
+        already checked against the presented id. It is passed rather than re-read: taking it as a
+        parameter is what makes the dependency on that check visible in the signature instead of only
+        in prose, and it saves a second ``SELECT`` on every directory sign-in. The id-keyed lookup
+        then runs only when the name misses -- the directory-side RENAME, the one state a name-keyed
+        read cannot answer.
+
+        A directory returning no id at all falls back to the name, which is the behaviour that shipped
+        before the column existed. The engine cannot key on an identifier it is not given; the LDAP
+        layer logs each such read.
+
+        **WHAT THIS DELIBERATELY DOES NOT DO: propagate a directory-side RENAME.** A renamed account
+        is found by its id and keeps the username its row was created with, because the stored name is
+        a display and audit label rather than a key. **That is an improvement and a new wart, and both
+        are worth stating.** Before this, a rename resolved to nothing and minted a SECOND account, so
+        the person silently lost the uploads and presets keyed to the first -- the same class of defect
+        this item closes, arriving from the other side. Now they keep the account, and
+        ``reconcile_directory_sessions`` still probes the directory BY USERNAME, which the directory
+        no longer answers to. At the shipped settings (``ad_session_recheck_seconds`` 300 and
+        ``ad_session_recheck_strikes`` 2, i.e. on whenever a directory is wired) a renamed account
+        reads as absent on every probe, so it would collect a strike per pass and have its sessions
+        revoked once it reaches the threshold.
+
+        **THERE IS NO ADMINISTRATIVE REMEDY FOR THAT TODAY. An earlier draft of this paragraph said
+        the revocation continued "until an administrator corrects the stored name", and no such
+        operation exists** -- nothing writes ``users.username`` after ``create_user``, in this module,
+        in the store protocol or any of its three backends, or in the API. That sentence was a
+        compensating control resting on a false premise, which is worse than naming no remedy: a
+        reader plans around the correction and there is nothing to run.
+
+        What a deploying site would actually get: sign-in works (the id finds the row), then the
+        sessions are revoked again a couple of passes later, indefinitely, because the account leaves
+        the candidate set once it holds no live session and re-enters it on the next login. The only
+        escape available today is deleting the row and letting the next login mint a fresh one, which
+        discards the ``user_id`` -- and with it the uploaded-file ownership, the per-uploader quota
+        and the saved search presets this binding exists to keep pointed at one person.
+
+        Fail-closed and audited, never a widened grant, which is what makes this a wart rather than a
+        blocker. Both candidate fixes -- a rename path, and re-keying the probe off the name -- belong
+        to the ADR 0184 reconciler question, which this item does not claim.
+        """
+        if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
+            # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
+            # what stops a row being adopted by a principal it does not belong to, so a caller that
+            # skipped it must fail loudly here: an unnoticed adoption is the defect this item exists
+            # to remove, and a 500 on a misuse that no shipped path can reach is the cheap side of
+            # that trade. Not reachable from ``_complete_ad_login``, which refuses first.
+            raise ValueError("directory principal does not match the row holding its username")
+        existing = by_name
+        if existing is None and principal.directory_object_id is not None:
+            existing = await self._store.get_user_by_directory_object_id(
+                principal.directory_object_id
+            )
         if existing is None:
             user_id = uuid4().hex
             await self._store.create_user(
@@ -1842,6 +1950,10 @@ class AuthService:
                 auth_provider=AuthProvider.AD.value,
                 display_name=principal.display_name,
                 email=principal.email,
+                # Written AT CREATION rather than by a follow-up setter, so the row cannot exist in an
+                # unbound state. A crash between the two writes would have left a row no id-carrying
+                # login may adopt and no operator asked for -- a self-inflicted lockout.
+                directory_object_id=principal.directory_object_id,
             )
         else:
             user_id = existing.id
