@@ -83,7 +83,6 @@ tests/test_coord_overlap_work_signal.py
 tests/test_coord_presence.py
 tests/test_coord_recoverable.py
 tests/test_coord_dispatch_gate.py
-tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
@@ -120,6 +119,7 @@ tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_merge_gate_controls.py
 tests/test_negative_controls.py
+tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py
 tests/test_nightly_notice.py
 tests/test_operator_docs_no_warning_sign.py
