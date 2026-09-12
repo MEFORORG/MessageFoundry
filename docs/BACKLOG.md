@@ -31753,6 +31753,11 @@ The draft's headline table comparing 190/30/7 against 23/6/17 is dropped. Neithe
 ## 1595. X12FrameReader rescans the whole buffer on every chunk, so reassembly is quadratic and a slow-drip sender would buy minutes of engine CPU per interchange
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-02, vault PR 1475). Open; not started.** Value **6/10**, Difficulty **2/10**. `X12FrameReader._take_one` restarts `buf.find(b"IEA", 3)` and the terminator walk from the ISA on every `feed()`, and the X12 transports feed it from `reader.read(4096)`, which returns whatever is available, so the feed size is the sender's choice. Measured: 8 MiB in 4 KiB chunks 1.91 s; 512 KiB fed 16 bytes at a time 1.60 s; a 16 MiB interchange fed 16 bytes at a time extrapolates to about 27 minutes of CPU on the event loop, in short slices. Value 6: an exposed X12 listener would let one paced sender pin a core; the loop is not stalled, so this is amplification, not a freeze. Difficulty 2: a scan offset in one method.
+---
+
+## 1605. the SQL Server audit append is serialised in-process only, so two engine shards over one store would fork the tamper-evidence chain and raise permanent false tamper alarms
+
+> 🔢 **Filed 2026-09-12 - not started.** Value **8/10**, Difficulty **4/10**. Fable review packet 4 finding P4-01, the measured residue of closed #1 (June H-7). `record_audit` in `messagefoundry/store/sqlserver.py` guards its read-tail-then-INSERT with `self._audit_lock`, an `asyncio.Lock` created per store instance, on the stated premise that the store is "the single audit writer per engine process". Engine sharding (`serve --shard`, ADR 0037, ADR 0063) runs one process per shard, each serving its own API, over one unified store, so that premise does not hold on the built default scaling topology. Measured at engine `2ffcf3347` against a live SQL Server 2022: two processes each appending 60 audit rows concurrently broke the chain in 3 of 3 runs; 120 rows from one process verified clean, so the in-process lock does its job and the defect is strictly cross-process. Postgres, same experiment, verified 3 of 3 because its `record_audit` takes `pg_advisory_xact_lock`.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -31882,6 +31887,26 @@ Keep a scan offset on the reader and resume both the `IEA` search and the termin
 ## 1596. importing messagefoundry.parsing pulls the config layer in, so the client carve-out it is documented to earn is not held at the import level, and no test checks it
 
 > 🔢 **Filed 2026-09-11 by Fable review packet 1 (finding P1-03, vault PR 1475). Open; not started.** Value **5/10**, Difficulty **4/10**. In a fresh interpreter `import messagefoundry.parsing` loads 65 `messagefoundry` modules, including all of `config` (`wiring`, `state`, `models`, `tls_policy`, `db_lookup`, `fhir_lookup`), `actions`, `diagnostics` and `fhirsearch`. No `store`, `pipeline`, `transports`, `api` or `auth` module loads, so the "no I/O, no DB" half of CLAUDE.md section 4's carve-out holds and the "no engine state, a client may import it" half does not. `tests/test_dependency_boundaries.py` has no inward rule for `parsing`. Value 5: the carve-out is the stated reason a client may import the package. Difficulty 4: two small moves inside `parsing`, one boundary assertion, and a larger package-root change that belongs to the engine-root packet.
+**Cluster:** Store / Operations. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). On a first sharded deployment, two operators acting through two shards' consoles, or one operator plus a shard's own retention or reload audit, would fork the chain; `verify_audit_chain`, `audit_anchor` and the CLI verify would then report tampering on every later run, indistinguishable from a real tamper without out-of-band evidence. Single-process deployments would not be affected. Not a PHI exposure.
+
+### Why the lock is in the wrong place
+
+Closed #1 recorded H-7 as fixed by "serialized under `_audit_lock`". That fix serialises one process. `api/app.py` carries 50 `record_audit` call sites and `pipeline/wiring_runner.py`, `pipeline/dr.py`, `pipeline/retention.py` and `pipeline/reference_sync.py` write audit rows from inside every shard, so two shards are two locks over one chain.
+
+The comment beside the lock gives a reason for not using a database lock: a transaction-scoped `sp_getapplock` "taken as the connection's first statement ... does not release on commit and strands under concurrent contention". `_ensure_schema` in the same file takes exactly that lock as the first statement and documents that it "auto-releases on the commit/rollback below", and the concurrent-open tests exercise it. One of the two comments is wrong (packet 4 finding P4-06), and the one that steered a control out of the database is the one to re-measure as the first step of this item.
+
+### Fix
+
+Serialise the append at the database, as Postgres does and as `_maybe_finalize` already does on SQL Server: open the transaction with a leading statement (or an explicit `BEGIN TRANSACTION`), take `sp_getapplock @LockOwner='Transaction'` on a fixed resource such as `mefor:audit_append`, then read the tail and INSERT, releasing at the existing commit. Keep the in-process lock if wanted; it is not sufficient. Record the applock-as-first-statement measurement beside both comments. Add the two-process test named in #1610, because today no test on either backend can see this lock removed.
+
+**Source:** vaulted `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md`, P4-01 and P4-06, with the two-process reproduction quoted in its part 9.
+
+---
+
+## 1610. the per-message finalize lock has no test that can fail on either server backend, and the audit-append lock has none on Postgres
+
+> 🔢 **Filed 2026-09-12 - not started.** Value **8/10**, Difficulty **3/10**. Fable review packet 4 finding P4-02, from the plan's required negative control. With the SQL Server finalize applock patched to a no-op, `tests/test_sqlserver_store.py` passed 155 of 155. With the Postgres finalize advisory lock patched out, `tests/test_postgres_store.py` passed 153 of 153. With the Postgres audit-chain advisory lock patched out, 153 of 153. Positive controls under the same patches show each lock is load-bearing: 79 of 80 fan-out messages on SQL Server and 68 of 80 on Postgres silently never finalised, with zero exceptions, and the Postgres chain forked in 2 of 2 two-process runs. Measured at engine `2ffcf3347` against live SQL Server 2022 and PostgreSQL 16.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -32033,3 +32058,20 @@ Attach a permanent filter (or level) to the `pyx12` logger tree once, at module 
 ### What to build
 
 Assert `len(unescape(...)) == 0` (or compare against a count just over the cap, which fails with a short diff) so a regression fails fast with a readable message. Re-run the negative control after the change and record that the failure text names the test.
+**Cluster:** Testing / silent-failure class. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). This is test coverage of two reliability controls, not engine behaviour. Its cost is that a refactor moving either lock out of the database, which is exactly the shape of the P4-01 defect, would keep every gated test green.
+
+### What the suites can and cannot see today
+
+SQL Server's `test_audit_chain_no_fork_under_concurrent_record_audit` turned red when the in-process audit lock was removed, so that one control is pinned, in one process. Disabling `verify_audit_chain` outright turned two CLI tests red on SQL Server and three on Postgres, so tamper detection itself is pinned. Nothing drives two concurrent `mark_done` calls on either backend, and nothing drives two processes. June's 2026-06-10 note was "the gated CI suite exercises none of this"; three months later the controls landed and the suites still cannot tell whether they are there.
+
+### Fix
+
+On each server backend, two tests on the gated live leg:
+
+1. Enqueue a two-destination message, claim both rows, run both `mark_done` calls under `asyncio.gather` so they take two pooled connections, and assert the message reads `PROCESSED`. Repeat enough times to be deterministic; 30 iterations was decisive on both backends here, and the whole suite still runs in under a minute.
+2. Append audit rows from two subprocesses over one store, then `verify_audit_chain()` and assert it is clean.
+
+Both must be shown to turn red with the lock removed before they are trusted; the run-only monkeypatch plugin that does that is quoted in the packet 4 findings document and can be reused as the control.
+
+**Source:** vaulted `docs/reviews/FABLE-PACKET-4-SERVERSTORES-2026-09-11-FINDINGS.md`, P4-02 and part 6.
