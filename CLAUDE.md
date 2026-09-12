@@ -269,7 +269,9 @@ retractions. At least these went:
 - the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Manager, for
   the same reason the planning gate does: the Manager is the seat that can warn somebody and wait;
 - `/clear` and `/compact` as the fix for a stuck session;
-- declaring your own seat with `seat.ps1 -Declare`;
+- declaring your own seat with `seat.ps1 -Declare`, **as a RULE. The MECHANISM stayed and has
+  since become load-bearing for something that did not exist then -- see "Declare your seat"
+  below, and declare anyway;**
 - routing owner questions through a Liaison.
 
 Seven seats went with them: Dispatcher, Liaison, PM, Cleaner, Role Manager, Process Improvement,
@@ -292,6 +294,35 @@ often leaves a mechanism running on purpose, with the reason recorded beside it 
 are the source of record for what CI still reads and why. A mechanism this section does not mention
 is not thereby retired; this section binds on seats and rules, not on the machine's inventory.
 
+### Declare your seat, which is the one retired mechanism you should still run
+
+    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"
+
+On arrival. One command, nothing to wait for, so it deadlocks nobody.
+
+**IT IS NOW THE ONLY THING THAT MAKES A SEAT FINDABLE FROM ANOTHER CLAUDE ACCOUNT, and that was not
+true when it was retired.** Measured 2026-09-12: `SendMessage` and `ListAgents` do not cross
+accounts -- a Lander enumerated exactly two peers, both on its own config root, while a session on a
+different account held finished work for it and kept retrying an address that cannot resolve. The
+coordination directory DOES cross: six config roots write seat records into one `.git/mefor-coord/`.
+**But a mailbox is keyed by WORKTREE while a searcher is looking for a SEAT**, so guessing a box from
+a role name finds only the dead ones. The seats registry is the bridge, and it bridges only if you
+declared: that Lander's record was live that minute, 158 writes that day, with `seat` absent and
+`declaredAt` null. **A live record with no seat is indistinguishable from no record at all.**
+
+**WHY IT WAS RETIRED IS NOT RECORDED, AND BOTH AVAILABLE EXPLANATIONS FAIL.** Written down so nobody
+re-derives them. `f0e1365bc` retired a section on the stated ground that four of its rules deadlock a
+one-turn Builder -- wait for a go, the ultracode gate, `/clear`, and ask before pushing. Declaring is
+not one of the four. The Builder section below says *"It CAN declare its own seat, through the Bash
+tool"*, measured the same day. And the retired rule's own stated purpose, feeding the fleet view,
+survives: `scripts/coord/fleet.ps1` is a live pure reader over the seats layer. **So treat the
+retirement as unexplained rather than as a judgement you would be overturning by declaring.**
+
+korus `roles/COMMON.md`, section *"The seat registry is the only channel that crosses accounts"*,
+carries the read side: how to find a live seat from any account, and why that search must sort by
+recency.
+
+
 ### The KORUS roster, and only these seats
 
 | Seat | Life | Owns | Must not |
@@ -300,7 +331,28 @@ is not thereby retired; this section binds on seats and rules, not on the machin
 | **Builder** | ephemeral, one per brief | The change, the commit, the push, and the PR carrying the `BACKLOG.md` update. | Guess at something the brief left open, or wait for an answer; it puts the question in its report, comments it on the PR, and stops. Plan and wait for a "go". Declare its own seat. Spawn another session. |
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. | Merge a diff it has not read. Arm auto-merge. |
+| **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+
+**The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
+Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
+the fix is re-placing an existing, already-reviewed row at a vacant numeric slot. Forbidden the
+moment code is touched or a choice about what an item *says* is required -- those go back to the
+authoring session, because a peer writing to another session's branch is how two sessions silently
+collide.
+
+**The filename is necessary and not sufficient.** Two sessions editing one item's *body* also
+conflict in `docs/BACKLOG.md` and that is a CONTENT conflict. The discriminator is whether the
+resolution decides *where a row sits* or *what it says*.
+
+*Why the line sits there.* The standing objection is separation of duties: the Lander's value is
+being a second reader, and authoring plus landing the same change means nobody checked it. That
+holds for content and not for position -- re-placing a reviewed row creates nothing new, and it is
+verifiable without judgement: `merge-tree` exit 0 paired with a self-merge control (0) and the PR's
+own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledger gate green, the
+`parse_items` count up by exactly the expected number, and both items present and whole.
+*Measured 2026-09-11:* all four open conflicts (PRs 1029, 1030, 1032, 1049) were this one shape, and
+#1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
+new session to it.
 
 **NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds nothing. The owner starts each
 Manager, in a desktop instance, and a Manager's workers are subagents in its own process.** That is
@@ -494,6 +546,12 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   with clear messages. Direct pushes to `main` stay blocked by the harness.
 - Commits at logical stops are Claude's own judgment. Commit coherent, tested, one-layer changes and
   narrate each. Respect the ledger gate: never `--no-verify`, never a rename workaround.
+- **Omit the `Co-Authored-By` trailer and the PR-body byline.** Standing owner preference, restated
+  2026-09-11. The project turns both off at source with `attribution` in
+  [`.claude/settings.json`](.claude/settings.json), which also drops the `Claude-Session:` trailer.
+  Your own session reminder may still tell you to add the trailer. Do not. If one appears in a
+  message you are about to commit, your session is reading a stale or user-scope setting, so remove
+  it by hand.
 - A long commit message can fail to parse. The harness reported a 1015-byte ceiling when it refused
   one on 2026-09-02; that number is not recorded anywhere in this repository, so treat it as a
   measurement rather than a contract. Write the message to a uniquely-named file **inside your own
@@ -717,11 +775,14 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   question once already. Censused over git-tracked files at `172b1327c`: 496 occurrences across 75
   files, and 479 across 70 once #1265's first slice landed.** That slice was the five shipped operator
   docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — now at zero
-  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left: 430 under `docs/`
-  (127 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 38 in `docs/adr/`), 26 in `harness/`, 10 in
-  `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across repository-root and
-  `.github/` files, and **zero in `scripts/` and in this file**. Those buckets sum to the total; the
-  filed table's did not.
+  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left, re-measured
+  2026-09-11: 427 under `docs/` (125 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 37 in `docs/adr/`),
+  26 in `harness/`, 10 in `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across
+  repository-root and `.github/` files, and **zero in `scripts/` and in this file**. Those buckets
+  sum to **476**, the population today. The 479 above is the figure at `172b1327c`, a dated
+  measurement rather than a current one, and the filed table's buckets did not sum at all. Two of
+  the three that have left `docs/` since came off `BACKLOG.md` in the 2026-09-11 #1003 repair; the
+  third, and the `docs/adr/` row, were drift that nothing reported.
 
   **Two rows of the filed table were instrument errors, both SDS-3.8.** It read the web console as
   zero by counting `packaging/`; the console's source is `messagefoundry_webconsole/`, which carries
@@ -730,7 +791,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 
   **Census this population only with the ledger counts as a positive control** — the first attempt
   returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere is
-  indistinguishable from a clean repo. `docs/BACKLOG.md` at 127 and `BACKLOG-CLOSED.md` at 93 are that
+  indistinguishable from a clean repo. `docs/BACKLOG.md` at 125 and `BACKLOG-CLOSED.md` at 93 are that
   control: an instrument that cannot find those proves nothing by returning zero anywhere else.
 
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
@@ -856,6 +917,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
+  (section 5). The project turns them off at source in `.claude/settings.json`.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
   `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.

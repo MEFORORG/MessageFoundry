@@ -1019,3 +1019,99 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python3 scripts/quality/liveness.py verify --needs-json "$NEEDS_JSON"
+
+  deferral-resolution:
+    # BACKLOG #1527 -- a Verdict that defers to a condition recorded the CONDITION and never the
+    # RESOLUTION, so one ruling silently staled three artefacts and no instrument could see any.
+    #
+    # `scripts/docs/deferral_resolution_screen.py` reports every OPEN row whose Verdict statement
+    # declares a deferral, with the age of the declaration, and joins each against the tracked
+    # register at `docs/DEFERRAL-RESOLUTIONS.md`. A row whose condition the register records as
+    # settled is reported as still declaring it -- the measured 2026-09-10 shape, where the owner
+    # lifted the ADR 0056 privileged-helper pause and #1494, #1495 and ADR 0056 all went on saying
+    # the work was paused. Two of those three were repaired by ACCIDENT, by a builder editing
+    # nearby.
+    #
+    # IT RUNS ON EVERY PULL REQUEST, unlike the two cron-gated ledger jobs above it. Their argument
+    # for moving was that a required pytest leg already catches their hard finding pre-merge. That
+    # is not true here: this screen's finding is a DISAGREEMENT between a row and a register, and no
+    # required test asserts that population is empty -- deliberately, because emptiness is not a
+    # property anybody has ruled the ledger must have. A day's latency on a report nothing else
+    # produces is the cost the cron would add, so it is not taken.
+    #
+    # WHY IT REPORTS AND CANNOT GATE. Promotion is the owner's call, not a Builder's (CLAUDE.md
+    # section 5), and the blocking form would be wrong here on its own terms: a stale deferral is
+    # fixed by re-reading a row and re-writing its Verdict, which is an assessor's act. A merge that
+    # cannot land until somebody finishes reading is a freeze, not a gate. The same four properties
+    # keep it advisory as its two siblings, and tests/test_deferral_resolution_screen.py pins the
+    # three a repository test can see: this workflow holds no required context; `--advisory` turns a
+    # finding into exit 0; `continue-on-error: true` means even the screen's REFUSAL cannot fail the
+    # job; and the job is absent from `liveness`'s `needs`.
+    #
+    # THE EXIT CODE IS RE-RAISED, NOT SWALLOWED WITH `|| true`. Under `--advisory` the only non-zero
+    # exit left is 2 -- the screen refusing to report on an empty population, or on an empty
+    # register. Both are what a dead parse or the wrong file looks like, and both must not render
+    # like a clean scan, so they stay visible as a red STEP inside a green job.
+    #
+    # THIS IS THE THIRD COPY OF THE SAME STEP BODY, AND THE SIBLING'S OWN EXPIRY HAS FIRED.
+    # `verdict-divergence` above says: "Revisit if a third ledger check lands and the boilerplate is
+    # worth a shared runner script." It has landed. Recorded here rather than quietly ignored,
+    # because an unmet trigger nobody names reads as if nobody noticed.
+    #
+    # WHAT IS AND IS NOT WORTH FOLDING. That comment's argument has two halves and only one expired.
+    # A separate JOB per check still earns its keep -- a job's `name:` IS the status context, so
+    # folding these into one hides two checks behind a third's label. What expired is the copied
+    # ~28-line shell BODY: the 1 MiB summary cap, the TOOL_STATUS capture and the re-raise idiom now
+    # live in three places, as do the eight wiring assertions in three test files. Three jobs each
+    # calling one shared runner script keeps the contexts and removes the copies.
+    #
+    # NOT TAKEN IN THIS CHANGE, deliberately. A concurrent pull request is appending jobs to this
+    # same file, and a rewrite of all three step bodies underneath it is a merge conflict resolved
+    # by hand over YAML. The extraction is a change of its own with its own item; it is named here
+    # by subject rather than by number, because no number has been allocated for it.
+    #
+    # THE DEFAULT SHALLOW CHECKOUT IS CORRECT HERE, AND THAT IS A CLAIM, NOT AN OVERSIGHT. This
+    # file's own `liveness` job records three signals that reported success for months while
+    # measuring nothing, and diff-coverage died on exactly this -- a shallow clone with no merge
+    # base. This screen reads two TRACKED FILES and no history, so `fetch-depth: 0` would buy
+    # nothing; test_the_job_needs_no_git_history asserts the step body stays that way, because
+    # "correct" and "nobody checked" render identically.
+    name: deferral resolution screen (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report open rows deferring to a condition, aged and joined (advisory - never gates)
+        continue-on-error: true
+        run: |
+          echo "== open rows whose Verdict defers to a condition, with the age of the deferral =="
+          echo "== advisory: this reports, it never gates a merge =="
+          TOOL_STATUS=0
+          python3 scripts/docs/deferral_resolution_screen.py --advisory \
+            > deferral-resolution.txt 2>&1 || TOOL_STATUS=$?
+          cat deferral-resolution.txt
+          {
+            echo "## Deferral resolution"
+            echo ""
+            echo "Advisory only. An AGED row is not a defect -- a deferral may legitimately wait a"
+            echo "long time, and a check that fires on good news gets muted. The finding is the"
+            echo "other class: a row still declaring a condition that docs/DEFERRAL-RESOLUTIONS.md"
+            echo "records as settled. The denominators are printed beside the counts, because a run"
+            echo "that joined nothing must not read like one that joined everything."
+            echo ""
+            echo '```'
+            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+            # ENTIRELY, so truncate rather than silently lose the whole summary.
+            head -c 200000 deferral-resolution.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TOOL_STATUS" -ne 0 ]; then
+            echo "::warning title=Deferral-resolution screen did not complete::the screen exited ${TOOL_STATUS} in advisory mode, which means it measured nothing rather than that it found something. See the job log."
+          fi
+          # Re-raise the screen's status. `continue-on-error` above keeps the JOB green; this keeps a
+          # broken scan distinguishable from a clean one.
+          exit "$TOOL_STATUS"

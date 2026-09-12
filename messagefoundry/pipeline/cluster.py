@@ -378,10 +378,14 @@ def demote_stop_budget(
     compares against no ``lease_expires_at``, makes the Windows monotonic clock load-bearing for
     nothing, and cannot degrade to zero.
 
-    The renew round trip is NOT subtracted, because it is not observable here. It is bounded only by
-    ``[store].command_timeout`` (30.0 by default) — which equals the stock lease TTL — so until that is
-    clamped separately the real margin can be zero and this budget is nominal rather than guaranteed.
-    Say that plainly rather than implying the budget is met.
+    The renew round trip is not subtracted, and since ADR 0157 Inc 0 it no longer needs to be:
+    :meth:`DbCoordinator._maintain_leadership` stamps the fence baseline BEFORE it issues the renew, so
+    the baseline is never later than the DB clock's own ``lease_expires_at`` stamp and the headroom
+    below is a floor rather than a nominal figure. Two things that remain true. This budget bounds the
+    DEMOTE source phase, not the whole teardown, so a met budget is not a stopped node. And the
+    headroom it is computed from is spent by the ex-leader's own in-flight renew as well — that is what
+    ``[cluster].lease_renew_timeout_seconds`` clamps, and what
+    ``ClusterSettings._renew_fits_the_margin`` checks at config load.
     """
     headroom = lease_ttl_seconds - fence_timeout_seconds - fence_tick_seconds(fence_timeout_seconds)
     return (
@@ -688,6 +692,7 @@ class DbCoordinator:
         node_timeout_seconds: float = 30.0,
         leader_lease_ttl_seconds: float = 30.0,
         leader_fence_timeout_seconds: float = 20.0,
+        lease_renew_timeout_seconds: float = 5.0,
         acquire_delay_seconds: float = 0.0,
         promotable: bool = True,
         db_schema: str | None = None,
@@ -720,13 +725,19 @@ class DbCoordinator:
         # The SELF-FENCE timeout: a leader that has not renewed within this many seconds (its own
         # monotonic clock, no DB I/O) demotes itself. MUST be < the TTL — but note what that ordering
         # does and does not buy. It bounds when this node stops *calling itself* leader; it does NOT
-        # bound when this node stops *acting*. Two terms sit outside the validator (settings.py
-        # _fence_ordering, which checks ordering only, never margin): the fence baseline is stamped
-        # AFTER the renew round trip returns while the lease expiry is stamped on the DB clock at
-        # statement execution, so the real margin is short by that round trip; and detection lands up to
-        # one _fence_tick late. Graph teardown is not budgeted against the remainder at all. Treat this
-        # as the split-brain DETECTION bound, not a proof that the old leader has stopped.
+        # bound when this node stops *acting*. The real margin is (ttl - fence - _fence_tick), because
+        # detection lands up to one tick late; ADR 0157 Inc 0 removed the round-trip term by stamping
+        # the baseline BEFORE the renew is issued, and settings.py's _renew_fits_the_margin now checks
+        # that remainder at config load (_fence_ordering checks the ordering alone). Treat this as the
+        # split-brain DETECTION bound, not a proof that the old leader has stopped.
         self._fence_timeout = leader_fence_timeout_seconds
+        # ADR 0157 Inc 0: the per-statement clamp on the acquire/renew round trip, replacing the
+        # inherited `[store].command_timeout` (30 s — the stock lease TTL itself, and unbounded
+        # entirely when an operator sets the documented command_timeout=0). It does not widen the
+        # detection margin, which the baseline stamp already fixed; it bounds how long a renew this
+        # node issued BEFORE it self-fenced can still be in flight, re-extending the very lease it is
+        # standing down from. Passed to asyncpg per call, so it overrides the pool's command_timeout.
+        self._renew_timeout = lease_renew_timeout_seconds
         # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
         # promptly (well before the lease TTL). Pure in-memory check — no DB.
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
@@ -774,6 +785,8 @@ class DbCoordinator:
         self._lock_key = f"{db_schema or 'public'}:mefor_cluster_nodes"
         # The leadership-lease KEY (the single leader_lease row's primary key). Schema-namespaced so two
         # deployments sharing one database via different schemas elect leaders independently.
+        # Right HERE only because search_path separates the tables. SqlServerCoordinator's keys are
+        # deliberately constant; do not mirror these there (StoreSettings._db_schema_backend says why).
         self._lease_key = f"{db_schema or 'public'}:mefor_cluster_leader"
         self._host = socket.gethostname()
         self._pid = os.getpid()
@@ -1151,15 +1164,28 @@ class DbCoordinator:
         demote on an error here; ``_last_renew_ok`` simply isn't advanced, so the fence watchdog demotes
         us only if the failure persists past the fence timeout (and always before the lease can expire).
 
+        **The baseline is read BEFORE the claim is issued, not after it returns (ADR 0157 Inc 0), and
+        the ordering is the whole point.** The two clocks race: this baseline is on the node's
+        monotonic clock, and the ``lease_expires_at`` it has to stay ahead of is stamped on the DB's
+        clock at statement execution, which is somewhere inside the round trip. Stamping after the
+        return makes the baseline LATER than the DB's stamp by the whole round trip, so the fence fires
+        that much later and the margin ``_fence_ordering`` appears to guarantee is short by an amount
+        nothing measures. Reading it first makes the baseline no later than the DB's own, so the margin
+        is at least ``ttl - fence - _fence_tick`` whatever the round trip costs. It can only make this
+        node fence EARLIER, which is the conservative direction: an early fence costs a leaderless
+        interval, a late one is the two-leader window the fence exists to prevent.
+
         The whole tick — the claim AND the bookkeeping that reads its result — runs under
         :attr:`_leadership_lock`, because the promotion decision is made on a value that crossed an
         await. A stepdown that interleaved here would be undone by the tick's own stale result; see the
         lock's comment in ``__init__``.
         """
         async with self._leadership_lock:
+            # ADR 0157 Inc 0 — read the paragraph above before moving this below the claim.
+            issued_at = self._monotonic()
             held = await self._claim_or_renew_lease()
             if held:
-                self._last_renew_ok = self._monotonic()
+                self._last_renew_ok = issued_at
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)
@@ -1240,6 +1266,12 @@ class DbCoordinator:
             self.node_id,
             self._lease_ttl,
             self._acquire_delay,
+            # ADR 0157 Inc 0 — asyncpg's own per-statement timeout, which overrides the pool's
+            # command_timeout for this call. On expiry asyncpg raises TimeoutError, which the
+            # maintenance loop logs and retries WITHOUT demoting: _last_renew_ok is simply not
+            # advanced, so the watchdog fences only if the failure outlives the fence timeout. That
+            # is the same handling a raise already got, so the clamp adds a bound, not a new path.
+            timeout=self._renew_timeout,
         )
         if row is None or row["owner"] != self.node_id:
             return False
@@ -1256,13 +1288,14 @@ class DbCoordinator:
 
         ``_fence_timeout < lease_ttl`` is what makes a partitioned old leader stop *reporting* leader
         before its lease can expire — and that is the whole of it. Two caveats, both load-bearing for
-        anyone deriving a safety argument from this ordering. The margin is smaller than
-        ``lease_ttl - _fence_timeout``: the baseline this compares against is stamped after the renew
-        round trip RETURNS while the lease expiry is stamped on the DB clock at statement execution, and
-        detection lands up to one ``_fence_tick`` late. And demotion here flips a boolean — it cancels
-        no listener, worker, or in-flight send. Nothing budgets graph teardown against the remainder, so
-        **"fenced" does not imply "stopped processing"**; do not use this as a premise for a write that
-        assumes the prior leader is quiescent."""
+        anyone deriving a safety argument from this ordering. The margin is ``lease_ttl -
+        _fence_timeout - _fence_tick``, one tick short of the configured gap, because detection lands
+        up to one tick late; the renew round trip is no longer a third term, since ADR 0157 Inc 0
+        stamps the baseline before the renew is issued. And demotion here flips a boolean — it cancels
+        no listener, worker, or in-flight send. The DEMOTE teardown (ADR 0157 Inc 4/5) budgets the
+        source phase against that remainder and nothing budgets the rest, so **"fenced" does not imply
+        "stopped processing"**; do not use this as a premise for a write that assumes the prior leader
+        is quiescent."""
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._fence_tick)
@@ -1526,6 +1559,25 @@ class DbCoordinator:
             log.warning("cluster: leadership_lost alert failed", exc_info=True)
 
 
+#: Fallback renew clamp for a DUCK-TYPED settings stand-in that carries no resolved value. A real
+#: ``ClusterSettings`` never reaches this -- its validator derives the clamp from the detection margin
+#: and fills the field in, so the attribute is always a concrete float by the time it is read here.
+_DUCK_TYPED_RENEW_TIMEOUT_FALLBACK = 5.0
+
+
+def _renew_timeout_or_default(cluster_settings: Any) -> float:
+    """Read the resolved renew clamp off duck-typed settings (ADR 0157 Inc 0).
+
+    ``is None``, not ``or``. A falsy-test also swallows ``0.0`` and substitutes the fallback, which
+    would be wrong twice over: ``0.0`` is a value :class:`ClusterSettings` refuses outright, and
+    silently turning it into a fixed 5.0 re-introduces exactly the constant this increment removed --
+    at the one seam that feeds the live coordinator, where it would be least visible."""
+    configured = getattr(cluster_settings, "lease_renew_timeout_seconds", None)
+    if configured is None:
+        return _DUCK_TYPED_RENEW_TIMEOUT_FALLBACK
+    return float(configured)
+
+
 def build_coordinator(
     store: Any, cluster_settings: Any, *, alert_sink: AlertSink | None = None
 ) -> ClusterCoordinator:
@@ -1559,11 +1611,7 @@ def build_coordinator(
         or getattr(store, "_owner", None)
         or default_node_id()
     )
-    # Reach the store's configured schema (duck-typed) so the coordinator's nodes-DDL advisory lock is
-    # namespaced identically to the store's own lock keys. Defaults to 'public' inside DbCoordinator
-    # when the store has no _settings (a non-Postgres path never reaches here).
     settings = getattr(store, "_settings", None)
-    db_schema = getattr(settings, "db_schema", None)
     # The SQL Server store ALSO exposes a `_pool` (aioodbc), but DbCoordinator drives the asyncpg API, so
     # dispatch a SQL Server store to its own active-passive coordinator instead. Backend is duck-typed off
     # the settings enum's value (no StoreBackend import → no config dependency here); the import is local
@@ -1594,8 +1642,23 @@ def build_coordinator(
         leader_fence_timeout_seconds=getattr(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
+        # ADR 0157 Inc 0. Threaded to this coordinator ALONE: SqlServerCoordinator above has no
+        # per-statement seam to apply it through (its renew still inherits [store].command_timeout
+        # via the ODBC connection), so passing it there would name a bound that does not bind.
+        #
+        # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
+        # validator, so a real settings object always hands over a concrete float and the derivation
+        # is not copied here. The fallback covers a DUCK-TYPED settings stand-in that carries the
+        # field unresolved -- this function takes `Any` on purpose and several tests pass a
+        # SimpleNamespace. `is None`, never `or`: `or` also swallows a duck-typed 0.0 and silently
+        # substitutes 5.0, which is both a value the settings model refuses and the exact fixed
+        # constant this increment exists to stop deriving behaviour from.
+        lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
         acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
         promotable=getattr(cluster_settings, "promotable", True),
-        db_schema=db_schema,
+        # The store's schema (duck-typed), so the nodes-DDL advisory lock is namespaced identically to
+        # the store's own lock keys; 'public' inside DbCoordinator when unset. Read on this path only:
+        # the SQL Server store ignores db_schema (StoreSettings._db_schema_backend).
+        db_schema=getattr(settings, "db_schema", None),
         alert_sink=alert_sink,  # #145: failover-transition alerts
     )

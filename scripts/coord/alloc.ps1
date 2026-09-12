@@ -21,7 +21,19 @@
 
     The floor is the max over: the numbers on origin/main, the numbers on EVERY local and remote ref, and
     every existing allocation. The all-refs term closes the "registry wiped -> re-issue a number that only
-    exists on an unpushed branch" hole. It costs about a second, once per ADR -- not per edit.
+    exists on an unpushed branch" hole. NEITHER KIND SPAWNS A PROCESS PER REF, which is the property
+    that matters: a per-ref sweep is fine at a few hundred refs and unusable at several thousand, and
+    it does not announce the crossing (BACKLOG #1534). What each costs instead, COUNTED with GIT_TRACE
+    on this clone on 2026-09-11 rather than reasoned about, and dated because both are live properties
+    that drift:
+      adr      440 git processes for the whole -ShowFloor run -- ref enumeration, one
+               `cat-file --batch-check`, then one `ls-tree` per DISTINCT docs/adr tree, 434 here.
+               It scales with distinct TREES, not with refs.
+      backlog  18 -- ref enumeration, one `cat-file --batch-check`, then one `git grep` per 128
+               DISTINCT ledger blobs, 13 here at 1,538 blobs (BACKLOG #1535). Scales with blobs.
+    An earlier version of these lines said "TWO git processes" for each and was wrong twice over: it
+    omitted the ref enumeration both branches run, and it described an adr stage 2 that has since been
+    reverted. The cost is per allocation, not per edit.
 
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
@@ -161,11 +173,65 @@ function Get-Floor {
     $seen.Add(0)
 
     if ($Kind -eq "adr") {
+        # Batched for the reason the backlog branch below was batched, and it is the same measurement
+        # taken again on a bigger clone: one `git ls-tree` PER REF is one PROCESS per ref, and this
+        # clone now carries 7,196 of them. Measured 2026-09-11 -- 359.7s for a single -ShowFloor, and
+        # over 17 minutes for the session that reported it, which lost two tool timeouts before its
+        # allocation returned. The refs collapse hard: 7,199 specs resolve to 434 DISTINCT docs/adr
+        # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
+        # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
+        #
+        # A TREE, NOT A BLOB, is the difference from the backlog branch. A directory has no fixed path
+        # to hand `--batch-check`, so the dedupe collapses to distinct TREE ids and each distinct tree
+        # is listed once. The refs are what exploded; the trees never were.
+        #
+        # THE SAVING IS THE DEDUPE, NOT A CLEVERER READER. 7,199 specs collapse to 434 trees, which is
+        # a 16x cut in processes and the whole of the fix. Two spellings of stage 2 that tried to go
+        # further were BUILT, MEASURED AND REVERTED, and both failed the same way -- silently, by
+        # losing a name, which is a number that then reads as FREE:
+        #
+        #   `git rev-list --objects` dedupes by OBJECT, so two ADR files with byte-identical content
+        #   print ONE of their two names. Measured: `0150-alpha.md` and `0151-beta.md` sharing a blob
+        #   printed one name, which would re-issue 0151 over a live ADR.
+        #
+        #   Scanning the RAW TREE BYTES through the pipeline, anchored on `(?:100644|100755) `, broke
+        #   TWICE. (a) A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native
+        #   output with [Console]::OutputEncoding -- the OEM console code page on Windows. Under a
+        #   DBCS page a lead byte at the end of one entry's id CONSUMES the `1` that starts the next
+        #   entry's `100644`, and that entry vanishes. Measured on this clone: cp932 lost 7 of 181
+        #   numbers, cp936/949/950 lost 17, while utf-8 and cp1252 lost none. End to end on a fixture
+        #   with `chcp` set before pwsh started, the floor fell from 999 to 100 and the next
+        #   allocation would have landed on a live ADR. The comment that shipped it argued no
+        #   multi-byte decode could swallow an ASCII byte; that is true of UTF-8 and false of DBCS.
+        #   (b) The mode literal admitted regular files only, where `ls-tree` reports EVERY mode, so
+        #   an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to
+        #   its replacement (120000) became invisible.
+        #
+        # SO STAGE 2 IS `ls-tree` PER DISTINCT TREE, and it is the boring spelling on purpose. It
+        # emits TEXT that git already decoded, so no console code page can touch it, and it reports
+        # every mode, so no entry shape can hide from it. It costs 434 processes here instead of one
+        # -- about 40s against the 5s the byte scan managed and the 359.7s this branch started at.
+        # That trade is deliberate: the failures it buys out are both SILENT, and this script exists
+        # to prevent exactly the collision they cause.
+        #
+        # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
+        # Two implementations of one question drift; change one and read the other.
         $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        foreach ($ref in ($refs | Select-Object -Unique)) {
-            $names = & git -C $repo ls-tree --name-only $ref docs/adr/ 2>$null
-            foreach ($n in $names) {
-                if ($n -match 'docs/adr/(\d{4})-') { $seen.Add([int]$Matches[1]) }
+        $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
+
+        $trees = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
+        }
+
+        # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+        # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
+        $rx = [regex]::new('^(\d{4})-')
+        foreach ($t in $trees) {
+            foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
+                $m = $rx.Match("$n")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
             }
         }
     } else {
@@ -201,21 +267,105 @@ function Get-Floor {
             if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
         }
 
-        # MULTILINE IS LOAD-BEARING, and its absence was a silent hole. `[regex]'^...'` anchors at the
-        # start of the STRING, not of each line. The all-refs term below feeds it one line at a time
-        # (cat-file output through the pipeline), so it matched there and looked correct -- but the
-        # working-tree term feeds it `Get-Content -Raw`, one string starting "# Backlog", where `^`
-        # could never match. Measured on this tree: 0 of 277 headings found without Multiline, 277
-        # with. So the term that exists to catch a number written but committed NOWHERE has been
-        # finding nothing since it was written, and the all-refs term hid it by covering every number
-        # that had been committed somewhere -- i.e. every case except the one this term is for.
-        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+        # GIT FILTERS; POWERSHELL DOES NOT (BACKLOG #1535). Stage 1 above is already batched, so this
+        # branch never had the adr branch's one-process-per-ref defect. Its cost was BYTE VOLUME: the
+        # 1,518 distinct blobs average ~2.8 MB, so feeding them through `cat-file --batch` shipped
+        # ~4.2 GB and 24.5 MILLION pipeline objects into PowerShell to keep ~500 thousand lines. Only
+        # ~13s of a ~111s stage was git. `git grep` applies the pattern in C and emits the headings
+        # only: 526,162 lines, 4.3 MB, a 46x drop in objects and a 984x drop in bytes.
+        #
+        # PROVEN BY SET EQUALITY, NOT BY A STOPWATCH. Both spellings were run over the same 1,518 oids
+        # on this clone: 855 distinct numbers, max 1535, SubFloorMax 354, `Compare-Object` empty in
+        # BOTH directions. Re-verify that way, never by comparing floors -- the printed floor is the
+        # union max and the REGISTRY term carries it, so this whole stage can return nothing and the
+        # floor will not move. Measured: registry max 1537 against all-refs max 1536, and 61 numbers
+        # live on refs and nowhere else.
+        #
+        # EVERY FLAG BELOW IS A SILENT-ZERO GUARD, and each was reproduced rather than assumed:
+        #   -h      without it git prefixes `<oid>:` and the anchored extraction matches 0 of 314 lines
+        #   -o      emits the heading alone: same line count, 4.3 MB instead of 55.1 MB
+        #   -a      git otherwise prints `Binary file <oid> matches` and drops the lines. 0 of 1,518
+        #           blobs trip it today, and `cat-file` had no such gate, so this is a failure mode the
+        #           port INTRODUCES -- one NUL from a bad merge would zero a blob's contribution
+        #   --no-color --no-line-number --no-column
+        #           `color.ui=always`, `grep.lineNumber` and `grep.column` each prefix every line and
+        #           each takes the extraction to 0. This stage reads git config that `cat-file` never
+        #           did; these three neutralise it
+        #   -E -e   `grep.patternType=fixed` turns the pattern into a literal without an explicit -E
+        #
+        # `[0-9]`, NEVER `\d`. Git's POSIX ERE HAS NO `\d`: the pattern matches ZERO lines corpus-wide
+        # and exits 1, which reads as "no numbers on any ref" and frees every one of them. That is the
+        # #240-#247 shape this term exists to prevent, and transcribing the .NET regex below is all it
+        # takes to get there.
+        $chunk = 128
         if ($oids.Count -gt 0) {
-            foreach ($line in (($oids -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
-                $m = $rx.Match("$line")
-                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            $rxGrep = [regex]::new('^#{2,3} ([0-9]+)\.$')
+            $oidList = @($oids)
+            for ($i = 0; $i -lt $oidList.Count; $i += $chunk) {
+                $slice = @($oidList[$i..([Math]::Min($i + $chunk - 1, $oidList.Count - 1))])
+
+                # BOTH RESETS ARE LOAD-BEARING. An over-long argument list is not a non-zero exit: git
+                # never starts, `$LASTEXITCODE` keeps its PREVIOUS value and `$out` keeps the PREVIOUS
+                # slice's output, so an unguarded loop re-adds the last slice and skips this one with
+                # no error.
+                #
+                # Ceiling bisected on this clone 2026-09-11, with a 72-char repo path: 794 oids run
+                # and 795 does not, at roughly 32,710 chars against Windows' 32,767-char CreateProcess
+                # limit. The message it fails with names StandardOutputEncoding, not the length, so
+                # the argv cause is not discoverable from the error. A chunk of 128 leaves 666 spare
+                # oids, about 27,300 characters of slack for a longer repo path, and the extra
+                # processes are free against a stage that used to stream 4.2 GB. Both figures move
+                # with the repo path, so re-bisect rather than trusting them elsewhere.
+                $out = $null
+                $global:LASTEXITCODE = -1
+                $out = & git -C $repo grep -h -o -a --no-color --no-line-number --no-column -E -e '^#{2,3} [0-9]+\.' @slice 2>$null
+                # THE EXIT CODE IS THE WITNESS, AND `$?` IS NOT. For a native command PowerShell sets
+                # `$?` from the exit code, so `if (-not $?)` is true for git grep's exit 1 as well as
+                # for a fatal -- and exit 1 means "no match", which is LEGITIMATE. Measured: a blob
+                # with no numbered heading exits 1 with `$?` False. An earlier spelling threw there,
+                # which made a repository whose ledger blobs carry no heading yet -- a fresh clone of
+                # this tooling -- unable to allocate a backlog number AT ALL, and left the accurate
+                # exit-code message below as dead code that could never print.
+                #
+                # -1 is the sentinel from the reset above and means git NEVER RAN: an over-long
+                # argument list does not set an exit code, and without the sentinel the stale value
+                # from the previous slice reads as success while `$out` still holds that slice's
+                # output. 0 = matched, 1 = no match, 128 = fatal -- and a fatal aborts the WHOLE slice
+                # for zero lines, so up to 128 blobs' numbers vanish at once.
+                if ($LASTEXITCODE -lt 0) { throw "git grep never ran over backlog blobs $i..$($i + $slice.Count - 1). An over-long argument list reports a StandardOutputEncoding error rather than the real cause; lower `$chunk` before believing anything else." }
+                if ($LASTEXITCODE -gt 1) { throw "git grep exited $LASTEXITCODE over backlog blobs $i..$($i + $slice.Count - 1); the whole slice returned nothing." }
+
+                foreach ($line in $out) {
+                    $m = $rxGrep.Match("$line")
+                    # THROW, DO NOT SKIP. `$` anchors the whole emitted line, so a non-match means git
+                    # emitted something we did not ask for -- a prefix from config, an ANSI escape, a
+                    # binary notice. Skipping turns each of those into a number-free blob reported as
+                    # clean; throwing turns a silent zero into a loud failure.
+                    if (-not $m.Success) { throw "git grep emitted a line that is not a bare heading: [$line]" }
+                    $seen.Add([int]$m.Groups[1].Value)
+                }
             }
         }
+        # MULTILINE IS LOAD-BEARING HERE, and its absence was a silent hole. `[regex]'^...'` anchors at
+        # the start of the STRING, not of each line. The all-refs term above feeds one line at a time,
+        # so `^` matched there and looked correct -- but this term feeds `Get-Content -Raw`, one string
+        # starting "# Backlog", where `^` could never match. Measured on this tree: 0 of 277 headings
+        # found without Multiline, 277 with. So the term that exists to catch a number written but
+        # committed NOWHERE was finding nothing, and the all-refs term hid it by covering every number
+        # committed somewhere -- i.e. every case except the one this term is for.
+        #
+        # ITS OWN VARIABLE, deliberately. The two regexes used to be one `$rx`, and that sharing is a
+        # trap now that the grep path visibly does not need Multiline: tidying the flag away because
+        # the loop above works fine without it returns THIS term to 0 of 749.
+        #
+        # THE TWO SPELLINGS DIVERGE ON PURPOSE AND THE ASYMMETRY IS SAFE. Git has no `\d` so the grep
+        # pattern must say `[0-9]`; .NET `\d` also matches non-ASCII Unicode digits. Census over all
+        # 1,518 blobs with PCRE, whose `\d` IS Unicode-aware: exactly 0 headings differ. Kept as `\d`
+        # so this file still agrees character-for-character with ledger_check.py and
+        # alloc_strand_sweep.py, which police the same headings in Python. Note that a heading with
+        # non-ASCII digits would throw in `[int]::Parse` below, so `\d` is a latent crash rather than a
+        # capability -- if that ever fires, narrow all four to `[0-9]` together, not this one alone.
+        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
         # Working-tree term: catches a number written to a file but committed nowhere. Both paths, for
         # the same reason -- an item drafted straight into the archive is still a claim on its number.
         foreach ($p in $backlogPaths) {

@@ -529,13 +529,19 @@ tuple: they act only on the caller's own account.
 > a file belongs to.
 >
 > **Bound, and stated because the bound is the load-bearing part.** This closes local accounts and any
-> AD account that goes through a MessageFoundry `delete_user`. It does **not** close a
-> `sAMAccountName` recycled in the directory *without* one: `_upsert_ad_user` resolves by username and
-> mints a new `user_id` only when no mirror row survives, so on the default AD path the surviving row
-> is adopted and **its `user_id` is re-bound to the new principal**. A deploying site on AD would
-> therefore still need the directory-immutable binding — AD to `objectGUID`/`objectSid`, the way OIDC
-> binds `(issuer, sub)` — tracked as BACKLOG #1143. `AdPrincipal` carries no such identifier today, so
-> `user_id` is the strongest key currently available, not a complete one.
+> AD account that goes through a MessageFoundry `delete_user`. It used **not** to close a
+> `sAMAccountName` recycled in the directory *without* one: `_upsert_ad_user` resolved by username and
+> minted a new `user_id` only when no mirror row survived, so on the default AD path the surviving row
+> was adopted and **its `user_id` re-bound to the new principal**. BACKLOG #1471 closed that: an AD
+> login now resolves its row by the directory's immutable identifier — the normalised `objectGUID`,
+> stored in `users.directory_object_id` — the way a federated login binds `(issuer, sub)`, and a
+> principal whose identifier disagrees with the row holding its username is refused rather than handed
+> that row. A recycled name gets a new account with a new `user_id`.
+>
+> **One residual, and it is the honest limit of the control.** A directory that returns no immutable
+> identifier at all still resolves by username; the engine cannot key on an identifier it is never
+> given. The engine warns once per distinct cause -- the attribute absent, or present in a shape it
+> cannot read -- so a site on that path is told rather than left to assume the control is running.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is

@@ -320,6 +320,93 @@ still inside '--all'".
 """
 
 [[control]]
+context = "gitleaks (secret scan)"
+plants = """
+An EMPTY commit range -- the one input on which this scanner reports success having read nothing --
+and the scanner's own two reports, `0 commits scanned` and `3 commits scanned`, run against whatever
+pattern the shipped step actually greps for. Plus the unpiped one-liner `main` carried until
+2026-09-10, replayed through the same reader, and a pipeline whose failing exit code is discarded by
+its last command. The subject is whether the gate walked ANYTHING, and whether a scan that DID find
+something can still report success -- a third question: the allowlist entry above asks what the
+scanner may skip inside the diffs it reads, the scope entry asks whose diffs it reads at all.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_gitleaks_scan_asserts_it_walked_a_non_empty_range",
+  "tests/test_merge_gate_controls.py::test_every_piped_step_in_the_gitleaks_job_sets_pipefail_explicitly",
+]
+holds = """
+The two halves must fail SEPARATELY. Deleting `set -o pipefail` must red the pipefail arm and leave
+the range arm green, and deleting the guard must do the converse -- two readers that fired together
+for either defect would be one control wearing two names, and a red could not say which guarantee
+went. The detector itself must stay green while the shipped guard is neutered, or "the guard is gone"
+and "the reader is broken" are the same red. And it must not demand one SPELLING: three `set` forms,
+both capture shapes, any log name, a re-wrapped continuation, and a guard chained onto the capture
+line all stay green, because a reader flagging those would be "fixed" by deleting the guard -- which
+reinstates the defect.
+
+THE `ci =` FIELD WAS CONSIDERED AND DECLINED, recorded here because a reader will ask. `ci` asserts a
+command string appears in a `run:` step, by exact substring. Pointed at this guard it would (a) red on
+every legitimate respelling -- the thing the green rows above exist to tolerate, and the thing arm 5
+below proves matters -- and (b) be satisfied by a COMMENT quoting the pattern, which is a live failure
+shape in this repo. A string-presence check is the spell-check this entry refuses.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_vacuous_pass_detector_fires_on_each_half_and_holds_on_the_rest"
+]
+observed = """
+BACKLOG #1481, raised by a peer session reviewing #1479 and filed rather than bolted onto a green pull
+request that was unblocking a frozen queue. The hazard was MEASURED on the pinned 8.18.4 binary on
+2026-09-07, not inferred: `--log-opts HEAD..HEAD` reports `0 commits scanned` and exits **0**;
+`--log-opts HEAD` over the same tree reports 2 and exits 1 on a planted secret; the unscoped default
+reports 2 and exits 1. The count line is present even on a run carrying a finding, so the guard does
+not depend on a clean scan. `0 commits scanned` with exit 0 is a green tick, and nothing downstream
+tells it from a clean one.
+
+THE SHIPPED RANGE IS A LITERAL AND IS MEASURED SAFE, including on a two-parent HEAD shaped like a
+merge-queue commit. This control is for the NEXT edit to that flag: the step's own comment records
+that an event-aware range was declined partly because not every trigger carries a base SHA, and on a
+trigger with no base a range built from one is exactly the empty range.
+
+THE BINARY WAS NOT RE-RUN IN THIS PASS, stated rather than implied. Every 8.18.4 number above is
+#1481's measurement, quoted. What was measured here is the reader and the seven arms below.
+
+RUN AGAINST A NEUTERED GATE, 2026-09-10, eight arms against the real security.yml, each restored
+byte-identical (sha256 compared) before the next. Baseline: 0 of the 10 gitleaks-context controls red.
+
+  1. the SCAN step's `set -o pipefail` deleted        1 of 10 red -- the pipefail arm only
+  2. the range guard deleted                          1 of 10 red -- the range arm only
+  3. the scan step reverted to main's one-liner       1 of 10 red -- the range arm only
+  4. `shell: bash` in place of the explicit `set`     1 of 10 red -- the pipefail arm only
+  5. the guard re-widened to accept a zero count      1 of 10 red -- the range arm only
+  6. the scan step RENAMED and nothing else           0 of 10 red -- and that is the point
+  7. the capture (the pipe into `tee`) deleted        1 of 10 red -- the range arm only
+  8. the INSTALL step's `set -o pipefail` deleted     1 of 10 red -- the pipefail arm only
+
+Arms 1 and 2 are the asymmetry: each half reds alone, so a red says WHICH guarantee went.
+
+ARM 3 IS THE ONE TO READ CAREFULLY, because it is the arm that changed shape. Against the exact state
+`main` carried, the RANGE arm fires and the pipefail arm does NOT -- correctly. That one-liner does not
+pipe, so nothing swallows its exit code and there is no guarantee to lose. The pipefail arm asks "does
+every PIPED step in this job set it", which is why it fires on arms 1, 4 and 7's successor state and
+not on a step with no pipe. An arm demanding pipefail of an unpiped step would be a false demand
+dressed as rigour.
+
+Arm 5 is why the guard is RUN against the scanner's two reports instead of being spell-checked: a
+pattern that also accepts `0 commits scanned` passes every text check and is satisfied by exactly the
+run it exists to refuse. Arm 6 mirrors the scope entry's: these controls select the step by what it
+RUNS, so a later wording tweak cannot red a required leg with "has no step named like ...". Arm 8 is
+the sibling step -- the install step's `grep ... | sha256sum -c -` had no pipefail either, and the
+control covers it because the rule was never gitleaks-specific. The four scope controls and the three
+allowlist controls stayed GREEN in all eight arms, which is the boundary between the three subjects.
+
+`2>&1` IS PART OF THE CAPTURE, and its reason is recorded because it is the one thing here nobody
+re-measured: the count is one of the scanner's own log lines and those go to stderr, while `--verbose`
+findings go to stdout. Merging is correct under either reading of that split -- a stdout-only pipe
+capturing no count would red every clean run, which is the one failure direction a required gate must
+never acquire by accident.
+"""
+
+[[control]]
 context = "semgrep (project SAST rules)"
 plants = """
 Annotated handler fixtures carrying inter-statement PHI taint, an aliased import, an ambient subprocess
