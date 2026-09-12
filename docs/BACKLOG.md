@@ -33015,3 +33015,290 @@ Retention bounds bytes at rest (bodies are blanked) and leaves the row count alo
 **Duplicate search.** #207 (closed) built the harness counters; #209 (closed) taught the ladder that routed fan-out differs from delivered; #64 (closed) is the roadmap. None pins the engine number. Searched both ledgers for `3 + 2H + 2N`, `committed_txns`, `commits per message`, `txn/msg`.
 
 **Source.** `docs/reviews/FABLE-PACKET-16-PERF-2026-09-11-FINDINGS.md` (vault PR 1493), finding P16-13. The same proposal is on engine PR 1082 as `docs/backlog-proposals/fable-packet16-perf.md`.
+
+## 1737. the console's user-update route rides the shared step-up window while its JSON twin requires the action-bound single-use grant
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-01, vault PR 1492). Open; not started.** Value **7/10**, Difficulty **3/10**. `routes/admin.py` `ui_user_update` is gated `require_ui_step_up`; `auth_routes.py` `update_user` is gated `require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE, ...)`, and the constant appears nowhere in the console. Measured at engine `fa7bc9e3e`: the JSON route answered 403 and the console route answered 303 with the display name changed and the account disabled. The whole console suite stayed green with the gate removed (part 6 control A).
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** auth / step-up parity across the console seam. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0). On a first deployment a session hijacked inside the login window could disable any account or redirect its security notices through the only shipped operator surface, while `PATCH /users/{id}` refuses the same request with `X-Step-Up-Action: admin_user_update`.
+
+### What closing looks like
+
+1. The console twin of what `routes/admin.py` already does for reset-password and reset-MFA: an action-bound factory plus a tagged unlock continuation.
+2. A stale-window test (#1745 carries the wider test gap).
+
+**Duplicate search.** No match by `admin_user_update`, `users/{user_id}/update`, `require_ui_step_up_action` with `USERS` in either ledger. Related: #1148 (the reset lanes, since bound).
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-01. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1738. the console's PHI reads skip the ADR 0092 serve-hop guard that require_phi_read folds in
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-02, vault PR 1492). Open; not started.** Value **5/10**, Difficulty **2/10**. `require_ui(phi=True)` re-applies the permission and throttle and never calls `enforce_phi_read_hop`; the console reaches `get_message`, `list_messages`, `list_dead_letters` and `download_attachment` by reference, skipping the dependency that carries the guard. Measured at engine `fa7bc9e3e` with the disposition set to REFUSE: four JSON routes 403, four console routes 200 (two with the body), the search route 403 because its handler guards in the body.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI containment / console seam. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). A production-PHI instance whose serve hop is not proven secure would emit the raw message body, parse tree and summaries from `/ui` while every JSON PHI read answers 403. Reachability is defence in depth: `serve` refuses the cleartext bind first and mints TLS (ADR 0172), so the state is met by an embedder or a later posture change rather than on the default path.
+
+### What closing looks like
+
+1. One call to `enforce_phi_read_hop` in `require_ui` when `phi=True`, plus a test.
+
+**Duplicate search.** No match by `enforce_phi_read_hop`, `phi_read_hop`, `hop guard` with `console` or `/ui` in either ledger. #1126 (open, ASVS 4.4.1 research) names the symbol only for the WebSocket hop question.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-02. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1739. the console upload route carries no step-up while POST /uploads requires one
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-03, vault PR 1492). Open; not started.** Value **5/10**, Difficulty **2/10**. `routes/uploaded_logs.py` `ui_uploaded_logs_upload` is `require_ui(FILES_UPLOAD)`; `app.py` `upload_file` is `require_step_up(FILES_UPLOAD)`. The module docstring records the reason (a body-carrying POST cannot cross the re-auth redirect); the same file and `routes/admin.py` already solve that with a registered unlock GET, and `GET /ui/uploaded-logs/upload` is that form. Measured at engine `fa7bc9e3e` with a stale window: JSON 403, console 303 and the file listed with an `upload.create` row. The uploaded-logs suite stayed green with the permission removed (part 6 control B).
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI at rest / step-up parity across the console seam. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). On a first deployment a session past its step-up window could import a PHI file through the browser where the engine's own gate design owes a fresh re-verification.
+
+### What closing looks like
+
+1. `require_ui_step_up(FILES_UPLOAD, reauth_next=...)` plus `register_ui_action(..., unlock=True)` and a test.
+
+**Duplicate search.** No item carries it. #1227 (closed) notes "upload has no step-up either" in passing while fixing resend. Related: #1227, #1152.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-03. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1740. the console's own GET and control routes skip every path and query rule api/validation.py defines
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-04, vault PR 1492). Open; not started.** Value **5/10**, Difficulty **3/10**. The JSON routes type `channel_id`, `destination_name`, `connection`, `{name}`, `status`, `message_type`, `control_id`, `kind` and every id with `api/validation.py` rules; the console routes into the same handlers (`ui_messages`, `ui_dead_letters`, `ui_message_search`, `ui_events`, the three per-name controls, bulk control and purge) declare length bounds only, and a direct handler call runs no parameter validation. Measured at engine `fa7bc9e3e`: 422 on four JSON routes, 200 or 403 on their console twins, and a rule-refused connection name stored byte for byte in the tamper-evident audit chain.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** input validation / console seam. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). On a first deployment any channel-scoped operator could write a forged or garbage channel name into `auth.channel_denied` rows, and any searcher into `message_search` rows, from the browser; the hash chain keeps them for the life of the store. The off-box tee escapes the value (measured) and the CSV export quotes it (measured), so this is chain integrity and a line-oriented consumer, not log forgery.
+
+### Why this is filed rather than folded into #1108
+
+#1108 records the class in its remainder paragraphs (a) and (b) as text inside an open ASVS research item whose closing act is a scorecard re-score. No build item exists, the consequence measured here is not recorded there, and a research item cannot carry a build to closure. The console's own `uploaded_logs.py` states the rule this breaks: the console must not be the looser of the two doors.
+
+### What closing looks like
+
+1. Import the `Annotated` rules the JSON routes use; convert the two datetime-local items then apply `EpochSeconds`.
+2. One 422 test per console route, and a golden-table drift guard.
+
+**Duplicate search.** #1108 (open) as above; no build item exists. Searched `api/validation`, `EpochSeconds`, `channel_denied` with `console`.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-04. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1741. the console health heart ignores connection state, reporting ok for an empty configuration and for an inbound that failed to bind
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-05, vault PR 1492). Open; not started.** Value **5/10**, Difficulty **2/10**. `routes/status.py` `_derive_health` weighs store, disk, pool, DR and leadership and nothing about connections. Measured at engine `fa7bc9e3e`: an empty engine showed heart `ok` with status "0/0 running"; an MLLP inbound on an occupied port gave JSON `/connections` `failed`, heart `ok`, reason null, alerts 0.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** status display / console. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). On a first deployment the always-on heart would show green over an engine listening on nothing (the empty-configuration case #1648 covers for the CLI) and after a port conflict on the only feed, with no alert; the dashboard row is right and the signal an operator watches is wrong.
+
+### What closing looks like
+
+1. Any deployed inbound in `failed` state is at least `warn`, naming it.
+2. Zero deployed inbounds on a started engine is `warn`.
+3. Whether a bind failure should also raise an alert instance is a pipeline question, not settled here.
+
+**Duplicate search.** No match by `nav-status`, `_derive_health`, `health heart`, `empty config` with `console` or `health` in either ledger.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-05. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1742. the console bulk connection control writes the channel-denied row with a NULL client where the per-name and JSON controls carry the browser address
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-07, vault PR 1492). Open; not started.** Value **2/10**, Difficulty **1/10**. `routes/connection_writes.py` `ui_bulk_control` calls `core.dual_role_control(...)` without the `client=` keyword the primitive takes. Measured at engine `fa7bc9e3e`: JSON stop and console per-name stop recorded `127.0.0.1`, console bulk stop recorded `None`.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** audit attribution / ADR 0150. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). ADR 0150 says NULL means no client was in scope; for this row the browser was.
+
+### What closing looks like
+
+1. Pass `client_ip(request)`.
+
+**Duplicate search.** No match by `bulk-control`, `dual_role_control`, `bulk control` in either ledger. #1644 is the same contract broken at a different set of sites (authorization grant, denial and MFA-denial rows) and stays separate.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-07. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1743. the console reaches only the first page of every paginated API surface and presents the newest 200 audit rows as the full trail
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-08, vault PR 1492). Open; not started.** Value **4/10**, Difficulty **3/10**. Messages and dead letters render a count line with no navigation; audit, events and alerts render a first page with no count; only uploaded logs has a pager (#1152). `auth_routes.py` `_audit_ui_list` says "The UI shows the full trail". Measured at engine `fa7bc9e3e`: 50 of 120 messages with no next link, 200 of 269 audit rows under the full-trail heading, 100 of 130 events, and a dead-letter channel absent from the page and from the per-channel replay controls, which are derived from the rendered page.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** console pagination / status display. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). An operator would read the newest 200 audit rows as the trail and would not see a channel whose dead deliveries are older than the first page; the per-channel replay for it exists only on the JSON API.
+
+### What closing looks like
+
+1. One pager helper on the four lists.
+2. Store-side distinct channels for the replay controls.
+3. A corrected sentence in `_audit_ui_list`.
+
+**Duplicate search.** No match by `_audit_ui_list`, `pager`, `paginat` with `console` or `/ui` in either ledger. #1152 (open) covers the uploaded-logs pager only.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-08. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1744. two console routes silently substitute a value where the JSON twin refuses the input
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-09, vault PR 1492). Open; not started.** Value **3/10**, Difficulty **1/10**. An out-of-range alert suspend becomes sixty minutes and audits as sixty, and a malformed received-date bound is dropped. Measured at engine `fa7bc9e3e`: JSON suspend with `minutes=999999` answered 422; the console answered 303, suspended for 60.0 minutes, and wrote an `alert_suspend` row reading `"minutes": 60.0`. The date branch was read, not measured.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** input validation / console. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, conditional (sec. 0). An operator would be told a suspend or a filter succeeded when the engine did something else, and the audit row would record the substitute as the request.
+
+### What closing looks like
+
+1. Refuse with 400 and re-render with the error, as `routes/search.py` does.
+
+**Duplicate search.** No match by `suspend` with `fallback` or `60 minutes`, `datetime-local` with `drop`, in either ledger. #1740 is the same seam's missing path and query rules and stays separate.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-09. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1745. no console test can see the step-up gate removed from the user-update route or the permission removed from the upload route
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 17 (finding P17-10, vault PR 1492). Open; not started.** Value **4/10**, Difficulty **2/10**. Measured at engine `fa7bc9e3e`, part 6. Control A (the user-update gate reduced to plain `require_ui`): the whole console suite, 490 passed. Control B (the upload permission removed): 21 passed. Control C (a list-page permission removed): 1 failed, so the instrument can see the class.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** test quality / console gates. **Priority:** P3. **Verdict:** build.
+**Severity:** Low, no deployment axis for the tests themselves; the gates they should pin are shipped controls.
+
+### What closing looks like
+
+1. A parametrised stale-window test over the golden write-action and step-up sets.
+2. A permission-denied test per console POST.
+
+May be folded into #1737 and #1739 if the tests are preferred to land with the fixes. #1700 is the purge route's half of the same gap, from packet 12, and the three should share one helper.
+
+**Duplicate search.** No match. #1643 recorded the same shape for seven audit writes on the API side.
+
+**Source.** `docs/reviews/FABLE-PACKET-17-PARITY-2026-09-11-FINDINGS.md` (vault PR 1492), finding P17-10. The same proposal is on engine PR 1081 as `docs/backlog-proposals/FABLE-PACKET-17.md`.
+
+## 1746. controls across the engine report success without exercising what they name: admit every invariant test with its red, make zero a non-OK outcome, and score instruments by exit code
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 18 (proposal 1, vault PR 1485). Open; not started.** Value **8/10**, Difficulty **5/10**. Six review packets measured thirteen controls that report success through a regression, in three kinds. **Tests that cannot fail:** the runner's ACK-after-commit (140 tests green with the ACK returned before the commit), both Postgres locks and the SQL Server finalize lock, seven audit writes, four store-level guarantees on the shipped inline path, a follower gate whose failure signal the code swallows, a Windows config-source test that asserts a stub it installed. **Gates that pass on nothing:** `audit-verify` on a zero-byte file, the `check` dryrun gate with zero deployed inbounds, an empty config directory through `serve`, `validate` and `check`, the dependency-boundary test with five package names that do not exist, the refused-config-key ratchet reading a document that names a refused key twice as being at zero. **Controls whose stated premise is false:** the `db_lookup` read-only gate finding a `;` that T-SQL does not need, the unsafe-db-lookup lint reading only the call's own argument, the SQL Server audit lock's "single writer per process" under the built sharding topology, ADR 0159's "no next borrower" on SQLite, and a `record_audit` comment contradicted by `_ensure_schema` in the same file. The pattern reached four reviewers' own instruments.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Quality record / test quality. **Priority:** P1. **Verdict:** build.
+**Severity:** High, conditional (sec. 0). A first deployment would carry the reliability invariant, both server-store locks, the audit chain's cross-process integrity, the read-only lookup carve-out, the dependency boundary and the audit-verify compliance job, each behind a control that would report success through a regression. No instance is a live defect alone; the class is that a regression in any of them ships green.
+
+### Why one item
+
+Every instance shares a generative rule: a control is admitted on what it is called, and nothing asks what it would take for it to report success while doing nothing. BACKLOG #1092 (closed 2026-08-10) named that rule and corrected the quality record's claims; the pattern then recurred thirteen times in five weeks in the controls themselves, so the record was not where the fix belonged.
+
+### What closing looks like, as a class
+
+1. A test that pins a named invariant, lock, gate or audit write ships with a planted-violation sibling in the same file, the shape `test_the_scanner_catches_a_deliberately_bad_line` already uses.
+2. Every verifier or gate that iterates a collection reports its count and treats zero as `SKIPPED` with a reason or `FAILED`, never `OK`; a lint over `tests/` for `assert not <list>` with no preceding count assertion.
+3. A control's premise is stated beside it and has a test that fails when the premise is false.
+4. Instruments are scored by exit code and `FAILED` lines, never by parsed summary text, run under `PYTHONSAFEPATH=1`, and print which tree answered (#1677).
+5. A bounded, checked-in list of mutations over the named invariant tests that must go red, run nightly, seeded from the thirteen above.
+6. Promote the review plan's sections 7 and 8 rules into `docs/Code_Quality_Standards.md`, and carry Signal 1's grade with the measured scope of its instrument.
+
+**Duplicate search.** Ancestor, not duplicate: #1092 (closed). Related: #1000 (a required check green over the wrong directory), #1018 (guards that go quiet), #1380 (the mirror, a checker that falsely accused, retracted in full). The instance items are cited, not absorbed: #1608, #1610, #1605, #1548 (PR 1064), #1633, #1643, #1667, #1669, #1671, #1654, #1658, #1688, #1700, #1716, #1722, #1723, #1733, #1734, #1735, #1745, #1747. Searched `cannot fail`, `negative control`, `pass on nothing`, `verified 0`, `SDS-3.7`, `systemic`, `false premise` in both files and every open PR body.
+
+**Source.** `docs/reviews/FABLE-PACKET-18-CROSSCUTTING-2026-09-11-FINDINGS.md` (vault PR 1485), proposal 1. The same proposal is on engine PR 1074 as `docs/backlog-proposals/fable-packet18-crosscutting.md`.
+
+## 1747. the dependency-boundary test passes when its walk finds no files; add a walk floor and a planted-violation guard
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 18 (proposal 2, vault PR 1485). Open; not started.** Value **5/10**, Difficulty **2/10**. `tests/test_dependency_boundaries.py` walks `_ENGINE_PACKAGES` with `rglob("*.py")` and asserts an empty violation list. Measured at engine `fa7bc9e3e`: a planted `from fastapi import FastAPI` in `transports/base.py` turns it red with the file named, so the outward rule is enforced; the same test with all five package names replaced by names that do not exist passes in 0.22 s. Nothing asserts the package directories exist, that the walk visited any file, or that a planted violation is caught; the one guard-the-guard test proves relative imports resolve, not that a resolved forbidden import is reported.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). This is the test `Code_Quality_Standards.md` cites for Signal 1 and the one June's low-30 asked for; a package rename, a test relocation, or a checkout whose `parents[1]` is not the repository would report the boundary clean while checking nothing, and CI could not tell that green from a real one. An instance of #1746's class.
+
+### What closing looks like
+
+1. Assert each `root / package` is a directory and the walk visited at least a floor of files per package.
+2. Add `test_the_walk_catches_a_planted_violation` over a `tmp_path` tree.
+3. Land it with #1615 (add `messagefoundry_webconsole`, and `starlette` and `uvicorn` beside `fastapi`), #1596 (the inward rule that `parsing/` imports nothing under `messagefoundry` except `parsing`, `timezone` and `controlchars`) and #1697 (the inward rule for `harness/`, `tee/`, `samples/` and the web console), because all four edit the same forty lines.
+
+**Duplicate search.** Three halves are filed: #1596 (PR 1066, inward rule for parsing), #1615 (PR 1071, console package name) and #1697 (this pass, the client inward rule). The walk guard is new. Searched `test_dependency_boundaries` (#1092 only, closed), `inward`, `rglob`, `walk` with `boundary`.
+
+**Source.** `docs/reviews/FABLE-PACKET-18-CROSSCUTTING-2026-09-11-FINDINGS.md` (vault PR 1485), proposal 2. The same proposal is on engine PR 1074 as `docs/backlog-proposals/fable-packet18-crosscutting.md`.
+
+## 1748. the file sources log a partner-chosen file name at WARNING in twenty places the redaction chain cannot see; add safe_name and safe_exc
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 18 (proposal 3, vault PR 1485), widening #1625 to the remote source and to the measured redactor blindness. Open; not started.** Value **5/10**, Difficulty **2/10**. `transports/file.py` has 11 `logger.warning` sites carrying `path.name` and `transports/remotefile.py` has 9 carrying the remote name, all on quarantine, retry, archive or delete arms; two of them also log the raw exception where `mllp.py` uses `safe_exc`. The engine's own `_file_key` docstring (file.py, #142) says a filename "can embed an MRN" and must never be logged. Measured at engine `fa7bc9e3e` with all four root filters from `logging_setup` installed: a WARNING carrying `MRN123456789_ADT.hl7`, `DOE_JANE_19800505_ADT.hl7` or `PID-100001-DOE-JANE.hl7` reaches the handler verbatim; only a space-separated name with a delimited date is redacted. The name heuristic needs whitespace and the date heuristic needs delimiters; a filename supplies neither.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** PHI. **Priority:** P2. **Verdict:** build.
+**Severity:** Medium, conditional (sec. 0). On a first deployment with a partner that names drops by MRN, accession or patient name (common), every quarantined or retried file would write that identifier to the NSSM-captured general log at WARNING, the sink the C-1 fix exists to keep clean, whose directory ACL (June H-13, and #1699) is unsettled. No attacker gain; the concern is a benign partner's naming convention.
+
+### Relation to #1625
+
+#1625 carries packet 2's P2-11 and is scoped to eight `transports/file.py` sites, graded on contract grounds. This item carries the other half that no packet filed: the nine `remotefile.py` sites, the measurement that the shipped redaction chain does not catch a filename-shaped identifier, and the shared helper. **Neither closes alone** -- fixing file.py without remotefile.py leaves the same identifier on the same sink. Packet 9's P9-11 was handed to packet 18 for this ruling and is not separately filed.
+
+### What closing looks like
+
+1. One `safe_name(path)` helper returning a short hash prefix plus the extension and byte length (the `_file_key` shape), used at all twenty sites.
+2. `safe_exc` at the two raw-exception sites.
+3. One test per source that logs an identifier-shaped name and asserts the captured record carries no long digit run and no underscore-joined capitalised pair.
+
+**Duplicate search.** #1625 (open) is the file.py half, cited above and cross-linked. #1130 and #1238 contain a server-chosen name as a path, not as a log value. Searched `path.name`, `basename`, `_file_key`, `#142`, `file name` with `log`, `MRN` with `filename`.
+
+**Source.** `docs/reviews/FABLE-PACKET-18-CROSSCUTTING-2026-09-11-FINDINGS.md` (vault PR 1485), proposal 3. The same proposal is on engine PR 1074 as `docs/backlog-proposals/fable-packet18-crosscutting.md`.
+
+## 1749. the six sequenced operator documents carry a refused config key, a pre-ADR-0172 TLS model, 0.1.0 install pins and a retired console extra
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 18 (proposal 4, vault PR 1485). Open; not started.** Value **5/10**, Difficulty **2/10**. `docs/README.md` sequences six documents for a new operator. Measured or read at engine `fa7bc9e3e`: `USER-GUIDE.md` tells the operator at two sites (the console section and the troubleshooting list) that the console is served when `[api].serve_ui` is on, and `load_settings` on that key refuses it with the ADR 0118 relocation message, while the same document's earlier section names the right key; `USER-GUIDE.md` gives `http://` console and health URLs and `DEPLOYMENT.md` has no mention of ADR 0172, describes the API's TLS as two branches and calls the remote-bind refusal a cleartext refusal, for an engine that mints a self-signed pair unconditionally and always serves TLS; `INSTALL-GUIDE.md` and `EARLY-ADOPTER-GUIDE.md` pin `messagefoundry==0.1.0` under a caution written for 0.1.0 while the tree is 0.3.2 (the console pin on the same page is current); `EARLY-ADOPTER-GUIDE.md` lists a `console` extra for the retired desktop console that the extras table does not contain. `SYSTEM-REQUIREMENTS.md` and `testing/VERIFY.md` were accurate on every claim checked. The guard for the refused-key class, `tests/test_docs_cite_no_refused_config_keys.py`, is green with the USER-GUIDE at an implicit zero because its scanner matches assignment shape only; driven on the USER-GUIDE's lines it returns nothing.
+> Verdict: build
+> Research: none
+> Closing-act: doc
+
+**Cluster:** Documentation correctness. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect (sec. 0). Medium because the cost lands on exactly the reader these six documents exist for: a first operator following them in order would install a wheel two minor versions behind, look for an extra that does not exist, browse to a scheme the engine does not serve, and on the troubleshooting path be told to confirm a key that fails the load.
+
+### What closing looks like
+
+1. The named line edits (the exact lines are in the vaulted document, part 4.5).
+2. A `docs/` version-pin drift test comparing every `messagefoundry==` and `messagefoundry-webconsole==` pin in the six documents against the two `__version__` values, with a planted stale pin as its control.
+3. Extend the ratchet's scanner with a prose form (a backticked `[section].key` from `_RELOCATED_TO_SECURITY` inside an instruction sentence), or hold the six operator documents at zero under a stricter rule. The scanner gap is an instance of #1746's class.
+4. A `DEPLOYMENT.md` and `USER-GUIDE.md` pass for ADR 0172, which is the documentation half of #1672 and should land with it.
+
+**Duplicate search.** Same class as #1383 and #1388 in a different document (both scoped to `SECURITY.md`; #1383's SECURITY.md half is built). #1263 (file:line citations validated by nothing) is adjacent. Searched `serve_ui` (21 open hits: ADR 0118 research rows and #1383/#1388), `0.1.0`, `USER-GUIDE`, `DEPLOYMENT.md` with `0172` (none), `console extra`, `EARLY-ADOPTER`.
+
+**Source.** `docs/reviews/FABLE-PACKET-18-CROSSCUTTING-2026-09-11-FINDINGS.md` (vault PR 1485), proposal 4. The same proposal is on engine PR 1074 as `docs/backlog-proposals/fable-packet18-crosscutting.md`.
+
+## 1750. documentation sweep: eight docstring, comment and document claims that stand at fa7bc9e3e and that no other item carries
+
+> 🔢 **Filed 2026-09-12 by Fable review packet 18 (proposal 5, vault PR 1485). Open; not started.** Value **3/10**, Difficulty **2/10**. Re-read at engine `fa7bc9e3e` from the flags packets 1 to 10 handed to packet 18, minus every flag a packet's own item or an open PR already carries. The eight: (1) `transports/base.py` lines 10 to 12 say adding a transport "never touches the channel model" and `config/models.py` line 29 says "Plugins may register additional values", while `ConnectorType` is a closed enum. (2) The `record_audit` comment in `store/sqlserver.py` says a transaction-scoped applock taken as the first statement "does not release on commit and strands", and `_ensure_schema` in the same file takes exactly that lock first and says it auto-releases; one is wrong and the wrong one steered a control out of the database. (3) `docs/PHI.md` section 6 names `summary_search_display` and `dead_letter_display` as the summary audit actions; the code writes `summary_access`. (4) The `inline` fast-path keyword (`build_inbound_connection`, ADR 0057) appears in neither `CONNECTIONS.md` nor `CONFIGURATION.md`. (5) `messagefoundry/__init__.py` says "The PySide6 console (and any other client) drives it"; that console was retired (#103). (6) `docs/CONFIGURATION.md` omits `[api].tls_client_crl_file`, the only one of 359 `ServiceSettings` keys not documented (census with a positive and a negative control), and `docs/SECURITY.md`'s mTLS row says "no revocation checking", a row written 2026-07-23 a month before #1005 shipped CRL checking on 2026-08-22. (7) `docs/CONNECTIONS.md` documents the SFTP `private_key` as "PEM private-key text or a path" with no type restriction while `remotefile.py` loads `paramiko.RSAKey` only, so an Ed25519 or ECDSA key is refused at connect with no document saying so. (8) `docs/AI.md` states "the MVP assistant only ever sends code, never message bodies" as an engine guarantee; packet 7 measured it to be a client property.
+> Verdict: build
+> Research: none
+> Closing-act: doc
+
+**Cluster:** Documentation correctness. **Priority:** P3. **Verdict:** build (small).
+**Severity:** no engine effect (sec. 0). Low. Each is a reader believing something the code does not do.
+
+### What closing looks like
+
+1. One documentation PR with each edit named.
+2. Settle (2) by one measurement recorded beside both sites. It is the one with a code consequence, and #1605's fix needs that measurement anyway.
+3. Claim (1)'s code half is #1624, which owns the closed-enum decision; this item carries only the two prose sites.
+
+**Duplicate search.** No match on any of the eight anchors. #1624 (open) carries the connector-contract half of (1) and asked packet 18 to cite it rather than file the prose alone; #95 (open) carries (8)'s engine-brokered question. Searched `Plugins may register`, `record_audit` with `applock` or `first statement`, `summary_search_display`, `inline` with `fast-path` or `0057`, `PySide6 console` (5 open hits, all the retired-console history), `tls_client_crl_file` (none; #1005 closed is the code), `RSAKey` and `Ed25519` (#1168, an unrelated PKCS#1 item), `only ever sends code` (#95 open, cited).
+
+**Source.** `docs/reviews/FABLE-PACKET-18-CROSSCUTTING-2026-09-11-FINDINGS.md` (vault PR 1485), proposal 5. The same proposal is on engine PR 1074 as `docs/backlog-proposals/fable-packet18-crosscutting.md`.
