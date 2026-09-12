@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.2 (BACKLOG #1136, ADR 0183) -- the offline first-administrator provisioning command.
 
 ``tests/test_first_run_default_account.py`` pins what the SHIPPED DEFAULT still does: run ``serve``

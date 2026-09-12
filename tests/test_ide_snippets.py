@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The shipped VS Code snippet bodies must be code the engine actually accepts.
 
 A snippet is generated source: the user tabs through it and the result runs in a Handler. Nothing

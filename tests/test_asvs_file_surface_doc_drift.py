@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 5.1.1 — file-surface doc-drift guard for `docs/CONNECTIONS.md`.
 
 The old `#### File handling & quarantine policy (ASVS 5.1.1)` intro carried a factually false denial —

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The PERSISTED per-key AES-GCM invocation bound (ASVS 11.3.4) — backend-agnostic half.
 
 Nonce *generation* was never the gap: every encrypt draws a fresh 96-bit ``os.urandom`` nonce, which is

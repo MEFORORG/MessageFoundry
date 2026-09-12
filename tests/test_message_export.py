@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """S7b #124 — bulk raw-message-body export from a search result (ADR 0131).
 
 Covers the LARGEST PHI surface in the cluster: GET /messages/export streaming decrypted bodies to a

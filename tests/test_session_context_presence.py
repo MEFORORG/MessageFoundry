@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The SessionStart banner (``scripts/worktree/session-context.ps1``) must degrade, never throw.
 
 Whatever this hook prints to stdout IS the chat's starting context. If it raises, the session opens

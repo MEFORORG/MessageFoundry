@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the dispatch gate and the banner fields it reads.
 
 **These pin that the gate NAMES rather than REFUSES, which is a correction to its first version.**

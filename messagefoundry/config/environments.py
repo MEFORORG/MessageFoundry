@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-environment **values** for ``env()`` lookups in the message graph (DEV/PROD).
 
 The code-first graph references environment-specific values via ``env("key")`` (see

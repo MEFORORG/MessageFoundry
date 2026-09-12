@@ -192,7 +192,31 @@ jobs:
           # docs/archive/backlog/ once it is retired. Updating a retired item's banner is a legitimate
           # satisfaction of this rule, so both locations count -- otherwise the one PR shape that
           # correctly amends an archived item fails a REQUIRED check with no way to comply.
-          if printf '%s\n' "$changed" | grep -qE '^(docs/BACKLOG\.md|docs/archive/backlog/.+\.md)$'; then
+          # A HERE-STRING, NOT A PIPE, AND THE DIFFERENCE IS A LIVE DEFECT THIS GATE HAD.
+          # `printf ... | grep -q` fails BECAUSE the match succeeds. `grep -q` exits the instant it
+          # matches, which closes the pipe; `printf` is still writing, so its next write fails with
+          # "write error: Broken pipe"; and `set -o pipefail` (line 99) then takes the pipeline's
+          # status from the FAILING member. A match is reported as a miss, and this gate tells the
+          # author their PR does not touch docs/BACKLOG.md at the exact moment it has proved that it
+          # does.
+          #
+          # It needs the list to be long enough that printf is still writing when grep quits, so it
+          # scales with PR size. Measured 2026-09-10 on PR 1020: a 1,531-file diff whose match sat at
+          # line 19, leaving 1,512 lines still to write. Attempts 1 and 3 both failed identically, so
+          # IT IS NOT A FLAKE AND A RE-RUN DOES NOT CLEAR IT.
+          #
+          # DO NOT cite that gate's earlier green on this same branch as a contrast: that run exited
+          # at the "No 'BACKLOG #N' claim" branch above and never reached this line, so it is
+          # evidence of nothing here. That mistake was made and corrected while diagnosing this, and
+          # it is recorded because the wrong version is the more natural thing to write.
+          #
+          # What DID establish the content was fine: running this gate's own logic, with the SHAs
+          # from its own failing log, against a full clone -- it passes there and prints
+          # docs/BACKLOG.md at line 19 of `changed`.
+          #
+          # A here-string has no second process and no pipe, so there is nothing to break. Do not
+          # "simplify" it back into a pipe.
+          if grep -qE '^(docs/BACKLOG\.md|docs/archive/backlog/.+\.md)$' <<< "$changed"; then
             echo "OK — PR claims '$claim', touches code, and updates the backlog item namespace."
             exit 0
           fi

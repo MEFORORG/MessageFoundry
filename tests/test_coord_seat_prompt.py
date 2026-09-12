@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``seat.ps1 -Prompt`` records that a seat was ASKED for a goal, and never invents one.
 
 seat.ps1 has carried ``-Declare -Seat -Goal`` since it was written, and the mechanical half of the

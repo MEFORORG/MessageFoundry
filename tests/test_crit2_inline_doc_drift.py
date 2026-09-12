@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CRIT-2 (P7 disposition) — the ADR 0057 inline Step-A `handoff` fast-path is WIRED but ships
 permanently DEFAULT-OFF (DO-NOT-PROMOTE per the ADR 0057 banner + ADR 0107 measured dead-end).
 

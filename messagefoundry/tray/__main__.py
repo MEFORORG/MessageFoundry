@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Entry point for the MessageFoundry tray: ``pythonw -m messagefoundry.tray`` (ADR 0113).
 
 Single-instance guarded, config loaded from ``%LOCALAPPDATA%\\MessageFoundry\\tray.toml`` + the

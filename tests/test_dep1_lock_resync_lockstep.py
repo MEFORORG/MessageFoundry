@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural guard: the Dependabot lock-resync must re-export exactly what DEP-1 diffs.
 
 ``security.yml``'s DEP-1 step re-runs every ``uv export`` and ``git diff --exit-code``s the result;

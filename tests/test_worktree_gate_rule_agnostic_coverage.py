@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The escape-blind span scan is RULE-AGNOSTIC, so its coverage must be too.
 
 WHAT THE DEFECT WAS is stated once, in `Remove-QuotedSpans` in the hook itself, and pinned by

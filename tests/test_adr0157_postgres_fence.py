@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0157 — the H1 leader-epoch fence on TERMINAL resolves (C1/C3/D1) and on ``claim_ready`` (C5).
 
 **Gated** on ``MEFOR_TEST_POSTGRES`` like the rest of the Postgres suite, so a laptop run skips this

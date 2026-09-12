@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale run profiles — authored as **data** (TOML), parsed into a frozen dataclass (B11).
 
 A connection-scale profile names the connection counts to sweep (500 / 1000 / 1500, or the CI smoke's

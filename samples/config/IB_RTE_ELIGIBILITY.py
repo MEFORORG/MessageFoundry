@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample feed: real-time eligibility (X12 270 → 271) as synchronous request/response (ADR 0016).
 
 A trigger 270 (eligibility inquiry) arrives, is forwarded to the payer over a raw-TCP X12 connection

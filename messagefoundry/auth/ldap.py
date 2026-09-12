@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Active Directory authentication: LDAP simple-bind + nested-group resolution, and Kerberos SSO.
 
 Pure (no FastAPI). ``ldap3`` does a service-account bind to locate the user, then a bind *as the
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import ssl
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,12 @@ _MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"  # AD nested-group ("member 
 #: this file by ``test_every_covered_file_still_names_its_connector_label``.
 _LDAPS_CONNECTOR = "AD LDAPS bind"
 
+#: The directory attribute carrying the account's immutable identity (BACKLOG #1471). ``objectGUID``
+#: is minted once per account object and survives a rename, a move between organizational units and a
+#: change of ``sAMAccountName``; it is NOT reissued when a name is recycled to a different person,
+#: which is the whole reason the engine binds on it.
+_OBJECT_GUID_ATTR = "objectGUID"
+
 
 @dataclass(frozen=True)
 class AdPrincipal:
@@ -46,6 +53,12 @@ class AdPrincipal:
 
     ``groups`` holds **lower-cased** identifiers — both each group's DN and its ``sAMAccountName`` —
     so the admin can map roles by whichever form they configured in ``ad_group_role_map``.
+
+    ``directory_object_id`` is the account's **immutable** directory identity (BACKLOG #1471): the
+    normalised ``objectGUID``, which is what the engine resolves a MessageFoundry user row by. It
+    defaults to ``None`` for the directory that returns no such attribute — an unreadable or trimmed
+    attribute is not an identity claim, and the caller falls back to the username on that path. ``dn``
+    is deliberately NOT that key: a DN changes on a rename or an OU move.
     """
 
     username: str
@@ -53,6 +66,7 @@ class AdPrincipal:
     email: str | None
     dn: str
     groups: frozenset[str]
+    directory_object_id: str | None = None
 
 
 class LdapError(RuntimeError):
@@ -75,6 +89,82 @@ def _attr(entry: Any, name: str) -> str | None:
         return None
     value = entry[name].value
     return str(value) if value else None
+
+
+def normalise_object_guid(value: object) -> str | None:
+    """Render a directory ``objectGUID`` in ONE canonical text form, or ``None`` if it cannot be.
+
+    BACKLOG #1471. ``objectGUID`` arrives in at least two shapes and **an identifier that renders two
+    ways is not an identifier**: the raw 16 bytes off the wire, and the braced upper-case string
+    ``ldap3``'s own formatter produces. Both normalise here to the lower-case hyphenated form without
+    braces — the spelling Windows tooling shows — so a row bound through one shape is still found
+    through the other. Do the conversion at this boundary and nowhere else; a second spelling created
+    downstream is the same defect in a new place.
+
+    **The 16 bytes are read little-endian** (``UUID(bytes_le=...)``), which is the Microsoft GUID
+    layout: the first three fields are byte-swapped relative to RFC 4122. Reading them big-endian
+    produces a well-formed UUID that is a DIFFERENT identifier, and nothing downstream could tell.
+
+    ``None`` for a value of any other shape or length, and the caller then falls back to the username.
+    Refusing the login instead was considered and not taken: an unexpected attribute shape is a
+    directory-side condition, not an attack, and the fallback is the behaviour that shipped before
+    this column existed. The caller logs it.
+    """
+    try:
+        if isinstance(value, bytes | bytearray | memoryview):
+            return str(uuid.UUID(bytes_le=bytes(value)))
+        if isinstance(value, str):
+            return str(uuid.UUID(value.strip()))
+    except ValueError:
+        # One rule applied to both shapes: the constructor already refuses a wrong length as well as
+        # a malformed string, so there is no separate length guard to drift out of step with it.
+        return None
+    return None
+
+
+#: Shapes of ``objectGUID`` already reported by :func:`_object_guid`, so the warning below fires once
+#: per distinct shape rather than once per read. ``_find_user`` is NOT login-only: the ADR 0079
+#: session reconciler probes it once per user per pass (``ad_session_recheck_seconds``, 300 by
+#: default), so an unreadable attribute would otherwise emit one identical line per user every five
+#: minutes. ``_probe_principal`` logs its own failure at DEBUG for exactly that reason; this keeps the
+#: louder level and pays for it by saying each thing once.
+_object_guid_shapes_warned: set[str] = set()
+
+
+def _warn_once_about_object_guid(shape: str) -> None:
+    """Report an unusable ``objectGUID`` once per distinct ``shape`` (a type name, or ``absent``)."""
+    if shape in _object_guid_shapes_warned:
+        return
+    _object_guid_shapes_warned.add(shape)
+    logger.warning(
+        "AD %s is unusable (%s); these logins resolve by sAMAccountName, which a directory-side "
+        "name recycle can redirect (BACKLOG #1471). Reported once per shape.",
+        _OBJECT_GUID_ATTR,
+        shape,
+    )
+
+
+def _object_guid(entry: Any) -> str | None:
+    """The entry's normalised ``objectGUID`` (BACKLOG #1471), or ``None`` when it cannot be read.
+
+    ``raw_values`` is preferred over ``value`` because it is the bytes off the wire, before whichever
+    formatter ``ldap3`` has registered for this attribute has had an opinion about them.
+    """
+    if _OBJECT_GUID_ATTR not in entry:
+        # AN ATTRIBUTE THE DIRECTORY NEVER RETURNS IS THE QUIETEST WAY TO BE ON THE OLD PATH, so it
+        # is reported too. Every account at such a site resolves by name, and an operator who is told
+        # nothing has no way to learn that the control they read about is not running for them.
+        _warn_once_about_object_guid("absent")
+        return None
+    attr = entry[_OBJECT_GUID_ATTR]
+    raw = getattr(attr, "raw_values", None)
+    value = raw[0] if raw else attr.value
+    text = normalise_object_guid(value)
+    if text is None:
+        # The value itself is NOT logged: it identifies a directory account, and the SHAPE is what a
+        # reader needs in order to fix the read.
+        _warn_once_about_object_guid(f"unreadable {type(value).__name__}")
+    return text
 
 
 def _multi(entry: Any, name: str) -> list[str]:
@@ -252,6 +342,7 @@ class LdapAuthenticator:
             attributes=[
                 "distinguishedName",
                 "sAMAccountName",
+                _OBJECT_GUID_ATTR,
                 "displayName",
                 "mail",
                 "memberOf",
@@ -270,6 +361,10 @@ class LdapAuthenticator:
         return {
             "dn": str(e.entry_dn),
             "username": _attr(e, "sAMAccountName") or username,
+            # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
+            # is given, which would render the raw 16 bytes as a Python bytes repr and store a
+            # second, non-canonical spelling of the same identity.
+            "object_id": _object_guid(e),
             "display_name": _attr(e, "displayName"),
             "email": _attr(e, "mail"),
             "memberOf": _multi(e, "memberOf"),
@@ -350,6 +445,7 @@ class LdapAuthenticator:
             email=info["email"],
             dn=user_dn,
             groups=groups,
+            directory_object_id=info["object_id"],
         )
 
     def resolve_principal(self, username: str) -> AdPrincipal | None:
@@ -372,6 +468,7 @@ class LdapAuthenticator:
             email=info["email"],
             dn=user_dn,
             groups=groups,
+            directory_object_id=info["object_id"],
         )
 
 

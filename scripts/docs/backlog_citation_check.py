@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Resolve backlog CITATIONS against the item namespace, so a number cannot name the wrong ledger.
 
 **The defect (BACKLOG #1095).** Retiring an item moves its text verbatim from ``docs/BACKLOG.md``

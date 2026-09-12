@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1101: the empty-claims monotonicity SLO must measure the engine, not the runner.
 
 The SLO used to read ``empty_claims_per_s``, which carries wall clock in its denominator. Anything

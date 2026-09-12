@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Doc-drift guard for ``docs/CLOUD-PHI-HIPAA.md`` (ADR 0047 deliverable 5).
 
 The cloud PHI/HIPAA posture doc leans on concrete engine knobs — env vars

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the licence-header gate (``scripts/quality/licence_header_check.py``).
 
 THIS FILE IS THE GATE'S NEGATIVE CONTROL, AND IT SHIPS WITH THE GATE RATHER THAN AFTER IT. Per

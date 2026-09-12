@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Support-bundle assembly (#49).
 
 ``messagefoundry support-bundle`` writes a single zip an operator can hand to support without leaking

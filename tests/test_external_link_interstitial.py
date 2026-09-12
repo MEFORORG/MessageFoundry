@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ASVS 3.7.3 predicate: is this navigation leaving the organisation?
 
 The interstitial itself is UI; this is the part that decides whether it appears, so it is the part

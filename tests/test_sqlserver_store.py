@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQL Server store behaviour — mirrors the SQLite suite, against a real SQL Server.
 
 **Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*`` connection env),
@@ -468,6 +468,162 @@ async def test_totp_store_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_totp_contract
 
     await _assert_totp_contract(store)
+
+
+async def test_directory_identity_store_contract(store) -> None:
+    """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real SQL Server backend.
+
+    The method shipped on all three backends with no backend-level test on any of them, and it is
+    the read the whole sAMAccountName-recycle defence resolves through. The shared body is the same
+    one the SQLite and Postgres suites run, so a SQL Server drift fails against the same assertions
+    rather than against its own wording.
+
+    Case is NOT asserted here -- it is where this backend legitimately differs, and it is pinned
+    against the server's own collation in the next test.
+    """
+    from tests._directory_identity_store_contract import _assert_directory_identity_contract
+
+    await _assert_directory_identity_contract(store)
+
+
+async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
+    """The layer under the lookup, on the real SQL Server backend.
+
+    ``directory_object_id`` carries no uniqueness constraint here, unlike ``(oidc_issuer,
+    oidc_subject)`` which this schema backs with a FILTERED ``ux_users_federated_subject`` -- and
+    the filter is required on this backend rather than stylistic, because it treats NULLs as equal
+    in a unique index. The reason the asymmetry is safe is ``UNIQUE(username)``, stated in the
+    schema comment and asserted nowhere. Both halves are pinned here.
+    """
+    from tests._directory_identity_store_contract import (
+        _assert_the_binding_column_is_unconstrained_and_username_is_not,
+    )
+
+    await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
+
+
+async def _directory_id_collation(store) -> str | None:
+    """The collation SQL Server reports for ``users.directory_object_id``, or None if it has none."""
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute(
+            "SELECT collation_name FROM sys.columns"
+            " WHERE object_id = OBJECT_ID('users') AND name = 'directory_object_id'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    assert row is not None, "users.directory_object_id is absent from sys.columns"
+    return str(row[0]) if row[0] is not None else None
+
+
+async def test_directory_id_comparison_follows_this_servers_collation(store) -> None:
+    """**A real cross-backend divergence, pinned rather than papered over.**
+
+    SQLite and Postgres compare ``directory_object_id`` byte-for-byte, so an id differing only in
+    case resolves to nothing on both. SQL Server hands the comparison to the DATABASE's collation:
+    the column carries no ``COLLATE`` of its own, so under the common ``..._CI_...`` default two ids
+    differing only in case MATCH here and do not there. ``store/sqlserver.py`` records this beside
+    the method; nothing asserted it.
+
+    The expectation is derived from the collation the server actually reports rather than guessed,
+    because the answer is a property of the deployed database and a hard-coded guess would pin this
+    suite to whichever container CI happens to run. What is unconditional is the half that carries
+    the security property: the EXACT id always resolves, on every collation.
+
+    Not reachable through the login path -- ``auth/ldap.py`` normalises every ``objectGUID`` through
+    ``str(uuid.UUID(...))``, which emits one case -- and that normaliser is what keeps a divergence
+    this test now makes visible from being a live defect. Case is the divergence measured here; it
+    is not a claim to be the only one (``=`` is also trailing-space-insensitive on this backend and
+    not on the other two, which is unmeasured).
+    """
+    from tests._directory_identity_store_contract import CASE_GUID
+
+    await store.create_user(
+        user_id="dir-case",
+        username="case",
+        auth_provider="ad",
+        directory_object_id=CASE_GUID,
+        now=1_000.0,
+    )
+    # Unconditional, on every collation: the id as stored resolves to its own row. This is the half
+    # the recycle defence rests on, and it is also the control that makes the miss-or-match below a
+    # fact about CASE rather than about the row being absent or the column unwritten.
+    exact = await store.get_user_by_directory_object_id(CASE_GUID)
+    assert exact is not None and exact.id == "dir-case"
+
+    collation = await _directory_id_collation(store)
+    assert collation is not None, "an NVARCHAR column with no collation cannot be compared"
+    # `_CI_` is case-insensitive; `_CS_` and the `_BIN`/`_BIN2` binary collations are not.
+    case_insensitive = "_CI_" in collation.upper()
+    upper = await store.get_user_by_directory_object_id(CASE_GUID.upper())
+    if case_insensitive:
+        assert upper is not None and upper.id == "dir-case", (
+            f"collation {collation} is case-insensitive, so the upper-cased id must still match;"
+            " a lookup that had become case-sensitive would disagree with this server's own ="
+        )
+    else:
+        assert upper is None, (
+            f"collation {collation} is case-sensitive, so the upper-cased id must not match;"
+            " matching would mean the lookup folds case somewhere the column does not"
+        )
+
+
+async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
+    """The COL_LENGTH-gated ADD for ``users.directory_object_id`` (BACKLOG #1471) on a pre-#1471
+    database.
+
+    Driven against a table that really lacks the column: the fixture's table has it from CREATE
+    TABLE, so without dropping it first the ALTER branch is unexercised and deleting the migration
+    statement would still pass. The marker row goes too -- with it current, ADR 0064's fast-path
+    skips the whole batch and this would assert nothing.
+
+    The ADD carries NO backfill, deliberately: nothing in the store has ever held the directory's
+    identifier, so the only value on that schema to seed from is the recyclable username.
+    """
+    from tests._directory_identity_store_contract import BOUND_GUID
+
+    async def _col_length() -> int | None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT COL_LENGTH('users','directory_object_id')")
+            row = await cur.fetchone()
+            await cur.close()
+        return None if row[0] is None else int(row[0])
+
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("ALTER TABLE users DROP COLUMN directory_object_id")
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await _col_length() is None  # positive control: the column really is gone
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    # NVARCHAR(256) is 512 bytes. Asserting the WIDTH, not merely presence, is what separates the
+    # guarded ADD having run from some other statement having created a differently-typed column.
+    assert await _col_length() == 512
+
+    await store.create_user(
+        user_id="dir-upgrade",
+        username="upgraded",
+        auth_provider="ad",
+        directory_object_id=BOUND_GUID,
+        now=1.0,
+    )
+    found = await store.get_user_by_directory_object_id(BOUND_GUID)
+    assert found is not None and found.id == "dir-upgrade"
+
+    # Second full run against an already-migrated table: COL_LENGTH is not NULL, so the guard must
+    # skip the ADD rather than raise "column names must be unique", and must leave the row bound.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await store._ensure_schema() is True
+    assert await _col_length() == 512
+    again = await store.get_user_by_directory_object_id(BOUND_GUID)
+    assert again is not None and again.id == "dir-upgrade"
 
 
 async def test_mark_session_reauthed_reanchors_client(store) -> None:
@@ -2170,6 +2326,9 @@ async def test_reference_rows_rotate_on_reencrypt_to_active(store) -> None:
 
 # --- H1: store-checked leader epoch (fencing token) ---------------------------
 
+# SqlServerCoordinator's lease key: constant, because this store ignores [store].db_schema.
+_LEASE_KEY = "mefor_cluster_leader"
+
 
 async def _seed_lease_epoch(store, lease_key: str, epoch: int) -> None:
     """Upsert the single ``leader_lease`` row to ``epoch`` (the authoritative current leader epoch). The
@@ -2196,7 +2355,7 @@ async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
     # The fence. leader_lease.leader_epoch is 5 (a standby took over + bumped). A superseded ex-leader
     # still believes it holds epoch 3 (held < current) — its FIFO claim must affect 0 rows (None) and
     # leave the head PENDING, untouched.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
@@ -2211,7 +2370,7 @@ async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
 async def test_current_epoch_claim_succeeds(store) -> None:
     # The live leader holds the SAME epoch as the lease row (held == current): its claim passes. Equality
     # is the boundary — held >= current must include equality, else the true leader could never claim.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     store.set_leader_epoch(5, lease_key=lease_key)
@@ -2230,7 +2389,7 @@ async def test_stale_then_promoted_claim_preserves_fifo_head(store) -> None:
     # FIFO survives the fence: two messages on one lane (N, N+1). A stale ex-leader is rejected (delivers
     # neither); once this node is the current leader it claims the OLDEST first (N), preserving per-lane
     # order across the would-be split-brain.
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "n")], now=100.0)
     m2 = await store.enqueue_message(
@@ -2250,7 +2409,7 @@ async def test_pooled_claim_fenced_ex_leader_claims_zero_across_all_lanes(store)
     # ADR 0066 §8 row 7 (H1 pooled): the epoch guard rides the pooled claim's probe AND UPDATE, so a
     # superseded ex-leader's claim_fifo_heads matches 0 rows across ALL requested lanes in one shot —
     # and leaves every head PENDING with attempts untouched (the probe locked nothing).
-    lease_key = "dbo:mefor_cluster_leader"
+    lease_key = _LEASE_KEY
     await _seed_lease_epoch(store, lease_key, 5)
     m1 = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB_PF1", "p")], now=100.0

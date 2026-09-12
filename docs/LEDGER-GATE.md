@@ -268,7 +268,7 @@ from the branch-holding worktree and **passed** from the aliased entitled one, a
 the PR branch. `tests/test_coord_alloc_strand_sweep.py` pins every step, and pins the recreate ruling
 above — which had been carried as an owner ruling since 2026-08-21 with nothing ever executing it.
 
-**Allocating for another seat: use `-For`, do not allocate in your own tree.** A Console that
+**Allocating for another seat: use `-For`, do not allocate in your own tree.** A Manager that
 allocates on a Builder's behalf records **its own** worktree, both keys then miss for the Builder, and
 the gate correctly refuses a commit nobody can make from the right place. That is not drift — the
 claim is born pointing at the wrong tree, which is the third limb #1414 does not name.

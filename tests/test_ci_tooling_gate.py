@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The CI `tooling` path-gate, driven directly.
 
 `ci.yml`'s `changes` job decides whether the `tooling` job runs. That job is the ONLY place the
@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +36,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _bash_resolver import explain_returncode, require_bash  # noqa: E402
+from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -185,7 +186,14 @@ def _run_detector(
     script.write_text(_changes_step_script(), encoding="utf-8", newline="\n")
     out_file = cwd / "gh_output"
     out_file.write_text("", encoding="utf-8")
-    env = dict(os.environ)
+    # THE CHILD NEEDS REAL UTILITIES, NOT JUST THE INTERPRETER (BACKLOG #1373). The step below runs
+    # `git` and `grep`; a PATH without them -- what PowerShell and cmd supply -- fails the child at
+    # 127, and the detector's `if echo ... | grep -qE` then takes its ELSE branch and writes
+    # `tooling=false`. The test reads that as the workflow filter narrowing, so a harness fault
+    # accuses content that was never wrong. `probe_env` appends the interpreter's own directory,
+    # where those utilities ship. Same call, same reason, as
+    # tests/test_dependabot_automerge_guardrails.py.
+    env = probe_env(Path(bash), dict(os.environ))
     env.update(
         {
             "EVENT_NAME": event,
@@ -312,4 +320,83 @@ def test_a_fork_never_pays_for_the_windows_leg(tmp_path: Path) -> None:
     assert legs == ["ubuntu-latest"], (
         f"a fork should build this tier on ubuntu only, got {legs} -- the 2x-billed Windows leg "
         "would be spending a contributor's own minutes"
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE REGRESSION ARM for BACKLOG #1373. Everything above asks what the detector decides; this asks
+# whether the ANSWER SURVIVES A STRIPPED PATH, which is a separate failure with the same appearance.
+#
+# The damage shape is what makes it worth an arm of its own. Without the utilities the detector's
+# `grep -qE` cannot run, the `if` takes its else branch, the step writes `tooling=false`, and
+# `test_a_docs_only_pr_gets_one_leg_and_a_code_pr_gets_both` fails saying THE FILTER MUST NOT
+# NARROW -- a sentence about ci.yml, produced by a box that never read ci.yml's answer. A reader
+# acting on it edits a workflow that was never wrong. Measured on one variable before the fix: this
+# module was 27 passed with coreutils on PATH and 1 failed without.
+# ---------------------------------------------------------------------------------------------
+
+
+def _git_only_path(tmp_path: Path) -> str:
+    """A PATH carrying `git` and NOTHING ELSE, synthesised rather than borrowed from the host.
+
+    The item's end-to-end condition is Git's own `cmd` directory on PATH but not its `usr/bin`.
+    Reading that off the host reproduces it on Windows and is VACUOUS on Linux, where `git` and
+    coreutils share `/usr/bin` -- a green there would prove nothing, on the leg this tier always
+    runs. A directory holding one shim has the same shape on every OS.
+
+    The shim carries no extension on purpose. bash's own ENOEXEC fallback runs it as a script, so
+    it needs no interpreter lookup and therefore no PATH of its own, which is the whole point.
+    """
+    git = shutil.which("git")
+    assert git, "git is not on PATH, so the fixtures in this module could not have been built"
+    stub = tmp_path / "gitonly"
+    stub.mkdir()
+    shim = stub / "git"
+    shim.write_text(
+        f'#!/bin/sh\nexec "{Path(git).as_posix()}" "$@"\n', encoding="utf-8", newline="\n"
+    )
+    shim.chmod(0o755)
+    return str(stub)
+
+
+def test_the_tooling_verdict_survives_a_coreutils_less_PATH(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A working interpreter plus a PATH without coreutils must still produce ci.yml's real answer.
+
+    Resolve the interpreter and build the fixture repository FIRST, while PATH is still whole: the
+    subject is the CHILD's environment, and stripping the parent's would only measure whether this
+    test can find its own tools.
+    """
+    bash = require_bash(tmp_path)
+    repo = tmp_path / "docs_pr"
+    repo.mkdir()
+    base = _pr_repo(repo, ["docs/ARCHITECTURE.md"])
+    stripped = _git_only_path(tmp_path)
+
+    # ANTI-VACUITY, and it runs before the assertion rather than after it. If the stub PATH ever
+    # reaches coreutils by some route -- an inherited BASH_ENV, a shim directory that gained a
+    # sibling -- the row below passes for the wrong reason and goes on passing forever. So make the
+    # instrument say the opposite first: this exact PATH, this exact interpreter, no `probe_env`.
+    control = subprocess.run(  # noqa: S603  # nosec B603 - resolved interpreter, fixed argv
+        [bash, "-c", "grep --version"],
+        env={**os.environ, "PATH": stripped},
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert control.returncode != 0, (
+        "the stub PATH still reaches `grep`, so this test cannot fail and measures nothing"
+    )
+
+    monkeypatch.setenv("PATH", stripped)
+    outputs = _run_detector(bash, repo, "pull_request", base_sha=base)
+    assert outputs["tooling"] == "true", (
+        "a coreutils-less PATH turned the tooling verdict false. The workflow filter is not wrong "
+        "-- the child could not run `grep`, so every `if` in the detector took its else branch "
+        "(BACKLOG #1373). Route the child env through `probe_env`"
+    )
+    assert outputs["code"] == "false", (
+        "the docs-only short-circuit did not fire, so `git diff` returned nothing through the shim "
+        "and the verdict above was reached without reading the fixture at all"
     )

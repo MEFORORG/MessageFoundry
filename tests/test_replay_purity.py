@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Replay-idempotency property test (PIPE-14, Phase 1).
 
 The at-least-once contract (ADR 0001 / ADR 0009 / CLAUDE.md §2) requires Routers/Handlers to be

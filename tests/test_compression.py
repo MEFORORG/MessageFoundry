@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip.
 
 Covers round-trips, the re-run-purity determinism guarantee (fixed gzip mtime / zip date), the

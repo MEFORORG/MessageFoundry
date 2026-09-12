@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """base64 binary-carriage codec (ADR 0028) — the pure codec, the RawMessage contract, the OBX-5 ED
 helpers, the ingress seam, and the load-bearing proof: NUL-bearing binary survives the str/TEXT store
 (identity + AES-GCM) where the latin-1 round-trip it supersedes would be rejected/truncated."""

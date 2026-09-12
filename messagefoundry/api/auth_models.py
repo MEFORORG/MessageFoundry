@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pydantic request/response models for the auth + user-administration endpoints.
 
 A model the API parses out of a REQUEST BODY subclasses

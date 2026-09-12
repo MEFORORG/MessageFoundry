@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # Topology A — in-process TLS (the default shipped posture; see docs/CONTAINER-EXPOSURE-EVALUATION.md).
 # The engine terminates TLS itself (WP-13a) on 8443 and runs MLLP-over-TLS (WP-13b) on 2575. This is a
