@@ -26,7 +26,7 @@ caching) are copied verbatim and only the DB layer differs:
   analog of PG's ``pg_advisory_xact_lock``.
 
 It is duck-typed on the store (``store._acquire`` / ``store._applock`` / ``store._fetchone`` /
-``store._fetchall`` / ``store._execute`` / ``store._settings``) so this module imports cleanly without
+``store._fetchall`` / ``store._execute``) so this module imports cleanly without
 the optional ``aioodbc`` extra and never hard-imports the concrete store.
 
 .. note::
@@ -144,11 +144,11 @@ class SqlServerCoordinator:
         # re-promoted ex-leader is not fenced out of claim_ready or any terminal resolve.
         self._leadership_lock = asyncio.Lock()
         self._monotonic = monotonic
-        # Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two
-        # deployments sharing one database via different schemas don't contend / co-elect.
-        schema = getattr(getattr(store, "_settings", None), "db_schema", None) or "dbo"
-        self._lock_key = f"{schema}:mefor_cluster_nodes"
-        self._lease_key = f"{schema}:mefor_cluster_leader"
+        # Constant, NOT schema-namespaced like DbCoordinator's: this store never reads db_schema, so
+        # installs sharing one database share these tables and must share this election and DDL lock.
+        # The reasoning, and the refusal that enforces it: StoreSettings._db_schema_backend.
+        self._lock_key = "mefor_cluster_nodes"
+        self._lease_key = "mefor_cluster_leader"
         self._host = socket.gethostname()
         self._pid = os.getpid()
         self._heartbeat_task: asyncio.Task[None] | None = None

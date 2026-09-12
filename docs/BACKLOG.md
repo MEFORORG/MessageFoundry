@@ -1996,9 +1996,13 @@ mutual-auth `out_token` browser-behavior question.
 
 **Why:** ADR 0068 §9 ships browser SSO with `channel_bindings=None` always and records the CBT
 question as a spike; the L5c code is deliberately containment-first (off by default, boot-once
-preflight, single-leg). **Trigger:** a deployment that wants EPA, or the first domain-joined lab box
-(project memory: the test-server box has no AD). The Phase-2 AD-fidelity lab in **#99(e)** is exactly
-that first domain-joined box — run this spike alongside it.
+preflight, single-leg). **Trigger:** a deployment that wants EPA, or the first domain-joined lab box. **The second limb is
+now reachable and was not before:** the owner ruled 2026-09-11 that a lab is available for validation,
+which is **#1003**'s trigger, so the standing note that the test-server box has no AD no longer means
+there is nowhere to stand one up. It has not fired yet — *available for validation* is not *a
+domain-joined box exists*, and standing up the DC plus AD CS is **#1003** step 1. The Phase-2
+AD-fidelity lab in **#99(e)** is still that first domain-joined box — run this spike alongside it.
+Carried by **#1003**.
 
 ---
 
@@ -2010,7 +2014,7 @@ that first domain-joined box — run this spike alongside it.
 > **AMENDED 2026-07-28 — this is no longer a 6/6 engineering build; ONE sub-item remains, and it is PROVISIONING, not code.** ⚠️ **Do not schedule this as a build.**
 > * **(g) — engine-side "require an AD MFA claim" hook: SHIPPED**, not "build only on a customer requirement". It landed via **#274** / [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) as `oidc_require_mfa_claim: bool = True` (`messagefoundry/config/settings.py:1854`, enforced at `:2102`) — note it ships **on by default**. *(ADR 0142's own status line reads "Proposed — code COMPLETE, awaiting lab validation": the code is merged and green; the ADR flips to Accepted only when its runbook cells report. The **hook exists** either way.)*
 > * **(b)** was closed separately via **#224**. **(c)** remains a documented stdlib scope-out (OpenSSL, not SChannel) — a decision, not a task.
-> * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **rig/provisioning the project does not own** (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275**. No engineering capacity closes it.
+> * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **provisioning, not code** — and as of the owner's 2026-09-11 ruling the project has a lab available for validation to provision it in, so it is schedulable rather than unreachable (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275** and carried by **#1003**, whose trigger fired 2026-09-11. No engineering capacity closes it: it closes on a DC, AD CS and a gMSA being stood up in that lab, which is **#1003** step 1.
 > ⚠️ **Two cross-references above resolve to paths that no longer exist from this baseline** (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`): `docs/security/` is **gitignored post-cutover**. The deployment content is intact for operators with the working tree; the links simply do not resolve in the public repo. See [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md).
 > Verdict: demand-gate
 > Closing-act: blocked
@@ -2110,20 +2114,6 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > ⛔ **DROPPED 2026-08-10 -- owner-ruled at the G26 demand-gate triage.** Its named trigger has not fired, and a shipped mechanism, a configuration change or the network layer already answers the need it describes. Dropping is reversible: re-filing costs one item, while carrying it costs a re-read and a re-price at every planning pass, which is the failure mode the sitting exists to end.
 
 > **No longer demand-gated -- declined.** The line applied across the sitting: KEEP the rows whose trigger, if it fires, BLOCKS a feed; DROP the rows whose trigger merely INCONVENIENCES.
-
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: its residual is the live domain-lab gMSA / SSO / reverse-proxy smoke, and that is the ONLY thing left on this item.
-
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: it needs the same real DC + AD CS the #99 smoke does.
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -3221,7 +3211,7 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. Diagnosis only: the CI symptom was absorbed by #115's widened stranding budget, nothing was lost, and the record-correction half is in the tree at report.py:596-606. What is left is a single measurement under concurrent load driven from an existing dispatch-only workflow, so both worth and cost stay small. _(was 3/10 · 3/10.)_
 >
-> **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is blocked: that runner is unregistered (`actions/runners` → `total_count: 0`) and `selfhosted-win2025-sql.yml` has never run.
+> **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is **runnable, and what is left is provisioning rather than a block**: the owner ruled 2026-09-11 that the lab is available for validation, which is **#1003**'s trigger. What has not changed is the measurement. Re-read 2026-09-11, `actions/runners` still returns `total_count: 0` and the workflows API reports `selfhosted-win2025-sql.yml` at `total_count: 0` runs against a `ci.yml` control of 4988, so the runner is still unregistered and that workflow has still never run. Register the runner in the lab, then run the sweep. Carried by **#1003**.
 > Verdict: build
 > **NO `Closing-act` DELIBERATELY -- THE CLASSIFICATION IS CONTESTED AND A GATE SHOULD REFUSE THIS.**
 > *An adversarial pass moved this from `research` to `build` on a real argument (the item mentions
@@ -3871,12 +3861,31 @@ The distinction matters because these two paths do not look like the case AV cov
 > 🚧 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. The margin is unchanged in the shipped test and the item's own remedy is parked behind #1003, whose trigger the owner ruled on 2026-08-20 will not fire. Value 4 because the cost is a CI red that misreads as the PR's own defect, with no engine path and no PHI effect; difficulty 3 because the remainder is a one-file test change plus an _acquire latency benchmark that has to run against a real SQL Server rather than the mocked path. _(was 4/10 · 3/10.)_
 >
 > **Status OPEN (filed 2026-08-02).** `tests/test_cluster_failover_sqlserver.py::test_preferred_delay0_wins_expired_lease_race_over_delayed_node` sleeps `_TTL + 0.15` so the lease is expired by ~0.15s, then requires a node carrying a **0.5s** acquire handicap to be rejected. Correctness therefore rests on **less than 0.35s of wall clock** elapsing between the sleep and `dr._maintain_leadership()` — across a real SQL Server round-trip, on a shared CI runner. Observed failing as `assert dr.is_leader() is False → assert True is False`.
-> ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
-> controlled multi-VM lab that the project did not own; one is ~2 weeks out as of 2026-08-04, so any
-> sentence below saying the rig is unavailable, unregistered or not the project's to provide is
-> **true today and scheduled to become false**. Do not read it as a permanent block. Tracked by
-> **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, which fires on
-> *lab available for validation* and carries this item's run: its patch has never been executed against a real SQL Server, and the `_acquire` latency question it reserves needs a benchmark rather than a lease-election test.
+> ⚠️ **AMENDED 2026-09-11 — THE 2026-08-04 EXPIRY DATE WAS WRONG ABOUT THE DATE AND RIGHT ABOUT
+> THE OUTCOME.** That amendment said a multi-VM lab was about two weeks out, and that every sentence
+> below calling the rig unavailable was *"true today and scheduled to become false"*. The owner then
+> ruled 2026-08-20 that no such lab existed, and ruled 2026-09-11 that **the lab is available for
+> validation**. So read those sentences as **false now, not as scheduled to become false**. Tracked
+> by **[#1003](#1003-validate-the-lab-and-discharge-the-four-hardware-gated-residuals)**, whose
+> trigger fired 2026-09-11.
+>
+> **BUT THE PATCH HALF NEEDED NO LAB, AND STILL DOES NOT.** `ci.yml`'s `sqlserver-store` job runs
+> `pytest -v tests/test_cluster_failover_sqlserver.py` against `mcr.microsoft.com/mssql/server:2022-latest`
+> and `:2025-latest` — and this item's own discriminating evidence is a pass/fail split between
+> exactly those two legs. What no hosted leg covers is a real Windows plus a real ODBC stack;
+> `selfhosted-win2025-sql.yml` supplies that for the store, coordinator and connector suites but
+> **deliberately excludes this item's test file**, because it hangs on that VM. So registering the
+> `mefor-win2025-sql` runner would still not run this item's test.
+>
+> **THE `_acquire` MEASUREMENT MUST BE RE-HOMED BEFORE THE PATCH LANDS.** It is recorded only here
+> and in #1003. **Re-home it to ADR 0159 as a named residual**, because the patch makes the test
+> deterministic and so removes the only thing raising the question. **Re-specify it while
+> re-homing:** today's `_acquire` in `messagefoundry/store/sqlserver.py` carries at least three later
+> per-call additions that are not ADR 0159's — the B11 `perf_counter` timing pair, BACKLOG #1052's
+> bounded `acquire_pooled(...)`, and the STORE-3 `command_timeout` assignment — while ADR 0159's
+> own success-path cost is a `try/except BaseException` frame plus one `isinstance` that does not
+> execute. Note that `messagefoundry_store_pool_acquire_wait_*_seconds` measures the WAIT for a free
+> pooled connection, not the frame's overhead; a green percentile there answers a different question.
 
 **Cluster:** Testing & CI. **Priority:** P3. **Verdict:** triage — **do not "fix" by widening the margin until the question below is answered.** **Severity:** medium (a red that reads as the PR's own defect), unknown (likelihood: one observation).
 
@@ -3940,15 +3949,17 @@ So the registered control for a context should record **what it does not break**
 
 ## 1003. Validate the lab and discharge the four hardware-gated residuals
 
-> 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **6/10** · _money pit_. The owner ruled 2026-08-20 that no multi-VM lab exists, so the trigger cannot fire, and the item's own cheapest deliverable is undone: docs/BACKLOG.md:3075 still tells a reader #351's blocker is scheduled to become false. Worth-if-built is breadth over four validation residuals whose own banners read 5, 3, 3 and 4, none of them a shipping-default defect, so 5 rather than a number above every part. Difficulty 6 on the explicit Windows-CI-gated anchor: #320 needs a registered self-hosted WS2025 runner, #99 and #98 a real DC plus AD CS plus gMSA, #351 a real SQL Server. _(was 7/10 · 4/10.)_
+> 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **5/10** · Difficulty **6/10** · _money pit_. The owner ruled 2026-08-20 that no multi-VM lab exists, so the trigger cannot fire, and the item's own cheapest deliverable is undone: #351's own 2026-08-04 amendment still tells a reader its blocker is scheduled to become false. Worth-if-built is breadth over four validation residuals whose own banners read 5, 3, 3 and 4, none of them a shipping-default defect, so 5 rather than a number above every part. Difficulty 6 on the explicit Windows-CI-gated anchor: #320 needs a registered self-hosted WS2025 runner, #99 and #98 a real DC plus AD CS plus gMSA, #351 a real SQL Server. _(was 7/10 · 4/10.)_
 >
 > **Filed 2026-08-04 — not started.** Four open items are blocked on the same missing thing — a controlled multi-VM environment — and each currently asserts a premise that expires when it arrives; the work is the validation runs themselves, which are bounded, already specified by the items they discharge, and need no new design.
 > Verdict: build
 > Closing-act: code
 
-**Cluster:** Testing & CI. **Priority:** P2. **Verdict:** build when the trigger fires. **Severity:** medium (four items are parked on a blocker that is about to stop existing, and their own text will keep saying otherwise).
+**Cluster:** Testing & CI. **Priority:** P2. **Verdict:** build — the trigger fired 2026-09-11. **Severity:** medium (four items still read as parked on a blocker that has lifted, and their own text will keep saying so until each row is corrected).
 
-**THE TRIGGER WILL NOT FIRE. OWNER RULED 2026-08-20: THERE IS NO MULTI-VM LAB.** Asked directly whether one was available, the answer was no. **So this item's own framing is now FALSE and it is the sentence that misleads every planning pass:** the body above says the four residuals are *"parked on a blocker that is about to stop existing"*. **That blocker is not about to stop existing.** It is indefinite, and the four are blocked on HARDWARE rather than on a decision -- which is not a thing any amount of triage, scoring or re-reading can move.
+**THE TRIGGER FIRED. OWNER RULED 2026-09-11: THE LAB IS AVAILABLE FOR VALIDATION.** That is this item's trigger in its own words, so the two paragraphs below — *THE TRIGGER WILL NOT FIRE* and *WHAT THAT CHANGES FOR EACH RESIDUAL* — are **withdrawn as statements of current state** and kept only as the record of what was true between 2026-08-20 and 2026-09-11. **#99, #98, #320 and #351 are runnable rather than parked — schedule them.** Two bounds, so nobody reads this as more than it is. First, *available for validation* is not *validated*: Scope step 1 below is still undone, and an environment that is merely up has not been shown to carry a Domain Controller, AD CS, a gMSA or a registered runner. Second, the runner is still unregistered as re-measured 2026-09-11 — `actions/runners` returns `total_count: 0`, and the workflows API reports `selfhosted-win2025-sql.yml` at `total_count: 0` runs against a `ci.yml` control of 4988 — but that is now **provisioning with somewhere to happen**, which is the whole of the change. **The *TRAP* paragraph further down is NOT withdrawn**; it is now live, and it is the first thing to read before recording any rig result. **This item's own first deliverable is DONE as of 2026-09-11** — the four rows were amended in one pass, and the two copies of the 2026-08-04 expiry stanza that had been misfiled onto **#108** were deleted, their content re-sited onto #99 and #98 where it belongs. A third misfiled copy remains on **#321** and was left deliberately; see that row.
+
+**THE TRIGGER WILL NOT FIRE. OWNER RULED 2026-08-20: THERE IS NO MULTI-VM LAB.** Asked directly whether one was available, the answer was no. **So this item's own framing is now FALSE and it is the sentence that misleads every planning pass:** the body above said the four residuals were *"parked on a blocker that is about to stop existing"* when this amendment was written. **That blocker is not about to stop existing.** It is indefinite, and the four are blocked on HARDWARE rather than on a decision -- which is not a thing any amount of triage, scoring or re-reading can move.
 
 **WHAT THAT CHANGES FOR EACH RESIDUAL.** #99, #98, #320 and #351 stay open and stay blocked, but they stop being *imminent*. **Do not price any of them as capacity in a wave plan, and do not re-triage them hoping for a different answer** -- a hardware precondition does not yield to analysis. #98 is the one partial exception and only in one limb: its trigger reads *"a deployment that wants EPA, OR the first domain-joined lab box"*, and **the first disjunct survives this ruling** -- a real deployment wanting EPA would still fire it. The lab half is dead; the deployment half is not.
 
@@ -3956,11 +3967,11 @@ So the registered control for a context should record **what it does not break**
 
 *Amended by the Dispatcher on the owner's ruling. No hardware was required for this amendment and none is implied by it; the ruling closed a question, it did not unblock any work.*
 
-**Trigger:** the lab is **available for validation** — reachable, with VMs provisionable. **Not** "lab validated": proving the lab does what these items need is this item's own first deliverable, so gating on validation would mean the trigger can never fire.
+**Trigger:** the lab is **available for validation** — reachable, with VMs provisionable. **Not** "lab validated": proving the lab does what these items need is this item's own first deliverable, so gating on validation would mean the trigger can never fire. **FIRED 2026-09-11:** the owner ruled that the lab is available for validation.
 
 **Scope.** Two halves, in order.
 
-1. **Validate the lab against what the residuals actually require** — a real Domain Controller, AD CS, a gMSA, a registered self-hosted Windows runner, and a real SQL Server instance. Each is a precondition of a specific item below; an environment that is merely *up* is not one that can discharge them. Record what was stood up and what was verified, because "the lab exists" and "the lab can answer question X" are different claims and only the second unblocks anything.
+1. **Validate the lab against what the residuals actually require** — a real Domain Controller, AD CS, a gMSA, and a registered self-hosted Windows runner. **Not a SQL Server:** `ci.yml`'s `sqlserver-store` legs already provide one. Each is a precondition of a specific item below; an environment that is merely *up* is not one that can discharge them. Record what was stood up and what was verified, because "the lab exists" and "the lab can answer question X" are different claims and only the second unblocks anything.
 2. **Run the four residuals** and record their results.
 
 **What it discharges** (each already fully specified in its own item — this item adds no new design):
@@ -3970,7 +3981,7 @@ So the registered control for a context should record **what it does not break**
 | **#99** | the live domain-lab gMSA / SSO / reverse-proxy smoke — the **only** residual left on that item | real DC + AD CS + gMSA |
 | **#98** | Kerberos SSO channel-binding (EPA) opt-in + acceptor-enforcement spike | same gate as #99 |
 | **#320** | the decisive windows-2025 capacity sweep, currently blocked because the runner is unregistered (`actions/runners` → `total_count: 0`) | a registered self-hosted WS2025 runner |
-| **#351** | execute the failover patch against a real SQL Server, **and** measure ADR 0159's `_acquire` cost — the question that item reserves | a real SQL Server |
+| **#351** | measure the `_acquire` cost the item reserves | a benchmark rig. **Not a SQL Server, and not the self-hosted runner:** `ci.yml`'s `sqlserver-store` legs already run this item's test against real SQL Server 2022 and 2025, and `selfhosted-win2025-sql.yml` deliberately excludes that test file. |
 
 ⚠️ **#351's measurement is the one that is easy to lose.** Its patch makes the test deterministic, which removes the only thing currently raising the latency question. The item says plainly that a lease-election test is the wrong instrument for discovering latency — so the measurement belongs here, as a benchmark or an explicit budget assertion, not there. Landing the patch without doing this drops the question rather than answering it.
 
@@ -3978,7 +3989,7 @@ So the registered control for a context should record **what it does not break**
 
 **Also, and it is the part that rots if nobody does it:** four items assert a premise that becomes false the moment the lab lands. #99 says its residual is *"rig/provisioning the project does not own"*; #320 says its experiment is blocked on an unregistered runner. Left alone, those sentences keep telling every future planning pass that the work is unreachable — the same stale-premise rot the 2026-07-28 reconcile found on five items and the 2026-08-03 re-score found on twenty-four. Each of the four gets its trigger line amended in this item's first commit, whether or not the runs have started.
 
-**Source:** owner, 2026-08-04 — a server for multi-VM testing is ~2 weeks out.
+**Source:** owner, 2026-08-04 — a server for multi-VM testing was then said to be about two weeks out. **That forecast was wrong about the date and right about the outcome, so read this line as history and never as a schedule.** The owner ruled 2026-08-20 that no such lab existed, and ruled 2026-09-11 that the lab **is available for validation**. The 2026-09-11 ruling is the current state.
 
 ## 1004. ASVS 13.3.4 — the store DEK's calendar expiry alerts and never refuses; build the enforced stop with a loud opt-out
 
@@ -17837,6 +17848,19 @@ point, which are the parts that must survive it.**
 > **WHY THE UBUNTU ZERO IS NOT A SKIP ARTEFACT.** Both gate test files are gated on `shutil.which("pwsh")` and never on `os.name`, so if `pwsh` were absent on ubuntu the whole pwsh-only class would skip. It does not: ubuntu executes 2,893 tooling tests against windows' 3,591, a delta of 698, while the pwsh-only class alone holds 334 functions and the windows-only class 431. A missing interpreter would have to collapse 765 functions into a 698-item delta, which is a parametrization factor below 1 and impossible. **The control genuinely ran.**
 > **WHAT THIS AMENDMENT STILL CANNOT ESTABLISH, EACH NAMING ONE THING.** (a) The cause, unchanged. (b) Whether the 5 probe timeouts and the 12 probe successes are one mechanism or two. (c) Whether `-n 2` removes it: untried on this leg, and `.github/workflows/ci.yml:1486-1488` warns the cost is wall clock on every leg while the block above it records that `-n 8` was measured worse on all three. (d) Whether the ubuntu zero is attributable to the OS or partly to its lower spawn volume -- that confound is not separated. (e) The rate per individual `pwsh` launch: bounded at no worse than 17 failures across 36 executions of roughly 3,590 tests each, but the number of those tests that actually spawn a child was not counted, so the per-launch figure is not established. (f) Two arms this item's signature folds in did not appear in this window and are therefore neither confirmed nor excluded: the crashed xdist worker in `tests/test_worktree_prune_merged.py` and the `test_connscale_smoke` monotonicity failure. Nor did the second named script -- all 17 timeouts here were `worktree_gate.ps1`, none `claim-reconcile.ps1`.
 > **STILL OPEN, EACH NAMING EXACTLY ONE THING.** (1) **The cause**, unchanged and unmeasurable off the runner -- not touched here. (2) **`--max-worker-restart=0`**, the engine step's third belt, **not ported**: it is a behaviour change (a worker death fails the run instead of being survived) whose zero cost was measured on the engine tier's history and on **no** sample from this one. It is the belt that would answer a controller left polling a dead worker until the 30-minute step cap, so it is the strongest remaining candidate and it needs its own measurement first. (3) **The rerun budget**, still an unwritten norm; a recommendation is in this change's PR body and the decision is the owner's.
+>
+> **AMENDMENT 2026-09-10: LIMB 2 IS NOW MEASURED ON THIS TIER, AND THE MEASUREMENT SAYS DO NOT PORT.** Limb 2 asks for this tier's own dead-worker sample before porting the belt. Taken: **58 completed `repo harness tests` jobs** -- 32 ubuntu success, 16 windows success, 10 windows failure -- drawn from the 60 most recent completed `ci.yml` runs, every log retrieved and none unavailable. **57 carried no `node down` at all. ONE did**, and it is the whole finding:
+> ```
+> job 103031540111   repo harness tests (windows-2025)   2026-09-10T20:12Z
+>   20:22:56  ...F[gw1] node down: Not properly terminated
+>   20:34:08  worker 'gw1' crashed while running
+>             tests/test_worktree_gate_control_plane.py::test_an_assignment_MENTIONED_before_the_write_does_not_earn_a_refusal
+>             2 failed, 3594 passed, 17 skipped, 8 xfailed in 1240.08s (0:20:40)
+> ```
+> **THE ENGINE TIER'S ARGUMENT DOES NOT TRANSFER, and that is the point.** Its `ci.yml` comment records that of the 33 jobs it sampled, the one with a `node down` HUNG until the cap and **zero** carried one and still passed -- so restarts had saved nothing there and disabling them cost nothing. Here the replacement worker **came up**, the run **completed in 20:40, under the 30-minute step cap**, and it returned a verdict naming the culprit test. With the belt in place `triggershutdown()` fires on the first death, so that run would have been **truncated at 21 percent progress**, losing roughly 3,594 results and the attribution. It would still be red, and far less readable.
+> **SO THE COST ON THIS TIER IS MEASURED ABOVE ZERO, NOT AT IT**, and `ci.yml`'s refusal to port blind is upheld on evidence rather than on the absence of it. **NOT CLAIMED:** that the belt is wrong for this tier forever. One dead worker in 58 jobs is a thin base, and a future sample showing a controller genuinely hanging here would reopen it. **The instrument carried its own positive control:** the grep returned 1, so its 57 zeroes are meaningful rather than the false zero a broken pattern produces.
+> **LIMB 2 STAYS OPEN, RE-AIMED.** What it asks for now is not "measure the cost" -- that is done -- but whether this tier ever shows the hang the belt exists to prevent. `.github/workflows/ci.yml` is deliberately untouched by the change carrying this amendment, to keep it clear of a sibling lane already editing that file; the comment there already points here.
+> **AND THE FALSE COMMENT IN `tests/test_worktree_gate.py` IS FIXED, which is this change's own limb.** `run_gate`'s timeout message asserted that an empty CHILD STDOUT "means it never reached its own first write", separating a startup hang from a later stall. **That was wrong.** `scripts/hooks/worktree_gate.ps1` writes to stdout in exactly one place, `Write-Deny`, which exits immediately after -- so empty stdout is the ORDINARY ALLOW RESULT and carries no information about how far the child got. Measured by driving the shipped hook: allow returned exit 0 with **0 bytes**, deny exit 0 with **3,496**. `run_gate` itself says the same thing a few lines below, where an empty stdout returns None. The comment now states what the dump genuinely carries and forbids the inference.
 > Verdict: build
 > Closing-act: code
 
@@ -21079,6 +21103,19 @@ that no entry can rescue. **The `partition` half is untouched and still needs a 
 > 🔢 **Filed 2026-08-27 (builder 2) - TWO HALVES BUILT IN THIS COMMIT, THE THIRD DELIBERATELY NOT.**
 >
 > **Scored 2026-09-03 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Both shipped halves were verified by DRIVING the script, not by reading it. Running scripts/coord/seat.ps1 -Declare with a BARE -Handoff filename against a throwaway git repo resolved it through the fallback at scripts/coord/seat.ps1:604-608 to an absolute handoffs path with state "resolves", bytes and sha256, and a nonexistent bare name appended a .writer-errors.txt line carrying 3 REAL tab bytes and 0 backtick-t sequences, which is half two at scripts/coord/seat.ps1:125. The deliberately-unchanged drift check is intact at scripts/coord/seat.ps1:130-212, and scripts/coord/fleet.ps1:296-346 counts dangling, drifted and unreadable separately; fleet.ps1 -Json over the live coord returned 39 dangling, 32 drifted, 0 unreadable across 75 pointers, with only 1 record still carrying unresolved:true and no file recoverable by the fallback. What remains is a pinning test and nothing else: tests/test_coord_handoff_pointer.py passes 12 of 12, but all 12 -Handoff calls hand it an absolute path and no test reads .writer-errors.txt, so reverting either half would leave the suite green. That is one or two cases on the existing repo fixture in that file, which is why this reads 2 rather than 1.
+>
+> **AMENDMENT 2026-09-10: THE PINNING TEST IS BUILT. Both shipped halves are now held by a test that FAILS when either is reverted.** The scoring note above is exactly right that all twelve existing tests hand `-Handoff` an absolute path and none reads `.writer-errors.txt`, so reverting either half left the suite green. Two tests in a new `TestDeclareResolvesAndRecordsItsOwnFailures` class close that, and both were **mutation-proved rather than assumed**:
+> ```
+> revert the seat.ps1 handoffs fallback  -> test_a_bare_handoff_filename_resolves_through_the_handoffs_directory
+>                                           FAILS: "the bare name was stored as given: bare-name.md"
+>                                           the tab test stays GREEN
+> revert the format string to '{0}`t...'  -> test_the_writer_error_log_carries_real_tabs
+>                                           FAILS on the raw bytes, backtick-t back in the log
+>                                           the fallback test stays GREEN
+> ```
+> Each mutation moves **exactly one** test, so neither pin is passing for a reason belonging to the other. The fallback test writes its file **only** into the handoffs directory and asserts the cwd cannot answer, so the fallback is the only path that can produce a resolving pointer. The tab test reads **bytes**, not text, because the defect is invisible to any assertion that reads fields.
+> **CONFIRMED EXECUTED, NOT SKIPPED.** The suite is gated on `os.name == "nt"` plus `pwsh` on PATH, so a silent skip would ship two tests measuring nothing. Collected 14, selected 2, **2 passed** on Windows with `pwsh` present.
+> **AND THE DRIFT PARAGRAPH BELOW IS STALE -- read this before acting on it.** *"WHAT IS DELIBERATELY NOT CHANGED: THE DRIFT CHECK"* was true when filed and is not now. Drift was removed from the stop-condition roll-up, ruled 2026-08-27 under the owner's standing AFK authority, with the reasoning recorded at `scripts/coord/fleet.ps1` above the `ptrDangling` stop. Recorded values are still never repaired and `handoffPointersDrifted` is still counted and still rendered; only what the STOP CONDITION aggregates changed. `tests/test_coord_handoff_pointer.py::test_a_drifted_pointer_alone_raises_no_stop_condition` pins the new behaviour. **What is deliberately not changed is narrower than the paragraph claims: the drift DETECTION in `seat.ps1`, not the roll-up.**
 > Verdict: build
 > Closing-act: code
 
@@ -26592,6 +26629,15 @@ line appeared on every one of six `Workflow` spawns in that session.
 
 ## 1458. the subprocess sandbox allocates one unpooled worker tree per traffic-carrying inbound, the exact per-connection-worker growth ADR 0052 AC-2 forbids
 
+> 🚧 **Status 2026-09-10 -- THE ADR IS FILED AND THIS ITEM STAYS OPEN. Read this banner first; the "not started" line below is stale.** [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md) is on this item as **Proposed**, deliberately. It prices four shapes and recommends one; it decides nothing, because the shape is the owner's ruling. **This item cannot close until that ruling lands**, and its closing-act is still code that does not exist.
+> **What the ADR changes about the question below.** The two candidate shapes this row names are **not alternatives**. Router-phase-only isolation changes *what runs* in the child, not *how many children exist*, so on its own it leaves the cardinality exactly where it is; it earns its place by making a pool easy to size. The ADR's recommendation is therefore the **combination** -- isolate the router phase and serve it from a bounded shared pool -- and the cost it asks the owner to accept is isolation breadth, since transforms lose the address-space boundary they have at `mode="subprocess"` today.
+> **The load-bearing fact this row did not have.** `_sandbox_worker.main` runs `load_config` over the **whole config dir**, so every per-inbound child holds an **identical** full registry and the children differ only in a stderr log label. That is the strongest argument for pooling, and it also means pooling does not widen handler-to-handler exposure, which [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) already disclaims.
+> **The strongest argument AGAINST the pool, carried rather than buried.** `SandboxSession.dispatch` holds its lock across the whole body and ends every isolation fault in a worker kill; **kill is the only cancellation primitive there is.** So a pool escalates ADR 0087's accepted *"a compromised worker can deny its own feed"* residual into a **cross-lane** denial of service. No shape here answers that, and the ADR records it as unresolved on purpose.
+> **A measurement was run, and it settles the 22-versus-11 contradiction #1278 records.** `Win32_Process` returns **distinct** pids in parent-child pairs -- 3 spawns produced 3 venv launcher stubs each with exactly 1 live base-interpreter child, 23 rows and 23 distinct `ProcessId` values. So the second process is **real**, not a duplicated row, and ADR 0087's *"two processes per worker tree on Windows"* is the figure to use: 22 was the true process count for 11 logical workers. **The test #1278 names is still unrun** -- the engine was not started, and the probe reproduced the launcher mechanism in isolation instead. Memory arithmetic is unchanged; only the process limb moves, which is the limb AC-2 names most directly.
+> **The stale sub-claim below is corrected in the artifact.** The benchmark README's finding 3 still asserted the **74 GiB** framing [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) retracted in place on 2026-09-05; it is now retracted there too, citing that retraction. Its heading also claimed *"no record states it"*, which ADR 0087's own amendment had already made false.
+> **AC-2 still cannot be closed by measurement, in either direction.** [ADR 0052](adr/0052-enterprise-scale-target.md) calls the 1,500-connection axis unvalidated (`:99`) and its connection-scale harness one that *"does not exist"* (`:108`). The structural claim needs no harness and is unchanged: the count grows one-per-inbound, uncapped and unevicted.
+> **Anchor drift found while re-checking this row, recorded because line numbers are navigation aids and never evidence.** The `mode="off"` default is at `config/settings.py:1403` (`SandboxSettings` at `:1352`), not `:1311` / `:1294-1321`; the `SandboxPolicy` build is at `pipeline/engine.py:723-732`, not `:675-688`; the *"no line between admin functions"* disclaimer is at `pipeline/sandbox.py:53-54`, not `:39-42`; `_spawn`'s `Popen` is at `:637`, its pipes at `:639`, its daemon threads at `:662`/`:668` and `_assign_kill_on_close_job` at `:472`. **And the count is wrong, not just the numbers:** this row and the benchmark both say *both* `run_contexts(..., phase="transform")` activation sites; there are now **three**, at `pipeline/wiring_runner.py:5587`, `:6044` and `:6321`. The substance is untouched -- all three are transform-phase -- but "both" is no longer true.
+>
 > 🔢 **Filed 2026-09-05 -- not started. Scored at filing.** Value **6/10** · Difficulty **7/10** · _big bet_. At `[sandbox].mode = "subprocess"` the engine holds one persistent worker process tree per traffic-carrying inbound. Nothing pools it and nothing caps it: the child is spawned lazily on first dispatch, never evicted, and released only at runner stop or config reload. Each one adds a process tree, two parent daemon threads, three parent pipe file descriptors and a Windows job-object handle -- which is precisely the resource class [ADR 0052](adr/0052-enterprise-scale-target.md) AC-2 names. The remedy is a rearchitecture of the worker cardinality, and this row deliberately does not choose between the two shapes the record already names.
 > Verdict: research
 > Research: none
@@ -30641,7 +30687,8 @@ and will move to the archive when it closes.
 
 ## 1529. Retire the Console seat; the Manager is the live dispatching seat
 
-> 🚧 **Filed 2026-09-10, and the change is IN THIS PR. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
+> ✅ **CLOSED 2026-09-11 -- landed on `main` via `cbb63ad28` (PR 1030), verified with `git merge-base --is-ancestor` against a negative control that correctly refused an unmerged head.** The Console seat is retired in `CLAUDE.md` section 5, `seats.json` now reads live = manager, builder, regulator, steward, lander, and korus PR 100 retired it there too, so both repositories agree. **The sentence below said the change was IN THIS PR; that went stale at merge**, which is the #1448 shape this item itself cites -- a row stays open because nothing records the work that answered it.
+> **Filed 2026-09-10. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
 > Verdict: build
 > Research: none
 > Closing-act: the Lander flips this banner
@@ -31180,3 +31227,73 @@ confirmation. They were the same artifact.
 **Severity:** developer tooling only -- no product, engine or PHI surface, and **no deployment axis (sec. 0)**. The cost is a namespace control that would approve an interpreter it exists to reject, if the candidate ordering that currently hides it ever changes.
 
 **Related:** [#1216](#1216) shipped the resolver this guards and is closed. [#1373](#1373) fixed the coreutils-less PATH conflation and is closed; this row is its residual. [#1272](#1272) is the 126-versus-127 discrimination in the same module.
+
+---
+
+## 1541. the SQL Server cluster coordinator namespaced its lease key by a db_schema its store never reads, so two installs on one database would elect two leaders over one queue
+
+> 🚧 **Built 2026-09-11 by a Builder on branch `claude/sqlserver-lease-schema`, PR 1056, in branch commits `cce2db39c` and `7bb408d8b`. Open until that PR merges, when the Lander flips this banner.** Value **7/10**, Difficulty **2/10**. `SqlServerCoordinator` built its leadership lease key and its DDL applock name from `[store].db_schema`. The SQL Server store never reads that setting, so the key split by schema while the tables it guards stayed shared. The fix makes both keys constant on SQL Server and refuses `db_schema` at load on every backend but Postgres. Value 7: the failure is two leaders over one queue, though only under one misconfiguration. Difficulty 2: two constants, one validator and one doc row.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** HA / clustering. **Priority:** P1. **Verdict:** build.
+**Severity:** conditional (sec. 0). The defect is real and shipped. On `main` at `8c1ad29d8`, the SQL Server coordinator derives its lease key from `db_schema`. The exposure is conditional, because there are zero deployments. Two installs on one SQL Server database with different `db_schema` values would elect separately on first deployment. Each would then run a leader over one shared queue.
+
+### Two leaders break the premise the SQL Server design rests on
+
+The SQL Server coordinator is active-passive only. Its module docstring says "The single active node (the leader) drains every lane". It also skips the startup `reset_stale_inflight`, which "would steal a live sibling's rows", and runs it on promotion instead. Both rules assume one leader. With two, duplicate delivery is the expected result. No test here ran two leaders, so that outcome is inferred from the design, not measured.
+
+### The key split by schema while the tables stayed shared
+
+Measured at `8c1ad29d8` with `git show` and a per-line match:
+
+| Measure | Value |
+|---|---|
+| `messagefoundry/store/sqlserver.py` length | 10,288 lines |
+| Lines naming `db_schema` in that file | 0 |
+| Control: lines naming `_settings` in the same file | 16 |
+| Control: lines naming `db_schema` in `store/postgres.py` | 7 |
+| `CREATE TABLE` statements in the SQL Server store / its coordinator | 32 / 3 |
+| Of those, schema-qualified | 0 |
+
+The qualified-name pattern matched `CREATE TABLE dbo.nodes` and `CREATE TABLE [mefor].[nodes]` before it was trusted, so that zero is real. A plain line count gives the coordinator 4, because a docstring also names `CREATE TABLE`. The brief that raised this row cited 9,787 lines for the store, a figure from an older tree.
+
+Unqualified names resolve against the login's default schema, whatever `db_schema` says. So two installs that differed only in `db_schema` would share every table, including `leader_lease` and `nodes`. Each would hold its own lease row, keyed by its own schema, so each would elect its own leader. The DDL applock would split the same way. A concurrent first open would then no longer be serialized across the two installs.
+
+The same key derivation is correct on Postgres. `PostgresStore` points the pool's `search_path` at `db_schema`, so each schema there has its own tables.
+
+### The natural wrong reading: "the store never reads db_schema, so the key always fell back to dbo"
+
+A reader who searches `store/sqlserver.py` finds no `db_schema`. The easy next step is to decide that the old `getattr(..., "db_schema", None) or "dbo"` always fell through to `"dbo"`. Both installs would then share one key and elect together, which would be safe. **That reading is wrong.**
+
+`db_schema` is a field on `StoreSettings` in `messagefoundry/config/settings.py`. It is set from `[store].db_schema` or from the env var `MEFOR_STORE_DB_SCHEMA`. The SQL Server store keeps that settings object as `self._settings`. The old coordinator read `db_schema` off `store._settings`, not off the store module. So the setting reached the key even though the store never used it. **Absent from the implementation is not absent from the settings.**
+
+Measured by the Builder that filed this row, not relayed. It loaded the coordinator from `8c1ad29d8` and gave it a real `SqlServerStore`. The store's settings carried no schema, then a schema read through `MEFOR_STORE_DB_SCHEMA`, then a third schema. They were built with `model_construct`, because the fixed validator now refuses them. The store module's text names no `db_schema`, yet the old coordinator produced three lease keys: `dbo:mefor_cluster_leader`, `tenant_a:mefor_cluster_leader` and `tenant_b:mefor_cluster_leader`. The fixed coordinator produced one.
+
+### The recurrence shape: a mirrored comment whose premise holds only in the original
+
+`SqlServerCoordinator` in `pipeline/cluster_sqlserver.py` is a hand-mirror of the Postgres coordinator, `DbCoordinator` in `pipeline/cluster.py`. Its module docstring says the in-memory pieces "are copied verbatim and only the DB layer differs". Its comments say "Mirrors DbCoordinator" and "keep the two in lockstep".
+
+**A hand-mirrored backend copy carries a comment whose premise is TRUE in the original and FALSE in the copy, and nothing compares the two.** Here the namespacing line came across with its comment: "Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two deployments sharing one database via different schemas don't contend / co-elect." That premise holds on Postgres, where `search_path` separates the tables. It is false on SQL Server, where nothing does.
+
+A mirror carries two kinds of line. Mechanism lines, such as the fence math, should match. Premise lines depend on what that backend's store actually does, so each must be re-derived. Nothing marks which kind a line is, and a "keep the two in lockstep" comment pushes a reader to copy both.
+
+The test suites mirrored it too. The SQL Server store tests and the pooled-rider test seeded `dbo:mefor_cluster_leader`, a string only the old derivation produced. Expect the next instance wherever a backend file says it mirrors another.
+
+### What was built
+
+1. `SqlServerCoordinator`'s keys are constants: `mefor_cluster_leader` and `mefor_cluster_nodes`. Installs that share tables now share the election and the DDL lock.
+2. `StoreSettings._db_schema_backend` refuses a non-empty `db_schema` on `sqlserver` and `sqlite` at load, because neither store reads it. Its docstring holds the reasoning, and the comments on both coordinators point at it.
+3. `build_coordinator` reads `db_schema` only on the Postgres path.
+4. `docs/CONFIGURATION.md` gives `db_schema` its own row, marked Postgres only, and `docs/CLUSTERING.md` links to it.
+
+PR 1056's before-and-after run reports that `test_sqlserver_lease_identity_ignores_db_schema` and both cases of `test_db_schema_refused_off_postgres` fail without the fix and pass with it. No Postgres assertion was removed.
+
+**Rejected:** making the SQL Server store honour `db_schema` by qualifying every table. That rewrites the store, its claim procedures and its privilege probe to close a two-leader window. If several installs on one SQL Server database are ever wanted, that is a feature with its own row (unfiled).
+
+### Left open
+
+- Nothing compares a mirrored backend file with its original. A screen that lists premise-bearing comments in `cluster_sqlserver.py` beside their `cluster.py` twins would catch the next one. This row does not build it.
+- The Postgres schema rule is still derived in two places: `PostgresStore._lock_key`, and `DbCoordinator`'s key strings fed by `build_coordinator`. Having the store supply the key prefix would leave one source. A review of this change raised it. It was left out because it changes the Postgres store and the coordinator's constructor.
+- Privilege: no change. The keys are a `leader_lease` row value and an `sp_getapplock` resource name, and the same login already uses both. The SQL Server CI leg runs as `sa`, so a green run there does not prove a low-privilege login works.
