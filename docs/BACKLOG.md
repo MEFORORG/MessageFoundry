@@ -30685,7 +30685,8 @@ and will move to the archive when it closes.
 
 ## 1529. Retire the Console seat; the Manager is the live dispatching seat
 
-> 🚧 **Filed 2026-09-10, and the change is IN THIS PR. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
+> ✅ **CLOSED 2026-09-11 -- landed on `main` via `cbb63ad28` (PR 1030), verified with `git merge-base --is-ancestor` against a negative control that correctly refused an unmerged head.** The Console seat is retired in `CLAUDE.md` section 5, `seats.json` now reads live = manager, builder, regulator, steward, lander, and korus PR 100 retired it there too, so both repositories agree. **The sentence below said the change was IN THIS PR; that went stale at merge**, which is the #1448 shape this item itself cites -- a row stays open because nothing records the work that answered it.
+> **Filed 2026-09-10. Owner decision: there is no Console seat at all.** Value **6/10** · Difficulty **3/10**. Value 6: the roster is injected at session start, so a wrong seat outranks the document that would correct it, and the specific wrong read has already happened once. Difficulty 3: the hook is data-driven from `docs/roles/seats.json`, so the roster change is one file; the cost is prose across the governing documents.
 > Verdict: build
 > Research: none
 > Closing-act: the Lander flips this banner
