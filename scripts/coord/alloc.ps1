@@ -81,7 +81,16 @@ param(
     # number -- instead of the tree this allocator runs in. See the -For discussion in .DESCRIPTION:
     # it names the owner at BIRTH and never moves an existing claim, so it is not the transfer verb
     # docs/LEDGER-GATE.md declined.
-    [string]$For
+    [string]$For,
+    # Skip the pre-flight `git fetch origin` that runs at the Get-Floor call site below.
+    #
+    # THE DEFAULT IS TO FETCH. This switch disables the ONLY instrument that can see a number already
+    # allocated in ANOTHER CLONE: with it set, the floor is computed from whatever refs this clone
+    # happens to hold, so a number taken on a branch nobody here has fetched reads FREE.
+    #
+    # It exists for a genuinely OFFLINE box, not for a slow one. Measured on this clone 2026-09-12:
+    # the fetch costs about 1.4s against a ~40s backlog sweep, so there is no performance case for it.
+    [switch]$NoFetch
 )
 
 $ErrorActionPreference = "Stop"
@@ -392,7 +401,13 @@ function Get-Floor {
     # good enough: persist the high-water mark and never go below it.
     #
     # SAFE:      `git fetch origin --prune` -- prunes only refs/remotes/origin/*, which is not where the
-    #            high numbers live. It is also what you SHOULD run before allocating.
+    #            high numbers live.
+    # NOT ADVICE: this table says which CLEANUP operations break the ratchet, and nothing more. It used
+    #            to end by telling you to run that same line before allocating, which is advice for the
+    #            ALLOCATOR bolted onto a table about cleanup. The caller now fetches for you -- see the
+    #            pre-flight block at the single Get-Floor call site -- and it deliberately omits
+    #            --prune: a fetch there exists to ADD refs, which can only RAISE the floor, while a
+    #            prune only DELETES refs, which can only lower one and removes witnesses.
     # DANGEROUS: `git remote prune <name>` / `git remote remove <name>` for a non-origin remote,
     #            deleting refs/<vault-ish>/*, or an aggressive `gc` / `reflog expire` that drops
     #            unreachable objects. Those are what this ratchet defends against.
@@ -411,10 +426,17 @@ function Get-Floor {
     $previous = 0
     if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
 
+    # NAME THE CAUSE, AND DO NOT SEND THE OPERATOR AFTER A REMEDY THAT CANNOT WORK. This used to end
+    # "re-fetch them before trusting any number-space reasoning here", which is wrong twice over now:
+    # the caller has ALREADY fetched origin by the time this prints, and the refs carrying those higher
+    # numbers are NON-ORIGIN remote-tracking refs, which no fetch of origin can restore.
     if ($previous -gt $computed) {
         Write-Host "NOTE: computed $Kind floor $computed is BELOW the recorded high-water $previous." -ForegroundColor Yellow
-        Write-Host "      Using $previous. Refs that carried the higher numbers are missing from this clone;" -ForegroundColor Yellow
-        Write-Host "      re-fetch them before trusting any number-space reasoning here." -ForegroundColor Yellow
+        Write-Host "      Using $previous, so the gap is already covered -- this is the ratchet working," -ForegroundColor Yellow
+        Write-Host "      not something to act on. The refs that carried the higher numbers are gone from" -ForegroundColor Yellow
+        Write-Host "      this clone: a non-origin remote was deleted, an aggressive gc or reflog expire" -ForegroundColor Yellow
+        Write-Host "      dropped unreachable objects, or this clone never had them. Fetching origin does" -ForegroundColor Yellow
+        Write-Host "      not restore any of those, and the caller already fetched it." -ForegroundColor Yellow
     }
     $floor = [Math]::Max($computed, $previous)
     if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
@@ -456,6 +478,107 @@ if (Test-Path $gateFile) {
     # this contract so the break lands in CI on whoever edits the constant, not on a session days later.
     $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)')
     if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
+}
+
+# PRE-FLIGHT FETCH -- THE ONLY INSTRUMENT THAT CAN SEE A NUMBER ALLOCATED IN ANOTHER CLONE.
+#
+# Every term in Get-Floor reads refs THIS CLONE ALREADY HAS, and until this block landed the script
+# executed zero fetches. So when clone B has not fetched since clone A pushed a branch, A's ref is
+# simply absent here: the number reads FREE, B allocates it, and B's ledger gate then passes
+# CORRECTLY -- the number genuinely IS allocated in B's own registry. Two machines, one number, every
+# gate green on both sides, and nothing anywhere reporting it. That happened on 2026-09-11: PR 1061
+# wrote "## 1546." while #1546 was allocated and claimed to PR 1060.
+#
+# WHERE THIS SITS IS PART OF THE FIX. All four reasons are load-bearing:
+#   * OUTSIDE Get-Floor. That function's -Peek comment says "Reading a value must not be able to
+#     corrupt it", and network I/O belongs to the caller. Get-Floor has exactly ONE call site, so
+#     fetching here provably precedes BOTH of its ref enumerations without touching either arm.
+#   * BEFORE the -ShowFloor block below, whose own comment states the invariant that both checks are
+#     evaluated ONCE so -ShowFloor and a real allocation cannot disagree. A fetch that ran only on a
+#     real allocation would break exactly that, and -ShowFloor would preview a floor the allocator
+#     would not use. (Spelled "the -ShowFloor block" and not with its `if` keyword on purpose:
+#     tests/test_ledger_check.py locates that block with `src.index`, a FIRST-match instrument for a
+#     question about the block itself, so writing the opening line verbatim in a comment ABOVE it
+#     moves the index and reds a guard that has nothing to do with this change. Measured here.)
+#   * AFTER the -List early return. -List reads the local registry only; it stays offline and fast.
+#
+# NO --prune, DELIBERATELY. A fetch here exists to ADD refs, and an added ref can only RAISE the
+# floor. A prune only DELETES refs, so it can only LOWER one: no benefit to the question being asked,
+# and it removes witnesses. Measured on this clone: one `git fetch origin --prune` deleted six refs,
+# among them origin/gh-readonly-queue/main/pr-1060-..., a queue branch belonging to one of the two
+# PRs in the #1546 collision -- and a queue branch carries the ledger row.
+#
+# `fetch origin`, NOT --all AND NOT `fetch origin main`. Both #1546 items lived on UNMERGED
+# refs/remotes/origin/claude/* refs, so fetching main alone would have seen neither. The configured
+# refspec +refs/heads/*:refs/remotes/origin/* is what a bare `fetch origin` uses, and it is what
+# brings those refs in. --all fails closed on any dead remote, which manufactures deadlocks rather
+# than safety.
+#
+# NO ORIGIN IS NOT A FAILURE AND MUST NOT FAIL CLOSED. Measured 2026-09-12: with origin absent,
+# `git config --get remote.origin.url` exits 1 with no output, where an unguarded `git fetch origin`
+# exits 128 with a fatal. No origin means there is no shared upstream to be stale against -- and
+# every fixture in tests/test_coord_alloc_floor.py is such a repo, so an unguarded fail-closed fetch
+# would refuse the whole suite.
+#
+# A NETWORK FAILURE FAILS CLOSED AND ALLOCATES NOTHING, and this is the decisive part. The control
+# this block replaces is a PRINTED WARNING, and that warning was already in this script when #1546
+# collided. Re-adding allocate-and-shout would reinstall a control MEASURED not to work, which is the
+# compensating-control-resting-on-a-false-premise defect CLAUDE.md section 11 and SDS-3.7 forbid. The
+# header above already settles the trade: holes are free, collisions are not. The throw lands before
+# the allocation loop, so there is no partial state to unwind.
+if ($NoFetch) {
+    Write-Host "WARNING: -NoFetch. The floor below came from refs this clone ALREADY HAD." -ForegroundColor Yellow
+    Write-Host "         A number allocated in another clone, on a branch nobody here has fetched," -ForegroundColor Yellow
+    Write-Host "         reads FREE -- and the ledger gate will then pass on BOTH sides, because each" -ForegroundColor Yellow
+    Write-Host "         registry genuinely holds its own claim. Nothing downstream reports it." -ForegroundColor Yellow
+    Write-Host "         Say in the PR why you skipped the fetch." -ForegroundColor Yellow
+}
+else {
+    # THE EXIT CODE IS THE WITNESS, NOT `$?`. Same rule the git grep loop records above: `$?` is False
+    # after ANY non-zero native exit and cannot tell a fatal from a legitimate 1. -1 is a NEVER-RAN
+    # sentinel, because a command that never starts sets no exit code at all and a stale value from an
+    # earlier call would read as success.
+    #
+    # $ErrorActionPreference is pinned to Continue across this scope, and restored before anything
+    # throws. `2>&1` on a native command yields ErrorRecord objects, so on a host with
+    # $PSNativeCommandUseErrorActionPreference true the script-level "Stop" turns git's first stderr
+    # line into a generic NativeCommandExitException and the actionable message below never prints.
+    $fetchFailure = $null
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $global:LASTEXITCODE = -1
+        $originUrl = & git -C $repo config --get remote.origin.url 2>&1
+        $originCode = $LASTEXITCODE
+        if ($originCode -eq 0 -and -not [string]::IsNullOrWhiteSpace("$originUrl")) {
+            $global:LASTEXITCODE = -1
+            $fetchOut = & git -C $repo fetch origin 2>&1
+            $fetchCode = $LASTEXITCODE
+            if ($fetchCode -ne 0) {
+                $fetchFailure = [pscustomobject]@{
+                    Code   = $fetchCode
+                    Detail = ((@($fetchOut) | ForEach-Object { "$_" }) -join "`n  ").Trim()
+                }
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previousEap
+    }
+    if ($null -ne $fetchFailure) {
+        throw @"
+REFUSING TO ALLOCATE: the pre-flight 'git fetch origin' failed, so the floor could not be computed
+against the refs this clone is missing. Exit $($fetchFailure.Code) (-1 means git never ran). Git said:
+  $($fetchFailure.Detail)
+
+This fails closed on purpose. Allocating anyway and printing a warning is the control that was
+already in this script on 2026-09-11, when PR 1061 wrote "## 1546." over a number claimed to PR
+1060: both registries were right, both gates passed, and nothing reported the collision. Holes are
+free, collisions are not.
+
+Fix the network or the remote and re-run. On a genuinely offline box pass -NoFetch, and say in the
+PR why the number was allocated without checking the remote.
+"@
+    }
 }
 
 $measured = Get-Floor -Peek:$ShowFloor

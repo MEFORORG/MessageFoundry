@@ -31812,3 +31812,72 @@ Difficulty is 3 rather than 2 because of the coupling, not the edit. The tuples 
 ### The version is not in scope
 
 **This row does not propose changing `sigstore==4.4.0`, and must not be read as reopening it.** That version is an owner ruling, twice affirmed. Its rationale lives once, at the `release-tools` group in `pyproject.toml`, with the record in [#332](#332). Everything here is about what guards the pin, never about what the pin says. Step 1 would make the ruling harder to undo, not easier.
+
+## 1616. alloc.ps1 computed its ledger number floor from refs the clone already held and executed zero fetches, so two clones could take one number with every gate green on both sides
+
+> 🚧 **Built 2026-09-12 by a Builder. Open until its PR merges, when the Lander flips this banner.** Value **7/10** · Difficulty **3/10**. `scripts/coord/alloc.ps1` derived its floor from local and remote-tracking refs only and ran no `git fetch`. A clone that had not fetched since a sibling clone pushed could not see the sibling's number, read it as free, and take it -- and the ledger gate then passed on BOTH sides, correctly, because each registry genuinely held its own claim. The fix is a guarded pre-flight `git fetch origin` at the single `Get-Floor` call site, a `-NoFetch` escape for a genuinely offline box, and three cases in `tests/test_coord_alloc_floor.py`. Value 7: the allocator is the one control standing against a silent ledger collision, and it carried a hole no gate could see. Difficulty 3: one guarded fetch, two prose repairs, three test cases.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination / ledger allocator. **Priority:** P2. **Verdict:** build.
+
+**Severity:** no deployment axis (section 0). This is repository coordination tooling: no engine behaviour, no shipped artifact, no PHI. A colliding allocation **would** corrupt the ledger's number space and **would** file two unrelated pieces of work under one item number. It would reach no running instance, because there are none.
+
+### The collision already happened, and only that part is history rather than a forecast
+
+On 2026-09-11, PR 1061 wrote `## 1546.` into `docs/BACKLOG.md` while #1546 was allocated and claimed to PR 1060. Both PRs' gates passed. Nothing reported the overlap.
+
+### The script executed zero fetches, counted rather than inferred
+
+Measured at `origin/main` `fa7bc9e3e`, over the 663 lines of `scripts/coord/alloc.ps1`:
+
+| Measure | Value |
+| --- | --- |
+| Executed `& git` calls | 15 |
+| Of those, naming `fetch` | **0** |
+| Occurrences of the word `fetch` in the file | 2 |
+| Of those, inside a comment | 1 |
+| Of those, inside a `Write-Host` string | 1 |
+| Control: raw `& git` matches, comments included | 16 |
+
+The control is why the first row reads 15 and not 16. A bare grep for `& git` returns 16 and the sixteenth is prose, so counting matches rather than calls would have put the executed total one high -- without changing the answer about `fetch`, which is the question.
+
+### Every gate passes on both sides, which is why nothing reported it
+
+The allocator's registry is per clone. `alloc.ps1` writes `<git-common-dir>/mefor-coord/alloc/<kind>/<number>.json`, so clone A's claim on a number is invisible to clone B by construction; the only way B can learn the number is taken is to see A's ref. When B has not fetched, that ref is absent, the floor reads lower, and B issues the number. B's `ledger_check.py` then finds a live local claim for exactly that number and passes -- which is the correct answer to the question it asks. The defect is not a gate failing. It is two gates each answering a local question truthfully while the global invariant breaks between them.
+
+### The recurrence shape: a hazard named in a comment and enforced by a printed warning is not enforced
+
+`Get-Floor`'s high-water ratchet already carried a comment about missing refs, and the ratchet printed a warning when the computed floor fell below the recorded high-water. That warning was in the script on 2026-09-11 when #1546 collided.
+
+So the control existed, the hazard was written down beside it, and the collision happened anyway. A comment informs whoever reads the file; a printed warning informs whoever reads the terminal. Neither refuses anything. Re-adding allocate-and-shout would have reinstalled a control **measured** not to work, which is the compensating-control-on-a-false-premise defect section 11 and SDS-3.7 forbid -- so the fetch fails closed instead. The script's own header already settles that trade: *holes are free, collisions are not*.
+
+This shape is worth carrying past this row. Wherever a comment records a hazard and the only mechanism beside it prints, the hazard is documented and unguarded, and the documentation is what makes it look handled.
+
+### What was built
+
+1. A guarded pre-flight `git fetch origin` immediately before the single `Get-Floor` call site. Its position is load-bearing four ways: outside `Get-Floor`, whose `-Peek` contract is that reading a value must not corrupt it; before the `-ShowFloor` block, whose comment states that both checks are evaluated once so an inspection and a real allocation cannot disagree; after the `-List` early return, which reads the local registry only and stays offline; and at the one call site, which provably precedes both of `Get-Floor`'s ref enumerations without touching either arm.
+2. **No `--prune`, deliberately.** A fetch here exists to ADD refs, and an added ref can only RAISE the floor. A prune only DELETES refs, so it can only lower one. Measured: one `git fetch origin --prune` on this clone deleted six refs, among them a `gh-readonly-queue` branch for one of the two PRs in the #1546 collision -- and a queue branch carries the ledger row. Zero benefit, and it removes witnesses.
+3. `fetch origin`, not `--all` and not `fetch origin main`. Both #1546 items lived on unmerged `refs/remotes/origin/claude/*` refs, so fetching main alone would have seen neither; the configured `+refs/heads/*:refs/remotes/origin/*` refspec that a bare `fetch origin` uses is what brings them. `--all` fails closed on any dead remote, which manufactures deadlocks rather than safety.
+4. **No origin is not a failure.** Measured 2026-09-12: with origin absent, `git config --get remote.origin.url` exits 1 with no output where an unguarded `git fetch origin` exits 128. Every fixture in `tests/test_coord_alloc_floor.py` is originless, so an unguarded fail-closed fetch would have refused the whole suite.
+5. `-NoFetch`, for a genuinely offline box rather than a slow one -- the fetch costs about 1.4s against a roughly 40s backlog sweep. It prints a yellow warning naming the exact hazard, including that the ledger gate will pass on both sides and that the user must say in the PR why they skipped it. That last clause turns an invisible risk into a reviewable statement.
+6. Two now-stale prose sites in the ratchet block, repaired. The SAFE/DANGEROUS table ended by telling the reader to run `git fetch origin --prune` before allocating -- advice for the allocator bolted onto a table about which cleanup operations break the ratchet, and now wrong about the flag. The ratchet's warning ended "re-fetch them before trusting any number-space reasoning here", which after this change tells the operator to do what the caller just did AND points at a remedy that cannot work: the refs carrying those higher numbers are non-origin remote-tracking refs, which no fetch of origin can restore.
+
+### The three test cases, and what each one refuses
+
+Added to the existing `tests/test_coord_alloc_floor.py`, so no `tooling_manifest` row is needed. All three use a LOCAL PATH as the remote, so none touches a network.
+
+| Case | Mutation it catches |
+| --- | --- |
+| the floor sees a number that only the remote carries | the fetch deleted |
+| `-NoFetch` really does not fetch | the flag made a no-op |
+| a repo with no origin still returns a floor | the no-origin guard removed |
+
+Each mutation was applied to the shipped script and run: **each reds exactly its own case, the other two stay green, and the unmutated script passes all three.** The first case carries a positive control before its assertion -- the remote-tracking ref must not resolve, and the planted number must appear in no local ref's ledger and not in the working tree -- because a fixture that had already fetched would pass it vacuously.
+
+Process counts re-measured with `GIT_TRACE` on the 200-ref fixture: **7** git invocations on both the adr and the backlog arm, up from 6, the one addition being the `config --get remote.origin.url` probe. The existing `<= 15` bounds are unchanged and still discriminate against a per-ref sweep, which measured 206.
+
+### What is deliberately NOT changed
+
+`scripts/coord/alloc_strand_sweep.py` gains no fetch. `alloc.ps1`'s own comment says its `numbers_on_refs` is "the same sweep in Python" and that you should "change one and read the other", which reads as an obligation to mirror this. It is not: that script is a diagnostic READER, not an allocator, so it issues nothing and a stale read there costs a stale diagnostic rather than a collision. The asymmetry is intentional and is recorded here so the next reader does not file it as drift.
