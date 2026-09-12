@@ -26,10 +26,24 @@ The lock-only venvs are one half. The other half is every OTHER `pip install` on
 `build`, `sigstore`, `cyclonedx-bom`, `packaging`, and the `pip` bootstraps — which resolved whatever
 PyPI served at tag time. `sigstore` is the sharp one: its step is unconditional and the very next
 command signs the release artifacts with the job's OIDC identity, the same identity that publishes to
-PyPI. Those are now version-pinned, and the second half of this module keeps them that way — nothing
+PyPI. Those are now pinned, and the second half of this module keeps them that way — nothing
 else can see the regression, because Dependabot has no updater for an inline `pip install X==Y` in a
 workflow (its `uv` ecosystem only reads pyproject.toml + uv.lock), so a stale pin rots invisibly and a
 DELETED pin is invisible twice over.
+
+**Amendment, 2026-09-10 (BACKLOG #332 step 6).** Three of those four are no longer INLINE pins at all.
+`sigstore`, then `build` and `cyclonedx-bom`, moved into the PEP 735 `release-tools` group and are
+installed from `ci/locks/release-tools.lock` with `--require-hashes`. That closes the gap an inline
+`==` never could: an inline pin fixes the TOP package while every transitive still floats and resolves
+at tag time, inside the privileged job. `packaging` is the one that stays inline, by design — it is
+derived at run time from `constraints.lock` rather than literal (see the `$PKG_PIN` steps), so it
+tracks the lock without a workflow edit.
+
+THE GUARD MOVED WITH THEM, and the direction of travel matters when reading the tables below: a tool
+that leaves `RELEASE_PINNED_TOOLS` must arrive in `LOCK_INSTALLED_TOOLCHAINS` (its install site count is
+checked EXACTLY) and in `MOVED_TO_A_GROUP` (its declaration must survive, and no inline install may
+reappear beside the lock install). An entry deleted from the first table without landing in the other
+two is the regression this module exists to make impossible, and it looks exactly like tidying up.
 
 `/tmp/relsmoke` (`release.yml`) stays out of the hash-verified rule — it exists to prove the freshly
 built wheel's own declared closure resolves, so feeding it a lock would defeat its purpose — but its
@@ -209,11 +223,23 @@ RELEASE_PINNED_TOOLS = (
     # deleting the lock install fails there instead. Removing an entry from this tuple WITHOUT a
     # replacement guard is the exact regression the comment above warns about, so the two changes
     # belong in one commit and this note is what makes that reviewable.
-    ("release.yml", "build"),
-    ("release.yml", "pip"),
-    ("release.yml", "cyclonedx-bom"),
+    #
+    # `build` AND `cyclonedx-bom` LEFT THE SAME WAY, 2026-09-10, and so did `release.yml`'s `pip`
+    # (BACKLOG #332 step 6). All three had entries here. The replacements, in one commit:
+    #   build          -> `release-tools` group + lock. Covered by LOCK_INSTALLED_TOOLCHAINS (five
+    #                     install sites in release.yml, counted EXACTLY, so losing one of the three
+    #                     build steps' installs fails) and by MOVED_TO_A_GROUP + EXACT_GROUP_PINS.
+    #   cyclonedx-bom  -> same group and lock; MOVED_TO_A_GROUP + FLOOR_BY_DESIGN (`~=7.3.1` is a
+    #                     bound by decision, see that table). Its byte-identity twin below moved with
+    #                     it and now compares the step's whole install prologue.
+    #   pip            -> NOT replaced by a lock entry, and this is the one to read carefully.
+    #                     `release.yml` no longer installs `pip` AT ALL; why that is a strengthening
+    #                     rather than a loss is argued at release.yml's engine build step, once.
+    #                     What matters HERE is the replacement guard: the direction this table watched
+    #                     -- somebody adding an UNPINNED `pip install pip` back -- is still covered by
+    #                     the blanket `test_release_path_pip_installs_name_a_version` scan, which
+    #                     reports any unpinned target rather than working from a name list.
     ("release.yml", "packaging"),
-    ("security.yml", "cyclonedx-bom"),
     # The scanners the BLOCKING jobs install for themselves. These run on every `pull_request` and
     # three of them back required contexts, so they are held to the release rule despite not being on
     # the release path — see the 2026-07-29 correction in the module docstring.
@@ -231,8 +257,11 @@ RELEASE_PINNED_TOOLS = (
 #: remain: `python -m pip install --upgrade pip` alongside a pinned tool, where pip is the installer
 #: rather than an input to any gate's verdict. Registering it means a NEW unpinned install added to
 #: that file still reds `test_security_yml_unpinned_installs_are_registered` — the exception is a
-#: decision someone made, not a gap nobody noticed. (`pip` also appears PINNED in that file's SBOM
-#: step, which must stay byte-identical to release.yml's — see the twin test below.)
+#: decision someone made, not a gap nobody noticed. (`pip` USED TO appear pinned in that file's SBOM step
+#: too. It no longer appears there in any form: BACKLOG #332 step 6 replaced
+#: `pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"` with a `--require-hashes` lock install, which
+#: resolves nothing and so needs no bootstrap. The step must still stay byte-identical to release.yml's
+#: — see the twin test below.)
 #:
 #: `uv` and `pip-audit` were HERE until 2026-07-29 and are now pinned instead; the reasoning that put
 #: them here — that this file's jobs are schedule/dispatch-only — was factually wrong (it triggers on
@@ -260,26 +289,50 @@ SECURITY_YML_PIP_BOOTSTRAPS = 2
 #: `-r` and its argument, so `pip install --require-hashes -r <lock>` names zero packages and passes by
 #: not being looked at. The tests below are the ones that look.
 #:
-#: THE COUNT IS LOAD-BEARING, not decoration. Five install sites collapse onto three (workflow, lock)
+#: THE COUNT IS LOAD-BEARING, not decoration. Twelve install sites collapse onto five (workflow, lock)
 #: pairs — `security.yml` installs `ci-scanners.lock` three times (the pip-audit step, the bandit step
-#: and released-line-audit, which audits the latest release tag's core lock rather than the tree) and
-#: `quality-advisory.yml` installs `ci-quality.lock` twice (the coverage job and the mutation job). An
+#: and released-line-audit, which audits the latest release tag's core lock rather than the tree),
+#: `quality-advisory.yml` installs `ci-quality.lock` twice (the coverage job and the mutation job), and
+#: `release.yml` installs `release-tools.lock` five times. An
 #: `assert lines` non-vacuity check is satisfied by ONE surviving line, so deleting either of a pair
 #: leaves its job installing nothing while every check here stays green. Measured: with only "≥1", four
 #: of the five sites were individually deletable at zero test cost — and the coverage job's failure mode
 #: is silent (`pytest -q --cov` dies on `unrecognized arguments`, `|| true` swallows it, and the
 #: diff-coverage step reports "skipped" and exits 0).
+#:
+#: `release-tools.lock` carries the largest count and needs the exact number most, because ONE of its
+#: five `release.yml` sites fails quietly. Losing the install would still leave `python -m build` and
+#: `python -m sigstore` failing loudly; `python -m cyclonedx_py` failing reads as the release breaking at
+#: the SBOM, not as a pinning regression. Read each job's own `permissions:` block for what those sites
+#: run with — restating it here would be a second copy free to drift, and the first draft of this comment
+#: got it wrong in exactly that way.
 LOCK_INSTALLED_TOOLCHAINS = (
     ("security.yml", "ci/locks/ci-scanners.lock", 3),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
+    ("release.yml", "ci/locks/release-tools.lock", 5),
+    ("security.yml", "ci/locks/release-tools.lock", 1),
 )
 
 #: Tools that MOVED from an inline `pip install <tool>==<version>` into a PEP 735 dependency group. Two
 #: directions need guarding, and neither is visible to anything else: the declaration silently
 #: disappearing from `pyproject.toml` while the lock still carries the name as somebody else's
 #: transitive, and a future edit re-adding an inline `pip install bandit` beside the lock install.
-MOVED_TO_A_GROUP = ("bandit", "pip-audit", "zizmor", "mutmut", "diff-cover", "pytest-cov")
+#:
+#: `build` and `cyclonedx-bom` joined 2026-09-10 (BACKLOG #332 step 6). For them the SECOND direction is
+#: the live one: both are ordinary tools somebody would reach for inline while debugging a release, and
+#: `pip install build` beside the lock install would win, silently, with every hash check here still
+#: green because those checks only ever read the lock line.
+MOVED_TO_A_GROUP = (
+    "bandit",
+    "pip-audit",
+    "zizmor",
+    "mutmut",
+    "diff-cover",
+    "pytest-cov",
+    "build",
+    "cyclonedx-bom",
+)
 
 #: Moved tools whose `[dependency-groups]` spec must be an EXACT `==` pin, and why the exactness is the
 #: contract rather than a preference. This exists because moving `bandit` and `pip-audit` out of
@@ -292,7 +345,11 @@ MOVED_TO_A_GROUP = ("bandit", "pip-audit", "zizmor", "mutmut", "diff-cover", "py
 #: The failure that buys: a floor means Dependabot's weekly `uv` PR moves a blocking gate's version
 #: inside `uv.lock` with NO `pyproject.toml` diff to review, `dependabot-lock-resync.yml` re-exports and
 #: stages the new lock automatically, and a required gate's findings baseline changes GREEN.
-EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut")
+#:
+#: `build` joined 2026-09-10: it is the PEP 517 frontend that produces the wheel and sdist the release
+#: then signs, attests and publishes, so the version that builds the artifact is the contract in the
+#: strongest sense available here.
+EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "build")
 
 #: The counterpart: moved tools deliberately declared as a FLOOR. Enumerated so "floor by design" and
 #: "floor nobody noticed" cannot look the same.
@@ -301,7 +358,11 @@ EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut")
 #: reads, so it is floored at the current major and left free for Dependabot to move.
 #: `pytest-timeout` — deliberately the IDENTICAL spec to `[project.optional-dependencies].dev`, so the
 #: hashed toolchain install cannot re-point the plugin the coverage run already executes under.
-FLOOR_BY_DESIGN = ("pytest-cov", "pytest-timeout")
+#: `cyclonedx-bom` — `~=7.3.1`, where the CEILING is the decision and the floor is incidental. The
+#: reasoning lives at `[dependency-groups].release-tools` in `pyproject.toml`, beside the spec it
+#: governs; what this entry records is that the bound is DELIBERATE, which is the distinction this table
+#: exists to make.
+FLOOR_BY_DESIGN = ("pytest-cov", "pytest-timeout", "cyclonedx-bom")
 
 
 def _install_targets(line: str) -> list[str]:
@@ -940,32 +1001,162 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     )
 
 
+def _run_blocks(workflow: str) -> list[tuple[str, str]]:
+    """``(step label, run body)`` for every step in ``workflow`` that has a ``run:``.
+
+    PARSED, NOT SPLIT ON TEXT, and the difference is a silent failure rather than a loud one. The first
+    version of this helper split the file on `^\\s*-\\s+name:`, which assumes every step is written
+    `name:`-first. That is a convention, not a property of YAML, and it is ALREADY broken in these two
+    files -- `release.yml` has three `- uses:`-first steps and `security.yml` seventeen. The loud
+    direction (a `uses:`-first step inserted after the one being measured, whose body then joins it) is
+    survivable. The quiet one is not: rewrite the SBOM step itself as `run:`-before-`name:` -- legal
+    YAML -- and its body is attributed to the PRECEDING step while a `exactly one block contains the
+    marker` guard still passes, because exactly one block still contains it. The guard would be checking
+    that some block holds the marker, not that the block IS the step.
+
+    `yaml` is imported HERE rather than at module scope, matching
+    `test_release_asset_downloads_in_blocking_jobs_are_checksum_verified` below: a module-scope
+    `importorskip` would skip the ~40 pure-text pin tests in this module on a PyYAML-less venv, which is
+    a far worse trade than skipping the two that need a parse.
+    """
+    yaml = pytest.importorskip("yaml")
+    doc = yaml.safe_load((_WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    blocks: list[tuple[str, str]] = []
+    for job_name, job in (doc.get("jobs") or {}).items():
+        for i, step in enumerate(job.get("steps") or []):
+            run = step.get("run")
+            if isinstance(run, str):
+                label = step.get("name") or f"step #{i}"
+                blocks.append((f"{workflow} :: job {job_name} :: {label}", run))
+    assert blocks, f"{workflow} has no `run:` steps — this helper is no longer looking at anything"
+    return blocks
+
+
+def _installs_in(run_body: str) -> tuple[str, ...]:
+    """The `pip install` command lines in a `run:` body, comments stripped, in order.
+
+    The comment filter is not optional and not cosmetic: the rationale comments in these workflows
+    quote the very commands under test (`release.yml` and `security.yml` each carry `pip install` inside
+    a `#` line describing what the step replaced), so an unfiltered scan compares prose.
+    """
+    return tuple(
+        stripped
+        for ln in run_body.splitlines()
+        if (stripped := ln.strip())
+        and not stripped.startswith("#")
+        and _PIP_INSTALL.search(stripped)
+    )
+
+
+def _sbom_step_installs(workflow: str) -> tuple[str, ...]:
+    """Every `pip install` line inside the step that builds the CycloneDX SBOM, in order.
+
+    SCOPED TO THE STEP, and that scoping is the whole point of this helper. Until 2026-09-10 the two
+    installs could be found by searching the file for a line naming `cyclonedx-bom`; BACKLOG #332 step 6
+    moved that tool into `ci/locks/release-tools.lock`, so the line is now
+    `pip install --require-hashes -r ci/locks/release-tools.lock` -- which `release.yml` runs at FIVE
+    sites. An unscoped search would have compared an arbitrary one of them against `security.yml`'s and
+    reported agreement it had not actually checked.
+
+    The step is located by what it DOES (`cyclonedx_py environment`) rather than by its `name:`, because
+    the two steps are deliberately named differently -- `release.yml` ships its SBOM and `security.yml`
+    rehearses it -- and a name is also the one thing here that may be reworded freely.
+    """
+    owning = [
+        (label, run) for label, run in _run_blocks(workflow) if "cyclonedx_py environment" in run
+    ]
+    assert len(owning) == 1, (
+        f"{workflow} has {len(owning)} step(s) running `cyclonedx_py environment`, expected exactly 1. "
+        f"Re-point this twin check rather than letting it compare the wrong pair of steps."
+    )
+    installs = _installs_in(owning[0][1])
+    assert installs, (
+        f"{workflow}'s SBOM step runs no `pip install` — this check has nothing to compare"
+    )
+    return installs
+
+
+#: ``python -m <module>`` invocations that MUST be accompanied, in their OWN step, by the hashed
+#: release-toolchain install. The module name is the load-bearing part: these are the three tools
+#: `release-tools` exists to deliver, and each is run by exactly the step that should have installed it.
+#: IMPORT names, not distribution names -- `cyclonedx-bom` ships the module `cyclonedx_py`.
+_RELEASE_TOOL_MODULES = ("build", "cyclonedx_py", "sigstore")
+
+#: The lock those three arrive from. Named once so the tests below and `LOCK_INSTALLED_TOOLCHAINS`
+#: cannot disagree about the path.
+_RELEASE_TOOLS_LOCK = "ci/locks/release-tools.lock"
+
+
 def test_sbom_install_is_byte_identical_in_release_and_security() -> None:
-    """The two CycloneDX installs must be the SAME command.
+    """The two CycloneDX SBOM steps must run the SAME install commands.
 
     Nothing in PR CI executes `release.yml` (tag push only, ADR 0034 "What no test can see"), so the
     documented way to validate its SBOM step before cutting a tag is to dispatch `security.yml`'s sbom
-    job and read that log. That check is only evidence while the two commands are identical — the
-    moment they drift, the dry-run proves something about a command the release does not run.
+    job and read that log. That check is only evidence while the commands are identical — the moment
+    they drift, the dry-run proves something about a command the release does not run.
+
+    THE WHOLE INSTALL PROLOGUE, not one line. The old form compared the single line naming
+    `cyclonedx-bom`; both steps have always run TWO installs (the toolchain, then the hash-locked core
+    runtime into the scratch venv the SBOM is read from), and only one of them was ever compared. Now
+    that the toolchain arrives from a lock, a line-level check would need an anchor to cherry-pick, and
+    picking one is exactly how a twin check ends up watching the half that did not move. Comparing the
+    tuple needs no anchor and is strictly stronger: an install added to one side and not the other
+    fails here rather than at a tag push.
     """
-    installs = {}
-    for workflow in ("release.yml", "security.yml"):
-        matches = [
-            ln
-            for ln in _code_lines(_WORKFLOWS / workflow)
-            if _PIP_INSTALL.search(ln) and "cyclonedx-bom" in ln
-        ]
-        assert len(matches) == 1, (
-            f"{workflow} has {len(matches)} cyclonedx-bom install lines, expected exactly 1 — "
-            f"re-point this twin check rather than letting it compare the wrong pair.\n{matches}"
-        )
-        installs[workflow] = matches[0]
-    assert installs["release.yml"] == installs["security.yml"], (
+    release, security = _sbom_step_installs("release.yml"), _sbom_step_installs("security.yml")
+    print(f"[ci-venv-pinning] SBOM step installs compared: {len(release)} line(s) each")
+    assert release == security, (
         "the SBOM install commands have drifted:\n"
-        f"  release.yml : {installs['release.yml']}\n"
-        f"  security.yml: {installs['security.yml']}\n"
-        "ADR 0034 makes security.yml's sbom job the pre-tag dry-run for release.yml's. Keep both "
-        "lines identical, or replace that dry-run route with one that actually covers the release."
+        + "  release.yml :\n    "
+        + "\n    ".join(release)
+        + "\n  security.yml:\n    "
+        + "\n    ".join(security)
+        + "\nADR 0034 makes security.yml's sbom job the pre-tag dry-run for release.yml's. Keep both "
+        "steps' installs identical, or replace that dry-run route with one that actually covers the "
+        "release."
+    )
+
+
+@pytest.mark.parametrize("workflow", ("release.yml", "security.yml"))
+def test_the_step_that_runs_a_release_tool_also_installs_it(workflow: str) -> None:
+    """The step running `python -m build` / `cyclonedx_py` / `sigstore` must install the lock ITSELF.
+
+    THE INVARIANT THE SITE COUNT CANNOT STATE. `LOCK_INSTALLED_TOOLCHAINS` asserts that `release.yml`
+    holds exactly five `--require-hashes -r ci/locks/release-tools.lock` lines, and that is an AGGREGATE:
+    a refactor that drops the harness build's install and adds one to some new step keeps the total at
+    five and stays green, with the harness wheel then built by whatever `build` the runner happened to
+    have. The count sees a number; this sees the pairing, and it names the offending STEP rather than
+    reporting that a number moved.
+
+    It also localizes the failure that matters most here. Of the three tools, two fail loudly when their
+    install goes missing -- `python -m build` and `python -m sigstore` raise `No module named` -- while
+    `python -m cyclonedx_py` failing reads as the release breaking at the SBOM rather than as a pinning
+    regression, which is the one somebody triages down the wrong path.
+    """
+    offenders = []
+    checked = 0
+    for label, run in _run_blocks(workflow):
+        used = [
+            m for m in _RELEASE_TOOL_MODULES if re.search(rf"\bpython -m {re.escape(m)}\b", run)
+        ]
+        if not used:
+            continue
+        checked += 1
+        if not any(_RELEASE_TOOLS_LOCK in ln for ln in _installs_in(run)):
+            offenders.append(f"{label} runs {used} but does not install {_RELEASE_TOOLS_LOCK}")
+    print(f"[ci-venv-pinning] {workflow}: {checked} step(s) run a release tool")
+    # Non-vacuity: `security.yml` runs exactly the SBOM step, `release.yml` five. A zero here means the
+    # scan stopped matching, which must not read as "no offenders".
+    assert checked > 0, (
+        f"{workflow} has no step invoking {list(_RELEASE_TOOL_MODULES)} — either the release path was "
+        f"restructured or this scan has gone blind; re-point it rather than letting it pass on nothing."
+    )
+    assert not offenders, (
+        "a release tool is run by a step that did not install the hashed lock:\n  "
+        + "\n  ".join(offenders)
+        + f"\nEach such step must run `pip install --require-hashes -r {_RELEASE_TOOLS_LOCK}` itself. "
+        "Relying on an earlier step's install works only while the two share a runner, and the three "
+        "build steps do NOT — they are in three different jobs."
     )
 
 
