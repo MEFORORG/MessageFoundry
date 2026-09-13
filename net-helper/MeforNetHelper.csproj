@@ -36,11 +36,17 @@
 
   <ItemGroup>
     <!--
-      NativeAOT binds Windows API imports, SendARP among them, when it links. The loader resolves those at
-      start-up, where [DefaultDllImportSearchPaths] has no effect, and looks beside the executable first.
-      Measured 2026-09-10: without this flag, a planted IPHLPAPI.DLL loaded into the helper. 0x800 is
+      NativeAOT binds Windows API imports when it links. The loader resolves those at start-up, where
+      [DefaultDllImportSearchPaths] has no effect, and looks beside the executable first. Measured
+      2026-09-10: without this flag, a planted IPHLPAPI.DLL loaded into the helper. 0x800 is
       LOAD_LIBRARY_SEARCH_SYSTEM32, so every DLL this executable imports at load comes from System32. The
       net-helper workflow checks it.
+
+      STILL LOAD-BEARING AFTER BACKLOG #1522. The helper's own SendARP import was this comment's worked
+      example and is now deleted, but the flag is not therefore vacuous: NetOps still calls
+      System.Net.NetworkInformation, whose GetAdaptersAddresses IS an iphlpapi import, so the same planted
+      IPHLPAPI.DLL is still what this flag refuses. Do not remove it on the grounds that nothing P/Invokes
+      any more.
     -->
     <LinkerArg Include="/DEPENDENTLOADFLAG:0x800" />
   </ItemGroup>
