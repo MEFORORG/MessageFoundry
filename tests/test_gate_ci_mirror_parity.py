@@ -3,8 +3,8 @@
 """The eight pre-commit gates whose CI mirror nothing else compares (BACKLOG #1395).
 
 ``tests/test_lint_scope_parity.py`` already pins hook-versus-CI equivalence for ``ruff-format``,
-``ruff-check`` and ``bandit``. **THAT LEAVES EIGHT OF THE ELEVEN HOOKS WITH A HAND-WRITTEN CI MIRROR
-AND NOTHING COMPARING THE TWO.** This file covers those eight and only those eight -- duplicating the
+``ruff-check`` and ``bandit``. **THAT LEAVES EVERY OTHER HOOK WITH A HAND-WRITTEN CI MIRROR AND
+NOTHING COMPARING THE TWO.** This file covers those and only those -- duplicating the
 three already pinned would create a second, silently different definition of one rule, which is the
 defect this whole family of tests exists to prevent.
 
@@ -31,8 +31,8 @@ check only that a mirror LOOKS right. The trade is stated again, at the point wh
 ``_MIRRORS`` bullet below.
 
 **THIS MATTERS BECAUSE THE LOCAL HOOK IS SKIPPABLE.** ``git`` never invokes ``pre-commit`` for a commit
-created by the sequencer, so a rebase or cherry-pick lands a commit with none of the eleven gates
-having run (BACKLOG #1395, reproduced independently by two seats). **The CI mirror is therefore the
+created by the sequencer, so a rebase or cherry-pick lands a commit with none of the gates in that
+file having run (BACKLOG #1395, reproduced independently by two seats). **The CI mirror is therefore the
 only enforcement left on a replayed commit, and until this file eight of those mirrors could drift away
 from the rule they mirror with nothing failing.**
 
@@ -80,7 +80,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PRECOMMIT = _ROOT / ".pre-commit-config.yaml"
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 
-#: The eight hooks this file owns, mapped to a regex that must match a NON-COMMENT workflow line.
+#: The hooks this file owns, mapped to a regex that must match a NON-COMMENT workflow line.
 #: ruff-format, ruff-check and bandit are deliberately absent -- see the module docstring.
 #:
 #: ***ANCHORED ON THE INVOCATION, NOT THE TOOL NAME, AND FOR gitleaks AND actionlint THAT IS
@@ -92,8 +92,14 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 #: The docstring's "an executable line, not a comment" was necessary and not sufficient:
 #: `sudo install ... gitleaks` IS an executable line and is not an invocation.
 #:
-#: The six script-path patterns were measured safe (1-3 hits each, all run lines) -- but safe BY THE
+#: The script-path patterns were measured safe (1-3 hits each, all run lines) -- but safe BY THE
 #: CURRENT CORPUS, not by construction, which is why they are regexes too rather than substrings.
+#:
+#: ***THE COUNTS THAT USED TO BE WRITTEN THROUGH THIS FILE -- eight arms, eleven hooks, six patterns
+#: -- ARE GONE ON PURPOSE.*** They were restated in six places and every one of them had to move
+#: whenever a hook was added, which is a fact with nobody maintaining it. The characterisations that
+#: replaced them stay true whatever `.pre-commit-config.yaml` declares, and the exhaustiveness arm
+#: below is what actually holds the set together.
 _MIRRORS: dict[str, str] = {
     "ledger-gate": r"python\s+scripts/hooks/ledger_check\.py",
     # `backlog-parses` stood here, mirroring `python scripts/docs/backlog_status_check.py`. The hook,
@@ -110,6 +116,11 @@ _MIRRORS: dict[str, str] = {
     # the hook shipped in PR 928 with no CI step; the mirror was added to ci.yml in the same
     # pull request rather than exempting it, which is what this file's exhaustiveness arm asks for.
     "stale-repo-slug": r"python\s+scripts/quality/stale_repo_slug_check\.py",
+    # THE ONE ENTRY WHERE THE MIRROR CAME FIRST. `crypto-inventory` was a required status context
+    # reporting from security.yml for months with NO local hook at all, so this pattern pins a leg
+    # that already existed rather than one added alongside the hook. The direction does not change
+    # what this file asks: the two must not drift, whichever of them was written first.
+    "crypto-inventory": r"python\s+scripts/security/crypto_inventory_check\.py",
 }
 
 #: The file the three hooks below are pinned by. Kept as a PATH, not just named in prose, so the
@@ -117,7 +128,7 @@ _MIRRORS: dict[str, str] = {
 _SIBLING = _ROOT / "tests" / "test_lint_scope_parity.py"
 
 #: Already pinned by _SIBLING. Named so the split is visibly deliberate and so the exhaustiveness arm
-#: below can account for all eleven.
+#: below can account for every declared hook.
 _COVERED_ELSEWHERE = frozenset({"ruff-format", "ruff-check", "bandit"})
 
 
@@ -136,7 +147,7 @@ def _workflow_lines() -> list[tuple[str, int, str]]:
     the raw file text -- so THAT assertion is satisfied by the comment and would stay green with the
     run line deleted.
 
-    ***THE RULE IS PROPHYLACTIC FOR THE EIGHT ARMS, NOT LOAD-BEARING, AND SAYING SO IS THE POINT.***
+    ***THE RULE IS PROPHYLACTIC FOR THESE ARMS, NOT LOAD-BEARING, AND SAYING SO IS THE POINT.***
     Measured 2026-08-29 over the workflows: ZERO comment lines match ANY pattern in ``_MIRRORS``
     (control: a fabricated pattern also returns zero, so the search can return no).
     """
@@ -225,7 +236,7 @@ def test_the_sibling_this_file_defers_to_still_exists() -> None:
     """``_COVERED_ELSEWHERE`` is a claim about ANOTHER FILE, and nothing here used to open it.
 
     Measured: move ``tests/test_lint_scope_parity.py`` away entirely and this file stayed at 13
-    passed, with three of the eleven hooks still reported covered by a file the repo no longer had.
+    passed, with three of the declared hooks still reported covered by a file the repo no longer had.
     An assertion that cannot fail is the defect this whole family of tests exists to catch, and it
     was sitting one level up, inside the catcher.
 
