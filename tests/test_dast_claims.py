@@ -156,7 +156,18 @@ def test_no_stray_paraphrase_of_the_boundary() -> None:
     reader_facing = {
         label: text for label, text in passages.items() if not label.startswith("scripts/security/")
     }
-    assert len(reader_facing) >= 4, reader_facing.keys()
+    # FOUR UNTIL THE LEDGER LEFT (BACKLOG #1250), THREE SINCE, and the number moved because the
+    # POPULATION did -- `docs/BACKLOG.md #318` was the fourth and its subject is no longer in this
+    # repository. Lowered in the same change that removed the carrier, because a floor left above its
+    # own population reds on every run and says "this guard is broken" when the truth is "this guard
+    # has one fewer thing to guard".
+    #
+    # IT IS STILL A FLOOR AND MUST NOT BE READ AS A FORMALITY. Its job is to stop the silent-passage
+    # check below being satisfied by an EMPTY set: with no lower bound, deleting every reader-facing
+    # entry would make `silent` empty and this test green over nothing. Three is the count that
+    # exists; if a fourth carrier is ever added, raise this with it, and never lower it to make a
+    # failing run pass.
+    assert len(reader_facing) >= 3, reader_facing.keys()
     silent = [label for label, text in reader_facing.items() if "0155" not in text]
     assert not silent, (
         f"DAST passage(s) with neither the boundary nor a pointer to ADR 0155: {silent}"
