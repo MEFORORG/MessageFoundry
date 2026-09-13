@@ -301,6 +301,93 @@ def test_the_divergence_note_ALSO_fires_on_release_from_a_foreign_cwd(tmp_path: 
     )
 
 
+def _last_release_record(tree: Path) -> dict[str, object]:
+    """The final JSON line of ``tree``'s release ledger.
+
+    Read from ``tree``'s own ``.git``, which is the anchoring question restated: a release recorded into
+    the caller's registry instead would leave this file absent, and an assertion on a missing file says
+    something different from an assertion on a wrong field.
+    """
+    history = tree / ".git" / "mefor-coord" / "claims" / ".history"
+    assert history.is_file(), f"no release ledger in the named checkout: {history}"
+    lines = [ln for ln in history.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert lines, "the release ledger is empty"
+    record = json.loads(lines[-1])
+    assert isinstance(record, dict), record
+    return record
+
+
+def _same_path(a: object, b: Path) -> bool:
+    return str(a).replace("\\", "/").casefold() == str(b).replace("\\", "/").casefold()
+
+
+def test_the_release_RECORD_names_the_caller_and_not_only_the_script_tree(tmp_path: Path) -> None:
+    """BACKLOG #1358, the record half -- the warn arm above is the half that already shipped.
+
+    The console note fires and is gone the moment the terminal scrolls. What PERSISTS is the ledger
+    line, and it carried ``released_by`` alone: ``$holder``, anchored on ``$PSScriptRoot``. A release
+    run from another checkout therefore wrote a line naming a tree the operator was never standing in,
+    and -- unlike a misdirected ``-Take``, which the commit gate refuses at the point of use -- nothing
+    downstream ever re-reads a release record, so that line simply stands.
+
+    THE DIVERGENCE IS THE WHOLE TEST. Run from inside the named tree, ``released_by`` and the caller are
+    the same directory and the two candidate answers are indistinguishable, exactly as this module's
+    docstring says.
+    """
+    named = _coord_checkout(tmp_path / "Named", drafted=4242, boundary=1200)
+    caller = _coord_checkout(tmp_path / "Caller", drafted=7777, boundary=1900)
+
+    taken = _run_claim(named, named, "-Take", "record-probe", "-Note", "fixture")
+    assert taken.returncode == 0, taken.stderr or taken.stdout
+
+    released = _run_claim(named, caller, "-Release", "record-probe")
+    assert released.returncode == 0, released.stderr or released.stdout
+
+    record = _last_release_record(named)
+    assert record.get("event") == "release", record
+    assert _same_path(record.get("released_by"), named), record
+    assert _same_path(record.get("invoked_from"), caller), (
+        "the release record does not say which tree actually ran it, so a reader gets the script "
+        f"copy's tree and no cue that anyone else acted: {record}"
+    )
+
+
+def test_the_release_record_names_the_caller_on_an_AsWorktree_release(tmp_path: Path) -> None:
+    """The same field, under the flag that makes it matter MOST (measured 2026-09-10).
+
+    ``-AsWorktree`` re-aims the ownership test at the tree it names, so a checkout holding nothing can
+    release another's claim **without -Force**. Every other field then agrees with a routine self-
+    release: ``prior_holder``, ``released_by`` and ``released_branch`` all name the holder, and ``force``
+    stays ``false`` because none was needed. ``invoked_from`` is the only field that can say otherwise.
+
+    Note which way round this fixture runs: the claim is held in the CALLER's name and the shell stands
+    in the NAMED tree, the mirror of the test above. That is deliberate -- there ``invoked_from`` differs
+    from ``$repo``, here it differs from ``$holder``, and only the pair rules out both.
+    """
+    named = _coord_checkout(tmp_path / "Named", drafted=4242, boundary=1200)
+    caller = _coord_checkout(tmp_path / "Caller", drafted=7777, boundary=1900)
+
+    taken = _run_claim(named, named, "-Take", "as-probe", "-AsWorktree", str(caller), "-Note", "fx")
+    assert taken.returncode == 0, taken.stderr or taken.stdout
+
+    released = _run_claim(named, named, "-Release", "as-probe", "-AsWorktree", str(caller))
+    assert released.returncode == 0, released.stderr or released.stdout
+    assert "Released claim" in released.stdout, released.stdout
+
+    # The claim was taken in the caller's name, so its registry -- and its ledger -- is the caller's.
+    record = _last_release_record(caller)
+    assert record.get("event") == "release", record
+    assert record.get("force") is False, (
+        "no -Force was needed, which is the point: this takeover leaves the flag that exists to mark "
+        f"one untouched. {record}"
+    )
+    assert _same_path(record.get("released_by"), caller), record
+    assert _same_path(record.get("invoked_from"), named), (
+        "a tree that held nothing released this claim and the record names only the holder, so the "
+        f"line reads as that holder releasing its own claim: {record}"
+    )
+
+
 def test_setup_leak_gate_does_not_reintroduce_an_unanchored_toplevel(tmp_path: Path) -> None:
     """A spelling guard for the regression, paired with the behavioural test above.
 
