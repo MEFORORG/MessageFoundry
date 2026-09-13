@@ -47,6 +47,7 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
+tests/test_context_budget_hook.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_durability_hook_provenance.py
