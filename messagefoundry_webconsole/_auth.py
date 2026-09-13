@@ -246,8 +246,16 @@ def require_ui(
     allow_must_change: bool = False,
     allow_mfa_pending: bool = False,
     activity: bool = True,
+    mfa_refusal: Callable[[Request], HTTPException] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request from the session cookie and assert ``permissions``.
+
+    ``mfa_refusal`` changes only WHERE the ASVS 6.3.3 gate sends a pending session, never WHETHER it
+    refuses or records the refusal. The step-up factories pass it so a pending session lands on
+    ``/ui/reauth`` carrying the action it clicked, while the gate, its audit row and its place above
+    the permission loop stay as they are for every other route. ``allow_mfa_pending`` is the opposite
+    switch: it turns the gate OFF, and the row with it, so it belongs only on a route a pending session
+    must reach (enrollment, the confinement page, the account pages).
 
     ``phi=True`` also applies the same per-actor anti-automation throttle as ``require_phi_read`` (the
     /ui PHI views call the JSON handlers directly, which skips their own ``Depends`` gate, so this
@@ -302,7 +310,7 @@ def require_ui(
             # would skip the row. Awaited rather than fired-and-forgotten so a store failure
             # surfaces instead of dropping the record.
             await auth.audit_mfa_denied(identity, request.url.path)
-            raise _mfa_redirect()
+            raise _mfa_redirect() if mfa_refusal is None else mfa_refusal(request)
         for permission in permissions:
             if not identity.has(permission):
                 await auth.audit_permission_denied(identity, permission, request.url.path)
@@ -570,6 +578,19 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
 
 
+def _reauth_refusal(
+    reauth_next: Callable[[Request], str] | None,
+) -> Callable[[Request], HTTPException]:
+    """The ``mfa_refusal`` a step-up factory hands :func:`require_ui`: the same 303 to ``/ui/reauth``
+    its own freshness check sends, carrying the same continuation. The gate that raises it is still
+    ``require_ui``'s, so the refusal is audited and runs above the permission loop."""
+
+    def refuse(request: Request) -> HTTPException:
+        return _reauth_redirect(request, reauth_next(request) if reauth_next is not None else None)
+
+    return refuse
+
+
 def require_ui_step_up(
     *permissions: Permission,
     phi: bool = False,
@@ -620,26 +641,32 @@ def require_ui_step_up(
     docstring.
 
     ORDERING, deliberate (gate ``phi=`` routes, i.e. the edit pair): the budget is charged inside
-    ``base``, i.e. BEFORE the step-up freshness check below — so a request that ends in a 303 to
-    ``/ui/reauth`` has already spent a token. That is the fail-safe direction (an attacker cannot probe
-    the route for free by letting the window go stale) and is immaterial at the shipped 120-reads/60s
-    default. (An INLINE charge, as the two search routes use, runs after the dependency instead, so a
-    stale-window request there redirects before charging — harmless, since a redirect emits no PHI.)
+    ``base``, i.e. BEFORE the step-up freshness check below — so a request that check refuses has
+    already spent a token. That is the fail-safe direction (an attacker cannot probe the route for free
+    by letting the window go stale) and is immaterial at the shipped 120-reads/60s default. A PENDING
+    session is not charged: ``base``'s MFA gate refuses it before the budget is touched, as the JSON
+    plane's gate does. (An INLINE charge, as the two search routes use, runs after the dependency
+    instead, so a stale-window request there redirects before charging — harmless, since a redirect
+    emits no PHI.)
     """
-    # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
-    # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the
-    # next= continuation*; letting the base pre-empt it would drop that continuation and land the
-    # operator on /ui instead of the action they clicked. Same refusal, better destination.
-    base = require_ui(*permissions, phi=phi, allow_mfa_pending=True)
+    # mfa_refusal, NOT allow_mfa_pending. The base's own 6.3.3 gate refuses a pending session, and
+    # the hook only moves where it lands: /ui/reauth carrying the next= continuation, so the operator
+    # returns to the action they clicked instead of /ui. This factory used to pass
+    # allow_mfa_pending=True and refuse below, under a comment reading "Same refusal, better
+    # destination". It was not the same refusal: that flag also switched off the audit row, the gate's
+    # place above the permission loop, and its place before the admin-write and PHI charges. The JSON
+    # twin, require_step_up, keeps all three. Only the destination was ever meant to change.
+    base = require_ui(*permissions, phi=phi, mfa_refusal=_reauth_refusal(reauth_next))
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
-        # Second factor first (mirrors require_step_up): an MFA-required session must have verified TOTP.
+        # Unreachable while the base gate stands, as in require_step_up. Kept so this factory never
+        # loses its second-factor check if the base is changed; the audited refusal is the one above.
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         # Contextual risk + password step-up window: a new client IP or a stale window forces re-auth.
@@ -709,19 +736,18 @@ def require_ui_step_up_action(
     session window under ``[auth].require_action_step_up = false``. ``new_ip`` is checked FIRST so a
     forced new-IP step-up short-circuits and leaves the single-use grant UNCONSUMED (mirrors
     ``api.security.require_step_up_action``)."""
-    # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
-    # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the
-    # next= continuation*; letting the base pre-empt it would drop that continuation and land the
-    # operator on /ui instead of the action they clicked. Same refusal, better destination.
-    base = require_ui(*permissions, allow_mfa_pending=True)
+    # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
+    # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
+    base = require_ui(*permissions, mfa_refusal=_reauth_refusal(reauth_next))
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
+        # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         client = request.client.host if request.client else None

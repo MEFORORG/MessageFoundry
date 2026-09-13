@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An open row whose Verdict defers to a condition, aged and joined to the register (BACKLOG #1527).
 
 A row may defer part of itself: *"build slice 1; leave the VIP mechanism gated on the owner's

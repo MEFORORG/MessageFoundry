@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // CSP-ENFORCEMENT CANARY (ASVS 3.7.5). Loaded by the /ui page shell as an UN-NONCED <script src>
 // whenever a per-response nonce CSP is bound. Under `script-src 'nonce-…' 'strict-dynamic'` a browser
 // that ENFORCES the policy refuses this parser-inserted, un-nonced script before it is even fetched —

@@ -387,12 +387,19 @@ function Show-List {
                     $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
-                # -List is what a Cleaner or Dispatcher reads to decide where to spend attention, so
-                # a directory that outlived its session must not render identically to a lane that
-                # is building. It still says ROUTE, not release: the refusal is unchanged.
+                # -List is what a dispatching seat reads to decide where to spend attention, so a
+                # directory that outlived its session must not render identically to a lane that is
+                # building. It still says ESCALATE, not release: the refusal is unchanged.
+                #
+                # THIS LINE NAMED TWO SEATS UNTIL 2026-09-11 AND BOTH HAD RETIRED (BACKLOG #1543).
+                # It read "ROUTE to the Cleaner/Dispatcher". CLAUDE.md section 5 retired both, so the
+                # register's largest category had no live destination: measured that day, 56 of 80
+                # claims sat in this state, median age 118h, and 48 of them over 96h. A tool that
+                # names a ROLE inherits that role's lifetime; this one now names the CONDITION that
+                # settles the case, which cannot retire. Do not put a seat name back here.
                 'unoccupied' {
                     $age = "  [held ${hrs}h; DIRECTORY ONLY -- no live session in it, last commit $($live.QuietHours)h ago]"
-                    $age += " -- ROUTE to the Cleaner/Dispatcher; not releasable on this signal alone"
+                    $age += " -- not releasable on this signal alone; run -Release to see what settles it"
                 }
                 default   { $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]" }
             }
@@ -452,10 +459,20 @@ if ($Release) {
             'unoccupied' {
                 Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
                 Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
-                Write-Host "  STILL NOT YOURS TO -Force. Nothing on this host can prove a session is gone: occupancy"
-                Write-Host "  sees a session by the cwd it launched in, so one working here BY ABSOLUTE PATH from"
-                Write-Host "  elsewhere is invisible to it. This is reported so you can ROUTE it, not act on it."
-                Write-Host "  Route to the Cleaner or the Dispatcher -- releasing another worktree's claim is theirs."
+                Write-Host "  STILL NOT YOURS TO -Force ON THIS SIGNAL. Nothing on this host can prove a session is"
+                Write-Host "  gone: occupancy sees a session by the cwd it launched in, so one working here BY"
+                Write-Host "  ABSOLUTE PATH from elsewhere is invisible to it. Occupancy can VETO, never authorise."
+                Write-Host ""
+                Write-Host "  TWO THINGS SETTLE IT, and neither is a seat you have to find:" -ForegroundColor Cyan
+                Write-Host "   1. THE ITEM IS ALREADY CLOSED. Then there is no work for a live session to be doing,"
+                Write-Host "      so liveness stops mattering. Check the banner in docs/BACKLOG.md (or the archive)"
+                Write-Host "      and, if it is closed, -Force it and say so in the note."
+                Write-Host "   2. THE OWNER SAYS SO. That is the escalation, and it is deliberately a person rather"
+                Write-Host "      than a role: this line named two seats until 2026-09-11 and both had retired,"
+                Write-Host "      which left 56 of 80 claims with no destination at all (BACKLOG #1543)."
+                Write-Host ""
+                Write-Host "  A LONG QUIET PERIOD IS NOT A THIRD REASON. Age is not evidence: a session can be alive"
+                Write-Host "  and simply not committing, and this state is the one where you cannot tell."
             }
             default {
                 Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
@@ -656,10 +673,15 @@ try {
         'unoccupied' {
             Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
             Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
-            Write-Host "  STILL NOT YOURS TO -Force, and the refusal is deliberate: occupancy can VETO but never"
-            Write-Host "  authorise, because nothing here can prove a session is gone. A session working in this"
-            Write-Host "  path BY ABSOLUTE PATH from another cwd does not appear as an occupant."
-            Write-Host "  Hand it to the Cleaner or the Dispatcher with this line; do not build it in parallel."
+            Write-Host "  STILL NOT YOURS TO -Force ON THIS SIGNAL, and the refusal is deliberate: occupancy can"
+            Write-Host "  VETO but never authorise, because nothing here can prove a session is gone. A session"
+            Write-Host "  working in this path BY ABSOLUTE PATH from another cwd does not appear as an occupant."
+            Write-Host ""
+            Write-Host "  TWO THINGS SETTLE IT: the ITEM being already closed (then no live session can be doing" -ForegroundColor Cyan
+            Write-Host "  the work, so liveness stops mattering -- check its banner and -Force it saying so), or"
+            Write-Host "  an OWNER decision. Escalate to the owner, not to a seat: this line named the Cleaner and"
+            Write-Host "  the Dispatcher until 2026-09-11 and both had retired (BACKLOG #1543)."
+            Write-Host "  Until one of those, do NOT build it in parallel."
         }
         default {
             Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
