@@ -112,7 +112,14 @@ def _pointer_only_passages() -> dict[str, str]:
         ".github/workflows/dast.yml": _read(_REPO / ".github" / "workflows" / "dast.yml"),
         "scripts/security/dast_target.py": _read(_REPO / "scripts" / "security" / "dast_target.py"),
         "scripts/security/route_gates.py": _read(_REPO / "scripts" / "security" / "route_gates.py"),
-        "docs/BACKLOG.md #318": _section(_REPO / "docs" / "BACKLOG.md", "## 318. DAST", "\n## "),
+        # `docs/BACKLOG.md #318` was a carrier here until the ledger left this repository
+        # (BACKLOG #1250). `_section` returns -1 for a heading that is not there, and the guard
+        # correctly refused rather than scanning nothing. The item's DAST prose lives in the
+        # maintainer-internal ledger now, so no assertion here can reach it.
+        #
+        # docs/BACKLOG.md STAYS in the closure-claim sweep below: the stub is still a real file
+        # that must not claim DAST closes the independence gap, and that sweep's `>= 6` floor
+        # counts it.
         "docs/adr/README.md (the 0155 row)": _section(
             _REPO / "docs" / "adr" / "README.md",
             "| [0155](0155-dast-dynamic-security-testing-of-the-running-engine.md) |",
