@@ -79,7 +79,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 ## 5. Rewrite semantics + PHI (the load-bearing correctness section)
 
 - **Row-scoped splice, never reformat.** `lens rewrite` regenerates only the edited/inserted row's line range from its template; untouched rows/blank lines/comments are byte-preserved (test gate §6.2). No AST unparse of the whole file (stdlib `ast.unparse` discards formatting/comments — rejected); no `libcst` in v1 (new runtime dep, DEP-1 — revisit only if splicing proves brittle, as an ADR amendment).
-- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale. **The first clause is RELAXED for the PROJECTION only by Amendment F (BACKLOG #234); the other three stand unchanged, and live values remain save-gated.**
+- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale. **The first clause is RELAXED for the PROJECTION only by Amendment F (BACKLOG #1759); the other three stand unchanged, and live values remain save-gated.**
 - **Static analysis only.** `lens parse`/`rewrite` never import or execute config modules — a module whose top level would raise still parses. No message content is involved at all in parse/rewrite; **PHI enters only via the live-value annotations, which reuse the ADR 0072 stream and its `--show-phi` gate unchanged** — the lens adds no second PHI gate and no persisted artifact.
 - **IDE trust:** the lens shells the CLI, so it inherits the ADR 0035 workspace-trust exec gate like every other extension CLI call.
 
@@ -90,7 +90,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 3. **Emitted code is first-class:** rewritten files pass `ruff check`, `ruff format --check`, `mypy` (strict), and `messagefoundry check` on the samples corpus.
 4. **Static-only:** a config module with a top-level `raise` parses successfully (proves no import/execution).
 5. **Vocabulary purity:** `actions.py` helpers do no I/O (enforced by review + a no-new-imports test); SPDX header present; **no new runtime dependency** in phases 1–2 (stdlib `ast` only); crypto-inventory gate not tripped (no crypto imports).
-6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only (**the projection half is relaxed by Amendment F — BACKLOG #234; live values still sync on save only**); live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
+6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only (**the projection half is relaxed by Amendment F — BACKLOG #1759; live values still sync on save only**); live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
 
 Two-way door: if the lens disappoints, phase 1's vocabulary remains independently valuable and nothing else in the product depends on the lens.
 
@@ -149,7 +149,7 @@ Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendere
 > emitted at `lens parse --contract 2` and threaded through both IDE implementations; every AC-N below
 > carries the node id that proves it. §A.6's two known-wrong behaviours remain unfixed **by design** —
 > the build discharges §A.6's requirement by making notes non-movable rather than by landing the extent
-> fix. §A.8's #239 re-run is **still owed** and is NOT part of this build.
+> fix. §A.8's #1764 re-run is **still owed** and is NOT part of this build.
 
 §3's row enum ends at `{ "kind": "code", … } // verbatim, unrecognized`, and §4's ladder sends
 "everything else" there. A standalone comment is therefore projected as an opaque `Code` step. This
@@ -211,7 +211,7 @@ The coverage motivation is **reproducible from `main` as of PR #81 (merged 2026-
 scan (388 files · 145 handlers · 1,423 rows · 0 parse refusals; **editable share 42.0%**, **fully-typed
 handlers 14.5%**) can be re-run rather than taken on trust. Its comment-only split — **28% of opaque
 rows, 146 of 522** — was reported in PR #81's comments and is **not committed as data**, so it must be
-**re-derived by running the scan**, not quoted from this ADR, before it is used as a build warrant. Note also that #239's pre-registered rule fired RED and the RED prescription was overridden
+**re-derived by running the scan**, not quoted from this ADR, before it is used as a build warrant. Note also that #1764's pre-registered rule fired RED and the RED prescription was overridden
 on the "comment-only + helper delegation ≈ 70% of the opaque mass" argument — recorded on that same
 branch as **a delegated judgment call never explicitly ratified by the owner**.
 
@@ -295,7 +295,7 @@ the comment merged into an unrelated row. **The build lands failing tests for (1
   leading comment breaks `_find_stmt` / `_locate_stmt` exact-span matching, so `set_params` and
   `delete_row` would begin failing with "internal: could not locate the statement" on **every** action
   that has a leading comment. Attachment ("a statement travels with its leading comment block") is a
-  separate, larger item and is gated on BACKLOG #233 — `blockExtent` / `walkMove` / `resolveDrop` are
+  separate, larger item and is gated on BACKLOG #1758 — `blockExtent` / `walkMove` / `resolveDrop` are
   implemented twice (`blockExtent` in `ide/src/stepsModel.ts` vs `ide/media/stepsWebview.js:68`) with no
   differential test. *(2026-08-04: the "no differential test" half is closed —
   `ide/src/test/suite/steps-mirror.test.ts` is that test. The duplication itself stands; the owner chose
@@ -337,8 +337,8 @@ must also be threaded through both implementations — `stepsModel.ts` (`359`, `
 ### A.8 Measurement discipline
 
 `note` rows are counted in **their own bucket** and are **excluded from the editable-share numerator**
-in the BACKLOG #239 scan. Reclassifying ~146 of 522 opaque rows as editable would move a P1 investment
-metric by roughly ten points without converting a single transform statement. #239 is re-run before and
+in the BACKLOG #1764 scan. Reclassifying ~146 of 522 opaque rows as editable would move a P1 investment
+metric by roughly ten points without converting a single transform statement. #1764 is re-run before and
 after so the delta is attributable.
 
 ### A.9 Consequence deltas
@@ -392,7 +392,7 @@ unfixed: a move/delete of a *recognized* row still re-attaches a neighbouring co
 and a comment at the END of an `if`/`for` body still projects at the PARENT nesting. A.6 required v1 to
 either land the extent fix or keep notes explicitly positional; this build takes the second option — **no
 note is movable**, in the engine and in the client — so the lens never renders a confidently
-mis-positioned caption. A.8's measurement discipline (the BACKLOG #239 re-run with `note` in its own
+mis-positioned caption. A.8's measurement discipline (the BACKLOG #1764 re-run with `note` in its own
 bucket, excluded from the editable-share numerator) is **not** part of this build and is still owed.
 
 ## Amendment B (DECLINED, 2026-07-30) — ADR 0089 Phase D "helper descent"
@@ -482,7 +482,7 @@ the *shape* of `rows`.
   functions / 87 files** (2026-07-13); the 2026-07-30 scan counts **1,423 rows / 145 handlers / 388
   files**; ADR 0104's scan cites **152 handlers**. "~66% opaque → 42.0% editable" is **not** a
   like-for-like delta and must not be presented as a measured lift. §4's "~80–90%" is of *transform
-  statements*; 42.0% is of *projected rows*. BACKLOG #239 already warns: "state which population any new
+  statements*; 42.0% is of *projected rows*. BACKLOG #1764 already warns: "state which population any new
   number describes."
 - **`218/522` (41.8%) is re-derivable but not committed as data** (see Amendment A.3) and is a **heuristic superset**:
   the scan's `classify_code_row` is explicitly "a HEURISTIC on source text, not a parse" and never
@@ -572,10 +572,10 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
   widening the tracer's frame scope) or SHALL render an explicit "not traced" state distinguishable from
   PHI redaction — never a redacted placeholder that can never resolve.
 
-## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #234)
+## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #1759)
 
 > **Status of this amendment: ACCEPTED — owner-ratified 2026-08-10.** It was written and built ahead of
-> ratification because BACKLOG #234 requires the guardrail it touches to be re-argued in a dated
+> ratification because BACKLOG #1759 requires the guardrail it touches to be re-argued in a dated
 > amendment in the same change; the owner has now ruled, so its acceptance criteria join this ADR's
 > counted bucket under the plain heading below, as Amendment A's and Amendment D's did on ratification.
 > Ratification covers this amendment only: whether to relax the save gate itself stays open (see §C.4).
@@ -644,7 +644,7 @@ document it.
 - **`clearPending()` is unchanged and NOT folded in.** Dropping a queued *param edit* on a structural op
   (the orphaned-queue rule, §5 v2) and deferring a *document refresh* are different rules with different
   reasons; both release sites keep their existing `clearPending()` / `takePending()` behaviour.
-- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #234.
+- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #1759.
 
 ### C.4 A correction this amendment depends on
 
@@ -655,14 +655,14 @@ computed from stale disk content". **That premise is false**, and is corrected i
 view models, exactly as this ADR's 2026-07-10 addendum states ("the rows are projected from the **live
 buffer**"). The disk read belongs to the live-value **trace**, which is separately save-gated by #225.
 
-This matters beyond tidiness: BACKLOG #234's *other* half asks whether a bounded relaxation of the save
+This matters beyond tidiness: BACKLOG #1759's *other* half asks whether a bounded relaxation of the save
 gate is safe, and that question was about to be argued against a premise that does not hold. A
 compensating control must not rest on a false premise (CLAUDE.md §11). The real, surviving reasons for
 the gate are re-shelling Python per keystroke and the fact that each re-projection replaces the entire
 webview HTML — which would destroy focus, selection and any half-typed input mid-word.
 
 **Deliberately not decided here.** Whether to relax the gate to a debounced re-projection on *change* is
-BACKLOG #234's remaining half. It stays open, and it should be decided against the corrected premise
+BACKLOG #1759's remaining half. It stays open, and it should be decided against the corrected premise
 above rather than the false one. This amendment lands the race fix **first**, on purpose: the dropped
 refresh is a defect under the current gate and would widen materially under any relaxation.
 
@@ -878,7 +878,7 @@ bounded `msg[...]` read is also already admitted. **`templated` means an interpo
 values, which is neither** — so a writable `templated` makes `lens rewrite` emit a shape the grammar
 does not currently accept.
 
-**The sibling item is the proof that the read-only reading was available.** #235 (schema-driven parameter
+**The sibling item is the proof that the read-only reading was available.** #1760 (schema-driven parameter
 forms, closed 2026-08-05) records in its own closing line that it *"widens what is editable without
 widening the recognition grammar"*. Same seam, same surface, no amendment. This one differs only because
 of what E.2 records.
@@ -1019,7 +1019,7 @@ The reverse direction needs its own handling. A newer IDE meeting an older engin
   the item's original claim, and it becomes true of a shape the contract actually computes.
 - The editable share of the corpus moves. Per Amendment A §A.8's measurement discipline, templated
   arguments are counted in **their own bucket** rather than folded into the editable numerator, so this
-  amendment cannot flatter the #239 coverage figure without converting anything.
+  amendment cannot flatter the #1764 coverage figure without converting anything.
 - One new rewrite class enters `lens rewrite`, the first widening of §5's emit surface since this ADR was
   written. E.6.3 and E.6.4 are the gates that bound it.
 
@@ -1085,7 +1085,7 @@ question before it is checked against these sets.
   samples corpus.
 
 
-## Amendment F (2026-08-26) — the §5 "sync on save only" guardrail is relaxed for the PROJECTION only (BACKLOG #234)
+## Amendment F (2026-08-26) — the §5 "sync on save only" guardrail is relaxed for the PROJECTION only (BACKLOG #1759)
 
 **Status: accepted.** The owner ruled AC 6's "edits sync on save only" **open, and a lane free to relax
 it**. That is permission, not a specification of how; this amendment is the how, and it is deliberately
@@ -1105,7 +1105,7 @@ narrower than the permission granted.
 `render()` pipes `document.getText()` to `lens parse -` over stdin, so rows are projected from the
 buffer, not from disk — §5's addendum says so, and the save gate's own comment carried the opposite
 claim until it was corrected on 2026-08-04. **The disk read belongs only to the live-value trace**,
-which is why that half does not move. BACKLOG #234's own non-goal says the same.
+which is why that half does not move. BACKLOG #1759's own non-goal says the same.
 
 ### F.2 The bound is three conditions, not a timer
 

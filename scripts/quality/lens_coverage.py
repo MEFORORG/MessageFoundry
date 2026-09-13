@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Measure what the Steps view actually projects over a config estate (BACKLOG #239).
+"""Measure what the Steps view actually projects over a config estate (BACKLOG #1764).
 
 WHY THIS EXISTS. [ADR 0089](../../docs/adr/0089-recognition-first-lens-native-idioms.md) §1
 measured a real estate -- 87 files, 486 `msg`-manipulating functions, 3,852 statements -- and found

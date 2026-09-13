@@ -35,7 +35,7 @@ import {
 } from "../../stepsModel";
 
 // ---------------------------------------------------------------------------------------------------
-// BACKLOG #233 — the webview↔model MIRROR-PARITY differential suite (master test plan
+// BACKLOG #1758 — the webview↔model MIRROR-PARITY differential suite (master test plan
 // docs/testing/master-test-plan/13-steps-editor.md §S2, STEPS-06..12).
 //
 // `ide/media/stepsWebview.js` is loaded as a plain script into a `default-src 'none'` webview (the
@@ -1481,9 +1481,9 @@ suite("Steps mirror — context-menu enablement parity (STEPS-10)", () => {
   }
 });
 
-// ---- #234: the provider never releases the edit slot outside releaseEdit ---------------------------
+// ---- #1759: the provider never releases the edit slot outside releaseEdit ---------------------------
 
-suite("Steps update-loop guard — every release site goes through releaseEdit (#234)", () => {
+suite("Steps update-loop guard — every release site goes through releaseEdit (#1759)", () => {
   test("ide/src/stepsView.ts contains no bare guard.endEdit() call", () => {
     // A FOURTH release site added later would silently reintroduce the dropped-save defect: endEdit()
     // frees the slot without draining the refresh a save owed while the slot was held. releaseEdit is

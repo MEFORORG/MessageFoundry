@@ -14,7 +14,7 @@ import {
   type OpSchema,
 } from "../../stepsModel";
 
-// BACKLOG #235 — the Steps-view param INPUT widgets are driven by the engine's `lens schema` output
+// BACKLOG #1760 — the Steps-view param INPUT widgets are driven by the engine's `lens schema` output
 // (op -> editable params with their kind), not a hand-rolled IDE table. These are the pure, vscode-free
 // renderer + edit-mapping tests (the CI ide job has no Python, so they consume a CANNED op-schema
 // fixture — a faithful dump of `messagefoundry lens schema` — never shelling the CLI). Covers: an int
@@ -92,7 +92,7 @@ const DB_LOOKUP_ROW: LensRow = {
   nesting: 0,
 };
 
-suite("Steps param schema — schema-driven input widgets (#235)", () => {
+suite("Steps param schema — schema-driven input widgets (#1760)", () => {
   test("an enum param renders a <select> with the current value selected", () => {
     // An INLINE schema (not the fixture) so this proves the RENDERER reacts to an `enum` kind regardless
     // of whether the live engine currently emits one for `mode` (that hinges on the actions.py Literal

@@ -23,7 +23,7 @@ Rules (ADR 0076 §2):
 * A **closed-set** argument (``convert_case`` mode, ``pad_field`` side, ``arith_field`` op,
   ``date_diff_field`` unit) is typed ``Literal[...]`` **and** kept behind its runtime ``ValueError``
   guard: the type layer rejects a wrong literal at author time (and lets ``lens schema`` project it as an
-  ``enum`` dropdown, BACKLOG #235), while the guard still catches a dynamically-supplied bad value at run
+  ``enum`` dropdown, BACKLOG #1760), while the guard still catches a dynamically-supplied bad value at run
   time — the overlap is intentional, two layers guarding different callers, not a restated check.
 """
 

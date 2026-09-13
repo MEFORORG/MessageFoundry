@@ -3271,7 +3271,7 @@ def test_the_rendered_line_never_carries_a_commit_distance(tmp_path: Path) -> No
     the checked tree is engine `main` -- which moves. Measured against one real `verified_at`:
     459 commits behind `origin/main`, 458 behind `main~1`, 457 behind `main~2`. So every engine commit
     changed a committed file, and `render-drift` would have gone red on every unrelated engine merge:
-    a gate whose resting state is red, which is the antipattern filed as BACKLOG #320 the same day.
+    a gate whose resting state is red, which is the antipattern filed as BACKLOG #1765 the same day.
 
     The distance is not discarded -- it prints to stderr in the verify summary. It just cannot live in
     a file.

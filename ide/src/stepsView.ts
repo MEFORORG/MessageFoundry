@@ -167,7 +167,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // (§2.3 P2/P3; `undefined` until that build lands). Loaded once — pure in-memory data, no per-pick I/O.
   private readonly schema: Hl7Schema | undefined;
   private readonly structures: Hl7Structures | undefined;
-  // The transform-vocabulary param schema (BACKLOG #235) that drives each editable param's input widget
+  // The transform-vocabulary param schema (BACKLOG #1760) that drives each editable param's input widget
   // (enum -> dropdown, int -> number field). Shelled ONCE (`lens schema`, config-independent) and cached
   // for the panel's life — pure signature-derived data, so it never changes between projections. Left
   // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
@@ -290,7 +290,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     const guard = new EditLoopGuard();
 
     // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
-    // the guard deferred (BACKLOG #234) go through it, so an owed refresh coalesces with a real save
+    // the guard deferred (BACKLOG #1759) go through it, so an owed refresh coalesces with a real save
     // exactly like two rapid saves do instead of adding a second, differently-timed render. `render()`
     // CANCELS it on entry, so a release site that forces a full re-projection discharges the debt
     // rather than racing it into a second one (ADR 0076 Amendment C, AC-C2).
@@ -301,7 +301,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       (handle) => clearTimeout(handle),
     );
     // Which trigger armed the pending re-projection, and therefore whether live values may attach
-    // (BACKLOG #234). The rule, its direction, and why a conjunction cannot reintroduce #225 are
+    // (BACKLOG #1759). The rule, its direction, and why a conjunction cannot reintroduce #225 are
     // stated once on `LiveValueArming` rather than restated here.
     const arming = new LiveValueArming();
 
@@ -316,7 +316,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       rerender.schedule();
     };
 
-    // The CHANGE-flavoured schedule (BACKLOG #234). SAME debounced channel -- deliberately not a
+    // The CHANGE-flavoured schedule (BACKLOG #1759). SAME debounced channel -- deliberately not a
     // second timer -- and it never arms live values.
     const scheduleRowsOnlyRerender = (): void => {
       if (disposed) {
@@ -349,7 +349,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // taken here: this render SATISFIES whatever was pending, so the next one starts from nothing.
       const wantsLiveValues = arming.consume();
       const ws = workspaceDir();
-      // Fetch the op-param schema ONCE (BACKLOG #235) — it drives each editable param's input widget and
+      // Fetch the op-param schema ONCE (BACKLOG #1760) — it drives each editable param's input widget and
       // is config-independent signature data, so a single shell suffices for the panel's life. A failure
       // leaves it undefined (every param falls back to a text input); it never blocks the projection.
       if (!this.opSchemaFetched) {
@@ -489,7 +489,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           );
           void render(); // revert the optimistic webview change to the true projection
         },
-        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#234)
+        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
@@ -540,7 +540,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         // ADR 0076 §5 v2). clearPending precedes the release so nothing can drain in between.
         guard.clearPending();
         // releaseEdit, never a bare endEdit: a save that landed while this op held the slot still owes a
-        // re-projection (#234). Its `clearPending` semantics are unchanged — a DROPPED param edit and a
+        // re-projection (#1759). Its `clearPending` semantics are unchanged — a DROPPED param edit and a
         // DEFERRED document refresh are different rules and must not be folded together.
         releaseEdit(guard, scheduleRerender);
       }
@@ -575,7 +575,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
         }
       } finally {
-        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#234).
+        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#1759).
         releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
@@ -604,7 +604,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         );
       } finally {
         guard.clearPending();
-        // releaseEdit, never a bare endEdit — a save suppressed during the undo/redo is deferred (#234).
+        // releaseEdit, never a bare endEdit — a save suppressed during the undo/redo is deferred (#1759).
         releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
@@ -621,7 +621,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         lineStart?: number;
         lineEnd?: number;
         name?: string;
-        // A number for a number-kind widget (BACKLOG #235); a string for every other field.
+        // A number for a number-kind widget (BACKLOG #1760); a string for every other field.
         value?: string | number;
         direction?: "up" | "down";
         toLineStart?: number;
@@ -674,7 +674,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineStart === "number" &&
           typeof m.lineEnd === "number" &&
           typeof m.name === "string" &&
-          // A number-kind widget posts a JS number (BACKLOG #235); every other field posts a string.
+          // A number-kind widget posts a JS number (BACKLOG #1760); every other field posts a string.
           (typeof m.value === "string" || typeof m.value === "number") &&
           typeof m.expectSrc === "string"
         ) {
@@ -943,14 +943,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // destroy focus, selection and any half-typed param input mid-word. A save is the natural,
     // user-chosen commit point. Debounced to coalesce rapid saves.
     //
-    // NB (BACKLOG #234, corrected 2026-08-04): this comment used to justify the gate by claiming
+    // NB (BACKLOG #1759, corrected 2026-08-04): this comment used to justify the gate by claiming
     // "`lens parse` reads the file from disk, so re-projecting on every keystroke would slice the current
     // (dirty) buffer against line ranges computed from stale disk content". That is FALSE — `render()`
     // above pipes `document.getText()` as `lens parse -` over stdin and slices that SAME snapshot for the
     // view models, and ADR 0076's addendum says so too ("the rows are projected from the live buffer").
     // The disk read belongs to the live-value TRACE (`dryrun --trace`), which is separately save-gated by
     // #225 and is a different rule. A compensating control must not rest on a false premise
-    // (CLAUDE.md §11); whether to relax the gate is #234's other half and is not decided here.
+    // (CLAUDE.md §11); whether to relax the gate is #1759's other half and is not decided here.
     const sub = vscode.workspace.onDidSaveTextDocument((saved) => {
       if (saved.uri.toString() !== document.uri.toString()) {
         return;
@@ -959,14 +959,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // document update loop the guard exists to break (ADR 0076 §5). But the guard cannot tell OUR
       // WorkspaceEdit apart from a USER save that merely landed mid-rewrite, and returning here used to
       // DISCARD that save outright, leaving the view on a stale projection until the next one. Record the
-      // debt instead; `releaseEdit` runs it through this same debounced path when the slot frees (#234).
+      // debt instead; `releaseEdit` runs it through this same debounced path when the slot frees (#1759).
       if (!guard.shouldReactToDocumentChange()) {
         guard.noteSuppressedChange();
         return;
       }
       scheduleRerender();
     });
-    // BACKLOG #234: RE-PROJECT ON CHANGE, NOT ONLY ON SAVE. ADR 0076 section 5 adopted "sync on save
+    // BACKLOG #1759: RE-PROJECT ON CHANGE, NOT ONLY ON SAVE. ADR 0076 section 5 adopted "sync on save
     // only" wholesale from the verified InterSystems set; the owner ruled that acceptance criterion
     // OPEN and a lane free to relax it. This is the bounded relaxation, and it is bounded in three
     // ways rather than by a timer:

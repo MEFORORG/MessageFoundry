@@ -468,12 +468,12 @@ suite("Steps edit — one-edit-at-a-time + update-loop guard", () => {
   });
 });
 
-// BACKLOG #234 — a document change the guard SUPPRESSES is deferred, not dropped. The provider's save
+// BACKLOG #1759 — a document change the guard SUPPRESSES is deferred, not dropped. The provider's save
 // subscription returns early when `shouldReactToDocumentChange()` is false; before this, a user save that
 // landed inside an in-flight `lens rewrite` was discarded outright and the view would keep showing a
 // projection of the pre-save buffer until the next save. The guard now records the debt and
 // `releaseEdit` pays it when the slot frees.
-suite("Steps update-loop guard — a suppressed document change is DEFERRED, not dropped (#234)", () => {
+suite("Steps update-loop guard — a suppressed document change is DEFERRED, not dropped (#1759)", () => {
   test("noteSuppressedChange → releaseEdit runs the owed refresh exactly once (clear-on-read)", () => {
     const guard = new EditLoopGuard();
     let refreshes = 0;
@@ -619,11 +619,11 @@ class FakeClock {
   }
 }
 
-// BACKLOG #234 / ADR 0076 Amendment C AC-C2 — releasing the slot after a suppressed save must yield
+// BACKLOG #1759 / ADR 0076 Amendment C AC-C2 — releasing the slot after a suppressed save must yield
 // EXACTLY ONE re-projection. That is a property of the guard and the debounce COMPOSED: three of the
 // provider's release sites force a full re-projection immediately after releasing, so without the
 // cancel-on-render half the deferred run fires 250 ms later as a SECOND whole-webview replacement.
-suite("Steps re-render debouncer — one re-projection per release (#234, AC-C2)", () => {
+suite("Steps re-render debouncer — one re-projection per release (#1759, AC-C2)", () => {
   const DELAY = 250;
 
   test("rapid schedules coalesce into ONE run", () => {
@@ -700,7 +700,7 @@ suite("Steps re-render debouncer — one re-projection per release (#234, AC-C2)
   });
 
   test("…and the assertion above is DISCRIMINATING: a render that does not cancel yields two", () => {
-    // Kept in the tree as the falsification of the test above. Before #234's cancel-on-render half,
+    // Kept in the tree as the falsification of the test above. Before #1759's cancel-on-render half,
     // the provider's render() looked exactly like `bareRender` here: the forced pass ran, and the
     // armed debounce then replaced the whole webview HTML a second time ~250 ms later.
     const clock = new FakeClock();
@@ -1274,7 +1274,7 @@ suite("Steps toolbar — the top-of-lens INSERT toolbar (Corepoint-style Add)", 
 //
 // The webview's MIRRORS of these pure functions — menu enablement, walkMove/blockExtent/captureBlock,
 // canDrop/resolveDrop/barAnchor/scopeLabel — are no longer "verified manually": `steps-mirror.test.ts`
-// (BACKLOG #233) loads media/stepsWebview.js under jsdom and asserts each one against its model
+// (BACKLOG #1758) loads media/stepsWebview.js under jsdom and asserts each one against its model
 // counterpart. What genuinely REMAINS manual is the menu's positioning/viewport clamping, submenu
 // flipping, dismissal and keyboard navigation (STEPS-76) — DOM behaviour with no pure counterpart.
 suite("Steps context menu — explicit before/after insert (right-click, ADR 0103)", () => {
@@ -1662,11 +1662,11 @@ suite("Steps cross-suite — canDropRow / resolveDrop / scopeLabel (the pure dro
     assert.strictEqual(canDropRow(block, bodyA), false, "a block can't be dropped into its own body");
   });
 
-  test("canDropRow: a read-only CODE row is never a drop target, even though it is DRAGGABLE (#233)", () => {
+  test("canDropRow: a read-only CODE row is never a drop target, even though it is DRAGGABLE (#1758)", () => {
     // renderRowHtml marks a `code` row draggable="true" ON PURPOSE — solely so a drag ATTEMPT can be
     // intercepted and answered with "edit it in the code editor" (stepsWebview.js:469-473). So
     // `target.draggable` does NOT already exclude it, and the model's own contract ("never treats a code
-    // row as a drop target") needs an explicit rule. Before #233 the model returned true here while the
+    // row as a drop target") needs an explicit rule. Before #1758 the model returned true here while the
     // CSP-isolated mirror (stepsWebview.js:388) returned false — a deploying site would have seen the
     // insertion indicator refuse a code row while the model-side resolution accepted it.
     const codeTarget = ctx({ lineStart: 3, lineEnd: 3, kind: "code", draggable: true });

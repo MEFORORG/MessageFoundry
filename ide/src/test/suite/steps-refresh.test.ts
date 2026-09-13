@@ -18,7 +18,7 @@ import {
 } from "../../stepsModel";
 
 // ---------------------------------------------------------------------------------------------------
-// BACKLOG #234 / ADR 0076 Amendment C — the three invariants the deferred re-projection must preserve.
+// BACKLOG #1759 / ADR 0076 Amendment C — the three invariants the deferred re-projection must preserve.
 //
 // Amendment C makes a save that lands while a `lens rewrite` holds the single edit slot DEFERRED rather
 // than DISCARDED. `steps-edit.test.ts` already unit-tests the pieces (the guard's clear-on-read debt,
@@ -115,7 +115,7 @@ interface Harness {
 }
 
 /**
- * The provider's three #234 wires, assembled the way `stepsView.ts` assembles them:
+ * The provider's three #1759 wires, assembled the way `stepsView.ts` assembles them:
  *
  *   * the ONE debounced re-projection channel both a save and a deferred refresh go through;
  *   * `render()`, whose first two statements are the two discharges (`rerender.cancel()` then
@@ -173,7 +173,7 @@ function startRewrite(
 
 // ---- INVARIANT 1: the update-loop guard still holds when a save races an in-flight rewrite ----------
 
-suite("Steps #234 invariant 1 — a save racing an IN-FLIGHT lens rewrite never re-projects early", () => {
+suite("Steps #1759 invariant 1 — a save racing an IN-FLIGHT lens rewrite never re-projects early", () => {
   test("zero re-projections while the slot is held; exactly one, after release", async () => {
     const guard = new EditLoopGuard();
     const h = providerHarness(guard);
@@ -284,7 +284,7 @@ suite("Steps #234 invariant 1 — a save racing an IN-FLIGHT lens rewrite never 
 // release, right after a structural WorkspaceEdit, which is precisely when the buffer is DIRTY. So it
 // is the natural place for the two rules to get conflated.
 
-suite("Steps #234 invariant 2 — a deferred refresh keeps live values save-gated (#225)", () => {
+suite("Steps #1759 invariant 2 — a deferred refresh keeps live values save-gated (#225)", () => {
   /** DISK has the Send on source line 5 (0-based 4). The BUFFER has shifted it to 6 by an unsaved insert. */
   const DISK_TRACE: LiveInlineValue[] = [{ line: 4, after: REDACTED_LIVE_VALUE, kind: "value" }];
 
@@ -351,8 +351,8 @@ suite("Steps #234 invariant 2 — a deferred refresh keeps live values save-gate
       `the live-value gate must be keyed on the document's dirty state (#225); scanned ${scanned}, ` +
         `got ${JSON.stringify(gates[0])}`,
     );
-    // BACKLOG #234 NARROWED THIS ASSERTION, AND THE REASON IS THE POINT. It used to read "never on how
-    // the projection was triggered", which #234 option B now deliberately does -- a change-triggered
+    // BACKLOG #1759 NARROWED THIS ASSERTION, AND THE REASON IS THE POINT. It used to read "never on how
+    // the projection was triggered", which #1759 option B now deliberately does -- a change-triggered
     // render attaches no live values. The old wording FORBADE A CLASS CONTAINING BOTH A DANGEROUS AND A
     // SAFE FORM, and passed anyway because it only tested for a substring.
     //
@@ -378,7 +378,7 @@ suite("Steps #234 invariant 2 — a deferred refresh keeps live values save-gate
 
 // ---- INVARIANT 3: no second execution path, no declarative artifact (CLAUDE.md §12 / BACKLOG #26) ---
 
-suite("Steps #234 invariant 3 — refreshing more often adds no second state of record", () => {
+suite("Steps #1759 invariant 3 — refreshing more often adds no second state of record", () => {
   test("the owed-refresh debt carries no payload, so it can only cause a RE-DERIVATION", () => {
     // If the debt could carry rows, the deferred refresh would be able to restore a projection the
     // webview held rather than re-reading the buffer — a second state of record by the back door.
@@ -482,7 +482,7 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
   });
 });
 
-// ---- INVARIANT 4: the CHANGE trigger (BACKLOG #234 option B, ADR 0076 section 5 relaxation) --------
+// ---- INVARIANT 4: the CHANGE trigger (BACKLOG #1759 option B, ADR 0076 section 5 relaxation) --------
 //
 // ADR 0076 section 5 adopted "sync on save only" wholesale. The owner ruled that acceptance criterion
 // OPEN and a lane free to relax it -- permission, not a specification of how. This is the bounded
@@ -492,7 +492,7 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
 // so relaxing both is not what was ruled in. `LiveValueArming` is the pure half of that separation and
 // is driven directly here; the wiring is vscode-coupled and is scanned.
 
-suite("Steps #234 invariant 4 - a change-triggered projection never arms live values", () => {
+suite("Steps #1759 invariant 4 - a change-triggered projection never arms live values", () => {
   test("a save arms; a change does not", () => {
     const a = new LiveValueArming();
     assert.strictEqual(a.pending, false, "nothing pending before any trigger");
