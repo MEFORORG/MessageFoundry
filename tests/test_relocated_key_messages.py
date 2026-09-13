@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1361: an operator-facing message must not name a config key the loader REJECTS.
 
 ADR 0118 moved fifteen posture keys into ``[security]`` and ``_reject_relocated_keys`` REFUSES the old

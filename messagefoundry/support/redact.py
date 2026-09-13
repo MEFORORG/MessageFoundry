@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lightweight, PHI/secret-aware redaction for support-bundle log lines (#49).
 
 The support bundle ships a tail of the app log. Even though MessageFoundry never logs full message

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#200 (ADR 0092) posture-keyed cleartext-hop refusal for the raw-TCP / DIMSE / plain-FTP OUTBOUND
 transports (cell group ``rawtcp-ftp``).
 

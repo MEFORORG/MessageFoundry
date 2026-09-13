@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 15.2.4 (BACKLOG #1193): the engine verifies WHOSE code occupies the web-console import name.
 
 ``serve`` used to gate the in-process console mount on ``find_spec(...) is not None`` -- presence, not

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 6.3.2 (BACKLOG #1136) — what a fresh install's user table actually holds.
 
 The pinned verb asks that default user accounts *"are not present in the application or are

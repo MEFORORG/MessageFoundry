@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cleartext-bind guard for raw-TCP/X12 LISTEN connectors (SEC-002, CWE-319).
 
 Regression intent: ``check_tcp_tls_exposure`` must refuse a **non-loopback** raw-TCP or X12 listener

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """REST destination connector (ADR 0003): delivery, error→retry/dead-letter mapping, egress, TLS.
 
 The opener is faked so nothing hits the network — we assert the Request that would be sent and the

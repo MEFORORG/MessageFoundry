@@ -118,10 +118,13 @@ jobs:
 
       # DELIBERATELY UNGATED — the one step in this job with no `code` condition.
       #
-      # The ledger gate polices the ADR/BACKLOG number space, and an ADR-only PR is by definition
-      # DOCS-ONLY, so `code == 'false'` and every gated step above is skipped. Gating this one the same
-      # way would skip it on exactly the pull requests it exists to police. It needs only git + stdlib
-      # python (no install), so it costs seconds and runs on every PR.
+      # The ledger gate polices the ADR number space, and an ADR-only PR is by definition DOCS-ONLY, so
+      # `code == 'false'` and every gated step above is skipped. Gating this one the same way would
+      # skip it on exactly the pull requests it exists to police. It needs only git + stdlib python (no
+      # install), so it costs seconds and runs on every PR.
+      #
+      # ITS BACKLOG HALF IS RETIRED (BACKLOG #1250, #1754) -- see the note at the top of
+      # ledger_check.py. What remains is the ADR rule, and ADRs are still in this repository.
       #
       # It rides inside the already-REQUIRED `test` leg rather than becoming a new required context: a
       # brand-new required check wedges every PR opened before it existed (see the `ci-gate` roll-up).
@@ -129,48 +132,42 @@ jobs:
       # This is the backstop for `git commit --no-verify` and for a branch cut from a stale main — each
       # branch is internally consistent, and the duplicate number only exists once BOTH have merged, so
       # only a check against freshly-fetched main can see it.
-      - name: Ledger gate (ADR / BACKLOG number space)
+      - name: Ledger gate (ADR number space)
         if: runner.os == 'Linux'
         run: |
           # Only `origin/main` needs fetching: the gate reads it (`git show origin/main:…`, `ls-tree`) and
-          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine and no
-          # deepening is required -- see the long note in ledger_check.py's tree-access section for why
-          # three-dot was wrong here, and why its failure was silent.
+          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine -- see
+          # the long note in ledger_check.py's tree-access section for why three-dot was wrong here, and
+          # why its failure was silent.
+          #
+          # THE DEPTH IS NOW SLACK, AND IT IS KEPT DELIBERATELY. It was load-bearing for the backlog
+          # REVERSE arm (BACKLOG #1470), which read the PARENTS of HEAD and refused when none was
+          # readable; that arm retired with the ledger (BACKLOG #1250) and the ADR rule resolves no
+          # ancestry, so `--depth=1` would pass today. Trimming it buys seconds and costs the next
+          # parent-reading rule a silent narrowing, which is the failure mode this depth was bought to
+          # prevent. Leave it.
           git fetch --no-tags --depth=200 origin main
           python scripts/hooks/ledger_check.py --ci
 
-      # ALSO DELIBERATELY UNGATED, for exactly the reason the step above is — and it was NOT, which
-      # cost `main`.
+      # THE BACKLOG STATUS INVARIANT STEP STOOD HERE AND IS RETIRED WITH ITS SUBJECT (BACKLOG #1250).
       #
-      # Two guards police docs/BACKLOG.md. The number-space gate above is ungated because "gating it
-      # would skip it on exactly the pull requests it exists to police". The STATUS invariant was
-      # reachable only through pytest, which IS gated on `code == 'true'` — so on a BACKLOG-only PR
-      # (the exact shape it exists to check) it did not run at all.
+      # It ran `backlog_status_check.py --min-items 300` over docs/BACKLOG.md and
+      # docs/archive/backlog/. Both files left this repository for the maintainer-internal one, so the
+      # step had nothing to parse: with a stub in place of the ledger it would report zero items and
+      # `--min-items 300` would red every PR, while dropping the floor to 0 would leave a step that
+      # cannot fail. Neither is a check.
       #
-      # On 2026-08-01 that landed a #320 entry whose banner used an emoji the invariant does not
-      # accept. The PR was docs-only, went green in seconds without compiling the suite, merged, and
-      # red `main` for every other session until someone else's PR tripped over it. A 0.6s markdown
-      # parse would have caught it. One hardened guard and one unhardened guard over the same file is
-      # worse than neither, because the hardened one makes it reasonable to assume BACKLOG changes are
-      # covered.
+      # ***DO NOT RE-ADD IT AGAINST THE STUB.*** The anti-narrowing floor this step existed to hold --
+      # "a change that stops a file being scanned must go red, not green" -- is now the receiving
+      # repository's to enforce, and it is enforced there. A floor of 0 here would be the shape that
+      # rule was written against: a guard that cannot fail, licensing the behaviour while withdrawing
+      # the caution its absence would have preserved.
       #
-      # No install needed, so the step above's "git + stdlib python, costs seconds" property holds:
-      # scripts/docs/backlog_status_check.py imports only argparse/re/sys/pathlib and has its own CLI.
-      # tests/test_backlog_status_check.py imports that SAME module, so there is one implementation and
-      # the unit tests keep covering its edge cases — this only adds the always-on invocation.
-      # --min-items is the anti-narrowing floor, and it is the point of this invocation as much as the
-      # banner check is. The item namespace spans docs/BACKLOG.md AND docs/archive/backlog/: retiring
-      # items moves them between those files, so every OTHER assertion here — one banner per item, no
-      # contradictions, no duplicates — is satisfied just as easily by scanning a remnant of the corpus
-      # as the whole of it. Without a floor, a change that stopped the archive being read would go green.
-      # Raise the number when the total legitimately grows; it must never be lowered to make CI pass.
-      # WARNING: THE FLOOR LIVES IN TWO PLACES AND NOTHING COMPARES THEM: here, and `_MIN_TOTAL_ITEMS` in
-      # tests/test_backlog_status_check.py. Raise BOTH, or the lower one becomes the only floor that
-      # binds. Found on 2026-08-05 at 277 against a corpus of 300 — 23 items of accumulated slack, in a
-      # guard whose entire purpose is to notice the corpus shrinking.
-      - name: Backlog status invariant (ungated — see above)
-        if: runner.os == 'Linux'
-        run: python scripts/docs/backlog_status_check.py --min-items 300
+      # The history is kept because it is the argument for the rule, not for the step. On 2026-08-01 a
+      # #320 entry landed with a banner the invariant rejects: the PR was docs-only, pytest was gated
+      # on `code == 'true'`, so nothing parsed the file and `main` went red for every other session.
+      # That is why the step was ungated. Anything that polices a shared document in future belongs
+      # outside the `code` gate for the same reason.
 
       # THE SAME ARGUMENT, ONE STEP FURTHER — and the evidence is from 2026-08-04.
       #
@@ -262,14 +259,19 @@ jobs:
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
-            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
+            tests/test_sds_rule_ids_are_stable.py
             tests/test_link_resolution.py tests/test_dast_claims.py
             tests/test_claude_section_citations.py tests/test_write_share_denominator.py
-            tests/test_cutover_slug_rot.py tests/test_backlog_citation_check.py
-            tests/test_dangling_citation_check.py
-            tests/test_subject_exists_screen.py
+            tests/test_cutover_slug_rot.py
             tests/test_docs_cite_no_refused_config_keys.py
             tests/test_operator_docs_no_warning_sign.py"
+          # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
+          # the ruling above says removing a guard is a different act from adding one. They were
+          # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
+          # test_subject_exists_screen and test_verdict_divergence_check -- every one of them a test
+          # OF a ledger tool, deleted in the same change as the tool and the ledger itself. This is
+          # not a guard dropped on a reading of its name; the file it named no longer exists, and the
+          # `test -f` loop below would fail the leg if it did not go.
           # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
           # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
           for m in $DOC_GUARDS; do
@@ -891,7 +893,7 @@ jobs:
         # and still passed. The recovery path this disables has not saved a single run in that window.
         # `retry-native-crash.sh` cannot help here either: under `-n` a worker segfault surfaces as a
         # controller-side node-down, not as exit 139, so the wrapper never sees it.
-        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
@@ -1285,7 +1287,7 @@ jobs:
           # job executes them, and the shipped ones construct QApplication at import on some paths.
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
@@ -1311,6 +1313,17 @@ jobs:
       - name: Prove the tier actually ran
         if: always() # a timeout or a crash is exactly when the receipt matters most
         run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml
+
+      # The tier's junit is written, read once by the receipt above, and then discarded. Keeping it
+      # is what lets the next change to this tier be sized by MEASURED time rather than by file
+      # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
+      - name: Upload the tier's junit
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tooling-junit-${{ matrix.os }}
+          path: tooling-junit.xml
+          if-no-files-found: ignore
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise

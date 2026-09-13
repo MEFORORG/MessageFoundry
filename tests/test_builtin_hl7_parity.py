@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Byte-PARITY suite for the built-ins HL7 parser (ADR 0054).
 
 This is the parity guarantee that makes ``_builtin_hl7`` a safe drop-in for ``python-hl7`` on the

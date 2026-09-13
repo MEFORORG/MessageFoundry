@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // The single source of CSP nonces for every webview the extension builds.
 //
 // WHY node:crypto AND NOT crypto.getRandomValues. The two contexts have different crypto APIs and

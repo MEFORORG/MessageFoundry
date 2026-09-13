@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.3.4 (BACKLOG #282) — the SecretRotationMetaStore protocol on the SERVER store backends.
 
 The narrow ``SecretRotationMetaStore`` slice the rotation watcher persists through was implemented on the

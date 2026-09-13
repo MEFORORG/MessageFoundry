@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#129 (ADR 0094) — granular expiry-only TLS relaxation (``tls_allow_expired``).
 
 The safety properties are the whole point, so they are asserted end-to-end over a real TLS handshake

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-connection auto-start (#115): a persisted ``auto_start=False`` flag makes the RegistryRunner NOT
 bind that inbound listener / build that outbound connector at engine start. BOTH roles then report
 status:"stopped" (distinct from DR "filtered" and ADR-0031 "failed") — the outbound lane is recorded

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 B5 PR2 — fusion wiring infra (default-OFF, SQL-Server-scoped), non-gated.
 
 These run in normal CI (no ``MEFOR_TEST_SQLSERVER``): they prove the construction sentinel (flag off /

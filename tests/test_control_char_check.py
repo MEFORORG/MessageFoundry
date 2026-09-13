@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A control byte is invisible in every view a human uses, so a gate is the only way to see it.
 
 An escape written into a string can collapse into the byte it names: a backslash-b becomes 0x08, a

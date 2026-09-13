@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PostgreSQL implementation of the :class:`~messagefoundry.store.base.Store` protocol.
 
 A **production** server-database backend with single-node parity to the SQLite

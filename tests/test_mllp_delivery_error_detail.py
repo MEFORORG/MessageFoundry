@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DeliveryError must carry the OS-level cause (WS-C claim-storm campaign, 2026-07-02): ~18.6k
 dead-letters recorded ``last_error`` ending at "failed:" because ``str(exc)`` was empty for the
 underlying exception — the actual cause (ephemeral-port exhaustion, WinError 10055-class) was

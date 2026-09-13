@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Steps-view accumulator Send fan-out (ADR 0104 copy-on-Send authoring).
 
 The lens recognizes ``sends.append(Send(dest, msg))`` as an editable ``send`` action row (positioned AT

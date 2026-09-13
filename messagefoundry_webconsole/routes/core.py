@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Core /ui pages: login/logout, dashboard, messages + parse-tree, dead-letters, replay, and the step-up re-auth flow (GET/POST /ui/reauth + the WebAuthn leg) — the sole consumer of the write-action registry (ADR 0065)."""
 
 from __future__ import annotations

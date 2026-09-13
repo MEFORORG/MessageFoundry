@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample feed (Shape A): stream a very-large MDM (a base64 PDF in OBX-5.5) into Epic, inline over MLLP.
 
 The owner's end-to-end scenario, document-present-at-ingress half (#149, ADR 0105). A partner sends a

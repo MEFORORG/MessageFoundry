@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DR-1 sub-test B (SQL Server) — the server-DB DR backup boundary against a LIVE SQL Server store.
 
 The existing ``tests/test_backup_runner.py::test_server_db_is_config_only`` fakes the backend via

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Which worktree does ``scripts/coord/overlap.ps1`` say a session is sitting in?
 
 A session is attributed to a worktree by its cwd. The rule has to survive the layout this project

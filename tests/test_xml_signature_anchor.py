@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """XML-DSig verify() must require an explicit trust anchor (DELTA-03).
 
 Without an anchor, signxml would trust any signature whose embedded certificate chains to the host's

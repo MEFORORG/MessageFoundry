@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate value pools — the **tee seam** (ADR 0030 §1).
 
 Mirror of ``messagefoundry/anon/_pools.py`` for the standalone tee, which cannot import

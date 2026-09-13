@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live host/environment probes — the rows nothing else in the suite can assert.
 
 Each probe is a zero-arg callable returning a :class:`ProbeResult`. Probes must never raise: a broken

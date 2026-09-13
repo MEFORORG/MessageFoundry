@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Regression for SEC-015 (CWE-285): the last-enabled-administrator guard covers the disable and
 delete lock-out paths, not only role removal.
 

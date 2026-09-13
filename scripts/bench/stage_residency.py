@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Where does a message's wall-clock actually go — AS A FUNCTION OF OFFERED LOAD?
 
 Nine falsifiers asked *"is X a lever?"* and got nine no's. Nobody has ever asked where the time goes as

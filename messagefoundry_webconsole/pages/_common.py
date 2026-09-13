@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared cell/format helpers for the /ui page builders (ADR 0065).
 
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,

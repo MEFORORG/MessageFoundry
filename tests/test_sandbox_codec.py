@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MFW2 — the non-executing sandbox IPC codec (ADR 0087, BACKLOG #197).
 
 The regression suite for the pickle escape: the sandbox's whole purpose is an address-space boundary,

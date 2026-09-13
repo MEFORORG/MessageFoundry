@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Turnkey two-box SIZING **ceiling-pin** ladder (PR-C2, ADR 0073).
 
 Automates the manual per-rung ceiling hunt (``C1-MANUAL-LADDER-runbook.md``) that pinned the post-#842

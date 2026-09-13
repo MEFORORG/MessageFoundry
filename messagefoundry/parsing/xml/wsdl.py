@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure WSDL 1.1 import — a typed, read-only SOAP operation/message tree + validate-a-SOAP-envelope
 against the WSDL's embedded XSD (BACKLOG #69, ADR 0122).
 

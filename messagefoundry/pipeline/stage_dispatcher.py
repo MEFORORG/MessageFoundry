@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The pooled-mode per-stage runner — ``StageDispatcher`` (ADR 0066 §4).
 
 One dispatcher per stage replaces the per-inbound router/transform + per-outbound delivery workers

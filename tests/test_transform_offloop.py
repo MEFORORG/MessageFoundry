@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-013 (CWE-1322): the Router and Handler run OFF the asyncio event loop unconditionally.
 
 Previously the transform worker only offloaded ``transform_one`` to a worker thread when the graph

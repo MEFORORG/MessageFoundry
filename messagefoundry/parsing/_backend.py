@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Backend selector for the tolerant HL7 parse tier (ADR 0054).
 
 The tolerant ``Peek``/``Message`` surface can be backed by either the low-allocation **built-ins**

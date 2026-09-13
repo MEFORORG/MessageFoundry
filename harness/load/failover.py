@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Active-passive **failover under load** — the Gate #3 capstone the steady-state harness can't give.
 
 Where :mod:`harness.load.runner` drives one already-running engine, this orchestrator OWNS the engines'

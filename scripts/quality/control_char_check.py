@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse control bytes in tracked text, because a collapsed escape is invisible in every normal view.
 
 An escape sequence written into a string can collapse into the byte it names. ``\\b`` becomes a

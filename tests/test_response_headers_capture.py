@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """HTTP response-header capture on a captured DeliveryResponse (BACKLOG #154, ADR 0013 amendment).
 
 Covers the four contract points: (1) the connector captures ONLY the per-connection allow-listed

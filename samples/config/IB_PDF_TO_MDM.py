@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample feed (Shape B): pick up a PDF from a file drop, base64-encode it, wrap it in an MDM, send to Epic.
 
 The owner's end-to-end scenario, build-the-document half (#149, ADR 0105): "pick up a PDF from a file

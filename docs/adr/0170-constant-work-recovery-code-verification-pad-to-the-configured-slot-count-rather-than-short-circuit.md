@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 
 # ADR 0170 — Constant-work recovery-code verification: pad to the configured slot count rather than short-circuit
 

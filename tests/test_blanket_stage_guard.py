@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 r"""Tests for the blanket-git-stage PreToolUse guard (scripts/hooks/block-blanket-git-stage.ps1).
 
 The guard stops one session sweeping another session's files into its commit: it denies

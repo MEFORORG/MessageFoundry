@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization
+# Copyright (C) 2026 MessageFoundry Foundation, LLC
 """Reconcile ``.github/required-contexts.txt`` against the LIVE required set on the server.
 
 THE DEFECT THIS EXISTS FOR -- measured on ``MEFORORG/MessageFoundry`` 2026-08-30: branch protection

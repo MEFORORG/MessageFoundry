@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Expiry-clause audit — does the artifact a standing rule depends on still say what it says?
 
 **Why this exists, with the measurement.** The role playbooks require every standing prohibition to

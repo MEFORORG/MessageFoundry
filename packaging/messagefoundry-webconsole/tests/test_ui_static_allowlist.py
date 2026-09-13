@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.4.7 — ``/ui/static`` serves ONLY allow-listed file extensions.
 
 A bare ``StaticFiles`` mount serves any regular file under its directory: its only containment is

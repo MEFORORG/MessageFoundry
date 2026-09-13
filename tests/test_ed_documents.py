@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Base64-PDF-in-OBX-5 round-trip + escape-safety (SYNTHETIC-TEST-PLAN §1.0.b / tests 1.1.1-1.1.2).
 
 A scanned document rides an ORU/MDM message as a base64 ED ``OBX-5`` field. These prove the engine's

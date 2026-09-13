@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guards for the connscale port families (BACKLOG #1014, #1103).
 
 #1103's test requirement, stated in the item: *"A test that probes one port and asserts it binds

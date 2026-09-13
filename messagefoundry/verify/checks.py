@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Host / environment checks — wheel-only, no source tree or test suite required.
 
 Each check returns a :class:`CheckResult` and **never raises**: a broken check returns ``ERROR`` with

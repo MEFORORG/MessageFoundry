@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pass-through (PT) source — a deliberately inert *internal* inbound (ADR 0013, generalized).
 
 A **pass-through inbound** (``PT_*`` in the Corepoint idiom) has **no listening or polling source**:

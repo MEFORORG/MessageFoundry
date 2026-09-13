@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Reverse-reachability index (#176 dead-config detection, #152 reverse-dependency / impact analysis).
 
 Loads real config modules so the router->handler / handler->Send() edges come from genuinely-compiled

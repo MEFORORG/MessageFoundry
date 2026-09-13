@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate **production** — the code half of the rule model (ADR 0030 §2/§3).
 
 One pure function per :class:`~messagefoundry.anon.rules.SurrogateKind`, each turning a real field

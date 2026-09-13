@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Byte bounds on every reply the engine reads back off an egress hop (ASVS 15.2.2, BACKLOG #1191).
 
 Before this, each outbound HTTP connector called a bare ``resp.read()``, which reads to EOF. On a

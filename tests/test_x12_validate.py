@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Strict X12 validation (messagefoundry.parsing.x12.validate) — the opt-in pyx12 slow path behind the
 tolerant X12Peek/X12Message hot path (ADR 0012, BACKLOG #32).
 

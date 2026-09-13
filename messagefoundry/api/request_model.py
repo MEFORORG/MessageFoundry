@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The base class for every model the API parses out of a request body (ASVS 2.2.1, BACKLOG #1109).
 
 Pydantic's default is ``extra="ignore"``, so until this module existed every API request body

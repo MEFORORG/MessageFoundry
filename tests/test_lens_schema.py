@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Transform-vocabulary parameter schema (drives the Steps-view input widgets, ADR 0076 §5).
 
 Derivation (op -> params with kind/choices/required/keyword_only) from the action + diagnostic

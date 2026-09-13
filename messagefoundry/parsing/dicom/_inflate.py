@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Bounded-inflate guard for **Deflated Explicit VR Little Endian** DICOM (ASVS 5.2.3).
 
 A DICOM object whose transfer syntax is ``1.2.840.10008.1.2.1.99`` (Deflated Explicit VR LE, DICOM

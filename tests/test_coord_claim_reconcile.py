@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A stranded claim is released only on evidence, and the evidence has two halves.
 
 ``prune-merged.ps1`` releases the claims held by a worktree it removes (BACKLOG #345). It can do

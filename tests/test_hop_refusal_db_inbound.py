@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Posture-keyed transport-hop refusal — the ``db-inbound-cli`` cell group (#200, ADR 0092).
 
 Covers three cells that consume the shared authority in ``config/tls_policy.py``:

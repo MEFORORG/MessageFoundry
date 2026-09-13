@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """base64 binary-carriage codec (ADR 0028) — carry arbitrary bytes over the str/TEXT ingress+store.
 
 MessageFoundry's non-HL7 ingress and all three store backends are ``str``/TEXT end-to-end (the

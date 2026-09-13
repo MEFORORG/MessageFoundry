@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0114 AC-7's **degraded gauge** — proving the three operator surfaces actually EMIT it.
 
 AC-7 says the store degrades "loudly", and its compensating-control story assumes an operator can

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Opt-in per-connection detached-JWS outbound signing (ASVS 4.1.5, ADR 0018).
 
 Covers the signing core (RS256/PS256/ES256 sign + verify, detached-JWS shape, tamper detection,

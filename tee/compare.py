@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pure HL7 parity diff for the tee compare tool (#14).
 
 Given two HL7 messages — MEFOR's transformed output and Corepoint's output for the same input —

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1137 -- the directory simple-bind LOGIN pathway is retired; the BIND is not.
 
 ``ad_enabled`` used to answer two unrelated questions on one switch: "can this engine BIND to the

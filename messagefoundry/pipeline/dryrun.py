@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Dry-run a wiring Registry against messages — pure routing/handling, no I/O.
 
 Runs a message through an inbound connection's Router and Handler(s) exactly as the engine would,

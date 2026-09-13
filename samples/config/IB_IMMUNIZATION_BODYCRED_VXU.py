@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample feed: submit HL7 VXU to a registry that takes credentials in the operation **body**.
 
 The sibling of ``IB_IMMUNIZATION_VXU.py``. That one authenticates with a WS-Security ``UsernameToken``

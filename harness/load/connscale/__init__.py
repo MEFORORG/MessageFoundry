@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale measurement harness (B11).
 
 Spins up N inbound MLLP connections (500 / 1000 / 1500) at a low per-connection rate against a real

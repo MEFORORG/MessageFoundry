@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`connection schema --json` — the engine-derived connection catalogue the VS Code editor renders.
 
 The editor used to enumerate transports and settings by hand in TypeScript: 9 of 11 transports, and

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0050 — single project-root config anchoring.
 
 Covers the pure anchor helpers (resolve_project_root / anchor_under_root / graph_references_env) and

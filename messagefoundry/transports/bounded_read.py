@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Byte-bounded reads of the reply the engine asked for on an egress hop (ASVS 15.2.2).
 
 Every outbound HTTP connector reads the partner's response body back into memory. A bare

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Offline uploaded-logs page builders (BACKLOG #125/#126, ADR 0134).
 
 The Uploaded Logs page lets an operator import a partner-supplied `.hl7`/`.txt`/`.xml` file and browse

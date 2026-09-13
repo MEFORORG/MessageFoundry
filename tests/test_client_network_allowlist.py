@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``[security].allowed_client_networks`` — the operator-surface source-address allow-list.
 
 Covers the three things that make this control either sound or useless:

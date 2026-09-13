@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """P1a — the `connection_event` store layer (Corepoint-style transport/lifecycle log, #46).
 
 Covers the invariants the design review flagged as load-bearing: metadata-only + `reason`

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The multishard record's achieved/delivered rates must be HOLD-BRACKETED steady-state rates.
 
 The original metric divided the baseline→post-drain read-delta by the nominal hold, so any intake

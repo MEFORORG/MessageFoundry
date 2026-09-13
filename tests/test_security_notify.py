@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-05: per-user security-event email notifier (pipeline/security_notify.py).
 
 The SMTP send is faked (``send_plain_email`` monkeypatched) so nothing hits the network — we assert

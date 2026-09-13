@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1040, the two sites the first pass did not reach: push_guard and ledger_check.
 
 ``tests/test_hook_prose_folding.py`` covers ``claim_check.py``, whose fold landed in 889dd9409. That

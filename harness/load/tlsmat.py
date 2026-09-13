@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One TLS trust anchor for a whole harness run.
 
 The engine always serves TLS (BACKLOG #1276 part A, owner ruling 2026-08-22) and mints a

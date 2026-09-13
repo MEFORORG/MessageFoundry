@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``reply_wait_state`` — the metadata-only poll read behind the ADR 0154 D3 sync-reply wait.
 
 Two properties carry this module, and both are correctness rather than convenience.

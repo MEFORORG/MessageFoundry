@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine's half of the vault ASVS gate's RUNTIME contract (ADR 0156).
 
 The ASVS gate does not live here. It lives in the vault repo, and it makes three claims about

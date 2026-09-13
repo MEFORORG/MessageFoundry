@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The cross-site refusal reaches the /ui/static MOUNT, and does not overreach (BACKLOG #1371).
 
 The middleware itself landed under #1371 -- this header previously cited #1122, which is the ASVS

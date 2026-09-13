@@ -63,8 +63,9 @@ the marker survives a crash, a compaction, an account switch, and a respawn.
 
 ### 2.2 The cards: `docs/roles/<seat>.card.md`
 
-One tracked file per live seat. Five of them: Console, Builder, Regulator, Steward,
-Lander. (Six at the time of writing; the Reviewer was retired on 2026-09-05.)
+One tracked file per live seat. Five of them: Manager, Builder, Regulator, Steward,
+Lander. (At the time of writing the first name was Console; the owner retired that seat on
+2026-09-10 and the Manager replaced it, BACKLOG #1529. The Reviewer went on 2026-09-05.)
 
 Each card is capped at **150 lines and 6 KB**. Only one is ever injected, so the cost
 to a session is about 1,500 tokens against the 60 KB `CLAUDE.md` already loaded.
@@ -135,7 +136,7 @@ Three paths, matching how worktrees are actually made.
 
 | Path | How the marker gets written |
 |---|---|
-| The harness worktree feature | The owner or the spawning Console writes it in one command. |
+| The harness worktree feature | The owner or the dispatching Manager writes it in one command. |
 | `scripts/worktree/new.ps1` | The same one command, run after creation. |
 | A subagent | Already covered. The Agent tool sets the seat mechanically, at 100%. |
 
@@ -158,9 +159,11 @@ Set-Content .claude\seat 'builder'
 
 ## 4. The roster, and which document governs it
 
-Five seats: **Console, Builder, Regulator, Steward, Lander.** That list comes from section 5
+Five seats: **Manager, Builder, Regulator, Steward, Lander.** That list comes from section 5
 of `CLAUDE.md`. The Reviewer was a sixth until 2026-09-05, when the owner retired it with the
-`reviewed` label and the review gate.
+`reviewed` label and the review gate. The **Console** held the Manager's place until 2026-09-10,
+when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
+rule does not carry across (BACKLOG #1529).
 
 **The vault's `roles/README.md` disagrees, and it is the stale one.** Its table still
 lists Dispatcher, PM, Liaison, ASVS Tracker, Cleaner, Role manager and Process
@@ -170,9 +173,10 @@ settles this directly: a document naming a retired seat is stale, and section 5 
 So the cards are written against section 5's roster, using the vault playbooks only as
 raw material for the seats that survived.
 
-**Two live seats have no playbook at all.** Console and Regulator have no file in
-`roles/`. Their cards are written from section 5 alone, and this is stated on the card
-so nobody goes looking for a longer version that does not exist.
+**One live seat has no playbook at all.** The Regulator has no file in korus `roles/`, so its
+card is written from section 5 alone, and the card says so rather than sending anyone looking for a
+longer version that does not exist. The Manager does have one, `roles/MANAGER.md`, and its card
+cites it.
 
 ---
 

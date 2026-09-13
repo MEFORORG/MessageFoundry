@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SQLite leg of the WebAuthn credential store contract (+ TOTP backfill) — ADR 0068 §4.
 
 Extra-free by design (no ``webauthn`` import anywhere on this path): the shared contract lives in

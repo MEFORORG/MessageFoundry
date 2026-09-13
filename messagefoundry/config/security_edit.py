@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read/write the ``[security]`` section of the service-settings TOML — the comment/format-preserving
 editor behind the ``security`` CLI (ADR 0118; the VS Code ``[security]`` GUI editor shells it).
 

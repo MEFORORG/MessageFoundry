@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The active **environment** name, readable inside a transform (per-face logic).
 
 A migrated feed sometimes branches on which deployment it is running as — e.g. stamp MSH-11 (Processing

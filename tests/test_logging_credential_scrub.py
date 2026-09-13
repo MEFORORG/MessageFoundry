@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The WRITE-TIME log handler filters carry a credential vocabulary (BACKLOG #1478).
 
 The three filters ``logging_setup._install_phi_filters`` installed carried none. Measured 2026-09-06 by

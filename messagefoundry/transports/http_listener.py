@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Inbound HTTP/1.1 listen source — a connector-owned SOAP/REST web-service receiver (ADR 0023).
 
 A partner ``POST``s a body (JSON / XML / text / HL7-over-HTTP) and the listener decodes it, hands it

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-connection DR / priority tier resolution (#61, ADR 0048 AC-1): a connection with no priority=
 inherits the [delivery].priority global default; an explicit priority= overrides it. The resolution
 order is per-connection override > [delivery] global default > built-in NORMAL, applied independently

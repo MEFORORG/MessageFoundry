@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synchronous **read side** for captured request/response replies (ADR 0013).
 
 A capturing outbound's reply is persisted (immutably, per message) by the delivery worker; a

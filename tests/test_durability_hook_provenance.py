@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The durability hook must write a ref that can be read after the branch is gone (BACKLOG #1349).
 
 ``scripts/hooks/durability_push.sh`` is the highest-volume writer of rescue refs in this project --

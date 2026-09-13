@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The uploaded-file store's key migration + rotation pass, and its scan's per-cause logging.
 
 Both are **preconditions** for the strict-ciphertext read BACKLOG #1169 researches (ASVS 11.3.3), and

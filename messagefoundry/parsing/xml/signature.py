@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """XML Digital Signature (XML-DSig) verification for the XML codec (``signxml`` behind the ``[xml]``
 extra, BACKLOG #31) — verifying an inbound signed XML/SOAP body's integrity & origin.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`PHI_RETENTION_WINDOWS` and docs/PHI.md §2's Retention column must describe the SAME set.
 
 ASVS 14.2.7 wants retention derived from a data classification. The serve gate's tier list is built

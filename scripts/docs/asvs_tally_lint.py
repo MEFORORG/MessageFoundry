@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a NEW hard-coded ASVS verdict tally in a Markdown document (ADR 0156).
 
 ADR 0156 made the count computed. It did not stop anyone writing one down. Measured on the

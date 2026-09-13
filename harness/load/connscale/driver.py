@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The connection-scale driver — N persistent MLLP connections, one aggregate token bucket (B11).
 
 Where :class:`~harness.load.sender.Dispatcher` spreads by message *type* across a pool (the wrong

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for rule 3 of the worktree gate: git commands that swap the SHARED PRIMARY's working tree.
 
 This rule exists because it actually happened. A sibling session ran `git checkout <its-branch>` inside

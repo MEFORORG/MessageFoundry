@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A screen that has not been made to fire on a real instance is not evidence.
 
 ``Identity.username`` is reassignable; ``user_id`` is not. A username used as an ACCESS KEY lets

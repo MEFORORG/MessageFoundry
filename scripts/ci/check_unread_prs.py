@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A pull request can be finished, green and unread, and nothing anywhere says so.
 
 THE DEFECT THIS EXISTS FOR (BACKLOG #1413). ``a reviewer has read this`` became a required context on

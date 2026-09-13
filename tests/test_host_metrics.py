@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Host CPU/mem gauges on the Prometheus surface (BACKLOG #74).
 
 Verifies the host gauges are emitted, carry real values, and add NO labels — so the strict

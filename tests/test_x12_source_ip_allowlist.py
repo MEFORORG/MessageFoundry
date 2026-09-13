@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Peer-IP allowlist for the X12 inbound LISTEN connector (SEC-011, CWE-306).
 
 Regression intent: an X12 inbound must accept a ``source_ip_allowlist`` (wiring previously rejected

@@ -1,50 +1,39 @@
-# Backlog status hygiene — stop `docs/BACKLOG.md` from lying about build state.
+# Backlog status hygiene -- RETIRED IN SUBSTANCE, KEPT AS A REPORTING CONTEXT (BACKLOG #1250).
 #
-# WHY. Work ships, the item's banner is never updated, and the backlog goes on describing finished
-# work as open. A 2026-07-09 audit found 11 items misfiled as open — including #60 (turnkey DR),
-# which shipped with ADR 0049 and a working `backup` / `restore-verify` CLI while its banner still
-# read "PRE-RESERVED, owner-gated". That stale banner was then repeated as fact in a merged PR. The
-# same rot left the Corepoint gap analysis ~22% obsolete. A doc that lies about build state is worse
-# than no doc: it silently misdirects planning.
+# WHAT THIS JOB DID. Two checks, both over `docs/BACKLOG.md` and `docs/archive/backlog/`:
+#   1. a PR claiming `BACKLOG #N` in its title or body, and touching engine/IDE code, had to update
+#      that item's status banner in the same PR;
+#   2. every backlog citation a PR added beside a ledger path had to name the file its item lives in
+#      (`backlog_citation_check.py`, BACKLOG #1095).
 #
-# TWO HALVES.
-#   * The STRUCTURAL half ("every item declares exactly one status") is enforced by pytest —
-#     `tests/test_backlog_status_check.py` runs the checker against the real file on every PR, so it
-#     rides the existing test matrix and needs no job here.
-#   * The BEHAVIOURAL half is here, because only the PR context can see it: if a PR claims to
-#     implement a backlog item (`BACKLOG #N` in its title or body) and touches engine/IDE code, then
-#     it must also update `docs/BACKLOG.md`. That is the step whose omission caused #60.
+# BOTH LOST THEIR SUBJECT. The numbered-item ledger moved to the maintainer-internal repository and
+# both files are gone from this tree, so a PR here CANNOT update an item banner and there are no
+# ledger paths for a citation to name. Enforcement moved with the ledger.
 #
-# THE JOB BELOW NOW RUNS TWO CHECKS, and its `name:` describes only the first. That is deliberate and
-# must stay: the name is the branch-protection CONTEXT STRING, so renaming it makes the required
-# context stop reporting and wedges every PR (see .github/required-contexts.txt). The second check is
-# the CITATION gate (BACKLOG #1095) — every backlog number this PR adds beside a ledger path must
-# name the file that item actually lives in. It rides this job rather than a new one for the same
-# reason: an unrequired context is decoration, since auto-merge blocks only on required ones, and
-# adding one to branch protection is not an in-repo change.
+# ***THE JOB AND ITS `name:` STAY, AND THAT IS THE WHOLE REASON THIS FILE STILL EXISTS.*** The name
+# below is a REQUIRED status-check CONTEXT STRING in branch protection. Deleting the job, renaming
+# it, or dropping either trigger makes the context never report -- and a required context that never
+# reports does not fail, it WEDGES: nothing merges, in the queue or out of it. codeql.yml's header
+# records PR 619 sitting AWAITING_CHECKS with its contexts simply absent. Retiring the context is a
+# branch-protection change, which is not an in-repo edit, so it is a separate act by whoever holds
+# that setting -- not something this file may do on its own.
 #
-# Read-only. No secrets. Workflow expressions are hoisted into `env` and never interpolated into a
-# `run:` body (zizmor: a PR title/body is attacker-controlled on a fork PR and must arrive as data).
+# SO THE STEP BELOW IS A DELIBERATE NO-OP, AND IT SAYS SO RATHER THAN LOOKING LIKE A PASS. A green
+# check whose reason is "there was nothing to check" must not read like a green check whose reason is
+# "the rule was satisfied". It prints which is which.
+#
+# DO NOT ADD A NEW RULE HERE JUST BECAUSE THE SLOT IS FREE. The context string names one specific
+# rule; a job doing something else under that name is a check whose label points at the wrong
+# subject, which is exactly what BACKLOG #1254 is about.
+#
+# Read-only. No secrets. Nothing is interpolated into a `run:` body.
 name: backlog-hygiene
 
 on:
-  # BACKLOG #340 step 1. THE QUEUE IS LIVE, SO THIS TRIGGER IS LOAD-BEARING -- DO NOT REMOVE IT.
-  # This job's name is a REQUIRED context, and branch protection evaluates required contexts on the
-  # MERGE-GROUP commit, so removing this trigger means the context never reports in the queue and
-  # NOTHING MERGES. That is not hypothetical: codeql.yml's header records PR 619 sitting
-  # AWAITING_CHECKS on the queue's first entry with its CodeQL contexts simply absent.
-  #
-  # WHAT THIS JOB CHECKS ON merge_group IS NOT WHAT IT CHECKS ON A PULL REQUEST. Its question --
-  # "does THIS pull request update BACKLOG.md" -- has no subject in a merge group, where every
-  # `github.event.pull_request.*` field is null. The enforcement that matters therefore happens on
-  # the `pull_request` run; the queue-time run is what keeps the required context reporting. The
-  # concurrency note below is the other half of that story, and it was measured the hard way.
-  #
-  # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
-  # That was true when the trigger landed on 2026-08-26 and became false once a queue was
-  # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
-  # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
-  # enabled the queue is recorded nowhere.
+  # THE QUEUE IS LIVE, SO THIS TRIGGER IS LOAD-BEARING -- DO NOT REMOVE IT (BACKLOG #340 step 1).
+  # Branch protection evaluates required contexts on the MERGE-GROUP commit, so without this trigger
+  # the context never reports in the queue and NOTHING MERGES. That remains true of a no-op job: what
+  # branch protection waits for is the context reporting, not the work it does.
   merge_group:
   pull_request:
     branches: [main]
@@ -58,9 +47,9 @@ concurrency:
   # bare string "backlog-hygiene-" for EVERY queue entry, and `cancel-in-progress` then made each new
   # entry cancel the previous entry's run.
   #
-  # This job's name is a REQUIRED status context ("a PR that implements BACKLOG #N must update
-  # BACKLOG.md"), and a cancelled required check can never go green, so the cancelled entry was
-  # EVICTED from the merge queue. It never failed. It was cancelled by its successor.
+  # This job's name is a REQUIRED status context, and a cancelled required check can never go green,
+  # so the cancelled entry was EVICTED from the merge queue. It never failed. It was cancelled by its
+  # successor.
   #
   # MEASURED over 754 `merge_group` runs: 151 backlog-hygiene runs, 102 success, 49 CANCELLED
   # (32.5 percent), ZERO failures. Every other workflow on that event cancels at 0.0 percent except
@@ -69,8 +58,8 @@ concurrency:
   #
   # `github.ref` is unique per queue entry (`refs/heads/gh-readonly-queue/main/pr-N-<sha>`) and stable
   # per pull request (`refs/pull/N/merge`), so supersede-on-push is preserved and entries stop
-  # cancelling each other. It is also what asvs-prove-absences, asvs-tally-lint, freethread-smoke and
-  # manifest-lint already use; this workflow was the only merge_group one keyed on the PR number.
+  # cancelling each other. A no-op job is fast, which makes an eviction race LESS likely and not
+  # impossible -- keep the key.
   group: backlog-hygiene-${{ github.ref }}
   cancel-in-progress: true
 
@@ -79,171 +68,24 @@ jobs:
     # QUOTED: an unquoted YAML scalar ends at " #" (comment start), which silently truncated this to
     # "a PR that implements BACKLOG". The job name is the required-status-check *context* string, so
     # a truncated name is what you would have to add to branch protection.
+    #
+    # ***BYTE-IDENTICAL TO .github/required-contexts.txt. DO NOT EDIT IT.*** It no longer describes
+    # what the job does, and that is accepted: the string is an identifier in a setting outside this
+    # repository, so its accuracy is worth less than its stability.
     name: "a PR that implements BACKLOG #N must update BACKLOG.md"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Require a backlog update when a PR claims to implement an item
-        env:
-          # Hoisted, never interpolated into the script body (zizmor: template injection).
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # NO CHECKOUT. The job reads nothing, so cloning the tree would only make it look like it did.
+      - name: Report that this rule moved with the ledger
         run: |
           set -euo pipefail
-
-          # Does this PR *claim* to implement a backlog item? Only the explicit `BACKLOG #N` token
-          # counts — a bare `#123` is ambiguous in this repo (it is usually a PR number).
-          #
-          # EVERY CITED ITEM, NOT JUST THE FIRST (BACKLOG #1347). The house form is
-          # `(BACKLOG #1319, #1322, #1323, #1331)`: the prefix appears ONCE and the siblings carry a
-          # bare `#N`. `grep -oiE 'BACKLOG #[0-9]+' | head -1` saw #1319 and none of the other three,
-          # so a four-item PR was told to update one banner while four were owed. The repo already
-          # solved this for the claim gate -- scripts/hooks/claim_check.py takes every `#N` AFTER the
-          # BACKLOG token -- and that rule is reused here.
-          #
-          # SCOPED TO THE PARENTHETICAL, WHICH claim_check.py DOES NOT NEED TO BE AND THIS DOES.
-          # A squash-merge appends the pull-request number as a trailing group, so a landed subject
-          # reads `(BACKLOG #1040) (#547)`. Taking every `#N` after the token would claim item #547.
-          # claim_check.py is safe from that only by TIMING -- it runs at commit-msg time, before the
-          # suffix exists -- while this gate reads a PR title that can already carry one. Measured
-          # over `git log --all` on 2026-08-25: the unscoped rule calls 641 subjects multi-item, the
-          # parenthetical-scoped rule calls 38 of 1070. A ~17x inflation, and every one of those 603
-          # extra would be a demand to update the banner of a pull-request number.
-          # SPLIT ON `)` RATHER THAN MATCHING `\(BACKLOG...\)`, for two independent reasons.
-          #
-          # 1. It scopes without a regex. Each `)` ends a group, so the line carrying BACKLOG holds
-          #    exactly that group's numbers and the trailing squash group `(#547)` becomes its own
-          #    line with no BACKLOG token -- excluded by the grep rather than by a lookahead.
-          # 2. A pattern containing literal parens CANNOT be written here.
-          #    tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps strips
-          #    command substitutions before applying its `|| true` rule, because `x="$(... || true)"`
-          #    is the idiomatic guard for grep exiting 1 on no-match under `set -euo pipefail`. Its
-          #    substitution regex stops at the FIRST `)`, so any close-paren earlier in the line --
-          #    in a grep pattern OR in a quoted `tr` argument -- orphans the `|| true` and the
-          #    required gate reports a false positive on a correct script. Hence `\051`, the octal
-          #    escape for `)`: it leaves the substitution's own closing paren as the first one on the
-          #    line, which is what that strip is written to find. Measured: the literal-paren forms
-          #    failed that gate, this one passes it.
-          #    THIS IS A REAL LIMITATION IN THAT DETECTOR, not a quirk of this file -- any required
-          #    step whose command substitution quotes a `)` hits it. Reported, not worked around
-          #    silently.
-          #
-          # It also removes the need for a no-parenthetical fallback: a subject with no parens at all
-          # is one line, and it still carries its BACKLOG token.
-          # A MENTION IS NOT A CLAIM, so strip code before extracting (BACKLOG #1296). A token
-          # written in backticks to DISCUSS this gate, or quoted inside a fenced block to show
-          # this job's own error output, was indistinguishable from one written to CLAIM an item.
-          # This is a REQUIRED check, so that direction is a false DENY on a compliant pull
-          # request -- the direction that gets acted on, where a false pass is merely believed.
-          # It fired for real on PR #428: the paragraph explaining this gate is what tripped it.
-          #
-          # THE RULE IS NOT INVENTED HERE. `backlog_citation_check.py`, a LATER STEP OF THIS SAME
-          # JOB, already draws this line for citations -- fenced blocks by toggle, inline spans by
-          # position -- and its own record says a same-line rule was tried first and read generic
-          # prose as a citation. That lesson never moved upward inside this file. This is that
-          # rule one stage earlier, so the two halves of one job stop disagreeing about what
-          # counts as text.
-          #
-          # STRIPPING MUST PRECEDE THE OCTAL-ESCAPED SPLIT, not follow it: a fence marker is a
-          # whole LINE, and splitting on close-paren first can cut one in half. A close-paren
-          # inside a code span is dropped WITH the span, which is correct -- it never delimited a
-          # group. The scoping this preserves is BACKLOG #1347's and must not be disturbed.
-          #
-          # NO CLOSE-PAREN APPEARS INSIDE THE STRIP SUBSTITUTION, deliberately. See the zizmor
-          # note above: one appearing before a substitution's own closer orphans a trailing
-          # '|| true' and reds a required gate on a correct script. Neither expression needs one,
-          # which is why the strip is its own line rather than another stage on the pipeline that
-          # carries the guard.
-          prose="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | awk '/^[[:space:]]*```/ { f = 1 - f; next } f { next } { print }' | sed 's/`[^`]*`/ /g')"
-          items="$(printf '%s' "$prose" | tr '\051' '\n' | grep -i BACKLOG | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)"
-          claim="$(printf '%s' "$items" | head -1 | sed 's/^/BACKLOG #/')"
-          if [ -z "$items" ]; then
-            echo "No 'BACKLOG #N' claim in this PR — nothing to enforce."
-            echo "(If this PR completes a backlog item, say so with 'BACKLOG #N' and update its banner.)"
-            exit 0
-          fi
-
-          # THREE-dot, deliberately. The two-dot form asks "how do these two trees differ", which
-          # includes everything main gained since this PR branched -- as a REVERSE delta on paths the
-          # PR never touched. Any main-side change to docs/BACKLOG.md (the archive move being one
-          # large one) would then be credited to every open PR with an older base, and this gate would
-          # pass while enforcing nothing. Three-dot asks the question actually being posed: what did
-          # THIS PR change relative to the merge base. `ci.yml` already uses three-dot for the same
-          # question. fetch-depth: 0 above guarantees the merge base is present.
-          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
-          touches_code=false
-          case "$changed" in
-            *messagefoundry/*|*ide/*|*messagefoundry_webconsole/*) touches_code=true ;;
-          esac
-
-          if [ "$touches_code" != true ]; then
-            echo "PR claims '$claim' but changes no engine/IDE code — no banner update required."
-            exit 0
-          fi
-
-          # The item's banner lives in docs/BACKLOG.md while the item is open, and moves verbatim into
-          # docs/archive/backlog/ once it is retired. Updating a retired item's banner is a legitimate
-          # satisfaction of this rule, so both locations count -- otherwise the one PR shape that
-          # correctly amends an archived item fails a REQUIRED check with no way to comply.
-          if printf '%s\n' "$changed" | grep -qE '^(docs/BACKLOG\.md|docs/archive/backlog/.+\.md)$'; then
-            echo "OK — PR claims '$claim', touches code, and updates the backlog item namespace."
-            exit 0
-          fi
-
-          n="$(printf '%s' "$items" | head -1)"
-          all_items="$(printf '%s' "$items" | tr '\n' ' ' | sed 's/ *$//')"
-          count="$(printf '%s\n' "$items" | grep -c . || true)"
-          cat >&2 <<EOF
-          ERROR: this PR cites $count backlog item(s) — $all_items — and changes engine/IDE code, but
-          it does not touch docs/BACKLOG.md or any file under docs/archive/backlog/.
-
-          EVERY ITEM LISTED ABOVE OWES A BANNER, not just the first. The house citation form writes
-          the BACKLOG prefix once and the siblings after it, so '(BACKLOG #1319, #1322)' declares
-          TWO items. A gate that read only the first sent authors to update one banner of four
-          (BACKLOG #1347).
-
-          Update each item's status banner in the same PR — in docs/BACKLOG.md if the item is still
-          open, or in its docs/archive/backlog/ file if it has already been retired. If the work is
-          complete:
-
-              > ✅ **SHIPPED in <version> (<ADR / PR>).** <one line of evidence>
-
-          and remove its '🔢 Re-scored' banner (an item must declare exactly one status).
-
-          This gate exists because #60 shipped while its banner still said "PRE-RESERVED", and that
-          stale banner was later repeated as fact. A doc that lies about build state silently
-          misdirects planning.
-
-          If this PR only *partially* implements the item, keep the open banner and say so in the
-          item body — then drop the 'BACKLOG #$n' token from this PR's title/body.
-          EOF
-          exit 1
-
-      # BACKLOG #1095. Retiring an item MOVES it verbatim from docs/BACKLOG.md into
-      # docs/archive/backlog/, and every citation that named the live file keeps pointing at a file
-      # the item is no longer in. No link checker can see this: docs/BACKLOG.md resolves perfectly,
-      # and only the human-readable number beside it is stale.
-      #
-      # DIFF-SCOPED, and that is the design rather than a convenience. PR #271 declined a gate partly
-      # because "a gate that fails on a legitimate archive is one people delete"; with pre-existing
-      # violations a corpus-wide gate is red on day one and gets suppressed. --base/--head restricts
-      # findings to lines THIS PR added, so it can only be red about something the PR wrote. Run the
-      # script with neither flag for the repo-wide report, which is a measurement, not a merge gate.
-      #
-      # No setup-python: the checker and the parse_items module it imports are stdlib-only, so the
-      # runner's preinstalled python3 is enough and the job stays a checkout plus two scripts.
-      - name: Every backlog citation this PR adds must name the file its item lives in
-        env:
-          # Hoisted, never interpolated into the script body (zizmor: template injection).
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          python3 scripts/docs/backlog_citation_check.py --base "$BASE_SHA" --head "$HEAD_SHA"
+          echo "NO-OP. This context is kept so branch protection keeps seeing it report."
+          echo
+          echo "The rule it names -- a PR citing 'BACKLOG #N' must update that item's status banner"
+          echo "-- was retired with its subject. The numbered-item ledger left this repository"
+          echo "(BACKLOG #1250); docs/BACKLOG.md is now a stub and docs/archive/backlog/ is gone, so"
+          echo "there is no banner here to update and no ledger path for a citation to name."
+          echo
+          echo "This is GREEN BECAUSE THERE WAS NOTHING TO CHECK, not because a rule was satisfied."
+          echo "Do not read it as coverage. Enforcement moved to the repository holding the ledger."

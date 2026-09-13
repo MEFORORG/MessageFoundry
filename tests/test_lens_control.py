@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Recognition-first lens (ADR 0089 Phase C) — native CONTROL-FLOW idioms render as RECOGNIZED
 ``control`` rows with a descriptive ``label`` + a captured, READ-ONLY ``operand``, instead of the
 UNRECOGNIZED badge.

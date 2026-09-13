@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sample route: ingest FHIR resources (JSON) and deliver them to a FHIR server (ADR 0022).
 
 The inbound declares ``content_type="fhir"`` so each body routes as a ``RawMessage`` (ADR 0004); the

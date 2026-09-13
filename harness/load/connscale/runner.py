@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The connection-scale run orchestrator (B11) — sweep connection count, read the 6 walls.
 
 Parallels :func:`~harness.load.runner.run_load`, but sweeps **connection count** instead of offered

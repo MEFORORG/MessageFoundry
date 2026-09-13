@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PARTITIONED-FANOUT routing — partitioned's high-ingress shape, but with a real fan-out D>1.
 
 ``partitioned`` (see test_shardcert_partitioned.py) selects ONE handler per message → one delivery →

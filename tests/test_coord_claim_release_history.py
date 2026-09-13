@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every release must leave a record -- including a ``-Force`` one (BACKLOG #1068).
 
 ``claim.ps1 -Release`` was ``Remove-Item`` and nothing else. With ``-Force`` that meant any session

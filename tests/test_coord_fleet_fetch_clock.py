@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``fleet.ps1`` must time the FETCH, and must never go quiet when it cannot time anything.
 
 ``fleet.ps1`` computes every landed verdict against the cached ``origin/main``, so the receipt has

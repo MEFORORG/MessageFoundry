@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DICOMweb STOW-RS destination tests (ADR 0025 Phase 2): target-URL derivation, the
 ``multipart/related; type="application/dicom"`` framing, the dicom+json FailedSOPSequence / HTTP-status
 classification (transient retry vs permanent dead-letter), response capture, and the egress arm.

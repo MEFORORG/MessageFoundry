@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0067 §9 / BACKLOG #97 — persistent ``Tcp()`` outbound connections.
 
 Mirrors the MLLP persistent acceptance suite for the generic raw-TCP destination: one lazily-

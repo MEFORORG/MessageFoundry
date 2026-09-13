@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Docs-contract guards for the DB-TLS CA-import + cert-rotation runbooks (hardening H5/M11).
 
 These pin the *operator-facing* contract so it can't silently regress into the exact footgun the

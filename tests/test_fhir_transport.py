@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """FHIR REST destination (ADR 0022 §2): interaction→method/path derivation, the three conditional
 knobs, OperationOutcome classification, response capture, registry resolution, and the egress arm.
 

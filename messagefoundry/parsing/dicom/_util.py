@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared, pure helpers for the DICOM codec (ADR 0025) — kept here so
 :mod:`~messagefoundry.parsing.dicom.peek` and :mod:`~messagefoundry.parsing.dicom.dataset` reuse them
 without importing each other. No engine imports, no I/O."""

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the two signals ``scripts/coord/overlap.ps1`` reports per file.
 
 ``Files`` is the UNION of what a branch committed-and-has-not-landed with what is dirty in its tree.

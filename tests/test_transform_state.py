@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Transform-accessible state (ADR 0005): the SetState write contract + state_get read side.
 
 Adversarial focus — the exactly-once / pure-re-run invariant the staged pipeline depends on:

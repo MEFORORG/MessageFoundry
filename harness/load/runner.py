@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The load runner — wires the sink, sender pool, governor, and engine poller into one run.
 
 Orchestration: start the correlation sink → preflight the engine (reachable + target inbounds exist)

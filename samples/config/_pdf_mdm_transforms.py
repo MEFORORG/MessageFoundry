@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared transform helper for the PDF -> base64 -> MDM feed (Shape B, #149/ADR 0105).
 
 Split out per CLAUDE.md §4 ("author config as modular Python … put shared helpers in ``_``-prefixed

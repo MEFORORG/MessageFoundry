@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the parallel-run reconcile core (harness/reconcile/normalize.py).
 
 All fixtures are SYNTHETIC HL7 (no real PHI). They exercise the normalize+diff comparison that the

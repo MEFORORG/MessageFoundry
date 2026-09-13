@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Anonymizer integrations (ADR 0030 §6): the tee ``anonymize-captures`` subcommand, the harness
 capture-sink hook, and the harness file-backed replay corpus — end to end."""
 

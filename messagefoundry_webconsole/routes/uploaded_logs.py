@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Offline uploaded-logs /ui routes (BACKLOG #125/#126, ADR 0134).
 
 Upload / list / browse / resend / delete over the engine's uploaded-logs CoreHandlers (seam v7). The

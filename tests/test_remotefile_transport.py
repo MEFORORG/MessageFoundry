@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """REMOTEFILE transport connector (SFTP / FTP / FTPS): upload, poll, error mapping, security, egress.
 
 The remote client is faked (``_make_client`` is monkeypatched, or the ``_SftpClient`` host-key policy

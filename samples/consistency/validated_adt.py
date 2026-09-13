@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Worked example (WP-7b): Handler-level cross-field consistency on an ADT feed.
 
 Strict validation (`validation.strict`) checks a message against the HL7 *schema* — segment

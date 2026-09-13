@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural policy tests for the shipped container liveness probes (BACKLOG #1179, ASVS 12.3.3).
 
 The image ``HEALTHCHECK`` used to try https on 8443 and then fall back to plaintext http on 8765

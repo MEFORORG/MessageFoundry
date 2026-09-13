@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A dead-simple cross-process **file-drop** coordination channel for the WS-C two-box shardcert drive.
 
 The N-active certification's throughput/sizing half runs the engine fleet on one box and the load

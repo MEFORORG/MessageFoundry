@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Phase-3a auth entry-surface hardening: fail-closed (SYS-1), rate limiting (AUTH-RATE),
 input/body caps (API-INPUT)."""
 

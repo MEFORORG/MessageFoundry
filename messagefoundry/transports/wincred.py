@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-endpoint alternate Windows / network-share credential for the File connector (ADR 0132, #111).
 
 A File (UNC/SMB) endpoint may authenticate to a share under a Windows identity **distinct from the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-01 (ASVS 1.3.12, 1.5.3): static guards so the ReDoS posture and the single-parser-per-type
 invariants can't silently regress.
 
@@ -1079,7 +1079,6 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # unpredictability -- a random 128-bit tail is the cheapest way to be sure the name was never
     # committed, and generating it is what keeps it out of the file the probe greps. No key, no
     # secret, no message authentication, nothing user- or PHI-derived: a string asserted to be absent.
-    "scripts/docs/subject_exists_screen.py": frozenset({"secrets"}),
 }
 
 

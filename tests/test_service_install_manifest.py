@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Static-manifest policy guards for the NSSM integrity-verify path (DEPLOY-7).
 
 ``install-service.ps1`` auto-downloads a pinned NSSM release when nssm is absent from PATH, then

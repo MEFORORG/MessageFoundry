@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SMTP-send outbound EMAIL destination (ADR 0029): message build, STARTTLS path, the cleartext
 refusals, DeliveryError on failure, and the connect/EHLO/NOOP test_connection probe — all against an
 in-process fake SMTP (no real server is ever contacted)."""

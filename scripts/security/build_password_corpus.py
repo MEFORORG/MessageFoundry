@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Rebuild and verify the offline password-screening corpus (BACKLOG #1433, from #1134).
 
 ``messagefoundry/auth/data/common_passwords.txt`` was assembled by hand and no script was committed

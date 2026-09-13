@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DST-aware named-zone HL7 timestamp conversion (Tier 2.4): convert_hl7_timestamp() and to_zone()
 shift HL7 v2 timestamps between IANA zones using zoneinfo's DST rules, preserving precision.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The neutral credential leaf (ADR 0154 D6): constant-time comparison, the dual-key accumulator, and
 the certificate-subject mapping hoisted out of ``api/security.py``.
 

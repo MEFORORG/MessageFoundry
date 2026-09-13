@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure (vscode-free) view-model for the CONNECTIONS view (ADR 0091 D2). Two perspectives over the
 // one wiring graph the `graph --json` CLI emits (v2: provenanced edges + reverse adjacency):
 //

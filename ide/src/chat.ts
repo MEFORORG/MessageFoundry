@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // @messagefoundry chat participant. Provider-agnostic: it uses whichever model the user picked in
 // VS Code's Chat view (Copilot/Enterprise under their BAA, Claude, etc.) — we never bundle a vendor
 // or ship keys. PHI boundary: we only ever attach code + the config graph (names) — never message

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Doc-drift guard for the comparative authentication-strength table (ASVS 6.1.3).
 
 6.1.3 asks that the *relative strength* of every authentication pathway be documented. The table was

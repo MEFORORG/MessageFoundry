@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Real-association loopback tests for the DICOM C-STORE SCP source (ADR 0025 Phase 1): a live
 ``pynetdicom`` SCU associates and C-STOREs into the ``DicomScpSource``, proving commit-before-SUCCESS
 (via a stub ingress handler), the AE-title / peer-IP allowlists, the ``max_object_bytes`` cap, the

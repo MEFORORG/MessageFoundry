@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tray SCM read path (ADR 0113 §3). The mapping is pure; the ctypes read is Windows-only."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0073 — single-delivery-consumer-per-outbound-lane in the RegistryRunner (SQLite-backed).
 
 Engine shards on one unified store share every outbound lane, but exactly ONE shard (the

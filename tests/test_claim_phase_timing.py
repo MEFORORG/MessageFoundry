@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Bench-gated CLAIM phase timing (``ClaimPhaseTiming``) — the phase PR #842's timer could not see.
 
 #842 timed ``send_ack`` + ``mark_done`` on the premise that the per-delivery wall "is either" one or

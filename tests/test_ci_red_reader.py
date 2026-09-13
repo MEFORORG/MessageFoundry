@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``ci-red`` reader: does the label get read back, and read back correctly (BACKLOG #1385)?
 
 ``failure-signal.yml`` has written the label since PR #716. Nothing read it until

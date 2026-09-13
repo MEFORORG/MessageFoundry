@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """B12 / ADR 0061 — per-lane wake events (targeted worker wakeup, DEFAULT-OFF).
 
 The per-stage wake events were engine-wide singletons: one committed message set the whole-stage event

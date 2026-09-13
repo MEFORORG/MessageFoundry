@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One definition of "which cells are cipher-covered", shared by the tests that need it.
 
 There are TWO mechanisms, and a test that knows only the first will pass while the code and the prose

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Inbound HTTP intake authentication (ADR 0154 increment A) — the per-inbound peer control.
 
 Deliberately NOT ``tests/test_http_auth.py`` (the existing *outbound* OAuth2/Digest suite) and NOT

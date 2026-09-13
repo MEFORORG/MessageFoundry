@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connections-area page builders for the /ui ops dashboard (ADR 0065).
 
 The dashboard + the pollable connections fragment + the per-connection start/stop/restart controls.

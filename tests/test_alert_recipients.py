@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-rule alert recipients (#146, ADR 0014 amendment): a matching rule re-targets the EMAIL
 transport's recipients, the override is popped before any webhook payload (no addresses on the wire),
 and the model rejects an empty override."""

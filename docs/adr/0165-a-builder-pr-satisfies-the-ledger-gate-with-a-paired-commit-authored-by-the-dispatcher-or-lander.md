@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 
 # ADR 0165 — A builder PR satisfies the ledger gate with a paired commit authored by the Dispatcher or Lander
 

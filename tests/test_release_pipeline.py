@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guard the release PIPELINE's load-bearing policy (pyproject sdist allowlist + .github/workflows/release.yml).
 
 Almost none of release.yml can be executed here (it needs a tag push, GitHub OIDC, a real build/SBOM/sign

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural AND behavioural regression tests for the Dependabot auto-merge guardrails (SEC-007).
 
 Most of these assert the YAML wiring of ``.github/workflows/dependabot-auto-merge.yml``; the

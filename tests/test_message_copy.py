@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``Message.copy()`` / ``RawMessage.copy()`` — the ADR 0104 structural-clone primitive.
 
 Verifies AC-2 (dual-backend ``copy().encode() == source.encode()`` over an escaping / repetition /

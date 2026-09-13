@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The gate-rule text scan exists THREE times. Nothing tied the three together (BACKLOG #1018).
 
 Each reads ``worktree_gate.ps1`` as text and extracts every tool name the gate branches on, with the

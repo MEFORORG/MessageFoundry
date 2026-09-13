@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0071 (B5) — per-hop SQL statement / network round-trip inventory (Lane 3a).
 
 Sibling analysis to ``b5_microbench.py``. Where that bench measures *executor->loop crossings*

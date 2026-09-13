@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The overlap cache must round-trip ZERO rows as zero rows.
 
 ``scripts/coord/overlap.ps1`` writes its walk to a per-repo cache and every later run inside

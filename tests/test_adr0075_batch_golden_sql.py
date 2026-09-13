@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0075 AC-1 — golden-SQL test: the batched and unbatched handoff forms emit the IDENTICAL logical
 ``(sql, params)`` sequence (same statements, same order, same params), grouped into fewer round-trips.
 

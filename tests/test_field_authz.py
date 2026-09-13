@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Centralized field-level (property) authorization (WP-9, ASVS 8.1.2/8.2.3).
 
 The PHI map + `redact_unauthorized` are the single place per-property read gating happens; these tests

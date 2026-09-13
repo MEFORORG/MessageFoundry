@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Escape-blind span scanning let a gated git command hide from every rule (BACKLOG #1229 residual).
 
 Two fail-opens, one root cause, and it is the same sentence this gate has already written twice:

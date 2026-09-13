@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Timer / scheduled source (ADR 0011).
 
 A timer reads no external resource — it fires a configured ``body`` on a schedule and hands it to the

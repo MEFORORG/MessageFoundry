@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No script under ``scripts/`` can abort on a stock Windows console (BACKLOG #1030).
 
 THE DEFECT THIS REPLACES. Enforcement was per-file and hand-placed: ``tests/test_cli.py`` asserts one
@@ -109,7 +109,11 @@ def test_the_scan_actually_covers_something() -> None:
     assert len(found) >= 25, (
         f"only {len(found)} files under scripts/ -- the walk is not finding them"
     )
-    assert (_SCRIPTS / "docs" / "backlog_status_check.py") in found
+    # A NAMED FILE, NOT JUST A COUNT: a walk can find 25 files and still miss the directory you care
+    # about. This anchor was `docs/backlog_status_check.py` until the ledger left the repository
+    # (BACKLOG #1250) and that script went with it; `docs/link_check.py` is its replacement in the
+    # same directory, so the control still proves the walk reaches `scripts/docs/`.
+    assert (_SCRIPTS / "docs" / "link_check.py") in found
 
 
 def test_every_script_file_decodes_as_utf8() -> None:

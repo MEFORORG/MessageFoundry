@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The authoritative static wiring graph (ADR 0091 D1): ``config.graph`` extraction tiers +
 provenance, the ``graph --json`` v2 CLI shape, and the ``send-target`` advisory (AC-1/2/3/5/7)."""
 

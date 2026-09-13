@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The Windows notification-area shell for the tray (ADR 0113 §2/§4/§8/§9).
 
 A hand-rolled ``ctypes`` message pump: a hidden window receives the ``Shell_NotifyIcon`` callback,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """What does ``[sandbox].mode = "subprocess"`` actually cost per message? (ADR 0087, BACKLOG #1194)
 
 ADR 0087 states a price -- ``~6.2 ms end-to-end per dispatch, ~0.19 ms with no reference view``,

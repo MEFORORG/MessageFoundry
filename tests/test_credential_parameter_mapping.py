@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A credential factory PARAMETER must land on a SETTING name the redactor covers (BACKLOG #1208).
 
 THE BOUNDARY, and why it needed its own guard. A connector factory takes a credential parameter and

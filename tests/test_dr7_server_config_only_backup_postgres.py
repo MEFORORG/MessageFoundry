@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live Postgres proof of the DR-7 server-DB config-only backup (ADR 0049 AC-7, BACKLOG #52/#60): a
 REAL server-DB store produces a config-only .mfbak (no store.db snapshot) that restore-verifies PASS,
 with exactly one PHI-free dr_backup audit row.

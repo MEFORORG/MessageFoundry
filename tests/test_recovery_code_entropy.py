@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An entropy FLOOR for MFA recovery codes, derived rather than transcribed (BACKLOG #1172).
 
 Recovery codes are a full authentication factor: one of them substitutes for the authenticator app.

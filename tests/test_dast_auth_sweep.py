@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the DAST authenticated authorization sweep (ADR 0155, BACKLOG #318).
 
 Every case here drives the SHIPPED functions from ``scripts/security/dast_auth_sweep.py`` and

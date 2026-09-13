@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``vault_transit`` store cipher — bulk at-rest crypto INSIDE Vault/OpenBao Transit (ADR 0138).
 
 This is a :class:`~messagefoundry.store.crypto.Cipher`, **not** a KeyProvider. The ADR 0019 KeyProvider

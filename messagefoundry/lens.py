@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structured Steps view over Python Handlers and Routers — the static ``ast`` parser (ADR 0076 §3–§4).
 
 :func:`parse_module` classifies each ``@handler`` (and, at contract v2, each ``@router``) body in a

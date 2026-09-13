@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # Multi-replica ACTIVE-PASSIVE HA reference (ADR 0047) — Postgres-backed, replicas: 3.
 # A COPYABLE example of the shipped, code-complete active-passive HA (docs/CLUSTERING.md) packaged for

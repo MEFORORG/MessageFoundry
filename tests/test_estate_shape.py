@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Estate-shape SUT graph (#216) — the HETEROGENEOUS N-inbound code-first graph: a majority of simple
 1-in-1-out feeds + a minority of fan-out hubs, desugared through the SAME inbound()/outbound() factories
 into a flat endpoint list (no "channel" element). The topology split is by CONNECTION COUNT, decided by

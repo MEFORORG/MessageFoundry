@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DR run-profile (#61, ADR 0048 half (b)): under a threshold X the engine binds only inbound
 listeners and builds only outbound connectors whose resolved priority rank >= X (AC-2); the below-
 threshold connections report status:"filtered" — a fifth status distinct from ADR 0031's "failed" — and

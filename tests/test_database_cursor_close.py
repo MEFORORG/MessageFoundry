@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1104: a pooled connection must never go back to the pool with an open cursor.
 
 aioodbc/pyodbc keep the ODBC statement handle open until the cursor is closed. A connection released

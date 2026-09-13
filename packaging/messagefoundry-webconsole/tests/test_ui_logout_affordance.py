@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 7.4.4 — a visible, one-click sign-out on EVERY authenticated /ui page.
 
 The full chrome (``_default_nav``) always rendered one. Five authenticated pages dropped the nav for

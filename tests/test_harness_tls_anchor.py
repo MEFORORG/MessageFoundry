@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The harness's TLS trust anchor (BACKLOG #1276 fallout).
 
 The engine always serves TLS and mints a self-signed placeholder when no operator certificate is

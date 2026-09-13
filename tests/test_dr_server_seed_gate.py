@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Server-DB DR seed live gate (BACKLOG #102, ADR 0048). On a Postgres/SQL Server store the #60 backup is
 config-only, so run_restore_verify PASSes without restoring/inspecting the DBA-managed live 'mefor' DB —
 activation could otherwise promote priority feeds onto a FRESH/UNRESTORED server store (non-empty only

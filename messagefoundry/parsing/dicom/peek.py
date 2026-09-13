@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tolerant DICOM *peek* — cheap routing-field extraction (the HL7
 :class:`~messagefoundry.parsing.peek.Peek` / X12 :class:`~messagefoundry.parsing.x12.peek.X12Peek` /
 FHIR :class:`~messagefoundry.parsing.fhir.peek.FhirPeek` analog for DICOM).

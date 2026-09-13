@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Is the worktree-selfheal payload that RUNS the one in this checkout?
 
 BACKLOG #1019. ``install-selfheal.ps1`` lays the SessionStart backstop down as an installed COPY:

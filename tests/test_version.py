@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The package version is single-sourced and SemVer.
 
 hatchling's dynamic version (`[tool.hatch.version] path = "messagefoundry/__init__.py"`) reads

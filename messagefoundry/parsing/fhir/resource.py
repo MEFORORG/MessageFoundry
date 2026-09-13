@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The full, validated FHIR resource model for transforms — the strict/slow path (the HL7
 :class:`~messagefoundry.parsing.message.Message` / X12
 :class:`~messagefoundry.parsing.x12.message.X12Message` analog).

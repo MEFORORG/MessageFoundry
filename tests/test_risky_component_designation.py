@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The risky-component designation must stay closed over the runtime closure (BACKLOG #1189).
 
 ASVS 15.1.4 asks that application documentation highlight third-party libraries considered risky

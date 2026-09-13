@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Update-check (#30, ADR 0026) tests: the no-network pinned-vs-current diff, off-by-default switch,
 the version comparator, that the alert fires only on drift, and the [update_check] config clamps."""
 

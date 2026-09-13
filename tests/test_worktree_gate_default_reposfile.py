@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Run the gate the way PRODUCTION runs it: with no arguments at all.
 
 Every other test in this suite passes `-ReposFile` so it can point at a temp allowlist. That is necessary

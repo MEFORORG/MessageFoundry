@@ -1,7 +1,22 @@
-# The ledger gate — ADR / BACKLOG number allocation
+# The ledger gate -- ADR number allocation
 
-**What it does in one line:** it makes it impossible for two concurrent sessions to take the same ADR or
-BACKLOG number — the one collision in this repo that **merges cleanly and corrupts silently**.
+> **THE BACKLOG HALF OF THIS DOCUMENT IS HISTORY, NOT INSTRUCTION (BACKLOG #1250, #1754).**
+> The numbered-item ledger moved to the maintainer-internal repository on 2026-09-13.
+> `scripts/coord/alloc.ps1` no longer accepts `-Kind backlog` -- PowerShell refuses it at parameter
+> binding -- and `PUBLIC_BACKLOG_FLOOR`, the `#1000` partition, the residual warning, the boundary
+> ratchet and the gate's item-destruction arm were all removed with it.
+>
+> **Every `-Kind backlog` command below will now fail, and every claim about a backlog floor,
+> partition or item namespace describes a machine that is gone.** They are kept rather than deleted
+> because the reasoning is the argument for the ADR half that remains, and because a reader who meets
+> the retired shape somewhere else needs to know what it was. Read anything about backlog numbers as
+> a record of what this repository used to do.
+>
+> **What still binds: the ADR half.** ADRs live in `docs/adr/` here, two sessions can still collide on
+> one number, and `alloc.ps1 -Kind adr` is still the only correct way to take one.
+
+**What it does in one line:** it makes it impossible for two concurrent sessions to take the same ADR
+number -- the one collision in this repo that **merges cleanly and corrupts silently**.
 
 Companion to [WORKTREE-GATE.md](WORKTREE-GATE.md). That one stops sessions trampling one working tree;
 this one stops them colliding in a *number space* that git cannot see.
@@ -39,10 +54,12 @@ reaches `docs/adr/README.md`, so the ADR becomes invisible. Three had already be
 ### 1. Allocate, never guess — `scripts/coord/alloc.ps1`
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr      -Title "Worktree gate"
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -Title "Ledger allocator"
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # read-only: allocates nothing
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -ShowFloor   # allocates nothing; still fetches
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -ShowFloor -NoFetch   # offline, and stale by design
+
+# -Kind backlog is REFUSED at parameter binding. See the banner at the top of this file.
 ```
 
 `-ShowFloor` prints the computed floor, **the paths it swept**, the sub-partition maximum and the number
@@ -61,8 +78,18 @@ allocations, and a different clone automatically gets its own.
 
 The floor is the maximum over: `origin/main`, **every local and remote ref**, every existing
 allocation, and a **persisted high-water mark**. The all-refs term closes the "wipe the registry →
-re-issue a number that only exists on an unpushed branch" hole. It costs about a second, once per ADR —
-not per edit.
+re-issue a number that only exists on an unpushed branch" hole **within one clone**. The cost is per
+allocation, not per edit: measured on the maintainer clone 2026-09-12, about 21s for an ADR and about
+38s for a backlog number.
+
+**Every one of those terms reads refs this clone already has, so the allocator FETCHES `origin` first**
+(BACKLOG #1616). Without that, a clone that has not fetched since a sibling clone pushed cannot see the
+sibling's number, reads it as free, and takes it — and both ledger gates then pass, correctly, because
+each registry genuinely holds its own claim. A fetch that FAILS **refuses** rather than allocating, after
+retrying, because allocate-and-shout was the control in place the day two PRs took one number. `-NoFetch`
+skips the fetch for a genuinely offline box; it prints the hazard and asks you to say in the PR why you
+skipped it. The reasoning, the flags, and what the fetch still does not close live once, in the
+pre-flight block at `alloc.ps1`'s single `Get-Floor` call site.
 
 **The all-refs term is only as good as the refs this clone still has, so the floor ratchets.** Measured
 on the maintainer clone: the backlog floor is **314** counting every ref, but **252** counting only
@@ -105,8 +132,13 @@ internal `#1001` from a public `#1001` was impossible either way.)*
 
 Two consequences worth knowing before you tidy refs:
 
-- **`git fetch origin --prune` is safe** — it prunes only `refs/remotes/origin/*`, which is not where the
-  high numbers live. It is also what you *should* run before allocating.
+- **`git fetch origin --prune` leaves the ratchet alone** — it prunes only `refs/remotes/origin/*`, which
+  is not where the 62 missing numbers above live. **This bullet used to end "it is also what you should
+  run before allocating", and that sentence is withdrawn** (BACKLOG #1616). The allocator fetches for
+  itself now, and it passes `--no-prune` on purpose: a prune before allocating deletes remote-tracking
+  refs that DO carry ledger rows. Measured on this clone: one `git fetch origin --prune` deleted six
+  refs, among them a `gh-readonly-queue` branch for one of the two PRs that collided on `#1546` — and a
+  queue branch carries the row. Prune when you are tidying refs, never as a step before allocating.
 - **Removing a non-`origin` remote, deleting its refs, or an aggressive `gc` / `reflog expire` that drops
   unreachable objects is what the ratchet defends against.** It keeps the number space correct, but the
   underlying history would still be gone — the ratchet is a backstop, not a substitute for the refs.
@@ -268,7 +300,7 @@ from the branch-holding worktree and **passed** from the aliased entitled one, a
 the PR branch. `tests/test_coord_alloc_strand_sweep.py` pins every step, and pins the recreate ruling
 above — which had been carried as an owner ruling since 2026-08-21 with nothing ever executing it.
 
-**Allocating for another seat: use `-For`, do not allocate in your own tree.** A Console that
+**Allocating for another seat: use `-For`, do not allocate in your own tree.** A Manager that
 allocates on a Builder's behalf records **its own** worktree, both keys then miss for the Builder, and
 the gate correctly refuses a commit nobody can make from the right place. That is not drift — the
 claim is born pointing at the wrong tree, which is the third limb #1414 does not name.

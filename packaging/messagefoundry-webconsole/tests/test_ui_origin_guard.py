@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 3.5.1 — origin validation on EVERY state-changing /ui POST, including the three that had
 none: ``POST /ui/login``, ``POST /ui/logout`` and ``POST /ui/csp-report``.
 

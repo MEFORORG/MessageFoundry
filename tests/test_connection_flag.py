@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Object flagging + the FIRST console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment).
 
 ``Engine.set_connection_flag`` persists the operator "object of interest" flag into ``connections.toml``

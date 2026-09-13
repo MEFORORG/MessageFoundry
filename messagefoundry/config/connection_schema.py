@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The connection configuration schema, derived from the engine by introspection (ADR 0007).
 
 The VS Code connection editor used to enumerate transports and their settings by hand in

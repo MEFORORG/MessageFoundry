@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The properties `.github/zizmor.yml` suppresses a `dangerous-triggers` finding ON, held as tests.
 
 A SUPPRESSION IS A CLAIM, AND A CLAIM NOBODY CAN WATCH FAIL IS AN ASSUMPTION WEARING A GREEN TICK.

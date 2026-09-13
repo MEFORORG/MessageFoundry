@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """HTML page/fragment builders for the /ui ops dashboard (ADR 0065), split by console area.
 
 Every builder returns :class:`.._html.Markup`; every dynamic value is placed through the escaping

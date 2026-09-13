@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #321, build half -- per-class coverage that exercises the LOADED token set.
 
 WHY THIS FILE EXISTS, AND WHY THE EXISTING PER-CLASS TESTS DO NOT COVER IT. Every per-class test in

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Resolve relative markdown links, so a moved file cannot silently orphan the docs that cite it.
 
 **Why this exists.** Closing a backlog item moves its text *verbatim* from ``docs/BACKLOG.md`` into

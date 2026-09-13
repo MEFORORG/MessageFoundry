@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The PHI property gate is fail-CLOSED at the model, not fail-open at the call site (BACKLOG #1045).
 
 ``redact_unauthorized`` used to be the *only* thing that masked a PHI property, so masking happened

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Gate liveness: prove each advisory quality job actually MEASURED something.
 
 Three defects across two of quality-advisory.yml's gates, all green the whole time. Two are the same

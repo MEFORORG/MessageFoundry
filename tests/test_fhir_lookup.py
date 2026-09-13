@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for handler-callable live fhir_lookup (ADR 0043).
 
 Covers the accessor + active-runner indirection (config/fhir_lookup.py), the GET-only read executor

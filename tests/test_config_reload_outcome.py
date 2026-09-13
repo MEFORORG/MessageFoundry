@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The reported outcome of a config reload matches what the engine actually did (BACKLOG #1111).
 
 ``Engine.reload`` swaps the live graph, and until this landed three steps that could raise ran

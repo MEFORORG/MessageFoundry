@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Deployment verifier — ``messagefoundry verify``.
 
 Adopter-grade, **wheel-only** acceptance for a real deployment: host/environment checks, a store

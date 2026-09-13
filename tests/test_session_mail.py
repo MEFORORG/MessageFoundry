@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the async session-mail channel (``scripts/coord/mail*.ps1``, ``scripts/hooks/mail-drain.ps1``).
 
 The channel WAS a prototype and is now WIRED -- ``mail-drain.ps1`` runs at ``SessionStart`` and

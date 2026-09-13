@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No test fixture may issue an UNGUARDED ``DELETE FROM outbox`` once the legacy table is retired.
 
 ASVS 14.2.7 migrates the legacy SQL Server ``outbox`` table into ``queue`` and DROPs it. After that, a

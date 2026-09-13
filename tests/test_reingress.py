@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Re-ingress orchestration (ADR 0013 Increment 2).
 
 Built in the design's order; this file grows per build step. Step 1 pins the stage-model edits — the

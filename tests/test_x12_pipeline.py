@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """X12 through the FULL staged engine (P2 X12-15).
 
 The X12 transport is proven at the socket level (``test_x12_transport``) and the codec in isolation, but

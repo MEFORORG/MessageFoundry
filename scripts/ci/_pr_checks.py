@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One reading of a pull request's ``statusCheckRollup``, shared by the checks that need it.
 
 WHY THIS IS STILL ITS OWN MODULE ON ONE CALLER. It was split out when two scripts read the rollup:

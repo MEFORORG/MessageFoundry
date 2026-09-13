@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The CONTRACT_V2 Steps grammar — the ``note`` kind (ADR 0076 Amendment A, BACKLOG #248) and the
 ``route`` kind + ``@router`` projection (Amendment D, BACKLOG #232).
 

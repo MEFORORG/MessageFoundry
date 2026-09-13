@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Zero-dependency, autoescape-by-default HTML rendering for the /ui ops dashboard (ADR 0065).
 
 Security model (the reason this exists instead of a template engine): the **only** way to place a

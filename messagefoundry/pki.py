@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PKI helpers (BACKLOG #71/#72): PKCS#12 import, read-only cert inventory, self-signed dev certs.
 
 The single first-party home for the ``cryptography`` PKI primitives the ``cert`` CLI group relies on —

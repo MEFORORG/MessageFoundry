@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Multi-ENGINE store-contention CI smoke (WS-B) — N=2 engines on ONE shared SQLite store.
 
 The multishard orchestrator OWNS two ``serve`` subprocesses, both pointed at the SAME SQLite ``.db``

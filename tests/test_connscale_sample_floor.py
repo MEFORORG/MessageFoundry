@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1430: the connscale in-hold sampler must produce at least two readings per sweep step.
 
 A window needs two endpoints. `_empty_claim_rates` and `_throughput_rates` each read a first and a

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0059 — seq-only per-lane FIFO (dropping the ``_fifo_created_at`` write-time clamp).
 
 Per-lane FIFO now orders by ``seq`` alone (SQLite ``rowid``, SQL Server ``BIGINT IDENTITY``, Postgres

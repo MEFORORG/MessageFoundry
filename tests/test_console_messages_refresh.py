@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MessagesPanel refresh convergence — the discard-every-snapshot livelock.
 
 NOT BACKLOG #17, despite what earlier comments here and in test_harness_monitor.py said. #17 is the

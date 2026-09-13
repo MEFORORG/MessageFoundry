@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The multi-ENGINE store-contention orchestrator (WS-B) — N ``serve`` engines, ONE shared store.
 
 Where :mod:`harness.load.connscale.runner` sweeps CONNECTION count against a SINGLE owned engine, this

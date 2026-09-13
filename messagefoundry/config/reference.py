@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synchronous **read side** for reference sets (external-data enrichment, ADR 0006 Tier 1).
 
 A **reference set** is a managed, versioned, read-only lookup snapshot the engine *materializes* from

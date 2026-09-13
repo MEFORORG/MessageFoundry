@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Can the anchor report actually detect a stale anchor, and does it refuse what it must refuse?
 
 BACKLOG #1405. The reporter's whole value is a negative claim -- "these citations no longer reach the

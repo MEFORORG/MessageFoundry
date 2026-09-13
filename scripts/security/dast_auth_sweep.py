@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Authenticated authorization sweep against a live loopback listener in front of a real engine.
 
 THE DEFECT THIS EXISTS FOR. Point any scanner at a deny-by-default API without a credential and it

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``accepts=`` Router-stage seam (ADR 0084, BACKLOG #213).
 
 A Handler may declare a **pure** ``accepts=`` predicate evaluated in the ROUTER stage, before any

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI cert tooling (BACKLOG #71/#72): `.pfx` import, read-only inventory, self-signed dev certs.
 
 Driven end-to-end through `messagefoundry.__main__.main([...])` (int return codes + capsys/tmp_path),

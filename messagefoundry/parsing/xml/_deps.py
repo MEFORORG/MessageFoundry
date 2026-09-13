@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lazy loaders for the optional ``[xml]`` extra (``lxml`` + ``xmlschema`` + ``signxml``).
 
 These third-party libraries live behind the ``messagefoundry[xml]`` optional extra (BACKLOG #31), so

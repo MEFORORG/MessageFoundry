@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0118 acceptance criteria for the ``[security]`` configuration section.
 
 The switches live in one plain-language section, default to the secure position, and desugar into the

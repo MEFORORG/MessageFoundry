@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Inbound HTTP listen source (ADR 0023): body-POST -> ingress, 202 respond-with-receipt-after-commit,
 content_type payload selection, the oversize/malformed/allowlist/slow-loris pre-ingress refusals (each
 emitting a metadata-only connection_event), the TLS/allowlist wiring guards, and bounded teardown.

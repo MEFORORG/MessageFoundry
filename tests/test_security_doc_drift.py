@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Doc-vs-code drift guard for ``docs/SECURITY.md``'s authorization documentation.
 
 ASVS 8.1.1 / 8.1.2 / 8.1.3 / 8.1.4 score the **shipped documentation** as the control, so an

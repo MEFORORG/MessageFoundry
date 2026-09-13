@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The eight pre-commit gates whose CI mirror nothing else compares (BACKLOG #1395).
 
 ``tests/test_lint_scope_parity.py`` already pins hook-versus-CI equivalence for ``ruff-format``,
@@ -96,7 +96,9 @@ _REPLAY_SKIPS = frozenset({"ledger-gate", "forbidden-content"})
 #: CURRENT CORPUS, not by construction, which is why they are regexes too rather than substrings.
 _MIRRORS: dict[str, str] = {
     "ledger-gate": r"python\s+scripts/hooks/ledger_check\.py",
-    "backlog-parses": r"python\s+scripts/docs/backlog_status_check\.py",
+    # `backlog-parses` stood here, mirroring `python scripts/docs/backlog_status_check.py`. The hook,
+    # the script and the ledger they read all left in one change (BACKLOG #1250), so the pair is
+    # gone rather than half-removed -- which is the state this file exists to detect.
     "forbidden-content": r"python\s+scripts/security/scan_forbidden\.py",
     "licence-header": r"python\s+scripts/quality/licence_header_check\.py",
     "control-char": r"python\s+scripts/quality/control_char_check\.py",

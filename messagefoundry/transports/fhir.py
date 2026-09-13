@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """FHIR REST transport: a destination that delivers a FHIR resource to a FHIR server (ADR 0022 §2).
 
 ``FhirDestination`` is a sibling :class:`~messagefoundry.transports.base.DestinationConnector` that

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The CI docs-only short-circuit, driven directly (BACKLOG #1200).
 
 `ci.yml`'s `changes` job decides whether a PR runs the suite at all. When it says `code=false`,

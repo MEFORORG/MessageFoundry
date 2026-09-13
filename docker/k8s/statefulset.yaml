@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # Minimal Kubernetes manifests for the headless engine — Topology A (in-process TLS), the self-contained
 # baseline. See docs/CONTAINER-EXPOSURE-EVALUATION.md §1 for Topology B (a same-pod TLS-terminating

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-connection active-window scheduler (#147, ADR 0095): the RegistryRunner honors a per-connection
 time-of-day / day-of-week ``Schedule`` to AUTO-START a connection on entering an active window and
 cleanly STOP (park) it on leaving — reusing the SAME start/stop lifecycle the API uses. The clock is

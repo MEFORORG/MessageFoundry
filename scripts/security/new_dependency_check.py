@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Verify every dependency this project declares is a REAL, established distribution.
 
 THE GAP THIS CLOSES. ``pip-audit`` answers "does this pinned version have a known CVE". It cannot

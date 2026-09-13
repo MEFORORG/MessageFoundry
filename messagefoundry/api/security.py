@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """FastAPI authentication + authorization dependencies (deny-by-default).
 
 ``require(*permissions)`` is a dependency factory applied to every protected route. Once an enabled

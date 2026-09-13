@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.2.2 — the cryptographic-agility seam contract (docs/PHI.md section 3.x).
 
 The owner ruled 2026-08-11 that this project commits to RELEASE-swappability (a release can change an

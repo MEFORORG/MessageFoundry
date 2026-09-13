@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Estate run profiles — authored as **data** (TOML), parsed into a frozen dataclass (#216).
 
 An estate profile names the connection count, the simple/hub split, the hub fan-out, and the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The operator alert-state API (ADR 0044, #56): GET /alerts/active + ack/resolve (RBAC
 monitoring:diagnose + per-channel scope) and the wired ConnectionRow.alerts_active open count."""
 

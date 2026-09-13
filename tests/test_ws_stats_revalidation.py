@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-018 — /ws/stats must stop streaming promptly after a session is revoked/downgraded.
 
 The feed authorizes once at handshake then revalidates the session on an elapsed-time cadence

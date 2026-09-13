@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Operator attachment read/download surface (#149, ADR 0105 Phase 3b) + its ASVS 1.3.4 serve-time
 neutralization.
 

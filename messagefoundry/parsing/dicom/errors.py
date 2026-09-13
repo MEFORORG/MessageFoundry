@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Exceptions for the DICOM codec (ADR 0025).
 
 Kept in their own module (mirroring :mod:`messagefoundry.parsing.fhir.errors` /

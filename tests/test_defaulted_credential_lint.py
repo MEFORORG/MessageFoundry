@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A credential-named key must not ship a hard-coded literal default (BACKLOG #1091).
 
 The shape is `POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:-changeme}"` -- a shell default that makes a

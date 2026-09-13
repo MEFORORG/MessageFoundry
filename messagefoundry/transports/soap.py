@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 r"""SOAP transport: a destination that POSTs a SOAP envelope to a web service.
 
 The **destination** is a thin SOAP layer over the same stdlib HTTP client the REST connector uses

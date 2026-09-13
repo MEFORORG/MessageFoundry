@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Estate-shape system-under-test: a HETEROGENEOUS estate of N inbound MLLP connections (#216).
 
 A ``MEFOR_ESTATE_SIMPLE_FRACTION`` majority are **simple** feeds (1 inbound → 1 outbound to the

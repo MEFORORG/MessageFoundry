@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A stray quote must not let a gated git command hide between two quoted words (BACKLOG #1229).
 
 The gate blanks quoted spans before scanning, so a commit message cannot supply a verb. It used to do

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """STRUCTURAL tests for the two-box off-loopback bind override (ADR 0073 cert + ADR 0075 batch_ab).
 
 A ``serve``/``serve --shard`` subprocess that binds its inbound MLLP listener on a NON-loopback

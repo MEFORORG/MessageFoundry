@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0075 AC-3 — CONTENT-vs-INFRA error attribution is preserved under batching.
 
 The handoff is an all-or-nothing boundary in the pipeline: ANY raise from a ``*_handoff`` (a statement or

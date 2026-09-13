@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Measure whether sessions actually followed the rules, from their own transcripts.
 
 WHY THIS EXISTS. Research on instruction-following in long documents measures fact retrieval,

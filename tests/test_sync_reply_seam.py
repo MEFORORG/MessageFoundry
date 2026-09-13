@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The synchronous-reply injection seam (ADR 0154 D2) — the types, and the PHI property they carry.
 
 ``InboundReply.body`` is the partner's reply: PHI, decrypted out of the store. The design rule is

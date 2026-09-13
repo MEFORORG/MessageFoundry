@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DATABASE stored-proc OUT-param / scalar-return capture (BACKLOG #67, ADR 0013 amendment).
 
 The aioodbc/pyodbc driver is never imported — a fake cursor/conn/pool stands in (mirroring

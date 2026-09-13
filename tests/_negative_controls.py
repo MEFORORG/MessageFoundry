@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Load and validate the negative-control registry (BACKLOG #1000).
 
 Shared rather than inlined for the same reason ``_workflow_contexts`` is: this reconciliation is run

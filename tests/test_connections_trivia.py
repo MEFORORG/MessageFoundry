@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """connections.toml writer TRIVIA parity: a GUI/CLI save must not destroy documentation.
 
 `connections_edit.upsert_connection` replaced the edited entry with a freshly built table

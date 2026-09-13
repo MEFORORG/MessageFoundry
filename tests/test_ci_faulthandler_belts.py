@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The hang-diagnostic belts on CI's two pytest steps, pinned so a silent removal goes red.
 
 BACKLOG #1304. The ``repo harness tests (windows-2025)`` leg intermittently hangs on a ``pwsh``

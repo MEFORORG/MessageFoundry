@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """End-to-end pin for every field-level redaction site (ASVS 8.1.2).
 
 ``docs/SECURITY.md`` states that the same disposition text gates on ``messages:view_summary`` on

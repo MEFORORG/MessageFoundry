@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the shared session-liveness fence (``scripts/coord/session-registry.ps1``).
 
 This module exists so ``presence.ps1`` (a read-only roster) and ``sessions.ps1`` (which MOVES a

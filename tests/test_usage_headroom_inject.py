@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the spawn-point headroom injection (``scripts/hooks/usage-headroom-inject.ps1``).
 
 The usage collector can compute a warning and has no way to deliver it: it writes files, and the four

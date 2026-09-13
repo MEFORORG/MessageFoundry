@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ADR 0064 schema-content hash: any DDL edit must change it (forcing one full run on the next
 open), and it must be deterministic (or every open would spuriously re-run the batch). No DB needed —
 this pins the discriminator the ``schema_meta`` fast-path trusts; the fast-path behavior itself is

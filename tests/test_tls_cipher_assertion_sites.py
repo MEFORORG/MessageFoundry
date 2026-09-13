@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Call-site coverage for the forward-secrecy assertion (ASVS 12.1.2), one test per hardened site.
 
 ``tests/test_tls_policy.py`` covers the FUNCTION and derives its call-site list from the presence of

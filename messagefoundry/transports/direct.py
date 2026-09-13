@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Direct-Project S/MIME-over-SMTP destination (ADR 0085, PR1 — **outbound only**).
 
 The Direct Project carries clinical content between trusted correspondents as an **S/MIME message

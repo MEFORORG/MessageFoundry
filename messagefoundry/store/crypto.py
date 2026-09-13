@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PHI-at-rest encryption for the message store (STORE-1; WP-5 keyring + rotation; M9 crypto-agility).
 
 The store persists raw HL7 message bodies and a few PHI-bearing text columns (`messages.error`,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Store-once-deliver-many (L2b): when one handler's transform produces an IDENTICAL transformed body
 for N destinations, the body is stored ONCE in ``shared_body`` and the N outbound rows reference it via
 ``body_ref`` (dereferenced at delivery). Covers the dedup, the per-destination deref, the inline

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Resend a stored message to an ALTERNATE outbound connection (ADR 0090, BACKLOG #123).
 
 The SQLite invariant matrix for ``store.resend_to`` + the API ``POST /messages/{id}/resend``:

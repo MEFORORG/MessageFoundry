@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The OIDC relying party's outbound TLS wiring (ADR 0142, BACKLOG #274).
 
 This is the **wiring layer** the pure :mod:`messagefoundry.auth.oidc` package deliberately does not

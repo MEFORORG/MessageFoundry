@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin the advisory guarantees of .github/workflows/quality-advisory.yml.
 
 Every safety property of that workflow is a string in a YAML file: one edit can grant a write

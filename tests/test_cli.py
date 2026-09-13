@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """CLI introspection subcommands (validate/graph/dryrun/hl7schema) emit JSON for the IDE."""
 
 from __future__ import annotations

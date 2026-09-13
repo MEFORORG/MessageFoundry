@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """docs/PHI.md's browser-storage sentence must describe what the web console actually writes.
 
 BACKLOG #1186 (ASVS 14.2.4) asks that the named control domains be implemented as defined in the

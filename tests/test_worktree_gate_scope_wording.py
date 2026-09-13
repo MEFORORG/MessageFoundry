@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1082: rule 3c's deny text named a mechanism a ``--global``/``--system`` write does not use.
 
 **THE VERDICT WAS ALWAYS CORRECT AND DOES NOT MOVE HERE.** ``git config --global core.hooksPath <dir>``

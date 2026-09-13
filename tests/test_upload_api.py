@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Offline uploaded-logs API — upload/list/browse/resend/delete (BACKLOG #125/#126, ADR 0134).
 
 RBAC + step-up + audit + the DISTINCT inject path (enqueue_ingress, not reingress) + the path-traversal

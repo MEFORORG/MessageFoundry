@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The baseline security headers must be on EVERY response, including the ones no route produced.
 
 `_security_headers` is the INNERMOST user middleware, so every emitter outside it escaped: the request

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Ledger gate — stop two concurrent sessions from silently colliding on an ADR / BACKLOG number.
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Ledger gate — stop two concurrent sessions from silently colliding on an ADR number.
 
 THE DEFECT THIS EXISTS FOR. Two sessions each grep for "the next free number", both pick N, and create
-DIFFERENTLY-NAMED files (docs/adr/0084-alpha.md and docs/adr/0084-beta.md, or two `## 227.` headings
-1,600 lines apart in BACKLOG.md). Git merges both **cleanly** — there is no textual conflict — and the
-ledger is quietly corrupt. It has happened three times here (d1d0a5a #574, 5b7d046 #598, 9f3483d), and it
-is the one measured collision class that a worktree, a file lock, and `git merge-tree` are all blind to.
+DIFFERENTLY-NAMED files: docs/adr/0084-alpha.md and docs/adr/0084-beta.md. Git merges both **cleanly**
+— there is no textual conflict — and the ledger is quietly corrupt. It has happened three times here
+(d1d0a5a #574, 5b7d046 #598, 9f3483d), and it is the one measured collision class that a worktree, a
+file lock, and `git merge-tree` are all blind to.
+
+THE BACKLOG HALF IS GONE. Two of those three collisions were backlog items, not ADRs, and that arm
+was retired with the ledger itself (BACKLOG #1250) — see the note above `git()` for what went and
+why. The remaining risk is real and unchanged: ADRs still live in this repository.
 
 WHY A GIT PRE-COMMIT HOOK. Installed by scripts/coord/install-git-hooks.ps1 into the SHARED .git/hooks,
 one copy governs EVERY worktree at once — no branch, no merge, no propagation lag — and it sees every
@@ -33,76 +37,25 @@ from pathlib import Path
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
-BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 
-# THE ITEM NUMBER SPACE SPANS MORE THAN ONE FILE.
+# THE BACKLOG HALF OF THIS GATE IS RETIRED (BACKLOG #1250, BACKLOG #1754).
 #
-# docs/BACKLOG.md carries the OPEN items; retired ones are moved verbatim into docs/archive/backlog/.
-# A number is taken if it appears in EITHER, so every rule below reads their union. Keying on the one
-# published path was safe only while it was the only path, and would leave the archive an unpoliced
-# region: a commit touching only the archive would early-return having checked nothing, and two
-# sessions could file the same number there and merge clean -- the exact collision this gate exists
-# to stop, reintroduced through the back door of a file it does not look at.
+# The numbered-item ledger no longer lives in this repository. It moved to the maintainer-internal
+# one, and docs/BACKLOG.md is now a stub saying so. With no `## N.` items anywhere in this tree
+# there is no namespace for a collision rule to police, so check_backlog(), the item-destruction
+# reverse arm, and every helper only they used were removed rather than left to pass vacuously over
+# an empty corpus. A gate that cannot fail is worse than no gate: it licenses the behaviour while
+# withdrawing the caution its absence would have preserved.
 #
-# Reading the union on BOTH sides also disposes of a false positive that a base-only view would
-# create: the move commit RELOCATES 185 items, so head-union == base-union and `head - base` is
-# empty. A per-file view would instead see 185 numbers vanish from BACKLOG.md and, on any worktree
-# whose base straddles the move, report them -- with a remedy that would renumber cited items.
-BACKLOG_PATH = "docs/BACKLOG.md"
-BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
-
-# THE PUBLIC BACKLOG NUMBER SPACE IS PARTITIONED AT #1000.
+# PUBLIC_BACKLOG_FLOOR WENT WITH THEM, AND ITS READER WENT FIRST. `scripts/coord/alloc.ps1` used to
+# regex-match the literal out of this file so the floor was defined exactly once; that allocator no
+# longer accepts `-Kind backlog`, so the constant had no reader and no subject. Do not reintroduce
+# it to "preserve the contract" -- a floor guarding a number space this repository does not carry
+# is a compensating control resting on a false premise.
 #
-# docs/BACKLOG.md is a published baseline of a larger maintainer-internal ledger. The two sequences
-# diverged around #231 and have been allocated INDEPENDENTLY since, so one number can name two
-# unrelated items: public #248 and internal #248 are different work. That overlap is recorded, not
-# repaired -- renumbering would rewrite ratified ADRs and an operator-facing refusal string that ships
-# inside the wheel, and it would not stop the NEXT one. It would only make stale citations resolve
-# uniquely and WRONGLY, which is worse than resolving ambiguously.
-#
-# The partition stops the next one. New items here are allocated at #1000+, the internal sequence stays
-# below (high-water 314 when this landed), so the overlapping set is CLOSED at the numbers already
-# issued and a cited #N >= 1000 is unambiguously an item in THIS file.
-#
-# Why a constant and not a manifest of reserved numbers: a manifest cannot fire. `## 316.` is already
-# on origin/main and alloc.ps1's floor is max(...)+1 over a sweep that includes it, so every clone
-# issues >= 317 while a manifest of internal numbers tops out at 314 -- the reject set and the emit set
-# never intersect. A manifest would also be born stale (its source refs belong to a remote this clone
-# no longer lists), be regenerable on exactly one machine, and be the very instrument the erratum
-# convicts: "the published baseline is not a safe place to check a number against; only the allocator
-# is." A constant has no source data, so it cannot rot.
-#
-# This is the ONE backlog rule that also runs in --ci. The ownership rule cannot: it reads a per-clone
-# registry under .git and compares a worktree path, and a runner has neither -- which left the CI half
-# of check_backlog() computing a set and discarding it, i.e. unable to fail at all. A floor needs no
-# registry, no worktree, and no sight of the internal ledger (CI checks out origin only).
-#
-# KNOWN RESIDUAL, and it is NOT detected anywhere: this binds only the public side, and nothing in this
-# repository can stop -- or observe -- the maintainer-internal ledger allocating past #1000.
-#
-# This comment used to claim alloc.ps1 "warns at allocation time if the all-refs maximum ever reaches
-# this boundary". That was the wrong instrument twice over, and it was the defect written down:
-#   - The all-refs maximum has NO PROVENANCE. A public item legitimately allocated at the boundary and
-#     an internal breach are the same observation. That guard fired on BACKLOG #1000 -- correct input --
-#     and bricked every backlog allocation in the repo until 2026-08-03.
-#   - It claimed a liveness the ref store does not have. The vault-ish remote-tracking refs it would
-#     read are a FOSSIL: no configured refspec advances them, the newest is older than the partition
-#     itself, and a fresh clone has none at all.
-# alloc.ps1 now warns only on the highest number BELOW the boundary (which over-states the internal
-# high-water, so it warns early), and refuses only on a lowered boundary, which is locally observable.
-#
-# Raising this number is a one-line reviewable source change, deliberately not an allowlist file that
-# would rot out of sight. LOWERING it is the dangerous direction and is the one thing neither this gate
-# nor CI can catch -- both read only the current value and have no memory of the previous one -- so
-# alloc.ps1 keeps a `.boundary-highwater` ratchet beside its registry and refuses when the constant
-# drops beneath a value that clone has already allocated against.
-#
-# THIS LINE IS PARSED, not imported: scripts/coord/alloc.ps1 regex-matches it so the floor is defined
-# exactly once and the allocator can never emit a number this gate refuses. Keep the name and the
-# literal on ONE line. A type annotation is tolerated; splitting, computing, or renaming it is not, and
-# would make every backlog allocation refuse. tests/test_ledger_check.py pins the contract, so that
-# break lands in CI on whoever edits this line rather than on an unrelated session days later.
-PUBLIC_BACKLOG_FLOOR = 1000
+# THIS GATE STILL POLICES ADR NUMBERS, which is now the whole of its job. ADRs live in docs/adr/
+# here, they are public, and two sessions can still allocate one number and merge clean. Allocate
+# with `pwsh -NoProfile -File scripts/coord/alloc.ps1 -Kind adr -Title "<title>"`.
 
 
 def git(*args: str) -> str:
@@ -175,6 +128,11 @@ class Ledger:
         # allocations — and a different clone gets its own, automatically.
         self.alloc = Path(common) / "mefor-coord" / "alloc"
         self.failures: list[str] = []
+        # Per-run memos. Every entry is derived from a REF, and refs do not move inside one run of a
+        # pre-commit hook -- so a repeat lookup is pure waste, and each one costs git subprocesses.
+        # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
+        # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
+        self._parents: list[str] | None = None
 
     # -- tree access ---------------------------------------------------------------------------------
     #
@@ -198,41 +156,12 @@ class Ledger:
             return git("diff", "--name-only", "--diff-filter=A", self.base, "HEAD").split()
         return git("diff", "--cached", "--name-only", "--diff-filter=A").split()
 
-    def changed_files(self) -> list[str]:
-        if self.ci:
-            return git("diff", "--name-only", self.base, "HEAD").split()
-        return git("diff", "--cached", "--name-only").split()
-
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
         return git("show", f"HEAD:{path}") if self.ci else git("show", f":{path}")
 
     def base_text(self, path: str) -> str:
         return git("show", f"{self.base}:{path}")
-
-    def base_has(self, path: str) -> bool:
-        """Does the base ref contain ``path`` at all?
-
-        A ledger file being ADDED legitimately has no base version, and `git show base:path` exits 128
-        for that — indistinguishable, to :func:`git`, from a real failure, which it must keep raising on
-        (an error swallowed as "empty ledger" reads as "no numbers taken", the false-clean this gate
-        exists to prevent). So absence is probed EXPLICITLY here, and only after the base ref itself is
-        verified — otherwise a bad/unfetched base would quietly answer "absent" and disable the check.
-        """
-        git("rev-parse", "--verify", f"{self.base}^{{commit}}")
-        return _obj_exists(f"{self.base}:{path}")
-
-    def head_has(self, path: str) -> bool:
-        """Does the commit under test contain ``path``? Mirrors :meth:`head_text`'s ref.
-
-        The symmetric case to :meth:`base_has`, and it bites the moment a ledger file is FIRST
-        published. In CI the change set is `diff base HEAD`, so once ``origin/main`` gains a file that
-        a branch predates, that branch's diff lists it — as a DELETION relative to base — even though
-        the branch never touched it. The rule then reads HEAD for a copy that was never there and
-        `git show HEAD:path` exits 128. That is not a ledger violation; it is a stale branch, and it
-        broke every open branch the hour docs/BACKLOG.md landed.
-        """
-        return _obj_exists(f"HEAD:{path}" if self.ci else f":{path}")
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -279,7 +208,15 @@ class Ledger:
         writes one sha per line and rev-parse would answer only the first, silently policing the
         rest. CI never has a merge in progress -- there HEAD is already the merge commit -- so this
         is empty there and the CI path is unchanged.
+
+        Memoized per run. ``MERGE_HEAD`` cannot change while the hook runs, and this is called once
+        per rule plus once per added ADR file -- each call spawning a `git rev-parse`.
         """
+        if self._parents is None:
+            self._parents = self._read_merge_parents()
+        return self._parents
+
+    def _read_merge_parents(self) -> list[str]:
         if self.ci:
             return []
         path = Path(git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
@@ -292,22 +229,6 @@ class Ledger:
         # built on, and folding it in unconditionally would stop policing an ordinary second commit
         # that adds a number to a branch -- a real narrowing, and not this fix's business.
         return [*parents, "HEAD"]
-
-    def _backlog_numbers_at(self, ref: str) -> set[str]:
-        """Every ``## N.`` number carried by ``ref``, across the live file and the archive.
-
-        Mirrors :meth:`backlog_paths` for an arbitrary commit rather than for base/head, and probes each
-        path's existence for the same reason that method does: a listed-but-absent path makes `git show`
-        exit 128, which :func:`git` correctly raises on and which would read here as a crash rather than
-        as "this ref has no archive".
-        """
-        paths = [BACKLOG_PATH] if _obj_exists(f"{ref}:{BACKLOG_PATH}") else []
-        listing = git("ls-tree", "-r", "--name-only", ref, f"{BACKLOG_ARCHIVE_DIR}/")
-        paths += [p for p in listing.split() if p.endswith(".md")]
-        out: set[str] = set()
-        for p in paths:
-            out |= set(BACKLOG_HEADING.findall(git("show", f"{ref}:{p}")))
-        return out
 
     def _carried_by_a_merge_parent(self, path: str) -> bool:
         """Does ``path`` already exist on a commit this merge is bringing in?"""
@@ -326,11 +247,26 @@ class Ledger:
         happens the recorded path stops matching for EVERY session, the number is uncommittable by
         anyone, and nothing reports it. Measured 2026-08-30: 43 numbers were already in that state.
 
-        ***THE FALLBACK PRESERVES THE EXCLUSIVITY THE PATH WAS PROVIDING, WHICH IS THE ONLY REASON IT
-        IS SAFE: GIT REFUSES TO CHECK ONE BRANCH OUT IN TWO WORKTREES.*** So "the session on this
-        branch" is as single-valued as "the session in this worktree" ever was -- the gate exists to
-        stop two sessions filing one number, and two sessions cannot hold one branch. What changes is
-        that the key now survives its worktree.
+        ***THE FALLBACK PRESERVES THE EXCLUSIVITY THE PATH WAS PROVIDING, AND THAT IS THE ONLY REASON
+        IT IS SAFE: GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO WORKTREES.*** So "the
+        session on this branch" is as single-valued as "the session in this worktree" ever was -- the
+        gate exists to stop two sessions filing one number, and two sessions do not hold one branch.
+        What changes is that the key now survives its worktree.
+
+        ***THAT REFUSAL IS A DEFAULT, NOT A GUARANTEE, AND THIS SENTENCE USED TO SAY "GIT REFUSES"
+        FLAT (BACKLOG #1039).*** Measured: `git worktree add --force` (and `-f`) check the same branch
+        out again and succeed, and `git checkout --ignore-other-worktrees` switches -- the same two
+        bypasses `worktree_gate.ps1` already spells out in its own rule-3b deny text. A claim about
+        this repository's CONFIGURATION was being written as a claim about git.
+
+        **So there is a real residual, stated rather than repaired here, because repairing it is a
+        change to the ownership model and not to a docstring.** Force a second checkout of the
+        recorded branch and BOTH trees satisfy the fallback, so entitlement to the number leaks to a
+        tree that never allocated it. It is narrow: the fallback is unreachable while the recorded
+        path still matches (see the early return below), so the leak needs the recorded worktree to be
+        gone AND a deliberate `--force`. It stops the ACCIDENT, not a determined bypass -- which is
+        the same bound `worktree_gate.ps1` reaches about its own guard, and it is the honest strength
+        of the argument above rather than a hole this change opens.
 
         WHY THIS AND NOT A TRANSFER VERB: a transfer verb would let a seat take a number another
         session is actively holding, which is the collision the gate exists to prevent. The branch
@@ -402,8 +338,10 @@ class Ledger:
         if branch:
             lines.append(f"    2. or check that branch out and commit there: {branch}")
         lines += [
-            "       (git refuses a branch held by another worktree; from the worktree in 1 you can",
-            "        still reach it with: git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+            "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
+            "        not force past that -- two trees on one branch is what makes the branch key above",
+            "        stop being exclusive. From the worktree in 1 you can still reach it with:",
+            "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
             "    3. ONLY if neither tree nor branch still exists, allocate a new number:",
             f"       {allocate}",
             "",
@@ -413,6 +351,21 @@ class Ledger:
 
     # -- rules ---------------------------------------------------------------------------------------
     def check_adrs(self) -> None:
+        """ADR rules -- now the only rules this gate has. See the retirement note at the top.
+
+        THERE IS NO ADR REVERSE ARM, AND THAT WAS DELIBERATE BEFORE THE BACKLOG HALF LEFT. The two
+        ledgers hid a deletion differently. A backlog item was a HEADING inside a 30k-line file:
+        absorb it into the line above and the diffstat reads 5 insertions, 1 deletion, with the
+        item's whole body still present and re-attributed (BACKLOG #1470). An ADR is a FILE --
+        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list.
+        Building the same machinery against a threat git already reports is not depth, it is noise.
+        So the reverse arm went with the half that needed it, and nothing is owed here.
+
+        WHAT IS GENUINELY UNCOVERED HERE, stated rather than implied: nothing checks the ROW -> FILE
+        direction, so an index row in docs/adr/README.md can outlive the file it names and the number
+        reads as live to every citation checker while naming nothing. That is an index-only question --
+        no parents, no base, no shallow reasoning -- and it belongs to its own row.
+        """
         base_adrs = self.base_adr_numbers()
         try:
             head_readme = self.head_text("docs/adr/README.md") or self.base_text(
@@ -475,83 +428,8 @@ class Ledger:
                 "remove the duplicate row",
             )
 
-    def backlog_paths(self, side: str) -> list[str]:
-        """Every file carrying numbered items on ``side`` ('head' or 'base').
-
-        Enumerated per side rather than assumed, because the archive does not exist on a base that
-        predates it, and a path listed but absent makes `git show` exit 128 — indistinguishable from
-        a real failure, which is the false-clean this gate must never produce.
-        """
-        if side == "base":
-            listing = git("ls-tree", "-r", "--name-only", self.base, f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.base_has(BACKLOG_PATH)
-        elif self.ci:
-            listing = git("ls-tree", "-r", "--name-only", "HEAD", f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.head_has(BACKLOG_PATH)
-        else:
-            # The INDEX, matching head_text() — a staged archive edit must be policed before it lands.
-            listing = git("ls-files", "--", f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.head_has(BACKLOG_PATH)
-        paths = [BACKLOG_PATH] if have_main else []
-        paths += [p for p in listing.split() if p.endswith(".md")]
-        return paths
-
-    def check_backlog(self) -> None:
-        changed = self.changed_files()
-        if not any(f == BACKLOG_PATH or f.startswith(f"{BACKLOG_ARCHIVE_DIR}/") for f in changed):
-            return
-        base_paths = self.backlog_paths("base")
-        if not base_paths:
-            # The base has no backlog at all — the file is being ADDED (it was gitignored until the
-            # cutover published it). Numbers that do not exist on base cannot be collided with, so
-            # there is nothing to police; without this, importing the ledger wholesale would report
-            # every one of its ~229 items as "not allocated to this worktree".
-            return
-        head_paths = self.backlog_paths("head")
-        if not head_paths:
-            # Present on base, absent here: a branch that PREDATES the file's publication. CI diffs
-            # against origin/main, so the file shows up as "changed" (a deletion relative to base)
-            # although the branch never touched it — and reading HEAD for a copy that was never there
-            # exits 128. A stale branch is not a ledger violation.
-            return
-        head: set[str] = set()
-        for p in head_paths:
-            head |= set(BACKLOG_HEADING.findall(self.head_text(p)))
-        base: set[str] = set()
-        for p in base_paths:
-            base |= set(BACKLOG_HEADING.findall(self.base_text(p)))
-        # A merge allocates nothing: numbers the other parent already carries are not new here. See
-        # the MERGE PARENTS block above for why this is safe and what it cost when it was missing.
-        for parent in self._merge_parents():
-            base |= self._backlog_numbers_at(parent)
-        # Only `head - base` is examined, so everything already on origin/main -- including the
-        # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
-        for number in sorted(head - base, key=int):
-            # Floor first: a below-floor number gets the reason that is actionable, rather than
-            # "not allocated to this worktree", which would send you to re-run the allocator and file
-            # at whatever it prints -- correct by luck rather than because you were told why.
-            if int(number) < PUBLIC_BACKLOG_FLOOR:
-                self.fail(
-                    f"BACKLOG item #{number} is below the public floor (#{PUBLIC_BACKLOG_FLOOR})",
-                    "Numbers under the floor belong to the maintainer-internal ledger this file is a "
-                    "published baseline of, or to the pre-partition overlap. Filing one means every "
-                    "citation of it resolves to two unrelated items -- and it looks like success. This "
-                    "also catches a branch cut before the partition whose number has since been "
-                    "re-allocated. See the Ledger erratum at the top of docs/BACKLOG.md.",
-                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind backlog -Title "<title>"'
-                    "   # issues >=1000 now; move your heading to the number it prints",
-                )
-            elif not self.ci and not self.owns("backlog", number):
-                self.fail(
-                    f"BACKLOG item #{number} was not allocated to this worktree",
-                    "BACKLOG numbers are '## N.' headings inside ONE 6.7k-line file. Two sessions adding "
-                    "#N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598).",
-                    self.ownership_remedy("backlog", number),
-                )
-
     def run(self) -> int:
         self.check_adrs()
-        self.check_backlog()
         if not self.failures:
             return 0
         print("\nMessageFoundry ledger gate\n", file=sys.stderr)

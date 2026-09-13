@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """JWKS handling for the OIDC relying party (ADR 0142): JWK → public key, with a key-material floor,
 plus a bounded, TTL'd, min-refetch-throttled key cache.
 

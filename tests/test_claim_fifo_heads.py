@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0066 — the pooled-claimer store primitives: ``claim_fifo_heads`` / ``list_fifo_lanes`` /
 ``release_claimed`` (the §8 store-level matrix, minus the external-lock schedules).
 

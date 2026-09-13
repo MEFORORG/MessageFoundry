@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Qt-free, FastAPI-free client library for the MessageFoundry localhost API (ADR 0088).
 
 :class:`EngineClient` is a small, synchronous, typed wrapper over the engine's REST API. It

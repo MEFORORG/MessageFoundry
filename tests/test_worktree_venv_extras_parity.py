@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A lane virtualenv must install what CI installs, or the lane reads green over a tree it never ran.
 
 BACKLOG #1335. ``scripts/worktree/new.ps1`` installed ``.[dev,harness]`` while ``ci.yml``'s test leg

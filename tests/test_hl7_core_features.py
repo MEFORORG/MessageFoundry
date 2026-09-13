@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """HL7-core engine features exercised through Corepoint patterns (SYNTHETIC-TEST-PLAN §1.3).
 
 Gap-filling tests (the recon confirmed the rest is already covered elsewhere):

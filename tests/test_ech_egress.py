@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the ECH SNI-hiding send-path (transports/rest.py, ADR 0139, ASVS 12.1.5).
 
 An `ech_egress` REST connection re-addresses each request to a loopback **terminating** sidecar

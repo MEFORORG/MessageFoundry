@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Sign-in dialog shown before the harness monitor window when the engine requires authentication.
 
 Rehomed verbatim from the retired ``messagefoundry.console`` package (BACKLOG #103, ADR 0032 retired):

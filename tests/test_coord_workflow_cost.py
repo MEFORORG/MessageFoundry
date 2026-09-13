@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the workflow cost estimator (BACKLOG #1400).
 
 **What these pin, and why the negative controls carry the weight.** The tool exists because

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guards on `docs/FEATURE-MAP.md`, the **public** capability catalog.
 
 FEATURE-MAP.md is not git-ignored as a private-only path, so it reaches the public

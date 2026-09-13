@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Opt-in per-connection **detached-JWS** message signing for REST/SOAP outbound (ASVS 4.1.5, ADR 0018).
 
 A signed outbound puts a message-level digital signature **on top of** the transport (TLS) so a

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The nightly-failure notice must fire on the right runs, and only those.
 
 THE DEFECT THIS EXISTS FOR. A scheduled run's failure reported nowhere. Measured 2026-07-30: the

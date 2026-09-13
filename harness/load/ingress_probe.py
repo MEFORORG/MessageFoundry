@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Measure the MLLP ingress SERVICE RATE of the machine this runs on (#320).
 
 THE QUESTION THIS EXISTS FOR. `test_load_runner::test_run_load_end_to_end_no_loss` red the required

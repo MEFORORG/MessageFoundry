@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Offline unit tests for the turnkey two-box SIZING ceiling ladder (PR-C2).
 
 The live drive/engine halves need a real 4-shard SQL-Server fleet + two boxes, so these exercise the

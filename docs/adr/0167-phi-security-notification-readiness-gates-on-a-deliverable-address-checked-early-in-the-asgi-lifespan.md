@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 
 # ADR 0167 — PHI security-notification readiness gates on a deliverable address, checked early in the ASGI lifespan
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # MessageFoundry durability hook -- INSTALLED COPY. Source: scripts/hooks/durability_push.sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 #
 # DURABILITY HOOK (post-commit). Pushes this commit somewhere it is not the only copy.
 # This file is installed VERBATIM as .git/hooks/post-commit -- it needs no shim, because unlike the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """OS-side probes for the connection-scale harness — FD/handle + CPU/RSS count + reload timing (B11).
 
 Two pure-measurement helpers, both run OFF the event loop (in a thread), psutil-free (stdlib +

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1438 (ASVS 6.2.4): the BUNDLED breach corpus must fail closed, not screen nothing.
 
 Its own module rather than a section of `test_auth_core.py`, for two reasons. The subject is one

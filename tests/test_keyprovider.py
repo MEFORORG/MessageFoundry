@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pluggable KeyProvider seam (ADR 0019, ASVS 13.3.3).
 
 Covers: the default `auto` ladder is BYTE-IDENTICAL to the pre-seam `resolve_active_key`; the `env`/

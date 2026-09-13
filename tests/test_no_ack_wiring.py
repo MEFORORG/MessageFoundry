@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #117 / ADR 0124 — build-time wiring rejects for the MLLP ``no_ack`` knob (AC-5, AC-6).
 
 ``no_ack`` skips the ACK read entirely, so there is nothing to capture (mutually exclusive with

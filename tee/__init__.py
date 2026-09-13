@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Standalone MLLP **tee relay** — a small, separate application (no ``messagefoundry`` imports).
 
 It repoints an ``Epic -> Corepoint`` feed through a relay that **always ACKs on receipt** and forwards

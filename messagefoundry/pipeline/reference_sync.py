@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Materializes reference sets off the message path (ADR 0006 Tier 1).
 
 The :class:`ReferenceSyncRunner` is a supervised background loop (modelled on

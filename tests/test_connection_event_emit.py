@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """P2a — MLLP connection-event emit-points + the runner's off-hot-path drain to the store (#46).
 
 The transport tests inject a capturing sink straight onto the source and drive real client sockets,

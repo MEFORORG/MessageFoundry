@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Alert-triggered connection-control action (#144, ADR 0128): a firing rule dispatches an injected
 async control callback (restart_inbound/restart_outbound) off the delivery worker, never-raise,
 throttled with the notification, independent of transport suppression, and whitelisted at config-load."""

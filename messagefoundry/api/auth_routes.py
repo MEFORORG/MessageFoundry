@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Authentication + user-administration routes, registered onto the app by :func:`add_auth_routes`.
 
 Kept out of ``app.py`` to keep that file focused on the engine surface. Every route here is

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pass-through (PT) re-ingress system-under-test (§7 S7.4/S7.5).
 
 A minimal graph exercising the ADR 0013 (generalized) **pass-through** primitive: an MLLP entry hub

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-connection offline reconciliation: match MEFOR's captured output against Corepoint's export and
 diff each pair with the normalize core (TEST-ENVIRONMENT-PLAN.md §5).
 

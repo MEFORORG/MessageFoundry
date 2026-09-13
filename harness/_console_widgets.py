@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Reusable PySide6 leaf widgets for the harness monitor GUI.
 
 The HL7 parse-tree view, the message browser, the single-message detail pane, and the

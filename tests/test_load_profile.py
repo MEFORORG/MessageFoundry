@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the load-profile schema + TOML loader.
 
 Pin the loud-validation contract (a typo'd/missing/wrong-typed key is rejected before any traffic),

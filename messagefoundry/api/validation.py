@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Input-validation rules for the operator API's control-plane data items (BACKLOG #1108).
 
 **This module is the single authority for the rules; the prose lives in

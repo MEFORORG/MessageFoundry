@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0067 §9 / BACKLOG #97 — persistent ``X12()`` outbound connections.
 
 Mirrors the MLLP persistent suite for the X12-over-TCP destination: one lazily-established connection

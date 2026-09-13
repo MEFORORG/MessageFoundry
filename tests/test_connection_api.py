@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection metadata + reachability-test API (operability Tier 4, PR C).
 
 Covers the per-connector ``test_connection()`` probes (socket connect, dir writability, the

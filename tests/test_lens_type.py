@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The lens emits a handler's recognized HL7 message type (ADR 0104 §2.3 P2) for the field-picker scope."""
 
 from __future__ import annotations

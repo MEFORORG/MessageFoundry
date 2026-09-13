@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural guard: the Dependabot lock-resync must re-export exactly what DEP-1 diffs.
 
 ``security.yml``'s DEP-1 step re-runs every ``uv export`` and ``git diff --exit-code``s the result;
@@ -99,6 +99,43 @@ def test_constraints_lock_is_in_the_set() -> None:
     assert "constraints.lock" in _exports(_RESYNC), (
         "dependabot-lock-resync.yml stopped re-exporting constraints.lock — every Dependabot uv PR "
         "will be red with no bot-reachable path to green (see this module's docstring)"
+    )
+
+
+def test_release_tools_lock_is_in_the_set() -> None:
+    """The release toolchain's lock must stay a DEP-1 member, for the #1193 reason.
+
+    The three tests above compare the gate's export set to the resync's, so they are satisfied by set
+    EQUALITY: drop ``ci/locks/release-tools.lock`` from BOTH workflows and every one of them stays green
+    while the lock silently stops being re-derived, diffed and re-synced. ``test_constraints_lock_is_in_
+    the_set`` exists for exactly that class; this is its counterpart for the lock that arrived later, in
+    ``a9354808e``, without one.
+
+    WHY THIS LOCK NEEDS THE PIN. It is the only DEP-1 artifact whose consumer PR CI never runs —
+    ``release.yml`` is tag-push only — so a lock that quietly stopped being refreshed would keep
+    existing, keep pinning, keep hashing and keep installing, and the first thing to notice would be a
+    release built from a year-old toolchain. That is ADR 0034's *"pinned, stale and unpatched is worse
+    than floating"* posture, reached with every check in this repository green. FRESHNESS is what is
+    being defended, which is why ``test_the_release_signing_toolchain_is_installed_from_a_hashed_lock``
+    does not cover it: that test reads the lock's SHAPE, and a stale lock's shape is perfect.
+
+    WHAT THE GATE HALF DUPLICATES, stated so nobody re-derives it as a finding. Since BACKLOG #332 step 6
+    added this lock to ``LOCK_INSTALLED_TOOLCHAINS``,
+    ``tests/test_ci_venv_pinning.py::test_lock_installed_toolchain_locks_are_in_the_dep1_set`` covers the
+    gate half parametrically and MORE strictly — it pins the ``--only-group`` selector as well as the
+    ``-o`` path. The first assertion below is therefore belt-and-braces, and deliberately so: that
+    coverage is a side effect of a row in a tuple somebody may remove, and this module is where the
+    anti-shrink floor is supposed to live. **The RESYNC half is covered nowhere else**, which is the part
+    that turns a Dependabot PR red with no bot-reachable path to green.
+    """
+    assert "ci/locks/release-tools.lock" in _exports(_GATE), (
+        "DEP-1 stopped diffing ci/locks/release-tools.lock — the release signing, build and SBOM "
+        "toolchain would drift from uv.lock with nothing to report it until a tag push"
+    )
+    assert "ci/locks/release-tools.lock" in _exports(_RESYNC), (
+        "dependabot-lock-resync.yml stopped re-exporting ci/locks/release-tools.lock — every "
+        "Dependabot uv PR touching it will be red with no bot-reachable path to green (see this "
+        "module's docstring)"
     )
 
 

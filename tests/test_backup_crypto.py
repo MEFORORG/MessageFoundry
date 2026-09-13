@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The ``.mfbak`` chunked AES-256-GCM archive codec (ADR 0049, #60): round-trips faithfully across
 chunk boundaries; tamper (a flipped byte, a reordered/dropped/appended frame) fails the GCM tag
 fail-closed; a wrong key is a clean KEY_MISMATCH *before* decrypt; and the no-key/PHI fail-closed

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lazy loader for the optional ``[x12]`` extra (``pyx12``) — the strict X12 validator's only need.
 
 ``pyx12`` lives behind the ``messagefoundry[x12]`` optional extra (ADR 0012), so it is imported

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Server-store connection-pool observability — a read-only, additive measurement surface (B11).
 
 The connection-scale measurement harness (``harness/load/connscale``) reads the **connection-pool

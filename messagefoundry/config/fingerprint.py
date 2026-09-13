@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Content fingerprint of a loaded config bundle — bind "reviewed in git" to "what loaded".
 
 ADR 0041 (D1). ``load_config()`` executes **every** ``*.py`` in the config dir as the engine

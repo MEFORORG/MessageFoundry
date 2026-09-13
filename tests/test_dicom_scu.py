@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Real-association loopback tests for the DICOM C-STORE SCU destination (ADR 0025 Phase 2): the
 ``DicomScuDestination`` associates with a live ``pynetdicom`` Storage SCP and C-STOREs the object,
 proving byte-faithful forwarding, C-ECHO ``test_connection``, the status→retry classification

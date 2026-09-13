@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Test Bench: load a message set, dry-run it through the config (no sending), show a results table,
 // and a Before/After view per message (side-by-side or above/below) with an HL7 segment/field-aware
 // diff — inserted/deleted segments are aligned so they don't cascade false changes, and changed

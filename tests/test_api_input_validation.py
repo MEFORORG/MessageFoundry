@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The operator API's input-validation rules (BACKLOG #1108, ASVS 2.1.1).
 
 Three jobs, in order of what each protects:

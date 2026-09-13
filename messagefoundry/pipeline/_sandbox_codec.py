@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MFW2 — the non-executing IPC codec for the sandbox pipe (ADR 0087, BACKLOG #197).
 
 **Why a codec at all.** The sandbox exists to put an OS address-space boundary between the engine

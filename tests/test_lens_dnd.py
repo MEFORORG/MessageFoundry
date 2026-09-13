@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Drag-and-drop reorder — ``move_row`` to an ARBITRARY sibling position (to_line_start/to_position).
 
 Byte-stability (gate 2) is asserted against an INDEPENDENT regex-driven line oracle, not the lens's own

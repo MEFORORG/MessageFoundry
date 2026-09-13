@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The unconditional floor under the API's baseline security response headers (ASVS 3.4.1/3.4.4/3.4.6).
 
 The app's ``_security_headers`` middleware is registered FIRST in ``create_app``, which makes it the

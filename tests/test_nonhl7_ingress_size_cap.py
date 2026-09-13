@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-017 (CWE-770): engine-level ingress size guard for NON-HL7 content types.
 
 The HL7 path enforces a 16 MiB ceiling via ``Peek.parse`` → ``enforce_size_limits``. The non-HL7

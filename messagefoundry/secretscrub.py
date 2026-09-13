@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The credential-label vocabulary every log sink scrubs by, stated once (BACKLOG #1478).
 
 A **neutral leaf**: stdlib ``re`` only, no engine, config, FastAPI or Qt imports, so both the

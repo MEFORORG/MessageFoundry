@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A renamed repository's OLD slug still resolves, so a stale reference answers instead of failing.
 
 The private vault repository was renamed on 2026-09-05, from the same name the public engine

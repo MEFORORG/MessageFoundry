@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A wall #4 gap must carry its CAUSE, and the smoke must assert only what that cause entitles it to.
 
 Before this module the connscale FD probe had SEVEN paths that produced a reading-less

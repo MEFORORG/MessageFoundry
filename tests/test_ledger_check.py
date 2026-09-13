@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the ledger gate (scripts/hooks/ledger_check.py).
 
 The defect under test merges CLEAN, which is what makes it dangerous: two sessions each pick "the next
@@ -172,10 +172,11 @@ def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_p
     """A sibling session holds 0002. Hand-writing it here must not slip through.
 
     ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
-    worktree AND on another branch -- git refuses one branch in two worktrees, so that pairing is not
-    a coincidence, it is the only shape a live sibling can have. Once ownership grew a branch fallback
-    (BACKLOG #1282) this arm had to name the branch or it would have been asserting the weaker
-    "different path" and passing for a reason unrelated to sibling-ness.
+    worktree AND on another branch -- git refuses an ORDINARY second checkout of one branch in two
+    worktrees (a DEFAULT, not a law of git; `Ledger.owns` records what defeats it, BACKLOG #1039), so
+    that pairing is not a coincidence, it is the shape a live sibling has. Once ownership grew a
+    branch fallback (BACKLOG #1282) this arm had to name the branch or it would have been asserting
+    the weaker "different path" and passing for a reason unrelated to sibling-ness.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -207,10 +208,21 @@ def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
     permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
     nothing anywhere reported the loss.
 
-    ***IT IS SAFE ONLY BECAUSE GIT REFUSES ONE BRANCH IN TWO WORKTREES.*** The gate exists to stop two
-    sessions filing one number, and two sessions cannot hold one branch -- so "the session on this
-    branch" is exactly as single-valued as "the session in this worktree" was, while outliving it. A
-    branch that is free to check out is one nobody is working in.
+    ***IT IS SAFE ONLY BECAUSE GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO
+    WORKTREES.*** The gate exists to stop two sessions filing one number, and two sessions do not hold
+    one branch -- so "the session on this branch" is as single-valued as "the session in this
+    worktree" was, while outliving it. A branch that is free to check out is one nobody is working in.
+
+    ***THAT REFUSAL IS A DEFAULT, NOT A LAW OF GIT, AND THIS DOCSTRING SAID IT FLAT (BACKLOG #1039).***
+    `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get past it, so
+    forcing a second checkout makes the branch key non-exclusive and leaks entitlement to a tree that
+    never allocated the number. `Ledger.owns` carries the full statement of the residual; it is named
+    here because THIS is the sentence that licenses the loosening, and a flat version of it here
+    contradicts the qualified version there.
+
+    **Recorded because the miss generalises: the first sweep for this premise used a CASE-SENSITIVE
+    grep and this site is in capitals**, so the strongest instance in the repository was the one left
+    behind while the ledger row said the sweep was finished.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -299,27 +311,6 @@ def test_duplicate_index_rows_are_blocked(repo: Path) -> None:
 # ----------------------------------------------------------------- BACKLOG numbers
 
 
-def test_a_new_backlog_number_must_be_allocated(repo: Path) -> None:
-    """Two sessions adding '## 227.' land ~1,600 lines apart in one file and BOTH ship.
-
-    Uses an ABOVE-FLOOR number deliberately. With a below-floor one this test still goes red, but on
-    the partition rule instead of the ownership rule — passing for the wrong reason and asserting
-    nothing about allocation. The reason is asserted below for the same reason.
-    """
-    write(
-        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
-    )
-    git(repo, "add", "docs/BACKLOG.md")
-
-    code, out = run_check(repo)
-    assert code == 1
-    assert "BACKLOG item #1001" in out
-    assert "was not allocated to this worktree" in out, (
-        "must fail on the OWNERSHIP rule; if this now reports the public floor, the test has stopped "
-        f"exercising allocation:\n{out}"
-    )
-
-
 def test_an_allocated_backlog_number_passes(repo: Path) -> None:
     write(
         repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
@@ -331,39 +322,172 @@ def test_an_allocated_backlog_number_passes(repo: Path) -> None:
     assert code == 0, out
 
 
-def test_a_backlog_number_below_the_public_floor_is_refused(repo: Path) -> None:
-    """The partition: new items live at #1000+, so the overlap with the internal ledger stays closed.
-
-    Allocated to THIS worktree, so ownership is satisfied and the floor is the only thing that can
-    reject it — otherwise the test would pass on the ownership rule and prove nothing.
-    """
-    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
-    allocate(repo, "backlog", "2")
+def test_editing_backlog_without_adding_a_number_passes(repo: Path) -> None:
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody, now edited\n")
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
-    assert code == 1
-    assert "below the public floor" in out, out
+    assert code == 0, out
 
 
-def test_the_public_floor_also_refuses_in_ci_mode(repo: Path) -> None:
-    """The floor is the FIRST backlog rule that can fail in --ci.
+# ------------------------------------------------- the REVERSE arm: a number that DISAPPEARS (#1470)
+#
+# Everything above asks which numbers APPEARED. An item is destroyed by losing its `## N.` heading,
+# which adds no number at all: the banner, the fields and the body stay in the file, re-attributed to
+# the item ABOVE. That happened on 642225f78 and reached main with every wired gate green.
+#
+# Each must-fire arm below is paired with a must-NOT-fire arm exercising the SAME machinery, because a
+# rule of this shape has two ways to be useless and the tests for them do not overlap: one that never
+# fires is invisible, and one that fires on a stale branch or on a moving main reddens a REQUIRED leg
+# for everybody.
 
-    The ownership rule cannot: it reads a per-clone registry and compares a worktree path, and a runner
-    has neither — so `check_backlog()` computed the added-number set and discarded it, leaving the CI
-    ledger step unable to fail on the backlog half at all.
+
+def test_moving_an_item_into_the_ARCHIVE_is_not_a_deletion(repo: Path) -> None:
+    """Retirement is the sanctioned way an item leaves docs/BACKLOG.md, and it must stay silent.
+
+    The number space is the UNION of the live file and the archive, so a verbatim move keeps the id in
+    the set on both sides. Without that union this rule would refuse every retirement in the repo.
     """
-    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
+    write(repo, "docs/BACKLOG.md", "# Backlog\n")
+    write(
+        repo,
+        "docs/archive/backlog/BACKLOG-CLOSED.md",
+        "# Closed\n\n## 1. First item\n\nbody\n",
+    )
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion(repo: Path) -> None:
+    """`git commit --amend` taking back an item you filed one commit ago must not read as destruction.
+
+    The parent carries #1001 and the index does not, which is byte-for-byte the shape the arm above
+    refuses. What separates them is the `& base` intersection in `_item_sets`: #1001 never reached
+    origin/main, so nothing shared was lost.
+
+    ***MAIN MUST MOVE AHEAD HERE, AND THAT IS THE WHOLE RIG RATHER THAN SCENERY.*** The first version
+    of this test left `base - head` EMPTY, which short-circuits the reverse arm before `prior` is
+    computed at all -- so it passed without the intersection ever running, and `& base` could have
+    been deleted as redundant with all 50 tests green. Proven by deleting it: with this rig the test
+    goes red naming #1001, and restoring it goes green. Keep #1002 on origin/main, or this test stops
+    testing anything.
+    """
+    # origin/main gains #1002, so `base - head` is non-empty and the reverse arm actually runs.
+    git(repo, "checkout", "-q", "-b", "sibling")
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1002. Theirs\n\nbody\n",
+    )
+    git(repo, "commit", "-qam", "somebody else files 1002")
+    git(repo, "update-ref", "refs/remotes/origin/main", "sibling")
+    git(repo, "checkout", "-q", "main")
+
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
+    allocate(repo, "backlog", "1001")
     git(repo, "add", "docs/BACKLOG.md")
-    git(repo, "commit", "-m", "add a below-floor item", "--no-verify")
+    git(repo, "commit", "-qm", "file 1001 -- NOT pushed, so origin/main never sees it")
+
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+    assert "1001" not in out, (
+        "#1001 is on the parent and NOT on origin/main, so the `& base` intersection must drop it; "
+        f"reporting it means the intersection is gone:\n{out}"
+    )
+
+
+def test_main_MOVING_AHEAD_is_not_a_deletion_by_this_change(repo: Path, tmp_path: Path) -> None:
+    """The false positive that would have reddened a REQUIRED leg for everybody.
+
+    A two-way comparison cannot see WHICH SIDE MOVED. In `--ci`, HEAD is the merge ref computed when
+    the event fired and origin/main is fetched when the job starts, so anything that lands in between
+    is in base and not in head. A rule reading `base - head` reports somebody else's landed item as
+    destroyed by this pull request; under a merge queue that window is minutes wide.
+
+    The arm asks the commit's own PARENTS instead, so main advancing afterwards changes nothing. This
+    test is the guard on that choice: swap `prior` back to `base` and it goes red.
+    """
+    # This change: an ordinary edit that deletes nothing.
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody, now edited\n")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-qm", "edit a body")
+
+    # Meanwhile, somebody else's item lands on main -- AFTER the commit under test was written.
+    other = tmp_path / "other"
+    git(repo, "worktree", "add", "-q", "-b", "sibling", str(other), "refs/remotes/origin/main")
+    write(
+        other,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n## 1002. Theirs\n\nbody\n",
+    )
+    git(other, "add", "docs/BACKLOG.md")
+    git(other, "commit", "-qm", "somebody else files 1002", "--no-verify")
+    git(repo, "update-ref", "refs/remotes/origin/main", "sibling")
 
     code, out = run_check(repo, "--ci")
-    assert code == 1, out
-    assert "below the public floor" in out, out
+    assert code == 0, f"main moving ahead is not this change deleting anything; got:\n{out}"
 
 
-def test_editing_backlog_without_adding_a_number_passes(repo: Path) -> None:
-    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody, now edited\n")
+def test_a_rewrite_that_changes_no_heading_scores_nothing(repo: Path) -> None:
+    """The negative control the detector must pass: rewrite the file, keep every id, stay silent.
+
+    A rule that plants a violation has to REFUSE to score a plant that did not change the item set --
+    otherwise the must-fire arm above is satisfied by a detector that simply always fires.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\nA new preamble paragraph.\n\n## 1. First item\n\nan entirely rewritten body\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+# ------------------------------------------- item identity is the PARSER's, not a regex kept in here
+
+
+def test_a_SUB_heading_inside_a_body_is_not_an_item(repo: Path) -> None:
+    """`### N.` is a sub-heading, and the gate must not police it as a number in either direction.
+
+    This file used to scan with its own `^#{2,3} (\\d+)\\.` regex -- a second definition of item
+    identity beside `backlog_status_check.parse_items`, which CLAUDE.md section 11 names as the single
+    source. Against the real ledger the two readings return the same 746 ids, so this is the arm that
+    can tell them apart: under the old regex `### 9999.` is an unallocated item and the commit is
+    refused; under the parser it is prose.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n\n### 9999. a sub-heading, not an item\n\nmore body\n",
+    )
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+    assert "9999" not in out, out
+
+
+def test_conflict_markers_QUOTED_IN_PROSE_do_not_trip_the_refusal(repo: Path) -> None:
+    """Item #1257 quotes all three markers inline in backticks, so a substring test calls it corrupt.
+
+    The parser anchors on a line start, and this pins that: a gate that refuses the ledger for
+    describing a conflict is one every seat learns to bypass.
+    """
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nresolve a `<<<<<<< HEAD` / `=======` / `>>>>>>> theirs` "
+        "block by hand\n",
+    )
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
@@ -390,24 +514,6 @@ def test_a_utf8_backlog_does_not_crash_the_gate(repo: Path) -> None:
     assert code == 0, out
     assert "Traceback" not in out
     assert "UnicodeDecodeError" not in out
-
-
-def test_a_utf8_backlog_still_catches_an_unallocated_number(repo: Path) -> None:
-    """The dangerous direction: a crash-to-empty would parse as 'no numbers taken' and pass silently."""
-    write(
-        repo,
-        "docs/BACKLOG.md",
-        f"# Backlog\n\n## 1. First item\n\n{NON_ASCII_BODY}\n## 1001. Mine — ⚠️ unallocated\n\nbody\n",
-    )
-    git(repo, "add", "docs/BACKLOG.md")
-
-    code, out = run_check(repo)
-    assert code == 1, out
-    assert "BACKLOG item #1001" in out
-    # Above the floor deliberately: a below-floor number would be rejected by the partition rule even
-    # if the UTF-8 read had crashed to empty, so this test would pass while proving nothing about the
-    # decode — the exact false-clean it exists to catch.
-    assert "was not allocated to this worktree" in out, out
 
 
 def test_ci_mode_works_on_a_SHALLOW_clone_with_no_reachable_merge_base(
@@ -520,6 +626,10 @@ def test_ci_mode_skips_the_ownership_rule_but_still_catches_a_reused_number(repo
 
 _CONFIG = Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml"
 _INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
+_CI = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+#: The `--depth=N` in the ledger step's own fetch. Not a free-standing number: see the test below.
+_FETCH_DEPTH = re.compile(r"--depth=(\d+)\s+origin\s+main")
 
 
 def test_ADDING_a_backlog_that_the_base_lacks_is_not_a_wall_of_unallocated_numbers(
@@ -656,22 +766,6 @@ def test_a_merge_carrying_ANOTHER_worktrees_number_is_committable(
     assert code == 0, f"a merge that allocates nothing must commit; got:\n{out}"
     assert "1441" not in out
 
-
-def test_a_number_INVENTED_during_a_merge_is_still_refused(repo: Path, tmp_path: Path) -> None:
-    """The other half, and the one that keeps the arm above from being a hole.
-
-    Same mid-merge state, plus a heading no commit anywhere carries. Being inside a merge must not
-    become a way to file an unallocated number.
-    """
-    _diverge_and_merge(repo, tmp_path, number="1441")
-
-    merged = (repo / "docs/BACKLOG.md").read_text(encoding="utf-8")
-    write(repo, "docs/BACKLOG.md", merged + "\n## 1442. Invented while merging\n\nbody\n")
-    git(repo, "add", "-A")
-
-    code, out = run_check(repo)
-    assert code != 0, "a number on no parent is a fresh allocation, merge or not"
-    assert "1442" in out, out
     # DELIBERATELY NOT asserted here: that 1441 is absent from the message. It is true, and it belongs
     # to the arm above. Asserting it here made both arms red under the same mutation, which is exactly
     # the overlap that stops a pair from localising a failure -- caught by running the mutation.
@@ -687,9 +781,11 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
     disjoint FROM EACH OTHER, which says nothing about whether either points at the real shape.
 
     ***THE MERGER MUST BE ON A DIFFERENTLY-NAMED BRANCH, AND THAT IS NOT INCIDENTAL.*** git refuses
-    one branch in two worktrees, so a merger cannot stand on the author's branch -- it cuts its own
-    from theirs, exactly as `lander-fix/850` was cut. Stay on the author's branch NAME and `owns()`'s
-    branch fallback (BACKLOG #1282) returns True, so the run passes for a reason unrelated to merging.
+    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git;
+    `Ledger.owns` records what defeats it, BACKLOG #1039), so a merger does not stand on the author's
+    branch -- it cuts its own from theirs, exactly as `lander-fix/850` was cut. Stay on the author's
+    branch NAME and `owns()`'s branch fallback (BACKLOG #1282) returns True, so the run passes for a
+    reason unrelated to merging.
     The first reproduction of this did precisely that and reported a false all-clear.
     """
     git(repo, "checkout", "-q", "-b", "sibling")
@@ -715,6 +811,20 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
 
     git(repo, "checkout", "-q", "-b", "lander-fix/850", "sibling")
     git(repo, "merge", "--no-commit", "--no-ff", "origin/main")
+    # ***THE MERGE CONFLICTS, AND THE RESOLUTION HAS TO BE WRITTEN OUT.*** Both sides appended at the
+    # tail of docs/BACKLOG.md, which is the very conflict a Lander is here to resolve. `git add -A`
+    # alone stages the file WITH its markers still in it -- a state no commit should ever reach, and
+    # one the gate now refuses outright rather than scan (`parse_items` will not read a conflicted
+    # source, because a conflicted ledger parses into a census counting items from BOTH sides). This
+    # test is about the OWNERSHIP question, so the conflict is resolved the way a Lander resolves it
+    # -- keep both items -- and the ownership rule then gets a file it can actually read.
+    write(
+        repo,
+        "docs/BACKLOG.md",
+        "# Backlog\n\n## 1. First item\n\nbody\n"
+        "\n## 1441. Filed by the sibling\n\nbody\n"
+        "\n## 1440. Filed on main\n\nbody\n",
+    )
     git(repo, "add", "-A")
 
     code, out = run_check(repo)
@@ -768,45 +878,53 @@ def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
     )
 
 
+def test_the_CI_ledger_step_fetches_DEEPER_THAN_ONE() -> None:
+    """The reverse arm's CI coverage depends on this fetch depth, and nothing else pins it.
+
+    ***THE DEPENDENCY IS NEW AND IT IS INVISIBLE AT THE SITE THAT MATTERS.*** `actions/checkout` takes
+    `refs/pull/N/merge` at its default depth of 1, so HEAD is a shallow GRAFT whose parent objects are
+    absent. The arm reads those parents; the base tip arrives ONLY because this step runs
+    `git fetch --no-tags --depth=200 origin main` before invoking the gate. Trim that to `--depth=1`
+    as a plausible speedup and the arm stops being able to see anything -- and it would go SILENT
+    rather than red, which is the exact failure shape this whole item exists to catch.
+
+    Until this test existed the dependency lived in a comment beside the fetch. A comment cannot fail.
+
+    The depth is asserted as a FLOOR, not pinned to 200: the number is a judgement about how far main
+    can move, and re-tuning it is legitimate. Dropping to 1 is not.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    steps = [
+        s
+        for job in cfg["jobs"].values()
+        for s in job.get("steps", [])
+        if "Ledger gate" in str(s.get("name", ""))
+    ]
+    assert len(steps) == 1, f"expected exactly one ledger-gate step in ci.yml, found {len(steps)}"
+    run = str(steps[0]["run"])
+
+    assert "ledger_check.py --ci" in run, (
+        f"the ledger-gate step no longer invokes the gate -- this test is now vacuous:\n{run}"
+    )
+    depths = [int(d) for d in _FETCH_DEPTH.findall(run)]
+    assert depths, (
+        "the ledger-gate step no longer fetches origin main with an explicit --depth. If the "
+        f"checkout became deep, say so here rather than deleting the assertion:\n{run}"
+    )
+    assert min(depths) > 1, (
+        f"--depth={min(depths)} leaves HEAD's parents unfetched, and the reverse arm (BACKLOG #1470) "
+        "reads them. At depth 1 it goes SILENT, not red."
+    )
+
+
 _ALLOC = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "alloc.ps1"
 
 # Kept deliberately identical to the pattern in scripts/coord/alloc.ps1 — the point of this test is to
 # fail the moment the two drift. A duplicated regex that is TESTED is not the same hazard as a
 # duplicated value that is not: this one fails loudly on drift, which is the property being bought.
 _FLOOR_RE = re.compile(r"(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)")
-
-
-def test_the_public_floor_is_parseable_by_the_allocator() -> None:
-    """`alloc.ps1` PARSES the floor out of this gate so the value is defined exactly once.
-
-    That coupling is to SOURCE TEXT, which is a weaker contract than an import, so it is pinned here.
-    Without this test the break is silent and lands on the wrong person: whoever reformats the constant
-    gets a green CI, and an unrelated session hits "refusing to allocate" days later — where the
-    tempting repair is to hardcode the floor back into alloc.ps1, re-creating the two-copies drift the
-    single source exists to remove.
-
-    The realistic break is a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000` is idiomatic in
-    a mypy-strict codebase and is tolerated; splitting, computing or renaming the value is not.
-    """
-    matches = _FLOOR_RE.findall(CHECK.read_text(encoding="utf-8"))
-    assert len(matches) == 1, (
-        "scripts/coord/alloc.ps1 parses PUBLIC_BACKLOG_FLOOR out of ledger_check.py and expects exactly "
-        f"one match; found {len(matches)}. Keep the name and the literal on one line."
-    )
-    assert int(matches[0]) > 0
-
-
-def test_the_allocator_still_parses_the_floor_the_same_way() -> None:
-    """The allocator's own regex must accept the constant as written — not merely a similar one."""
-    alloc_src = _ALLOC.read_text(encoding="utf-8")
-    assert "PUBLIC_BACKLOG_FLOOR" in alloc_src, (
-        "alloc.ps1 no longer reads the floor from the gate — the value is defined twice again"
-    )
-    # The annotation-tolerant form; if alloc.ps1 reverts to the naive `\s*=\s*` it breaks on Final[int].
-    assert r"(?::[^=]+)?" in alloc_src, (
-        "alloc.ps1's floor regex must tolerate a type annotation "
-        "(PUBLIC_BACKLOG_FLOOR: Final[int] = 1000), or an ordinary tidy-up silently disarms allocation"
-    )
 
 
 # --- the partition guard must never again read the whole-set maximum -------------------------------
@@ -841,40 +959,6 @@ def test_the_allocator_measures_the_partition_band_separately() -> None:
     )
 
 
-def test_the_residual_detector_does_not_read_the_whole_set_maximum() -> None:
-    """The exact regression: the guard compared `$observed` (union max) against the public floor."""
-    src = _ALLOC.read_text(encoding="utf-8")
-    assert re.search(r"\$observed\s+-ge\s+\$PublicBacklogFloor", src) is None, (
-        "alloc.ps1 compares the WHOLE-SET maximum against PUBLIC_BACKLOG_FLOOR again. That is the "
-        "2026-08-03 defect verbatim: every public item at or above the floor is indistinguishable from "
-        "an internal breach in this data, so the comparison fires on the partition working as designed. "
-        "Measure the sub-floor band instead."
-    )
-    assert re.search(r"\$subFloorMax\s+-ge\s+\$warnAt", src), (
-        "the residual warning must be derived from the sub-partition maximum, not the union maximum"
-    )
-
-
-def test_the_floor_preview_evaluates_the_same_guard_as_a_real_allocation() -> None:
-    """`-ShowFloor` must not be able to disagree with the run it previews.
-
-    It could, and did: the `-ShowFloor` block `return`ed 19 lines before the guard, so it printed a
-    `next:` number while every real allocation threw. An inspector that skips the checks it previews
-    answers a question adjacent to the one asked — and it is worse than no inspector, because a peer
-    session verified the allocator with it, got a green answer, and recorded it as a fact.
-    """
-    src = _ALLOC.read_text(encoding="utf-8")
-    show_at = src.index("if ($ShowFloor)")
-    assert "$residualWarning" in src[:show_at], (
-        "$residualWarning must be computed BEFORE the -ShowFloor block, so the preview and the real "
-        "allocation evaluate one shared expression rather than two that can drift apart."
-    )
-    assert src.count("$residualWarning") >= 3, (
-        "-ShowFloor must consult $residualWarning too; if only the allocation path reads it, the "
-        "preview is once again reporting a number the allocator would refuse to issue."
-    )
-
-
 # --- EXECUTION tests: the allocator is actually RUN, in a throwaway repo ---------------------------
 #
 # Nothing in tests/ had ever executed alloc.ps1. The two references above are `read_text()` assertions,
@@ -890,118 +974,3 @@ def test_the_floor_preview_evaluates_the_same_guard_as_a_real_allocation() -> No
 # coincide, and every tier assertion would pass for the wrong reason.
 
 _PWSH = shutil.which("pwsh")
-
-
-def _mkrepo(tmp: Path, floor: int, items: list[int]) -> Path:
-    """A throwaway repo carrying its own alloc.ps1, its own floor constant, and its own registry."""
-    repo = tmp / "rig"
-    (repo / "scripts" / "coord").mkdir(parents=True)
-    (repo / "scripts" / "hooks").mkdir(parents=True)
-    (repo / "docs").mkdir()
-    shutil.copy(_ALLOC, repo / "scripts" / "coord" / "alloc.ps1")
-    (repo / "scripts" / "hooks" / "ledger_check.py").write_text(
-        f"PUBLIC_BACKLOG_FLOOR = {floor}\n", encoding="utf-8"
-    )
-    body = "# rig\n\n" + "".join(f"## {n}. item {n}\n\n> OPEN\n\n" for n in items)
-    (repo / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rig"],
-        cwd=repo,
-        check=True,
-    )
-    return repo
-
-
-def _alloc(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    assert _PWSH
-    return subprocess.run(
-        [_PWSH, "-NoProfile", "-File", str(repo / "scripts" / "coord" / "alloc.ps1"), *args],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-
-
-@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
-def test_the_rig_cannot_reach_the_real_registry(tmp_path: Path) -> None:
-    """FIRST, because every later test here spends real numbers if this is false.
-
-    The registry lives beside the git common dir, so a throwaway repo must resolve to its OWN .git.
-    If it resolved to the project's, these tests would burn production ledger numbers on every run --
-    and claims are never released, so the damage would be permanent and silent.
-    """
-    repo = _mkrepo(tmp_path, floor=100, items=[5, 7])
-    out = _alloc(repo, "-Kind", "backlog", "-ShowFloor")
-    assert out.returncode == 0, out.stderr
-    real = str(Path(__file__).resolve().parents[1] / ".git").lower()
-    assert real not in out.stdout.lower().replace("/", "\\"), (
-        f"the rig resolved to the REAL registry — refusing to run the rest.\n{out.stdout}"
-    )
-    assert str(tmp_path).lower()[:12] in out.stdout.lower(), out.stdout
-
-
-@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
-def test_a_public_number_at_the_boundary_does_not_brick_allocation(tmp_path: Path) -> None:
-    """The 2026-08-03 regression, executed rather than pattern-matched.
-
-    An item at exactly the floor is the FIRST legitimate public allocation. Before the fix this threw
-    `REFUSING TO ALLOCATE … has reached the public floor` for every subsequent caller, repo-wide.
-    """
-    repo = _mkrepo(tmp_path, floor=100, items=[5, 100])
-    out = _alloc(repo, "-Kind", "backlog", "-Title", "after the boundary")
-    assert out.returncode == 0, f"allocation refused on legitimate input:\n{out.stdout}{out.stderr}"
-    assert "ALLOCATED BACKLOG #101" in out.stdout, out.stdout
-    assert "REFUSING" not in out.stdout + out.stderr
-
-
-@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
-def test_the_warning_reads_the_sub_boundary_band_not_the_union(tmp_path: Path) -> None:
-    """A public number above the boundary must NOT trip the runway warning; a sub-boundary one must."""
-    quiet = _alloc(
-        _mkrepo(tmp_path / "a", floor=100, items=[5, 100]), "-Kind", "backlog", "-ShowFloor"
-    )
-    assert "WOULD WARN" not in quiet.stdout, (
-        f"a public item at the boundary tripped the internal-runway warning:\n{quiet.stdout}"
-    )
-    loud = _alloc(_mkrepo(tmp_path / "b", floor=100, items=[95]), "-Kind", "backlog", "-ShowFloor")
-    assert "WOULD WARN" in loud.stdout, (
-        f"sub-boundary 95 is past the 90 warn tier and did not warn:\n{loud.stdout}"
-    )
-
-
-@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
-def test_lowering_the_boundary_is_refused(tmp_path: Path) -> None:
-    """The replacement refusal, and it must actually fire.
-
-    Neither the pre-commit gate nor CI can catch a LOWERED floor: both read only the current value and
-    have no memory of the previous one. The ratchet beside the registry is the only instrument that can.
-    """
-    repo = _mkrepo(tmp_path, floor=100, items=[5])
-    first = _alloc(repo, "-Kind", "backlog", "-Title", "sets the ratchet")
-    assert first.returncode == 0, first.stderr
-    gate = repo / "scripts" / "hooks" / "ledger_check.py"
-    gate.write_text("PUBLIC_BACKLOG_FLOOR = 50\n", encoding="utf-8")
-    after = _alloc(repo, "-Kind", "backlog", "-Title", "should be refused")
-    assert after.returncode != 0, f"a lowered boundary was accepted:\n{after.stdout}"
-    assert "REFUSING TO ALLOCATE" in after.stdout + after.stderr
-
-
-@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
-def test_showfloor_agrees_with_a_real_allocation(tmp_path: Path) -> None:
-    """The preview must not be able to contradict the run it previews — it could, and did."""
-    repo = _mkrepo(tmp_path, floor=100, items=[5, 100])
-    preview = _alloc(repo, "-Kind", "backlog", "-ShowFloor")
-    assert "next     : 101" in preview.stdout, preview.stdout
-    real = _alloc(repo, "-Kind", "backlog", "-Title", "must match the preview")
-    assert "ALLOCATED BACKLOG #101" in real.stdout, (
-        f"-ShowFloor promised 101 and the allocator issued something else:\n{real.stdout}"
-    )
-
-    # And the refusal case must agree too, in the same direction.
-    (repo / "scripts" / "hooks" / "ledger_check.py").write_text(
-        "PUBLIC_BACKLOG_FLOOR = 50\n", encoding="utf-8"
-    )
-    assert "WOULD REFUSE" in _alloc(repo, "-Kind", "backlog", "-ShowFloor").stdout
-    assert _alloc(repo, "-Kind", "backlog", "-Title", "x").returncode != 0

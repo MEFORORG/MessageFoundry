@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Stability guard for the ``SDS-<section>.<n>`` rule identifiers in the Secure Development Standards.
 
 WHY THIS EXISTS. The standard's requirements used to be citable only by section number, and a section

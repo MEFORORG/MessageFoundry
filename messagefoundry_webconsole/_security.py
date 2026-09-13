@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-response /ui browser-security hardening (ADR 0065 §hardening / BACKLOG #192, ASVS 5.0 L3).
 
 A self-contained, /ui-scoped ASGI middleware the web console installs on the mounted app (in

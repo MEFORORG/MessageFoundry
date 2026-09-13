@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0065 §hardening / BACKLOG #192: /ui browser hardening — __Host- cookie prefix, per-response
 nonce CSP, COOP/CORP, CSP reporting. HTTP-level (httpx ASGITransport), asserting the loopback-vs-
 effective-https split: byte-identical over cleartext http; hardening engages over https; org opt-out

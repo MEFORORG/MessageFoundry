@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The honesty gate for the DAST tier (ADR 0155), inside the required test legs.
 
 WHY THIS EXISTS AS CI RATHER THAN CONVENTION. ``docs/Secure_Build_Standards.md`` grades independent
@@ -112,7 +112,14 @@ def _pointer_only_passages() -> dict[str, str]:
         ".github/workflows/dast.yml": _read(_REPO / ".github" / "workflows" / "dast.yml"),
         "scripts/security/dast_target.py": _read(_REPO / "scripts" / "security" / "dast_target.py"),
         "scripts/security/route_gates.py": _read(_REPO / "scripts" / "security" / "route_gates.py"),
-        "docs/BACKLOG.md #318": _section(_REPO / "docs" / "BACKLOG.md", "## 318. DAST", "\n## "),
+        # `docs/BACKLOG.md #318` was a carrier here until the ledger left this repository
+        # (BACKLOG #1250). `_section` returns -1 for a heading that is not there, and the guard
+        # correctly refused rather than scanning nothing. The item's DAST prose lives in the
+        # maintainer-internal ledger now, so no assertion here can reach it.
+        #
+        # docs/BACKLOG.md STAYS in the closure-claim sweep below: the stub is still a real file
+        # that must not claim DAST closes the independence gap, and that sweep's `>= 6` floor
+        # counts it.
         "docs/adr/README.md (the 0155 row)": _section(
             _REPO / "docs" / "adr" / "README.md",
             "| [0155](0155-dast-dynamic-security-testing-of-the-running-engine.md) |",
@@ -149,7 +156,18 @@ def test_no_stray_paraphrase_of_the_boundary() -> None:
     reader_facing = {
         label: text for label, text in passages.items() if not label.startswith("scripts/security/")
     }
-    assert len(reader_facing) >= 4, reader_facing.keys()
+    # FOUR UNTIL THE LEDGER LEFT (BACKLOG #1250), THREE SINCE, and the number moved because the
+    # POPULATION did -- `docs/BACKLOG.md #318` was the fourth and its subject is no longer in this
+    # repository. Lowered in the same change that removed the carrier, because a floor left above its
+    # own population reds on every run and says "this guard is broken" when the truth is "this guard
+    # has one fewer thing to guard".
+    #
+    # IT IS STILL A FLOOR AND MUST NOT BE READ AS A FORMALITY. Its job is to stop the silent-passage
+    # check below being satisfied by an EMPTY set: with no lower bound, deleting every reader-facing
+    # entry would make `silent` empty and this test green over nothing. Three is the count that
+    # exists; if a fourth carrier is ever added, raise this with it, and never lower it to make a
+    # failing run pass.
+    assert len(reader_facing) >= 3, reader_facing.keys()
     silent = [label for label, text in reader_facing.items() if "0155" not in text]
     assert not silent, (
         f"DAST passage(s) with neither the boundary nor a pointer to ADR 0155: {silent}"

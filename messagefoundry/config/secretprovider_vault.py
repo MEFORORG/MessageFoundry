@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``vault`` SecretProvider — HashiCorp Vault **KV v2** read of a connector credential (ADR 0019 §5).
 
 The connector-secret twin of [store/keyprovider_vault.py](../store/keyprovider_vault.py): the base

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Anonymizer (de-identification) for PHI-free test datasets — engine side (ADR 0030, BACKLOG #36).
 
 Turns a real, messy HL7 v2 message into a **structurally-faithful, PHI-free** copy safe to commit,

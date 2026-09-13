@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-environment values (DEV/PROD): ``env()`` references resolve per instance and fail loud if a
 referenced value is missing (Part B)."""
 

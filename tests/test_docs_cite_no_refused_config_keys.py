@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No shipped document may present a config key the loader REFUSES as a key to write.
 
 BACKLOG #1383. `_RELOCATED_TO_SECURITY` maps 15 legacy `[section] key` spellings to their
@@ -143,10 +144,8 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md": 1,
     "docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md": 2,
     "docs/adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md": 1,
-    "docs/archive/backlog/BACKLOG-CLOSED.md": 2,
     # #1279: was 2. The two added are in item 1279 itself -- the row that ASKED for the removal,
     # naming the key it wanted gone, and the closing banner recording that it went.
-    "docs/BACKLOG.md": 4,
     "docs/CLOUD-PHI-HIPAA.md": 1,
     "docs/CLUSTERING.md": 1,
     "docs/CONFIGURATION.md": 3,

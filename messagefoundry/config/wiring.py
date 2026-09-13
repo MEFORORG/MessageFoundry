@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Code-first wiring: declare **Connections** and decorate **Router**/**Handler** functions.
 
 A config module (loaded from a directory via :func:`load_config`) declares named inbound/outbound

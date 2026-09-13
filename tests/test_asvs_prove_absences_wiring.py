@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pin the guarantees of .github/workflows/asvs-prove-absences.yml and scripts/asvs/prove_report.py.
 
 `--prove-absences` shipped on 2026-08-07 and ran in no workflow in either repo until this wiring

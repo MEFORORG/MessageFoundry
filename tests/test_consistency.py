@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-field HL7 consistency primitives (WP-7b, ASVS 2.2.3/2.1.2/2.2.1).
 
 Each primitive takes a parsed Message + field paths and returns PHI-safe Violations (path + rule,

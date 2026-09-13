@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``POST /alerts/test-email`` — operator-triggered alert-mail-server connectivity test (BACKLOG #118).
 
 The endpoint sends a synthetic, PHI-free event through the **real** ``[alerts]`` email transport

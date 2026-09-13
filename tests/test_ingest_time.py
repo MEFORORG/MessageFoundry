@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the re-run-stable ingest-time provider (config.ingest_time, ADR 0009).
 
 The SQLite path that surfaces `OutboxItem.created_at` from the claim is exercised by the whole

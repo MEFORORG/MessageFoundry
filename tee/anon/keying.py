@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Deterministic, salt-keyed pseudonymization seed for the anonymizer (ADR 0030 §4).
 
 The surrogate chosen for a real value must be two things at once:

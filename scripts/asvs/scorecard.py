@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS scorecard as data (ADR 0156) — derive the count, verify the evidence, fail closed.
 
 The score used to live in prose. On 2026-08-01 one re-anchoring session re-derived the headline count

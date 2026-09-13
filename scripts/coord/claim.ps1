@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
     Claim a piece of WORK, atomically, so two concurrent sessions cannot build the same thing twice.
@@ -32,10 +32,15 @@
     earlier was labelled STALE and recommended for release.
 
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
-    <git-common-dir>/mefor-coord/claims/.history: the key, the releasing worktree and branch, the
-    prior holder, its branch and note, when the claim was taken, and whether -Force was used. The
-    record is written BEFORE the claim file is removed and the release is refused if it cannot be
-    written -- a release nobody can trace is the outcome this will not produce (BACKLOG #1068).
+    <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
+    the tree the command was actually invoked FROM (`invoked_from`, BACKLOG #1358), the prior holder,
+    its branch and note, when the claim was taken, and whether -Force was used. The record is written
+    BEFORE the claim file is removed and the release is refused if it cannot be written -- a release
+    nobody can trace is the outcome this will not produce (BACKLOG #1068).
+
+    `released_by` and `invoked_from` answer different questions and routinely differ: the first is the
+    tree the claim is held in the name of, the second is where the operator's shell was. Read them as a
+    PAIR -- a release where they diverge was performed on another tree's behalf.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\claim.ps1 -Take 105 -Note "corepoint xml importer"
@@ -101,6 +106,25 @@ if ($AsWorktree) {
     $holder = $holderTop.Trim()
 }
 
+# WHERE THE SHELL IS STANDING -- a THIRD question, and the one nothing recorded (BACKLOG #1358).
+#
+# $repo answers *where this copy of the script lives*; $holder answers *who the claim is for*. Neither
+# answers *who ran this*, and inside a single checkout all three are the same directory, which is why
+# the gap stayed invisible for as long as it did.
+#
+# Returns $null rather than a guess when the shell is not inside a repository at all. An empty string
+# would land in the release record looking like a tree whose path is "", and a record that invents a
+# value is the failure this whole item is about.
+#
+# THIS IS NOT A RE-ANCHORING (BACKLOG #1060). Nothing here decides where the registry lives, who owns a
+# claim, or which tree a release is judged against -- every one of those still comes from $PSScriptRoot
+# by way of $repo/$holder. This value is written down and never acted on.
+function Get-CallerTree {
+    $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if (-not $top) { return $null }
+    return $top.Trim()
+}
+
 # ONE divergence test, three call sites (BACKLOG #1358). The note used to be written inline at the very
 # end of the script, which put it after the `-Take` success block and therefore made it UNREACHABLE from
 # `-Release` -- the script stated the release rule at claim time and went silent at the moment the
@@ -114,9 +138,11 @@ if ($AsWorktree) {
 # tree the operator is not standing in -- so once `-AsWorktree` names the tree they ARE standing in, there
 # is no divergence left to warn about and firing anyway would be a false alarm on the correct usage.
 function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
-    $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    # Get-CallerTree, not a second copy of the same read: the note and the release record must agree
+    # about where the shell was, and two spellings of one question is how they stop agreeing.
+    $cwdTop = Get-CallerTree
     if (-not $cwdTop) { return }
-    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $a = ($cwdTop -replace '\\', '/').TrimEnd('/')
     $b = ($holder -replace '\\', '/').TrimEnd('/')
     if ($a -ieq $b) { return }
     Write-Host "  NOTE: your shell is in $a, but this claim is recorded against $b," -ForegroundColor Yellow
@@ -387,12 +413,19 @@ function Show-List {
                     $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
-                # -List is what a Cleaner or Dispatcher reads to decide where to spend attention, so
-                # a directory that outlived its session must not render identically to a lane that
-                # is building. It still says ROUTE, not release: the refusal is unchanged.
+                # -List is what a dispatching seat reads to decide where to spend attention, so a
+                # directory that outlived its session must not render identically to a lane that is
+                # building. It still says ESCALATE, not release: the refusal is unchanged.
+                #
+                # THIS LINE NAMED TWO SEATS UNTIL 2026-09-11 AND BOTH HAD RETIRED (BACKLOG #1543).
+                # It read "ROUTE to the Cleaner/Dispatcher". CLAUDE.md section 5 retired both, so the
+                # register's largest category had no live destination: measured that day, 56 of 80
+                # claims sat in this state, median age 118h, and 48 of them over 96h. A tool that
+                # names a ROLE inherits that role's lifetime; this one now names the CONDITION that
+                # settles the case, which cannot retire. Do not put a seat name back here.
                 'unoccupied' {
                     $age = "  [held ${hrs}h; DIRECTORY ONLY -- no live session in it, last commit $($live.QuietHours)h ago]"
-                    $age += " -- ROUTE to the Cleaner/Dispatcher; not releasable on this signal alone"
+                    $age += " -- not releasable on this signal alone; run -Release to see what settles it"
                 }
                 default   { $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]" }
             }
@@ -452,10 +485,20 @@ if ($Release) {
             'unoccupied' {
                 Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
                 Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
-                Write-Host "  STILL NOT YOURS TO -Force. Nothing on this host can prove a session is gone: occupancy"
-                Write-Host "  sees a session by the cwd it launched in, so one working here BY ABSOLUTE PATH from"
-                Write-Host "  elsewhere is invisible to it. This is reported so you can ROUTE it, not act on it."
-                Write-Host "  Route to the Cleaner or the Dispatcher -- releasing another worktree's claim is theirs."
+                Write-Host "  STILL NOT YOURS TO -Force ON THIS SIGNAL. Nothing on this host can prove a session is"
+                Write-Host "  gone: occupancy sees a session by the cwd it launched in, so one working here BY"
+                Write-Host "  ABSOLUTE PATH from elsewhere is invisible to it. Occupancy can VETO, never authorise."
+                Write-Host ""
+                Write-Host "  TWO THINGS SETTLE IT, and neither is a seat you have to find:" -ForegroundColor Cyan
+                Write-Host "   1. THE ITEM IS ALREADY CLOSED. Then there is no work for a live session to be doing,"
+                Write-Host "      so liveness stops mattering. Check the banner in docs/BACKLOG.md (or the archive)"
+                Write-Host "      and, if it is closed, -Force it and say so in the note."
+                Write-Host "   2. THE OWNER SAYS SO. That is the escalation, and it is deliberately a person rather"
+                Write-Host "      than a role: this line named two seats until 2026-09-11 and both had retired,"
+                Write-Host "      which left 56 of 80 claims with no destination at all (BACKLOG #1543)."
+                Write-Host ""
+                Write-Host "  A LONG QUIET PERIOD IS NOT A THIRD REASON. Age is not evidence: a session can be alive"
+                Write-Host "  and simply not committing, and this state is the one where you cannot tell."
             }
             default {
                 Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
@@ -476,6 +519,9 @@ if ($Release) {
     # failed -- which the catch below corrects in the same ledger. Refusing when the record cannot be
     # written is safe because a release is always retryable: the claim stays where it was.
     #
+    # Read ONCE and shared with the release-failed record below, so a single release can never write two
+    # lines that disagree about where its operator was standing.
+    $invokedFrom = Get-CallerTree
     # ConvertTo-Stamp on every field carried over from the claim file, not just the timestamp:
     # ConvertFrom-Json date-coerces ANY ISO-8601-shaped string, and note/branch/worktree are free text.
     $record = [ordered]@{
@@ -484,6 +530,25 @@ if ($Release) {
         key             = $Release
         released_by     = $holder
         released_branch = $branch
+        # THE ACTOR (BACKLOG #1358), read as a pair with released_by per the header. WHY A RECORD AND
+        # NOT A WARNING: a misdirected -Take is refused by the commit gate at the point of use, and
+        # nothing anywhere re-reads a release record, so a wrong actor here is never contradicted.
+        #
+        # ALWAYS WRITTEN, including when it equals released_by, and $null when the shell was not inside a
+        # repository. Omitting it on the ordinary same-tree release would make absence mean two things --
+        # "the caller was the holder" and "this record predates the field" -- and a reader cannot tell
+        # those apart, which is the ambiguity the field exists to remove.
+        #
+        # -AsWorktree MAKES THIS SHARPER RATHER THAN REDUNDANT (measured 2026-09-10, BACKLOG #1346's
+        # flag). `-Release <key> -AsWorktree <holder>` re-aims the ownership test at the named tree, so a
+        # checkout that holds nothing can release another's claim WITHOUT -Force: prior_holder,
+        # released_by and released_branch all name the holder and `force` stays false, so the line is
+        # indistinguishable from that holder releasing its own claim routinely. This field is the only
+        # one that says otherwise.
+        #
+        # The caller's BRANCH is deliberately not recorded beside it: the item asks which seat acted, and
+        # the tree answers that.
+        invoked_from    = $invokedFrom
         prior_holder    = ConvertTo-Stamp $info.Claim.worktree
         prior_branch    = ConvertTo-Stamp $info.Claim.branch
         # The note is what a later reader judges the release BY -- it is the field that was stale and
@@ -509,11 +574,14 @@ if ($Release) {
         # The line above says a release happened; it did not. Correct it in the same ledger rather than
         # leave a record that is now false.
         Add-HistoryLine ([ordered]@{
-                ts          = (Get-Date).ToString("o")
-                event       = "release-failed"
-                key         = $Release
-                released_by = $holder
-                reason      = $_.Exception.Message
+                ts           = (Get-Date).ToString("o")
+                event        = "release-failed"
+                key          = $Release
+                released_by  = $holder
+                # Same reason as the record above, and the correction is the half a reader is MORE
+                # likely to act on: it is the line that says the ledger's previous sentence is false.
+                invoked_from = $invokedFrom
+                reason       = $_.Exception.Message
             } | ConvertTo-Json -Compress) | Out-Null
         throw
     }
@@ -656,10 +724,15 @@ try {
         'unoccupied' {
             Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
             Write-Host "  but NO live session is placed in it. This is the third state (BACKLOG #1348)."
-            Write-Host "  STILL NOT YOURS TO -Force, and the refusal is deliberate: occupancy can VETO but never"
-            Write-Host "  authorise, because nothing here can prove a session is gone. A session working in this"
-            Write-Host "  path BY ABSOLUTE PATH from another cwd does not appear as an occupant."
-            Write-Host "  Hand it to the Cleaner or the Dispatcher with this line; do not build it in parallel."
+            Write-Host "  STILL NOT YOURS TO -Force ON THIS SIGNAL, and the refusal is deliberate: occupancy can"
+            Write-Host "  VETO but never authorise, because nothing here can prove a session is gone. A session"
+            Write-Host "  working in this path BY ABSOLUTE PATH from another cwd does not appear as an occupant."
+            Write-Host ""
+            Write-Host "  TWO THINGS SETTLE IT: the ITEM being already closed (then no live session can be doing" -ForegroundColor Cyan
+            Write-Host "  the work, so liveness stops mattering -- check its banner and -Force it saying so), or"
+            Write-Host "  an OWNER decision. Escalate to the owner, not to a seat: this line named the Cleaner and"
+            Write-Host "  the Dispatcher until 2026-09-11 and both had retired (BACKLOG #1543)."
+            Write-Host "  Until one of those, do NOT build it in parallel."
         }
         default {
             Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-003 (CWE-732): the Windows config-source trust guard must actively refuse a config dir/module
 that a broad/low-privilege principal can write — it used to be a silent no-op on Windows.
 

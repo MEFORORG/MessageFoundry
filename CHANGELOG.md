@@ -213,7 +213,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   is byte-identical. An **undeclared** proxy (`web_console_public_address` set, no
   `tls_terminated_upstream`) deliberately still does not refuse — exposure there would be an inference —
   but it no longer passes in silence: a new warning names single-factor admin directly on a PHI instance
-  with `require_mfa` off. ([BACKLOG #326](docs/archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off), [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
+  with `require_mfa` off. ([BACKLOG #326](docs/BACKLOG.md), [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
 - **BREAKING — an `[[alerts.rules]]` block that routes to an unconfigured transport now refuses at
   startup instead of being silently ignored.** `notifier_from_settings` returned early when **no**
   transport was configured, *before* the loop that cross-checks each rule's `transports` against the
@@ -292,6 +292,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   migrating, because a key that is refused now was doing nothing before.
 
 ### Security
+- **The web console's step-up actions would have refused an MFA-pending session without the audit
+  row the console's other MFA refusals write.** `require_ui_step_up` and `require_ui_step_up_action` switched off
+  `require_ui`'s second-factor gate to keep their `/ui/reauth?next=` continuation, then refused a
+  pending session with a bare redirect of their own. On a first deployment with
+  `[security].require_mfa` on, which is the default, a stolen password-only session cookie would have
+  probed all 42 step-up route gates and left no `auth.mfa_denied` row. The same switch put the
+  permission check first, so the refusal would also have shown which of those permissions the account
+  holds, and it spent the account's admin-write budget before refusing. The gate now refuses, audits
+  and orders its checks as it does on every other `/ui` route. Only where it sends the browser
+  differs. The JSON API was never affected. ([BACKLOG #1542](docs/BACKLOG.md))
 - **The web console's message editor would have opened the raw body to a custom role holding
   `messages:edit` without `messages:view_raw`.** `GET /ui/messages/{id}/edit` and
   `POST /ui/messages/{id}/edit-resend` gated on `messages:edit` alone, while the JSON handler they
@@ -304,7 +314,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   displays the body it edits. **Who this would bite:** a deploying org whose admin had minted such a
   custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
   deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
-  and every such read was already audited. ([BACKLOG #324](docs/archive/backlog/BACKLOG-CLOSED.md#324-custom-role-with-messagesedit-alone-reads-raw-phi-via-the-ui-editor))
+  and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
 - **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
@@ -647,7 +657,7 @@ is additive / opt-in.
   gate never fired (adopters are pip + IT-covered), and it only ever shipped unsigned. **The desktop console
   is unaffected** — it stays installable via `pip install messagefoundry[console]` + the ADR 0032 Phase A
   `gui-script` and shortcut scripts; only the *frozen, zero-Python* conveyance is gone. The zero-install
-  audience is now served by the browser ops dashboard ([BACKLOG #75](docs/archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor)).
+  audience is now served by the browser ops dashboard ([BACKLOG #75](docs/BACKLOG.md)).
 
 ### Changed
 - **Server-DB store opens now skip the schema DDL batch when it already ran** ([ADR 0064](docs/adr/0064-schema-init-fastpath.md)).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure (vscode-free, I/O-free) logic for the engine LIFECYCLE the status bar drives — the decisions the
 // shell (statusBar.ts) needs but that must be unit-testable node-side, like engineStatusModel.ts. No
 // vscode, no child_process, no fs: the shell does the exec/fs and hands the RESULTS to these functions.

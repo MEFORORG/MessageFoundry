@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Store-once-deliver-many (L2b) system-under-test — the shape that actually triggers dedup.
 
 The load graph (``harness/config/load``) fans out via N **separate** handlers (one ``Send`` each → N

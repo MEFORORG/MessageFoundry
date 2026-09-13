@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 15.2.4: no shipped text may instruct an install that resolves an UNCLAIMED name.
 
 The defect this guards was live in **shipped code**, not just docs: ``api/app.py``'s ``serve_ui``

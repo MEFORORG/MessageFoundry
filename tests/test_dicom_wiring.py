@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Config/wiring tests for the DICOM connectors (ADR 0025) — the DICOM()/DICOMweb() factories, the binary
 content type, the inbound host-rejection + peer-IP allowlist, the generalized non-loopback bind-guard
 (check_dimse_tls_exposure), and the fail-closed egress arms (DIMSE→allowed_tcp, DICOMWEB→allowed_http).

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Synchronous, handler-callable **live** database lookup (the Corepoint real-time Data Point pattern).
 
 Unlike :func:`~messagefoundry.config.reference.reference` / :func:`~messagefoundry.config.state.state_get`

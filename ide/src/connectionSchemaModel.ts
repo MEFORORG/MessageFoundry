@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure (vscode-free) half of the engine-derived connection catalogue (ADR 0007). The engine now
 // describes its own transports — `messagefoundry connection schema --json`
 // (messagefoundry/config/connection_schema.py) — instead of the editor carrying a hand-written

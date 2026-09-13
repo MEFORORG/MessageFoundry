@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1268: what counts as "the same username" must be decided in ONE place.
 
 Two limbs of one root cause, and fixing either alone leaves the other a live trap:

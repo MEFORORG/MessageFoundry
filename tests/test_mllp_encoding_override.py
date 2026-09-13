@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-outbound MLLP encoding-character override (Tier 2.5, Corepoint ``-override`` parity).
 
 The override makes an MLLP destination re-encode the outgoing message with a different set of HL7

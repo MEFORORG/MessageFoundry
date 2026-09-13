@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Outbound batch aggregation — BACKLOG #134 / ADR 0082 acceptance criteria.
 
 A batching outbound coalesces its contiguous FIFO head-prefix into one ``BHS``…``BTS`` envelope on a

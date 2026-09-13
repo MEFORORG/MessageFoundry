@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Installing the gate must leave a record, and the record must not lie about WHEN (BACKLOG #1247).
 
 Three things were missing, all measured at zero on origin/main against a positive control of three

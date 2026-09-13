@@ -177,7 +177,8 @@ Then open the admin console in a browser (install the web console alongside the 
   Wizard, validate-on-save, a Test Bench (dry-run `.hl7` files with before/after diffs), Stage →
   Promote to a running engine, and an HL7-aware `@messagefoundry` chat participant. **It is not on PyPI**
   (a VS Code extension is a different ecosystem) **and not yet on the VS Code Marketplace** — Marketplace
-  + Open VSX publishing is **planned** (see [the backlog](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/BACKLOG.md)). Until then, get it from
+  + Open VSX publishing is **planned** (the plan itself is not public — see
+  [docs/BACKLOG.md](docs/BACKLOG.md)). Until then, get it from
   this repo: open the `ide/` folder in VS Code and press **F5** (Extension Development Host), or build the
   VSIX (`cd ide && npm install && npx @vscode/vsce package`) and install the `.vsix`. See
   [ide/README.md](https://github.com/MEFORORG/MessageFoundry/blob/main/ide/README.md).
@@ -191,7 +192,7 @@ Then open the admin console in a browser (install the web console alongside the 
 MessageFoundry is licensed under the **GNU Affero General Public License v3.0 or later**
 (`AGPL-3.0-or-later`) — see [LICENSE](https://github.com/MEFORORG/MessageFoundry/blob/main/LICENSE). Running a modified version as a network service
 triggers the AGPL's §13 source-offer obligation. A separately-licensed commercial edition is planned
-by **MessageFoundry Organization** under the standard open-core model — see
+by **MessageFoundry Foundation, LLC** under the standard open-core model — see
 [COMMERCIAL-LICENSE.md](https://github.com/MEFORORG/MessageFoundry/blob/main/COMMERCIAL-LICENSE.md) (terms pending legal review). See [NOTICE](https://github.com/MEFORORG/MessageFoundry/blob/main/NOTICE)
 for copyright and attribution.
 

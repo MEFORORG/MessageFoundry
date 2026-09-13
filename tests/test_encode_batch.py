@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``encode_batch`` — BHS…BTS batch envelope encoder (BACKLOG #134 / ADR 0082).
 
 The encode-side inverse of ``split_batch``: N MSH messages → one BHS…BTS envelope, framed from the

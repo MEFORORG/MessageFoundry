@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """GET /config/provenance + the web config-page badge (ADR 0041 D1, item C).
 
 Provenance = the content fingerprint + best-effort git commit of the graph the engine currently has

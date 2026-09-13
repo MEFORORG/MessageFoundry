@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Engine-brokered AI assistance (ADR 0135, BACKLOG #95).
 
 Covers the crown-jewel security invariants of the NEW LLM-egress surface: the SERVER re-resolves the

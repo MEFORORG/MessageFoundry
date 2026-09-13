@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Delegated-identity precondition on the store (#203, ASVS 13.2.1 / 13.3.2).
 
 ``[store].require_managed_identity`` makes "the store authenticates via a managed/delegated identity"

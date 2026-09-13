@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Audit + self-service security-event page builders for the /ui ops dashboard (ADR 0065, L1c).
 
 Read-only views over the tamper-evident audit log: the full audit trail (``audit:read``) and the

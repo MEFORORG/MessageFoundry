@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the config content fingerprint (ADR 0041 D1).
 
 Verifies the fingerprint is stable, location-independent, and changes when *any* loaded file

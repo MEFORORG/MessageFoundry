@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read-only ``GET /alerts/rules`` endpoint (BACKLOG #22b, ADR 0014).
 
 The headline test is the **secret guard**: the loaded ``[alerts]`` config carries

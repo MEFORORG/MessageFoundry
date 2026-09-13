@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The extracted Qt-free / FastAPI-free engine-client library (ADR 0088).
 
 This is the canonical engine-client entrypoint (:mod:`messagefoundry.apiclient`) — the desktop

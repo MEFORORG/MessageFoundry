@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Static import-boundary guard for the sandbox worker files (ADR 0087, BACKLOG #346).
 
 The sandbox draws its trust boundary at runtime: :class:`_ForbiddenImportFinder` (in

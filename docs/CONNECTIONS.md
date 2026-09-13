@@ -2472,9 +2472,25 @@ cap on roughly the lane heads rather than the whole backlog; and an exhausted ro
 the replayable DLQ** rather than being discarded. For synchronous HTTP (REST/SOAP) **keep the finite
 `retry_max_attempts` and set a short `timeout_seconds`** to prevent cascading delays / resource
 exhaustion; failures classified *permanent* (e.g. an MLLP `AR` reject) go straight to the
-dead-letter path rather than retrying. `retry_max_attempts=None` remains expressible and still means
-retry forever, for a partner that must never be advanced past — under strict FIFO that head blocks
-its lane until it succeeds or an operator purges it, so it is a written decision, not a default. **Every infrastructure hop in Table B that performs a
+dead-letter path rather than retrying. `retry_max_attempts=None` remains expressible, and still means
+retry forever for a partner that must never be advanced past. **Three surfaces express it, and each
+one spells it differently — the word `"forever"` is the same, the KEY and the FILE are not** (BACKLOG
+#1217):
+
+| Surface | Where | What you write |
+|---|---|---|
+| code-first Python | an `outbound(...)` call | `retry=RetryPolicy(max_attempts=None)` |
+| global default | `messagefoundry.toml`, `[delivery]` (or `MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS=forever`) | `retry_max_attempts = "forever"` |
+| per-outbound override | `connections.toml`, `[outbound.retry]` | `max_attempts = "forever"` |
+
+`"forever"` is case-insensitive and whitespace-tolerant on both text surfaces; every other string
+(`""`, `"none"`, `"null"`, `"sometimes"`) is still a load error. **`connections.toml` accepts neither
+of the other two spellings**: it takes only `[[inbound]]`/`[[outbound]]` tables, so a `[delivery]`
+table there fails with `unknown top-level key(s) delivery`, and `retry_max_attempts` is not an
+`[[outbound]]` key, so a flat one fails `_reject_unknown`. See
+[CONFIGURATION.md](CONFIGURATION.md)'s `[delivery]` catalog for the global. Under strict FIFO a
+retry-forever head blocks its lane until it succeeds or an operator purges it, so it is a written
+decision, not a default. **Every infrastructure hop in Table B that performs a
 synchronous request/response is single-shot** — AD, OIDC, SMART, generic OAuth2, the AI broker, both
 Vault clients, both SMTP sinks, the webhook sink, syslog and SNTP: one attempt, no retry loop, which
 is what the requirement's "disable or strictly limit retries" clause asks for. The **store backends
@@ -2710,7 +2726,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
-| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG #27](archive/backlog/BACKLOG-CLOSED.md#27-serial-rs-232--astm-e1381e1394e1318--decision-decline-unless-lab-analyzer-demand-no-build)) |
+| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG #27](BACKLOG.md)) |
 | **FHIR** endpoint/client | ✅ | ✅ | ✅ | ~ | `FHIR-OUT` shipped (`FHIR()`, ADR 0022) + SMART Backend Services client auth (ADR 0024); the inbound **server facade** is deferred (BACKLOG #20) |
 | **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — plus two first-class internal inbounds: `Loopback()` (a captured reply) and `PassThrough()` (1:N internal re-ingress), ADR 0013 |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |

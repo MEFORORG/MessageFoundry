@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """OIDC authorization-code + PKCE flow state (ADR 0142): PKCE generation, the browser-binding flow
 cache, the authorization-URL builder, and the token-endpoint code exchange.
 

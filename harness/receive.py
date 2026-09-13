@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Receive tab: an MLLP listener that shows inbound messages and replies per a chosen mode.
 
 Beyond plain AA/AE/AR/none, the reply mode can inject faults — delay the ACK, drop the connection,

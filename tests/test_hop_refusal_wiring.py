@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Posture-keyed transport-hop refusal — the escape clamp, the per-hop attestation model field, the
 [ai]->posture mapping, and the construction-time posture stamping (#200, ADR 0092)."""
 

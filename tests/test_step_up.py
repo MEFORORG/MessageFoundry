@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Step-up re-verification on highly sensitive operations (WP-L3-16, ASVS 7.5.3).
 
 A session must have re-proved its credential — at login or via ``POST /me/reauth`` — within

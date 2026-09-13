@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the RFC 6238 TOTP second factor (auth/totp.py, WP-14).
 
 The vector tests pin the implementation against the official RFC 6238 Appendix B test values. The

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate value pools — the **engine seam** (ADR 0030 §1/§3).
 
 :mod:`messagefoundry.anon.surrogates` draws fabricated names/streets/cities/clinicians from these

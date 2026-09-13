@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """L3 multi-process supervisor: shard-spec derivation + spawn/restart/stop lifecycle.
 
 The lifecycle tests inject a fake "process" (a controllable stand-in for an

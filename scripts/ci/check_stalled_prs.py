@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A pull request can be finished, green, armed to merge — and unable to merge, forever, silently.
 
 THE DEFECT THIS EXISTS FOR — measured on this repo, 2026-08-01. Nine open pull requests had zero

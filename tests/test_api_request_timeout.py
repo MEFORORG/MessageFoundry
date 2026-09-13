@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine API bounds how long a handler may build a response (BACKLOG #1044).
 
 ASVS 15.1.3's "avoid building a response that takes longer than the consumer's timeout" limb (properly

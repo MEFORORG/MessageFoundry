@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Deterministic observation of the egress send pacer (BACKLOG #82).
 
 **The flake this replaces.** ``_pace_outbound`` stamps the lane's send clock and returns; the delivery

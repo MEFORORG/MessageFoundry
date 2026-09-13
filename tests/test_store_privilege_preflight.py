@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1008 (ASVS 13.2.2) — the startup preflight on the store principal's EFFECTIVE privileges.
 
 The defect, in the conditional this repo requires (MessageFoundry is a not-deployed beta, zero
@@ -63,6 +63,8 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import open_store, sqlite_settings
 from messagefoundry.store.privilege import (
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
     PostgresRoleFacts,
     StorePrivilegeError,
     StorePrivilegeReport,
@@ -474,6 +476,231 @@ async def test_an_unobservable_probe_refuses_under_a_declared_requirement() -> N
             require_least_privilege=True,
             enforcing=True,
         )
+
+
+# --- direction 3, SQL Server arm: a NULL column is NOT READ (BACKLOG #1234) --------------------
+#
+# ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` all answer **NULL** — not 0 — when
+# the name they are asked about does not resolve for the caller. The arm folded that NULL through
+# ``== 1`` to ``False``, which reads as "not a member" and therefore as clean, so a probe that read
+# NOTHING reported OBSERVED with an empty excess list: the false-clean the by-name probe was chosen to
+# avoid, arriving by the other door.
+#
+# These legs drive the REAL T-SQL arm with ``_fetchone`` / ``_fetchall`` monkeypatched, so they need no
+# SQL Server and no container and run in the default local suite. The live legs at the foot of this
+# file cover the SQL itself; nothing here asserts what the server returns, only what the arm DOES with
+# what it gets. Both directions are present on purpose — this item's own scope warns that a fix
+# reporting UNKNOWN for everything trades a false clean for a useless one and would pass a single-arm
+# test.
+
+
+def _probe_row(
+    *,
+    server_roles: tuple[str, ...] = (),
+    database_roles: tuple[str, ...] = (),
+    control_server: int | None = 0,
+    control_db: int | None = 0,
+    unread: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """One ``probe_principal_privileges`` result row. ``unread`` names the roles that read NULL.
+
+    Built from the shipped closed sets rather than from literal ``srv_3`` / ``dbr_5`` aliases, so
+    adding a role to either set carries these fixtures with it instead of silently shifting what they
+    assert onto a neighbour."""
+    row: dict[str, Any] = {
+        "login_name": "CORP\\mefor-svc$",
+        "db_user": "mefor",
+        "db_name": "MessageFoundry",
+        "control_server": control_server,
+        "control_db": control_db,
+    }
+    for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
+        row[f"srv_{i}"] = None if name in unread else int(name in server_roles)
+    for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
+        row[f"dbr_{i}"] = None if name in unread else int(name in database_roles)
+    return row
+
+
+def _sqlserver_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    row: dict[str, Any] | None,
+    *,
+    user_defined: tuple[str, ...] = (),
+) -> Any:
+    """A real :class:`SqlServerStore` whose two read helpers are stubbed. No driver, no connection.
+
+    ``__init__`` only assigns attributes, so a ``None`` pool is inert: every call the probe makes goes
+    through ``_fetchone`` / ``_fetchall``, and ``record_audit`` is stubbed for the preflight legs."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    store = SqlServerStore(
+        None,
+        # Windows Integrated auth so the fixture carries no credential-shaped literal at all; nothing
+        # here connects, and the probe reads only `database` off these settings.
+        StoreSettings(
+            backend=StoreBackend.SQLSERVER,
+            auth=SqlAuth.INTEGRATED,
+            server="db.invalid",
+            database="MessageFoundry",
+        ),
+    )
+
+    async def _fetchone(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        return None if row is None else dict(row)
+
+    async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        return [{"role_name": name} for name in user_defined]
+
+    async def _record_audit(action: str, *, actor: str | None, detail: str | None) -> None:
+        return None
+
+    monkeypatch.setattr(store, "_fetchone", _fetchone)
+    monkeypatch.setattr(store, "_fetchall", _fetchall)
+    monkeypatch.setattr(store, "record_audit", _record_audit)
+    return store
+
+
+async def test_a_probe_whose_role_columns_all_read_null_is_not_observed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE regression. Every role column NULL — the probe read nothing — and the old arm called that
+    OBSERVED with an empty excess list, which is a clean bill of health from a control that never ran."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(unread=SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES),
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is not StorePrivilegeStatus.OBSERVED
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.excess == ()
+    # The wording, not just the enum: this line is what an operator reads and acts on.
+    assert "COULD NOT OBSERVE" in report.summary()
+    assert "UNVERIFIED" in report.summary()
+    assert "NOT READ" in report.detail
+    # Named grant by grant, or an operator cannot tell which grant to go and check by hand.
+    assert "server role sysadmin" in report.detail
+    assert "database role db_owner" in report.detail
+
+
+async def test_one_null_role_column_is_enough_to_stop_the_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An otherwise-perfect read with ONE unresolved role is still an incomplete read. ``db_owner`` is
+    the role whose silent absence matters most, and a partial fold would report exactly this row clean."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(database_roles=_DOCUMENTED_SQLSERVER, unread=("db_owner",)),
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert "database role db_owner" in report.detail
+    assert "1 of 19 probed grant(s)" in report.detail
+    # What DID read is still reported: a partial read can only understate an over-grant, never invent one.
+    assert set(_DOCUMENTED_SQLSERVER) <= set(report.database_roles)
+
+
+async def test_a_null_direct_permission_column_is_not_read_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HAS_PERMS_BY_NAME`` is the limb this item's original scope did not name. It NULLs on the same
+    unresolved-name condition, so a fix that repaired only the role columns would leave a direct
+    ``GRANT CONTROL SERVER`` mis-read exactly as before — silently absent on an OBSERVED report."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(database_roles=_DOCUMENTED_SQLSERVER, control_server=None),
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert "CONTROL SERVER" in report.detail
+
+
+async def test_a_partial_read_still_names_the_over_grant_it_did_see(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing a confirmed ``sysadmin`` because a NEIGHBOURING column was unreadable would trade one
+    false-clean for another. The read is incomplete AND the principal is a superuser; say both."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(server_roles=("sysadmin",), unread=("db_owner",)),
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert report.server_roles == ("sysadmin",)
+    assert "what DID read as held: server role sysadmin" in report.detail
+
+
+async def test_a_null_read_refuses_under_a_declared_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The status has to ROUTE, not merely read differently. An operator who declared
+    require_least_privilege gets the same refusal a raising probe gets, because an unread grant and an
+    unreachable server are the same fact about what this instance can prove."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(unread=SQLSERVER_FIXED_DATABASE_ROLES),
+    )
+    with pytest.raises(StorePrivilegeError, match="COULD NOT OBSERVE"):
+        await run_store_privilege_preflight(
+            store,
+            require_least_privilege=True,
+            enforcing=True,
+        )
+
+
+async def test_a_genuine_least_privilege_row_still_observes_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DIRECTION 2 for this arm, and it is what stops the fix above being a fix that reports UNKNOWN for
+    everything. Nothing NULL, the three documented database roles, no server role, no direct CONTROL:
+    OBSERVED with an EMPTY excess list, and the user-defined enumeration still folded in."""
+    store = _sqlserver_probe(
+        monkeypatch,
+        _probe_row(database_roles=_DOCUMENTED_SQLSERVER),
+        user_defined=("db_datareader", "mefor_app"),
+    )
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == ("database role mefor_app",)
+    assert report.server_roles == ()
+    assert set(_DOCUMENTED_SQLSERVER) <= set(report.database_roles)
+    assert report.principal == "CORP\\mefor-svc$"
+    assert report.database == "MessageFoundry"
+
+
+async def test_a_zero_read_is_a_real_negative_and_is_not_confused_with_a_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NEGATIVE control for the arm above. A row of honest zeros — a principal that genuinely holds
+    nothing, not even the documented grant — must still be OBSERVED. Treating 0 as unread would make
+    every correctly-scoped install permanently unobservable, which is the useless-status failure."""
+    store = _sqlserver_probe(monkeypatch, _probe_row())
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.server_roles == ()
+    assert report.database_roles == ()
+    assert report.excess == ()
+
+
+async def test_a_boolean_driver_reads_the_same_as_an_integer_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Some ODBC drivers hand back ``True``/``False`` where this SQL returns 1/0. Those compare equal,
+    so the three-way classifier must not have quietly narrowed the held case to the integer ``1``."""
+    row = _probe_row(server_roles=("sysadmin",))
+    row = {k: (bool(v) if isinstance(v, int) else v) for k, v in row.items()}
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.server_roles == ("sysadmin",)
+    assert "server role sysadmin" in report.excess
+
+
+async def test_no_row_at_all_is_still_unobservable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-existing empty-result guard, pinned so the NULL work above cannot displace it."""
+    store = _sqlserver_probe(monkeypatch, None)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert "returned no row" in report.detail
 
 
 # --- the durable record -----------------------------------------------------------------------

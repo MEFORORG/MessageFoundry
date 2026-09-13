@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.2.4 — constant-time, full-walk audit-chain MAC verification on all THREE store backends.
 
 The L3 assessment residual for 11.2.4 named one mechanism: the product's one MAC (``audit_log.row_hash``) was

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1089 — an HL7 field path index below 1 must be REFUSED, not wrapped around.
 
 ``parsing/peek.py::_PATH_RE`` matches ``\\d+`` for every index, so ``PID-5.0`` parsed with

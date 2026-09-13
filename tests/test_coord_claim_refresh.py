@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Re-taking a claim you already hold must actually refresh its note.
 
 ``scripts/coord/claim.ps1 -Take`` documented itself as idempotent -- "re-taking your own claim just

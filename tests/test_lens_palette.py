@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0106 authoring palette — the lens recognizes the new vocabulary + diagnostics helpers as rows.
 
 Recognition-side (read) coverage: the six new ``actions.py`` helpers render as editable ``action`` rows

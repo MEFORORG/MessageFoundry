@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Operator-editable alert-email templates (#138, ADR 0127): the CLOSED non-PHI variable allowlist
 (fail-closed at config-load), the HTML-escaped alternative + always-kept plain part, the header-injection
 guard on the subject, and the renderer↔allowlist sync invariant."""

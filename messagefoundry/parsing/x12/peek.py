@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tolerant X12 *peek* — cheap routing-field extraction (the HL7 :class:`~messagefoundry.parsing.peek.Peek`
 analog for X12 EDI).
 

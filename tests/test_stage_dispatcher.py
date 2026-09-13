@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0066 §8 row 5 — the pooled-mode ``StageDispatcher`` state-machine unit tests.
 
 These are the **only** caller of :mod:`messagefoundry.pipeline.stage_dispatcher` (it is unwired in
@@ -445,6 +445,34 @@ def _lane_report(d: StageDispatcher, lane: str) -> str:
     )
 
 
+def _empty_route(d: StageDispatcher) -> str:
+    """Which of the two EMPTY routes has EVIDENCE behind it (BACKLOG #1270).
+
+    The 2026-09-09 amendment could not say which route fired, and named that an INSTRUMENT gap rather
+    than a missing log: PR #670 already built the counter that separates them, and this report simply
+    never printed it.
+
+    READ THE ZERO CORRECTLY. ``claim_lock_timeouts == 0`` means the swallowed-1222 route is NOT
+    ESTABLISHED — never "there was no contention". The counter covers only that one route on SQL
+    Server, so a READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip increments nothing on either
+    backend and stays perfectly consistent with a zero.
+    """
+    n = d.claim_lock_timeouts
+    if n > 0:
+        return (
+            f" ROUTE: claim_lock_timeouts={n}, so the swallowed-1222 route is ESTABLISHED on this"
+            " dispatcher — at least one claim round-trip aborted on a store lock timeout. The abort"
+            " names no lane (it rolled back before reading a row), so this does not prove THIS lane's"
+            " EMPTY was that one; it is the route with evidence."
+        )
+    return (
+        " ROUTE: claim_lock_timeouts=0, which means the 1222 route is NOT ESTABLISHED, NOT that there"
+        " was no contention. That counter covers only the swallowed 1222 on SQL Server, so a READPAST"
+        " / FOR UPDATE SKIP LOCKED head-of-line skip increments nothing on either backend and is"
+        " still consistent with this dump."
+    )
+
+
 def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
     """State which #344 hypothesis this expiry is, so the next reader need not know the theory.
 
@@ -464,13 +492,14 @@ def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
             " only at DEBUG) and a READPAST head skip (the batch claim drops the whole lane when its"
             " rn=1 head is locked — no log line at all). Postgres is NOT structurally immune: its"
             " claim uses FOR UPDATE SKIP LOCKED, the same head-of-line skip. BACKLOG #344 instance 2."
+            + _empty_route(d)
         )
     if d.empty_claims[0] > 0:
         return (
             f"VERDICT: an EMPTY claim was recorded (empty_claims[0] > 0) but the lane is {pname},"
             " not IDLE — so this is NOT the plain #344 instance-2 stranding. Read the phase:"
             " CLAIMING/PROCESSING means a later claim or serializer is still outstanding; PAUSED"
-            " means the pause branch consumed it."
+            " means the pause branch consumed it." + _empty_route(d)
         )
     return (
         "VERDICT: NO empty claim was recorded (empty_claims[0] == 0), so the claim never returned at"
@@ -498,6 +527,7 @@ async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | Non
         lines.append(
             f"  dispatcher[{i}] stage={d._stage.value}"
             f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
+            f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
             f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
             f" slots_free={d._slots_free}"
         )
@@ -1093,6 +1123,12 @@ def _aborts_reached(d: StageDispatcher, n: int) -> Callable[[], bool]:
     return lambda: d.claim_lock_timeouts >= n
 
 
+def _anything_dispatched(stub: RecordingStub) -> Callable[[], bool]:
+    """A predicate bound to THIS stub, for the same reason `_aborts_reached` is a factory: a lambda
+    written inside a loop closes over the loop's binding and re-reads it at call time (ruff B023)."""
+    return lambda: bool(stub.records)
+
+
 async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_stays_quiet(
     store: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1419,6 +1455,85 @@ _MAX_SWEEP_STANDINS = 1
 _SWEEP_STANDINS: dict[str, int] = {}
 
 
+def _terminal_idle(d: StageDispatcher, lane: str) -> bool:
+    """TERMINAL IDLE: the T12 EMPTY-claim resting state, with no timer armed and (in this topology) no
+    periodic sweep left to arm one — so nothing will ever re-claim the lane."""
+    return d.phase(lane) is _LanePhase.IDLE and lane not in d._timer_deadline
+
+
+async def _stand_in_for_sweep(d: StageDispatcher, lane: str) -> None:
+    """Re-ready a lane the EMPTY-claim branch stranded in terminal IDLE, standing in for the periodic
+    sweep these tests disable. The caller has already established the stranding; this counts it, caps
+    it, and makes it loud.
+
+    Shared by `_wait_lane` (phase targets) and `_wait_lane_until` (work predicates) so the cap has ONE
+    definition. The cap is a property of the LANE's contention rate, not of the call site: two
+    separate budgets would let one test spend it twice and still read as within the allowance.
+    """
+    used = _SWEEP_STANDINS.get(lane, 0)
+    if used >= _MAX_SWEEP_STANDINS:
+        raise _WaitTimeout(
+            f"{lane} stranded in terminal IDLE {used + 1} times — past the"
+            f" {_MAX_SWEEP_STANDINS} allowed sweep stand-in(s). That is a contention"
+            f" regression, not the transient 1222 this stands in for.\n"
+            + await _expiry_report(lane=lane)
+        )
+    _SWEEP_STANDINS[lane] = used + 1
+    # LOUD, but not fatal: surfaced in pytest's warnings summary so the real-world rate of the
+    # swallowed 1222 stays visible (and reviewable) instead of being silently absorbed here.
+    warnings.warn(
+        f"sweep stand-in: {lane} was stranded in terminal IDLE after an EMPTY claim"
+        f" (empty_claims={d.empty_claims}, claim_lock_timeouts={d.claim_lock_timeouts}) —"
+        f" re-readied ({used + 1}/{_MAX_SWEEP_STANDINS})."
+        " See BACKLOG #344 instance 2 and BACKLOG #1270.",
+        stacklevel=3,  # past this helper AND its waiter, onto the test's own line
+    )
+    # woken=False: a sweep-class readiness, not a producer wake (books EMPTY as idle_poll).
+    d.mark_ready(lane, woken=False)
+
+
+async def _wait_lane_until(
+    d: StageDispatcher,
+    lane: str,
+    pred: Callable[[], bool],
+    *,
+    note: str,
+    timeout: float = 8.0,
+    stand_in: bool = True,
+) -> None:
+    """Wait for ``pred``, re-readying ``lane`` if a T12 stranding parks it in terminal IDLE first.
+
+    THE INSTRUMENT `_wait_lane` CANNOT BE (BACKLOG #1270, 2026-09-09 amendment). `_wait_lane` disables
+    the stand-in whenever IDLE is among its targets, because a test that WANTS the lane idle must
+    never have it re-readied underneath its assertion. That leaves a whole family uncovered: a test
+    whose subject is the WORK — a dispatch record, a drained successor — for which IDLE is merely the
+    resting phase. Terminal IDLE is exactly what the stranding produces, so a bare
+    ``_wait_until(phase == IDLE)`` SUCCEEDS and the record assertion after it then fails on a message
+    that was never dispatched, reported as a bare ``assert [a] == [a, b]`` with none of the dump.
+    **Poll the work, not a phase that proxies for it.**
+
+    The predicate is what makes standing in safe here: it is re-read FIRST on every pass, so a
+    re-ready can only ever happen in a window where the caller's own assertion would have failed
+    anyway. Same cap, same warning, same raise, same per-lane budget as `_wait_lane`.
+
+    ``stand_in=False`` has ONE caller: `_wait_lane`, turning the stand-in off when IDLE is a target.
+    Tests where a re-ready would destroy the invariant under test stay on a BARE ``_wait_until`` and
+    say so in a comment — three of them in the PAUSE/RESUME block. Keeping those visibly outside this
+    family is the point; spelling them ``stand_in=False`` would make them read as converted.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if pred():
+            return
+        if stand_in and _terminal_idle(d, lane):
+            await _stand_in_for_sweep(d, lane)
+        await asyncio.sleep(0.003)
+    if pred():
+        return
+    raise _WaitTimeout(f"{lane} never reached {note}\n" + await _expiry_report(pred, lane=lane))
+
+
 async def _wait_lane(
     d: StageDispatcher, lane: str, *phases: _LanePhase, timeout: float = 8.0
 ) -> None:
@@ -1438,43 +1553,21 @@ async def _wait_lane(
     silently would hide a genuine contention regression, which is the failure mode the cap exists for.
 
     When IDLE is itself an expected outcome the stand-in is disabled — a test that WANTS the lane idle
-    must never have it re-readied underneath its assertion.
+    must never have it re-readied underneath its assertion. `_wait_lane_until` is the instrument for
+    the sibling family that disabling leaves uncovered.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    idle_is_a_target = _LanePhase.IDLE in phases
-    while loop.time() < deadline:
-        phase = d.phase(lane)
-        if phase in phases:
-            return
-        # TERMINAL IDLE: no timer armed and (in this topology) no sweep to re-arm one.
-        if not idle_is_a_target and phase is _LanePhase.IDLE and lane not in d._timer_deadline:
-            used = _SWEEP_STANDINS.get(lane, 0)
-            if used >= _MAX_SWEEP_STANDINS:
-                raise _WaitTimeout(
-                    f"{lane} stranded in terminal IDLE {used + 1} times — past the"
-                    f" {_MAX_SWEEP_STANDINS} allowed sweep stand-in(s). That is a contention"
-                    f" regression, not the transient 1222 this stands in for.\n"
-                    + await _expiry_report(lane=lane)
-                )
-            _SWEEP_STANDINS[lane] = used + 1
-            # LOUD, but not fatal: surfaced in pytest's warnings summary so the real-world rate of the
-            # swallowed 1222 stays visible (and reviewable) instead of being silently absorbed here.
-            warnings.warn(
-                f"sweep stand-in: {lane} was stranded in terminal IDLE after an EMPTY claim"
-                f" (empty_claims={d.empty_claims}) — re-readied ({used + 1}/{_MAX_SWEEP_STANDINS})."
-                " See BACKLOG #344 instance 2.",
-                stacklevel=2,
-            )
-            # woken=False: a sweep-class readiness, not a producer wake (books EMPTY as idle_poll).
-            d.mark_ready(lane, woken=False)
-        await asyncio.sleep(0.003)
-    want = "/".join(p.name for p in phases)
-    raise _WaitTimeout(f"{lane} never reached {want}\n" + await _expiry_report(lane=lane))
+    await _wait_lane_until(
+        d,
+        lane,
+        lambda: d.phase(lane) in phases,
+        note="/".join(p.name for p in phases),
+        timeout=timeout,
+        stand_in=_LanePhase.IDLE not in phases,
+    )
 
 
 def _sweep_standins(lane: str) -> int:
-    """How many times `_wait_park_or_stop` had to stand in for the disabled sweep on ``lane``."""
+    """How many times a waiter had to stand in for the disabled sweep on ``lane``."""
     return _SWEEP_STANDINS.get(lane, 0)
 
 
@@ -1973,31 +2066,37 @@ async def test_pause_lane_synchronous_phases_conserve_slots(store: Any) -> None:
         d.pause_lane("NEW")
         assert d.paused("NEW") is True and d.phase("NEW") == _LanePhase.PAUSED
 
-        # IDLE: drain a lane to IDLE, then pause.
+        # IDLE: drain a lane to IDLE, then pause. IDLE is the TARGET here, so `_wait_lane` disables its
+        # stand-in — deliberately. Do not "fix" that: re-readying this lane would move it off the very
+        # phase the pause is being applied from. The gain is the lane-scoped expiry report.
         idle_lane = "IB_IDLE"
         await _seed(store, idle_lane, [100.0])
         d.mark_ready(idle_lane)
-        assert await _wait_until(lambda: d.phase(idle_lane) == _LanePhase.IDLE)
+        await _wait_lane(d, idle_lane, _LanePhase.IDLE)
         d.pause_lane(idle_lane)
         assert d.phase(idle_lane) == _LanePhase.PAUSED
 
         # PARKED: RETRY -> PARKED (timer armed), then pause -> timer cancelled, PAUSED.
+        # `_wait_lane` (BACKLOG #1270): reaching PARKED needs a claim that RETURNS the head, so a
+        # stranded EMPTY claim leaves the lane in terminal IDLE and this wait times out on a bare
+        # assertion. This is the site the 2026-09-09 amendment named as the drop-in.
         park_lane = "IB_PARK"
         await _seed(store, park_lane, [100.0])
         stub.program(park_lane, ["RETRY"])
         d.mark_ready(park_lane)
-        assert await _wait_until(lambda: d.phase(park_lane) == _LanePhase.PARKED)
+        await _wait_lane(d, park_lane, _LanePhase.PARKED)
         assert park_lane in d._timers
         d.pause_lane(park_lane)
         assert d.phase(park_lane) == _LanePhase.PAUSED
         assert park_lane not in d._timers  # the park backoff timer was cancelled
 
         # STOPPED: content-STOP -> STOPPED, then pause overrides it (operator intent wins).
+        # Same stranding exposure as PARKED above, and the same instrument.
         stop_lane = "IB_STOP"
         await _seed(store, stop_lane, [100.0])
         stub.program(stop_lane, ["STOP"])
         d.mark_ready(stop_lane)
-        assert await _wait_until(lambda: d.phase(stop_lane) == _LanePhase.STOPPED)
+        await _wait_lane(d, stop_lane, _LanePhase.STOPPED)
         d.pause_lane(stop_lane)
         assert d.phase(stop_lane) == _LanePhase.PAUSED
 
@@ -2031,15 +2130,15 @@ async def test_pause_ready_lane_pinned_by_full_slots(store: Any) -> None:
     await d.start()
     try:
         d.mark_ready(busy_lane)
-        assert await _wait_until(lambda: d.phase(busy_lane) == _LanePhase.PROCESSING)
+        await _wait_lane(d, busy_lane, _LanePhase.PROCESSING)  # a stranded claim never gets here
         assert d.slots_free == 0
         d.mark_ready(ready_lane)  # no free slot -> sits READY on the claimer's deque
-        assert await _wait_until(lambda: d.phase(ready_lane) == _LanePhase.READY)
+        await _wait_lane(d, ready_lane, _LanePhase.READY)
         d.pause_lane(ready_lane)
         assert d.phase(ready_lane) == _LanePhase.PAUSED
 
         gate.set()  # busy_lane resolves + frees the slot; the stale READY entry is skipped as non-READY
-        assert await _wait_until(lambda: d.phase(busy_lane) == _LanePhase.IDLE)
+        await _wait_lane(d, busy_lane, _LanePhase.IDLE)  # IDLE is the target: stand-in off
         await _settle()
         assert d.phase(ready_lane) == _LanePhase.PAUSED  # never re-armed
         assert [r for r in stub.records if r.lane == ready_lane] == []  # never dispatched
@@ -2065,7 +2164,7 @@ async def test_pause_while_processing_defers_then_mark_ready_cannot_drain(store:
     await d.start()
     try:
         d.mark_ready(lane)
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PROCESSING)
+        await _wait_lane(d, lane, _LanePhase.PROCESSING)
         d.pause_lane(lane)  # lands mid-PROCESSING -> pause_pending, phase STILL PROCESSING
         assert d.phase(lane) == _LanePhase.PROCESSING
         assert hits == []  # not yet quiesced (the head is still in flight)
@@ -2075,6 +2174,11 @@ async def test_pause_while_processing_defers_then_mark_ready_cannot_drain(store:
         d.mark_ready(lane)
         assert d.is_dirty(lane) is True
         gate.set()  # head finishes -> terminal transition sees pause_pending -> PAUSED (skip _lane_done)
+        # DELIBERATELY a bare `_wait_until`, NOT `_wait_lane`. IDLE here is the T14 BUG, not a
+        # stranding: it means the terminal transition took `_lane_done` and re-readied a lane the
+        # operator paused. A sweep stand-in would re-ready it too, drain the successor, and destroy
+        # the assertion this test exists for. Never point the stand-in at a site where IDLE is the
+        # failure.
         assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PAUSED)
         assert hits == [lane]  # fired exactly once, on reaching PAUSED
         await _settle()
@@ -2088,7 +2192,19 @@ async def test_pause_while_processing_defers_then_mark_ready_cannot_drain(store:
 
         # Resume: the retained successor drains head-first (FIFO), nothing reordered.
         d.resume_lane(lane)
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        # THE SIBLING `_wait_lane` CANNOT COVER — the 2026-09-09 amendment names this exact site. The
+        # subject is the successor DRAINING; IDLE is only where the lane comes to rest. Terminal IDLE
+        # is also what a stranded claim produces, so `_wait_until(phase == IDLE)` SUCCEEDS and the
+        # record assertion below then fails on a message that was never dispatched. Poll for both.
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: (
+                d.phase(lane) is _LanePhase.IDLE
+                and [r.message_id for r in stub.records] == [mids[0], mids[1]]
+            ),
+            note="IDLE with the retained successor drained head-first",
+        )
         assert [r.message_id for r in stub.records] == [mids[0], mids[1]]
     finally:
         await d.stop()
@@ -2112,7 +2228,7 @@ async def test_resume_cancels_pending_pause_mid_processing_drains_successor(stor
     await d.start()
     try:
         d.mark_ready(lane)
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PROCESSING)
+        await _wait_lane(d, lane, _LanePhase.PROCESSING)
         d.pause_lane(lane)  # lands mid-PROCESSING -> pause_pending set, phase STILL PROCESSING
         assert d.phase(lane) == _LanePhase.PROCESSING
         assert d._states[lane].pause_pending is True
@@ -2123,7 +2239,18 @@ async def test_resume_cancels_pending_pause_mid_processing_drains_successor(stor
         assert d.phase(lane) == _LanePhase.PROCESSING  # still draining the in-flight head
 
         gate.set()  # head resolves -> terminal transition sees pause_pending cleared -> NOT PAUSED
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        # The SIBLING the amendment warned a mechanical `_wait_lane` substitution would leave
+        # uncovered: same shape as the T14-trap test above — the subject is the successor draining,
+        # and a stranded claim lands the lane in the very IDLE a phase-only wait accepts.
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: (
+                d.phase(lane) is _LanePhase.IDLE
+                and [r.message_id for r in stub.records] == [mids[0], mids[1]]
+            ),
+            note="IDLE with the successor drained in the same episode",
+        )
         assert d.paused(lane) is False
         assert hits == []  # on_lane_paused never fired (the pause was cancelled before landing)
         # The successor DRAINED in the same episode (the lane did not wedge), in FIFO order.
@@ -2149,6 +2276,10 @@ async def test_pause_while_claiming_empty_routes_to_paused(store: Any) -> None:
     d = _make(shim, stub, set(), clock=mc, on_lane_paused=hits.append)
     await d.start()
     try:
+        # THIS WHOLE TEST STAYS ON BARE `_wait_until`, ON PURPOSE. Its subject is that an EMPTY claim
+        # with pause_pending routes to PAUSED and NEVER to a claimable IDLE — so IDLE is the defect
+        # here, exactly as in the T14-trap test above. A sweep stand-in fires on IDLE, which means
+        # pointing one at this test would re-ready the lane in the one state that proves the bug.
         d.mark_ready(lane)
         assert await _wait_until(lambda: d.phase(lane) == _LanePhase.CLAIMING)
         d.pause_lane(
@@ -2197,12 +2328,24 @@ async def test_notify_work_does_not_resurrect_paused_lane(store: Any) -> None:
     mc = ManualClock(1000.0)
     stub = RecordingStub(store, mc.time)
     lane = "IB_NW_PAUSE"
-    await _seed(store, lane, [100.0, 101.0])  # drained on start-seed
+    first = await _seed(store, lane, [100.0, 101.0])  # drained on start-seed
     d = _make(store, stub, {lane}, clock=mc)  # in the provider so notify_work names it
     await d.start()
     try:
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        # The start-seed drain is this test's PRECONDITION, so poll the WORK rather than the phase
+        # that proxies for it: terminal IDLE is what a stranded claim produces too, and an `n0`
+        # captured off a strand would silently weaken every assertion below (BACKLOG #1270).
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: (
+                d.phase(lane) is _LanePhase.IDLE
+                and {r.message_id for r in stub.records} >= set(first)
+            ),
+            note="IDLE with the start-seeded rows drained",
+        )
         n0 = len(stub.records)
+        assert n0 == len(first)  # the precondition, now stated rather than assumed
         d.pause_lane(lane)
         assert d.phase(lane) == _LanePhase.PAUSED
         more = await _seed(store, lane, [102.0, 103.0])  # undelivered work behind the pause
@@ -2214,7 +2357,12 @@ async def test_notify_work_does_not_resurrect_paused_lane(store: Any) -> None:
         assert len(stub.records) == n0  # nothing dispatched while paused
 
         d.resume_lane(lane)  # now the retained rows drain, in FIFO order
-        assert await _wait_until(lambda: {r.message_id for r in stub.records} >= set(more))
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: {r.message_id for r in stub.records} >= set(more),
+            note="the rows retained behind the pause drained on resume",
+        )
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
     finally:
@@ -2242,7 +2390,12 @@ async def test_sweep_leaves_paused_lane_halted(store: Any) -> None:
         assert stub.records == []  # never dispatched
 
         d.resume_lane(lane)  # only resume re-arms it
-        assert await _wait_until(lambda: len(stub.records) == 1)
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: len(stub.records) == 1,
+            note="the due head dispatched once resume re-armed the lane",
+        )
         assert d.busy_violations == 0
     finally:
         await d.stop()
@@ -2261,7 +2414,7 @@ async def test_resume_resweeps_backed_off_head_then_drains(store: Any) -> None:
     d = _make(store, stub, {lane}, clock=mc)
     await d.start()
     try:
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)  # needs a claim that RETURNED the head
         nxt = stub.last_retry_until[lane]
         assert nxt > mc.now  # the backoff deadline is in the future
         d.pause_lane(lane)  # PARKED -> PAUSED, park timer cancelled
@@ -2290,8 +2443,14 @@ async def test_resume_resweeps_backed_off_head_then_drains(store: Any) -> None:
         # advance until the `mc.advance(...)` below, so an armed timer cannot fire and disappear
         # underneath the assertion.
         #
-        # NB the sibling park assertion (`_wait_until(phase == PARKED)` then `lane in d._timers`)
-        # needs no such treatment — `_park` sets the phase and arms its timer in ONE synchronous span.
+        # NB the sibling park assertion (`_wait_lane(..., PARKED)` then `lane in d._timers`) needs no
+        # such treatment — `_park` sets the phase and arms its timer in ONE synchronous span.
+        #
+        # AND THIS SITE MUST STAY A BARE `_wait_until` (BACKLOG #1270). The sweep stand-in fires on
+        # exactly `phase is IDLE and lane not in _timer_deadline` — which is the LEGITIMATE
+        # intermediate state this wait polls through, between the empty claim landing and the
+        # requested sweep arming the timer. Pointing the stand-in here would re-ready the lane inside
+        # the race window the test exists to cross.
         assert await _wait_until(
             lambda: d.phase(lane) == _LanePhase.IDLE and lane in d._timer_deadline
         )
@@ -2302,7 +2461,15 @@ async def test_resume_resweeps_backed_off_head_then_drains(store: Any) -> None:
 
         mc.advance((nxt - mc.now) + 1.0)  # backoff elapses -> the sweep-armed timer drains the head
         await _settle()
-        assert await _wait_until(lambda: [r.message_id for r in stub.records] == [mid, mid])
+        # The timer has already fired synchronously inside `advance` and `_settle` has let the claim
+        # start, so the lane is past IDLE by now; the stand-in is here for the RE-CLAIM coming back
+        # EMPTY, which would strand the head with nothing left to re-ready it.
+        await _wait_lane_until(
+            d,
+            lane,
+            lambda: [r.message_id for r in stub.records] == [mid, mid],
+            note="the backed-off head re-claimed and dispatched once the backoff elapsed",
+        )
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
     finally:
@@ -2392,3 +2559,185 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
             assert order == list(range(len(mids)))  # per-lane FIFO on first dispatch, across pauses
     finally:
         await d.stop()
+
+
+def _counters_line(report: str) -> str:
+    """The expiry report's per-dispatcher COUNTERS line, so an assertion about that line cannot be
+    satisfied by the same number appearing in the prose verdict above it."""
+    lines = [ln for ln in report.splitlines() if ln.lstrip().startswith("dispatcher[")]
+    assert len(lines) == 1, f"expected exactly one dispatcher line, got {len(lines)}: {lines!r}"
+    return lines[0]
+
+
+# --- the harness's own instruments (BACKLOG #1270) ------------------------------------------------
+#
+# `_wait_lane_until` and the expiry report's ROUTE line are TEST INFRASTRUCTURE, so nothing else in
+# this file goes red when they break. A stand-in that quietly stopped standing in reads as a flake; a
+# report that dropped a field reads as a dump with nothing unusual in it. Both failures are invisible
+# in exactly the way the defect they were built for is invisible, so they get their own pins.
+
+
+async def test_wait_lane_until_recovers_a_stranded_lane_a_phase_wait_accepts(store: Any) -> None:
+    """BACKLOG #1270. The instrument `_wait_lane` cannot be: a wait whose subject is the WORK.
+
+    THE SHAPE. A 1222-aborted claim comes back EMPTY, T12 drops the lane to terminal IDLE, and the row
+    is never dispatched. A phase wait for IDLE therefore SUCCEEDS — terminal IDLE is what the
+    stranding produces — and the assertion after it fails on a message that was never sent.
+    `_wait_lane` disables its stand-in whenever IDLE is a target, by design, so it cannot cover this.
+
+    BOTH ARMS ARE REQUIRED. Arm 1 is the control: the bare waiter must NOT recover on its own, or arm
+    2 would prove nothing about the stand-in and would pass on a topology that self-heals.
+    """
+    # ARM 1 — CONTROL. The stranding is real and nothing in this topology clears it.
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_STRAND_CTRL"
+    await _seed(store, lane, [100.0])
+    d = _make(_ClaimShim(store, lane, mode="lock_timeout_once"), stub, set(), clock=mc)
+    await d.start()
+    try:
+        d.mark_ready(lane)
+        assert await _wait_until(lambda: d.claim_lock_timeouts >= 1)
+        await _settle()
+        assert _terminal_idle(d, lane), (
+            "the premise failed: the aborted claim did not leave the lane in terminal IDLE, so this"
+            " test is no longer measuring the stranding it names"
+        )
+        assert not await _wait_until(lambda: len(stub.records) == 1, timeout=0.5, required=False), (
+            "the control recovered by itself — arm 2 would then pass without the stand-in doing"
+            " anything at all"
+        )
+        assert stub.records == []  # the row is still pending, with nothing scheduled to touch it
+    finally:
+        await d.stop()
+
+    # ARM 2 — the instrument. Same stranding, and the work predicate is satisfied.
+    mc2 = ManualClock(1000.0)
+    stub2 = RecordingStub(store, mc2.time)
+    lane2 = "IB_STRAND_FIXED"
+    mid = (await _seed(store, lane2, [100.0]))[0]
+    d2 = _make(_ClaimShim(store, lane2, mode="lock_timeout_once"), stub2, set(), clock=mc2)
+    await d2.start()
+    try:
+        d2.mark_ready(lane2)
+        assert await _wait_until(lambda: d2.claim_lock_timeouts >= 1)
+        await _settle()
+        assert _terminal_idle(d2, lane2)
+        with pytest.warns(UserWarning, match="sweep stand-in"):
+            await _wait_lane_until(
+                d2,
+                lane2,
+                lambda: [r.message_id for r in stub2.records] == [mid],
+                note="the stranded head dispatched",
+            )
+        assert _sweep_standins(lane2) == 1, (
+            "the recovery must be COUNTED and capped, not silent — an uncounted stand-in absorbs a"
+            " contention regression as readily as the transient it exists for"
+        )
+        assert d2.busy_violations == 0
+    finally:
+        await d2.stop()
+
+
+async def test_the_sweep_stand_in_cap_refuses_a_second_strand_from_either_waiter(
+    store: Any,
+) -> None:
+    """The cap survives the split into two waiters, and they spend ONE per-lane budget.
+
+    `_MAX_SWEEP_STANDINS` covers the observed rate of an independent, transient 1222. A lane needing
+    more than that is a contention REGRESSION, and absorbing it would turn the instrument into the
+    kind of detector that reports green because it cannot see. Two consecutive aborts per arm: the
+    first is stood in for, the second must fail the test outright.
+    """
+    for lane, waiter in (("IB_CAP_PHASE", "wait_lane"), ("IB_CAP_WORK", "wait_lane_until")):
+        mc = ManualClock(1000.0)
+        stub = RecordingStub(store, mc.time)
+        await _seed(store, lane, [100.0])
+        stub.program(lane, ["RETRY"])  # so the phase arm's target is reachable absent the aborts
+        d = _make(_ClaimShim(store, lane, mode="lock_timeout_once", times=2), stub, set(), clock=mc)
+        await d.start()
+        try:
+            d.mark_ready(lane)
+            assert await _wait_until(_aborts_reached(d, 1))
+            await _settle()
+            with (
+                pytest.warns(UserWarning, match="sweep stand-in"),
+                pytest.raises(_WaitTimeout, match="contention"),
+            ):
+                if waiter == "wait_lane":
+                    await _wait_lane(d, lane, _LanePhase.PARKED)
+                else:
+                    await _wait_lane_until(
+                        d, lane, _anything_dispatched(stub), note="anything dispatched"
+                    )
+            assert _sweep_standins(lane) == 1, (
+                f"{waiter} spent a different budget — the cap is a property of the LANE's contention"
+                " rate, and two budgets let one test spend the allowance twice under one name"
+            )
+        finally:
+            await d.stop()
+
+
+async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any) -> None:
+    """BACKLOG #1270. The 2026-09-09 amendment could not say WHICH empty route fired, and named that
+    an INSTRUMENT gap: PR #670 already built the counter that separates them, and this report simply
+    never printed it. Both arms are required — a line that reads the same either way discriminates
+    nothing, which is the defect the counter was built to end.
+
+    ARM 2 ALSO PINS THE WORDING, not just the number. A zero on this counter means the 1222 route is
+    NOT ESTABLISHED; it does NOT mean there was no contention. The counter covers one route on one
+    backend, so a READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip increments nothing on either
+    backend and stays consistent with a zero. A reader who takes the zero for "no contention" stops
+    looking at the only route this item calls worse.
+    """
+    # ARM 1 — an aborted claim: the 1222 route has evidence and the report must say so.
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_ROUTE_1222"
+    await _seed(store, lane, [100.0])
+    d = _make(_ClaimShim(store, lane, mode="lock_timeout_once"), stub, set(), clock=mc)
+    await d.start()
+    try:
+        d.mark_ready(lane)
+        assert await _wait_until(_aborts_reached(d, 1))
+        await _settle()
+        text = await _expiry_report(lane=lane)
+        # Assert the COUNTERS line specifically, not merely the string somewhere in the dump. The
+        # verdict's own route sentence quotes the number too, so a bare `in text` passes with the
+        # counters line untouched — measured here: this assertion, written that way, went green
+        # against a report the field had been deleted from.
+        counters = _counters_line(text)
+        assert "claim_lock_timeouts=1" in counters, (
+            "the discriminator is not on the counters line, beside the siblings a reader scans it"
+            f" with: {counters!r}"
+        )
+        assert "ESTABLISHED" in text and "NOT ESTABLISHED" not in text
+    finally:
+        await d.stop()
+
+    # `_expiry_report` enumerates EVERY live dispatcher, so arm 1's would ride out inside arm 2's
+    # report and satisfy arm 2's assertions for the wrong reason. Drop it first.
+    _LIVE_DISPATCHERS.clear()
+
+    # ARM 2 — a genuinely empty claim: zero, and the zero must be stated as NOT ESTABLISHED.
+    mc2 = ManualClock(1000.0)
+    stub2 = RecordingStub(store, mc2.time)
+    lane2 = "IB_ROUTE_NOTHING"
+    d2 = _make(store, stub2, set(), clock=mc2)
+    await d2.start()
+    try:
+        d2.mark_ready(lane2)  # no rows seeded: a genuinely empty claim
+        assert await _wait_until(lambda: d2.empty_claims[0] > 0)
+        assert d2.claim_lock_timeouts == 0
+        text2 = await _expiry_report(lane=lane2)
+        assert "claim_lock_timeouts=0" in _counters_line(text2)
+        assert "NOT ESTABLISHED" in text2, (
+            f"the zero is reported without its reading, which is how it becomes 'no contention':"
+            f" {text2}"
+        )
+        assert "READPAST" in text2, (
+            "the route the zero says nothing about must be named beside it, or the dump points the"
+            f" next reader at the one route it can see: {text2}"
+        )
+    finally:
+        await d2.stop()

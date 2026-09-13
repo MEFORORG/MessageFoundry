@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pinned internal-CA trust anchor (#190, ADR 0093).
 
 Covers the pure resolver precedence (connection-ca wins; system/augment/pinned; pinned excludes the

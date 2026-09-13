@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Execute the matrix: probes run in-process; ``PYTEST`` rows run the real suites once via subprocess.
 
 The existing suites are run through a single ``python -m pytest … --junitxml`` subprocess (stdlib

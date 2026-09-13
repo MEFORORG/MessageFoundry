@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """L4b/L5a/L6b self-service account surface: change-password, TOTP MFA lifecycle, WebAuthn passkeys, and session management."""
 
 from __future__ import annotations

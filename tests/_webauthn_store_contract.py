@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-backend store contracts for the WebAuthn credential surface (+ the TOTP backfill).
 
 Deliberately **extra-free** (ADR 0068 §4 / decision 4): this module imports NOTHING from the

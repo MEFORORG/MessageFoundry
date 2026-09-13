@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Connection-scale smoke against a REAL Postgres store with a small pool (B11 wall #2 coverage).
 
 The SQLite CI smoke (test_connscale_smoke.py) cannot cover wall #2 — the pool-wait wall is a no-op on

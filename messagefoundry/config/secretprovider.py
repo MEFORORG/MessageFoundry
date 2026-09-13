@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Pluggable **SecretProvider** seam for connector credentials (ADR 0019 §5, BACKLOG #196 residual).
 
 This is the connector-secret twin of the store-DEK :class:`~messagefoundry.store.keyprovider.KeyProvider`

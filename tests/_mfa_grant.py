@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read a login leg's ``mfa_verified`` grant off its SOURCE (ASVS 6.3.4 / 6.8.4).
 
 Two suites assert on the same fact from different angles -- ``tests/test_mfa_access_gate.py`` pins the

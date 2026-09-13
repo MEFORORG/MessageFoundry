@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """REST transport: an HTTP destination that delivers each transformed payload to a URL.
 
 The **destination** sends one payload (the request body, already produced by the Handler) to a

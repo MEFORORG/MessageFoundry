@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Statement-batching A/B (ADR 0075 Bench B) — profile parsing of the ``batch_modes`` axis, per-arm env
 injection of ``MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS`` (with fusion kept OFF in both arms), and the
 GO/NO-GO verdict logic. The verdict path is the SAME §6.4(b) machinery the fusion A/B uses

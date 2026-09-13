@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0152 Phase 0 — process-local Windows crash-dump suppression + the mlock residency probe.
 
 A Windows Error Reporting dump of the engine is a full plaintext-PHI disclosure written to disk,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Per-tick intake ceilings on the three POLL sources: FILE, REMOTEFILE and DATABASE.
 
 Each source now takes at most ``DEFAULT_MAX_ITEMS_PER_POLL`` items per tick and leaves the rest where

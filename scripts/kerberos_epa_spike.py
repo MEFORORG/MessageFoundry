@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Kerberos/SPNEGO channel-binding (EPA) acceptor-enforcement spike (BACKLOG #98(a)).
 
 **AD-independent prep — a diagnostic, not a shipped feature and NOT a test.** It lives under

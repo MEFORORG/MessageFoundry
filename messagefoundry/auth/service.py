@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """AuthService — orchestrates authentication, sessions, role resolution, and first-run bootstrap.
 
 Pure engine-side code (no FastAPI): the API layer composes it. It ties together the store (users,

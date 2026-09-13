@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A native crash must not report as a test failure, and a test failure must never be retried (#1260).
 
 THE FILED DEFECT IS A NAMING ONE. A segfault kills the interpreter, so pytest returns 139 with no

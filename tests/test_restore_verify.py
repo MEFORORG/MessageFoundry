@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """restore-verify (ADR 0049 AC-5): the key-fingerprint precheck returns a clean KEY_MISMATCH BEFORE any
 decrypt; a matching key (active OR a retired key still in the keyring after a rotation) decrypts + opens
 the embedded store read-only + integrity_check + row-count compare (PASS); a corrupted archive is FAIL.

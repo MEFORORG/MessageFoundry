@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """`messagefoundry init` scaffolds a standalone config repo whose starter config passes `check`."""
 
 from __future__ import annotations

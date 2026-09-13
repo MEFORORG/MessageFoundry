@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Loopback source — a deliberately inert inbound (ADR 0013 Increment 2).
 
 A loopback inbound has **no listening or polling source**: messages arrive *exclusively* via the

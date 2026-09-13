@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0157 Inc 4/5 — the bounded, concurrent, edge-triggered demotion teardown.
 
 Not env-gated: every test here runs on every leg, because the thing being pinned is control flow, not

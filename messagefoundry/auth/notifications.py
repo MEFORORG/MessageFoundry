@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Security-event notification seam (ASVS 6.3.5 / 6.3.7).
 
 A tiny, dependency-free contract the auth layer uses to push an **out-of-band** notice to the affected

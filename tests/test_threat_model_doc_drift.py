@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Structural + numeric drift guard for ``docs/security/THREAT-MODEL.md``.
 
 Two ASVS cells are scored on this document alone, so **the document IS the control**:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Guard for the shipped-artifact line-ending pin (BACKLOG #1442).
 
 THE DEFECT THIS EXISTS FOR. Every blob in this repository stores pure LF, and under

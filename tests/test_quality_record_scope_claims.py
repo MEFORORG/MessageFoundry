@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The quality record's claims about its own instruments must stay true (BACKLOG #1092, #1033).
 
 ``docs/Code_Quality_Standards.md`` scores signals as "machine-checked"/"enforced". Section 4.0

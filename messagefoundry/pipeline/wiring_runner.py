@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Run a code-first wiring :class:`~messagefoundry.config.wiring.Registry` as a **staged pipeline**.
 
 Staged pipeline (ADR 0001, Step A): for each **inbound connection** a listener decodes/parses/

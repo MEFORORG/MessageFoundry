@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The VS Code extension's licence metadata must stay coherent with the repo it ships from.
 
 WHY THIS EXISTS, AND WHY IT IS NOT THE FIX THAT WAS ASKED FOR. BACKLOG #1010 step 6 records that

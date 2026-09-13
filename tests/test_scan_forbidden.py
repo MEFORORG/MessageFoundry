@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The forbidden-content scanner (scripts/security/scan_forbidden.py).
 
 Covers the detection mechanisms — customer/partner/vendor names (word-boundary, with a case-sensitive

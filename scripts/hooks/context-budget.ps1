@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # UserPromptSubmit hook: report how much of THIS SESSION'S CONTEXT WINDOW is spent, and warn a seat
 # before it runs out of room. Reads the tool-call JSON on stdin, opens the transcript the harness
 # names there, and takes the token counts from the last assistant message's usage object.

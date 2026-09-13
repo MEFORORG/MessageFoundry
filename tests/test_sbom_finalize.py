@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for scripts/security/sbom_finalize.py (ADR 0149).
 
 The helper is a standalone CI script (not part of the `messagefoundry` package), so it is loaded by

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the worktree gate PreToolUse hook (scripts/hooks/worktree_gate.ps1).
 
 The gate keeps concurrent Claude Code sessions from BUILDING in the shared primary checkout. It is keyed
@@ -137,12 +137,20 @@ def run_gate(
             "DO NOT read this as a regression in the change under test, and DO NOT rerun until green "
             "without recording that you did: a manufactured green and an earned one are "
             "indistinguishable afterwards.\n"
-            # The child is killed AT the bound, so whatever it emitted first is the only direct
-            # evidence of how far it got. Empty means it never reached its own first write, which
-            # separates a startup hang from a script that started and stalled later. The ubuntu
-            # sibling of this failure aborts with "Stack overflow." rather than hanging, and that
-            # text arrives on these same channels -- so this is also what will say whether the two
-            # arms are one bug or two, which the item currently cannot answer.
+            # EMPTY STDOUT SAYS NOTHING ABOUT HOW FAR THE CHILD GOT, and this comment used to claim
+            # the opposite. The gate writes to stdout in exactly ONE place -- `Write-Deny`, which
+            # exits immediately after -- so silence is the ORDINARY ALLOW RESULT and every other exit
+            # path emits zero bytes. Measured 2026-09-10 by driving the shipped hook: an allow payload
+            # returned exit 0 with 0 bytes on stdout, a deny payload exit 0 with 3,496. This function
+            # says the same thing below, where an empty stdout RETURNS None, which is allow.
+            #
+            # So this does NOT separate a startup hang from a script that started and stalled later.
+            # No field here does, and a reader must not infer one from silence.
+            #
+            # WHAT THE DUMP GENUINELY CARRIES is whatever the child emitted before the kill. The
+            # ubuntu sibling of this failure aborts with "Stack overflow." rather than hanging, and
+            # that text arrives on these same channels -- so a NON-EMPTY dump can still say whether
+            # the two arms are one bug or two, which the item cannot answer today.
             f"CHILD STDOUT before the kill: {exc.stdout!r}\n"
             f"CHILD STDERR before the kill: {exc.stderr!r}\n"
             f"LAUNCHED {_pwsh_identity()}"

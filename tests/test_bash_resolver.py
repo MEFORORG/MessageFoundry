@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The shared bash resolver must reject a wrong interpreter and name a harness fault (BACKLOG #1216).
 
 These are the properties three test modules were missing when they guarded on

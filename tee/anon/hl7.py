@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tee-side HL7 anonymization adapter (ADR 0030 §1) — the standalone **non-parity seam**.
 
 Does the *same thing* as ``messagefoundry/anon/hl7.py`` but through a tiny pure-stdlib splitter, so

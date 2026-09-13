@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fail-closed application-log write guard (BACKLOG #122, ADR 0162).
 
 The control is fail-closed, so a passing test proves nothing on its own — a guard that never fires

@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 
 # ECH egress sidecar (ASVS 12.1.5, ADR 0139)
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """IB_DEMO_ORU — Router (the *router* file of the per-feed **Hybrid** config layout).
 
 The three concerns of one feed are split by role across flat, prefixed files (the loader globs

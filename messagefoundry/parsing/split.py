@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Splitting a single inbound payload into many messages (Corepoint-style "message split").
 
 Two independent splits, both pure (no I/O, no engine state) so they can run on the hot path and be

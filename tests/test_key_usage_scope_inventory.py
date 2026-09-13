@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.1.2: every key-material row in the §4 inventory must document its **usage scope**.
 
 11.1.2 asks that cryptographic keys be inventoried *with the scope of their use* — which key protects

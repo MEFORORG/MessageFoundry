@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Run-scoped copy-on-Send flag carrier (ADR 0104).
 
 A single :class:`~contextvars.ContextVar` that says whether a :class:`~messagefoundry.config.wiring.Send`

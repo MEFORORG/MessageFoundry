@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Email transport: an SMTP destination that delivers each transformed payload as an email (ADR 0029).
 
 The **destination** sends one payload (the email *body*, already produced by the Handler) as a

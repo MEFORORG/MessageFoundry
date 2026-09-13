@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Copy-on-Send (ADR 0104) — the flag-gated snapshot-at-Send-construction behaviour and its propagation.
 
 Verifies AC-1 (a divergent fan-out — mutate the same message between two Sends — delivers per-destination

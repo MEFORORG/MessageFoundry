@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Driver-free unit tests for the store pool pre-warm (Workstream A — failover drain).
 
 No real aioodbc/asyncpg pool or DB driver is needed: a stub pool models ``acquire``/``release`` and

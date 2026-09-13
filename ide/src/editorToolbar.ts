@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Editor-area "build toolbar" for MessageFoundry config files. Two non-intrusive surfaces around the
 // REAL Python editor (Pylance, debugpy, our completion all untouched):
 //   * editor/title actions (Validate / Test Bench / Promote) — declared in package.json, gated on the

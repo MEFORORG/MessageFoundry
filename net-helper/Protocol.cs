@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 MessageFoundry Organization and contributors
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 
 using System;
 using System.Buffers;
@@ -81,7 +81,6 @@ namespace MessageFoundry.NetHelper
                     expected = new[] { "op", "address", "interface", "mask" };
                     break;
                 case "release":
-                case "arp":
                     expected = new[] { "op", "address", "interface" };
                     break;
                 default:

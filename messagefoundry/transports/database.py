@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """DATABASE transport: a SQL destination that runs one parameterized statement per payload.
 
 The **destination** executes the operator-declared ``statement`` (an INSERT/UPDATE or a stored-procedure

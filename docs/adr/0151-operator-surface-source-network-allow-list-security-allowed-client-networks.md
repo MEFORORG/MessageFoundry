@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (C) 2026 MessageFoundry Organization and contributors -->
+<!-- Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors -->
 
 # ADR 0151 — Operator-surface source-network allow-list (`[security].allowed_client_networks`)
 

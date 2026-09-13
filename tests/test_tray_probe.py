@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tokenless engine probes (ADR 0113 §2/§5) — classifiers are pure; probes use httpx MockTransport."""
 
 from __future__ import annotations

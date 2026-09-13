@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 1.2.10 — one spreadsheet formula-injection rule, enforced across every writer in the tree.
 
 The finding this closes was not "the escaping is missing" but "the escaping **diverges**": the engine

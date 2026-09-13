@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """P1b — the inbound "Response Sent" ACK/NAK store layer (ADR 0021 §§1-6).
 
 Covers the PHI fail-safe the design review flagged: a NAK never stores a body; an AA body is stored

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared /ui fixtures for the web console's OWN test suite (Option B, ADR 0065).
 
 This package is separately versioned and tested (its own ``[tool.pytest.ini_options]`` in the

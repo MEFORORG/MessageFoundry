@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the FHIR codec's **typed tier** (ADR 0022): FhirResource (validated model over
 fhir.resources) + FhirPeek.evaluate (FHIRPath). These need the optional ``[fhir]`` extra, so the whole
 module importorskips when it is absent (mirroring the repo's optional-driver test convention) — CI

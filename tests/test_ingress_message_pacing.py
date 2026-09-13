@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 2.4.1 / 15.2.2 — message-rate pacing on the raw-TCP, X12 and HTTP intakes (BACKLOG #1114).
 
 The pacer was built for MLLP and reachable there alone. Measured at ``2b8bccb4``:

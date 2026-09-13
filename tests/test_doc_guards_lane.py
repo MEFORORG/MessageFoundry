@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The docs-only CI lane must be able to FAIL, and its module list must be read from CI (#1262).
 
 The main pytest suite is skipped on a pull request touching only Markdown -- deliberately, and it is
@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -89,9 +87,12 @@ def test_the_citation_guards_are_IN_the_lane(tmp_path: Path) -> None:
     indistinguishable from a guard that was never in it.
     """
     guards = set(_doc_guards())
+    # TWO OF THE THREE ORIGINAL MEMBERS WERE LEDGER TOOLS AND ARE GONE (BACKLOG #1250):
+    # test_dangling_citation_check and test_backlog_citation_check both read the numbered-item
+    # ledger, which left this repository. What remains is the citation guard whose subject is
+    # CLAUDE.md, and it is still introduced by editing prose -- so the rule this test enforces is
+    # unchanged, over a smaller set.
     required = {
-        "tests/test_dangling_citation_check.py",
-        "tests/test_backlog_citation_check.py",
         "tests/test_claude_section_citations.py",
     }
     missing = sorted(required - guards)
@@ -100,76 +101,4 @@ def test_the_citation_guards_are_IN_the_lane(tmp_path: Path) -> None:
         + ", ".join(missing)
         + " -- a citation is introduced by editing prose, so a detector that does not run on a "
         "docs-only PR does not run on the shape it exists for (BACKLOG #1235)."
-    )
-
-
-def test_THE_LANE_CAN_FAIL_on_a_planted_documentation_violation(tmp_path: Path) -> None:
-    """THE ARM THE ITEM WAS LEFT OPEN FOR: prove a docs-only violation turns this lane RED.
-
-    ``tests/test_backlog_status_check.py`` is a DOC_GUARDS member and its subject is the ledger, which
-    is Markdown -- so it is exactly the kind of change the short-circuit skips the main suite for.
-
-    The violation is planted in an ISOLATED COPY of the ledger, never in the real one: this suite runs
-    under ``pytest-xdist`` at ``-n 4 --dist loadfile`` and mutating a tracked file would race three
-    other workers. The checker is invoked against the copy, so the assertion is about the CHECKER's
-    ability to fail rather than about the repository's current state.
-
-    PAIRED, and the pairing is the point: the same checker over the UNMODIFIED copy must exit 0. A
-    checker that failed on everything would satisfy the red arm alone.
-
-    DISCRIMINATION MEASURED DIRECTLY ON THE CHECKER 2026-08-23, three fixtures, one command each --
-    which is stronger evidence than mutating this test file and is recorded because a mutation of the
-    test proved awkward to apply cleanly:
-
-        clean copy of the ledger                 -> exit 0   "OK - 342 items, each declaring one status"
-        + an item heading with NO banner         -> exit 1   the violation, caught
-        + an item heading WITH a valid banner    -> exit 0   "OK - 343 items"
-
-    So the checker distinguishes a real violation from an ordinary addition, and the red arm below is
-    not satisfiable by a checker that simply fails on any edit.
-
-    A NOTE ON HOW THAT WAS ALMOST GOT WRONG, since it is the same class this lane guards against: the
-    FIRST probe of those three fixtures wrote them to ``/tmp`` under Git Bash, where the real path is
-    ``C:\\Users\\...\\Temp``. The files were never created, and the checker returned exit 1 for BOTH
-    the violation and the valid item -- because the FILE DID NOT EXIST. Read without checking, that is
-    a checker that fails on everything. The tell was in its own first line: ``ERROR: --backlog ...``
-    rather than a count."""
-    checker = _ROOT / "scripts" / "docs" / "backlog_status_check.py"
-    ledger = _ROOT / "docs" / "BACKLOG.md"
-    if not (checker.is_file() and ledger.is_file()):
-        pytest.skip("checker or ledger absent from this checkout")
-
-    clean = tmp_path / "BACKLOG.md"
-    clean.write_bytes(ledger.read_bytes())
-
-    def run(target: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell
-            [sys.executable, str(checker), "--backlog", str(target), "--min-items", "1"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(_ROOT),
-        )
-
-    # NEGATIVE CONTROL FIRST. If the unmodified copy already fails, the red below proves nothing.
-    before = run(clean)
-    assert before.returncode == 0, (
-        "the unmodified ledger copy already fails, so this test cannot attribute a red to the "
-        f"planted violation:\n{before.stdout}\n{before.stderr}"
-    )
-
-    # THE VIOLATION: an item heading carrying NO status banner at all. That is the defect
-    # backlog_status_check exists to catch, and it is reachable by a Markdown-only edit.
-    dirty = tmp_path / "DIRTY.md"
-    dirty.write_text(
-        clean.read_text(encoding="utf-8", errors="replace")
-        + "\r\n## 999999. an item with no status banner, planted by a test\r\n\r\nprose\r\n",
-        encoding="utf-8",
-        newline="",
-    )
-    after = run(dirty)
-    assert after.returncode != 0, (
-        "A DOC_GUARDS member did NOT fail on a planted documentation violation. The docs-only lane "
-        "would pass a Markdown-only pull request carrying this defect, which is the whole subject of "
-        f"BACKLOG #1262.\nstdout:\n{after.stdout}\nstderr:\n{after.stderr}"
     )

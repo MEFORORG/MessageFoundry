@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The CI step-margin gate, and the wiring that makes it real (BACKLOG #344).
 
 Two halves, and both are needed. The arithmetic half is easy to get right and easy to test. The

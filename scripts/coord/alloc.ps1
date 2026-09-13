@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Allocate the next free ADR or BACKLOG number, atomically, so two concurrent sessions can never take
-    the same one.
+    Allocate the next free ADR number, atomically, so two concurrent sessions can never take the same one.
+
+    THE BACKLOG KIND IS RETIRED (BACKLOG #1250, #1754). The numbered-item ledger left this
+    repository, so there is no backlog namespace here to allocate into. `-Kind` no longer accepts
+    `backlog`; PowerShell refuses it at parameter binding, before any of this runs.
 
 .DESCRIPTION
     NEVER grep for `max + 1`. Two sessions that both grep pick the SAME number, create DIFFERENTLY-named
@@ -20,15 +23,36 @@
     allocations, and a different clone automatically gets its own registry.
 
     The floor is the max over: the numbers on origin/main, the numbers on EVERY local and remote ref, and
-    every existing allocation. The all-refs term closes the "registry wiped -> re-issue a number that only
-    exists on an unpushed branch" hole. It costs about a second, once per ADR -- not per edit.
+    every existing allocation -- over refs REFRESHED FIRST by a pre-flight `git fetch origin`, because
+    every one of those terms reads refs THIS CLONE ALREADY HAS. The all-refs term closes the "registry
+    wiped -> re-issue a number that only exists on an unpushed branch" hole WITHIN one clone. It does NOT
+    close the same hole ACROSS clones, and reading it as though it did is how BACKLOG #1616 survived: a
+    number a sibling clone pushed is invisible here until something fetches it. That is what the
+    pre-flight block at the single Get-Floor call site does, what -NoFetch turns off, and what REFUSES
+    rather than allocating when the fetch fails -- holes are free, collisions are not.
+    NEITHER KIND SPAWNS A PROCESS PER REF, which is the property
+    that matters: a per-ref sweep is fine at a few hundred refs and unusable at several thousand, and
+    it does not announce the crossing (BACKLOG #1534). What each costs instead, COUNTED with GIT_TRACE
+    on this clone on 2026-09-11 rather than reasoned about, and dated because both are live properties
+    that drift:
+      adr      440 git processes for the whole -ShowFloor run -- ref enumeration, one
+               `cat-file --batch-check`, then one `ls-tree` per DISTINCT docs/adr tree, 434 here.
+               It scales with distinct TREES, not with refs.
+    An earlier version of this line said "TWO git processes" and was wrong twice over: it omitted the
+    ref enumeration, and it described a stage 2 that has since been reverted. The cost is per
+    allocation, not per edit. The retired backlog branch cost 18 and scaled with ledger blobs.
+
+    Both counts PREDATE the pre-flight fetch (2026-09-12), which adds one `config --get` probe on every
+    run and, when origin is reachable, a `fetch` plus git's own children -- 12 invocations for a whole
+    small run over a local remote, measured. The counts for the test fixtures are re-measured and
+    ASSERTED in tests/test_coord_alloc_floor.py, which is the copy to trust: these two are prose.
 
     Numbers are never reclaimed. An abandoned branch holds its number forever and the sequence develops
     holes. That is deliberate: holes are free, collisions are not.
 
     -For NAMES THE OWNER AT BIRTH. IT IS NOT A TRANSFER VERB, AND THE DIFFERENCE IS THE WHOLE ARGUMENT.
     A claim records the tree that will COMMIT the number, and by default that is the tree the allocator
-    runs in. When one seat allocates on another seat's behalf -- a Console reading the backlog and
+    runs in. When one seat allocates on another seat's behalf -- a Manager reading the backlog and
     cutting a brief for a Builder in a different worktree -- the default records the wrong tree, both of
     ledger_check.py's ownership keys miss, and the gate correctly refuses the Builder's commit. Nothing
     can then move the number, so the work is re-filed at a fresh one and the first is burned. Measured
@@ -46,13 +70,16 @@
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
-    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Ledger allocator"
-    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Builder's item" -For C:\path\to\builder\worktree
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Peer's ADR" -For C:\path\to\builder\worktree
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Offline ADR" -NoFetch
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet("adr", "backlog")]
+    # ONE VALUE, AND THAT IS THE HARD STOP (BACKLOG #1754). `-Kind backlog` is refused by parameter
+    # binding, before the script body runs, so there is no path through this file that can issue a
+    # backlog number. Widening this set is how that guarantee would be lost.
+    [ValidateSet("adr")]
     [string]$Kind = "adr",
     [string]$Title,
     # Show what this worktree currently holds, and exit.
@@ -69,7 +96,18 @@ param(
     # number -- instead of the tree this allocator runs in. See the -For discussion in .DESCRIPTION:
     # it names the owner at BIRTH and never moves an existing claim, so it is not the transfer verb
     # docs/LEDGER-GATE.md declined.
-    [string]$For
+    [string]$For,
+    # Skip the pre-flight `git fetch origin` that runs at the Get-Floor call site below.
+    #
+    # THE DEFAULT IS TO FETCH. This switch disables the ONLY instrument that can see a number already
+    # allocated in ANOTHER CLONE: with it set, the floor is computed from whatever refs this clone
+    # happens to hold, so a number taken on a branch nobody here has fetched reads FREE.
+    #
+    # It exists for a genuinely OFFLINE box, not for a slow one. ONE SAMPLE, this clone, 2026-09-12:
+    # the fetch took about 1.4s against a 38-42s backlog sweep, which is inside that sweep's own
+    # run-to-run spread. One remote on one link does not generalise -- a high-latency or authenticating
+    # remote is not 1.4s -- so the claim is that the fetch was free HERE, not that it is free anywhere.
+    [switch]$NoFetch
 )
 
 $ErrorActionPreference = "Stop"
@@ -155,76 +193,85 @@ function Get-Floor {
     # door, so an inspection that moves it is not an inspection -- and the first run of -ShowFloor
     # against a deliberately planted number proved it, ratcheting this clone from 316 to a fabricated
     # 990 that no later run could undo. Reading a value must not be able to corrupt it.
-    param([switch]$Peek)
+    #
+    # -FetchState is the CALLER'S ANSWER TO "was origin consulted", and it is a parameter because this
+    # function cannot know. It prints a note when the ratchet fires, and that note used to end "the
+    # caller already fetched it" unconditionally -- false on both skip paths, which is the same defect
+    # class the note was rewritten to remove: prose asserting a control ran when it did not.
+    param(
+        [switch]$Peek,
+        [ValidateSet("fetched", "skipped-nofetch", "skipped-no-origin")]
+        [string]$FetchState = "fetched"
+    )
 
     $seen = [System.Collections.Generic.List[int]]::new()
     $seen.Add(0)
 
-    if ($Kind -eq "adr") {
-        $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        foreach ($ref in ($refs | Select-Object -Unique)) {
-            $names = & git -C $repo ls-tree --name-only $ref docs/adr/ 2>$null
-            foreach ($n in $names) {
-                if ($n -match 'docs/adr/(\d{4})-') { $seen.Add([int]$Matches[1]) }
-            }
-        }
-    } else {
-        # BACKLOG.md is ONE BIG FILE, so the floor needs its CONTENT, not a filename listing -- but it
-        # still needs EVERY ref, exactly like the adr branch above and exactly as this function's own
-        # header comment promises. Reading only origin/main + HEAD is what re-issued #240-#247 on
-        # 2026-07-30 over numbers ADR 0115 and seven amended ADRs already cite: the items holding
-        # those numbers live on refs the published branch does not carry, so they were invisible here
-        # and the allocator handed the numbers out as free. A number that exists on ANY ref is taken.
-        #
-        # Batched deliberately: ~550 refs share ~190 distinct BACKLOG.md blobs, and a `git show` per
-        # ref costs ~34s on Windows (one process each). Two `git cat-file` processes do it in ~3s.
-        # THE NUMBER SPACE SPANS TWO PATHS. Retiring an item MOVES it verbatim out of docs/BACKLOG.md
-        # and into docs/archive/backlog/BACKLOG-CLOSED.md. Sweeping only the published file would make
-        # every archived number invisible here and free to re-issue -- the #240-#247 shape again, just
-        # sourced from a different blind spot. A number that exists in EITHER file, on ANY ref, is taken.
-        #
-        # The archive is ONE file with a FIXED name on purpose: `cat-file --batch-check` takes a spec
-        # list and cannot glob a directory, so a per-ref `git ls-tree -r` would be needed to discover
-        # archive filenames -- one process per ref, the ~34s cost the batching below exists to avoid.
-        # A fixed second spec keeps the sweep at two processes. Splitting the archive into several
-        # files means adding each one here; an archive file not listed here is not policed.
-        $backlogPaths = @("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md")
+    # ADR NUMBERS ONLY. The backlog branch that used to sit beside this one swept docs/BACKLOG.md
+    # and docs/archive/backlog/BACKLOG-CLOSED.md across every ref; both files left this repository
+    # with the ledger (BACKLOG #1250), so the sweep had no subject and went with them.
+    # Batched for the reason the backlog branch below was batched, and it is the same measurement
+    # taken again on a bigger clone: one `git ls-tree` PER REF is one PROCESS per ref, and this
+    # clone now carries 7,196 of them. Measured 2026-09-11 -- 359.7s for a single -ShowFloor, and
+    # over 17 minutes for the session that reported it, which lost two tool timeouts before its
+    # allocation returned. The refs collapse hard: 7,199 specs resolve to 434 DISTINCT docs/adr
+    # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
+    # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
+    #
+    # A TREE, NOT A BLOB, is the difference from the backlog branch. A directory has no fixed path
+    # to hand `--batch-check`, so the dedupe collapses to distinct TREE ids and each distinct tree
+    # is listed once. The refs are what exploded; the trees never were.
+    #
+    # THE SAVING IS THE DEDUPE, NOT A CLEVERER READER. 7,199 specs collapse to 434 trees, which is
+    # a 16x cut in processes and the whole of the fix. Two spellings of stage 2 that tried to go
+    # further were BUILT, MEASURED AND REVERTED, and both failed the same way -- silently, by
+    # losing a name, which is a number that then reads as FREE:
+    #
+    #   `git rev-list --objects` dedupes by OBJECT, so two ADR files with byte-identical content
+    #   print ONE of their two names. Measured: `0150-alpha.md` and `0151-beta.md` sharing a blob
+    #   printed one name, which would re-issue 0151 over a live ADR.
+    #
+    #   Scanning the RAW TREE BYTES through the pipeline, anchored on `(?:100644|100755) `, broke
+    #   TWICE. (a) A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native
+    #   output with [Console]::OutputEncoding -- the OEM console code page on Windows. Under a
+    #   DBCS page a lead byte at the end of one entry's id CONSUMES the `1` that starts the next
+    #   entry's `100644`, and that entry vanishes. Measured on this clone: cp932 lost 7 of 181
+    #   numbers, cp936/949/950 lost 17, while utf-8 and cp1252 lost none. End to end on a fixture
+    #   with `chcp` set before pwsh started, the floor fell from 999 to 100 and the next
+    #   allocation would have landed on a live ADR. The comment that shipped it argued no
+    #   multi-byte decode could swallow an ASCII byte; that is true of UTF-8 and false of DBCS.
+    #   (b) The mode literal admitted regular files only, where `ls-tree` reports EVERY mode, so
+    #   an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to
+    #   its replacement (120000) became invisible.
+    #
+    # SO STAGE 2 IS `ls-tree` PER DISTINCT TREE, and it is the boring spelling on purpose. It
+    # emits TEXT that git already decoded, so no console code page can touch it, and it reports
+    # every mode, so no entry shape can hide from it. It costs 434 processes here instead of one
+    # -- about 40s against the 5s the byte scan managed and the 359.7s this branch started at.
+    # That trade is deliberate: the failures it buys out are both SILENT, and this script exists
+    # to prevent exactly the collision they cause.
+    #
+    # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
+    # Two implementations of one question drift; change one and read the other.
+    $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
+    $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
 
-        $refs = @("origin/main", "HEAD") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        $specs = foreach ($r in ($refs | Select-Object -Unique)) {
-            foreach ($p in $backlogPaths) { "${r}:${p}" }
-        }
+    $trees = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+        $p = "$line".Split(' ')
+        if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
+    }
 
-        $oids = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
-            $p = "$line".Split(' ')
-            if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
-        }
-
-        # MULTILINE IS LOAD-BEARING, and its absence was a silent hole. `[regex]'^...'` anchors at the
-        # start of the STRING, not of each line. The all-refs term below feeds it one line at a time
-        # (cat-file output through the pipeline), so it matched there and looked correct -- but the
-        # working-tree term feeds it `Get-Content -Raw`, one string starting "# Backlog", where `^`
-        # could never match. Measured on this tree: 0 of 277 headings found without Multiline, 277
-        # with. So the term that exists to catch a number written but committed NOWHERE has been
-        # finding nothing since it was written, and the all-refs term hid it by covering every number
-        # that had been committed somewhere -- i.e. every case except the one this term is for.
-        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
-        if ($oids.Count -gt 0) {
-            foreach ($line in (($oids -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
-                $m = $rx.Match("$line")
-                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
-            }
-        }
-        # Working-tree term: catches a number written to a file but committed nowhere. Both paths, for
-        # the same reason -- an item drafted straight into the archive is still a claim on its number.
-        foreach ($p in $backlogPaths) {
-            $wip = Join-Path $repo $p
-            if (Test-Path $wip) {
-                foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
-            }
+    # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+    # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
+    $rx = [regex]::new('^(\d{4})-')
+    foreach ($t in $trees) {
+        foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
+            $m = $rx.Match("$n")
+            if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
         }
     }
+
 
     foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
         $n = 0
@@ -242,7 +289,14 @@ function Get-Floor {
     # good enough: persist the high-water mark and never go below it.
     #
     # SAFE:      `git fetch origin --prune` -- prunes only refs/remotes/origin/*, which is not where the
-    #            high numbers live. It is also what you SHOULD run before allocating.
+    #            high numbers live.
+    # NOT ADVICE: this table says which CLEANUP operations break the ratchet, and nothing more. It used
+    #            to end by telling you to run that same line before allocating, which is advice for the
+    #            ALLOCATOR bolted onto a table about cleanup. The caller fetches for you by default --
+    #            see the pre-flight block at the single Get-Floor call site -- and it passes --no-prune
+    #            EXPLICITLY, because a fetch there exists to ADD refs, which can only RAISE the floor,
+    #            while a prune only DELETES refs, which can only lower one and removes witnesses.
+    #            Explicitly, not by omission: `fetch.prune` turns pruning on from CONFIG.
     # DANGEROUS: `git remote prune <name>` / `git remote remove <name>` for a non-origin remote,
     #            deleting refs/<vault-ish>/*, or an aggressive `gc` / `reflog expire` that drops
     #            unreachable objects. Those are what this ratchet defends against.
@@ -261,83 +315,272 @@ function Get-Floor {
     $previous = 0
     if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
 
+    # NAME THE CAUSE, AND DO NOT SEND THE OPERATOR AFTER A REMEDY THAT CANNOT WORK. This used to end
+    # "re-fetch them before trusting any number-space reasoning here", which is wrong twice over now:
+    # the caller usually HAS fetched origin by the time this prints, and the refs carrying those higher
+    # numbers are NON-ORIGIN remote-tracking refs, which no fetch of origin can restore. What the caller
+    # actually did is -FetchState's business, not this block's guesswork -- there are three answers and
+    # the last line says which one applies.
     if ($previous -gt $computed) {
         Write-Host "NOTE: computed $Kind floor $computed is BELOW the recorded high-water $previous." -ForegroundColor Yellow
-        Write-Host "      Using $previous. Refs that carried the higher numbers are missing from this clone;" -ForegroundColor Yellow
-        Write-Host "      re-fetch them before trusting any number-space reasoning here." -ForegroundColor Yellow
+        Write-Host "      Using $previous, so the gap is already covered -- this is the ratchet working," -ForegroundColor Yellow
+        Write-Host "      not something to act on. The refs that carried the higher numbers are gone from" -ForegroundColor Yellow
+        Write-Host "      this clone: a non-origin remote was deleted, an aggressive gc or reflog expire" -ForegroundColor Yellow
+        Write-Host "      dropped unreachable objects, or this clone never had them. Fetching origin does" -ForegroundColor Yellow
+        Write-Host "      not restore any of those." -ForegroundColor Yellow
+        switch ($FetchState) {
+            "fetched" {
+                Write-Host "      Origin WAS fetched before this was computed, so a stale origin is not a cause." -ForegroundColor Yellow
+            }
+            "skipped-nofetch" {
+                Write-Host "      Origin was NOT fetched: -NoFetch was passed, so a number a sibling clone" -ForegroundColor Yellow
+                Write-Host "      pushed is missing too -- and that one a fetch WOULD find. Re-run without it." -ForegroundColor Yellow
+            }
+            "skipped-no-origin" {
+                Write-Host "      Origin was NOT fetched: this clone has no usable 'origin' url, so nothing" -ForegroundColor Yellow
+                Write-Host "      here has consulted any remote at all." -ForegroundColor Yellow
+            }
+        }
     }
     $floor = [Math]::Max($computed, $previous)
     if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
 
-    # TWO NUMBERS, NOT ONE -- and conflating them is what bricked this script on 2026-08-03.
+    # ONE NUMBER NOW. `Floor` is the whole observed set's maximum -- "what must I not re-issue" --
+    # so it includes every number seen anywhere.
     #
-    # `Floor` is the whole observed set's maximum. It answers "what must I not re-issue", so it MUST
-    # include public numbers.
+    # `SubFloorMax` used to ride alongside it: the maximum BELOW the #1000 partition, answering how
+    # much runway the maintainer-internal sequence had left. The partition, its warning and its
+    # ratchet all belonged to the backlog kind and went with it (BACKLOG #1250, #1754). Returning
+    # one number for two questions is what bricked this script on 2026-08-03; there is now one
+    # question, so do not add a second field back without a reader for it.
     #
-    # `SubFloorMax` is the maximum BELOW the partition. It answers a different question -- "how much
-    # runway does the maintainer-internal sequence have left" -- and it must EXCLUDE public numbers,
-    # because a public item at or above the boundary is the design working, not a breach.
-    #
-    # Returning one number for both is not a style problem. The residual detector below read `Floor`,
-    # so the first legitimate public item filed at #1000 made the guard throw on every subsequent
-    # backlog allocation, repo-wide, until it was patched. The guard fired on correct input.
-    #
-    # `[int]` on both: Measure-Object hands back a [double], and the 'D4' format specifier is
-    # integer-only and throws on one.
+    # `[int]`: Measure-Object hands back a [double], and the 'D4' format specifier is integer-only
+    # and throws on one.
     [pscustomobject]@{
-        Floor       = [int]$floor
-        SubFloorMax = [int](($seen | Where-Object { $_ -lt $PublicBacklogFloor } | Measure-Object -Maximum).Maximum)
+        Floor = [int]$floor
     }
 }
 
-# THE FLOOR IS DEFINED ONCE, IN THE GATE, AND READ HERE.
+# THE #1000 PARTITION IS GONE, AND SO IS THE CONSTANT THIS BLOCK USED TO READ.
 #
-# Two integers that must agree is the next place this rots: the allocator would go on emitting numbers
-# the gate refuses, and the tool would be sending people straight into a blocked commit while insisting
-# it had given them a valid number. So parse it out of ledger_check.py rather than restating it, and
-# REFUSE to allocate a backlog number if it cannot be read -- guessing a floor the gate will not honour
-# is the failure this whole partition exists to prevent, reintroduced by its own tooling.
-$gateFile = Join-Path $repo "scripts/hooks/ledger_check.py"
-$PublicBacklogFloor = $null
-if (Test-Path $gateFile) {
-    # The optional `(?::[^=]+)?` tolerates a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000`
-    # is idiomatic in a mypy-strict codebase and would otherwise fail to match -- silently disarming
-    # every backlog allocation as the result of an ordinary tidy-up. tests/test_ledger_check.py pins
-    # this contract so the break lands in CI on whoever edits the constant, not on a session days later.
-    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)')
-    if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
+# This script used to regex `PUBLIC_BACKLOG_FLOOR` out of scripts/hooks/ledger_check.py so the floor
+# was defined exactly once, and refuse to allocate a backlog number if it could not be read. The
+# ledger left this repository (BACKLOG #1250) and the constant went with the gate half that used it
+# (BACKLOG #1754), so there is nothing to read and no backlog number to guard.
+#
+# DO NOT RESTORE A DEFAULT HERE IF SOMETHING LATER WANTS A FLOOR. A missing constant read as a
+# number would be the exact failure the old block refused: a floor the gate will not honour,
+# guessed by the tool that hands out the numbers.
+
+# PRE-FLIGHT FETCH -- THE ONLY INSTRUMENT THAT CAN SEE A NUMBER ALLOCATED IN ANOTHER CLONE.
+#
+# Every term in Get-Floor reads refs THIS CLONE ALREADY HAS, and until this block landed the script
+# executed zero fetches. So when clone B has not fetched since clone A pushed a branch, A's ref is
+# simply absent here: the number reads FREE, B allocates it, and B's ledger gate then passes
+# CORRECTLY -- the number genuinely IS allocated in B's own registry. Two machines, one number, every
+# gate green on both sides, and nothing anywhere reporting it. That happened on 2026-09-11: PR 1061
+# wrote "## 1546." while #1546 was allocated and claimed to PR 1060.
+#
+# WHAT IT DOES NOT CLOSE, stated here because the fix reads as total and is not. A fetch can only
+# see what has been PUSHED, so two clones that BOTH fetch cleanly still take one number when the
+# first has not pushed yet. Measured 2026-09-12: A allocated 1000 and pushed nothing, B fetched
+# successfully and allocated 1000. This block narrows the exposure from "since this clone last
+# fetched" to "since the sibling pushed". Closing the remainder needs a registry the clones share,
+# which is not this block and is recorded as open in BACKLOG #1616.
+#
+# WHERE THIS SITS IS PART OF THE FIX. Four reasons, each load-bearing on its own:
+#   * OUTSIDE Get-Floor. That function's -Peek comment says "Reading a value must not be able to
+#     corrupt it", and network I/O belongs to the caller.
+#   * AT THE ONE CALL SITE. Get-Floor has exactly one, so fetching here provably precedes BOTH of its
+#     ref enumerations without touching either arm.
+#   * BEFORE the -ShowFloor block below, whose own comment states the invariant that both checks are
+#     evaluated ONCE so -ShowFloor and a real allocation cannot disagree. A fetch that ran only on a
+#     real allocation would break exactly that, and -ShowFloor would preview a floor the allocator
+#     would not use. (Spelled "the -ShowFloor block" and not with its `if` keyword on purpose:
+#     tests/test_ledger_check.py locates that block with `src.index`, a FIRST-match instrument for a
+#     question about the block itself, so writing the opening line verbatim in a comment ABOVE it
+#     moves the index and reds a guard that has nothing to do with this change. Measured here.)
+#   * AFTER the -List early return. -List reads the local registry only; it stays offline and fast.
+#
+# EVERY FLAG AND -c BELOW IS THERE BECAUSE CONFIG CAN CHANGE THE VERB UNDERNEATH IT. `git fetch
+# origin` is not one operation; it is whatever this clone's config says it is. Each of these was
+# measured on a fixture, one variable at a time, against a control arm, 2026-09-12:
+#
+#   --no-prune      EXPLICITLY, not by leaving --prune off. `fetch.prune` and `remote.<name>.prune`
+#                   turn pruning on from CONFIG, in any scope, and the earlier version of this block
+#                   claimed "no --prune" while honouring both. A fetch here exists to ADD refs, and
+#                   an added ref can only RAISE the floor; a prune only DELETES refs, so it can only
+#                   LOWER one and it removes witnesses. MEASURED with fetch.prune=true: a doomed
+#                   remote-tracking ref carrying #9999 was deleted by the pre-flight fetch itself and
+#                   the floor fell to 77 -- the allocator destroying its own evidence mid-run. The
+#                   control arm, same fixture without the config, kept the ref and the number. That
+#                   is the harm this flag now prevents outright, and the earlier measurement of the
+#                   same shape by hand: one `git fetch origin --prune` on this clone deleted six
+#                   refs, among them origin/gh-readonly-queue/main/pr-1060-..., a queue branch for
+#                   one of the two PRs in the #1546 collision -- and a queue branch carries a row.
+#   the refspec     +refs/heads/*:refs/remotes/origin/* WRITTEN OUT. It is the DEFAULT VALUE of
+#                   remote.origin.fetch, not a property of the verb, and `clone --single-branch`
+#                   (which --depth implies) and actions/checkout both narrow it to main alone.
+#                   MEASURED with the narrow value: the fetch RAN, exited 0, printed nothing, and the
+#                   floor stayed stale at 77 while the remote carried 4321 -- exactly the `fetch
+#                   origin main` behaviour this block rejects, reached by config instead of by
+#                   argument, and indistinguishable from a healthy run. Both #1546 items lived on
+#                   UNMERGED refs/remotes/origin/claude/* refs, so main alone sees neither.
+#   gc/maintenance  a fetch spawns `git maintenance run --auto`, and Get-Floor's DANGEROUS table
+#                   names an aggressive gc as one of the things the ratchet defends against. No floor
+#                   term reads an unreachable object, so this is belt and not brace -- but the
+#                   allocator should not be the thing that starts the operation the file warns about.
+#   credentials     with GIT_TERMINAL_PROMPT=0 below. A credential prompt has no timeout, and a HANG
+#                   is the one outcome neither branch here handles: a Builder gets ONE turn, and a
+#                   hung fetch spends it with nothing pushed. These two cover git's own terminal
+#                   prompt and Git Credential Manager's interactive mode. A GUI askpass helper is a
+#                   path neither covers, so this NARROWS the hazard; it does not close it.
+#
+# --all IS STILL REFUSED. It fails closed on ANY dead remote, including remotes that have nothing to
+# do with the ledger, which manufactures deadlocks rather than safety.
+#
+# NO ORIGIN IS NOT A FAILURE AND MUST NOT FAIL CLOSED. Measured 2026-09-12: with origin absent,
+# `git config --get remote.origin.url` exits 1 with no output, where an unguarded `git fetch origin`
+# exits 128 with a fatal. None of the 10 fixtures that predate this block adds a remote, so an
+# unguarded fail-closed fetch would refuse every one of them.
+#
+# BUT "NO ORIGIN" IS NOT "NO SHARED UPSTREAM", so the skip WARNS instead of going quiet. A clone made
+# with `clone -o gh` has an upstream under another name and is fully exposed to the #1546 shape.
+# MEASURED 2026-09-12 with the upstream named `upstream`: a stale floor, exit 0, and not one word of
+# output -- the deliberate version of the same risk, -NoFetch, prints five lines. A skip that is
+# silent because its premise says there is nothing to be stale against is that premise being wrong.
+#
+# A NETWORK FAILURE FAILS CLOSED AND ALLOCATES NOTHING, and this is the decisive part. What this
+# replaces is a PRINTED WARNING that was already in this script when #1546 collided -- and in the
+# never-fetched shape it cannot even fire: the missing number is absent from the computed floor AND
+# from the watermark, so the ratchet's `$previous -gt $computed` is false and nothing prints. A
+# control that cannot reach the case is not a weak control, it is none, and allocate-and-shout would
+# reinstall exactly that -- the compensating-control-resting-on-a-false-premise defect CLAUDE.md
+# section 11 and SDS-3.7 forbid. The header above already settles the trade: holes are free,
+# collisions are not. The throw lands before the allocation loop, so there is no partial state.
+#
+# IT RETRIES BEFORE IT REFUSES, because a failed fetch is not evidence of a broken remote. `git
+# fetch` takes a per-ref lock, so two allocations racing in ONE clone -- the ordinary case on this
+# fleet, where the registry shows one allocation about every 36s against a ~38s sweep -- make the
+# loser exit 1 with "cannot lock ref" while the winner brings the refs in. MEASURED 2026-09-12: four
+# concurrent -ShowFloor runs, two refused; and a held ref lock released after 2.5s refused outright
+# before this loop existed and succeeds with it. The retry is deliberately NOT conditioned on which
+# error came back: an error list is always missing one (SDS-3.6), and seconds are cheap against a
+# sweep measured in tens of them. A refusal that survives three attempts is worth believing.
+$fetchAttempts = 3
+$fetchRetryPause = 2
+$fetchState = "fetched"
+if ($NoFetch) {
+    $fetchState = "skipped-nofetch"
+    Write-Host "WARNING: -NoFetch. The floor below came from refs this clone ALREADY HAD." -ForegroundColor Yellow
+    Write-Host "         A number allocated in another clone, on a branch nobody here has fetched," -ForegroundColor Yellow
+    Write-Host "         reads FREE -- and the ledger gate will then pass on BOTH sides, because each" -ForegroundColor Yellow
+    Write-Host "         registry genuinely holds its own claim. Nothing downstream reports it." -ForegroundColor Yellow
+    Write-Host "         Say in the PR why you skipped the fetch." -ForegroundColor Yellow
+}
+else {
+    # THE EXIT CODE IS THE WITNESS, NOT `$?`. Same rule the git grep loop records above: `$?` is False
+    # after ANY non-zero native exit and cannot tell a fatal from a legitimate 1. -1 is a NEVER-RAN
+    # sentinel, because a command that never starts sets no exit code at all and a stale value from an
+    # earlier call would read as success.
+    #
+    # $ErrorActionPreference is pinned to Continue across this scope, and restored before anything
+    # throws. `2>&1` on a native command yields ErrorRecord objects, so on a host with
+    # $PSNativeCommandUseErrorActionPreference true the script-level "Stop" turns git's first stderr
+    # line into a generic NativeCommandExitException and the actionable message below never prints.
+    $fetchFailure = $null
+    $previousEap = $ErrorActionPreference
+    $hadPrompt = Test-Path Env:\GIT_TERMINAL_PROMPT
+    $previousPrompt = $env:GIT_TERMINAL_PROMPT
+    $ErrorActionPreference = "Continue"
+    $env:GIT_TERMINAL_PROMPT = "0"
+    try {
+        $global:LASTEXITCODE = -1
+        $originUrl = & git -C $repo config --get remote.origin.url 2>&1
+        $originCode = $LASTEXITCODE
+        if ($originCode -eq 0 -and -not [string]::IsNullOrWhiteSpace("$originUrl")) {
+            $fetchArgs = @(
+                "-C", $repo,
+                "-c", "gc.auto=0",
+                "-c", "maintenance.auto=false",
+                "-c", "credential.interactive=false",
+                "fetch", "--no-prune", "origin", "+refs/heads/*:refs/remotes/origin/*"
+            )
+            for ($attempt = 1; $attempt -le $fetchAttempts; $attempt++) {
+                $global:LASTEXITCODE = -1
+                $fetchOut = & git @fetchArgs 2>&1
+                $fetchCode = $LASTEXITCODE
+                if ($fetchCode -eq 0) {
+                    $fetchFailure = $null
+                    break
+                }
+                $fetchFailure = [pscustomobject]@{
+                    Attempts = $attempt
+                    Code     = $fetchCode
+                    Detail   = ((@($fetchOut) | ForEach-Object { "$_" }) -join "`n  ").Trim()
+                }
+                if ($attempt -lt $fetchAttempts) { Start-Sleep -Seconds $fetchRetryPause }
+            }
+        }
+        else {
+            $fetchState = "skipped-no-origin"
+            $global:LASTEXITCODE = -1
+            $remotes = @((& git -C $repo remote 2>&1) | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+            if ($LASTEXITCODE -eq 0 -and $remotes.Count -gt 0) {
+                Write-Host "WARNING: no usable 'origin' url, so NOTHING WAS FETCHED -- but this clone does have" -ForegroundColor Yellow
+                Write-Host "         remotes: $($remotes -join ', '). The pre-flight fetch names 'origin' and only" -ForegroundColor Yellow
+                Write-Host "         'origin', so the floor below came from refs this clone already had. A number" -ForegroundColor Yellow
+                Write-Host "         allocated in another clone and pushed to that upstream reads FREE here, and" -ForegroundColor Yellow
+                Write-Host "         the ledger gate then passes on BOTH sides. Fetch it yourself, or set it as" -ForegroundColor Yellow
+                Write-Host "         'origin', before trusting this number." -ForegroundColor Yellow
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previousEap
+        if ($hadPrompt) { $env:GIT_TERMINAL_PROMPT = $previousPrompt }
+        else { Remove-Item Env:\GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue }
+    }
+    if ($null -ne $fetchFailure) {
+        # Named for what the run was actually going to do. -ShowFloor allocates nothing, and telling
+        # its operator we refused an allocation misdescribes the refusal in its first four words.
+        # Spelled with a ternary rather than an `if`, for the `src.index` reason recorded above.
+        $refusing = $ShowFloor ? "REFUSING TO REPORT A FLOOR" : "REFUSING TO ALLOCATE"
+        throw @"
+$($refusing): the pre-flight 'git fetch origin' failed $($fetchFailure.Attempts) times, so the floor
+could not be computed against the refs this clone is missing. NOTHING WAS ALLOCATED.
+
+DO THIS: run it again -- a concurrent git process in any worktree of this clone fails a fetch on a
+ref lock, and that clears on its own. If it keeps failing, check that the remote is reachable. On a
+genuinely offline box pass -NoFetch, and say in the PR why the number was allocated without checking
+the remote.
+
+Last attempt: exit $($fetchFailure.Code) (-1 means git never ran). Git said:
+  $($fetchFailure.Detail)
+
+WHY THIS REFUSES RATHER THAN WARNING: allocate-and-shout was already the control here on 2026-09-11,
+when PR 1061 wrote "## 1546." over a number claimed to PR 1060. Both registries were right, both
+gates passed, and nothing reported the collision. Holes are free, collisions are not.
+"@
+    }
 }
 
-$measured = Get-Floor -Peek:$ShowFloor
+$measured = Get-Floor -Peek:$ShowFloor -FetchState $fetchState
 $observed = $measured.Floor
-$subFloorMax = $measured.SubFloorMax
 
-# Both checks are evaluated ONCE, here, so -ShowFloor and a real allocation cannot disagree. They did:
-# -ShowFloor returned 19 lines before the guard, so it printed a next number while every real
-# allocation threw. An inspector that does not run the checks it previews reports a number the tool
-# will refuse to issue -- it answers the adjacent question, which is the failure CLAUDE.md §11 names.
-$warnAt = if ($null -ne $PublicBacklogFloor) { [int]($PublicBacklogFloor * 0.9) } else { 0 }
-$residualWarning = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($subFloorMax -ge $warnAt)
-
-# THE BOUNDARY RATCHET -- the one refusal this data can actually justify.
+# THE WARNING AND THE RATCHET BOTH BELONGED TO THE BACKLOG KIND, AND BOTH ARE GONE.
 #
-# PUBLIC_BACKLOG_FLOOR is a constant in a source file, so it can be LOWERED: a bad revert, a merge
-# resolved the wrong way, a tidy-up. Lower it to 900 and ledger_check.py cheerfully accepts a new
-# public #900 sitting on top of an internal #900 -- with a GREEN pre-commit and a GREEN CI, because a
-# runner has no memory of yesterday's value and the constant is the only thing either consults.
+# What stood here: a residual warning when the highest number below #1000 reached 90% of the
+# partition, and a `.boundary-highwater` ratchet that refused to allocate when PUBLIC_BACKLOG_FLOOR
+# was LOWERED beneath a value this clone had already allocated against. Neither has a subject now
+# that the ledger and the constant have left the repository (BACKLOG #1250, #1754).
 #
-# A ratchet OUTSIDE the constant is the only instrument that can see this, and unlike the boundary
-# check it replaces, it is genuinely reachable: it triggers on an observable local fact (the value
-# moved down) rather than on an integer whose provenance cannot be recovered.
+# THE ORIGINAL LESSON STILL BINDS AND IS KEPT ON PURPOSE: a check must be evaluated ONCE so
+# -ShowFloor and a real allocation cannot disagree. They did once -- -ShowFloor printed a next
+# number while every real allocation threw, because the inspector did not run the checks it
+# previewed. Any guard added here later must sit above this line, not inside one branch.
 #
-# THREE QUANTITIES, THREE PURPOSES -- keep them strictly separate:
-#   $observed     (union max)      -> $start / the next number, ONLY
-#   $subFloorMax  (below boundary) -> the WARNING, ONLY
-#   $boundarySeen (highest floor)  -> the REFUSAL, ONLY
-$boundaryMark = Join-Path $alloc ".boundary-highwater"
-$boundarySeen = 0
-if (Test-Path $boundaryMark) { [void][int]::TryParse((Get-Content $boundaryMark -Raw).Trim(), [ref]$boundarySeen) }
-$boundaryLowered = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($PublicBacklogFloor -lt $boundarySeen)
+# An abandoned `.boundary-highwater` file may still sit beside the registry in an existing clone.
+# Nothing reads it any more; it is inert, not load-bearing.
 
 if ($ShowFloor) {
     # Name the SOURCES, not just the number. "Which files did this sweep actually read" is the
@@ -345,109 +588,22 @@ if ($ShowFloor) {
     # 353 looks identical whether it swept one path or two.
     Write-Host "kind     : $Kind"
     Write-Host "floor    : $observed"
-    if ($Kind -eq "backlog") {
-        Write-Host "paths    : docs/BACKLOG.md, docs/archive/backlog/BACKLOG-CLOSED.md"
-        Write-Host "sub-floor: $subFloorMax  (highest number BELOW the #$PublicBacklogFloor boundary; over-states the internal high-water)"
-        Write-Host "boundary : $PublicBacklogFloor  (highest ever seen on this clone: $boundarySeen)"
-        Write-Host "next     : $([Math]::Max($observed, $PublicBacklogFloor - 1) + 1)  (clamped to >= $PublicBacklogFloor)"
-    } else {
-        Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
-        Write-Host "next     : $($observed + 1)"
-    }
+    Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
+    Write-Host "next     : $($observed + 1)"
     Write-Host "watermark: $(Join-Path $alloc '.floor-highwater')"
-    if ($boundaryLowered) {
-        Write-Host ""
-        Write-Host "WOULD REFUSE: PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor but this clone has allocated against $boundarySeen." -ForegroundColor Red
-    }
-    if ($residualWarning) {
-        Write-Host ""
-        Write-Host "WOULD WARN: highest sub-boundary number $subFloorMax has reached 90% of #$PublicBacklogFloor." -ForegroundColor Yellow
-    }
     Write-Host ""
     Write-Host "Read-only: nothing was allocated." -ForegroundColor DarkGray
     return
 }
 
-if ($Kind -eq "backlog") {
-    if ($null -eq $PublicBacklogFloor) {
-        throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
-    }
+# NO CLAMP. The backlog kind clamped its start to the #1000 partition; ADR numbers have never had
+# a floor beyond the union maximum, and that maximum is what makes "never hand out a number that
+# exists anywhere" true.
+$start = $observed + 1
 
-    # WHY THE OLD "INTERNAL REACHED THE BOUNDARY" REFUSAL IS GONE.
-    #
-    # It compared the WHOLE-SET maximum against the floor, so the first legitimate public item filed at
-    # #1000 (BACKLOG #1000, 2026-08-03) made every subsequent backlog allocation throw, repo-wide. It
-    # was not detecting a breach; it was detecting the partition being used exactly as designed.
-    #
-    # It is NOT that this clone cannot see internal numbers -- that was suspected and is false.
-    # Measured 2026-08-03, while the vault-ish refs were still here: 490 present, 489 carrying
-    # docs/BACKLOG.md, and 67 item numbers living ONLY there, including the #242-#246 band ADR 0115
-    # cites. The sweep did reach them, and that is exactly why the floor was trustworthy. (Those 489
-    # refs were DELETED on 2026-08-05 -- docs/LEDGER-GATE.md has the provenance and the manifest's
-    # whereabouts -- so this clone is now case (c) below. Floor 1032 and sub-floor max 353 were measured
-    # unchanged across the deletion, for reason (d).)
-    #
-    # The premise fails for four other reasons, any ONE of them fatal:
-    #   (a) NO PROVENANCE. An integer does not say which sequence issued it. "Internal reached the
-    #       boundary" and "public was legitimately allocated at the boundary" are the SAME observation
-    #       -- which is why #1000, on origin/main and holding a registry claim, read as a breach.
-    #   (b) FOSSIL. The newest vault-ish ref was 2026-07-26 and the only configured refspec is
-    #       +refs/heads/*:refs/remotes/origin/*, so nothing could advance them. The partition landed
-    #       eight days later. (Measured: those refs said 314 while the real vault was at 315 -- the
-    #       fossil was already stale by one item.)
-    #   (c) CLONE-LOCAL. A fresh public clone has zero vault refs, so the term is absent entirely --
-    #       and since the 2026-08-05 deletion, so does this one.
-    #   (d) MASKED. Internal 314 < public 353, so the internal term never determined the sub-boundary
-    #       maximum -- which is why deleting those refs moved neither number.
-    #
-    # So the refusal moved to a trigger that IS observable and IS reachable -- the boundary ratchet
-    # above, which fires when PUBLIC_BACKLOG_FLOOR is lowered beneath a value this clone has already
-    # allocated against. What remains here is a warning only.
-    #
-    # $subFloorMax is "the highest number below the boundary", NOT "the internal maximum". It includes
-    # public pre-partition numbers, so it deliberately OVER-states the internal high-water: it warns
-    # early rather than late, which is the safe direction for a runway indicator.
-    if ($boundaryLowered) {
-        throw @"
-REFUSING TO ALLOCATE. PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor, but this clone has already
-allocated against a boundary of $boundarySeen. The constant was LOWERED beneath numbers that were
-issued under the higher value, so the next number handed out could collide with the maintainer-internal
-sequence -- and neither the pre-commit gate nor CI can see it, because both read only the current value
-of the constant and have no memory of the previous one.
-
-Restore PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py to at least $boundarySeen. If the
-reduction is deliberate, delete $boundaryMark and say why in the PR.
-"@
-    }
-    if ($residualWarning) {
-        Write-Host ""
-        Write-Host "WARNING: the highest sub-partition number ($subFloorMax) has reached 90% of the #$PublicBacklogFloor boundary." -ForegroundColor Yellow
-        Write-Host "         The maintainer-internal sequence is running out of room below the partition." -ForegroundColor Yellow
-        Write-Host "         Raise PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py (this script reads" -ForegroundColor Yellow
-        Write-Host "         it from there) BEFORE the two sequences meet, and say so in the PR. Once they" -ForegroundColor Yellow
-        Write-Host "         meet, nothing in this repository can tell the two apart." -ForegroundColor Yellow
-        Write-Host ""
-    }
-    # Record the boundary we are about to allocate under. Only rises; only on a real allocation.
-    if ($PublicBacklogFloor -gt $boundarySeen) {
-        Set-Content -Path $boundaryMark -Value $PublicBacklogFloor -Encoding ASCII
-    }
-
-    # $observed IS THE UNION MAXIMUM HERE, DELIBERATELY, AND MUST STAY THAT WAY.
-    #
-    # The tempting "fix" for the #1000 brick is to repoint $observed at the sub-boundary maximum, since
-    # that is what the guard should have read. Do not: $start would become max(353, 999) + 1 = 1000 --
-    # a number already merged on origin/main -- and in a FRESH clone, whose registry is empty, the
-    # atomic CreateNew has no claim file to collide with and would NOT catch the re-issue. The union
-    # maximum is what makes "never hand out a number that exists anywhere" true; the sub-boundary
-    # maximum answers a different question and belongs only to the warning above.
-    $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
-}
-else {
-    $start = $observed + 1
-}
 for ($i = $start; $i -lt $start + 500; $i++) {
-    $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
+    # Zero-padded to four digits: ADR filenames sort lexically in docs/adr/.
+    $name = "{0:D4}" -f $i
     $file = Join-Path $alloc "$name.json"
     try {
         # ATOMIC test-and-set. 'CreateNew' + FileShare::None throws IOException if a sibling got here

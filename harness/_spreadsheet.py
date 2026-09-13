@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Spreadsheet formula-injection neutralization for the harness reports (CWE-1236 / ASVS 1.2.10).
 
 A **deliberate mirror** of ``messagefoundry/spreadsheet.py``, not an import of it: the harness is a

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Do two spellings of the SAME local path compare equal to a governed root?
 
 BACKLOG #1071. ``Get-ComparablePath`` is a LEXICAL comparison -- ``GetFullPath`` never touches the

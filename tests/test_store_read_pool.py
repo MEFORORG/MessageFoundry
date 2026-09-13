@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Lockfree-reads: the dedicated read-only WAL connection pool.
 
 Reads run on a small bounded pool of read-only connections instead of serializing behind the single

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The BLOCKING paths must know whether the holder still exists (BACKLOG #345 Half B).
 
 ``-List`` learned holder-liveness first, and that was the wrong half to fix on its own: ``-List`` is

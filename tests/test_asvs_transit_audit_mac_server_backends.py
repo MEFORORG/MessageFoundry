@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """13.3.3 RIDER — the isolated-module (Vault Transit) audit MAC on the SERVER store backends.
 
 ``TransitCipher.audit_mac_key()`` returns ``None`` by design (the DEK never enters heap; the MAC is

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Retiring a handoff must refuse before it moves, and moving must never lose bytes.
 
 ``handoff.ps1 -Report`` is read-only. ``-Retire`` is the only thing that moves, one entry at a time,

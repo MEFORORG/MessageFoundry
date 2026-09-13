@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 # Queue a mid-task steering note for the Claude Code session running in this repo.
 #
 # Pairs with scripts/hooks/steer-inject.ps1 (a PreToolUse hook, opt-in -- see docs/STEERING.md).

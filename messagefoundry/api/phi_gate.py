@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fail-closed serialization gate for PHI-bearing response properties (BACKLOG #1045, ASVS 8.2.3).
 
 :func:`~messagefoundry.api.field_authz.redact_unauthorized` masks a property exactly where it is

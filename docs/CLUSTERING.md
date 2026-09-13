@@ -32,8 +32,9 @@ A clustered deployment **requires** (enforced at config load):
   membership/lease-renewal maintenance loop + the leader reclaim sweep + the per-stage workers), so it
   needs headroom over the store's working connections (prefer `>= 3`).
 
-Every node points at the **same** server database (same `[store]` server/database/schema) and runs
-the **same** config dir.
+Every node points at the **same** server database (same `[store]` server and database, and on Postgres
+the same `db_schema`) and runs the **same** config dir. A separate install on SQL Server needs its own
+database; the `db_schema` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why.
 
 ```toml
 # messagefoundry.toml — identical on every node (the DB password comes from MEFOR_STORE_PASSWORD)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Phase-8 STORE-1: PHI-at-rest encryption — the cipher + the store seam + migration."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 13.1.4 re-drift guard: the critical-secret enumeration + rotation schedule in
 ``docs/ASVS-L2-PHASE0-CHANGES.md`` must stay complete.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tests for the pure DICOM codec (ADR 0025): DicomPeek / DicomDataset / hl7_map, the base64 carriage
 round-trip (ADR 0028), fail-loud errors, the PHI rule, and the console-carve-out import purity."""
 

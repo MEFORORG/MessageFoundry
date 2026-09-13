@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The SFTP thread-parking bounds (BACKLOG #1195, ASVS 15.4.4).
 
 paramiko's ``connect(timeout=...)`` bounds the TCP connect. It does not bound the banner exchange,

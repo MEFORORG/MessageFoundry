@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 12.1.1 — every declared browser-TLS floor must be backed by a fence that PINS it.
 
 In Posture-B (``[api].tls_terminated_upstream``) the reverse proxy terminates browser TLS, so the

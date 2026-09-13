@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """HL7 v2.5.1 message-structure metadata for the Steps-view field picker (ADR 0104 §2.3 P2/P3).
 
 The picker scopes/ranks its segment list by the *message structure* a handler handles, and (P3) badges

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``lens rewrite`` — row-scoped param edits (ADR 0076 §2 phase 3 / §5), byte-stability gate 2.
 
 The load-bearing property (ADR 0076 §6 gate 2): for the whole ``samples/config`` corpus a **no-op**

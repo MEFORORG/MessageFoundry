@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Permission catalog and the fixed built-in roles for RBAC.
 
 Authorization is **deny-by-default**: an action is allowed only when one of the caller's roles grants

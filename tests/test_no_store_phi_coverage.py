@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 14.2.2 -- ``Cache-Control: no-store`` on every response that carries classified data, and a
 drift guard that blocks the next uncovered one.
 

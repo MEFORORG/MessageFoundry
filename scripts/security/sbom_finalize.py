@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Finalize a CycloneDX SBOM: declare its lifecycle, backfill a null primary-component version,
 and assert the fields a downstream operator relies on are present before we ship/retain it.
 

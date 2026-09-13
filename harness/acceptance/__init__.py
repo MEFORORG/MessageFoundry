@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Windows Server 2025 on-server acceptance harness.
 
 Turns ``docs/testing/WIN2025-TEST-MATRIX.md`` into an executable runner: each matrix row is bound to

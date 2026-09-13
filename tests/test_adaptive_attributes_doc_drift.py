@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """docs/SECURITY.md's "Attributes not consumed at this release" list must stay honest.
 
 BACKLOG #1153 (ASVS 8.2.4). The verb asks for adaptive controls based on a consumer's environmental

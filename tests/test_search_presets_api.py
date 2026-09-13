@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Saved / layered Log-Search preset API (BACKLOG #151, ADR 0136).
 
 CRUD + the bounded AND-compose layered query over search_messages. SQLite here; server parity on CI."""

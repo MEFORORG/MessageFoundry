@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 r"""Resolve a bash that can see THIS process's files (BACKLOG #1216).
 
 ``shutil.which("bash")`` is a fact about PATH, and on Windows PATH order decides WHICH OPERATING

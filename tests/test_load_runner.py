@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """End-to-end load run against a real engine on a temp SQLite DB.
 
 Serves ``harness/config/load`` (small fan-out, cheap transform, free ports) via the managed app, then

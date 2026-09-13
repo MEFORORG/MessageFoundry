@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Hybrid correlation for the tee parity comparison (#14, decision D2).
 
 Matches a MEFOR transformed output to the Corepoint output produced from the **same input message**, so

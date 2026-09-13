@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """What binds an outbound token-endpoint credential to its destination, and what does not.
 
 BACKLOG #1158 records an asymmetry between the two outbound OAuth2 legs: the SMART provider signs a

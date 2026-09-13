@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a NEW ``file:line`` citation in ASVS scorecard prose (ADR 0156).
 
 Half the assessment record is prose nothing checks. Roughly two thousand ``file:line`` citations

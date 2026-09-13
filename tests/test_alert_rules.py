@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Alerting rules engine (ADR 0014): rule matching, severity tagging, per-rule transport routing,
 suppression, per-rule cooldown, the unconfigured-transport guard, and AlertRule model validation."""
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SaturationDetector — the rising-backlog DERIVATIVE signal (BACKLOG #93, ADR 0014 amendment).
 
 The headline is the **key property**: the detector fires on a lane whose backlog is rising sustained
