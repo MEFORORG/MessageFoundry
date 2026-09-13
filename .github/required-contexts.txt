@@ -237,7 +237,8 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 -- otherwise the context never reports in the queue and NOTHING
 #                                 MERGES, which is the required-but-absent trap docs/CI.md names.
 #                                 scorecard.yml additionally has no `pull_request` trigger at all
-#                                 (`push`, `schedule`, `branch_protection_rule`, `workflow_dispatch`),
+#                                 (`branch_protection_rule`, `schedule`, `workflow_dispatch`; the
+#                                 `push` arm was deleted for cost -- see that file's own header),
 #                                 so it can never report on one -- the required-but-absent trap, on
 #                                 top of the token problem.
 #   zizmor.yml                 -- paths-filtered, so it does not report on most PRs.
