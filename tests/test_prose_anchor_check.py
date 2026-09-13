@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A new bare ``path:line`` in the ledger must be refused, and a located one must not be (#1315).
 
 Every test here is one half of a PAIR, and for this gate the pairing is not a style: a rule that

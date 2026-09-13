@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A NEW ``path:line`` citation in the ledger must carry something that can find the line again.
 
 BACKLOG #1315. A bare ``path:line`` asserts nothing an independent reference could check. It does not
