@@ -33727,6 +33727,7 @@ Also flag a `BinOp` whose operands include a `Call` or `Name`, a `%` `BinOp`, an
 ## 1751. reconcile the 228 shared-number pairs before the ledger merge: only 47 are byte-identical and 87 need a human read
 
 > 🔢 **Filed 2026-09-12 from a read-only measurement at engine `origin/main` and vault `origin/main` `152b6cbe`. Open; not started. TWO FINDINGS, and the first one is not migration cost.** Value **8/10**, Difficulty **6/10**. **34 shared numbers carry CONTRADICTORY STATUS CLAIMS across the two ledgers, and that corruption stands in both files today.** One side says an item shipped; the other lists it open with a named remainder, or declined. Both sides have been read as authoritative by somebody. Nothing could see it while the two files sat apart, and nothing would report it after a merge either: `backlog_status_check.py` verifies a banner EXISTS and does not self-contradict, never that it is TRUE, so a merged ledger inherits whichever side the merge rule picked and reads as settled. **If #1250 is abandoned outright these 34 are still wrong and still invisible, so this item outlives the migration that exposed it.** The second finding is the merge cost #1250 priced at zero: 238 numbers exist in both namespaces, only **47** pairs are byte-identical, **181** bodies differ, and **87** need a person to read two versions and choose.
+> **AMENDED 2026-09-12, and all three headline numbers above are now WRONG -- they were estimates taken before anyone adjudicated a pair.** It is **46** pairs that need a person, not 87; **37** status contradictions today, not 34; and **ZERO** need an owner ruling, not eleven, because all eleven were settled against the code the same day. The heading is stale on 87 for the same reason. Evidence in *The three corrections* at the end of this item. **The item stays OPEN:** at least 59 of the 180 pairs are still unadjudicated and the reconciliation itself has not started.
 > Verdict: build
 > Research: two unknowns named below, both cheap, both to be answered before the review starts
 > Closing-act: docs, plus an owner ruling on the eleven pairs named below
@@ -33806,6 +33807,171 @@ The mechanism behind that gap is that the engine ledger was deliberately sanitis
 **Duplicate search.** #1250 is the migration this blocks and the only item naming the vault ledger as a destination; it priced this work at zero, which is why this is a separate item as well as an amendment there. #1293 is the worktree-ownership hole class, unrelated. #1480 is the append-absorbs-the-next-heading defect, a filing hazard rather than this subject. Searched `shared-number`, `reconcile`, `vault ledger`, `common ancestor`, `contradictory status`.
 
 **Source.** A read-only measurement by the Manager seat, 2026-09-12, at engine `origin/main` and vault `origin/main` `152b6cbe`. No findings report was written; this item is the record.
+
+### AMENDMENT 2026-09-12: the three headline numbers were estimates, and adjudication moved all three
+
+Added the same day this item was filed, after the pairs were read rather than counted. **Nothing
+above is retracted as a record of what the filing pass saw.** What changed is that the filing pass
+estimated where a second pass measured, and the heading, the banner and both findings carry the
+estimates.
+
+| the item as filed | measured after adjudication |
+| --- | --- |
+| 87 pairs need a person | **46** |
+| 34 status contradictions | **37** |
+| eleven need an owner ruling | **zero** |
+
+Measured 2026-09-12 over the full corpus, engine `origin/main` against vault `origin/main`
+`152b6cbeb`.
+
+### Correction 1: 46 pairs need a person, not 87
+
+238 numbers are shared. **47 are byte-identical and 191 diverge**, and 47 plus 191 is 238.
+
+The 191 split five ways:
+
+| class of difference | count |
+| --- | --- |
+| link-target rewrite only | 36 |
+| linkification only | 20 |
+| banner differs, prose identical, no status conflict | 78 |
+| banner status-glyph conflict | 30 |
+| substantive body difference | 27 |
+
+**Those five sum to 191, and that arithmetic is the control on the classification.** A split that
+did not sum would mean a pair had been counted twice or dropped, and neither is visible any other
+way.
+
+Removing the eleven already settled by correction 3 leaves a working set of **180**, which splits
+**134 mechanically resolvable** and **46 needing a person**.
+
+**Whitespace and line-ending normalisation resolves ZERO pairs.** Every difference in this corpus is
+content, not formatting. A normalising pass would carry no risk and buy nothing, so nobody should
+plan one.
+
+The 30 banner status-glyph conflicts here and the 37 status contradictions in correction 2 come from
+two different screens over the same corpus. Nothing in this amendment reconciles the two figures,
+and they must not be read as the same population.
+
+### Correction 2: 37 status contradictions today, not 34
+
+Both ledgers moved between the filing measurement and this one. **34 was true when taken and is not
+true now**, which is what a count of a live corpus does.
+
+**Two further pairs are excluded deliberately.** #3 and #110 differ only in how many open banners the
+engine side stacked. That is not a claim about status, so counting them would inflate the figure to
+39.
+
+### Correction 3: zero pairs need an owner ruling, not eleven
+
+All eleven -- **#81, #84, #95, #122, #124, #125, #127, #131, #171, #172, #226** -- were adjudicated
+against the code and settled on evidence, each verdict then attacked by an adversarial reviewer. The
+verdicts, with a recommended merged text for every number, are in the coordination directory as
+`HANDOFF-1751-eleven-contradictions-adjudicated-20260912.md`.
+
+| verdict | count |
+| --- | --- |
+| engine side correct | 6 |
+| both partly right | 3 |
+| vault side correct | 1 |
+| not actually contradictory | 1 |
+
+**Step 2 of *What closing looks like* is discharged on its second half** -- there is no list to send
+the owner -- and the banner's closing-act line is stale on the same point. The first half of that
+step, fixing the contradictions in place in both ledgers, is untouched and still the work.
+
+### The 46 are not 46 independent reads
+
+**Nine are number COLLISIONS rather than disagreements: #232 through #239, and #320.** Two genuinely
+different items hold each of those numbers, so they are renumbering rather than adjudication.
+
+**#231 is NOT one of them, and a first pass counted it as one.** Checked here against both trees,
+engine `origin/main` and vault `origin/main` `152b6cbeb`: the vault heading reads *Steps "Block"
+Grouping*, the engine heading *Steps view: decorative collapsible block grouping (Corepoint Block
+analog)*. One item, worded twice, needing an ordinary two-version read. The other nine were checked
+the same way and each holds two unrelated subjects. **So the 46 split nine collisions and 37 genuine
+reads, not ten and 36.**
+
+**Twenty of the 37 share one cause.** The engine closed them at the 2026-08-10/11 G26 demand-gate
+triage and the vault fork never received the ruling. All twenty carry a 2026-08-10 or 2026-08-11
+date, and 19 of the 20 name the triage in words. They are **#62, #64, #94, #108, #113, #116, #130,
+#133, #137, #163, #165, #166, #169, #174, #179, #180, #181, #182, #184 and #214**, and they can be
+dispatched as one brief. One of the twenty, #184, is already settled -- see below -- so the cluster
+is not wholly outstanding.
+
+**Seventeen individual reads remain: #87, #89, #91, #96, #98, #99, #105, #139, #158, #185, #198,
+#200, #208, #223, #228, #230 and #231.**
+
+### Which side is cheaper to renumber is an OPEN QUESTION, and the discriminator is what you count
+
+Two readings taken on 2026-09-12 disagree on the direction, and a third was in flight when this was
+written. **Neither reading below settles it and this amendment states no direction.**
+
+| what was counted | engine-side cost | vault-side cost |
+| --- | --- | --- |
+| the literal `BACKLOG #N` spelling only | 131 | 66 |
+| every occurrence that MEANS the item -- bare `#N`, prose, links | about 309, over 73 files | about 624, over 132 files |
+
+**That is the whole disagreement, and it will recur, so it is named rather than averaged.** A
+renumber has to fix every citation that means the item, not only the ones spelled unambiguously, so
+the first reading counted a true number for the wrong question. The second inverts the direction.
+Whoever settles this states which definition they used before quoting a number.
+
+### #184 is settled CLOSED, and the G26 triage boilerplate is a claim rather than a premise
+
+#184's engine banner reads DROPPED at the G26 triage, carrying the triage's standard sentence that
+its named trigger has not fired. The vault side carries #184 open. **Adjudicated 2026-09-12 and
+settled ENGINE-CORRECT: the item is closed.** That unblocks **#69**, whose merged text depended on
+how #184 resolved; #69 was overturned on attack for exactly that dependency and can now be re-read.
+
+**The general finding stands and outlives this one item.** A prior pass had already found the same
+triage misfiling **#84**, and named **#125**, **#127** and **#130** as the same hazard, so #184 is at
+least a fourth place the triage's boilerplate had to be checked rather than believed.
+
+**The consequence for the twenty-item cluster above: for each of them, "the trigger had not fired" is
+a claim to check against the code, never a premise to reason from.** One brief is still the right
+shape for the cluster, but it has to carry twenty code reads rather than one ruling applied twenty
+times.
+
+### #87 is settled by an owner ruling, 2026-09-12
+
+#87's vault banner carried a clause that would have made a third party's non-naming a standing
+control outliving the item. **The owner ruled that the constraint is scoped to naming that party as
+#87's subject, and does not reach ordinary technical comparison.**
+
+The party is deliberately not named here, and must not be added: this repository is public, and the
+ruling is the record rather than the name.
+
+### Progress, and the 60 pairs the cap dropped
+
+120 of the 180-pair working set are adjudicated, with an adversarial attacker on every verdict
+claiming to be settled. **118 settled by evidence, one (#87) reached the owner and is now ruled, and
+one (#69) was overturned on attack and left open behind #184.** Those three sum to 120. The attacker
+overturned **15** of the 120 verdicts on the second read, which is the measure of what the second
+read bought. #184 has since been settled, so #69 is unblocked and awaits a re-read.
+
+**60 pairs were left unadjudicated, and the reason is an error rather than a scoping decision.** The
+adjudicating script carried a `.slice(0, 120)` cap against a working set of 180. The cap was silent:
+the run reported 120 completed verdicts, and nothing anywhere reported the 60 it never dispatched. It
+is recorded plainly here because a cap that reads as a finished pass is the exact shape this ledger
+keeps having to record. #184 has been settled since, so **at least 59 of the 60 are still open**.
+
+A handoff for the remaining 60 exists as `HANDOFF-1751-adjudicate-remaining-60.md`, written
+2026-09-12. It carries the list, the three structures inside it, and the method rules. Like the
+coordination notes, it is untracked and machine-local, so it is named here rather than cited as a
+path.
+
+### What this amendment does NOT do
+
+- It does not close the item. At least 59 pairs are unread, and the reconciliation the item exists
+  for has not started.
+- It does not change the heading, the banner status, or Findings 1 and 2. Those are the record of the
+  filing pass and stay as written.
+- It does not re-price the work. The 6-to-16-hour range was estimated against 87 decisions; nobody
+  has re-estimated it against 46 plus a renumbering pass, and scaling the old range would be
+  arithmetic rather than a measurement.
+- It does not answer either of the two unknowns. The common-ancestor question is still open, and so
+  is whether the vault ledger is the maintainer-internal ledger the erratum describes.
 
 ## 1752. overlap.ps1 classifies Dirty from status porcelain without comparing content, so one CRLF artifact blocks every session in the repo from a file nobody changed
 
