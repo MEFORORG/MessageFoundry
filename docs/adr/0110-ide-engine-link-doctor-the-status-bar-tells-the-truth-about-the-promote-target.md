@@ -1,6 +1,6 @@
 # ADR 0110 — IDE engine-link doctor: the status bar tells the truth about the promote target
 
-- **Status:** Accepted (2026-07-14) — owner-directed this session; built (IDE extension v0.0.28, BACKLOG #232).
+- **Status:** Accepted (2026-07-14) — owner-directed this session; built (IDE extension v0.0.28, BACKLOG #1757).
 - **Deciders:** owner (report + "do it all" directive) + a 23-agent design/adversarial pass.
 - **Extends:** [ADR 0100](0100-ide-native-surface-polish-and-open-to-messagefoundry-startup-experience-backlog-221.md)
   (the native surface, whose §1 enumerates this status-bar item — and records it as one that *"opens
