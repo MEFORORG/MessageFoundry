@@ -45,6 +45,26 @@ string embedded in code from counting: ``messagefoundry/corepoint_import.py`` co
 ``"# SPDX-License-Identifier: AGPL-3.0-or-later",`` because it GENERATES headers for imported
 configuration, and a substring check would read a header-emitting file as a headered one.
 
+THE COPYRIGHT HOLDER IS PINNED TOO (BACKLOG #1552), in the same window under the same comment rule.
+The licence and the holder are separate assertions because they fail separately: a file can declare
+the right licence and name a superseded legal entity, which is what happened when the entity renamed
+and nothing checked it. The holder is asserted POSITIONALLY -- "does this file's header name the
+right holder" -- never by excluding paths allowed to contain the old string. A path exclusion answers
+the wrong question and rots silently the moment someone legitimately quotes the old name in an ADR, a
+NOTICE or a migration note. ``docs/BACKLOG.md`` quotes the superseded entity deliberately, to record
+what was replaced; that is prose, not a header, so it never trips this and needs no exemption.
+
+AND THE COMMENT RULE LEAVES A BLIND SPOT THIS GATE NOW COVERS. A header inside a string literal is
+skipped by design -- but some of those literals are TEMPLATES that stamp headers onto GENERATED
+files, so the lines deciding the copyright holder of future files are exactly the lines the comment
+rule can never see. A naive scan for "SPDX tag in a string literal" finds seven sites and only two
+are templates; the other five are this module's own docstring, its ``SPDX_TAG`` constant, and test
+fixtures -- prose QUOTING the tag while explaining this very trap. ``_is_template_site`` discriminates
+by ADJACENCY rather than by a path list: a template carries the SPDX line and a copyright line
+together inside the same literal, and the prose mentions quote the tag alone and continue into
+sentences. Adjacency was chosen because a path list is the same enumeration mistake one level down --
+it would need an edit every time a template is added, and nothing would report that it needed one.
+
 Usage:
   licence_header_check.py [FILE ...]   # check the given files (how pre-commit invokes it)
   licence_header_check.py              # check every in-scope git-tracked file (how CI invokes it)
@@ -67,6 +87,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The SPDX identifier every first-party source must declare. Stated once, here.
 EXPECTED_IDENTIFIER = "AGPL-3.0-or-later"
+
+# The copyright holder every first-party header must name. Stated once, here, for the same reason
+# EXPECTED_IDENTIFIER is: BACKLOG #1552. The entity renamed (PR 1020) and nothing pinned it, so the
+# rename was left incomplete three times -- twice by its own author's later work, once by an
+# unrelated merge -- and CI could not see any of it.
+#
+# The HOLDER only. Not the year and not the trailing "and contributors": pinning those would red on
+# an ordinary new-year edit, which is how a gate teaches people to ignore it.
+EXPECTED_HOLDER = "MessageFoundry Foundation, LLC"
+
+# How a copyright line is recognised, kept separate from the holder for the same WRONG-vs-MISSING
+# reason SPDX_TAG is kept separate from EXPECTED_IDENTIFIER.
+COPYRIGHT_MARKER = "Copyright"
 
 # One specific vendored file -> the licence IT actually carries upstream. See the module docstring's
 # VENDORED_LICENCES paragraph for why this exists and what does and does not belong here. Keyed by
@@ -98,6 +131,9 @@ HEAD_LINES = 20
 # Violation classes. Reported separately because they are different defects with different fixes.
 MISSING = "MISSING"
 WRONG = "WRONG"
+HOLDER_MISSING = "HOLDER_MISSING"
+HOLDER_WRONG = "HOLDER_WRONG"
+TEMPLATE_HOLDER_WRONG = "TEMPLATE_HOLDER_WRONG"
 
 
 def in_scope(path: str) -> bool:
@@ -142,16 +178,35 @@ def registry_key(path: Path) -> str:
         return path.as_posix()
 
 
-def check_file(path: Path) -> tuple[str, str] | None:
-    """Classify one file. Returns ``(class, detail)`` for a violation, or None when compliant."""
-    prefix = COMMENT_PREFIXES[path.suffix]
-    # Only the LOOKUP key is normalised. The read below deliberately uses *path* as given, so a
-    # relative invocation still resolves against the caller's cwd exactly as it always has.
-    expected = VENDORED_LICENCES.get(registry_key(path), EXPECTED_IDENTIFIER)
+def _read_lines(path: Path) -> list[str] | None:
+    """Every line of *path*, or None when it cannot be read.
+
+    The read deliberately uses *path* as given, so a relative invocation still resolves against the
+    caller's cwd exactly as it always has. Only LOOKUP keys are normalised (see ``registry_key``).
+    """
     try:
-        head = path.read_bytes().decode("utf-8", errors="replace").splitlines()[:HEAD_LINES]
-    except OSError as exc:  # unreadable is a violation we must not swallow
-        return (MISSING, f"could not read: {exc}")
+        return path.read_bytes().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+
+def header_lines(path: Path) -> list[str] | None:
+    """The window a header may sit in. ONE definition of "where the header is", shared by both checks.
+
+    The licence check and the holder check must never disagree about which lines are the header, so
+    neither of them slices the file itself.
+    """
+    lines = _read_lines(path)
+    return None if lines is None else lines[:HEAD_LINES]
+
+
+def check_file(path: Path) -> tuple[str, str] | None:
+    """Classify one file's LICENCE declaration. ``(class, detail)`` for a violation, else None."""
+    prefix = COMMENT_PREFIXES[path.suffix]
+    expected = VENDORED_LICENCES.get(registry_key(path), EXPECTED_IDENTIFIER)
+    head = header_lines(path)
+    if head is None:  # unreadable is a violation we must not swallow
+        return (MISSING, "could not read")
 
     for line in head:
         stripped = line.strip()
@@ -166,6 +221,99 @@ def check_file(path: Path) -> tuple[str, str] | None:
         return (WRONG, f"declares {value!r}, expected {expected!r}")
 
     return (MISSING, f"no {SPDX_TAG} comment in the first {HEAD_LINES} lines")
+
+
+def check_holder(path: Path) -> tuple[str, str] | None:
+    """Classify one file's COPYRIGHT HOLDER. ``(class, detail)`` for a violation, else None.
+
+    A file registered in VENDORED_LICENCES is someone else's code under its own licence, so it is
+    exempt: stamping this project's holder on third-party work is the same affirmative misstatement
+    the licence half of this gate exists to prevent. The exemption is the registry's, not a second
+    list -- a file is exempt here exactly when it is exempt there.
+    """
+    if registry_key(path) in VENDORED_LICENCES:
+        return None
+
+    prefix = COMMENT_PREFIXES[path.suffix]
+    head = header_lines(path)
+    if head is None:
+        return (HOLDER_MISSING, "could not read")
+
+    for line in head:
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        if COPYRIGHT_MARKER not in stripped:
+            continue
+        if EXPECTED_HOLDER in stripped:
+            return None
+        return (HOLDER_WRONG, f"names {stripped.removeprefix(prefix).strip()!r}")
+
+    return (
+        HOLDER_MISSING,
+        f"no {COPYRIGHT_MARKER} comment in the first {HEAD_LINES} lines",
+    )
+
+
+def _is_template_site(lines: list[str], index: int) -> str | None:
+    """The ADJACENCY DISCRIMINATOR. Returns the adjacent copyright line, or None if this is prose.
+
+    *index* is a line carrying the SPDX tag in non-comment form -- that is, inside a string literal.
+    Two kinds of thing look like that, and only one of them decides a future file's header:
+
+      * a TEMPLATE, which carries the SPDX line and a copyright line together in the same literal;
+      * PROSE, which quotes the tag alone and continues into sentences.
+
+    So the next NON-EMPTY line decides it. Blank lines are skipped rather than ending the search
+    because a template may space its header block, and a blank line is not evidence either way.
+    """
+    for follow in lines[index + 1 :]:
+        stripped = follow.strip()
+        if not stripped:
+            continue
+        return stripped if COPYRIGHT_MARKER in stripped else None
+    return None
+
+
+def template_sites(path: Path) -> list[tuple[int, str]]:
+    """Every header-stamping TEMPLATE in *path*, as ``(line number, the copyright line it stamps)``.
+
+    Enumerates sites REGARDLESS of whether their holder is correct, which is what makes the scan
+    auditable: while every template happens to be right, a violations-only view returns nothing and
+    cannot tell "found both templates, both fine" apart from "found no templates at all". Those two
+    render identically and only one of them means the scan works.
+
+    Scans the whole file, not the head window: a template sits wherever the generating code sits.
+    """
+    if registry_key(path) in VENDORED_LICENCES:
+        return []
+
+    lines = _read_lines(path)
+    if lines is None:
+        return []
+
+    prefix = COMMENT_PREFIXES[path.suffix]
+    sites: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if SPDX_TAG not in stripped:
+            continue
+        if stripped.startswith(prefix):
+            continue  # a real header, already covered by check_file/check_holder
+        adjacent = _is_template_site(lines, i)
+        if adjacent is None:
+            continue  # prose quoting the tag, not a template
+        sites.append((i + 1, adjacent))
+    return sites
+
+
+def check_templates(path: Path) -> list[tuple[str, str]]:
+    """Every template site in *path* whose stamped copyright line names the wrong holder."""
+    return [
+        (TEMPLATE_HOLDER_WRONG, f"line {number}: template stamps {stamped!r}")
+        for number, stamped in template_sites(path)
+        if EXPECTED_HOLDER not in stamped
+    ]
 
 
 def main(argv: list[str]) -> int:
@@ -193,6 +341,11 @@ def main(argv: list[str]) -> int:
         result = check_file(path)
         if result is not None:
             violations.append((result[0], name, result[1]))
+        holder = check_holder(path)
+        if holder is not None:
+            violations.append((holder[0], name, holder[1]))
+        for cls, detail in check_templates(path):
+            violations.append((cls, name, detail))
 
     if not violations:
         vendored_note = (
@@ -202,12 +355,15 @@ def main(argv: list[str]) -> int:
         )
         print(
             f"licence-header: OK -- {len(candidates)} file(s) checked, all declare their expected "
-            f"licence{vendored_note}"
+            f"licence and name {EXPECTED_HOLDER}{vendored_note}"
         )
         return 0
 
     wrong = [v for v in violations if v[0] == WRONG]
     missing = [v for v in violations if v[0] == MISSING]
+    holder_wrong = [v for v in violations if v[0] == HOLDER_WRONG]
+    holder_missing = [v for v in violations if v[0] == HOLDER_MISSING]
+    template_wrong = [v for v in violations if v[0] == TEMPLATE_HOLDER_WRONG]
 
     # WRONG is printed first and named separately: an affirmative misstatement of licence is a worse
     # defect than an omission, and folding the two together is what a presence-only check does.
@@ -224,9 +380,38 @@ def main(argv: list[str]) -> int:
         for _, name, detail in missing:
             print(f"  {name}: {detail}", file=sys.stderr)
 
+    # A TEMPLATE is printed before the ordinary holder classes and named as its own defect, for the
+    # same reason WRONG precedes MISSING: a template decides the header of every file it generates,
+    # so one wrong template line is a wrong holder on files that do not exist yet.
+    if template_wrong:
+        print(
+            f"licence-header: {len(template_wrong)} header-stamping TEMPLATE(s) name the wrong "
+            f"holder (expected {EXPECTED_HOLDER}):",
+            file=sys.stderr,
+        )
+        for _, name, detail in template_wrong:
+            print(f"  {name}: {detail}", file=sys.stderr)
+    if holder_wrong:
+        print(
+            f"licence-header: {len(holder_wrong)} file(s) name the WRONG copyright holder "
+            f"(expected {EXPECTED_HOLDER}):",
+            file=sys.stderr,
+        )
+        for _, name, detail in holder_wrong:
+            print(f"  {name}: {detail}", file=sys.stderr)
+    if holder_missing:
+        print(
+            f"licence-header: {len(holder_missing)} file(s) carry NO copyright line:",
+            file=sys.stderr,
+        )
+        for _, name, detail in holder_missing:
+            print(f"  {name}: {detail}", file=sys.stderr)
+
     print(
         f"licence-header: {len(violations)} violation(s) across {len(candidates)} file(s) checked. "
-        f"Add '<comment> {SPDX_TAG} {EXPECTED_IDENTIFIER}' within the first {HEAD_LINES} lines.",
+        f"Add '<comment> {SPDX_TAG} {EXPECTED_IDENTIFIER}' and "
+        f"'<comment> Copyright (C) <year> {EXPECTED_HOLDER} and contributors' "
+        f"within the first {HEAD_LINES} lines.",
         file=sys.stderr,
     )
     return 1

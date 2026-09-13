@@ -1010,3 +1010,35 @@ def test_the_summary_counts_the_repairs_the_control_ref_already_carries(
     assert "FLOOR" in stream
     assert f"control={ref[:12]}" in stream
     _assert_no_assessment_content(stream)
+
+
+@pytest.mark.parametrize(
+    ("field", "want"),
+    [
+        ("anchor_repair = true\n", 1),
+        ('anchor_repaired_at = "2026-09-10"\n', 1),
+        ('anchor_repair = true\nanchor_repaired_at = "2026-09-10"\n', 1),
+        ("", 0),
+    ],
+)
+def test_the_repair_COUNT_reads_the_old_control_AND_the_witness_that_replaced_it(
+    field: str, want: int
+) -> None:
+    """THE COUNT SURVIVED A CHANGE OF WRITER, and this is where that is checked.
+
+    `anchor_repair` is a WRITER INSTRUCTION that used to persist into the record, and this counter
+    was its only reader. `apply.py` now consumes it and records `anchor_repaired_at` instead
+    (BACKLOG #1369), so reading either key alone is wrong in a different direction: the new key alone
+    reports a collapse that never happened, because cells the new writer has not rewritten still
+    carry the old one, and the old key alone watches the number decay as the record is cleaned.
+
+    THE FOURTH ARM IS THE CONTROL. Without a record carrying NEITHER key, a counter that returned 1
+    unconditionally would satisfy the other three -- and the two-key arm pins that a cell in the
+    middle of the transition is counted ONCE rather than twice.
+    """
+    record = (
+        f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
+        f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{"0" * 40}"\n'
+        f'reviewed_by = "a builder"\n' + field
+    )
+    assert anchor_provenance._repairs_declared(record) == want

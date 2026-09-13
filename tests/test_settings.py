@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import (
+    _DEFAULT_FILE,
     ApiSettings,
     AuthSettings,
     DeliverySettings,
@@ -1399,7 +1400,11 @@ def test_vip_default_grace_is_held_to_the_same_bound(tmp_path: Path) -> None:
         tmp_path / "messagefoundry.toml",
         _VIP_PG
         + "[cluster]\nenabled = true\nheartbeat_seconds = 1\nleader_fence_timeout_seconds = 2\n"
-        + "leader_lease_ttl_seconds = 3\n[cluster.vip]\nenabled = true\n"
+        # The renew clamp must fit this tightened pair's own margin (3 - 2 - a 0.4 fence tick = 0.6),
+        # or ClusterSettings._renew_fits_the_margin refuses the config first and this test would be
+        # asserting on the wrong refusal. Named here so the fence/TTL values stay the subject.
+        + "leader_lease_ttl_seconds = 3\nlease_renew_timeout_seconds = 0.5\n[cluster.vip]\n"
+        + "enabled = true\n"
         + _VIP_USABLE
         + "prefix = 24\n",
     )
@@ -1745,3 +1750,62 @@ def test_retry_forever_and_the_finite_default_both_survive_the_floor() -> None: 
     assert DeliverySettings(retry_max_attempts=None).retry_max_attempts is None
     assert DeliverySettings().retry_max_attempts == 100
     assert DeliverySettings(retry_max_attempts=1).retry_max_attempts == 1
+
+
+# --- BACKLOG #1217 half 2: the "forever" string spelling ------------------------------------
+#
+# Half 1 (above) floored the operator-facing int|None field. Half 2 is the part that was left
+# open: TOML has no null literal and an env var is always a string, so `None` (retry-forever) was
+# reachable from code-first Python only. Adopted here absent an owner ruling (see the PR body):
+# the string spelling "forever" is coerced to `None`, case-insensitively, everywhere this field is
+# populated from text -- the Python constructor, a TOML file, and MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS.
+
+
+@pytest.mark.parametrize("spelling", ["forever", "Forever", "FOREVER", " forever ", " FoReVeR "])
+def test_retry_forever_string_spelling_is_case_and_whitespace_insensitive(
+    spelling: str,
+) -> None:  # #1217
+    """Pins the case decision explicitly, both ways -- accepted here, rejected below for anything
+    that isn't this one word."""
+    assert DeliverySettings(retry_max_attempts=spelling).retry_max_attempts is None
+
+
+def test_retry_forever_spelling_loads_from_a_toml_file(tmp_path: Path) -> None:  # #1217
+    cfg = _write(tmp_path / "retry-forever.toml", '[delivery]\nretry_max_attempts = "forever"\n')
+    s = load_settings(config_path=cfg, environ={})
+    assert s.delivery.retry_max_attempts is None
+
+
+def test_retry_forever_spelling_loads_from_the_env_var(tmp_path: Path) -> None:  # #1217
+    cfg = _write(tmp_path / "empty.toml", "")
+    s = load_settings(config_path=cfg, environ={"MEFOR_DELIVERY_RETRY_MAX_ATTEMPTS": "forever"})
+    assert s.delivery.retry_max_attempts is None
+
+
+@pytest.mark.parametrize("bad", ["sometimes", "never", "always", ""])
+def test_retry_max_attempts_still_refuses_a_garbage_string(bad: str) -> None:  # #1217
+    """The new spelling is exactly one word -- anything else must still fail closed exactly as it
+    did before this item, never silently fall back to a default or to retry-forever."""
+    with pytest.raises(ValidationError):
+        DeliverySettings(retry_max_attempts=bad)
+
+
+def test_retry_max_attempts_as_a_quoted_number_still_hits_the_floor() -> None:  # #1217
+    """A quoted `"0"` is not the word "forever", so it must fall through to the SAME `ge=1` floor a
+    bare `0` hits -- the new validator must not accidentally widen what a string can smuggle past it."""
+    with pytest.raises(ValidationError):
+        DeliverySettings(retry_max_attempts="0")
+
+
+def test_retry_forever_loads_from_a_file_named_messagefoundry_toml(tmp_path: Path) -> None:  # #1217
+    """#1217 review finding 1. The test above proves the `[delivery]` table parses; this one pins the
+    FILE the docs send an operator to. The first cut of half 2 named connections.toml, which refuses
+    a `[delivery]` table outright (tests/test_retry_cap_default.py drives that refusal), so the
+    documented instruction produced a startup error. Uses the real default filename and asserts it is
+    the default, so a rename moves the docs and this test together."""
+    assert _DEFAULT_FILE == "messagefoundry.toml", (
+        "the default settings file was renamed; docs/CONFIGURATION.md, docs/CONNECTIONS.md and "
+        "docs/USER-GUIDE.md all name it by hand in the retry-forever passage"
+    )
+    cfg = _write(tmp_path / _DEFAULT_FILE, '[delivery]\nretry_max_attempts = "forever"\n')
+    assert load_settings(config_path=cfg, environ={}).delivery.retry_max_attempts is None

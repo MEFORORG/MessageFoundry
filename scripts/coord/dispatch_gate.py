@@ -103,8 +103,11 @@ Usage::
     python scripts/coord/dispatch_gate.py --range 1380-1399 --no-tree
     python scripts/coord/dispatch_gate.py --self-test
 
-Exit 0 only when EVERY named item is dispatchable. Exit 1 otherwise, listing each refusal and why.
-A tree hit never changes the exit code.
+Exit 0 only when EVERY named item is dispatchable. Exit 1 when ``--refuse`` blocks the wave, or when
+the ledger did not parse. A tree hit never changes the exit code. Exit 3 means the LISTING ITSELF
+failed partway through printing (BACKLOG #1526) -- a different failure from a ``--refuse`` fence, and
+deliberately a different code, so a caller checking the exit code alone cannot mistake one for the
+other.
 """
 
 from __future__ import annotations
@@ -143,6 +146,33 @@ from landed_citation_screen import (  # type: ignore[import-not-found]  # noqa: 
 
 # Below this, the ledger did not parse and no verdict from this gate is evidence.
 MIN_ITEMS = 50
+
+# A PRINT FAILURE AND A --refuse FENCE MUST NOT SHARE AN EXIT CODE (BACKLOG #1526).
+#
+# A note this gate prints can quote arbitrary ledger prose verbatim -- a status glyph, or any other
+# character a row's author typed -- because `retirement_marker`/`fence_marker`/`rebuild_marker` all
+# quote WHAT FIRED so a reader can check the claim. On a stock Windows cp1252 console, printing one of
+# those quotes without hardening the stream first raised `UnicodeEncodeError` and the process died
+# PARTWAY THROUGH THE LISTING. Measured 2026-09-10: a run over 301 open rows printed 11 items and
+# fell over. Python's default handler exits 1 on an uncaught exception -- the SAME CODE `--refuse`
+# returns on purpose -- so a caller checking the exit code alone could not tell a genuine fence from
+# the tool falling over mid-listing, and the reader got a listing that stopped without saying so, the
+# same shape as a truncated census reading as a clean one.
+#
+# THE STDOUT HARDENING IN `main` BELOW IS THE REAL FIX, following `backlog_status_check.main`'s own
+# shape (BACKLOG #1030) rather than inventing a second convention: reconfiguring stdout to UTF-8 with
+# `errors="replace"` substitutes an unencodable glyph instead of raising, so this path should not fire
+# against any stream Python can reconfigure. `EXIT_PRINT_FAILURE` is the backstop for the stream
+# `hasattr` finds incapable of it, caught around the whole report so the two failures are reported
+# under codes nobody can conflate.
+#
+# A DISTINCT CODE WAS CHOSEN OVER "N of M items listed" BOOKKEEPING. The listing below runs across
+# five independent print loops (unknown, refused, must-read, advise, and the `--explain` ok bucket);
+# threading a running counter through all five to report a partial count buys precision for a path
+# the hardening above should already have closed. A caller that sees this code knows the run is not
+# evidence either way and should re-run after fixing the stream, which is the only actionable fact a
+# count would have added.
+EXIT_PRINT_FAILURE = 3
 
 # VERDICTS THAT MEAN DO NOT JUST BUILD IT, and what lifts each (BACKLOG #1334).
 #
@@ -1009,6 +1039,21 @@ def _parse_range(spec: str) -> list[int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # THIS TOOL MUST CARRY WHATEVER A LEDGER ROW'S AUTHOR TYPED (BACKLOG #1526). A note built by
+    # `retirement_marker`/`fence_marker`/`rebuild_marker` quotes the row's own prose verbatim -- that
+    # is how a reader checks the claim instead of taking the gate's word for it -- so a status glyph
+    # or any other character in the ledger reaches stdout unfiltered. On a stock Windows cp1252
+    # console that raised `UnicodeEncodeError` and killed the process partway through the listing --
+    # measured, not theorised: a run over 301 open rows printed 11 items and died.
+    #
+    # `errors="replace"` mirrors `backlog_status_check.main`'s own hardening (BACKLOG #1030) rather
+    # than inventing a second convention. It is the fix, not a tolerance for mangled text: the codec
+    # was wrong and this corrects it to UTF-8. Replacement is the backstop for a stream that cannot be
+    # reconfigured at all, so one exotic codepoint can never again truncate this gate's output
+    # mid-listing. Scoped to the CLI entry point: importers get their own stdout untouched.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1097,83 +1142,101 @@ def main(argv: list[str] | None = None) -> int:
             (num, note)
         )
 
-    print(f"items closing by the builder's own act: {len(ok)} of {len(asked)}")
-    print(f"  ledger parsed: {len(items)} items from {args.root}")
-    # THE TREE LINE PRINTS AT THE TOP WHETHER OR NOT THE TREE ANSWERED, and a failure prints the
-    # reason rather than nothing. A limb that degrades quietly is worse than no limb: the output
-    # looks the same, one whole class of row stops being detected, and the reader has no way to tell.
-    if tree_off is None:
-        print(
-            f"  tree asked: {args.tree_ref} over {' '.join(SEARCH_PATHS)} -- landed code cites "
-            f"{tree_hits} of {len(asked)} rows in this wave"
-        )
-    else:
-        print(f"  TREE NOT ASKED: {tree_off}")
-    print()
+    # THE REPORT ITSELF IS WRAPPED, NOT JUST HARDENED (BACKLOG #1526). The hardening above
+    # should make this branch unreachable on any stream Python can reconfigure -- see
+    # `EXIT_PRINT_FAILURE`'s own comment for why a stream that cannot is still possible and why
+    # this catches rather than lets the default handler exit 1, the SAME CODE a --refuse fence
+    # returns on purpose.
+    try:
+        print(f"items closing by the builder's own act: {len(ok)} of {len(asked)}")
+        print(f"  ledger parsed: {len(items)} items from {args.root}")
+        # THE TREE LINE PRINTS AT THE TOP WHETHER OR NOT THE TREE ANSWERED, and a failure prints the
+        # reason rather than nothing. A limb that degrades quietly is worse than no limb: the output
+        # looks the same, one whole class of row stops being detected, and the reader has no way to tell.
+        if tree_off is None:
+            print(
+                f"  tree asked: {args.tree_ref} over {' '.join(SEARCH_PATHS)} -- landed code cites "
+                f"{tree_hits} of {len(asked)} rows in this wave"
+            )
+        else:
+            print(f"  TREE NOT ASKED: {tree_off}")
+        print()
 
-    for num in unknown:
-        print(f"  #{num}: NOT IN THE LEDGER")
-    for num, note in refused:
-        print(f"  #{num}: UNDECLARED -- {note}")
-    # MUST BE READ prints ahead of the workable rows because it is the only line here that can cost
-    # a whole lane-window if a reader skips it. No bucket label: the note already opens with the
-    # words, and a label would print them twice.
-    for num, note in must_read:
-        print(f"  #{num}: {note}")
-    for num, note in advise:
-        print(f"  #{num}: workable -- {note}")
-    if args.explain:
-        for num, note in ok:
+        for num in unknown:
+            print(f"  #{num}: NOT IN THE LEDGER")
+        for num, note in refused:
+            print(f"  #{num}: UNDECLARED -- {note}")
+        # MUST BE READ prints ahead of the workable rows because it is the only line here that can cost
+        # a whole lane-window if a reader skips it. No bucket label: the note already opens with the
+        # words, and a label would print them twice.
+        for num, note in must_read:
             print(f"  #{num}: {note}")
+        for num, note in advise:
+            print(f"  #{num}: workable -- {note}")
+        if args.explain:
+            for num, note in ok:
+                print(f"  #{num}: {note}")
 
-    print()
-    print(
-        "NAMING, NOT REFUSING. An item the builder cannot close is still worth building: the seat\n"
-        "ships the code and the item stays open until its named seat closes it. What the 2026-08-21\n"
-        "wave lacked was the NAME, not permission -- nobody was told the closing act was elsewhere."
-    )
-    if must_read:
-        # THE QUALIFIER IS LOAD-BEARING NOW THAT A FENCE BLOCKS. Left unqualified, this paragraph
-        # would tell a reader --refuse never blocks on a MUST BE READ while the exit code did
-        # exactly that -- a compensating control resting on a false premise, in the output of the
-        # tool that carries it.
+        print()
         print(
-            "A MUST BE READ ROW INFERRED FROM PROSE OR FROM THE TREE IS NOT REFUSED, AND --refuse\n"
-            "DOES NOT BLOCK ON ONE. A row can be stale in either direction, whether the claim came\n"
-            "from its own sentence or from the tree. Blocking on it would rebuild the screen #1394\n"
-            "records, which discarded 46 percent of the live ledger on a token match."
+            "NAMING, NOT REFUSING. An item the builder cannot close is still worth building: the seat\n"
+            "ships the code and the item stays open until its named seat closes it. What the 2026-08-21\n"
+            "wave lacked was the NAME, not permission -- nobody was told the closing act was elsewhere."
         )
-    if fenced:
-        print(
-            "A DISPATCH FENCE IS THE ONE MUST BE READ --refuse BLOCKS ON, and the difference is the\n"
-            "KIND of sentence rather than its strength. Every other level here is inferred. A fence\n"
-            "is an imperative a person wrote about this row, naming the seat it belongs to, and two\n"
-            "rows in the whole ledger carry one -- so refusing on it cannot produce a token-match\n"
-            "sweep. Brief the seat the fence names."
-        )
-    if tree_off is None:
-        print(
-            "CLEAR IS NOT PROOF OF UNBUILT, AND THIS IS THE HALF NOBODY GUESSES. The tree above is\n"
-            "LANDED code, and built work does not always land: a row finished onto a branch that\n"
-            "never reached origin comes back clear here, and the strongest signal this gate has\n"
-            "would have missed a finished job. A tree hit is a four-minute read, never a verdict."
-        )
-    else:
-        print(
-            "THE TREE WAS NOT ASKED, so this run cannot see a row that is fully built and shipped\n"
-            "with NOTHING IN ITS TEXT SAYING SO. Every level above came from prose somebody wrote\n"
-            "about the code. That is the class #1300 belongs to, and no amount of careful reading\n"
-            "finds it. Re-run without --no-tree, or fetch the ref, before spending a lane-window."
-        )
-    if args.refuse:
+        if must_read:
+            # THE QUALIFIER IS LOAD-BEARING NOW THAT A FENCE BLOCKS. Left unqualified, this paragraph
+            # would tell a reader --refuse never blocks on a MUST BE READ while the exit code did
+            # exactly that -- a compensating control resting on a false premise, in the output of the
+            # tool that carries it.
+            print(
+                "A MUST BE READ ROW INFERRED FROM PROSE OR FROM THE TREE IS NOT REFUSED, AND --refuse\n"
+                "DOES NOT BLOCK ON ONE. A row can be stale in either direction, whether the claim came\n"
+                "from its own sentence or from the tree. Blocking on it would rebuild the screen #1394\n"
+                "records, which discarded 46 percent of the live ledger on a token match."
+            )
         if fenced:
-            named = ", ".join(f"#{n}" for n in fenced)
-            print(f"--refuse given: DISPATCH-FENCED, so not to a build lane: {named}.")
-        if refused or unknown:
-            print("--refuse given: the wave contains undeclared or unknown items.")
-        if refused or unknown or fenced:
-            return 1
-    return 0
+            print(
+                "A DISPATCH FENCE IS THE ONE MUST BE READ --refuse BLOCKS ON, and the difference is the\n"
+                "KIND of sentence rather than its strength. Every other level here is inferred. A fence\n"
+                "is an imperative a person wrote about this row, naming the seat it belongs to, and two\n"
+                "rows in the whole ledger carry one -- so refusing on it cannot produce a token-match\n"
+                "sweep. Brief the seat the fence names."
+            )
+        if tree_off is None:
+            print(
+                "CLEAR IS NOT PROOF OF UNBUILT, AND THIS IS THE HALF NOBODY GUESSES. The tree above is\n"
+                "LANDED code, and built work does not always land: a row finished onto a branch that\n"
+                "never reached origin comes back clear here, and the strongest signal this gate has\n"
+                "would have missed a finished job. A tree hit is a four-minute read, never a verdict."
+            )
+        else:
+            print(
+                "THE TREE WAS NOT ASKED, so this run cannot see a row that is fully built and shipped\n"
+                "with NOTHING IN ITS TEXT SAYING SO. Every level above came from prose somebody wrote\n"
+                "about the code. That is the class #1300 belongs to, and no amount of careful reading\n"
+                "finds it. Re-run without --no-tree, or fetch the ref, before spending a lane-window."
+            )
+        if args.refuse:
+            if fenced:
+                named = ", ".join(f"#{n}" for n in fenced)
+                print(f"--refuse given: DISPATCH-FENCED, so not to a build lane: {named}.")
+            if refused or unknown:
+                print("--refuse given: the wave contains undeclared or unknown items.")
+            if refused or unknown or fenced:
+                return 1
+        return 0
+    except UnicodeEncodeError as exc:
+        # ASCII ONLY, DELIBERATELY -- this is the message printed when stdout could not carry
+        # the ledger's own characters, so it must not repeat that failure on its way out.
+        print(
+            f"PRINT FAILURE (exit {EXIT_PRINT_FAILURE}) -- NOT a --refuse fence. The listing "
+            f"above stopped mid-item because stdout could not carry a character from the ledger: "
+            f"{exc}. This exit code means the LISTING failed, not that any item was refused; "
+            f"re-run after fixing the stream's encoding before treating it as evidence either "
+            f"way.",
+            file=sys.stderr,
+        )
+        return EXIT_PRINT_FAILURE
 
 
 if __name__ == "__main__":

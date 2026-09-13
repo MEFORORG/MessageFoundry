@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1471: an AD account is bound to the directory's IMMUTABLE id, not to its recyclable name.
 
 **WHAT IS AND IS NOT EXERCISED HERE, stated so a green is not over-read.** There is no Active

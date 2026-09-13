@@ -127,8 +127,15 @@ class _FakeLeasePool:
         # release-retry tests ask "was a second UPDATE sent at all", and a row that already reads
         # released cannot distinguish a re-sent write from a write that never happened twice.
         self.on_execute_args: Callable[[tuple[object, ...]], None] | None = None
+        # The per-statement timeout the claim was issued with (ADR 0157 Inc 0's clamp), as asyncpg
+        # would receive it. Recorded rather than only asserted so a test can pin the VALUE that
+        # reached the statement, not merely that some keyword arrived.
+        self.last_fetchrow_timeout: float | None = None
 
-    async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
+    async def fetchrow(
+        self, sql: str, *args: object, timeout: float | None = None
+    ) -> dict[str, object] | None:
+        self.last_fetchrow_timeout = timeout
         if self.yield_in_fetchrow:
             await asyncio.sleep(0)  # the claim round trip is in flight; let another task run
         if self.fail:
@@ -186,6 +193,7 @@ def _coord(
     heartbeat: float = 10.0,
     acquire_delay_seconds: float = 0.0,
     promotable: bool = True,
+    lease_renew_timeout_seconds: float = 5.0,
 ) -> DbCoordinator:
     return DbCoordinator(
         pool,
@@ -193,6 +201,7 @@ def _coord(
         heartbeat_seconds=heartbeat,
         leader_lease_ttl_seconds=ttl,
         leader_fence_timeout_seconds=fence,
+        lease_renew_timeout_seconds=lease_renew_timeout_seconds,
         acquire_delay_seconds=acquire_delay_seconds,
         promotable=promotable,
         monotonic=mono,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-backend store contract for ``get_user_by_directory_object_id`` (BACKLOG #1471).
 
 **This is the lookup the whole name-recycle defence resolves through**, and it shipped with no

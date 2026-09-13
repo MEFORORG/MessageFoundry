@@ -269,7 +269,9 @@ retractions. At least these went:
 - the ultracode warn-and-offer gate, as a rule binding a Builder. It still binds the Manager, for
   the same reason the planning gate does: the Manager is the seat that can warn somebody and wait;
 - `/clear` and `/compact` as the fix for a stuck session;
-- declaring your own seat with `seat.ps1 -Declare`;
+- declaring your own seat with `seat.ps1 -Declare`, **as a RULE. The MECHANISM stayed and has
+  since become load-bearing for something that did not exist then -- see "Declare your seat"
+  below, and declare anyway;**
 - routing owner questions through a Liaison.
 
 Seven seats went with them: Dispatcher, Liaison, PM, Cleaner, Role Manager, Process Improvement,
@@ -291,6 +293,35 @@ naming** as stale and follow this section. **Do not extend it to the whole docum
 often leaves a mechanism running on purpose, with the reason recorded beside it -- `.github/` headers
 are the source of record for what CI still reads and why. A mechanism this section does not mention
 is not thereby retired; this section binds on seats and rules, not on the machine's inventory.
+
+### Declare your seat, which is the one retired mechanism you should still run
+
+    pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"
+
+On arrival. One command, nothing to wait for, so it deadlocks nobody.
+
+**IT IS NOW THE ONLY THING THAT MAKES A SEAT FINDABLE FROM ANOTHER CLAUDE ACCOUNT, and that was not
+true when it was retired.** Measured 2026-09-12: `SendMessage` and `ListAgents` do not cross
+accounts -- a Lander enumerated exactly two peers, both on its own config root, while a session on a
+different account held finished work for it and kept retrying an address that cannot resolve. The
+coordination directory DOES cross: six config roots write seat records into one `.git/mefor-coord/`.
+**But a mailbox is keyed by WORKTREE while a searcher is looking for a SEAT**, so guessing a box from
+a role name finds only the dead ones. The seats registry is the bridge, and it bridges only if you
+declared: that Lander's record was live that minute, 158 writes that day, with `seat` absent and
+`declaredAt` null. **A live record with no seat is indistinguishable from no record at all.**
+
+**WHY IT WAS RETIRED IS NOT RECORDED, AND BOTH AVAILABLE EXPLANATIONS FAIL.** Written down so nobody
+re-derives them. `f0e1365bc` retired a section on the stated ground that four of its rules deadlock a
+one-turn Builder -- wait for a go, the ultracode gate, `/clear`, and ask before pushing. Declaring is
+not one of the four. The Builder section below says *"It CAN declare its own seat, through the Bash
+tool"*, measured the same day. And the retired rule's own stated purpose, feeding the fleet view,
+survives: `scripts/coord/fleet.ps1` is a live pure reader over the seats layer. **So treat the
+retirement as unexplained rather than as a judgement you would be overturning by declaring.**
+
+korus `roles/COMMON.md`, section *"The seat registry is the only channel that crosses accounts"*,
+carries the read side: how to find a live seat from any account, and why that search must sort by
+recency.
+
 
 ### The KORUS roster, and only these seats
 

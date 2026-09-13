@@ -233,7 +233,7 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
     return build_outbound_connection(
         name,
         spec,
-        retry=_policy(RetryPolicy, table.get("retry"), "retry", where),
+        retry=_policy(RetryPolicy, _coerce_retry_forever(table.get("retry")), "retry", where),
         ordering=_enum(OrderingMode, table["ordering"], "ordering", where)
         if table.get("ordering") is not None
         else None,
@@ -411,3 +411,19 @@ def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M 
         return model_cls(**raw)
     except (ValueError, TypeError) as exc:
         raise WiringError(f"{where}: invalid {key} — {exc}") from exc
+
+
+def _coerce_retry_forever(raw: Any) -> Any:
+    """BACKLOG #1217 half 2. TOML has no null literal, so a per-outbound retry-forever posture
+    (``[outbound.retry] max_attempts = "forever"``, case-insensitive) needs a string spelling here —
+    mirrors the ``[delivery]`` global's field validator on ``DeliverySettings.retry_max_attempts``
+    (``config/settings.py``). Anything else (not a table, no ``max_attempts`` key, or a value that
+    isn't the literal word) passes through untouched so ``_policy``'s "must be a table" check and
+    :class:`~messagefoundry.config.models.RetryPolicy`'s own validation still fire exactly as before.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    value = raw.get("max_attempts")
+    if isinstance(value, str) and value.strip().lower() == "forever":
+        return {**raw, "max_attempts": None}
+    return raw

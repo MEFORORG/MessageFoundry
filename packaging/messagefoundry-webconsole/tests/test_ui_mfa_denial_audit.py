@@ -176,3 +176,151 @@ async def test_the_console_uses_the_engines_own_action_name(engine: Engine, path
 
     actions = {str(r["action"]) for r in await engine.store.list_audit(limit=200)}
     assert _ACTION in actions, f"no {_ACTION} row; the console wrote {sorted(actions)}"
+
+
+# --- the step-up factories --------------------------------------------------------------------------
+#
+# Every test above drives a plain require_ui route. require_ui_step_up and require_ui_step_up_action
+# built their base with allow_mfa_pending=True, which switched the audited gate OFF and refused with a
+# bare redirect of their own, so none of the tests above could see the silence on those routes.
+
+#: Sent on every request so assert_same_origin passes. A cross-site 403 would land before the gate
+#: this file is about, and prove nothing about it.
+_SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "role", "location"),
+    [
+        pytest.param(
+            "GET",
+            "/ui/messages/search",
+            Role.OPERATOR,
+            "/ui/reauth?next=/ui/messages/search",
+            id="step_up-get",
+        ),
+        pytest.param(
+            "POST",
+            "/ui/cluster/stepdown",
+            Role.ADMINISTRATOR,
+            "/ui/reauth?next=/ui/cluster/stepdown-confirm",
+            id="step_up-post-with-reauth_next",
+        ),
+        pytest.param(
+            "POST",
+            "/ui/account/mfa/disable",
+            Role.OPERATOR,
+            "/ui/reauth?next=/ui/account/mfa/disable",
+            id="step_up_action",
+        ),
+    ],
+)
+async def test_a_step_up_route_refusal_writes_an_mfa_denial_row(
+    engine: Engine, method: str, path: str, role: Role, location: str
+) -> None:
+    """RED when: a step-up factory refuses a pending session without the audited gate.
+
+    BOTH halves are asserted, because each guards a different mistake. The row is the defect. The
+    Location is what ``allow_mfa_pending`` was added to protect: a fix that restored the row by
+    sending the browser to ``/ui/mfa``, or by answering a bare 403, would pass a row-only test while
+    losing the continuation the operator clicked. One case per factory shape: a step-up GET, a step-up
+    POST whose continuation ``reauth_next`` remaps, and the action-bound factory.
+    """
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", role)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        assert await _mfa_denials(engine) == [], (
+            "the login itself wrote an mfa_denied row, so a row found below would prove nothing"
+        )
+
+        r = await c.request(method, path, headers=_SAME_ORIGIN)
+        assert r.status_code == 303, f"expected the reauth redirect, got {r.status_code}"
+        assert r.headers["location"] == location, (
+            "the refusal lost its continuation, which is the behaviour allow_mfa_pending existed for"
+        )
+
+    rows = await _mfa_denials(engine)
+    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert rows[0]["actor"] == "op"
+    assert path in str(rows[0]["detail"]), f"the row must name the refused path: {rows[0]!r}"
+
+
+async def test_a_pending_session_cannot_learn_which_step_up_permissions_it_holds(
+    engine: Engine,
+) -> None:
+    """RED when: a step-up factory checks permissions before the MFA gate.
+
+    ``require_ui`` states the rule in its own comment: a pending session must not learn whether it
+    holds a permission. With the gate switched off in the base, a password-only cookie got a 403 from
+    an admin form its user lacks and a redirect from one it holds, which is a free map of the victim's
+    authority. The JSON twin refuses both the same way, before its permission loop runs.
+    """
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)  # holds no users:manage
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        r = await c.get("/ui/users/new")
+        assert r.status_code == 303, f"a pending session saw {r.status_code}, not the MFA refusal"
+        assert r.headers["location"] == "/ui/reauth?next=/ui/users/new"
+
+    actions = [str(row["action"]) for row in await engine.store.list_audit(limit=200)]
+    assert actions.count(_ACTION) == 1, f"expected one {_ACTION} row, the store holds {actions}"
+    assert "auth.permission_denied" not in actions, (
+        "the permission loop ran for a pending session, so its result reached the caller"
+    )
+
+
+@pytest.mark.parametrize(
+    ("require_mfa", "charged"),
+    [pytest.param(True, False, id="pending"), pytest.param(False, True, id="control-satisfied")],
+)
+async def test_a_pending_session_spends_no_admin_write_budget_on_a_step_up_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, require_mfa: bool, charged: bool
+) -> None:
+    """RED when: the admin-write charge runs before the MFA gate on a step-up route.
+
+    The budget is per actor. A password-only cookie that could spend it could throttle the real
+    operator's writes without ever passing the second factor; the JSON twin charges only after its
+    MFA gate. The satisfied case is the control: it proves the spy is wired, so the pending case's
+    empty list means "not charged" and not "not observed".
+    """
+    service = await _service(engine, require_mfa=require_mfa)
+    await _add(service, "op", Role.OPERATOR)
+    calls: list[str] = []
+    real = service.allow_admin_write
+
+    def spy(user_id: str) -> bool:
+        calls.append(user_id)
+        return real(user_id)
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        monkeypatch.setattr(
+            service, "allow_admin_write", spy
+        )  # after login, so only the route counts
+        r = await c.post("/ui/account/mfa/disable", headers=_SAME_ORIGIN)
+        assert r.status_code == 303
+
+    assert bool(calls) is charged, f"allow_admin_write calls: {calls}"
+
+
+async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: Engine) -> None:
+    """RED when: the audit is placed on a step-up factory's freshness branch.
+
+    A satisfied session with no fresh action-bound proof is refused too, and to the same page. That
+    refusal is an ordinary step-up, not a second-factor denial, and recording it as one would put a
+    false MFA row on every sensitive action an operator takes.
+    """
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        r = await c.post("/ui/account/mfa/disable", headers=_SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/disable"
+
+    assert await _mfa_denials(engine) == [], "a step-up refusal was recorded as an MFA denial"
