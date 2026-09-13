@@ -74,7 +74,6 @@ _HISTORICAL = (
     "docs/adr/",
     "docs/releases/",
     "docs/BACKLOG.md",
-    "docs/archive/backlog/BACKLOG-CLOSED.md",
     "docs/reviews/",
     "docs/benchmarks/results",
 )

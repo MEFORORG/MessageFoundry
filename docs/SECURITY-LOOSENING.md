@@ -259,7 +259,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   factor over the network. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
-- **Scope correction ([BACKLOG #326](archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off)):** "a declared reverse proxy" above means exactly
+- **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly
   `[api].tls_terminated_upstream` — the bind-and-proxy posture, **independent of the browser console**. The
   shipped predicate additionally required the console to be *served*, which the ADR 0143 auto-degrade had
   already turned off, so a loopback-behind-a-declared-proxy instance would not have reached this refusal at

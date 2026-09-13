@@ -96,7 +96,9 @@ _REPLAY_SKIPS = frozenset({"ledger-gate", "forbidden-content"})
 #: CURRENT CORPUS, not by construction, which is why they are regexes too rather than substrings.
 _MIRRORS: dict[str, str] = {
     "ledger-gate": r"python\s+scripts/hooks/ledger_check\.py",
-    "backlog-parses": r"python\s+scripts/docs/backlog_status_check\.py",
+    # `backlog-parses` stood here, mirroring `python scripts/docs/backlog_status_check.py`. The hook,
+    # the script and the ledger they read all left in one change (BACKLOG #1250), so the pair is
+    # gone rather than half-removed -- which is the state this file exists to detect.
     "forbidden-content": r"python\s+scripts/security/scan_forbidden\.py",
     "licence-header": r"python\s+scripts/quality/licence_header_check\.py",
     "control-char": r"python\s+scripts/quality/control_char_check\.py",

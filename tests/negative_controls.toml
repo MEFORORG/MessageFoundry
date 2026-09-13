@@ -526,26 +526,65 @@ three-name enumeration. The wrong string was live in two files for months and is
 [[control]]
 context = "a PR that implements BACKLOG #N must update BACKLOG.md"
 plants = """
-A synthetic repository shaped like the PR this gate exists to police: a branch that claims
-`BACKLOG #42` and changes engine code and nothing else, while `main` has separately moved
-docs/BACKLOG.md since the branch point. The gate's OWN shell is lifted out of the workflow and run
-against it -- not a re-implementation, which would be a second copy free to agree with itself.
+THE PLANTED VIOLATION MOVED WITH THE SUBJECT (BACKLOG #1250), AND THE CONTEXT DID NOT. The numbered-item
+ledger left this repository: docs/BACKLOG.md is a stub and docs/archive/backlog/ is gone, so the job
+this string names is now a deliberate no-op that prints why. There is no banner here to leave
+un-updated, so the old plant -- a synthetic repository claiming `BACKLOG #42`, changing engine code and
+leaving the ledger alone -- has nothing left to be planted in, and the three tests that ran the gate's
+own shell against it went with it.
+
+WHAT CAN STILL FAIL IS THE CONTEXT REPORTING AT ALL, and that failure is strictly worse than the one it
+replaces. This string is an identifier in BRANCH PROTECTION, which is not an in-repo setting. A required
+context that never reports does not go red -- it WEDGES, and nothing merges, in the queue or out of it.
+So the plant is now AT LEAST these two edits that would silence it: renaming or deleting the job that
+carries the string, and a concurrency key that lets one queue entry cancel another (a cancelled required
+check can never go green, so the entry is evicted rather than failed -- backlog-hygiene.yml's own
+`concurrency` comment carries that measurement and it is not restated here).
+
+ONE SILENCING EDIT IS NAMED HERE AND COVERED BY NOTHING, and it is written down rather than left for the
+next reader to discover: DROPPING THE `merge_group:` TRIGGER. Branch protection evaluates required
+contexts on the merge-group commit, so without that trigger this context never reports in the queue and
+nothing merges -- the same wedge, reached by a third route. backlog-hygiene.yml's `on:` block carries a
+DO-NOT-REMOVE comment against exactly this, and a comment is the only thing holding it: as measured on
+2026-09-13, no test in this suite asserts that a required context's workflow declares `merge_group`.
+The two red nodes below do NOT cover it, and must not be read as if they did.
+
+THE FIRST RED NODE IS THE CLA CONTROL'S GREEN NODE, AND THAT IS NOT A COPY-PASTE. A node's arm is
+relative to the violation planted. Under `cla` the plant is a wrong context STRING, so resolving to a
+real job is the benign shape that must hold; here the plant IS the job going away, so the same
+assertion is the one that reddens.
 """
 red = [
-  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone",
-  "tests/test_merge_gate_controls.py::test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request",
+  "tests/test_required_contexts.py::test_every_required_context_matches_a_real_job",
+  "tests/test_workflow_concurrency_keys.py::test_no_workflow_groups_two_pull_requests_under_one_concurrency_key",
 ]
 holds = """
-Four benign shapes must stay green: no claim at all, a claim honoured in the live ledger, a claim
-honoured in the ARCHIVE (an item retired between the claim and the PR), and a bare `#42`, which is a PR
-number in this repo rather than an item. A gate that failed all four would satisfy the planted case and
-block every pull request in the repository.
+Two benign shapes must stay green, one per planted edit. The shipped key
+`backlog-hygiene-${{ github.ref }}` must NOT be condemned on the two events this workflow actually
+declares -- `github.ref` is unique per queue entry and stable per pull request on both `merge_group` and
+`pull_request` -- while the same expression on `pull_request_target` must be. A checker that reddened
+uniformly would condemn the shipped key and force an edit that reintroduces the eviction it exists to
+prevent. And the resolver must not be satisfiable by requiring everything: jobs that cannot report on an
+ordinary pull request have to stay OUT of the required set, which is the opposite failure from the one
+planted above.
 """
 green = [
-  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone",
-  "tests/test_merge_gate_controls.py::test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture",
+  "tests/test_workflow_concurrency_keys.py::test_the_checker_separates_the_defect_from_the_five_correct_siblings",
+  "tests/test_required_contexts.py::test_advisory_and_path_gated_jobs_are_not_required",
 ]
 observed = """
+THE NO-OP IS GREEN BECAUSE THERE IS NOTHING TO CHECK, NOT BECAUSE A RULE WAS SATISFIED, and this entry
+must not be read as coverage of the banner rule. Enforcement over that rule travels with the ledger to
+the repository that now holds it; whether the receiving repository carries an equivalent gate is not
+observable from this tree and is not claimed here.
+
+WHAT WAS OBSERVED HERE, 2026-09-13: the three nodes this block used to name were deleted alongside the
+gate's shell, and `unresolved_nodes()` reported all three -- reddening the tier on a real dangling
+reference, which is the resolver doing its job. The four nodes above resolve and pass.
+
+THE PRE-FIX EVIDENCE BELOW IS KEPT RATHER THAN DELETED, on this file's own standing rule: it is a ledger
+of controls that failed to catch things, and that record does not expire with its subject.
+
 RUN AGAINST THE PRE-FIX GATE, which is what makes this evidence rather than a claim. The identical
 fixture goes RED (exit 1) through the shipped three-dot diff and GREEN (exit 0) with only the diff form
 reverted to two-dot. That reproduces the recorded defect exactly: the two-dot form reports main-side

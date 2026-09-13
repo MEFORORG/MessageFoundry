@@ -1,7 +1,22 @@
-# The ledger gate — ADR / BACKLOG number allocation
+# The ledger gate -- ADR number allocation
 
-**What it does in one line:** it makes it impossible for two concurrent sessions to take the same ADR or
-BACKLOG number — the one collision in this repo that **merges cleanly and corrupts silently**.
+> **THE BACKLOG HALF OF THIS DOCUMENT IS HISTORY, NOT INSTRUCTION (BACKLOG #1250, #1754).**
+> The numbered-item ledger moved to the maintainer-internal repository on 2026-09-13.
+> `scripts/coord/alloc.ps1` no longer accepts `-Kind backlog` -- PowerShell refuses it at parameter
+> binding -- and `PUBLIC_BACKLOG_FLOOR`, the `#1000` partition, the residual warning, the boundary
+> ratchet and the gate's item-destruction arm were all removed with it.
+>
+> **Every `-Kind backlog` command below will now fail, and every claim about a backlog floor,
+> partition or item namespace describes a machine that is gone.** They are kept rather than deleted
+> because the reasoning is the argument for the ADR half that remains, and because a reader who meets
+> the retired shape somewhere else needs to know what it was. Read anything about backlog numbers as
+> a record of what this repository used to do.
+>
+> **What still binds: the ADR half.** ADRs live in `docs/adr/` here, two sessions can still collide on
+> one number, and `alloc.ps1 -Kind adr` is still the only correct way to take one.
+
+**What it does in one line:** it makes it impossible for two concurrent sessions to take the same ADR
+number -- the one collision in this repo that **merges cleanly and corrupts silently**.
 
 Companion to [WORKTREE-GATE.md](WORKTREE-GATE.md). That one stops sessions trampling one working tree;
 this one stops them colliding in a *number space* that git cannot see.
@@ -39,11 +54,12 @@ reaches `docs/adr/README.md`, so the ADR becomes invisible. Three had already be
 ### 1. Allocate, never guess — `scripts/coord/alloc.ps1`
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr      -Title "Worktree gate"
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -Title "Ledger allocator"
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # allocates nothing; still fetches
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor -NoFetch   # offline, and stale by design
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -ShowFloor   # allocates nothing; still fetches
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -ShowFloor -NoFetch   # offline, and stale by design
+
+# -Kind backlog is REFUSED at parameter binding. See the banner at the top of this file.
 ```
 
 `-ShowFloor` prints the computed floor, **the paths it swept**, the sub-partition maximum and the number

@@ -112,15 +112,14 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
         foreach ($n in @($listed)) { if ($n -match "/$pad-") { return $true } }
         return $false
     }
-    foreach ($ledger in @('docs/BACKLOG.md', 'docs/archive/backlog/BACKLOG-CLOSED.md')) {
-        $present = & git -C $RepoRoot ls-tree --name-only 'origin/main' $ledger 2>$null
-        if ($LASTEXITCODE -ne 0) { return $null }
-        if (-not $present) { continue }
-        $body = & git -C $RepoRoot show "origin/main:$ledger" 2>$null
-        if ($LASTEXITCODE -ne 0) { return $null }
-        foreach ($ln in @($body)) { if ($ln -match "^##\s+$([regex]::Escape($Number))\.") { return $true } }
-    }
-    return $false
+    # A BACKLOG NUMBER CANNOT BE ANSWERED FROM THIS REPOSITORY ANY MORE (BACKLOG #1250).
+    # The ledger moved to the maintainer-internal repo, so there is nothing here to read.
+    #
+    # $null is this function's own CANNOT TELL, and the caller already treats it as at-risk.
+    # $false would be worse than wrong: it asserts the number is ABSENT from main, which is a
+    # claim no evidence in this clone supports, and it would let a worktree holding a live
+    # backlog claim be removed quietly.
+    return $null
 }
 
 if ($allocDirRoot -and (Test-Path -LiteralPath $allocDirRoot)) {

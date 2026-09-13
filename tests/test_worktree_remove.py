@@ -441,13 +441,20 @@ def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "ba
     return f
 
 
-def _put_on_main(fx: Fixture, body: str) -> None:
-    """Put a docs/BACKLOG.md on origin/main WITHOUT touching the working tree, so the guard's
-    ls-tree/show read is what is exercised rather than a file on disk."""
-    (fx.primary / "docs").mkdir(exist_ok=True)
-    (fx.primary / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
-    _git(fx.primary, "add", "docs/BACKLOG.md")
-    _git(fx.primary, "commit", "-qm", "ledger")
+def _put_adr_on_main(fx: Fixture, number: str) -> None:
+    """Put an ADR on origin/main WITHOUT touching the working tree, so the guard's ls-tree read is
+    what is exercised rather than a file on disk.
+
+    THIS USED TO PLANT A docs/BACKLOG.md. The ledger left this repository (BACKLOG #1250), so
+    `remove.ps1` can no longer answer "did this backlog number land" and returns its CANNOT TELL --
+    which the caller treats as at-risk, by design. ADR numbers are still here, so the control moved
+    to the kind that has an answer.
+    """
+    adr = fx.primary / "docs" / "adr"
+    adr.mkdir(parents=True, exist_ok=True)
+    (adr / f"{number}-already-landed.md").write_text(f"# ADR {number}\n", encoding="utf-8")
+    _git(fx.primary, "add", "docs/adr")
+    _git(fx.primary, "commit", "-qm", "adr")
     head = _git(fx.primary, "rev-parse", "HEAD").strip()
     _git(fx.primary, "update-ref", "refs/remotes/origin/main", head)
 
@@ -464,10 +471,15 @@ def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixtur
 
 def test_removal_PROCEEDS_when_the_owned_number_is_already_on_main(fx: Fixture) -> None:
     """THE CONTROL THAT MAKES THE REFUSAL ABOVE MEAN SOMETHING. Without it, a guard that refused
-    unconditionally would pass every other test here and block every removal in the repo."""
+    unconditionally would pass every other test here and block every removal in the repo.
+
+    ON AN ADR NUMBER, because that is the only kind this repository can still answer for since the
+    ledger moved (BACKLOG #1250). A backlog number now returns CANNOT TELL, so it can no longer
+    carry the PROCEEDS arm -- see `_put_adr_on_main`.
+    """
     wt = fx.add("alpha")
-    _write_alloc(fx, "9102", wt)
-    _put_on_main(fx, "# Backlog" + chr(10) * 2 + "## 9102. already landed" + chr(10))
+    _write_alloc(fx, "9102", wt, kind="adr")
+    _put_adr_on_main(fx, "9102")
 
     proc = run(fx, "-Name", "alpha")
     assert proc.returncode == 0, proc.stderr

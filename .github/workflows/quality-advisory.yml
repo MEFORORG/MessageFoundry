@@ -94,6 +94,24 @@ concurrency:
 permissions: {}
 
 jobs:
+
+  # THREE ADVISORY JOBS STOOD HERE AND RETIRED WITH THEIR SUBJECT (BACKLOG #1250).
+  #
+  #   dangling-citations    reported a `#N` backlog citation naming no filed item  (BACKLOG #1431)
+  #   verdict-divergence    reported an open item whose banner contradicted its own re-score line
+  #                                                                                (BACKLOG #1342)
+  #   deferral-resolution   reported an open row still declaring a condition the register records
+  #                         as settled                                             (BACKLOG #1527)
+  #
+  # Every one read the numbered-item ledger, which left this repository. Their tools went with them.
+  #
+  # ***THEY WERE NOT LEFT IN PLACE, AND `continue-on-error` IS WHY THAT MATTERED.*** None of them
+  # gated a merge, so an absent corpus would not have reddened anything -- each would have run,
+  # found nothing, and written "nothing found" to the job summary in the same formatting a real
+  # measurement uses. A reader cannot tell that from a clean bill, and the count printed beside it
+  # would have been a fact about a file that is not there.
+  #
+  # Their unit tests were deleted in the same change, so nothing is left asserting on them.
   complexity:
     # Signal 11 - cyclomatic-complexity triage. Surfaces functions over the mccabe threshold (>10) so large
     # units are visible in review. Raw complexity is a WEAK defect predictor (rubric section 2), so this is
@@ -814,176 +832,6 @@ jobs:
           # the log rather than silently swallowed.
           if-no-files-found: warn
 
-  dangling-citations:
-    # BACKLOG #1431 -- a working detector that ran nowhere.
-    #
-    # `scripts/docs/dangling_citation_check.py` reports a `#N` backlog citation that names no item in
-    # EITHER ledger. Until this job, the SCRIPT was invoked by no workflow and no pre-commit hook:
-    # measured at 46ea10a78 with controls in the same pass, the script path occurs 0 times across
-    # .github/ plus .pre-commit-config.yaml, while backlog_citation_check.py (a real `run:`) occurs
-    # once and an invented path occurs 0 times. Only its TEST was wired, via ci.yml's DOC_GUARDS.
-    #
-    # WHY IT RUNS HERE AND CANNOT GATE. Four independent things keep it advisory, and
-    # tests/test_dangling_citation_advisory.py pins the three a repository test can see:
-    #   1. this workflow holds no required context (.github/required-contexts.txt records that it must
-    #      never be promoted) -- branch-protection membership is the only thing that decides gating;
-    #   2. `--advisory` makes a live-shape finding exit 0 rather than 1, which is this tool's default;
-    #   3. `continue-on-error: true` means even the checker's own empty-population REFUSAL cannot fail
-    #      the job -- it shows as a warning on a green job, which is the visibility this wants;
-    #   4. this job is deliberately absent from `liveness`'s `needs`, so it cannot redden the one job
-    #      in this file that is built to go red.
-    #
-    # THE EXIT CODE IS NOT SWALLOWED WITH `|| true`, and that is the point of (3). With `--advisory`
-    # the only way this tool exits non-zero is a GENUINE malfunction -- most plausibly its refusal to
-    # report on an empty population, which is what running from the wrong directory looks like. A
-    # clean scan and a scan that read nothing must not render alike, so that case stays visible as a
-    # red step inside a green job rather than being turned into a silent success.
-    #
-    # NO PATHS FILTER ON THIS WORKFLOW, which is what makes the job worth having: a citation is
-    # introduced by editing PROSE, and the pytest tier that holds this tool's unit test is skipped on
-    # a documentation-only pull request. This job runs on all of them.
-    name: dangling backlog citations (advisory)
-    # OFF PULL REQUESTS, ON THE NIGHTLY CRON AND ON DISPATCH -- see the `clone` job above for the
-    # slot-pressure reasoning, which is the same here and stated once.
-    #
-    # THE PARAGRAPH DIRECTLY ABOVE THIS ONE RESTS ON A PREMISE THAT IS NO LONGER TRUE, and that is
-    # why this job in particular can move while `verdict-divergence` below it cannot. It argues the
-    # job is worth running on every pull request because "the pytest tier that holds this tool's unit
-    # test is skipped on a documentation-only pull request". That was true when it was written. It is
-    # false now, twice over:
-    #   * ci.yml's `tooling` path filter matches `^docs/` and is deliberately NOT gated on `code` --
-    #     the filter says so in place -- so the tier runs on a documentation-only pull request,
-    #     narrowed to the ubuntu leg;
-    #   * ci.yml's ungated doc-guards step names tests/test_dangling_citation_check.py outright, and
-    #     that step exists precisely FOR the documentation-only shape.
-    #
-    # AND THE HARD FINDING IS ALREADY CAUGHT PRE-MERGE, MORE STRICTLY THAN HERE.
-    # tests/test_dangling_citation_check.py::test_no_docs_citation_names_a_number_that_can_still_be_issued
-    # walks the same population this job scans (docs/**/*.md) and ASSERTS it is empty, where this job
-    # runs `--advisory` and only reports. That test is tests/tooling_manifest.txt:99, so it runs in
-    # ci.yml's `tooling` job, which is a `needs:` of `ci-gate` -- a REQUIRED context. A live-shape
-    # citation therefore still fails a required check on every pull request.
-    #
-    # WHAT MOVES TO THE CRON IS THE TRIAGE REPORT, NOT THE GATE: the step summary additionally lists
-    # below-floor numbers and PR/issue/foreign-repo references, which the test does not rule on
-    # because they are not defects. That is a report for a human to read, and a day's latency on it
-    # costs nothing that the required test does not already hold.
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out the source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Report backlog citations that name no filed item (advisory - never gates)
-        continue-on-error: true
-        run: |
-          echo "== backlog citations under docs/ that name no item in either ledger =="
-          echo "== advisory: this reports, it never gates a merge =="
-          TOOL_STATUS=0
-          python3 scripts/docs/dangling_citation_check.py --advisory \
-            > dangling-citations.txt 2>&1 || TOOL_STATUS=$?
-          cat dangling-citations.txt
-          {
-            echo "## Dangling backlog citations"
-            echo ""
-            echo "Advisory only. A reported token is an UPPER BOUND ON CITATIONS, not a count of"
-            echo "defects: a number at or below the allocator high-water mark can never be issued,"
-            echo "and a PR, issue or foreign-repo reference is not a backlog citation at all. Both"
-            echo "kinds are printed so a human judges them. See BACKLOG item 1431 for the triage."
-            echo ""
-            echo '```'
-            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
-            # ENTIRELY, so truncate rather than silently lose the whole summary.
-            head -c 200000 dangling-citations.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$TOOL_STATUS" -ne 0 ]; then
-            echo "::warning title=Dangling-citation scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means a malfunction rather than a finding. See the job log."
-          fi
-          # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
-          # broken scan distinguishable from a clean one.
-          exit "$TOOL_STATUS"
-
-  verdict-divergence:
-    # BACKLOG #1342 -- the second working detector in this repository that ran nowhere, and it lands
-    # here for the same reason the citation job above does rather than by copying it.
-    #
-    # `scripts/docs/verdict_divergence_check.py` reports an OPEN backlog item whose banner
-    # `Verdict:` field contradicts a `Re-scored ... -> X` line in its own body. Every tool reads the
-    # BANNER -- parse_items exposes it, the dispatch gate consults it, dispatch screens filter on it
-    # -- so a contradicted row dispatches as freely workable while its own prose says it must not be.
-    #
-    # WHY IT REPORTS AND CANNOT GATE, which is a decision and not an omission. Wiring it blocking
-    # would red the tree on three rows the item DELIBERATELY refuses to reconcile: which source wins
-    # when banner and prose disagree is an assessor call, not a mechanical one. A gate that fails on
-    # a question nobody has answered is not a gate, it is a merge freeze. Making a check RUN is a
-    # Builder's call; making one BLOCK is the owner's. Promotion stays available and untaken.
-    #
-    # The same four things keep it advisory, and tests/test_verdict_divergence_advisory.py pins the
-    # three a repository test can see: this workflow holds no required context; `--advisory` turns a
-    # finding into exit 0; `continue-on-error: true` means even the checker's REFUSAL cannot fail the
-    # job; and the job is absent from `liveness`'s `needs`.
-    #
-    # THE EXIT CODE IS RE-RAISED, NOT SWALLOWED WITH `|| true`. Under `--advisory` the only non-zero
-    # exit left is 2 -- the checker's refusal to report on an empty population, which is what a dead
-    # `parse_items` or the wrong file looks like. A clean scan and a scan that read nothing must not
-    # render alike, so that stays visible as a red STEP inside a green job.
-    #
-    # NO PATHS FILTER ON THIS WORKFLOW, which is what makes the job worth having: a divergence is
-    # introduced by editing docs/BACKLOG.md, and the pytest tier holding this tool's unit test is
-    # skipped on a documentation-only pull request. This job runs on all of them.
-    #
-    # A SEPARATE JOB, NOT A SECOND STEP IN `dangling-citations`, AND THE COST IS REAL: the two are
-    # trigger-identical, so this pays for one extra runner and one extra checkout per pull request to
-    # run a stdlib-only script for a couple of seconds. Bought deliberately. A job's `name:` IS the
-    # status context, so a separate job is a separate line in the checks list; folded in as a step,
-    # this check appears nowhere until a reader opens a job named after a DIFFERENT check. For a
-    # check whose entire product is visibility, hiding it behind another check's label is the wrong
-    # trade -- and renaming the sibling job to cover both would change a context that a shipped guard
-    # already pins. Revisit if a third ledger check lands and the boilerplate is worth a shared
-    # runner script.
-    name: banner-vs-prose verdict divergence (advisory)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out the source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Report items whose banner contradicts their own re-score (advisory - never gates)
-        continue-on-error: true
-        run: |
-          echo "== open items whose banner Verdict contradicts a Re-scored -> line in their body =="
-          echo "== advisory: this reports, it never gates a merge =="
-          TOOL_STATUS=0
-          python3 scripts/docs/verdict_divergence_check.py --advisory \
-            > verdict-divergence.txt 2>&1 || TOOL_STATUS=$?
-          cat verdict-divergence.txt
-          {
-            echo "## Banner-vs-prose verdict divergence"
-            echo ""
-            echo "Advisory only. A reported row is a DISAGREEMENT, not a defect in either source:"
-            echo "which of the two wins is an assessor decision, and BACKLOG item 1342 leaves it"
-            echo "open on purpose. The denominator is printed beside the count -- a clean run that"
-            echo "compared three items must not read like one that compared them all."
-            echo ""
-            echo '```'
-            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
-            # ENTIRELY, so truncate rather than silently lose the whole summary.
-            head -c 200000 verdict-divergence.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$TOOL_STATUS" -ne 0 ]; then
-            echo "::warning title=Verdict-divergence scan did not complete::the checker exited ${TOOL_STATUS} in advisory mode, which means it measured nothing rather than that it found something. See the job log."
-          fi
-          # Re-raise the checker's status. `continue-on-error` above keeps the JOB green; this keeps a
-          # broken scan distinguishable from a clean one.
-          exit "$TOOL_STATUS"
-
   liveness:
     # THE META-GATE. Every other job here is built so it can never fail; this one is built so it CAN.
     #
@@ -1019,99 +867,3 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python3 scripts/quality/liveness.py verify --needs-json "$NEEDS_JSON"
-
-  deferral-resolution:
-    # BACKLOG #1527 -- a Verdict that defers to a condition recorded the CONDITION and never the
-    # RESOLUTION, so one ruling silently staled three artefacts and no instrument could see any.
-    #
-    # `scripts/docs/deferral_resolution_screen.py` reports every OPEN row whose Verdict statement
-    # declares a deferral, with the age of the declaration, and joins each against the tracked
-    # register at `docs/DEFERRAL-RESOLUTIONS.md`. A row whose condition the register records as
-    # settled is reported as still declaring it -- the measured 2026-09-10 shape, where the owner
-    # lifted the ADR 0056 privileged-helper pause and #1494, #1495 and ADR 0056 all went on saying
-    # the work was paused. Two of those three were repaired by ACCIDENT, by a builder editing
-    # nearby.
-    #
-    # IT RUNS ON EVERY PULL REQUEST, unlike the two cron-gated ledger jobs above it. Their argument
-    # for moving was that a required pytest leg already catches their hard finding pre-merge. That
-    # is not true here: this screen's finding is a DISAGREEMENT between a row and a register, and no
-    # required test asserts that population is empty -- deliberately, because emptiness is not a
-    # property anybody has ruled the ledger must have. A day's latency on a report nothing else
-    # produces is the cost the cron would add, so it is not taken.
-    #
-    # WHY IT REPORTS AND CANNOT GATE. Promotion is the owner's call, not a Builder's (CLAUDE.md
-    # section 5), and the blocking form would be wrong here on its own terms: a stale deferral is
-    # fixed by re-reading a row and re-writing its Verdict, which is an assessor's act. A merge that
-    # cannot land until somebody finishes reading is a freeze, not a gate. The same four properties
-    # keep it advisory as its two siblings, and tests/test_deferral_resolution_screen.py pins the
-    # three a repository test can see: this workflow holds no required context; `--advisory` turns a
-    # finding into exit 0; `continue-on-error: true` means even the screen's REFUSAL cannot fail the
-    # job; and the job is absent from `liveness`'s `needs`.
-    #
-    # THE EXIT CODE IS RE-RAISED, NOT SWALLOWED WITH `|| true`. Under `--advisory` the only non-zero
-    # exit left is 2 -- the screen refusing to report on an empty population, or on an empty
-    # register. Both are what a dead parse or the wrong file looks like, and both must not render
-    # like a clean scan, so they stay visible as a red STEP inside a green job.
-    #
-    # THIS IS THE THIRD COPY OF THE SAME STEP BODY, AND THE SIBLING'S OWN EXPIRY HAS FIRED.
-    # `verdict-divergence` above says: "Revisit if a third ledger check lands and the boilerplate is
-    # worth a shared runner script." It has landed. Recorded here rather than quietly ignored,
-    # because an unmet trigger nobody names reads as if nobody noticed.
-    #
-    # WHAT IS AND IS NOT WORTH FOLDING. That comment's argument has two halves and only one expired.
-    # A separate JOB per check still earns its keep -- a job's `name:` IS the status context, so
-    # folding these into one hides two checks behind a third's label. What expired is the copied
-    # ~28-line shell BODY: the 1 MiB summary cap, the TOOL_STATUS capture and the re-raise idiom now
-    # live in three places, as do the eight wiring assertions in three test files. Three jobs each
-    # calling one shared runner script keeps the contexts and removes the copies.
-    #
-    # NOT TAKEN IN THIS CHANGE, deliberately. A concurrent pull request is appending jobs to this
-    # same file, and a rewrite of all three step bodies underneath it is a merge conflict resolved
-    # by hand over YAML. The extraction is a change of its own with its own item; it is named here
-    # by subject rather than by number, because no number has been allocated for it.
-    #
-    # THE DEFAULT SHALLOW CHECKOUT IS CORRECT HERE, AND THAT IS A CLAIM, NOT AN OVERSIGHT. This
-    # file's own `liveness` job records three signals that reported success for months while
-    # measuring nothing, and diff-coverage died on exactly this -- a shallow clone with no merge
-    # base. This screen reads two TRACKED FILES and no history, so `fetch-depth: 0` would buy
-    # nothing; test_the_job_needs_no_git_history asserts the step body stays that way, because
-    # "correct" and "nobody checked" render identically.
-    name: deferral resolution screen (advisory)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out the source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Report open rows deferring to a condition, aged and joined (advisory - never gates)
-        continue-on-error: true
-        run: |
-          echo "== open rows whose Verdict defers to a condition, with the age of the deferral =="
-          echo "== advisory: this reports, it never gates a merge =="
-          TOOL_STATUS=0
-          python3 scripts/docs/deferral_resolution_screen.py --advisory \
-            > deferral-resolution.txt 2>&1 || TOOL_STATUS=$?
-          cat deferral-resolution.txt
-          {
-            echo "## Deferral resolution"
-            echo ""
-            echo "Advisory only. An AGED row is not a defect -- a deferral may legitimately wait a"
-            echo "long time, and a check that fires on good news gets muted. The finding is the"
-            echo "other class: a row still declaring a condition that docs/DEFERRAL-RESOLUTIONS.md"
-            echo "records as settled. The denominators are printed beside the counts, because a run"
-            echo "that joined nothing must not read like one that joined everything."
-            echo ""
-            echo '```'
-            # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
-            # ENTIRELY, so truncate rather than silently lose the whole summary.
-            head -c 200000 deferral-resolution.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$TOOL_STATUS" -ne 0 ]; then
-            echo "::warning title=Deferral-resolution screen did not complete::the screen exited ${TOOL_STATUS} in advisory mode, which means it measured nothing rather than that it found something. See the job log."
-          fi
-          # Re-raise the screen's status. `continue-on-error` above keeps the JOB green; this keeps a
-          # broken scan distinguishable from a clean one.
-          exit "$TOOL_STATUS"
