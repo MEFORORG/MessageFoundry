@@ -13,10 +13,19 @@ name: Security
 #   `|| true`, `--exit-zero`, and a skippable job-level `if:`) for any job in the required set. To take
 #   a gate off the merge path, remove its context from branch protection AND
 #   `.github/required-contexts.txt` — deliberately, in a reviewed diff. Never neuter it in place.
-# This repo is PUBLIC, so CodeQL runs free and IS a required context (codeql.yml) — it is not gated
-# behind GitHub Advanced Security. This comment previously said "this private repo", written when it
-# was; CodeQL reporting on every PR is itself the disproof. gitleaks below is retained deliberately:
-# it scans on the same run as the other gates rather than relying on native push protection.
+# This repo is PUBLIC, so CodeQL runs free (codeql.yml) -- it is not gated behind GitHub Advanced
+# Security. This comment previously said "this private repo", written when it was; CodeQL reporting
+# on every PR is itself the disproof.
+#
+# IT ALSO SAID CODEQL "IS A REQUIRED CONTEXT", AND THAT WAS FALSE. Running on every pull request and
+# BLOCKING a merge are different properties, and that sentence conflated them.
+# `.github/required-contexts.txt` lists codeql.yml under DELIBERATELY NOT REQUIRED and gives the
+# reason: its SARIF upload needs `security-events: write`, which fork-PR tokens lack, so requiring it
+# would block every fork PR. That file mirrors the server and is the single authority. A header in
+# the workflow a context would gate is a SECOND definition of the required set, free to drift from
+# the first -- which is what this one did, and codeql.yml's own header had it right the whole time.
+# gitleaks below is retained deliberately: it scans on the same run as the other gates rather than
+# relying on native push protection.
 # See docs/SECURITY.md.
 #
 # THE TRIGGER SET IS THE `on:` BLOCK BELOW AND NOTHING ELSE. Each arm carries its own reason there,

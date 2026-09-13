@@ -376,10 +376,14 @@ no commit and no PR the worktree is the only record of what you saw.
 ## Nothing tells anyone your PR is waiting
 
 No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
-green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`, and nothing
-reads that label either.
+green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`. No workflow
+reads that label back, though `scripts/ci/report_ci_red.py` does when a seat runs it by hand, and it
+names the run that reddened each labelled PR. Nothing delivers that to you; you have to ask.
 
-`unread-signal.yml` used to report unread PRs. It was deleted on 2026-09-05 with the review gate,
-because "unread" stopped being a state anything tracked.
+The review gate that made "unread" a tracked state is gone: `review-gate.yml` and the required context
+`a reviewer has read this` were both removed on 2026-09-05. The unread REPORTING was not removed with
+them, so whether `unread-signal.yml` and `scripts/ci/check_unread_prs.py` still run is a separate
+decision. `.github/required-contexts.txt` records what went and what stayed; read it there rather than
+from this page, which is how the two came to disagree.
 
 So say in your PR body what state you left it in. For now the prose is the signal.
