@@ -731,8 +731,17 @@ jobs:
         # a fallback for them -- and on a trigger with no base, whatever the fallback picks is what
         # gets graded. READ THE `on:` BLOCK for the live set; this paragraph used to count them and
         # went stale in a day. The template-injection objection -- an expression interpolated into a `run:` body --
-        # is NOT the reason: this repo already hoists base SHAs into a step `env:` for exactly that
-        # (backlog-hygiene.yml, precommit-replay.yml), so a range would have been reachable.
+        # is NOT the reason: this repo already hoists base SHAs into a step `env:` for exactly that --
+        # ci.yml's changed-file gate sets `BASE_SHA` from `github.event.pull_request.base.sha`, at
+        # least -- so a range would have been reachable.
+        #
+        # THAT EXAMPLE USED TO NAME backlog-hygiene.yml AND precommit-replay.yml, AND BOTH WENT STALE.
+        # Corrected rather than deleted, because it is the same lesson the paragraph above records one
+        # level up: naming another file as an example is a SECOND definition of what that file does,
+        # free to rot when it moves, and nothing reports it. backlog-hygiene.yml became a no-op with no
+        # checkout when the ledger left (BACKLOG #1250); precommit-replay.yml was retired on
+        # 2026-09-13. The point survives both, which is why ONE live example is named rather than a
+        # list: the list is the part that rots.
         run: |
           # `set -o pipefail` EXPLICITLY, AND NOT BY WRITING `shell: bash` (BACKLOG #1481). The scan
           # is piped into `tee` below so its own report can be read back, and GitHub's default `run:`
