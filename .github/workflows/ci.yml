@@ -1111,6 +1111,28 @@ jobs:
       # THE NESTING INVARIANT STILL HOLDS: setup(max) 4:05 + 9 = 13, under webconsole_job_timeout 20.
       # tests/test_ci_step_margin.py checks the arithmetic half of it and passes.
       #
+      # THE GATE'S OWN OUTPUT SAYS "Raising the cap is NOT the fix and this check must not be read as
+      # asking for one", and that sentence was read before this change rather than after. It is still in
+      # scripts/ci/step_margin.py. The rest of it is the part that governs here: "A cap sized against the
+      # work is the fix; the underlying runner slowness is its own item."
+      #
+      # WHICH OF THE TWO THIS IS, ARGUED RATHER THAN ASSERTED. What the sentence forbids is bumping a
+      # number until a warning stops. What it asks for is a cap derived from what the work takes. This cap
+      # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
+      # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
+      # the entire observed range.
+      #
+      # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 against 6:00 a green suite came within 35 seconds
+      # of being KILLED at its cap with zero failing assertions -- the outcome the gate's last clause says
+      # it exists to pre-empt. Leaving the cap at 6 keeps that.
+      #
+      # THE UNDERLYING ITEM IS REAL AND IS NOT CLOSED BY THIS. Two things feed the runtime and only one is
+      # the runner: this suite went from about 356 tests to 497, roughly 40 percent, since the cap was set.
+      # Whether the answer is xdist on this step (it runs with no -n today, on the stale premise that 356
+      # tests in 2-to-4 minutes would not repay worker startup) or a slower-runner escalation, it is its
+      # own change with its own measurement. Named rather than numbered: no item has been allocated for it,
+      # and citing a number nobody allocated is worse than citing none.
+      #
       # THE ~356 FIGURE ABOVE IS STALE AND IS LEFT AS WRITTEN so the drift stays visible: this suite was
       # about 356 tests when that line was authored and is 497 now. The 2-to-4 minute range went with it.
       - name: Web console tests (pytest)
