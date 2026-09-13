@@ -1,5 +1,12 @@
 [build-system]
-requires = ["hatchling"]
+# EXACT `==`, and every [build-system] table in this repository moves in lockstep with this one;
+# tests/test_packaging.py fails if one loosens or they disagree. Unpinned, PEP 517 build isolation
+# installed whatever `hatchling` PyPI served at build time, including inside release.yml's build jobs,
+# which hold `id-token: write` and publish what the backend emits. The pin picks one immutable release.
+# It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
+# that residual and the `--no-isolation` form that would close it. Nothing is known to bump this table
+# automatically, so bump it by hand.
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 # Single source of truth for the version: hatchling reads __version__ from the package module, so the

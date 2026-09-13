@@ -18,9 +18,8 @@ single line of UTF-8 JSON with no byte order mark, ending in a newline. The help
 | Request | What the helper does |
 |---|---|
 | `{"op":"ping"}` | Answers `{"ok":true,"version":"0.1.0"}`. |
-| `{"op":"bind","address":"<ipv4>","interface":"<name>","mask":"<mask>"}` | Adds the address to the adapter. If the address is already there, it succeeds and changes nothing. |
+| `{"op":"bind","address":"<ipv4>","interface":"<name>","mask":"<mask>"}` | Adds the address to the adapter, which is what makes Windows announce it. If the address is already there, it removes and re-adds it, so the announcement happens either way. |
 | `{"op":"release","address":"<ipv4>","interface":"<name>"}` | Removes the address. If the address is already gone, it succeeds and changes nothing. |
-| `{"op":"arp","address":"<ipv4>","interface":"<name>"}` | Announces the address to the adapter's gateway. Read [Known limits](#known-limits) first. |
 
 Every other answer is `{"ok":true}` or `{"ok":false,"error":"<message>"}`. The message is a short fixed
 phrase and never a stack trace. Addresses and masks are dotted decimal, such as `192.0.2.50` and
@@ -291,13 +290,23 @@ gh api --paginate repos/MEFORORG/MessageFoundry/actions/organization-secrets --j
 
 ## Known limits
 
-- **The `arp` announcement is not verified on the wire.** Windows does not transmit when asked to resolve
-  one of its own addresses, so the helper sends an ARP request to the adapter's IPv4 gateway, with the VIP
-  as the source. ADR 0056, "The helper as built", records the measurement. Nobody has confirmed that the
-  request's sender address is the VIP, and the engine must not rely on `arp` until someone does.
-  BACKLOG #1522 has the capture steps.
-- **`arp` needs an IPv4 gateway on the adapter.** Without one, it returns an error.
-- **`bind` and `release` have not yet run against a real adapter.** The netsh commands they run are in
-  `NetOps.cs`.
+- **The helper cannot observe the frame it causes.** `bind` tells you the stack accepted the address. It
+  cannot tell you an ARP frame left the wire, and it never claims to. Confirming that is a packet capture
+  on a real node, not something the helper or a CI assertion can assert. BACKLOG #1522 is the procedure.
+- **The announcement is not finished when `bind` returns.** Measured on Windows Server 2025 build
+  26100.33296 on 2026-09-11: duplicate-address probes run to about 2.3s after the address is added and the
+  gratuitous ARPs follow at about 3.3s and 5.3s. `bind` returns long before that. A caller that treats a
+  successful `bind` as "the peers know" is wrong by roughly five seconds.
+- **`bind` re-plumbs an address that is already present**, because Windows announces only when the address
+  is actually added. That is a delete followed by an add: for those few hundred milliseconds the node does
+  not hold the VIP. The alternative was worse -- the old "already there, change nothing" path emitted no
+  frame at all, which is silent failure in precisely the promotion that needs the announcement most.
+- **Nothing here survives a hardened image unexamined.** The announcement is the Windows IP stack's
+  behaviour, not the helper's. A machine-wide `ArpRetryCount` of 0 is the documented way to suppress
+  address-announcement ARPs, and its effect on this path has NOT been measured. Check it before trusting a
+  locked-down build.
+- **A duplicate address is not handled.** If duplicate-address detection fails -- the VIP genuinely live
+  elsewhere, i.e. the split brain -- the address lands in `Duplicate` state, no announcement is emitted,
+  and `bind` still answers `{"ok":true}`. Reading that state back is not implemented.
 - **The licence-header gate does not read these files.** `scripts/quality/licence_header_check.py` covers
   `.py`, `.ps1`, `.sh`, `.ts`, `.js` and `.go`, so the headers here are kept by hand.
