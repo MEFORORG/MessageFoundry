@@ -106,11 +106,11 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute. |
 | [CI.md](CI.md) | What runs on a PR in **this** repo and which checks gate a merge. Not `ADOPTER-CI.md`. |
 | [Code_Quality_Standards.md](Code_Quality_Standards.md) | The quality rubric. Contains a dated (July 2026) graded self-assessment — treat the grade as a snapshot. |
-| [BACKLOG.md](BACKLOG.md) | **777 KB / 7,157 lines.** The maintainer work surface — ranked, deferred and declined items, including superseded sections. A required CI check keeps it current, but it is *not* a description of the product. For what the engine does, use `FEATURE-MAP.md`; for what is built, `CHANGELOG.md`. |
+| [BACKLOG.md](BACKLOG.md) | A short notice, not a backlog. Planning is maintained privately and is not published here; the page says so and explains why a cited `BACKLOG #N` will not resolve. For what the engine does, use `FEATURE-MAP.md`; for what is built, `CHANGELOG.md`. |
 | [SECURITY-REMEDIATION-LEDGER.md](SECURITY-REMEDIATION-LEDGER.md) | Single-writer coordination ledger for the 2026-06-26 audit-wave remediation. A dated work record, not a posture statement. |
 | [WORKTREES.md](WORKTREES.md) | How do two sessions build at once without wrecking each other's files — a worktree each, its own branch and virtualenv, and why the first push needs `-u`. |
 | [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md) | What stops concurrent sessions colliding, as one estate: the four distinct drift failures, which layers actually enforce, and the audited gaps. |
-| [LEDGER-GATE.md](LEDGER-GATE.md) | Why you allocate an ADR or BACKLOG number instead of grepping for the next free one — the collision that merges clean and corrupts silently, and what the commit hook and the CI leg each refuse. |
+| [LEDGER-GATE.md](LEDGER-GATE.md) | Why you allocate an ADR number instead of grepping for the next free one — the collision that merges clean and corrupts silently, and what the commit hook and the CI leg each refuse. Its backlog half is history; the page says so at the top. |
 | [SESSION-MAIL.md](SESSION-MAIL.md) | The async session-to-session mail lane, for the peers the realtime channel cannot address (VS Code-launched and cross-login sessions). **It is wired and delivering** — the drain hook runs on `SessionStart` and `Stop`, and that page's status section is the record of which config roots. The count moves, so read it there rather than trusting one repeated here. Read its trust boundary and content rule before sending anything: the write side is unauthenticated by design, and delivery copies the body into a transcript no prune reaches. |
 
 ---
@@ -124,7 +124,6 @@ describe plans that were superseded, and several state "next steps" that shipped
 |---|---|---|
 | [benchmarks/](benchmarks/) | ~42 files | Measurement records and inter-session review notes. The numbers are dated; the *method* is the reusable part. |
 | [design/](design/) | 4 files | Engineering design notes behind the threading and sharding ADRs. |
-| [archive/backlog/](BACKLOG.md) | 1 file | Closed backlog items, moved here verbatim when an item closes. |
 | [quality-gates/](quality-gates/) | 1 file | A single gate record. |
 
 `research/` and `archive/throughput/` were here until 2026-08-31, along with the maintainer
