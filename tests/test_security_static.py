@@ -1079,7 +1079,6 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # unpredictability -- a random 128-bit tail is the cheapest way to be sure the name was never
     # committed, and generating it is what keeps it out of the file the probe greps. No key, no
     # secret, no message authentication, nothing user- or PHI-derived: a string asserted to be absent.
-    "scripts/docs/subject_exists_screen.py": frozenset({"secrets"}),
 }
 
 
