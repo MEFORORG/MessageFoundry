@@ -79,7 +79,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 ## 5. Rewrite semantics + PHI (the load-bearing correctness section)
 
 - **Row-scoped splice, never reformat.** `lens rewrite` regenerates only the edited/inserted row's line range from its template; untouched rows/blank lines/comments are byte-preserved (test gate §6.2). No AST unparse of the whole file (stdlib `ast.unparse` discards formatting/comments — rejected); no `libcst` in v1 (new runtime dep, DEP-1 — revisit only if splicing proves brittle, as an ADR amendment).
-- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale. **The first clause is RELAXED for the PROJECTION only by Amendment F (BACKLOG #234); the other three stand unchanged, and live values remain save-gated.**
+- **Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available** — the verified InterSystems/VS Code guardrail set, adopted wholesale. **The first clause is RELAXED for the PROJECTION only by Amendment F (BACKLOG #1759); the other three stand unchanged, and live values remain save-gated.**
 - **Static analysis only.** `lens parse`/`rewrite` never import or execute config modules — a module whose top level would raise still parses. No message content is involved at all in parse/rewrite; **PHI enters only via the live-value annotations, which reuse the ADR 0072 stream and its `--show-phi` gate unchanged** — the lens adds no second PHI gate and no persisted artifact.
 - **IDE trust:** the lens shells the CLI, so it inherits the ADR 0035 workspace-trust exec gate like every other extension CLI call.
 
@@ -90,7 +90,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 3. **Emitted code is first-class:** rewritten files pass `ruff check`, `ruff format --check`, `mypy` (strict), and `messagefoundry check` on the samples corpus.
 4. **Static-only:** a config module with a top-level `raise` parses successfully (proves no import/execution).
 5. **Vocabulary purity:** `actions.py` helpers do no I/O (enforced by review + a no-new-imports test); SPDX header present; **no new runtime dependency** in phases 1–2 (stdlib `ast` only); crypto-inventory gate not tripped (no crypto imports).
-6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only (**the projection half is relaxed by Amendment F — BACKLOG #234; live values still sync on save only**); live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
+6. **IDE:** lens editor degrades to the text editor on parse failure with a notice; edits sync on save only (**the projection half is relaxed by Amendment F — BACKLOG #1759; live values still sync on save only**); live values render redacted unless the existing show-PHI opt-in is set (never auto-enabled).
 
 Two-way door: if the lens disappoints, phase 1's vocabulary remains independently valuable and nothing else in the product depends on the lens.
 
@@ -572,10 +572,10 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
   widening the tracer's frame scope) or SHALL render an explicit "not traced" state distinguishable from
   PHI redaction — never a redacted placeholder that can never resolve.
 
-## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #234)
+## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #1759)
 
 > **Status of this amendment: ACCEPTED — owner-ratified 2026-08-10.** It was written and built ahead of
-> ratification because BACKLOG #234 requires the guardrail it touches to be re-argued in a dated
+> ratification because BACKLOG #1759 requires the guardrail it touches to be re-argued in a dated
 > amendment in the same change; the owner has now ruled, so its acceptance criteria join this ADR's
 > counted bucket under the plain heading below, as Amendment A's and Amendment D's did on ratification.
 > Ratification covers this amendment only: whether to relax the save gate itself stays open (see §C.4).
@@ -644,7 +644,7 @@ document it.
 - **`clearPending()` is unchanged and NOT folded in.** Dropping a queued *param edit* on a structural op
   (the orphaned-queue rule, §5 v2) and deferring a *document refresh* are different rules with different
   reasons; both release sites keep their existing `clearPending()` / `takePending()` behaviour.
-- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #234.
+- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #1759.
 
 ### C.4 A correction this amendment depends on
 
@@ -655,14 +655,14 @@ computed from stale disk content". **That premise is false**, and is corrected i
 view models, exactly as this ADR's 2026-07-10 addendum states ("the rows are projected from the **live
 buffer**"). The disk read belongs to the live-value **trace**, which is separately save-gated by #225.
 
-This matters beyond tidiness: BACKLOG #234's *other* half asks whether a bounded relaxation of the save
+This matters beyond tidiness: BACKLOG #1759's *other* half asks whether a bounded relaxation of the save
 gate is safe, and that question was about to be argued against a premise that does not hold. A
 compensating control must not rest on a false premise (CLAUDE.md §11). The real, surviving reasons for
 the gate are re-shelling Python per keystroke and the fact that each re-projection replaces the entire
 webview HTML — which would destroy focus, selection and any half-typed input mid-word.
 
 **Deliberately not decided here.** Whether to relax the gate to a debounced re-projection on *change* is
-BACKLOG #234's remaining half. It stays open, and it should be decided against the corrected premise
+BACKLOG #1759's remaining half. It stays open, and it should be decided against the corrected premise
 above rather than the false one. This amendment lands the race fix **first**, on purpose: the dropped
 refresh is a defect under the current gate and would widen materially under any relaxation.
 
@@ -1085,7 +1085,7 @@ question before it is checked against these sets.
   samples corpus.
 
 
-## Amendment F (2026-08-26) — the §5 "sync on save only" guardrail is relaxed for the PROJECTION only (BACKLOG #234)
+## Amendment F (2026-08-26) — the §5 "sync on save only" guardrail is relaxed for the PROJECTION only (BACKLOG #1759)
 
 **Status: accepted.** The owner ruled AC 6's "edits sync on save only" **open, and a lane free to relax
 it**. That is permission, not a specification of how; this amendment is the how, and it is deliberately
@@ -1105,7 +1105,7 @@ narrower than the permission granted.
 `render()` pipes `document.getText()` to `lens parse -` over stdin, so rows are projected from the
 buffer, not from disk — §5's addendum says so, and the save gate's own comment carried the opposite
 claim until it was corrected on 2026-08-04. **The disk read belongs only to the live-value trace**,
-which is why that half does not move. BACKLOG #234's own non-goal says the same.
+which is why that half does not move. BACKLOG #1759's own non-goal says the same.
 
 ### F.2 The bound is three conditions, not a timer
 

@@ -708,7 +708,7 @@ export function mergeLiveValues(rows: RowViewModel[], inline: LiveInlineValue[])
 
 /**
  * Which kind of trigger armed a pending re-projection, and therefore whether live values may be
- * attached to it at all (BACKLOG #234).
+ * attached to it at all (BACKLOG #1759).
  *
  * A SAVE-triggered projection may attach them; a CHANGE-triggered one may NOT. This is a SEPARATE and
  * STRICTLY STRONGER condition than {@link shouldAttachLiveValues}, never a replacement for it -- the
@@ -2246,7 +2246,7 @@ export function buildPasteRequest(
  * re-render that would fight the webview (the loop). `endEdit()` releases the slot. Pure + synchronous,
  * so the provider's flow is unit-testable without the Extension Host.
  *
- * A suppressed change is DEFERRED, not dropped (BACKLOG #234). `shouldReactToDocumentChange()` returning
+ * A suppressed change is DEFERRED, not dropped (BACKLOG #1759). `shouldReactToDocumentChange()` returning
  * false is the right answer for OUR OWN `WorkspaceEdit`, but the provider cannot tell that apart from a
  * USER save that happened to land while a `lens rewrite` held the slot — and returning false made the
  * caller return early, discarding the save outright. The view would then keep showing a projection of
@@ -2307,7 +2307,7 @@ export class EditLoopGuard {
 
   /**
    * Record that a document change arrived while the slot was held and was therefore NOT acted on, so the
-   * re-projection it owes can run when the slot frees (BACKLOG #234). Idempotent: a re-projection reads
+   * re-projection it owes can run when the slot frees (BACKLOG #1759). Idempotent: a re-projection reads
    * the whole buffer, so any number of suppressed changes owe exactly one refresh. Prefer
    * {@link releaseEdit} over calling {@link EditLoopGuard.endEdit} directly so the debt is always paid.
    */
@@ -2345,7 +2345,7 @@ export class EditLoopGuard {
 
 /**
  * Release the single edit slot, then run any re-projection a document change owed while the slot was
- * held (BACKLOG #234). THE ONLY sanctioned way to release: calling {@link EditLoopGuard.endEdit}
+ * held (BACKLOG #1759). THE ONLY sanctioned way to release: calling {@link EditLoopGuard.endEdit}
  * directly frees the slot without paying the debt, which is exactly the dropped-save defect — a save
  * that landed mid-rewrite would leave the view showing a stale projection until the user saved again.
  *
@@ -2361,7 +2361,7 @@ export function releaseEdit(guard: EditLoopGuard, onRefreshOwed?: () => void): v
 }
 
 /**
- * The ONE debounced re-projection channel (ADR 0076 §5 "sync on save", Amendment C / BACKLOG #234).
+ * The ONE debounced re-projection channel (ADR 0076 §5 "sync on save", Amendment C / BACKLOG #1759).
  *
  * Two callers ask for a re-projection and they must not stack: the save subscription, and
  * {@link releaseEdit} paying the refresh a suppressed save owed. Both go through {@link schedule}, so
@@ -2428,7 +2428,7 @@ export class RerenderDebouncer<H = unknown> {
  * refusal) never throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is
  * caught, routed to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until
  * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
- * document change suppressed during the drain still gets its re-projection (BACKLOG #234), including on
+ * document change suppressed during the drain still gets its re-projection (BACKLOG #1759), including on
  * the rejected-apply path above. Never throws.
  */
 export async function drainEdits(
