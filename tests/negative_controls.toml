@@ -536,10 +536,18 @@ own shell against it went with it.
 WHAT CAN STILL FAIL IS THE CONTEXT REPORTING AT ALL, and that failure is strictly worse than the one it
 replaces. This string is an identifier in BRANCH PROTECTION, which is not an in-repo setting. A required
 context that never reports does not go red -- it WEDGES, and nothing merges, in the queue or out of it.
-So the plant is now the two edits that would silence it: renaming or deleting the job that carries the
-string, and a concurrency key that lets one queue entry cancel another (a cancelled required check can
-never go green, so the entry is evicted rather than failed -- backlog-hygiene.yml's own `concurrency`
-comment carries that measurement and it is not restated here).
+So the plant is now AT LEAST these two edits that would silence it: renaming or deleting the job that
+carries the string, and a concurrency key that lets one queue entry cancel another (a cancelled required
+check can never go green, so the entry is evicted rather than failed -- backlog-hygiene.yml's own
+`concurrency` comment carries that measurement and it is not restated here).
+
+ONE SILENCING EDIT IS NAMED HERE AND COVERED BY NOTHING, and it is written down rather than left for the
+next reader to discover: DROPPING THE `merge_group:` TRIGGER. Branch protection evaluates required
+contexts on the merge-group commit, so without that trigger this context never reports in the queue and
+nothing merges -- the same wedge, reached by a third route. backlog-hygiene.yml's `on:` block carries a
+DO-NOT-REMOVE comment against exactly this, and a comment is the only thing holding it: as measured on
+2026-09-13, no test in this suite asserts that a required context's workflow declares `merge_group`.
+The two red nodes below do NOT cover it, and must not be read as if they did.
 
 THE FIRST RED NODE IS THE CLA CONTROL'S GREEN NODE, AND THAT IS NOT A COPY-PASTE. A node's arm is
 relative to the violation planted. Under `cla` the plant is a wrong context STRING, so resolving to a
