@@ -33981,6 +33981,121 @@ path.
 - It does not answer either of the two unknowns. The common-ancestor question is still open, and so
   is whether the vault ledger is the maintainer-internal ledger the erratum describes.
 
+### AMENDMENT 2026-09-12 (second): a ratio published without its basis, and a leak screen with no gate behind it
+
+Two gaps in the record above, one of them outranking everything else in this item. **Neither closes
+it.** Everything below was re-measured read-only at engine `origin/main` `1b98a0452` and vault
+`origin/main` `11b3a591`. Nothing was written to either repository.
+
+### The renumber direction IS settled -- the engine is cheaper -- and the size is 1.18x, not 2x
+
+*Which side is cheaper to renumber* above prints two rows and states no direction. Its second row,
+about 309 against about 624, reads as **roughly twice**, and twice is the wrong quantity. Re-counted
+over the ten true collisions (#231 to #239 and #320), across every git-tracked text blob in both
+clones:
+
+| the basis, stated in full | engine | vault | direction |
+| --- | --- | --- | --- |
+| literal `BACKLOG #N` spelling only | 131 over 53 files | 66 over 39 files | vault cheaper -- **WITHDRAWN** |
+| standalone `#N` token, counted per clone | 459 over 107 files | 543 over 106 files | **1.18x, engine cheaper** |
+| the same, less the `(#N)` squash-merge shape | 418 | 508 | **1.22x, engine cheaper** |
+| the same, mirrored duplicate text counted once | 459 | 541 | **1.18x, engine cheaper** |
+
+**The direction is identical under all three surviving bases, so no decision moves: the ENGINE is
+the cheaper side to renumber.** What moves is the size, from about 2x to **between 1.18x and 1.22x**.
+The spread across those three rows is exactly what the choice of definition is worth, and the band is
+the honest figure. **Nobody should quote one of these numbers without the row it came from.**
+
+**The 131 and the 66 reproduce exactly**, which is the control: an instrument that reproduces the
+published reading is aimed at the same subject as the reading it is replacing.
+
+### Why the literal-spelling row inverted rather than merely erred
+
+**It is WITHDRAWN, and the cause is recall.** The literal spelling catches **131 of 459** engine
+citations and **66 of 543** vault ones -- **197 of 1002 across both clones, roughly one in five**.
+Four citations in five that a renumber must still fix sat outside the count. The two clones spell
+the same intent at very different rates, **28.5 per cent against 12.2 per cent**, and that asymmetry
+alone is enough to flip the ranking. A low-recall screen does not merely understate a total; where
+recall differs between the two things being compared, it reverses them.
+
+**A premise offered with this correction does NOT hold, and it is recorded so nobody rebuilds on
+it.** The two clones share **1687 of the engine's 2222 tracked paths** -- verified here, and true. It
+does not follow that citations are double-counted across the pair. Of the 1663 shared paths holding
+text, only **346 hold the same text**, and that is after normalising line endings and trailing
+whitespace so that a CRLF-only difference still counts as a mirror. De-duplicating the mirrors
+removes **2 citations out of 1002**. **A shared path is not a shared file.** Reasoning from the
+overlap figure counts the directory listing and calls it the contents.
+
+**Two peer figures are not reproduced here.** A peer session reported 314 engine-meaning against 370
+vault-meaning, and 108 citations of #233 credited to the engine through mirrored files. This
+measurement returns 459 against 543, and #233 at 122 engine against 130 vault with 2 removable as
+mirrored. **The ratio agrees at 1.18x; the absolute counts do not.** The peer's method was not
+available to compare, so no cause is offered and the table above is what was measured.
+
+### The leak screen is a REQUIRED GATE on the move, and it has a name and a command
+
+*The engine ledger is SANITISED relative to the vault* above records a verdict and names no
+instrument, so no reader downstream can re-run it. It is the engine's own
+`scripts/security/scan_forbidden.py`, already wired into `.pre-commit-config.yaml`, and it is one
+command:
+
+    python scripts/security/scan_forbidden.py --path <file> --require-tokens
+
+Run 2026-09-12 against all three ledgers, with `--self-test` green first as the positive control
+(`mode=real`, site prefixes 2 of 2, estate 13 of 13, names 6 of 6):
+
+| file | exit | hits |
+| --- | --- | --- |
+| vault `docs/BACKLOG.md` | **1** | **111** |
+| engine `docs/BACKLOG.md` | 0 | 0 |
+| engine `docs/archive/backlog/BACKLOG-CLOSED.md` | 0 | 0 |
+
+Same gate, same flags, opposite verdict. **Nothing matched is reproduced here and nothing should be:
+this repository is public, which is the entire point of the finding.**
+
+**The count is 111, and any report of 119 is counting output lines.** The failing run emits 120
+lines: six informational lines that a **passing** run emits too, a header, 111 hit lines, a blank,
+and a footer stating the scanner's own total. Non-blank comes to 119. Six of any such figure belong
+to the scanner rather than to the file. **Take the total the scanner states; a line count answers a
+different question.** The 104 and 105 recorded above came from the vault's separate
+`scripts/publish/scan_forbidden.py`, a different copy with its own token list, so those and this 111
+are three readings from two instruments and none of them contradicts another. The vault ledger is
+byte-identical at `152b6cbe` and at `11b3a591`, so ref drift explains none of the spread.
+
+**Stated as a gate rather than an observation:** the reconciled ledger must exit 0 under
+`scan_forbidden.py --require-tokens` before any of its text is written back toward the public engine
+repository, and that check belongs **in the move procedure as a step that refuses**, not in a handoff
+note. A handoff is a reminder, and a reminder is satisfied by the reader who skipped it.
+
+### The measurement is solid; the exposure PATH is an open question
+
+**Say the two apart, because only one of them is established.** The vault ledger fails a screen the
+engine ledger passes: measured, reproducible, above. The route by which that becomes a publication is
+not. #1250 moves the **engine** ledger **into** the vault, and it is not obvious how vault content
+thereby reaches the public engine repository at all.
+
+**One path is established, and this item already names it:** a reviewer resolving a diverged pair by
+taking the vault's wording writes that wording into a public file, which is a publication decision
+rather than an editorial one. Whether the move itself opens a second path -- a mirrored tree, a later
+extraction, a published subset -- **must be answered before the move, not assumed.**
+
+**Do not read the 111 as a live exposure of the public repository.** It is a property of the vault
+file, measured today. It is what would be published if the wrong text travelled, which is why the
+gate goes in first.
+
+**Four shapes were reported alongside the 111 and are recorded as CARRIED, not verified.** This
+session ran counts only and never read a matched line, so it can confirm none of them: site codes
+inside one item, a partner product name in another, front matter naming ten vendors, and roughly 26
+vault-only items in the 280 to 305 range carrying a customer name **in the heading itself**. **The
+heading case is the worst of the four**, because a heading survives summarising, indexing and
+quotation in a way a buried line does not. Each needs confirming by somebody able to read the
+matches, and none is reproduced here.
+
+**What this second amendment does NOT do.** It does not close the item, touch the banner, or change
+the heading. It does not re-price the reconciliation. It does not answer either of the two unknowns.
+It does not establish the exposure path, which is the one claim above a reader might otherwise take
+as settled.
+
 ## 1752. overlap.ps1 classifies Dirty from status porcelain without comparing content, so one CRLF artifact blocks every session in the repo from a file nobody changed
 
 > 🔢 **Filed 2026-09-12, from a gate false positive that fired, blocked a file nobody had changed, and cleared on its own the same day. Open; not started.** Value **6/10**, Difficulty **3/10**. `scripts/coord/overlap.ps1` decides a peer worktree is Dirty from `git status --porcelain` alone and never compares content. A working copy whose bytes differ from the index only in line endings therefore reports modified while producing an empty diff, and `collision_gate.ps1` turns that into a hard deny of Write and Edit on the named file for every other session while the peer is live. **The blocked session cannot tell a false positive from a real collision except by doing the content comparison the gate skipped.**
