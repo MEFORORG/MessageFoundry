@@ -831,6 +831,20 @@ jobs:
           # Deliberately `warn`, not `ignore`: if mutmut ever renames its cache, that must be visible in
           # the log rather than silently swallowed.
           if-no-files-found: warn
+          # A WEEK, NOT THE 90-DAY DEFAULT, because nothing automated ever reads this. Censused
+          # 2026-09-13: 15,282 stored artifacts across the repository against exactly ONE
+          # `actions/download-artifact` in the whole tree (net-helper.yml), and `mutmut-results` was
+          # 3,283 of those copies -- the largest single name. That is not by itself a defect: these
+          # are a diagnostic a human downloads while investigating a mutation result, which is a
+          # legitimate consumer, just not an automated one.
+          #
+          # What is a defect is the WINDOW. This job runs on every pull request and nightly, and the
+          # investigation it serves happens while the pull request is open. Seven days spans that and
+          # a weekend; the remaining eighty-three were storing an advisory diagnostic for nobody. The
+          # other retention settings here are 5 (scorecard.yml) and 14 (net-helper.yml, the one
+          # artifact with an automated consumer), so this sits between them deliberately rather than
+          # inventing a third convention.
+          retention-days: 7
 
   liveness:
     # THE META-GATE. Every other job here is built so it can never fail; this one is built so it CAN.

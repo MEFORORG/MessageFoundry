@@ -14,9 +14,10 @@ name: Scorecard
 # settings rather than the private source's, and this file only ran once publish.ps1 copied it across.
 # Both caveats are obsolete: there is one repo, and the publish machinery was deleted.)
 #
-# PINNING CAVEAT: actions/checkout + actions/upload-artifact reuse this repo's existing SHA pins; the
-# ossf/scorecard-action and github/codeql-action/upload-sarif steps are on version tags pending a
-# SHA-pin lookup (zizmor / Scorecard itself will flag them).
+# PINNING: every step below is SHA-pinned -- actions/checkout, ossf/scorecard-action and
+# github/codeql-action/upload-sarif alike. This was a PINNING CAVEAT saying the latter two were "on
+# version tags pending a SHA-pin lookup"; that was true when written and has been false since they
+# were pinned. It also named actions/upload-artifact, which this workflow no longer uses.
 on:
   branch_protection_rule:
   schedule:
@@ -52,13 +53,14 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
-      - name: Upload the SARIF artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: scorecard-sarif
-          path: results.sarif
-          retention-days: 5
       - name: Upload to code scanning
+        # THE ONLY DESTINATION FOR THIS SARIF, and until 2026-09-13 there was a second one: a
+        # `scorecard-sarif` artifact uploaded by the step that used to sit here, 1,009 stored copies
+        # of it, read by nothing. Unread is not by itself a defect -- most artifacts in this
+        # repository are diagnostics a human downloads, and that is a real consumer. This one was
+        # REDUNDANT, which is a different finding: code scanning holds the same findings and is what
+        # a human actually queries, and `publish_results: true` above additionally sends the score to
+        # the public OpenSSF API. A third copy on a retention clock served neither reader.
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: results.sarif
