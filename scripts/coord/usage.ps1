@@ -57,6 +57,22 @@
     that is never coming. It is also not CRITICAL/11: CRITICAL says commit now because you are about to
     be cut off mid-task, which is a live pool running out, not an account that has none.
 
+    "UNAVAILABLE" MEANS SOMETHING ELSE IN THE SIBLING INSTRUMENT, AND HARMONISING THE TWO NAMES BREAKS
+    WHICHEVER SIDE MOVES. Here it means "this account has no subscription". In the separate reader at
+    `%USERPROFILE%\.claude\mefor-usage\usage-now.py`, which asks the live API rather than reading
+    anything this chain publishes, `unavailable` means "there is no credential to read", and the
+    no-subscription case is a distinct state there named `cancelled` that prints NO ACTIVE
+    SUBSCRIPTION. One word, two meanings, on one box. The two tools are INDEPENDENT -- neither reads
+    the other, and usage-collect.ps1, this script and usage-headroom-inject.ps1 carry zero references
+    to that file (measured 2026-09-13) -- so the collision costs nothing today. That independence is
+    also why nobody notices it: the two vocabularies never meet in one place, so they read as
+    agreement right up until somebody tidies them. Renaming this side's UNAVAILABLE to match that
+    file's `unavailable` would collide with the exit-code contract above, which callers branch on at
+    20 and 21. Renaming that file's `cancelled` to UNAVAILABLE would merge its no-credential state
+    into its no-subscription state, and the merged state would advise `claude login` for a cancelled
+    plan -- the one action a cancelled plan must not be told to take. Leave both names alone. That
+    file carries the matching note beside its own state definitions.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\usage.ps1
     pwsh -NoProfile -File scripts\coord\usage.ps1 -Json
