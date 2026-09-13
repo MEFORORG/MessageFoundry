@@ -391,12 +391,17 @@ def test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding(tmp_path: 
 
 
 # ===================================================================================================
-# `a PR that implements BACKLOG #N must update BACKLOG.md` -- the gate that went green enforcing
-# nothing, run as the SHIPPED SHELL against a synthetic repository.
+# THE BASH RESOLVER'S NEGATIVE CONTROL -- no required context of its own, which is why this banner
+# names none. `_bash_sees` and `_require_bash` wrap the shared probe in `tests/_bash_resolver.py`
+# (BACKLOG #1216) under this module's pinned child environment, and the one test below watches that
+# probe REJECT a candidate. `_hermetic_git_env` and `_ascii` are declared here and called by the
+# gitleaks scope block further down, not by anything in this section.
+#
+# The backlog-hygiene gate controls that used to run here went with the ledger (BACKLOG #1250) and
+# took their synthetic-repository fixture with them. What stayed is not their remnant. The resolver
+# it grades is shared across this suite, and this file is where it shipped broken; the test's own
+# docstring carries that measurement and it is not repeated here.
 # ===================================================================================================
-_HYGIENE_JOB = "banner-on-implementation"
-
-
 def _bash_sees(bash: Path, tmp_path: Path) -> bool:
     """Delegates to the shared probe, under THIS module's explicit child environment.
 
@@ -424,37 +429,6 @@ def _require_bash(tmp_path: Path) -> str:
         pytest.fail(str(exc))
     print(f"[#1000] bash resolved to {resolved} (namespace probe passed)")
     return resolved
-
-
-def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, str]:
-    """A repository shaped like the PR the gate exists to police.
-
-    ``A`` is the merge base. ``B`` is the PR head: it changes engine code and NOTHING else. ``C`` is
-    main moving on AFTER the branch point, touching only ``docs/BACKLOG.md`` -- the shape the archive
-    move produced in bulk, and the shape the two-dot diff mis-credited.
-    """
-    repo = tmp_path / "fixture"
-    (repo / "messagefoundry").mkdir(parents=True)
-    (repo / "docs").mkdir()
-    _run(["git", "init", "-b", "main", "."], repo, env)
-    (repo / "messagefoundry" / "engine.py").write_text("x = 1\n", encoding="utf-8")
-    (repo / "docs" / "BACKLOG.md").write_text("# ledger\n", encoding="utf-8")
-    _run(["git", "add", "."], repo, env)
-    _run(["git", "commit", "-m", "A"], repo, env)
-    base_a = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-
-    _run(["git", "checkout", "-b", "pr"], repo, env)
-    (repo / "messagefoundry" / "engine.py").write_text("x = 2\n", encoding="utf-8")
-    _run(["git", "commit", "-am", "B: engine only"], repo, env)
-    head_b = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-
-    _run(["git", "checkout", "main"], repo, env)
-    (repo / "docs" / "BACKLOG.md").write_text("# ledger\n\nmain moved on\n", encoding="utf-8")
-    _run(["git", "commit", "-am", "C: main-side ledger edit"], repo, env)
-    base_c = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-    _run(["git", "checkout", "pr"], repo, env)
-    assert base_a and head_b and base_c and len({base_a, head_b, base_c}) == 3
-    return repo, base_c, head_b, base_a
 
 
 def _hermetic_git_env(tmp_path: Path) -> dict[str, str]:
