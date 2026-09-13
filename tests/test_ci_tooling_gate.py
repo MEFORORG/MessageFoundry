@@ -344,8 +344,20 @@ def _git_only_path(tmp_path: Path) -> str:
     coreutils share `/usr/bin` -- a green there would prove nothing, on the leg this tier always
     runs. A directory holding one shim has the same shape on every OS.
 
-    The shim carries no extension on purpose. bash's own ENOEXEC fallback runs it as a script, so
-    it needs no interpreter lookup and therefore no PATH of its own, which is the whole point.
+    ***THE SHEBANG IS LOAD-BEARING, NOT DECORATION -- DO NOT DELETE IT AS REDUNDANT.*** `/bin/sh` is
+    ABSOLUTE, so resolving it needs no PATH, which is what lets the shim run on a PATH holding
+    nothing but itself. That is the whole mechanism, and it is the shebang that supplies it.
+
+    Measured on this box, one variable, three arms -- a shebang naming a MISSING interpreter is the
+    discriminator, because bash's ENOEXEC fallback would read that line as a comment and succeed::
+
+        no shebang                    rc 0     ran via bash's ENOEXEC fallback
+        #!/bin/sh                     rc 0     ran via the shebang
+        #!/nonexistent/interp         rc 126   "bad interpreter" -- the shebang IS resolved
+
+    So this file does NOT take the ENOEXEC path and never did. Deleting the shebang would MOVE it
+    onto that path, which arm 1 shows works here and which nothing in this suite measures anywhere
+    else. (126 is `BASH_CANNOT_EXECUTE` in `_bash_resolver`, named there for this exact reason.)
     """
     git = shutil.which("git")
     assert git, "git is not on PATH, so the fixtures in this module could not have been built"

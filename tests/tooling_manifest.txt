@@ -115,6 +115,7 @@ tests/test_install_gate_wiring.py
 tests/test_installed_coord_hooks.py
 tests/test_key_usage_scope_inventory.py
 tests/test_ledger_check.py
+tests/test_ledger_path_spellings.py
 tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_merge_gate_controls.py

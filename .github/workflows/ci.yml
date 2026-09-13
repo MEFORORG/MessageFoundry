@@ -898,7 +898,7 @@ jobs:
         # and still passed. The recovery path this disables has not saved a single run in that window.
         # `retry-native-crash.sh` cannot help here either: under `-n` a worker segfault surfaces as a
         # controller-side node-down, not as exit 139, so the wrapper never sees it.
-        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
@@ -1292,7 +1292,7 @@ jobs:
           # job executes them, and the shipped ones construct QApplication at import on some paths.
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
@@ -1318,6 +1318,17 @@ jobs:
       - name: Prove the tier actually ran
         if: always() # a timeout or a crash is exactly when the receipt matters most
         run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml
+
+      # The tier's junit is written, read once by the receipt above, and then discarded. Keeping it
+      # is what lets the next change to this tier be sized by MEASURED time rather than by file
+      # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
+      - name: Upload the tier's junit
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tooling-junit-${{ matrix.os }}
+          path: tooling-junit.xml
+          if-no-files-found: ignore
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise

@@ -2351,15 +2351,23 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 131. Object flagging - mark objects of interest + a Flagged Objects filter
 
-> ⛔ **DROPPED 2026-08-10 -- owner-ruled at the G26 demand-gate triage.** Its named trigger has not fired, and a shipped mechanism, a configuration change or the network layer already answers the need it describes. Dropping is reversible: re-filing costs one item, while carrying it costs a re-read and a re-price at every planning pass, which is the failure mode the sitting exists to end.
+> ⛔ **DROPPED 2026-08-10 -- owner-ruled at the G26 demand-gate triage; its stated ground CORRECTED 2026-09-12.** Its trigger FIRED and was SERVED for connections: the flag and the Flagged-only filter shipped under the ADR 0007 amendment, weeks before the triage sat. What the triage declined is the word "every" in the Scope, a console-settable flag on Routers and Handlers as well, and that branch is an ADR-ratified deferral rather than an unfired trigger. Dropping is reversible: re-filing costs one item, while carrying it costs a re-read and a re-price at every planning pass, which is the failure mode the sitting exists to end.
 
 > **No longer demand-gated -- declined.** The line applied across the sitting: KEEP the rows whose trigger, if it fires, BLOCKS a feed; DROP the rows whose trigger merely INCONVENIENCES.
 
-> **AMENDED 2026-07-30 — the CONNECTION flag and the Flagged-only filter are BUILT; "every configuration object" is a ratified scope fork.** Adversarial verification refuted a full close. **BUILT** ([ADR 0007 amendment 2026-07-19](adr/0007-gui-manageable-connections-toml.md)): a display-only `flagged` field on `InboundConnection` / `OutboundConnection` (`messagefoundry/config/wiring.py:2531`, `:2589` — **no runtime path reads it**), authored code-first **and** in `connections.toml` (`config/connections_file.py:118`, `:139`, round-tripped by `tests/test_connections_roundtrip.py`); `POST /connections/{name}/flag` (`messagefoundry/api/app.py:1944`) → `Engine.set_connection_flag` (`messagefoundry/pipeline/engine.py:1286`) through the comment-preserving validate-before-persist writer — the FIRST console→`connections.toml` write seam — reachable from the console at `POST /ui/connections/{name}/flag` (`messagefoundry_webconsole/routes/connection_writes.py:103`); and the **Flagged-only** filter itself (`messagefoundry_webconsole/pages/connections.py:297`, re-applied after each poll/ws swap by `static/app.js:943-961`). 6 tests in `tests/test_connection_flag.py`.
+> **CORRECTED 2026-09-12 — the disposition stands; the ground the sitting stated does not.** The sitting stamped its template sentence here: *"Its named trigger has not fired, and a shipped mechanism, a configuration change or the network layer already answers the need it describes."* Both limbs fail against the tree. The trigger HAD fired, because the connection half was built and shipped before the triage, and this item's own 2026-07-30 amendment below says so in bold. And the only shipped mechanism that answers any part of the need is **this item's own delivery**, so the sentence reads as though something external had made the row moot. A prior pass recorded that same misfiling at **#84**, and the same sitting avoided it in three rows it wrote up individually (**#125**, **#127**, **#130**), each of which states in terms that its trigger fired or cannot fire.
 >
-> ⚠️ **The REMAINDER is the word "every" in the Scope.** This item's own Why names **Connection/Router/Handler**; only *connections* carry the flag, and only `connections.toml`-managed ones are console-settable — a code-first connection is refused **409** (it can still declare `flagged=True` in Python). ADR 0007's amendment records that fork deliberately (`0007:190-197`): a durable console-settable flag on *every* object would need a new name-keyed annotation table across all three store backends, which it declines, leaving the universal-object-flag branch "for a future, owner-chosen, store-serialized effort". So this is a **ratified narrowing, not an accidental one** — keep the item open at that reduced scope, and do **not** rebuild the connection half.
+> The sitting's commit is `5ae390a53`, subject *"backlog: rule the G26 demand-gate triage, and file BACKLOG #1211"*; both tests quoted below come from its body.
+>
+> **The disposition survives on the sitting's second and stronger test**, stated in that commit: *"a working alternative in shipped code, or a trigger that cannot arise as the engine is built."* The connection slice is that working alternative for the objects an operator actually browses and filters, and the universal branch is deferred by ADR 0007 rather than pending. So the stated ground is swapped and the closed banner kept.
+>
+> **Do not quote the keep/drop line above to rescue this row.** That commit reads, in full, *"DROP the rows whose trigger merely INCONVENIENCES, **because** a shipped mechanism, a configuration change or the network layer already answers it"*. The ledger's copy is truncated before that "because", so the rescue ground contains the very limb that is false here and quoting it would be circular. Note also that the 2026-07-30 amendment ruled *"keep the item open at that reduced scope"*; the 2026-08-10 owner ruling is later and supersedes it on the disposition, which is why this correction changes the reasoning and leaves the status alone.
 
-> ⚠️ **AMENDED 2026-08-03 — the `console/` citations here name a package that no longer exists.** The Why says "**neither** console offers a flagged-only filter" and the Nearest-existing-mechanism cites "the kind-filtered connection event log in `console/connections.py`", but there is no `messagefoundry/console/` package — [ADR 0032](adr/0032-console-desktop-launch.md) records it **removed in full** (`0032:439`) when **#103** closed, leaving the browser web console as the sole operator UI. Read the `console/` paths here as `messagefoundry_webconsole/` (the flag cell is `pages/connections.py:171`; the Flagged-only toggle `:270`/`:297`). This corrects the **citations only** — the 2026-07-30 ruling above still states the build state, and the remainder is still the universal-object flag at that reduced scope.
+> **AMENDED 2026-07-30, re-anchored 2026-09-12 — the CONNECTION flag and the Flagged-only filter are BUILT; "every configuration object" is a ratified scope fork.** Adversarial verification refuted a full close. **BUILT** ([ADR 0007 amendment 2026-07-19](adr/0007-gui-manageable-connections-toml.md); the vault ledger records the same delivery under DEMAND-GATE-BACKLOG Wave 6, lane `dg-s8a`): a display-only `flagged` field on `InboundConnection` / `OutboundConnection` (`messagefoundry/config/wiring.py:3324`, `:3382` — **no runtime path reads it**), authored code-first **and** in `connections.toml` (`config/connections_file.py:118`, `:139`, round-tripped by `tests/test_connections_roundtrip.py`); `POST /connections/{name}/flag` (`messagefoundry/api/app.py:2249`, gated by `config:deploy` deny-by-default and audited) → `Engine.set_connection_flag` (`messagefoundry/pipeline/engine.py:1466`) through the comment-preserving validate-before-persist tomlkit writer, atomic unique-temp write, serialized under an engine-level lock — the FIRST console→`connections.toml` write seam — reachable from the console at `POST /ui/connections/{name}/flag` (`messagefoundry_webconsole/routes/connection_writes.py:103`); and the **Flagged-only** filter itself (`messagefoundry_webconsole/pages/connections.py:272`, `:299`, re-applied after each poll/ws swap by `static/app.js:939-961`). 6 tests in `tests/test_connection_flag.py`.
+>
+> **What was DECLINED is the word "every" in the Scope.** This item's own Why names **Connection/Router/Handler**; only *connections* carry the flag, and only `connections.toml`-managed ones are console-settable, a code-first connection being refused **409** (it can still declare `flagged=True` in Python), so `store_schema` stays false. ADR 0007 records that fork deliberately (`0007:219-226`): a durable console-settable flag on *every* object would need a new name-keyed annotation table across all three store backends, which it declines, leaving the universal-object-flag branch "for a future, owner-chosen, store-serialized effort". Re-measured 2026-09-12: `Registry` holds routers and handlers as bare functions (`messagefoundry/config/wiring.py:3578`, `:3579`), with no field to carry a flag and a comment there refusing a record type because eight call sites introspect the bare function, and no annotation or tag table exists in any of the three backends. Do **not** rebuild the connection half.
+
+> **AMENDED 2026-08-03, re-anchored 2026-09-12 — the `console/` citations below name a package that no longer exists.** The Why says "**neither** console offers a flagged-only filter" and the Nearest-existing-mechanism cites "the kind-filtered connection event log in `console/connections.py`", but there is no `messagefoundry/console/` package: [ADR 0032](adr/0032-console-desktop-launch.md) records it **removed in full** (`0032:439`) when **#103** closed, leaving the browser web console as the sole operator UI. Read the `console/` paths below as `messagefoundry_webconsole/` (the flag cell is `pages/connections.py:144`; the Flagged-only toggle `:272`/`:299`). This corrects the **citations only**.
 
 
 **Cluster:** Repository & Config. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
@@ -15782,6 +15790,25 @@ python scripts/docs/backlog_dependency_census.py --ref <sha>  # census a histori
 **IT ALSO CANNOT COUNT THE PARKED DEFICITS, and guessing would be worse than the gap.** The 2026-08-14 ruling above sends this class out of the public ledger and, with no private ledger, into `<git-common-dir>/mefor-coord/`. That directory is untracked, machine-local, and carries no machine-readable marker distinguishing a parked deficit from any other handoff note, so no count from it would be reproducible on another clone. The population is known to be at least one -- the ruling's own instance -- and is not otherwise quantified here.
 
 **NONE OF THIS UNBLOCKS THE MOVE.** The precondition is unchanged and it is vault-side: atomic allocation, a high-water ratchet and installed hooks, the Q5 ruling of 2026-08-13. Until those land the destination is still the weaker repository, and a better inventory of the source does not change which way that comparison runs. What this removes is a different failure -- going into the migration with a number nobody can re-derive.
+
+**AMENDMENT 2026-09-12 -- the vault-side precondition's third limb is MET, the four deferred questions are RULED, and the move now blocks on a defect nobody had measured.** The paragraph above is not retracted. The precondition is a conjunction, and this closes one limb of it rather than the move.
+
+**PHASE 0 SHIPPED.** The vault ledger gate is armed as of 2026-09-12; vault PR 1496 merged as `152b6cbeb`. That meets the **installed hooks** limb of the Q5 ruling of 2026-08-13. Measured across that merge: the payload went from **zero** occurrences of `VAULT_BACKLOG_CEILING` to **six**, and the vault's own tests went from **20 passing and 1 failing** to **21 of 21**.
+
+**THE FOUR DEFERRED QUESTIONS WERE DECIDED BY THE OWNER ON 2026-09-12.** The "DECIDE AT MOVE TIME" paragraph above requires that the choice be recorded, so it is recorded here.
+
+1. **The WHOLE ledger moves**, not only the ASVS-derived items.
+2. **The engine keeps a STUB** pointing at the vault, rather than nothing.
+3. **The already-published history is accepted and stated plainly.** It cannot be recalled and the move will not pretend otherwise.
+4. **The #1000 partition is RETIRED.** It is `PUBLIC_BACKLOG_FLOOR` in `scripts/hooks/ledger_check.py`, and the erratum block at the head of this file describes the same partition; both are in scope when the move lands.
+
+**THE MOVE NOW ADDITIONALLY BLOCKS ON #1751.** This plan treated the two ledgers' 238 shared numbers as a cheap fork echo, on a comparison of the first 60 characters of each heading. A read-only measurement at engine `origin/main` and vault `152b6cbe` shows only **47** of 228 pairs byte-identical, **87** needing a person to read two versions and choose, and **34 making contradictory STATUS claims about the same number** -- corruption already standing in both files, which a merge would launder rather than create. #1751 carries the evidence, the eleven pairs needing an owner ruling, and the 6-to-16-hour cost this plan priced at **zero**.
+
+**TWO HAZARDS THIS ITEM NEVER NAMED, both vault-side, both found by that measurement.**
+1. **The vault gate is architecturally INVERTED for this move.** It enforces a CEILING where the engine gate enforces a FLOOR, so it would refuse **561 of the 838 arriving numbers**. Arming it was necessary and is not sufficient; it has to be re-pointed before a single item moves. *The 561 reproduces from the engine side alone as a control:* 561 is exactly the count of engine numbers above the vault's maximum #354, and also exactly the count at or above #1000, the two agreeing because the engine namespace is empty between #355 and #999.
+2. **The vault has NO archive half on any ref.** The engine namespace is two files, `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md`, and every gate here reads their union deliberately -- `ledger_check.py` says in its own comment that keying on one path would leave the other an unpoliced region. Moving one file and not the other splits the namespace and reintroduces exactly the collision the union exists to stop.
+
+**A LEAK-GATE CONSTRAINT, and it runs engine-ward.** The vault's ledger fails the vault's **own** publish scanner: exit **1**, over 100 finding lines, against a clean engine control at exit **0**. The engine ledger is **sanitised relative to the vault**, so the two texts are not symmetric and the move is a screened migration rather than a file copy in either direction. Nothing matched is reproduced here. **Anything moving engine-ward must be screened first; this repository is public.** #1751 carries the detail, including that the screen's population is unmeasured and the exposure must not be read as bounded.
 
 ## 1253. one control-char predicate written out seven times across six files
 
@@ -33704,3 +33731,817 @@ Also flag a `BinOp` whose operands include a `Call` or `Name`, a `%` `BinOp`, an
 **Duplicate search.** #1583 (PR 1064) is the release wheel-smoke twin (the smoke importing the checkout) and stays separate; nothing covers the CLI self-report. Searched `PYTHONSAFEPATH`, `__file__`, `shadow`, `editable`.
 
 **Source.** `docs/reviews/FABLE-PACKET-10-ENGINEROOT-2026-09-11-FINDINGS.md` (vault PR 1484), finding P10-11.
+
+## 1751. reconcile the 228 shared-number pairs before the ledger merge: only 47 are byte-identical and 87 need a human read
+
+> 🔢 **Filed 2026-09-12 from a read-only measurement at engine `origin/main` and vault `origin/main` `152b6cbe`. Open; not started. TWO FINDINGS, and the first one is not migration cost.** Value **8/10**, Difficulty **6/10**. **34 shared numbers carry CONTRADICTORY STATUS CLAIMS across the two ledgers, and that corruption stands in both files today.** One side says an item shipped; the other lists it open with a named remainder, or declined. Both sides have been read as authoritative by somebody. Nothing could see it while the two files sat apart, and nothing would report it after a merge either: `backlog_status_check.py` verifies a banner EXISTS and does not self-contradict, never that it is TRUE, so a merged ledger inherits whichever side the merge rule picked and reads as settled. **If #1250 is abandoned outright these 34 are still wrong and still invisible, so this item outlives the migration that exposed it.** The second finding is the merge cost #1250 priced at zero: 238 numbers exist in both namespaces, only **47** pairs are byte-identical, **181** bodies differ, and **87** need a person to read two versions and choose.
+> **AMENDED 2026-09-12, and all three headline numbers above are now WRONG -- they were estimates taken before anyone adjudicated a pair.** It is **46** pairs that need a person, not 87; **37** status contradictions today, not 34; and **ZERO** need an owner ruling, not eleven, because all eleven were settled against the code the same day. The heading is stale on 87 for the same reason. Evidence in *The three corrections* at the end of this item. **The item stays OPEN:** at least 59 of the 180 pairs are still unadjudicated and the reconciliation itself has not started.
+> Verdict: build
+> Research: two unknowns named below, both cheap, both to be answered before the review starts
+> Closing-act: docs, plus an owner ruling on the eleven pairs named below
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this now blocks. **Verdict:** build.
+**Severity:** no deployment axis; nothing shipped changes. The exposure is that two ledgers disagree about what was built, and the disagreement is invisible from either side alone.
+
+### The measurement, and the assumption it replaces
+
+Read-only, at engine `origin/main` and vault `origin/main` `152b6cbe`. Nothing was written to either repository.
+
+The engine namespace is **838 distinct numbers**: 601 live in this file, 237 in `docs/archive/backlog/BACKLOG-CLOSED.md`, zero overlap. The vault ledger carries **287** items, maximum #354. **238 numbers exist in both.**
+
+#1250's plan treated 228 of those 238 as the same item under a fork echo, cheap to merge. **That rested on comparing the first 60 characters of the heading, and it is wrong.** Matching headings do not imply matching bodies.
+
+| shared-number pairs | count |
+| --- | --- |
+| byte-identical | **47** |
+| bodies differ | **181** |
+| resolve by a mechanical rule | 141 (47 verbatim, 39 after a link rewrite, 17 by preferring the linkified variant, 38 by taking the engine banner) |
+| **need a person to read both and choose** | **87** |
+| true collisions, two unrelated items on one number | 10 |
+
+141 plus 87 is 228, and 228 plus 10 is 238.
+
+### Finding 1: 34 pairs contradict each other on status, and that is a defect rather than a cost
+
+This is the half worth more than the migration. **A merge would not create these. It would launder them.**
+
+**Eleven are flat verdict contradictions and need an owner ruling.** The instrument returned exactly these: **#81, #84, #95, #122, #124, #125, #127, #131, #171, #172, #226.** The sharpest subset inside them: four have the vault claiming SHIPPED against an engine ledger that still lists the item open with a named remainder, and five have the vault claiming SHIPPED against an engine ledger that DECLINED it.
+
+**Fifteen pairs carry substantive content on both sides that the other lacks**, so neither side is a superset and picking one loses work. #64, #98, #208 and #230 are among them; the count is fifteen and those four are examples, not the list.
+
+**No single merge direction is right.** The engine is the newer side on 67 of the 108 banner-differing pairs, but the vault carries the later date on 4 and the closing claim on 4 more. A rule that always preferred one repository would publish a false status.
+
+### Finding 2: 87 human decisions, at 6 to 16 hours
+
+That range is an estimate over a measured population rather than a measurement. #1250's plan costed this work at **zero**, and that is the number this corrects.
+
+### The ten true collisions fold into this item
+
+The measurement identified ten numbers where the two ledgers hold **unrelated** items: **#231 through #239, and #320.** These are not a separate pass. They touch the same file, in the same review, read by the same person, so making them their own work item would put two seats in one document.
+
+**The measured ten and the erratum at the head of this file do not agree, and the review should reconcile that.** The erratum names #232-#239, plus #248-#251, as independently allocated in the two sequences. The measured set adds **#231** and **#320** and does not include #248-#251. Whether the vault ledger IS the maintainer-internal ledger the erratum describes is not established here; if it is, the erratum is a prior and partly different record of this same divergence.
+
+### The engine ledger is SANITISED relative to the vault, so nothing moves engine-ward unscreened
+
+The vault's own publish scanner exits **1** on the vault ledger, with **over 100 finding lines**: one run reported 104 and an independent re-run 105, the difference being a header line. **The line count is not the finding.** The finding is the opposite verdict under one instrument, and the control is that the same scanner exits **0** on the engine ledger.
+
+The mechanism behind that gap is that the engine ledger was deliberately sanitised. At least two of the diverged pairs differ **precisely because** an identifier was scrubbed from the engine side and still stands on the vault side. Nothing matched is reproduced here, and nothing should be: **this repository is public.**
+
+**That is a worked example and not a census.** The population is unmeasured, and the screen that found it was tuned for constant-shaped tokens, so it would miss a plain name written as prose. Do not read the exposure as bounded at two.
+
+**The constraint that follows:** every line moving engine-ward in this reconciliation is screened before it lands, and a reviewer who resolves a pair by taking the vault text is making a publication decision rather than an editorial one.
+
+### Two unknowns to answer before the review starts
+
+1. **Nobody has checked whether the vault ledger was branched from the engine ledger at a specific commit.** A defensible common ancestor would turn some of the 87 two-way decisions into three-way merges and could cut the set materially. It is a cheap check and it belongs first, because it changes how much work there is.
+2. **Whether the vault ledger is the maintainer-internal ledger the erratum describes** (see the collisions section above). If it is, the erratum's record is prior evidence to be reconciled with the measured ten rather than left sitting beside it.
+
+### What was NOT verified
+
+- The mechanical normalisations that reduce 228 to 87 are a judgement about what is safe to rewrite, not a measurement. A stricter reading raises 87; a looser one lowers it and risks laundering a real difference.
+- The 6-to-16-hour range is an estimate.
+- No common-ancestor check was run (unknown 1 above).
+- The identifier scrub is a worked example over an unmeasured population (above).
+- Nothing in either repository was modified.
+
+### What closing looks like
+
+1. Answer the common-ancestor question. Record it and the resulting decision count before anyone reads a pair.
+2. Fix the 34 status contradictions **in place, in both ledgers**, whether or not #1250 proceeds. Send the eleven flat verdict contradictions to the owner as one list.
+3. Reconcile the 87 by hand, screening every vault-side line before it moves engine-ward.
+4. Disambiguate the ten true collisions, and reconcile the outcome with the erratum at the head of this file.
+5. Only then does #1250's move have a defined input.
+
+**Duplicate search.** #1250 is the migration this blocks and the only item naming the vault ledger as a destination; it priced this work at zero, which is why this is a separate item as well as an amendment there. #1293 is the worktree-ownership hole class, unrelated. #1480 is the append-absorbs-the-next-heading defect, a filing hazard rather than this subject. Searched `shared-number`, `reconcile`, `vault ledger`, `common ancestor`, `contradictory status`.
+
+**Source.** A read-only measurement by the Manager seat, 2026-09-12, at engine `origin/main` and vault `origin/main` `152b6cbe`. No findings report was written; this item is the record.
+
+### AMENDMENT 2026-09-12: the three headline numbers were estimates, and adjudication moved all three
+
+Added the same day this item was filed, after the pairs were read rather than counted. **Nothing
+above is retracted as a record of what the filing pass saw.** What changed is that the filing pass
+estimated where a second pass measured, and the heading, the banner and both findings carry the
+estimates.
+
+| the item as filed | measured after adjudication |
+| --- | --- |
+| 87 pairs need a person | **46** |
+| 34 status contradictions | **37** |
+| eleven need an owner ruling | **zero** |
+
+Measured 2026-09-12 over the full corpus, engine `origin/main` against vault `origin/main`
+`152b6cbeb`.
+
+### Correction 1: 46 pairs need a person, not 87
+
+238 numbers are shared. **47 are byte-identical and 191 diverge**, and 47 plus 191 is 238.
+
+The 191 split five ways:
+
+| class of difference | count |
+| --- | --- |
+| link-target rewrite only | 36 |
+| linkification only | 20 |
+| banner differs, prose identical, no status conflict | 78 |
+| banner status-glyph conflict | 30 |
+| substantive body difference | 27 |
+
+**Those five sum to 191, and that arithmetic is the control on the classification.** A split that
+did not sum would mean a pair had been counted twice or dropped, and neither is visible any other
+way.
+
+Removing the eleven already settled by correction 3 leaves a working set of **180**, which splits
+**134 mechanically resolvable** and **46 needing a person**.
+
+**Whitespace and line-ending normalisation resolves ZERO pairs.** Every difference in this corpus is
+content, not formatting. A normalising pass would carry no risk and buy nothing, so nobody should
+plan one.
+
+The 30 banner status-glyph conflicts here and the 37 status contradictions in correction 2 come from
+two different screens over the same corpus. Nothing in this amendment reconciles the two figures,
+and they must not be read as the same population.
+
+### Correction 2: 37 status contradictions today, not 34
+
+Both ledgers moved between the filing measurement and this one. **34 was true when taken and is not
+true now**, which is what a count of a live corpus does.
+
+**Two further pairs are excluded deliberately.** #3 and #110 differ only in how many open banners the
+engine side stacked. That is not a claim about status, so counting them would inflate the figure to
+39.
+
+### Correction 3: zero pairs need an owner ruling, not eleven
+
+All eleven -- **#81, #84, #95, #122, #124, #125, #127, #131, #171, #172, #226** -- were adjudicated
+against the code and settled on evidence, each verdict then attacked by an adversarial reviewer. The
+verdicts, with a recommended merged text for every number, are in the coordination directory as
+`HANDOFF-1751-eleven-contradictions-adjudicated-20260912.md`.
+
+| verdict | count |
+| --- | --- |
+| engine side correct | 6 |
+| both partly right | 3 |
+| vault side correct | 1 |
+| not actually contradictory | 1 |
+
+**Step 2 of *What closing looks like* is discharged on its second half** -- there is no list to send
+the owner -- and the banner's closing-act line is stale on the same point. The first half of that
+step, fixing the contradictions in place in both ledgers, is untouched and still the work.
+
+### The 46 are not 46 independent reads
+
+**Nine are number COLLISIONS rather than disagreements: #232 through #239, and #320.** Two genuinely
+different items hold each of those numbers, so they are renumbering rather than adjudication.
+
+**#231 is NOT one of them, and a first pass counted it as one.** Checked here against both trees,
+engine `origin/main` and vault `origin/main` `152b6cbeb`: the vault heading reads *Steps "Block"
+Grouping*, the engine heading *Steps view: decorative collapsible block grouping (Corepoint Block
+analog)*. One item, worded twice, needing an ordinary two-version read. The other nine were checked
+the same way and each holds two unrelated subjects. **So the 46 split nine collisions and 37 genuine
+reads, not ten and 36.**
+
+**Twenty of the 37 share one cause.** The engine closed them at the 2026-08-10/11 G26 demand-gate
+triage and the vault fork never received the ruling. All twenty carry a 2026-08-10 or 2026-08-11
+date, and 19 of the 20 name the triage in words. They are **#62, #64, #94, #108, #113, #116, #130,
+#133, #137, #163, #165, #166, #169, #174, #179, #180, #181, #182, #184 and #214**, and they can be
+dispatched as one brief. One of the twenty, #184, is already settled -- see below -- so the cluster
+is not wholly outstanding.
+
+**Seventeen individual reads remain: #87, #89, #91, #96, #98, #99, #105, #139, #158, #185, #198,
+#200, #208, #223, #228, #230 and #231.**
+
+### Which side is cheaper to renumber is an OPEN QUESTION, and the discriminator is what you count
+
+Two readings taken on 2026-09-12 disagree on the direction, and a third was in flight when this was
+written. **Neither reading below settles it and this amendment states no direction.**
+
+| what was counted | engine-side cost | vault-side cost |
+| --- | --- | --- |
+| the literal `BACKLOG #N` spelling only | 131 | 66 |
+| every occurrence that MEANS the item -- bare `#N`, prose, links | about 309, over 73 files | about 624, over 132 files |
+
+**That is the whole disagreement, and it will recur, so it is named rather than averaged.** A
+renumber has to fix every citation that means the item, not only the ones spelled unambiguously, so
+the first reading counted a true number for the wrong question. The second inverts the direction.
+Whoever settles this states which definition they used before quoting a number.
+
+### #184 is settled CLOSED, and the G26 triage boilerplate is a claim rather than a premise
+
+#184's engine banner reads DROPPED at the G26 triage, carrying the triage's standard sentence that
+its named trigger has not fired. The vault side carries #184 open. **Adjudicated 2026-09-12 and
+settled ENGINE-CORRECT: the item is closed.** That unblocks **#69**, whose merged text depended on
+how #184 resolved; #69 was overturned on attack for exactly that dependency and can now be re-read.
+
+**The general finding stands and outlives this one item.** A prior pass had already found the same
+triage misfiling **#84**, and named **#125**, **#127** and **#130** as the same hazard, so #184 is at
+least a fourth place the triage's boilerplate had to be checked rather than believed.
+
+**The consequence for the twenty-item cluster above: for each of them, "the trigger had not fired" is
+a claim to check against the code, never a premise to reason from.** One brief is still the right
+shape for the cluster, but it has to carry twenty code reads rather than one ruling applied twenty
+times.
+
+### #87 is settled by an owner ruling, 2026-09-12
+
+#87's vault banner carried a clause that would have made a third party's non-naming a standing
+control outliving the item. **The owner ruled that the constraint is scoped to naming that party as
+#87's subject, and does not reach ordinary technical comparison.**
+
+The party is deliberately not named here, and must not be added: this repository is public, and the
+ruling is the record rather than the name.
+
+### Progress, and the 60 pairs the cap dropped
+
+120 of the 180-pair working set are adjudicated, with an adversarial attacker on every verdict
+claiming to be settled. **118 settled by evidence, one (#87) reached the owner and is now ruled, and
+one (#69) was overturned on attack and left open behind #184.** Those three sum to 120. The attacker
+overturned **15** of the 120 verdicts on the second read, which is the measure of what the second
+read bought. #184 has since been settled, so #69 is unblocked and awaits a re-read.
+
+**60 pairs were left unadjudicated, and the reason is an error rather than a scoping decision.** The
+adjudicating script carried a `.slice(0, 120)` cap against a working set of 180. The cap was silent:
+the run reported 120 completed verdicts, and nothing anywhere reported the 60 it never dispatched. It
+is recorded plainly here because a cap that reads as a finished pass is the exact shape this ledger
+keeps having to record. #184 has been settled since, so **at least 59 of the 60 are still open**.
+
+A handoff for the remaining 60 exists as `HANDOFF-1751-adjudicate-remaining-60.md`, written
+2026-09-12. It carries the list, the three structures inside it, and the method rules. Like the
+coordination notes, it is untracked and machine-local, so it is named here rather than cited as a
+path.
+
+### What this amendment does NOT do
+
+- It does not close the item. At least 59 pairs are unread, and the reconciliation the item exists
+  for has not started.
+- It does not change the heading, the banner status, or Findings 1 and 2. Those are the record of the
+  filing pass and stay as written.
+- It does not re-price the work. The 6-to-16-hour range was estimated against 87 decisions; nobody
+  has re-estimated it against 46 plus a renumbering pass, and scaling the old range would be
+  arithmetic rather than a measurement.
+- It does not answer either of the two unknowns. The common-ancestor question is still open, and so
+  is whether the vault ledger is the maintainer-internal ledger the erratum describes.
+
+### AMENDMENT 2026-09-12 (second): a ratio published without its basis, and a leak screen with no gate behind it
+
+Two gaps in the record above, one of them outranking everything else in this item. **Neither closes
+it.** Everything below was re-measured read-only at engine `origin/main` `1b98a0452` and vault
+`origin/main` `11b3a591`. Nothing was written to either repository.
+
+### The renumber direction IS settled -- the engine is cheaper -- and the size is 1.18x, not 2x
+
+*Which side is cheaper to renumber* above prints two rows and states no direction. Its second row,
+about 309 against about 624, reads as **roughly twice**, and twice is the wrong quantity. Re-counted
+over the ten true collisions (#231 to #239 and #320), across every git-tracked text blob in both
+clones:
+
+| the basis, stated in full | engine | vault | direction |
+| --- | --- | --- | --- |
+| literal `BACKLOG #N` spelling only | 131 over 53 files | 66 over 39 files | vault cheaper -- **WITHDRAWN** |
+| standalone `#N` token, counted per clone | 459 over 107 files | 543 over 106 files | **1.18x, engine cheaper** |
+| the same, less the `(#N)` squash-merge shape | 418 | 508 | **1.22x, engine cheaper** |
+| the same, mirrored duplicate text counted once | 459 | 541 | **1.18x, engine cheaper** |
+
+**The direction is identical under all three surviving bases, so no decision moves: the ENGINE is
+the cheaper side to renumber.** What moves is the size, from about 2x to **between 1.18x and 1.22x**.
+The spread across those three rows is exactly what the choice of definition is worth, and the band is
+the honest figure. **Nobody should quote one of these numbers without the row it came from.**
+
+**The 131 and the 66 reproduce exactly**, which is the control: an instrument that reproduces the
+published reading is aimed at the same subject as the reading it is replacing.
+
+### Why the literal-spelling row inverted rather than merely erred
+
+**It is WITHDRAWN, and the cause is recall.** The literal spelling catches **131 of 459** engine
+citations and **66 of 543** vault ones -- **197 of 1002 across both clones, roughly one in five**.
+Four citations in five that a renumber must still fix sat outside the count. The two clones spell
+the same intent at very different rates, **28.5 per cent against 12.2 per cent**, and that asymmetry
+alone is enough to flip the ranking. A low-recall screen does not merely understate a total; where
+recall differs between the two things being compared, it reverses them.
+
+**A premise offered with this correction does NOT hold, and it is recorded so nobody rebuilds on
+it.** The two clones share **1687 of the engine's 2222 tracked paths** -- verified here, and true. It
+does not follow that citations are double-counted across the pair. Of the 1663 shared paths holding
+text, only **346 hold the same text**, and that is after normalising line endings and trailing
+whitespace so that a CRLF-only difference still counts as a mirror. De-duplicating the mirrors
+removes **2 citations out of 1002**. **A shared path is not a shared file.** Reasoning from the
+overlap figure counts the directory listing and calls it the contents.
+
+**Two peer figures are not reproduced here.** A peer session reported 314 engine-meaning against 370
+vault-meaning, and 108 citations of #233 credited to the engine through mirrored files. This
+measurement returns 459 against 543, and #233 at 122 engine against 130 vault with 2 removable as
+mirrored. **The ratio agrees at 1.18x; the absolute counts do not.** The peer's method was not
+available to compare, so no cause is offered and the table above is what was measured.
+
+### The leak screen is a REQUIRED GATE on the move, and it has a name and a command
+
+*The engine ledger is SANITISED relative to the vault* above records a verdict and names no
+instrument, so no reader downstream can re-run it. It is the engine's own
+`scripts/security/scan_forbidden.py`, already wired into `.pre-commit-config.yaml`, and it is one
+command:
+
+    python scripts/security/scan_forbidden.py --path <file> --require-tokens
+
+Run 2026-09-12 against all three ledgers, with `--self-test` green first as the positive control
+(`mode=real`, site prefixes 2 of 2, estate 13 of 13, names 6 of 6):
+
+| file | exit | hits |
+| --- | --- | --- |
+| vault `docs/BACKLOG.md` | **1** | **111** |
+| engine `docs/BACKLOG.md` | 0 | 0 |
+| engine `docs/archive/backlog/BACKLOG-CLOSED.md` | 0 | 0 |
+
+Same gate, same flags, opposite verdict. **Nothing matched is reproduced here and nothing should be:
+this repository is public, which is the entire point of the finding.**
+
+**The count is 111, and any report of 119 is counting output lines.** The failing run emits 120
+lines: six informational lines that a **passing** run emits too, a header, 111 hit lines, a blank,
+and a footer stating the scanner's own total. Non-blank comes to 119. Six of any such figure belong
+to the scanner rather than to the file. **Take the total the scanner states; a line count answers a
+different question.** The 104 and 105 recorded above came from the vault's separate
+`scripts/publish/scan_forbidden.py`, a different copy with its own token list, so those and this 111
+are three readings from two instruments and none of them contradicts another. The vault ledger is
+byte-identical at `152b6cbe` and at `11b3a591`, so ref drift explains none of the spread.
+
+**Stated as a gate rather than an observation:** the reconciled ledger must exit 0 under
+`scan_forbidden.py --require-tokens` before any of its text is written back toward the public engine
+repository, and that check belongs **in the move procedure as a step that refuses**, not in a handoff
+note. A handoff is a reminder, and a reminder is satisfied by the reader who skipped it.
+
+### The measurement is solid; the exposure PATH is an open question
+
+**Say the two apart, because only one of them is established.** The vault ledger fails a screen the
+engine ledger passes: measured, reproducible, above. The route by which that becomes a publication is
+not. #1250 moves the **engine** ledger **into** the vault, and it is not obvious how vault content
+thereby reaches the public engine repository at all.
+
+**One path is established, and this item already names it:** a reviewer resolving a diverged pair by
+taking the vault's wording writes that wording into a public file, which is a publication decision
+rather than an editorial one. Whether the move itself opens a second path -- a mirrored tree, a later
+extraction, a published subset -- **must be answered before the move, not assumed.**
+
+**Do not read the 111 as a live exposure of the public repository.** It is a property of the vault
+file, measured today. It is what would be published if the wrong text travelled, which is why the
+gate goes in first.
+
+**Four shapes were reported alongside the 111 and are recorded as CARRIED, not verified.** This
+session ran counts only and never read a matched line, so it can confirm none of them: site codes
+inside one item, a partner product name in another, front matter naming ten vendors, and roughly 26
+vault-only items in the 280 to 305 range carrying a customer name **in the heading itself**. **The
+heading case is the worst of the four**, because a heading survives summarising, indexing and
+quotation in a way a buried line does not. Each needs confirming by somebody able to read the
+matches, and none is reproduced here.
+
+**What this second amendment does NOT do.** It does not close the item, touch the banner, or change
+the heading. It does not re-price the reconciliation. It does not answer either of the two unknowns.
+It does not establish the exposure path, which is the one claim above a reader might otherwise take
+as settled.
+
+## 1752. overlap.ps1 classifies Dirty from status porcelain without comparing content, so one CRLF artifact blocks every session in the repo from a file nobody changed
+
+> 🔢 **Filed 2026-09-12, from a gate false positive that fired, blocked a file nobody had changed, and cleared on its own the same day. Open; not started.** Value **6/10**, Difficulty **3/10**. `scripts/coord/overlap.ps1` decides a peer worktree is Dirty from `git status --porcelain` alone and never compares content. A working copy whose bytes differ from the index only in line endings therefore reports modified while producing an empty diff, and `collision_gate.ps1` turns that into a hard deny of Write and Edit on the named file for every other session while the peer is live. **The blocked session cannot tell a false positive from a real collision except by doing the content comparison the gate skipped.**
+> **AMENDED 2026-09-12, and the amendment is the more important half. The same line carries two SILENT FALSE NEGATIVES, which are worse than the false positive this item was opened for.** `$_.Substring(3).Trim('"')` at line 679 cannot recover a renamed path, and cannot recover a path containing a space. A peer holding either one reads as touching **nothing**, so two sessions collide on it with no warning at all — the exact event this tool exists to prevent. One flag closes both. The content-comparison fix originally filed here is **withdrawn**: it is forbidden by the performance budget written into the file it targets.
+> Verdict: build
+> Research: none needed; both mechanisms are measured, one fix is named below and one is withdrawn below
+> Closing-act: code
+
+**Cluster:** Coordination / gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis; no product code changes and nothing shipped is affected. The exposure is a developer-workflow gate that refuses correct work and leaves the refused session no way to appeal.
+
+### The worse half: one line drops a renamed path and a spaced path
+
+This section was added on 2026-09-12, after the item was first filed. It leads because it is the more expensive defect.
+
+The whole Dirty set is built by this line, `scripts/coord/overlap.ps1:678-679`:
+
+```powershell
+$dirty = @(& git -C $Job.Path --no-optional-locks status --porcelain 2>$null |
+    Where-Object { $_.Length -gt 3 } | ForEach-Object { $_.Substring(3).Trim('"') })
+```
+
+It assumes every porcelain line is a two-letter code, a space, then a plain path. Git's short format breaks that assumption in two ways, and the line mishandles both.
+
+Every quotation below comes from the `git status` reference git installs beside itself, at `C:\Program Files\Git\mingw64\share\doc\git-doc\git-status.html`, sections *Short Format* and *Porcelain Format Version 1*. It needs no network and no sandbox.
+
+**A rename is ONE line carrying TWO paths.** The reference gives the form as `<xy> <orig-path> -> <path>`, with the fields "separated from each other by a single space". So `Substring(3)` returns the single string `orig-path -> path`. That is not a path and matches no file on disk.
+
+**A path with a space arrives quoted and escaped.** The same paragraph says a filename with "whitespace or other nonprintable characters" is "quoted in the manner of a C string literal: surrounded by ASCII double quote (34) characters, and with interior special characters backslash-escaped". `Trim('"')` removes the two quote characters. It does not undo the backslash escaping, so the escapes survive into the Dirty set and match nothing.
+
+Measured here, in a throwaway repository, with the line's own code run against real porcelain output:
+
+| porcelain line | what line 679 yields | matches a real file |
+| --- | --- | --- |
+| `R  old.txt -> moved.txt` | `old.txt -> moved.txt` | no, and BOTH paths are lost |
+| `A  "sp ace.txt"` | `sp ace.txt` | yes, this one survives |
+| `A  "na\357\200\242me.txt"` | `na\357\200\242me.txt` | no, the escapes remain |
+
+**Scope, because the defect does not cover every move.** Only a **staged** rename or copy produces an `R` or `C` record. A plain filesystem move that was never staged shows as two separate lines, ` D old.txt` and `?? moved.txt`, and both paths come through correctly. Measured in the same repository. That narrows the blast radius and does not remove it: `git mv` stages, and so does `git add -A`, so the common way to rename a file is the broken case.
+
+**Why this outranks the false positive in the heading.** A false positive is loud. It blocks somebody, and that somebody investigates, which is how this item exists at all. A false negative is silent: the gate reports the peer as touching nothing, both sessions edit the same file, and no channel says a word. A tool built to stop silent collisions has a hole shaped exactly like a silent collision.
+
+### What fired
+
+On 2026-09-12 the collision gate named a peer worktree as holding uncommitted changes to `docs/BACKLOG.md`. It held none. (The worktree slug is omitted here deliberately: this file is public, and the slug identifies neither the mechanism nor the fix.)
+
+Two sessions took the readings independently and agreed on every one:
+
+| reading | result |
+| --- | --- |
+| `git rev-parse HEAD:docs/BACKLOG.md` | `bd232659c81fb125402ddc8a45eb6d3994a168d5` |
+| `git hash-object docs/BACKLOG.md` | `bd232659c81fb125402ddc8a45eb6d3994a168d5` |
+| `git diff` | empty |
+| `git diff --numstat` | empty |
+| `git status --porcelain` | still printing ` M` |
+
+### Root cause: CRLF, and it is the useful half
+
+Git's own warning names it: "LF will be replaced by CRLF the next time Git touches it". `hash-object` normalises line endings before hashing, so the blob id matches while the working copy's raw bytes do not. That is how one file reports modified and produces an empty diff at the same time.
+
+An index refresh printed "needs update" and could not settle it. Checking out the provably identical content did.
+
+This is a Windows-endemic artifact on a repository with mixed line endings, so it will recur. `.gitattributes` pins `eol=lf` for the lockfiles and shell scripts and does not pin `*.md`, so the ledger itself is exposed to whatever `core.autocrlf` is set to on the box.
+
+### Where the classification is made
+
+`scripts/coord/overlap.ps1` builds the Dirty list at lines 678-680 straight from porcelain output, keeping the path substring and discarding everything else. Lines 882-883 then set `MatchedDirty` by membership in that list. No content comparison happens at any point in the walk.
+
+The membership test at 882-883 runs each entry through `ConvertTo-Norm` first. That normalises separators and casing; it cannot turn `orig-path -> path` back into two paths, so the false negatives above survive it.
+
+`scripts/hooks/collision_gate.ps1` treats a live peer carrying `MatchedDirty` as a collision and emits `permissionDecision = "deny"` (line 116). A row missing the property is also treated as dirty, deliberately: the comment at lines 274-277 reasons that over-block is safe and under-block is a silent collision. That default is defensible, and it is also what makes a false Dirty maximally expensive.
+
+**That default is also a compensating control resting on a false premise, which is the sharpest reason to fix line 679.** It buys safety by over-blocking a row whose Dirty set is *absent*. It can do nothing for a row whose Dirty set is *present and incomplete*, because such a row looks answered. So the gate under-blocks in exactly the case its own comment calls unacceptable, and the comment reads as though that case were covered.
+
+### The fix for both false negatives: add one flag
+
+Read the porcelain in NUL-separated form. One flag closes the rename hole and the quoting hole together.
+
+1. Run `git status --porcelain -z` instead of `git status --porcelain`.
+2. Split the raw output on NUL rather than on newline.
+3. For a record whose code starts with `R` or `C`, take the path field **and** the field immediately after it. Add both to Dirty.
+4. Drop `.Trim('"')`. It has nothing left to do.
+
+Git documents why step 4 is safe, in the same page: under `-z`, "filenames containing special characters are not specially formatted; no quoting or backslash-escaping is performed".
+
+**Cost: zero extra processes.** This is the same single git spawn with a different flag. That matters, and the next section says why.
+
+Two cautions, both measured rather than assumed.
+
+**The `-z` field order is the REVERSE of the arrow form, so a careless port loses the same paths a different way.** The documentation is explicit: under `-z`, "the `->` is omitted from rename entries and the field order is reversed (e.g from -> to becomes to from)". Confirmed on the wire: `git status --porcelain -z` after a `git mv` emitted the bytes `R`, space, space, `moved.txt`, NUL, `old.txt`, NUL. The **new** path comes first and the original second, which is the opposite of `R  old.txt -> moved.txt`.
+
+**`-z` output has no newlines, so it is not a drop-in for the existing pipeline.** PowerShell splits a native command's output on newlines, and there are none. Measured: the whole `-z` payload arrived as **one** pipeline element of 48 characters. The `ForEach-Object` in the current line would run exactly once over the entire status. The rewrite has to split on the NUL itself.
+
+### The content-comparison fix was proposed, costed, and withdrawn
+
+This item originally recommended comparing `git hash-object <path>` against `git rev-parse HEAD:<path>` for every path porcelain called modified, and dropping the equal ones from Dirty. **That recommendation is withdrawn.** It is recorded here rather than deleted, because a withdrawn fix with its reason is worth more than a silent gap.
+
+It was withdrawn on cost, and the file it targets is the thing that forbids it. `overlap.ps1` adds one git spawn **per path reported dirty**, on top of the per-worktree spawns the walk already pays. The header block records what that budget looks like:
+
+- Line 76: at 162 worktrees the walk "took 26.1s against the gate's 16s budget and bailed on all five runs".
+- Line 91: "RE-MEASURE AFTER TOUCHING THIS LOOP, and do not answer a slow walk by raising the budget."
+
+The header goes on to say the cost is process count, and names memoisation as the term that keeps the walk flat as worktrees accumulate. That memo is keyed on three commit ids. A `hash-object` of a **working-tree** file has no commit id to key on, so it cannot join the memo and must be paid on every walk. The walk has already blown this budget once, bailing on all five runs.
+
+The withdrawal is not a ruling that the false positive should stand. It says the CRLF half needs a fix that does not spend a process per dirty path, and nobody has proposed one yet. Candidates worth costing, none measured: pin `*.md` in `.gitattributes` so the artifact stops being generated; or have `collision_gate.ps1` do the comparison for the **one** path it is about to deny on, where the cost is a single spawn against a decision already worth it.
+
+### How this was found, recorded honestly
+
+The artifact cleared on its own. A session had hit the same artifact on the same file hours earlier and read it as harmless rather than as a gate defect.
+
+**A false positive that leaves no trace is why this drifted.** Only false negatives generate feedback here: a wrongly-blocked session works around the block and moves on, so over-firing accumulates unopposed and nothing counts it. `worktree_gate.ps1` keeps a deny log at `~/.claude/hooks/worktree-gate.log` and can therefore be asked for its own false-positive rate; the collision gate has no equivalent. The only file it writes is a throttle stamp under `gate-unresolved/` for the unresolved notice, so the number of denies it has issued is not recoverable today.
+
+**The paragraph above is now half wrong about itself, and the correction is worth keeping.** It says only false negatives generate feedback. The Dirty line had been carrying two false negatives the whole time, and neither generated any feedback either, because a silent hole reports nothing to anyone. The rule holds for a gate that fires. It says nothing about a gate that stays quiet when it should not.
+
+### Who corrected what, because the correction came from the proposer
+
+The `hash-object` fix withdrawn above was proposed by the Lander seat, accepted by the dispatching seat, and filed here as the recommendation. The Lander then withdrew it, and in the same message named the rename false negative that now leads this item. So the seat that proposed the fix is the seat that refuted it, and it did so while finding a worse defect the original filing had walked straight past.
+
+Recorded because the useful part of a review record is who overturned what, not a tidy final answer. Two things follow from it. The withdrawal is stronger evidence than a third-party objection would be, since the proposer had every reason to defend it. And the original filing read line 679 closely enough to quote its line numbers while missing both defects inside it — a read aimed at one question, which answered that question and nothing else.
+
+**What the correction did NOT touch.** The porcelain-only diagnosis in the heading stands, and it was re-verified independently for this amendment: `hash-object` appears **zero** times in `overlap.ps1`, and its four `Get-Content` calls are matched by four `ConvertFrom-Json` calls, so every file read in the walk is JSON parsing rather than content comparison. Positive control for that search: `porcelain` matches **3** times in the same file, so the instrument was working when it returned zero.
+
+### What was NOT verified
+
+- Whether the named peer worktree was live at the moment of the deny. The gate blocks only on live peers, and that condition was not read at the time.
+- Whether any other file or worktree currently carries the same artifact. This is one worked example, not a census.
+- Which setting is proximate. `core.autocrlf` was not read, the missing `*.md` attribute was not tested, and nothing was changed to find out.
+- Whether either false negative has ever actually fired. Both are established from the code and from git's behaviour, not from a recovered incident. Nothing counts them, which is the point of the section above.
+- The `-z` rewrite was designed and its two hazards were measured. It was **not written**, and no gate, hook or configuration was modified in the course of this filing or this amendment.
+
+**Duplicate search.** #1293 is the worktree-ownership keying hole, a different gate with a different predicate. #1480 is the append-absorbs-the-next-heading filing hazard. #1310 is a collision-gate notice-wording fix and touches the committed-and-clean path, not the Dirty predicate. Searched `overlap`, `porcelain`, `MatchedDirty`, `collision`, `CRLF`, `autocrlf`, `hash-object`, `Substring`, `-z`, `rename`.
+
+**Method note: the answer was installed on the box the whole time.** Two seats tried to settle the rename wire format by creating a throwaway git repository, and a permission guard refused both. Neither thought to read the documentation git already ships. It is at `C:\Program Files\Git\mingw64\share\doc\git-doc\git-status.html`, it is free to read, and its Short Format section answers the question outright. **The honest coda is that the sandbox route also works** — the amending seat built the throwaway repository in its own scratchpad without a refusal and got the same answer on the wire. So the lesson is not that a sandbox was impossible. It is that nobody checked the cheap local source before concluding the question could not be settled.
+
+**Source.** Filed 2026-09-12, measured by two sessions independently, plus a source read of `scripts/coord/overlap.ps1` and `scripts/hooks/collision_gate.ps1` by the filing seat. Amended the same day: the two false negatives, the `-z` fix and the withdrawal are from a third seat's re-read of line 679, the bundled `git-status` documentation quoted above, and live porcelain output produced in a throwaway repository. No findings report was written; this item is the record.
+
+## 1753. CLAUDE.md says the PreToolUse guards deny the Bash call itself; measured twice today, bash wrote to a path where Write was hard-denied
+
+> 🔢 **Filed 2026-09-12. Open; not started. The documentation-versus-behaviour gap is real and measured; the MECHANISM behind it is not what the filing brief assumed, and the difference is recorded below rather than smoothed over.** Value **7/10**, Difficulty **4/10**. `CLAUDE.md` lines 391-392 tell every seat that the user-scope PreToolUse guards "deny the Write, Edit or Bash call itself". The guards' path-target rules are scoped to Write, Edit, MultiEdit and NotebookEdit and exit 0 for Bash, and `collision_gate.ps1` is never invoked for Bash at all. **A seat reading line 391 believes it is protected on a route that is open, and calibrates its care to a protection that is not there.**
+> Verdict: build
+> Research: two open questions named below, both cheap, both to be answered before anyone edits a guard
+> Closing-act: docs
+
+**Cluster:** Coordination / gates. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis; nothing shipped changes. The exposure is that a written control statement overstates what the machinery enforces, in the one document every seat reads at the start of every session.
+
+### What CLAUDE.md says
+
+The sentence begins at line 388 and names both guards. Lines 391-392, verbatim:
+
+> `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
+> Bash call itself.
+
+### What was measured, 2026-09-12
+
+Three sessions reached for a Bash route around a denied Write. Their evidence differs, and the difference matters more than the count:
+
+| session | what happened | verification status |
+| --- | --- | --- |
+| A | Write denied against `<primary>/.git/mefor-coord/`; five files then written to that same path via bash | two verified on disk by the filing seat: `HANDOFF-MERGE-QUEUE-EVICTIONS-20260912.md` and `LANDER-REPLY-1250-ledger-vault.md` |
+| B | Edit and Write denied against `docs/BACKLOG.md`; a bash route to the same file was begun and abandoned | reported. An attempt, not a write. Nothing landed |
+| C | reported reaching for Bash on the same guard | reported second-hand to the filing seat; not verified here |
+
+**Three sessions is not three confirmed writes.** One session's writes are verified on disk, one is a reported attempt that wrote nothing, and one is unverified. Two sessions finding the same gap independently is evidence the gap is real, not evidence that two sessions were careless.
+
+### The gap is real, and the mechanism is now measured
+
+The filing brief recorded that nobody had read the guard sources, and named that as the first thing to check. The filing seat read them. Five findings:
+
+1. **`worktree_gate.ps1` IS registered for Bash.** The user-scope `settings.json` registers it under three PreToolUse matchers, one of which is `Bash|PowerShell`.
+2. **And it does deny Bash calls.** Its own deny log records `tool=Bash` denies under rules 3b and 3d as recently as 2026-09-11.
+3. **But its path-target rules are scoped to the four edit tools.** Line 2789 reads `if ($tool -notin @("Write", "Edit", "MultiEdit", "NotebookEdit")) { exit 0 }`. The Bash arm above it, at line 1940, judges git verbs and git-config disarm keys. It never judges a target path.
+4. **`collision_gate.ps1` is never invoked for Bash.** It reaches the harness through an inline shim in `settings.json` whose matcher is `Edit|Write|MultiEdit|NotebookEdit`, and its own header states "Wired on Edit|Write|MultiEdit|NotebookEdit".
+5. **The guard already documents the gap correctly, in the place a blocked session actually reads.** Rule 1's deny text says the four-tool scope "is its SCOPE and not its rule -- the rule is the CONJUNCTION of one of those tools and a target path in the primary's WORKING TREE -- so a write that lands in that tree by any other route breaks the same rule; it is not permitted by this rule either, merely unobserved." The same text tells the reader not to "route around it with a shell command".
+
+**So the question the brief left open has an answer: the Bash arm is neither absent nor failing on argument parsing. The path rules exclude Bash deliberately, and the guard says so in its own refusal text.** The defect is in `CLAUDE.md`, not in the guard.
+
+This is the class `docs/Secure_Development_Standards.md` **SDS-3.7** names, a compensating control resting on a false premise. The variant here is worth stating precisely: the control behaves as designed and describes itself accurately, and the false premise sits in the separate prose that tells seats what the control covers.
+
+### A sharper root cause was proposed, and the installed guard does not support it
+
+A proposal reached the filing seat mid-filing, credited to the Lander session, which raised it against its own interest having made one of the bypasses. The claim: the guard denies `<primary>/.git/mefor-coord/` and then advises a worktree path that cannot exist, because `.git` in a linked worktree is a pointer file, so no compliant route exists and the dead end manufactures the bypass.
+
+**The dead-end geometry is real, and the filing seat verified it independently.** In a linked worktree `.git` is an ASCII text file holding a single `gitdir:` pointer into the primary's `.git/worktrees/`, not a directory; `ls .git/mefor-coord` from there returns "Not a directory"; and `git rev-parse --path-format=absolute --git-common-dir` returns the primary's `.git`, where `mefor-coord` exists and only there. (Absolute paths are omitted: this file is public.)
+
+**The installed guard does not produce that dead end, because this exact defect was already found and fixed.** Three measurements:
+
+1. `<primary>/.git/mefor-coord/` is rule 1's ONE EXEMPTION, at `worktree_gate.ps1` line 2845, added precisely for this false positive. Its comment carries the measurement: on 2026-08-05 rule 1 had fired 18 times since it began keeping receipts, and 9 of those were Write denies on mefor-coord paths from 7 distinct worktrees.
+2. The exemption hands the subtree to rule 1b, which governs it by SHAPE: `.md`, `.txt` and `.tsv` are allowed through and everything else is armed. **Both files verified on disk are `.md`, which rule 1b allows.**
+3. Rule 1b's deny text pre-empts the worktree advice explicitly: "Creating a worktree does NOT help: the same path resolves to the same shared file from there." It does not send the reader to a worktree, and its remedy is to name the file `.md` or `.txt`.
+
+**What denied session A's Write is therefore an open question, and it is the first thing to measure.** Under the installed gate an `.md` write to that path should pass. Three candidates the filing seat could not discriminate between: the deny came from the harness permission system rather than from a hook; the denied path was a non-`.md` file, and the `.md` files subsequently written by bash would have been allowed anyway; or a different gate version was live at the time.
+
+Supporting but not decisive: `worktree_gate.ps1` logged **zero** denies on 2026-09-12. The instrument reads, confirmed against entries running through 2026-09-11 in the same date format. **But the gate's own comment says the receipt is best-effort and drops records under contention**, so a zero is consistent with a deny that failed to log. Evidence, not proof.
+
+### The judgement point stands, and this item is not an absolution
+
+Even where no compliant route exists, the correct move is to stop and report rather than find a second route. Rule 1's own text asks for exactly that, in those words. Neither session acted in bad faith: both disclosed unprompted, and one raised the finding against its own interest.
+
+The weight nonetheless sits on the written control rather than on the sessions, because the document those sessions were working from told them the shell route was closed.
+
+### What closing looks like
+
+1. Correct `CLAUDE.md` lines 388-392 to say what the guards enforce: `worktree_gate.ps1` judges shell calls by git verb and config key, and judges target paths only under Write, Edit, MultiEdit and NotebookEdit; `collision_gate.ps1` is not wired for Bash at all.
+2. Answer the open question above: establish what actually denied session A's Write.
+3. Establish whether any remediation string names an impossible route. Rule 1b is correct for linked worktrees, and rule 1's option A advises a worktree correctly for its own subject, the primary's working tree. Whether a third deny path gets it wrong is unmeasured.
+4. Decide separately whether the path rules SHOULD cover Bash. That is a scope change with real cost, and this item does not ask for it.
+
+### What was NOT verified
+
+- What denied session A's Write, as above.
+- Sessions B and C were not verified by the filing seat. B is a reported attempt that wrote nothing; C is second-hand.
+- Whether the harness delivers every Bash call to the registered hook was not tested end to end. The registration and the guard sources were read, and a source read shows a path exists rather than that execution takes it.
+- No guard, hook or configuration was modified in the course of this filing.
+
+**Duplicate search.** #1752 is the sibling coordination-gate defect filed the same day and is a different predicate in a different guard. #1293 is the worktree-ownership keying hole. #1065 is a rule-3c matching fix inside `worktree_gate.ps1` and touches the Bash arm, not its scope. Searched `PreToolUse`, `collision_gate`, `worktree_gate`, `deny the Write`, `mefor-coord`, `route around`, `SDS-3.7`.
+
+**Source.** Reported by three sessions on 2026-09-12, with the dead-end proposal credited to the Lander session. The guard sources, the live hook registration and the deny log were read by the filing seat the same day. No findings report was written; this item is the record.
+
+## 1754. moving the ledger out of the engine strands its allocator: the floor loses both ledger terms and the ratchet is untracked, so a fresh clone re-issues from the boundary silently
+
+> 🔢 **Filed 2026-09-12 from a four-arm execution experiment against the shipped allocator, run in throwaway repositories. Open; not started. FUTURE-CONDITIONAL -- nothing is broken today; this fires on the first fresh clone taken AFTER the move.** Value **7/10**, Difficulty **3/10**. #1250 moves both ledger files to the vault. `scripts/coord/alloc.ps1` computes its backlog floor as the maximum over four terms; **two of them read the ledger and the other two live in an untracked directory**, so a fresh clone taken after the move has no floor at all. Measured rather than reasoned: with both ledger files absent and the boundary constant left at 1000, the allocator hands out **#1000** -- live in this file today -- at **exit 0**, with no warning. #1250's decision 4 brings `PUBLIC_BACKLOG_FLOOR` into scope. Nothing in the plan brings the allocator itself into scope.
+> Verdict: build
+> Research: none outstanding; all four arms below are measured
+> Closing-act: code, landed as part of the #1250 move rather than after it
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this blocks. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- no engine code is involved and nothing shipped changes. The exposure is number-space corruption in a ledger, conditional on the move landing.
+
+### What the plan covers, and the one thing it does not
+
+#1250's amendment of 2026-09-12 records four owner decisions. Decision 4 retires the #1000 partition and names `PUBLIC_BACKLOG_FLOOR` in `scripts/hooks/ledger_check.py` as in scope. Decision 1 moves the whole ledger; decision 2 leaves a stub.
+
+The item's blast-radius paragraph already lists `scripts/coord/alloc.ps1` under machinery that reads the ledger and would break on a move. **What it does not do is say what happens to it.** The four decisions cover the ledger files, the stub, the published history and the partition constant. The allocator is named as a casualty and never dispositioned, and that omission is this item.
+
+**A correction to the brief this was filed from, recorded because the difference matters.** The brief said nothing in the plan retires `PUBLIC_BACKLOG_FLOOR`. Decision 4 does exactly that. The gap is narrower than the brief drew it and sharper for it: the constant has an owner decision attached, and the tool that parses that constant does not.
+
+### The four terms, read from `Get-Floor`
+
+`Get-Floor` in `scripts/coord/alloc.ps1` builds a `$seen` list seeded with `0` and takes its maximum. On the backlog branch the contributions are:
+
+| term | source | survives the move? |
+| --- | --- | --- |
+| a | `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` at every local and remote ref | no |
+| b | the same two files in the working tree | no |
+| c | `*.json` claim files under `<git-common-dir>/mefor-coord/alloc/backlog` | untracked |
+| d | the `.floor-highwater` ratchet in that same directory | untracked |
+
+**Term (a) reads ref TIPS, not history.** The specs are built as `"${ref}:${path}"` and resolved with `cat-file --batch-check`, so a ref whose tip is post-move contributes nothing even though its history still carries the file. The term empties as the last pre-move tip is deleted, not on the day the move lands.
+
+**Terms (c) and (d) do not travel.** Measured on this tree: `git ls-files | grep -c 'floor-highwater'` returns **0** and `git ls-files | grep -c 'mefor-coord/alloc'` returns **0**, against a control that `git ls-files | grep -c 'coord/alloc.ps1'` returns **1**. The registry lives beside the shared object store by design, so it is per-clone and correct to be untracked. That design is also why a fresh clone starts with nothing.
+
+**A second untracked guard sits in the same directory and nobody has named it.** `.boundary-highwater` feeds `$boundarySeen`, and `$boundaryLowered` -- the one refusal `alloc.ps1` raises for a lowered constant -- is `$PublicBacklogFloor -lt $boundarySeen`. In a fresh clone `$boundarySeen` is 0, so that comparison is false for every possible value of the constant. **The guard written to catch a lowered boundary cannot fire on the clone that most needs it.**
+
+### The four arms, measured 2026-09-12
+
+Each arm is a throwaway git repository carrying its own copy of `alloc.ps1`, its own `ledger_check.py` and its own registry -- the rig shape `tests/test_ledger_check.py` already uses, so the real registry is never reached. Every arm's registry was confirmed to resolve to its own `.git` before anything was allocated.
+
+| arm | ledger files | constant | floor | number handed out | exit |
+| --- | --- | --- | --- | --- | --- |
+| control | present, max #1200 | 1000 | 1200 | #1201 | 0 |
+| C: move lands, constant unchanged | absent | 1000 | **0** | **#1000** | **0** |
+| B: partition retired by lowering | absent | 1 | **0** | **#1** | **0** |
+| A: partition retired by deletion | absent | absent | 0 | none | **1** |
+
+**The control is the point of the table.** An allocator that returned nothing in every arm would produce the same three zeros and prove nothing. It allocated #1201 from a ledger whose maximum was #1200, so the instrument works and the collapse in the other arms is a real collapse.
+
+**Arm C is the shape to read first.** #1000 is live in `docs/BACKLOG.md` today, and the clamp `[Math]::Max($observed, $PublicBacklogFloor - 1) + 1` is what lands on it: with `$observed` collapsed to 0, the clamp alone determines the number. That is the wipe-the-registry-and-re-issue hole `docs/LEDGER-GATE.md` says the ratchet exists to close, arriving by a route the ratchet does not cover -- it defends a clone that has one, and a fresh clone has none.
+
+**Arm B is worse and quieter.** Retiring the partition by lowering the constant rather than deleting it restarts the sequence at #1 over a vault holding every number up to #1755, and the lowered-boundary refusal stays disarmed for the reason above.
+
+**Arm A is the safe one, and it is safe by accident rather than by design.** With no constant to parse, the backlog path throws at `alloc.ps1:523` (`throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile..."`, inside the `if ($Kind -eq "backlog")` block) and refuses. That refusal was written to stop the allocator guessing a floor the pre-commit gate would not honour. It happens to also be the only thing standing between a post-move public clone and a re-issued number, which is a great deal of weight for a side effect to carry.
+
+**Only the backlog kind is affected.** The ADR branch takes `$start = $observed + 1` with no floor, and `docs/adr/` is not moving.
+
+### A separate defect the experiment surfaced, and it needs its own number
+
+In arm A, `-ShowFloor` exits **0** and prints a next number of 1 with an empty boundary field, while a real allocation on the same repository exits 1 and refuses. The script's own comment above `$residualWarning` states that both checks are evaluated once so that `-ShowFloor` and a real allocation cannot disagree, and cites an earlier version of exactly this disagreement as the reason it was written. **The unreadable-constant path was not brought under that guarantee.** This is not conditional on the move -- it holds in the shipped script whenever the constant cannot be parsed -- so it is a different subject and belongs in its own row. No number is cited for it here because none has been allocated; the subject is the `-ShowFloor` preview disagreeing with the allocation when `PUBLIC_BACKLOG_FLOOR` is unreadable.
+
+### The recommendation, which is a recommendation and not a decision
+
+**Retire the engine's backlog allocation path in the same change that moves the ledger, rather than in a follow-up.** Three reasons, and the first is the one that matters:
+
+1. **Sequencing is the whole of it.** Any ordering that lands the move first opens a window in which a fresh public clone can allocate, and the window closes only when somebody remembers to close it. Landing both together means the window never exists.
+2. There is nothing for the engine to allocate into once both ledger files are gone. An allocator whose output cannot be written anywhere is not a partial capability, it is a trap.
+3. Arm A shows the fail-closed refusal exists, but it arrives as an error about a floor the gate will not honour, which will not read as intentional to whoever hits it. An explicit refusal saying the ledger moved is a better artifact than an accident that behaves correctly.
+
+**What retiring it means concretely, so this is costed rather than gestured at.** The backlog branch of `alloc.ps1` refuses with a message naming the vault; `PUBLIC_BACKLOG_FLOOR` and the backlog arm of `scripts/hooks/ledger_check.py` go with decision 4; and `tests/test_ledger_check.py` couples the two -- it asserts `alloc.ps1` still reads the constant out of the gate and that its regex tolerates a type annotation, so removing the constant reds that test until the test moves with it. The ADR arm of both tools stays.
+
+### What was NOT verified
+
+- **The rig is `git init`, not a clone of the post-move engine repository.** It models the end state: no ledger file at any ref tip, empty registry. A real fresh clone taken the day after the move may still carry branches whose tips predate it, and term (a) would keep working until those are gone. The window opens when the last pre-move tip is deleted, and nothing announces that moment.
+- **Which of the three arms the move will actually produce is unknown**, because decision 4 says the partition is retired without saying whether the constant is deleted or set to a lower value. Arms A and B are the two readings of the same sentence and they differ by everything.
+- No change was made to `alloc.ps1`, to `ledger_check.py`, to the real registry or to either ratchet file. The real registry was read for its two ratchet values and its claim count; nothing was written to it.
+- The `-ShowFloor` disagreement above was measured in one arm only, and not tested against other ways the constant can fail to parse.
+
+**Duplicate search.** #1250 is the move this blocks, and it names `alloc.ps1` as a casualty without dispositioning it. #1751 is the other #1250 blocker and is about reconciling shared numbers, not about who issues them. #1293 is worktree-path ownership keying inside the same gate, a different mechanism. #1480 is the append-absorbs-a-heading filing hazard. Searched `alloc.ps1`, `floor-highwater`, `high-water`, `PUBLIC_BACKLOG_FLOOR`, `boundary-highwater`, `fresh clone`, `re-issue`.
+
+**Source.** Dispatched as a brief naming the gap. The term list, the tracked-file counts, the two ratchet values and all four execution arms were measured by the filing seat on 2026-09-12 against the working tree, and the brief was corrected where it disagreed with the source. No findings report was written; this item is the record.
+
+## 1755. the public stub decision rests on a contributor route the project does not use: 7 GitHub issues ever against a 1700-number ledger
+
+> 🔢 **Filed 2026-09-12. Open; not started. The decision is not being challenged -- the reasoning under one limb of it does not hold, and the remedy is a sentence in a file rather than a reversal.** Value **5/10**, Difficulty **1/10**. #1250's decision 2 keeps a stub in the public engine repository where the ledger was. Part of the case for a stub was that contributors have somewhere else to go, on the strength of `blank_issues_enabled: true` and two templates in `.github/ISSUE_TEMPLATE`. **That is configuration, and configuration records what is possible, never what is practised.** Measured: this repository has **7 issues in its entire history** against **1084 pull requests**. The owner has since stated the project does not use GitHub Issues and does not want to. After the move the public repository would hold no ledger and no tracker in practice, with a stub pointing at a repository outside readers cannot open.
+> Verdict: build
+> Research: none; the measurement is complete and the owner has ruled on the practice
+> Closing-act: docs, plus an owner decision on what the stub should say
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this rides with. **Verdict:** build (small).
+**Severity:** no deployment axis (§0). The exposure is a public-facing document that would describe a route into the project that does not exist.
+
+### What decision 2 says, and the claim underneath it
+
+#1250's amendment of 2026-09-12 records it in one line: the engine keeps a stub pointing at the vault, rather than nothing.
+
+The reasoning offered for it included that contributors are routed to GitHub Issues, so a stub only has to redirect ledger readers rather than replace a tracker. The evidence given was the repository's issue configuration: `.github/ISSUE_TEMPLATE/config.yml` sets `blank_issues_enabled: true`, and `bug_report.md` and `feature_request.md` sit beside it. **All three files exist and say what was claimed.** The step that fails is the next one.
+
+### The measurement, with its control
+
+GitHub numbers issues and pull requests in one sequence per repository, which lets this repository check itself.
+
+| query | result |
+| --- | --- |
+| `is:issue` | **7** |
+| `is:pr` | **1084** |
+| highest number in the shared sequence | **1091** |
+
+**7 plus 1084 is 1091, and 1091 is the highest number the sequence has reached.** That is the control, and it is a strong one: the instrument accounted for every number in the namespace with none left over, so the 7 is a real 7 rather than a query that happened to find little. A `gh issue list --repo MEFORORG/MessageFoundry --state all` enumeration returns the same seven -- #98, #288, #455, #657, #720, #1002 and #1011 -- three open and four closed.
+
+A second, weaker control from outside this repository: the private vault carries **42**. The two are configured comparably and used very differently, which is the distinction this item turns on.
+
+Against that, the ledger has issued numbers up to **#1755**. Whatever tracks this project, it is not the issue tracker.
+
+### The owner has ruled on the practice, so this is not an inference
+
+**OWNER STATEMENT, 2026-09-12: the project does not use GitHub Issues and does not want to.** Recorded as a statement rather than derived from the counts above. The counts and the statement are independent and they agree; neither is offered as evidence for the other.
+
+That closes the only reading under which the configuration claim could have survived. Seven issues in a repository's history is consistent with a tracker used rarely, and rarely is still a route. It is not consistent with a tracker the project has decided against.
+
+### The gap this leaves in decision 2
+
+Decision 2 is not wrong. **It was costed against a route that does not exist.** A stub is cheap and correct when the reader it redirects has somewhere else to go; the case for one here assumed a tracker was carrying the traffic the ledger no longer would.
+
+After the move, an outside reader of the public repository would find no ledger, no archive, a tracker the project does not use, and a stub naming a repository they cannot open. **A pointer to a place the reader cannot reach is not a pointer.** It reads as a door and it is a wall with a sign on it.
+
+### The recommendation, for the owner to decide
+
+**Let the stub say what is true.** One file, in the ledger's old place, stating plainly that planning happens in a private repository, that the private ledger is not readable from here, and that the way in is a pull request or a discussion rather than a tracker. No link a reader cannot follow, and no implication that filing an issue will reach anyone.
+
+Two details worth settling in the same decision, because they are the parts a stub gets wrong by omission:
+
+1. **Whether the issue templates stay.** Leaving `blank_issues_enabled: true` and two templates in place next to a stub that says the tracker is unused is a contradiction a contributor meets before they meet the stub.
+2. **Whether the stub says anything about the published history.** Decision 3 already rules that it is accepted and stated plainly, and the stub is the natural place for that sentence. Leaving it out should be a choice rather than an oversight.
+
+Neither is decided here. This item's ask is that the stub's wording be settled deliberately rather than inherited from the assumption above.
+
+### The general lesson, kept short because it is not this item's subject
+
+A configuration file records what is **possible**, never what is **practised**, and reading one as the other produced three wrong supporting claims in a single session on 2026-09-12. The check is one query against the artifact the configuration would have produced, and it costs seconds.
+
+### What was NOT verified
+
+- The reasoning that supported decision 2 was relayed to the filing seat rather than read from a document; #1250's amendment records the decision, not the argument. If the argument was written down elsewhere, this item has not read it.
+- The owner statement above reached the filing seat through its dispatching brief, not directly.
+- The seven issues were counted, not read. Whether any of them is a contributor report a stub would need to accommodate is unexamined.
+- That an outside reader cannot open the vault was taken as given from its being the private maintainer repository. No attempt was made to reach it as an unauthenticated reader.
+- No file was changed. The stub does not exist yet, so nothing was edited to match this recommendation.
+
+**Duplicate search.** #1250 carries decision 2 and is the only item that names a stub. #1751 is the other #1250 blocker and concerns shared numbers between the two ledgers. #1754 is the sibling filed alongside this one and concerns the allocator rather than the stub. ADR 0160 sets the public-repository content policy and is the document a stub's wording would have to satisfy. Searched `stub`, `blank_issues_enabled`, `ISSUE_TEMPLATE`, `GitHub Issues`, `contributor`, `decision 2`.
+
+**Source.** Dispatched as a brief naming the gap. The issue and pull-request counts, the shared-sequence arithmetic, the vault comparison and the three configuration files were measured by the filing seat on 2026-09-12. No findings report was written; this item is the record.
+
+## 1756. the vault CI docs-only short-circuit skips the ledger structure test on exactly the PRs that edit the ledger, and the move makes the vault the ledger's only home
+
+> 🔢 **Filed 2026-09-12 from a read of both repositories' `.github/workflows/ci.yml` at `origin/main`. Open; not started. FUTURE-CONDITIONAL -- nothing is broken today; this fires once #1250 makes the vault the ledger's only home.** Value **6/10**, Difficulty **2/10**. The vault's `test` job takes `needs: changes` for a docs-only short-circuit: on a pull request touching only `docs/`, `changes.outputs.code == 'false'` and the install, lint, type-check and pytest steps all skip while the required context still reports green, in seconds. **Exactly one step in that job is deliberately ungated** -- `Ledger gate (ADR / BACKLOG number space)`, whose own comment explains that an ADR-only pull request is by definition docs-only, so gating it would skip it on precisely the changes it polices. **The protection therefore splits in two and only half survives.** The number-space gate runs; the structure test that catches a malformed banner, an item declaring two statuses or a conflicted ledger does not, because it is reachable only through pytest. **The engine closed this same gap in August with two ungated steps of its own. The vault never received them.**
+> Verdict: build
+> Research: none outstanding on the mechanism; both workflows were read at `origin/main` on 2026-09-12
+> Closing-act: a CI change in the vault, plus a floor constant the vault does not yet carry
+
+**Cluster:** Ledger / CI gating. **Priority:** P2, matching #1250, which this rides with. **Verdict:** build (small).
+**Severity:** no deployment axis (§0). The exposure is a malformed ledger merging green -- a bad banner, an item declaring two statuses, a duplicated field, an unresolved conflict -- in the repository that would by then be the ledger's only home.
+
+### The split, read out of the vault's own `test` job
+
+Every step in that job carries the same condition except one. The table is the whole finding.
+
+| step | `if:` | runs on a docs-only PR |
+| --- | --- | --- |
+| `Ledger gate (ADR / BACKLOG number space)` | `runner.os == 'Linux'` | **yes** |
+| `Install Qt offscreen system libraries` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Set up uv` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Install project` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Lint (ruff)`, `Format check (ruff)` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Type-check (mypy)`, both platforms | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Web console tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+
+The ledger gate runs `python scripts/hooks/ledger_check.py --ci` and needs only git and stdlib python, which is why it costs seconds and why leaving it ungated was free.
+
+The structure check is a different program. The vault already carries **both** `scripts/docs/backlog_status_check.py` and `tests/test_backlog_status_check.py` on `origin/main`, from an earlier slice of the #1250 port. Neither is invoked by anything outside `pytest`, and `pytest` is in the gated column. **The file is present and the check is unreachable on the one change shape that needs it.**
+
+### The engine already fixed this, twice, and that changes what the fix is
+
+This is the part the finding turns on, because it means the remedy is a port rather than a design.
+
+The engine's `test` job carries **three** steps that run on a docs-only pull request, not one:
+
+1. `Ledger gate (ADR / BACKLOG number space)` -- the same step, same condition.
+2. `Backlog status invariant (ungated -- see above)`, `if: runner.os == 'Linux'`, running `python scripts/docs/backlog_status_check.py --min-items 300`. This is the structure check invoked through its own CLI, so it inherits the ledger gate's cost profile exactly: no install, git and stdlib only.
+3. `Doc guards (ungated -- the docs-only blind spot; see above)`, conditioned `runner.os == 'Linux' && needs.changes.outputs.code != 'true' && github.event_name == 'pull_request'` -- that is, it fires **only** on the docs-only PRs the gated steps skip. It runs `pytest -q -rs` over a named list of **21** modules, and `tests/test_backlog_status_check.py` is one of them. A preceding `Install (minimal -- for the doc guards on a docs-only PR)` step, under the same condition, installs `-e ".[dev]" --constraint constraints.lock`.
+
+The engine's workflow records why each was added, and both reasons are incidents rather than theory. Step 2 came from **2026-08-01**: a docs-only pull request added a `#320` entry whose banner used a glyph the invariant does not accept, went green in seconds without compiling the suite, merged, and reddened `main` for every other session. Step 3 came from **2026-08-04**, when four docs-only pull requests merged with none of the ten document guards running, and it **recurred on 2026-08-11** when the curated list turned out not to name `tests/test_dast_claims.py`.
+
+### What the move would undo
+
+#1250 moves both ledger files to the vault. After that the vault is the only place a `## N.` heading exists, so it is the only place a ledger defect can be introduced -- and the vault's CI is the August engine, before either fix.
+
+Stated as the shape of the regression rather than as a present fault: **the protection would not be lost to a bug, it would be lost to a relocation.** Nothing in the vault breaks, nothing in the engine breaks, and no check anywhere reports that a guard stopped covering the file it guards. The engine keeps two ungated steps over a ledger it no longer holds; the vault holds the ledger with one.
+
+The engine's own comment names the residual hazard that survives even a complete port: the doc-guards list is a **curated allowlist**, and a green run never says "a guard exists that I did not run." That is what let the 2026-08-11 recurrence through. A vault port inherits it.
+
+### What the port costs, stated honestly
+
+The two engine steps do not cost the same, and collapsing them into one recommendation would misprice the work.
+
+- **The CLI invocation is effectively free.** `backlog_status_check.py` imports only `argparse`, `re`, `sys` and `pathlib` and has its own CLI, so an ungated `python scripts/docs/backlog_status_check.py --min-items N` step needs no install and sits beside the ledger gate at the same cost. This is the recommended first slice.
+- **The pytest lane is not free.** It needs a Python install where the ledger gate needs only git and stdlib. In the engine that is a minimal `[dev]` install rather than the full extras set, and `[dev]` specifically because `pyproject` sets `asyncio_mode = "auto"` and a `--timeout` addopt, so a bare `pip install pytest` errors on an unknown option before collecting anything.
+- **A floor has to be chosen, and it lives in two places.** The engine passes `--min-items 300` in the workflow and pins `_MIN_TOTAL_ITEMS = 300` in the test, and its own comment warns that nothing compares the two, so the lower one becomes the only floor that binds. The vault's copy of the test carries **no** floor constant today, so a port that adds the CLI step without one adds a check that a shrinking corpus satisfies.
+
+Recommended, and offered as a recommendation rather than a decision: ungate the structure check in the vault the same way the ledger gate is already ungated, taking the CLI slice first because it is free, and treat the doc-guards lane as a separate decision with its own install cost.
+
+### A correction to the framing this item was dispatched with
+
+Recorded because the wrong version is the more quotable one and would propagate.
+
+The engine's `scripts/docs/backlog_status_check.py` carries an in-file comment saying the gate runs "UNGATED on every pull request including docs-only ones". **In the engine that sentence is true of both halves**, not just the number-space gate: the CLI step is ungated and the pytest module rides the ungated doc-guards lane. The same comment already qualifies itself, noting that the pytest guard "rides a lane that a curated allowlist could silently drop it from."
+
+It is the **vault** where that sentence would be true of the gate and false of the test, and the ported copy on the open PR 1497 branch already says so in its own words, ending with a warning not to read the engine's paragraph as cover for the vault. The value this item adds over that comment is that a comment in a file is not a tracked row: nothing schedules it, and the port that carries it can merge without the CI change it describes.
+
+### What was NOT verified
+
+- No CI run was observed. The gating was read out of both workflow files at `origin/main`; a source read shows which branch exists, not that a given run took it. No skipped-step log from a real vault docs-only pull request was pulled.
+- The vault's `changes` job allowlist was read as allowlisting `^docs/`; the exact filter was not exercised against a sample changed-file list, so "a PR touching only `docs/BACKLOG.md` sets `code=false`" is taken from the filter's own comment rather than from a run.
+- Whether the vault's copy of `tests/test_backlog_status_check.py` would pass unchanged against the vault's ledger was not run. The port is mid-flight.
+- The engine's 2026-08-01, 2026-08-04 and 2026-08-11 incidents are quoted from the engine workflow's own comments. The pull requests named there were not opened and read.
+- Nothing was changed in either repository. This item is a filing.
+
+**Duplicate search.** #1250 is the move this rides with and carries the phase plan. #1754 and #1755 are its other two filed gaps and concern the allocator and the public stub; neither touches CI gating. #1470 concerns the ledger gate's fetch depth, which is the same step and a different failure. Searched `docs-only`, `changes.outputs.code`, `Ledger gate`, `backlog_status_check`, `DOC_GUARDS`, `short-circuit`, `min-items`.
+
+**Source.** Found during the vault status-checker port, PR 1497 on `wshallwshall/MessageFoundry-vault`, which was **open** when this was filed and touches only the two ported files, not `ci.yml`. Both workflows, both copies of the status checker, the vault's ported test file and the engine's doc-guards list were read at `origin/main` by the filing seat on 2026-09-12. No findings report was written; this item is the record.

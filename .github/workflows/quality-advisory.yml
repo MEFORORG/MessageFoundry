@@ -512,7 +512,7 @@ jobs:
         # so a reader who asks the tree for 16 test files does not find them. The web console leg
         # measures 130-140s on ubuntu across the last 10 green ci.yml runs on main, and 114 is below
         # every sample taken. The conclusion "a cheap price" survives at 140s.
-        run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
+        run: pytest -q -m 'not tooling' --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered --durations=40 || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
         env:

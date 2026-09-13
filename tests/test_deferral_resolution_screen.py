@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 MessageFoundry Organization and contributors
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The deferral screen must fire on a settled-but-still-declared row and on nothing else (#1527).
 
 Every behaviour test is one half of a PAIR. The clause words this screen keys on -- ``gated on``,
