@@ -41,6 +41,15 @@ mornings running before anyone noticed, so ``.github/workflows/nightly-notice.ym
 ``Stalled PRs`` and opens one deduplicated issue when a scheduled run of it fails. See
 :data:`ROLLUP_FIELDS` for what those three reds actually were.
 
+AND WHAT THAT WATCHER COSTS WHEN THIS CHECK IS WRONG, which is a real cost and it was paid. Once the
+watcher existed, every FALSE red here became a GitHub issue too. Five of the ten scheduled runs before
+2026-09-13 failed on a guard that read ZERO OPEN PULL REQUESTS as a broken query -- a state this
+repository now reaches routinely, because the fleet drains its own merge queue -- and issue #1011,
+"Nightly Stalled PRs is failing", is what those manufactured. That guard has been moved off the COUNT
+and into :func:`_rows`, where the SHAPE of a payload is decidable and an unreadable one still fails
+closed. A scheduled check is read by whoever it interrupts, so the bar for interrupting them is that
+the finding be true.
+
 USAGE
     python scripts/ci/check_stalled_prs.py                     # uses gh's auth
     python scripts/ci/check_stalled_prs.py --repo owner/name
@@ -194,12 +203,29 @@ def _gh(repo: str | None, *args: str) -> list[str]:
 
 
 def _rows(payload: object) -> list[dict[str, object]]:
-    """Every dict in a JSON array payload; anything else is an empty population.
+    """Every row of a JSON array payload, refusing any shape this check cannot read.
 
-    Non-dict rows are dropped rather than passed on: `scan` calls ``pr.get(...)`` on each one.
+    FAIL CLOSED ON THE SHAPE, WHICH IS DECIDABLE HERE. Not on the COUNT, which is not a defect at all.
+
+    An earlier version returned ``[]`` for a payload that was not an array, and dropped non-object
+    rows on the way past. Both losses arrived downstream as "no open pull requests", so by the time
+    anything looked, a broken query and a drained queue were the same value. That conflation was then
+    patched at the WRONG END -- by refusing to report success on a zero-length result, which also
+    refuses the repository that genuinely has nothing open. Refusing the unreadable shape here is the
+    same guard moved to where the question can actually be answered, and it leaves an empty list
+    meaning exactly one thing.
     """
     if not isinstance(payload, list):
-        return []
+        raise RuntimeError(
+            f"the pull request listing came back as {type(payload).__name__}, not a JSON array. "
+            "Refusing to report on a payload this check cannot read."
+        )
+    bad = [row for row in payload if not isinstance(row, dict)]
+    if bad:
+        raise RuntimeError(
+            f"{len(bad)} of {len(payload)} rows in the pull request listing are not JSON objects "
+            f"(first: {str(bad[0])[:120]!r}). Refusing to report on a payload this check cannot read."
+        )
     return [row for row in payload if isinstance(row, dict)]
 
 
@@ -317,16 +343,29 @@ def main(argv: list[str] | None = None) -> int:
     armed = [s for s in stalls if s.armed]
 
     # Liveness receipt: say what was EXAMINED. "no stalls" and "nothing was scanned" are otherwise
-    # indistinguishable from the exit code, and an empty sweep reporting success is the exact shape
-    # this check is meant to make impossible.
+    # indistinguishable from the exit code alone.
     print(f"stalled-prs: scanned {len(prs)} open pull request(s); {len(stalls)} stalled")
+
+    # ZERO OPEN PULL REQUESTS IS A CLEAN REPOSITORY, NOT A BROKEN QUERY, AND THIS RETURNED 2 ON IT.
+    # The old guard read an empty list as a failed sweep, on the premise that this repository always
+    # has something open. That premise expired: a fleet that drains its own merge queue reaches zero
+    # routinely. Five of the ten scheduled runs before 2026-09-13 failed here -- run 34475291763 on
+    # 2026-09-10 among them, whose open set was reconstructed afterwards, by paginating all 1,088
+    # pull requests, as GENUINELY zero. The guard fired on a true state.
+    #
+    # NOR WERE THE REDS CONTAINED. nightly-notice.yml watches "Stalled PRs" (see the module
+    # docstring), so each false red manufactured a "Nightly Stalled PRs is failing" issue against a
+    # repository with nothing wrong with it. A check that cries wolf is a check nobody reads, which
+    # is the same end state as the silent one this file was written against -- reached from the
+    # other side.
+    #
+    # THE FAIL-CLOSED POSTURE IS KEPT AND MOVED, NOT DROPPED. `_run_gh` raises when `gh` keeps
+    # failing, and `_rows` raises on a payload that is not a readable array of objects, so a broken
+    # query can no longer reach this line wearing an empty list. The count is therefore free to mean
+    # what it says.
     if not prs:
-        print(
-            "::error::ZERO open pull requests came back. That is a broken query, not a clean repo — "
-            "refusing to report success.",
-            file=sys.stderr,
-        )
-        return 2
+        print("stalled-prs: no open pull requests, so nothing can be stalled.")
+        return 0
 
     if not stalls:
         print("stalled-prs: every open PR can still reach a merge.")
