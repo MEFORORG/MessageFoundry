@@ -146,7 +146,6 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md": 1,
     # #1279: was 2. The two added are in item 1279 itself -- the row that ASKED for the removal,
     # naming the key it wanted gone, and the closing banner recording that it went.
-    "docs/BACKLOG.md": 4,
     "docs/CLOUD-PHI-HIPAA.md": 1,
     "docs/CLUSTERING.md": 1,
     "docs/CONFIGURATION.md": 3,

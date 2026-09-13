@@ -176,7 +176,9 @@ def test_the_floor_reads_a_side_branch_not_just_the_checked_out_tip(
     assert _floor(repo) == 90
 
 
-@pytest.mark.parametrize(("kind", "expected"), [("adr", 1), ("backlog", 77)])
+# ONE ARM NOW. The `backlog` arm went with the kind itself (BACKLOG #1250, #1754) -- alloc.ps1
+# refuses `-Kind backlog` at parameter binding, so the case could only ever measure the refusal.
+@pytest.mark.parametrize(("kind", "expected"), [("adr", 1)])
 def test_the_sweep_does_not_spawn_a_git_process_per_ref(
     tmp_path: Path, kind: str, expected: int
 ) -> None:
@@ -199,13 +201,14 @@ def test_the_sweep_does_not_spawn_a_git_process_per_ref(
     a bound one process above the current total reds on any unrelated single-process addition.
 
     **WHAT THIS CASE CANNOT SEE, stated because the bound looks more general than it is.** All 200
-    refs here point at ONE commit, so the fixture holds exactly ONE distinct ledger blob. Since
-    BACKLOG #1535 the backlog sweep runs one ``git grep`` per 128 distinct BLOBS, so on this fixture
-    it is one grep whatever the chunk size -- and an implementation that never chunked at all, and
-    therefore dies on a real clone's 1,500 blobs against the Windows argv limit, would stay green
-    right here. The count is fixed against the REF count, which is what this case pins; it is not
-    fixed against the blob count. ``test_the_backlog_sweep_chunks_over_distinct_blobs`` is the case
-    that sees the other axis.
+    refs here point at ONE commit, so the ADR sweep resolves them to ONE distinct tree. The bound is
+    fixed against the REF count, which is what this case pins; it says nothing about how the sweep
+    scales with the number of distinct TREES, and an implementation that read every tree separately
+    would stay green right here.
+
+    The companion case that watched the other axis was the backlog sweep's blob-chunking test. It
+    retired with that sweep (BACKLOG #1250), so **the tree axis is now unwatched** -- recorded here
+    rather than left for someone to assume it is covered.
 
     The cat-file assertion is the POSITIVE CONTROL. An empty or unwritten trace file would satisfy
     the bound while measuring nothing at all, and a guard that cannot fail is worse than no guard.
