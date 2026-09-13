@@ -418,10 +418,20 @@ def _installed_version(hook_id: str, slug: str) -> tuple[str, str]:
         for name, run in _run_blocks()
         if name == workflow and f"{slug}/releases/download" in run and re.search(r"\bVER=", run)
     ]
-    assert len(blocks) == 1, (
-        f"expected exactly one run block in {workflow} that downloads a {slug} release and assigns "
-        f"VER=, found {len(blocks)}. If the install moved, move this mapping with it -- do NOT relax "
-        f"the anchor to a bare VER=, which would compare against an unrelated tool's version."
+    assert blocks, (
+        f"no run block in {workflow} downloads a {slug} release and assigns VER=. If the install "
+        f"moved, move this mapping with it -- do NOT relax the anchor to a bare VER=, which would "
+        f"compare against an unrelated tool's version."
+    )
+    # SEVERAL BLOCKS ARE ALLOWED ONLY WHILE THEY ARE THE SAME BLOCK. security.yml runs two composite
+    # jobs beside the seven they will replace for the duration of the security-job consolidation, so
+    # the gitleaks install appears twice until the originals are deleted. Two installs naming
+    # DIFFERENT versions is the defect: the hook rev would be compared against whichever this
+    # happened to pick, and a developer commit would be screened by one gitleaks and the pull request
+    # by another. That is refused here rather than by taking the first block.
+    assert len(set(blocks)) == 1, (
+        f"{len(blocks)} run blocks in {workflow} install a {slug} release and they are not "
+        f"identical. Reconcile them before this comparison can mean anything."
     )
     match = re.search(r"\bVER=v?([0-9][^\s\"']*)", blocks[0])
     assert match, f"no VER= assignment parsed out of {workflow}'s {slug} install: {blocks[0]!r}"

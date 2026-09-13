@@ -17,7 +17,7 @@ claims move with it.
 | Workflow | What it does |
 |---|---|
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
-| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
+| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals and are not required yet -- see *Consolidating the seven security contexts* below. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
@@ -110,6 +110,41 @@ nothing adds or removes the label -- labels already sitting on open PRs are iner
 otherwise-mergeable PR that carried no `reviewed` label, so **that signal reported against a standard
 nothing enforces**. The owner ruled it off on 2026-09-08, the workflow was disabled on the server that
 day, and both files were deleted on 2026-09-13 (BACKLOG #1490).
+
+### Consolidating the seven security contexts
+
+`security.yml` owns **seven** of the thirteen required contexts, and each is a separate job that
+acquires a separate runner slot. Five of the seven finish inside **55 seconds**, so seven
+acquisitions buy about four minutes of scanning. A slot is the scarce resource here: peak concurrency
+measured **exactly 20**, the free-plan ceiling for an organisation, and healthy pull requests have
+been evicted from the merge queue for want of a runner. Measured over one week to 2026-09-13, this
+workflow spent about **8,211 slot-starts** for about **4,770 execution-minutes**.
+
+Two composite jobs now run those seven scans in two slots, worth roughly 4,700 to 5,900 slot-starts a
+week at no coverage cost -- the same scanners, the same arguments, the same findings:
+
+| Composite job | Consolidates |
+| --- | --- |
+| `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)` | the four scans of the checked-out tree, which share one Python setup |
+| `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)` | the dependency audits and the secret scan, which share a full-history checkout |
+
+**A required context is a job NAME, so this lands in four steps and only the first is done.** Deleting
+the seven jobs while branch protection still names them wedges every pull request in the repository:
+protection waits forever for a context nothing produces. Moving protection first, to names nothing
+yet reports, wedges it identically -- that is the required-but-absent trap below, and on 2026-07-30
+ten required contexts sat on disabled workflows that still carried their files and job names.
+
+1. **Done.** The composites run **alongside** the seven. Both sets report; nothing was deleted.
+2. **The owner** adds the two composite names to branch protection.
+3. **A later PR** deletes the seven original jobs and syncs `.github/required-contexts.txt`, this
+   page, and the job classification in `tests/test_security_posture.py`.
+4. **The owner** removes the seven original names from branch protection.
+
+During the overlap the workflow carries two copies of every scan.
+`tests/test_security_composite_parity.py` asserts each copied body is **byte-identical** to its
+original, which is what makes the duplication safe to review: every control this repository already
+asserts about an original step is an assertion about a string the copy shares, so step 3 is a
+deletion rather than a rewrite.
 
 ### "What was required when this merged" is not answerable
 
