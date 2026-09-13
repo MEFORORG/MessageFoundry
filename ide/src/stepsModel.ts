@@ -236,7 +236,7 @@ export interface RowViewModel {
    * Which kind of annotation `liveValue` holds. `mergeLiveValues` folds the inline values' TEXT into one
    * string and used to drop their `kind`, so a skipped-lookup row rendered inside the live-value tooltip
    * and told the author it was showing a redacted live value -- the opposite of what happened (BACKLOG
-   * #236). Carried so the renderer can offer the right affordance instead.
+   * #1761). Carried so the renderer can offer the right affordance instead.
    */
   liveValueKind?: "value" | "warning";
   /**
@@ -662,7 +662,7 @@ export interface LiveInlineValue {
 }
 
 /**
- * The tooltip on a row whose annotation is a SKIPPED LIVE LOOKUP (BACKLOG #236).
+ * The tooltip on a row whose annotation is a SKIPPED LIVE LOOKUP (BACKLOG #1761).
  *
  * A `db_lookup`/`fhir_lookup` does not do I/O in a dry-run -- it RAISES, and the tracer records a
  * `live_lookup_skipped` annotation and re-raises so the disposition is byte-identical

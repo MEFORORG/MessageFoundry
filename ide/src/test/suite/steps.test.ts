@@ -393,7 +393,7 @@ suite("stepsModel — traceRowValues folds a traced dry-run onto rows (redacted 
     assert.ok(warn?.after.includes("live lookup"), warn?.after);
   });
 
-  test("a skipped lookup carries its KIND to the row, not just its text (BACKLOG #236)", () => {
+  test("a skipped lookup carries its KIND to the row, not just its text (BACKLOG #1761)", () => {
     // The affordance depends on the row knowing WHICH annotation it holds. `mergeLiveValues` used to
     // fold only the text, so a skipped-lookup row was indistinguishable from a value row downstream.
     const skipped = traceRowValues(
@@ -431,14 +431,14 @@ suite("stepsModel — traceRowValues folds a traced dry-run onto rows (redacted 
 });
 
 // --------------------------------------------------------------------------------------------------
-// BACKLOG #236: the lookup row's tooltip must OFFER THE SUPPORTED PREVIEW PATH rather than restate the
+// BACKLOG #1761: the lookup row's tooltip must OFFER THE SUPPORTED PREVIEW PATH rather than restate the
 // failure. A db_lookup/fhir_lookup does not do I/O in a dry-run -- it RAISES, and the tracer records a
 // `live_lookup_skipped` annotation and re-raises (dryrun_trace.classify_live_lookup). ADR 0010 already
 // names the mechanism: "a feed that uses it is previewed by stubbing its wrapper". Nothing is mocked and
 // no engine file changes; the IDE just stops pointing at a dead end.
 // --------------------------------------------------------------------------------------------------
 
-suite("stepsModel — a skipped live lookup offers the stubbing affordance (BACKLOG #236)", () => {
+suite("stepsModel — a skipped live lookup offers the stubbing affordance (BACKLOG #1761)", () => {
   const warnRow = (): RowViewModel => ({
     index: 0,
     kind: "action",
