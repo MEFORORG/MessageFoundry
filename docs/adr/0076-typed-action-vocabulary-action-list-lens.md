@@ -878,7 +878,7 @@ bounded `msg[...]` read is also already admitted. **`templated` means an interpo
 values, which is neither** — so a writable `templated` makes `lens rewrite` emit a shape the grammar
 does not currently accept.
 
-**The sibling item is the proof that the read-only reading was available.** #235 (schema-driven parameter
+**The sibling item is the proof that the read-only reading was available.** #1760 (schema-driven parameter
 forms, closed 2026-08-05) records in its own closing line that it *"widens what is editable without
 widening the recognition grammar"*. Same seam, same surface, no amendment. This one differs only because
 of what E.2 records.

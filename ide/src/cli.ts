@@ -342,7 +342,7 @@ export async function lensRewriteStdin(
 }
 
 /**
- * `lens schema` — the transform-vocabulary parameter schema (BACKLOG #235; op -> editable params with
+ * `lens schema` — the transform-vocabulary parameter schema (BACKLOG #1760; op -> editable params with
  * their widget kind/choices), derived by the engine from its own action + diagnostic signatures. The
  * Steps editor drives its per-param input widgets from it. Config-independent (a pure signature
  * introspection), so it takes no `--config`; the CLI is lazy-imported engine-side and starts no server.

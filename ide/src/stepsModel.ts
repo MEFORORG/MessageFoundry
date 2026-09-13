@@ -877,7 +877,7 @@ export interface EditMessage {
   lineStart: number;
   lineEnd: number;
   name: string; // the param name (e.g. "dst", "to")
-  // The new value, as typed in the field. A `number` for a number-kind widget (BACKLOG #235) so it
+  // The new value, as typed in the field. A `number` for a number-kind widget (BACKLOG #1760) so it
   // round-trips to the engine as a JSON number and renders as an int/float literal — a string would
   // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
   value: string | number;
@@ -894,7 +894,7 @@ export interface EditRequest {
   line_end: number;
   op: "set_params";
   // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
-  // not `"6"` (a re-typed string literal) — BACKLOG #235. Every other param stays a string.
+  // not `"6"` (a re-typed string literal) — BACKLOG #1760. Every other param stays a string.
   params: Record<string, string | number>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
@@ -906,7 +906,7 @@ export interface EditRequest {
  * Map a webview edit message to the engine's `lens rewrite` edit spec (ADR 0076 §5) — pure, so the
  * mapping is unit-testable without the Extension Host. A string value is rendered by the engine as a
  * Python **string literal** when the current argument is a literal (the common analyst edit: a field
- * path, a code, a destination name); a number value (a number-kind widget, BACKLOG #235) passes through
+ * path, a code, a destination name); a number value (a number-kind widget, BACKLOG #1760) passes through
  * as a JSON number so the engine renders an int/float literal, not a re-typed `"6"`. The engine refuses
  * — and the provider surfaces — an edit of an argument that is currently an expression, so the lens
  * never guesses.
@@ -2496,7 +2496,7 @@ export function pickMode(action: string | undefined, param: string): "path" | "s
   return action && HL7_PATH_PARAMS[action]?.includes(param) ? "path" : undefined;
 }
 
-// ---- op parameter schema (BACKLOG #235) -------------------------------------------------------------
+// ---- op parameter schema (BACKLOG #1760) -------------------------------------------------------------
 //
 // The IDE drives each EDITABLE param's input WIDGET from the engine's own type hints instead of a
 // hand-maintained per-op input table (a second source of truth that drifts from the signatures). The
@@ -2574,7 +2574,7 @@ function renderParamsHtml(
         // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
         // submit, so the F7 round-trip is unaffected.
         //
-        // BACKLOG #235: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
+        // BACKLOG #1760: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
         // int/float -> type=number, everything else -> text). Every widget carries the IDENTICAL edit
         // coordinates (data-handler/data-line-start/data-line-end/data-expect-src/data-name) so the F7
         // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
@@ -2770,7 +2770,7 @@ export function renderHandlerHtml(handler: HandlerViewModel, schema?: OpSchema):
 }
 
 /** Render every handler's Steps body (the provider wraps this in the CSP/nonce page shell). Pure.
- * `schema` (BACKLOG #235) drives each editable param's widget; omitted -> every param is a text input. */
+ * `schema` (BACKLOG #1760) drives each editable param's widget; omitted -> every param is a text input. */
 export function renderHandlersHtml(handlers: HandlerViewModel[], schema?: OpSchema): string {
   if (handlers.length === 0) {
     return `<p class="empty">No handlers to show.</p>`;

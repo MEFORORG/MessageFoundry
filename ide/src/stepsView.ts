@@ -167,7 +167,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // (§2.3 P2/P3; `undefined` until that build lands). Loaded once — pure in-memory data, no per-pick I/O.
   private readonly schema: Hl7Schema | undefined;
   private readonly structures: Hl7Structures | undefined;
-  // The transform-vocabulary param schema (BACKLOG #235) that drives each editable param's input widget
+  // The transform-vocabulary param schema (BACKLOG #1760) that drives each editable param's input widget
   // (enum -> dropdown, int -> number field). Shelled ONCE (`lens schema`, config-independent) and cached
   // for the panel's life — pure signature-derived data, so it never changes between projections. Left
   // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
@@ -349,7 +349,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // taken here: this render SATISFIES whatever was pending, so the next one starts from nothing.
       const wantsLiveValues = arming.consume();
       const ws = workspaceDir();
-      // Fetch the op-param schema ONCE (BACKLOG #235) — it drives each editable param's input widget and
+      // Fetch the op-param schema ONCE (BACKLOG #1760) — it drives each editable param's input widget and
       // is config-independent signature data, so a single shell suffices for the panel's life. A failure
       // leaves it undefined (every param falls back to a text input); it never blocks the projection.
       if (!this.opSchemaFetched) {
@@ -621,7 +621,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         lineStart?: number;
         lineEnd?: number;
         name?: string;
-        // A number for a number-kind widget (BACKLOG #235); a string for every other field.
+        // A number for a number-kind widget (BACKLOG #1760); a string for every other field.
         value?: string | number;
         direction?: "up" | "down";
         toLineStart?: number;
@@ -674,7 +674,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineStart === "number" &&
           typeof m.lineEnd === "number" &&
           typeof m.name === "string" &&
-          // A number-kind widget posts a JS number (BACKLOG #235); every other field posts a string.
+          // A number-kind widget posts a JS number (BACKLOG #1760); every other field posts a string.
           (typeof m.value === "string" || typeof m.value === "number") &&
           typeof m.expectSrc === "string"
         ) {
