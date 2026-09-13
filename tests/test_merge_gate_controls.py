@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _bash_resolver import CANNOT_RUN_CODES, bash_sees, require_bash
+from _bash_resolver import bash_sees, require_bash
 
 from tests._workflow_contexts import ROOT, jobs_of, load_workflow, required_contexts, resolve
 
@@ -397,17 +397,6 @@ def test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding(tmp_path: 
 _HYGIENE_JOB = "banner-on-implementation"
 
 
-def _hygiene_script() -> str:
-    steps = jobs_of("backlog-hygiene.yml")[_HYGIENE_JOB]["steps"]
-    script = next(str(s["run"]) for s in steps if "run" in s)
-    assert "BASE_SHA...$HEAD_SHA" in script or "$BASE_SHA...$HEAD_SHA" in script, (
-        "backlog-hygiene.yml's diff is no longer three-dot. The two-dot form reports main-side changes "
-        "as reverse deltas, which credited every PR with an older base for a docs/BACKLOG.md edit it "
-        "never made -- the gate went green while enforcing nothing."
-    )
-    return script
-
-
 def _bash_sees(bash: Path, tmp_path: Path) -> bool:
     """Delegates to the shared probe, under THIS module's explicit child environment.
 
@@ -468,50 +457,6 @@ def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, 
     return repo, base_c, head_b, base_a
 
 
-def _run_hygiene(
-    bash: str,
-    script: str,
-    repo: Path,
-    env: dict[str, str],
-    *,
-    title: str,
-    body: str,
-    base: str,
-    head: str,
-) -> tuple[int, str]:
-    """Run the workflow's own script, and VALIDATE THE SHAPE OF THE RESULT before returning it.
-
-    The script path is passed RELATIVE to ``cwd``. An absolute Windows path is not portable across
-    bash builds -- backslashes are escape characters and a drive letter means nothing outside the
-    Windows namespace -- and the mangling presents as "no such file", i.e. as exit 127, which a caller
-    comparing `code != 0` would happily read as "the gate refused this PR".
-
-    So 126/127 are a hard failure here rather than a verdict. That is the generalisable half of the
-    probe defect recorded in BACKLOG #1000: a probe must validate its own output rather than treating
-    a broken invocation as an answer.
-
-    Read from ``CANNOT_RUN_CODES`` rather than spelled out again (BACKLOG #1272). A local copy of the
-    rule is free to drift from the shared one, and the copy that drifts is the one still reading a
-    broken invocation as a verdict.
-    """
-    (repo / "gate.sh").write_text(script, encoding="utf-8", newline="\n")
-    proc = _run(
-        [bash, "gate.sh"],
-        repo,
-        {**env, "PR_TITLE": title, "PR_BODY": body, "BASE_SHA": base, "HEAD_SHA": head},
-    )
-    out = _text(proc)
-    assert proc.returncode not in CANNOT_RUN_CODES, (
-        f"bash could not execute the gate script (exit {proc.returncode}): {out.strip()[:300]}. That "
-        "is not a gate verdict -- it is a broken invocation, and reading it as one would make every "
-        "assertion here vacuous."
-    )
-    # Printed ASCII-safe: the gate's own error text carries a status glyph, and a Windows console
-    # under cp1252 would turn printing it into a UnicodeEncodeError -- an assertion about the gate
-    # lost to a property of the terminal.
-    return proc.returncode, out
-
-
 def _hermetic_git_env(tmp_path: Path) -> dict[str, str]:
     """A child environment in which `git` cannot read the developer's own global config.
 
@@ -527,14 +472,6 @@ def _hermetic_git_env(tmp_path: Path) -> dict[str, str]:
     )
     (tmp_path / "gitconfig").write_text("", encoding="utf-8")
     return env
-
-
-@pytest.fixture
-def hygiene(tmp_path: Path) -> tuple[str, str, Path, dict[str, str], str, str]:
-    env = _hermetic_git_env(tmp_path)
-    bash = _require_bash(tmp_path)
-    repo, base_c, head_b, _base_a = _fixture_repo(tmp_path, env)
-    return bash, _hygiene_script(), repo, env, base_c, head_b
 
 
 def _ascii(text: str) -> str:
@@ -567,105 +504,6 @@ def test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fix
         "looking at the wrong filesystem either"
     )
     assert _bash_sees(Path(_require_bash(tmp_path)), tmp_path)
-
-
-def test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone(
-    hygiene: tuple[str, str, Path, dict[str, str], str, str],
-) -> None:
-    """PLANTED: a PR that claims `BACKLOG #42`, changes engine code, and never touches the ledger --
-    while main has separately moved docs/BACKLOG.md since the branch point.
-
-    That last clause is the whole point. The gate computed its changed-file list with a two-dot
-    `git diff "$BASE_SHA" "$HEAD_SHA"`, which reports main-side changes as REVERSE deltas, so any
-    main-side edit to docs/BACKLOG.md credited every PR with an older base. It went green while
-    enforcing nothing, on exactly the population it exists to police.
-    """
-    bash, script, repo, env, base, head = hygiene
-    code, out = _run_hygiene(
-        bash,
-        script,
-        repo,
-        env,
-        title="feat: something (BACKLOG #42)",
-        body="",
-        base=base,
-        head=head,
-    )
-    print(f"[#1000] shipped three-dot gate exit={code}\n{_ascii(out)}")
-    assert code == 1, f"the gate passed a PR it exists to fail. exit={code}\n{_ascii(out)}"
-    assert "docs/BACKLOG.md" in out
-
-
-def test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request(
-    hygiene: tuple[str, str, Path, dict[str, str], str, str],
-) -> None:
-    """RUN AGAINST THE PRE-FIX GATE, which is what makes the control above evidence rather than a
-    claim. The identical fixture, with only the diff form reverted, must go GREEN.
-
-    If both forms failed, the fixture would be proving something else -- and the recorded defect would
-    be unreproduced.
-    """
-    bash, script, repo, env, base, head = hygiene
-    pre_fix = script.replace('"$BASE_SHA...$HEAD_SHA"', '"$BASE_SHA" "$HEAD_SHA"')
-    assert pre_fix != script, (
-        "the two-dot substitution matched nothing, so this test compares the shipped gate with itself"
-    )
-    code, out = _run_hygiene(
-        bash,
-        pre_fix,
-        repo,
-        env,
-        title="feat: something (BACKLOG #42)",
-        body="",
-        base=base,
-        head=head,
-    )
-    print(f"[#1000] pre-fix two-dot gate exit={code}\n{_ascii(out)}")
-    assert code == 0, (
-        "the two-dot form no longer reproduces the recorded defect, so the three-dot assertion above "
-        f"is not measuring what it says. exit={code}\n{_ascii(out)}"
-    )
-
-
-@pytest.mark.parametrize(
-    ("case", "title", "body", "touch"),
-    [
-        ("no claim at all", "chore: tidy", "", None),
-        ("claims and updates the ledger", "feat (BACKLOG #42)", "", "docs/BACKLOG.md"),
-        (
-            "claims and updates an ARCHIVED item",
-            "feat (BACKLOG #42)",
-            "",
-            "docs/archive/backlog/x.md",
-        ),
-        ("a bare #42 is a PR number, not a claim", "fix for #42", "see #42", None),
-    ],
-)
-def test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone(
-    hygiene: tuple[str, str, Path, dict[str, str], str, str],
-    case: str,
-    title: str,
-    body: str,
-    touch: str | None,
-) -> None:
-    """THE ASYMMETRY, four shapes wide.
-
-    A gate that failed everything would satisfy the planted case and block every PR in the repo. Each
-    row is a shape the rule deliberately does NOT break: no claim, a claim honoured in the live ledger,
-    a claim honoured in the ARCHIVE (an item retired between the claim and the PR), and the `#42`
-    spelling that is a PR number in this repo rather than an item.
-    """
-    bash, script, repo, env, base, head = hygiene
-    if touch:
-        target = repo / touch
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("banner\n", encoding="utf-8")
-        _run(["git", "add", "-A"], repo, env)
-        _run(["git", "commit", "-m", f"branch-side {touch}"], repo, env)
-        head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-    code, out = _run_hygiene(bash, script, repo, env, title=title, body=body, base=base, head=head)
-    print(f"[#1000] benign case {case!r} exit={code}")
-    assert code == 0, f"the gate failed a benign PR shape ({case}). exit={code}\n{_ascii(out)}"
 
 
 # ===================================================================================================
@@ -1451,72 +1289,6 @@ def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
 # parenthetical rather than "every #N after the token". A landed subject reads
 # `(BACKLOG #1040) (#547)`; an unscoped rule claims item 547. Measured over `git log --all` on
 # 2026-08-25: unscoped calls 641 subjects multi-item, parenthetical-scoped calls 38 of 1070.
-
-
-def test_the_hygiene_gate_names_every_cited_sibling_not_just_the_first(
-    hygiene: tuple[str, str, Path, dict[str, str], str, str],
-) -> None:
-    bash, script, repo, env, base, head = hygiene
-    # A code change with no ledger edit: the gate must refuse, and its message is what we read.
-    target = repo / "messagefoundry" / "x.py"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("x = 1\n", encoding="utf-8")
-    _run(["git", "add", "-A"], repo, env)
-    _run(["git", "commit", "-m", "code"], repo, env)
-    head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-
-    code, out = _run_hygiene(
-        bash,
-        script,
-        repo,
-        env,
-        title="four gates (BACKLOG #1319, #1322, #1323, #1331)",
-        body="",
-        base=base,
-        head=head,
-    )
-    assert code != 0, f"a code PR with no ledger edit must be refused\n{_ascii(out)}"
-    for item in ("1319", "1322", "1323", "1331"):
-        assert item in out, (
-            f"the gate refused but never named item #{item}. It used to report only the first of a "
-            f"sibling group, sending the author to update one banner of four.\n{_ascii(out)}"
-        )
-
-
-def test_the_hygiene_gate_does_not_read_a_squash_suffix_as_an_item(
-    hygiene: tuple[str, str, Path, dict[str, str], str, str],
-) -> None:
-    """The negative that bounds the fix.
-
-    Widening from "the first BACKLOG #N" to "every #N after the token" would close the sibling gap
-    and open this one: a squash-merged title carries the pull-request number as a trailing group,
-    and the gate would demand a status banner for a PR number. Scoping to the parenthetical is what
-    buys the first without the second, so both directions are pinned.
-    """
-    bash, script, repo, env, base, head = hygiene
-    target = repo / "messagefoundry" / "x.py"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("x = 1\n", encoding="utf-8")
-    _run(["git", "add", "-A"], repo, env)
-    _run(["git", "commit", "-m", "code"], repo, env)
-    head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-
-    code, out = _run_hygiene(
-        bash,
-        script,
-        repo,
-        env,
-        title="fix(hooks): the deny text (BACKLOG #1040) (#547)",
-        body="",
-        base=base,
-        head=head,
-    )
-    assert code != 0
-    assert "1040" in out, f"the real item must still be named\n{_ascii(out)}"
-    assert "547" not in out, (
-        "the gate read the squash-merge pull-request suffix as a backlog item. A banner would be "
-        f"demanded for a PR number that has no ledger row.\n{_ascii(out)}"
-    )
 
 
 # ===================================================================================================

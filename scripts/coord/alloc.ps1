@@ -2,8 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Allocate the next free ADR or BACKLOG number, atomically, so two concurrent sessions can never take
-    the same one.
+    Allocate the next free ADR number, atomically, so two concurrent sessions can never take the same one.
+
+    THE BACKLOG KIND IS RETIRED (BACKLOG #1250, #1754). The numbered-item ledger left this
+    repository, so there is no backlog namespace here to allocate into. `-Kind` no longer accepts
+    `backlog`; PowerShell refuses it at parameter binding, before any of this runs.
 
 .DESCRIPTION
     NEVER grep for `max + 1`. Two sessions that both grep pick the SAME number, create DIFFERENTLY-named
@@ -35,11 +38,9 @@
       adr      440 git processes for the whole -ShowFloor run -- ref enumeration, one
                `cat-file --batch-check`, then one `ls-tree` per DISTINCT docs/adr tree, 434 here.
                It scales with distinct TREES, not with refs.
-      backlog  18 -- ref enumeration, one `cat-file --batch-check`, then one `git grep` per 128
-               DISTINCT ledger blobs, 13 here at 1,538 blobs (BACKLOG #1535). Scales with blobs.
-    An earlier version of these lines said "TWO git processes" for each and was wrong twice over: it
-    omitted the ref enumeration both branches run, and it described an adr stage 2 that has since been
-    reverted. The cost is per allocation, not per edit.
+    An earlier version of this line said "TWO git processes" and was wrong twice over: it omitted the
+    ref enumeration, and it described a stage 2 that has since been reverted. The cost is per
+    allocation, not per edit. The retired backlog branch cost 18 and scaled with ledger blobs.
 
     Both counts PREDATE the pre-flight fetch (2026-09-12), which adds one `config --get` probe on every
     run and, when origin is reachable, a `fetch` plus git's own children -- 12 invocations for a whole
@@ -69,14 +70,16 @@
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Worktree gate"
-    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Ledger allocator"
-    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Builder's item" -For C:\path\to\builder\worktree
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Peer's ADR" -For C:\path\to\builder\worktree
     pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
-    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog -Title "Offline item" -NoFetch
+    pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "Offline ADR" -NoFetch
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet("adr", "backlog")]
+    # ONE VALUE, AND THAT IS THE HARD STOP (BACKLOG #1754). `-Kind backlog` is refused by parameter
+    # binding, before the script body runs, so there is no path through this file that can issue a
+    # backlog number. Widening this set is how that guarantee would be lost.
+    [ValidateSet("adr")]
     [string]$Kind = "adr",
     [string]$Title,
     # Show what this worktree currently holds, and exit.
@@ -204,209 +207,71 @@ function Get-Floor {
     $seen = [System.Collections.Generic.List[int]]::new()
     $seen.Add(0)
 
-    if ($Kind -eq "adr") {
-        # Batched for the reason the backlog branch below was batched, and it is the same measurement
-        # taken again on a bigger clone: one `git ls-tree` PER REF is one PROCESS per ref, and this
-        # clone now carries 7,196 of them. Measured 2026-09-11 -- 359.7s for a single -ShowFloor, and
-        # over 17 minutes for the session that reported it, which lost two tool timeouts before its
-        # allocation returned. The refs collapse hard: 7,199 specs resolve to 434 DISTINCT docs/adr
-        # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
-        # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
-        #
-        # A TREE, NOT A BLOB, is the difference from the backlog branch. A directory has no fixed path
-        # to hand `--batch-check`, so the dedupe collapses to distinct TREE ids and each distinct tree
-        # is listed once. The refs are what exploded; the trees never were.
-        #
-        # THE SAVING IS THE DEDUPE, NOT A CLEVERER READER. 7,199 specs collapse to 434 trees, which is
-        # a 16x cut in processes and the whole of the fix. Two spellings of stage 2 that tried to go
-        # further were BUILT, MEASURED AND REVERTED, and both failed the same way -- silently, by
-        # losing a name, which is a number that then reads as FREE:
-        #
-        #   `git rev-list --objects` dedupes by OBJECT, so two ADR files with byte-identical content
-        #   print ONE of their two names. Measured: `0150-alpha.md` and `0151-beta.md` sharing a blob
-        #   printed one name, which would re-issue 0151 over a live ADR.
-        #
-        #   Scanning the RAW TREE BYTES through the pipeline, anchored on `(?:100644|100755) `, broke
-        #   TWICE. (a) A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native
-        #   output with [Console]::OutputEncoding -- the OEM console code page on Windows. Under a
-        #   DBCS page a lead byte at the end of one entry's id CONSUMES the `1` that starts the next
-        #   entry's `100644`, and that entry vanishes. Measured on this clone: cp932 lost 7 of 181
-        #   numbers, cp936/949/950 lost 17, while utf-8 and cp1252 lost none. End to end on a fixture
-        #   with `chcp` set before pwsh started, the floor fell from 999 to 100 and the next
-        #   allocation would have landed on a live ADR. The comment that shipped it argued no
-        #   multi-byte decode could swallow an ASCII byte; that is true of UTF-8 and false of DBCS.
-        #   (b) The mode literal admitted regular files only, where `ls-tree` reports EVERY mode, so
-        #   an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to
-        #   its replacement (120000) became invisible.
-        #
-        # SO STAGE 2 IS `ls-tree` PER DISTINCT TREE, and it is the boring spelling on purpose. It
-        # emits TEXT that git already decoded, so no console code page can touch it, and it reports
-        # every mode, so no entry shape can hide from it. It costs 434 processes here instead of one
-        # -- about 40s against the 5s the byte scan managed and the 359.7s this branch started at.
-        # That trade is deliberate: the failures it buys out are both SILENT, and this script exists
-        # to prevent exactly the collision they cause.
-        #
-        # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
-        # Two implementations of one question drift; change one and read the other.
-        $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
+    # ADR NUMBERS ONLY. The backlog branch that used to sit beside this one swept docs/BACKLOG.md
+    # and docs/archive/backlog/BACKLOG-CLOSED.md across every ref; both files left this repository
+    # with the ledger (BACKLOG #1250), so the sweep had no subject and went with them.
+    # Batched for the reason the backlog branch below was batched, and it is the same measurement
+    # taken again on a bigger clone: one `git ls-tree` PER REF is one PROCESS per ref, and this
+    # clone now carries 7,196 of them. Measured 2026-09-11 -- 359.7s for a single -ShowFloor, and
+    # over 17 minutes for the session that reported it, which lost two tool timeouts before its
+    # allocation returned. The refs collapse hard: 7,199 specs resolve to 434 DISTINCT docs/adr
+    # trees. So resolve every ref in ONE `cat-file --batch-check`, dedupe the tree ids, and read
+    # each distinct tree ONCE. Measured on this clone: 359.7s -> 6.7s, same 181 numbers, same max.
+    #
+    # A TREE, NOT A BLOB, is the difference from the backlog branch. A directory has no fixed path
+    # to hand `--batch-check`, so the dedupe collapses to distinct TREE ids and each distinct tree
+    # is listed once. The refs are what exploded; the trees never were.
+    #
+    # THE SAVING IS THE DEDUPE, NOT A CLEVERER READER. 7,199 specs collapse to 434 trees, which is
+    # a 16x cut in processes and the whole of the fix. Two spellings of stage 2 that tried to go
+    # further were BUILT, MEASURED AND REVERTED, and both failed the same way -- silently, by
+    # losing a name, which is a number that then reads as FREE:
+    #
+    #   `git rev-list --objects` dedupes by OBJECT, so two ADR files with byte-identical content
+    #   print ONE of their two names. Measured: `0150-alpha.md` and `0151-beta.md` sharing a blob
+    #   printed one name, which would re-issue 0151 over a live ADR.
+    #
+    #   Scanning the RAW TREE BYTES through the pipeline, anchored on `(?:100644|100755) `, broke
+    #   TWICE. (a) A tree entry carries 20 RAW bytes of object id, and PowerShell decodes native
+    #   output with [Console]::OutputEncoding -- the OEM console code page on Windows. Under a
+    #   DBCS page a lead byte at the end of one entry's id CONSUMES the `1` that starts the next
+    #   entry's `100644`, and that entry vanishes. Measured on this clone: cp932 lost 7 of 181
+    #   numbers, cp936/949/950 lost 17, while utf-8 and cp1252 lost none. End to end on a fixture
+    #   with `chcp` set before pwsh started, the floor fell from 999 to 100 and the next
+    #   allocation would have landed on a live ADR. The comment that shipped it argued no
+    #   multi-byte decode could swallow an ASCII byte; that is true of UTF-8 and false of DBCS.
+    #   (b) The mode literal admitted regular files only, where `ls-tree` reports EVERY mode, so
+    #   an ADR kept as a directory (`docs/adr/0199-with-assets/`, mode 040000) or as a symlink to
+    #   its replacement (120000) became invisible.
+    #
+    # SO STAGE 2 IS `ls-tree` PER DISTINCT TREE, and it is the boring spelling on purpose. It
+    # emits TEXT that git already decoded, so no console code page can touch it, and it reports
+    # every mode, so no entry shape can hide from it. It costs 434 processes here instead of one
+    # -- about 40s against the 5s the byte scan managed and the 359.7s this branch started at.
+    # That trade is deliberate: the failures it buys out are both SILENT, and this script exists
+    # to prevent exactly the collision they cause.
+    #
+    # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
+    # Two implementations of one question drift; change one and read the other.
+    $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
+    $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
 
-        $trees = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
-            $p = "$line".Split(' ')
-            if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
-        }
+    $trees = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+        $p = "$line".Split(' ')
+        if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
+    }
 
-        # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
-        # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
-        $rx = [regex]::new('^(\d{4})-')
-        foreach ($t in $trees) {
-            foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
-                $m = $rx.Match("$n")
-                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
-            }
-        }
-    } else {
-        # BACKLOG.md is ONE BIG FILE, so the floor needs its CONTENT, not a filename listing -- but it
-        # still needs EVERY ref, exactly like the adr branch above and exactly as this function's own
-        # header comment promises. Reading only origin/main + HEAD is what re-issued #240-#247 on
-        # 2026-07-30 over numbers ADR 0115 and seven amended ADRs already cite: the items holding
-        # those numbers live on refs the published branch does not carry, so they were invisible here
-        # and the allocator handed the numbers out as free. A number that exists on ANY ref is taken.
-        #
-        # Batched deliberately: ~550 refs share ~190 distinct BACKLOG.md blobs, and a `git show` per
-        # ref costs ~34s on Windows (one process each). Two `git cat-file` processes do it in ~3s.
-        # THE NUMBER SPACE SPANS TWO PATHS. Retiring an item MOVES it verbatim out of docs/BACKLOG.md
-        # and into docs/archive/backlog/BACKLOG-CLOSED.md. Sweeping only the published file would make
-        # every archived number invisible here and free to re-issue -- the #240-#247 shape again, just
-        # sourced from a different blind spot. A number that exists in EITHER file, on ANY ref, is taken.
-        #
-        # The archive is ONE file with a FIXED name on purpose: `cat-file --batch-check` takes a spec
-        # list and cannot glob a directory, so a per-ref `git ls-tree -r` would be needed to discover
-        # archive filenames -- one process per ref, the ~34s cost the batching below exists to avoid.
-        # A fixed second spec keeps the sweep at two processes. Splitting the archive into several
-        # files means adding each one here; an archive file not listed here is not policed.
-        $backlogPaths = @("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md")
-
-        $refs = @("origin/main", "HEAD") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        $specs = foreach ($r in ($refs | Select-Object -Unique)) {
-            foreach ($p in $backlogPaths) { "${r}:${p}" }
-        }
-
-        $oids = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
-            $p = "$line".Split(' ')
-            if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
-        }
-
-        # GIT FILTERS; POWERSHELL DOES NOT (BACKLOG #1535). Stage 1 above is already batched, so this
-        # branch never had the adr branch's one-process-per-ref defect. Its cost was BYTE VOLUME: the
-        # 1,518 distinct blobs average ~2.8 MB, so feeding them through `cat-file --batch` shipped
-        # ~4.2 GB and 24.5 MILLION pipeline objects into PowerShell to keep ~500 thousand lines. Only
-        # ~13s of a ~111s stage was git. `git grep` applies the pattern in C and emits the headings
-        # only: 526,162 lines, 4.3 MB, a 46x drop in objects and a 984x drop in bytes.
-        #
-        # PROVEN BY SET EQUALITY, NOT BY A STOPWATCH. Both spellings were run over the same 1,518 oids
-        # on this clone: 855 distinct numbers, max 1535, SubFloorMax 354, `Compare-Object` empty in
-        # BOTH directions. Re-verify that way, never by comparing floors -- the printed floor is the
-        # union max and the REGISTRY term carries it, so this whole stage can return nothing and the
-        # floor will not move. Measured: registry max 1537 against all-refs max 1536, and 61 numbers
-        # live on refs and nowhere else.
-        #
-        # EVERY FLAG BELOW IS A SILENT-ZERO GUARD, and each was reproduced rather than assumed:
-        #   -h      without it git prefixes `<oid>:` and the anchored extraction matches 0 of 314 lines
-        #   -o      emits the heading alone: same line count, 4.3 MB instead of 55.1 MB
-        #   -a      git otherwise prints `Binary file <oid> matches` and drops the lines. 0 of 1,518
-        #           blobs trip it today, and `cat-file` had no such gate, so this is a failure mode the
-        #           port INTRODUCES -- one NUL from a bad merge would zero a blob's contribution
-        #   --no-color --no-line-number --no-column
-        #           `color.ui=always`, `grep.lineNumber` and `grep.column` each prefix every line and
-        #           each takes the extraction to 0. This stage reads git config that `cat-file` never
-        #           did; these three neutralise it
-        #   -E -e   `grep.patternType=fixed` turns the pattern into a literal without an explicit -E
-        #
-        # `[0-9]`, NEVER `\d`. Git's POSIX ERE HAS NO `\d`: the pattern matches ZERO lines corpus-wide
-        # and exits 1, which reads as "no numbers on any ref" and frees every one of them. That is the
-        # #240-#247 shape this term exists to prevent, and transcribing the .NET regex below is all it
-        # takes to get there.
-        $chunk = 128
-        if ($oids.Count -gt 0) {
-            $rxGrep = [regex]::new('^#{2,3} ([0-9]+)\.$')
-            $oidList = @($oids)
-            for ($i = 0; $i -lt $oidList.Count; $i += $chunk) {
-                $slice = @($oidList[$i..([Math]::Min($i + $chunk - 1, $oidList.Count - 1))])
-
-                # BOTH RESETS ARE LOAD-BEARING. An over-long argument list is not a non-zero exit: git
-                # never starts, `$LASTEXITCODE` keeps its PREVIOUS value and `$out` keeps the PREVIOUS
-                # slice's output, so an unguarded loop re-adds the last slice and skips this one with
-                # no error.
-                #
-                # Ceiling bisected on this clone 2026-09-11, with a 72-char repo path: 794 oids run
-                # and 795 does not, at roughly 32,710 chars against Windows' 32,767-char CreateProcess
-                # limit. The message it fails with names StandardOutputEncoding, not the length, so
-                # the argv cause is not discoverable from the error. A chunk of 128 leaves 666 spare
-                # oids, about 27,300 characters of slack for a longer repo path, and the extra
-                # processes are free against a stage that used to stream 4.2 GB. Both figures move
-                # with the repo path, so re-bisect rather than trusting them elsewhere.
-                $out = $null
-                $global:LASTEXITCODE = -1
-                $out = & git -C $repo grep -h -o -a --no-color --no-line-number --no-column -E -e '^#{2,3} [0-9]+\.' @slice 2>$null
-                # THE EXIT CODE IS THE WITNESS, AND `$?` IS NOT. For a native command PowerShell sets
-                # `$?` from the exit code, so `if (-not $?)` is true for git grep's exit 1 as well as
-                # for a fatal -- and exit 1 means "no match", which is LEGITIMATE. Measured: a blob
-                # with no numbered heading exits 1 with `$?` False. An earlier spelling threw there,
-                # which made a repository whose ledger blobs carry no heading yet -- a fresh clone of
-                # this tooling -- unable to allocate a backlog number AT ALL, and left the accurate
-                # exit-code message below as dead code that could never print.
-                #
-                # -1 is the sentinel from the reset above and means git NEVER RAN: an over-long
-                # argument list does not set an exit code, and without the sentinel the stale value
-                # from the previous slice reads as success while `$out` still holds that slice's
-                # output. 0 = matched, 1 = no match, 128 = fatal -- and a fatal aborts the WHOLE slice
-                # for zero lines, so up to 128 blobs' numbers vanish at once.
-                if ($LASTEXITCODE -lt 0) { throw "git grep never ran over backlog blobs $i..$($i + $slice.Count - 1). An over-long argument list reports a StandardOutputEncoding error rather than the real cause; lower `$chunk` before believing anything else." }
-                if ($LASTEXITCODE -gt 1) { throw "git grep exited $LASTEXITCODE over backlog blobs $i..$($i + $slice.Count - 1); the whole slice returned nothing." }
-
-                foreach ($line in $out) {
-                    $m = $rxGrep.Match("$line")
-                    # THROW, DO NOT SKIP. `$` anchors the whole emitted line, so a non-match means git
-                    # emitted something we did not ask for -- a prefix from config, an ANSI escape, a
-                    # binary notice. Skipping turns each of those into a number-free blob reported as
-                    # clean; throwing turns a silent zero into a loud failure.
-                    if (-not $m.Success) { throw "git grep emitted a line that is not a bare heading: [$line]" }
-                    $seen.Add([int]$m.Groups[1].Value)
-                }
-            }
-        }
-        # MULTILINE IS LOAD-BEARING HERE, and its absence was a silent hole. `[regex]'^...'` anchors at
-        # the start of the STRING, not of each line. The all-refs term above feeds one line at a time,
-        # so `^` matched there and looked correct -- but this term feeds `Get-Content -Raw`, one string
-        # starting "# Backlog", where `^` could never match. Measured on this tree: 0 of 277 headings
-        # found without Multiline, 277 with. So the term that exists to catch a number written but
-        # committed NOWHERE was finding nothing, and the all-refs term hid it by covering every number
-        # committed somewhere -- i.e. every case except the one this term is for.
-        #
-        # ITS OWN VARIABLE, deliberately. The two regexes used to be one `$rx`, and that sharing is a
-        # trap now that the grep path visibly does not need Multiline: tidying the flag away because
-        # the loop above works fine without it returns THIS term to 0 of 749.
-        #
-        # THE TWO SPELLINGS DIVERGE ON PURPOSE AND THE ASYMMETRY IS SAFE. Git has no `\d` so the grep
-        # pattern must say `[0-9]`; .NET `\d` also matches non-ASCII Unicode digits. Census over all
-        # 1,518 blobs with PCRE, whose `\d` IS Unicode-aware: exactly 0 headings differ. Kept as `\d`
-        # so this file still agrees character-for-character with ledger_check.py and
-        # alloc_strand_sweep.py, which police the same headings in Python. Note that a heading with
-        # non-ASCII digits would throw in `[int]::Parse` below, so `\d` is a latent crash rather than a
-        # capability -- if that ever fires, narrow all four to `[0-9]` together, not this one alone.
-        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
-        # Working-tree term: catches a number written to a file but committed nowhere. Both paths, for
-        # the same reason -- an item drafted straight into the archive is still a claim on its number.
-        foreach ($p in $backlogPaths) {
-            $wip = Join-Path $repo $p
-            if (Test-Path $wip) {
-                foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
-            }
+    # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+    # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
+    $rx = [regex]::new('^(\d{4})-')
+    foreach ($t in $trees) {
+        foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
+            $m = $rx.Match("$n")
+            if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
         }
     }
+
 
     foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
         $n = 0
@@ -480,44 +345,32 @@ function Get-Floor {
     $floor = [Math]::Max($computed, $previous)
     if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
 
-    # TWO NUMBERS, NOT ONE -- and conflating them is what bricked this script on 2026-08-03.
+    # ONE NUMBER NOW. `Floor` is the whole observed set's maximum -- "what must I not re-issue" --
+    # so it includes every number seen anywhere.
     #
-    # `Floor` is the whole observed set's maximum. It answers "what must I not re-issue", so it MUST
-    # include public numbers.
+    # `SubFloorMax` used to ride alongside it: the maximum BELOW the #1000 partition, answering how
+    # much runway the maintainer-internal sequence had left. The partition, its warning and its
+    # ratchet all belonged to the backlog kind and went with it (BACKLOG #1250, #1754). Returning
+    # one number for two questions is what bricked this script on 2026-08-03; there is now one
+    # question, so do not add a second field back without a reader for it.
     #
-    # `SubFloorMax` is the maximum BELOW the partition. It answers a different question -- "how much
-    # runway does the maintainer-internal sequence have left" -- and it must EXCLUDE public numbers,
-    # because a public item at or above the boundary is the design working, not a breach.
-    #
-    # Returning one number for both is not a style problem. The residual detector below read `Floor`,
-    # so the first legitimate public item filed at #1000 made the guard throw on every subsequent
-    # backlog allocation, repo-wide, until it was patched. The guard fired on correct input.
-    #
-    # `[int]` on both: Measure-Object hands back a [double], and the 'D4' format specifier is
-    # integer-only and throws on one.
+    # `[int]`: Measure-Object hands back a [double], and the 'D4' format specifier is integer-only
+    # and throws on one.
     [pscustomobject]@{
-        Floor       = [int]$floor
-        SubFloorMax = [int](($seen | Where-Object { $_ -lt $PublicBacklogFloor } | Measure-Object -Maximum).Maximum)
+        Floor = [int]$floor
     }
 }
 
-# THE FLOOR IS DEFINED ONCE, IN THE GATE, AND READ HERE.
+# THE #1000 PARTITION IS GONE, AND SO IS THE CONSTANT THIS BLOCK USED TO READ.
 #
-# Two integers that must agree is the next place this rots: the allocator would go on emitting numbers
-# the gate refuses, and the tool would be sending people straight into a blocked commit while insisting
-# it had given them a valid number. So parse it out of ledger_check.py rather than restating it, and
-# REFUSE to allocate a backlog number if it cannot be read -- guessing a floor the gate will not honour
-# is the failure this whole partition exists to prevent, reintroduced by its own tooling.
-$gateFile = Join-Path $repo "scripts/hooks/ledger_check.py"
-$PublicBacklogFloor = $null
-if (Test-Path $gateFile) {
-    # The optional `(?::[^=]+)?` tolerates a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000`
-    # is idiomatic in a mypy-strict codebase and would otherwise fail to match -- silently disarming
-    # every backlog allocation as the result of an ordinary tidy-up. tests/test_ledger_check.py pins
-    # this contract so the break lands in CI on whoever edits the constant, not on a session days later.
-    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)')
-    if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
-}
+# This script used to regex `PUBLIC_BACKLOG_FLOOR` out of scripts/hooks/ledger_check.py so the floor
+# was defined exactly once, and refuse to allocate a backlog number if it could not be read. The
+# ledger left this repository (BACKLOG #1250) and the constant went with the gate half that used it
+# (BACKLOG #1754), so there is nothing to read and no backlog number to guard.
+#
+# DO NOT RESTORE A DEFAULT HERE IF SOMETHING LATER WANTS A FLOOR. A missing constant read as a
+# number would be the exact failure the old block refused: a floor the gate will not honour,
+# guessed by the tool that hands out the numbers.
 
 # PRE-FLIGHT FETCH -- THE ONLY INSTRUMENT THAT CAN SEE A NUMBER ALLOCATED IN ANOTHER CLONE.
 #
@@ -713,34 +566,21 @@ gates passed, and nothing reported the collision. Holes are free, collisions are
 
 $measured = Get-Floor -Peek:$ShowFloor -FetchState $fetchState
 $observed = $measured.Floor
-$subFloorMax = $measured.SubFloorMax
 
-# Both checks are evaluated ONCE, here, so -ShowFloor and a real allocation cannot disagree. They did:
-# -ShowFloor returned 19 lines before the guard, so it printed a next number while every real
-# allocation threw. An inspector that does not run the checks it previews reports a number the tool
-# will refuse to issue -- it answers the adjacent question, which is the failure CLAUDE.md §11 names.
-$warnAt = if ($null -ne $PublicBacklogFloor) { [int]($PublicBacklogFloor * 0.9) } else { 0 }
-$residualWarning = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($subFloorMax -ge $warnAt)
-
-# THE BOUNDARY RATCHET -- the one refusal this data can actually justify.
+# THE WARNING AND THE RATCHET BOTH BELONGED TO THE BACKLOG KIND, AND BOTH ARE GONE.
 #
-# PUBLIC_BACKLOG_FLOOR is a constant in a source file, so it can be LOWERED: a bad revert, a merge
-# resolved the wrong way, a tidy-up. Lower it to 900 and ledger_check.py cheerfully accepts a new
-# public #900 sitting on top of an internal #900 -- with a GREEN pre-commit and a GREEN CI, because a
-# runner has no memory of yesterday's value and the constant is the only thing either consults.
+# What stood here: a residual warning when the highest number below #1000 reached 90% of the
+# partition, and a `.boundary-highwater` ratchet that refused to allocate when PUBLIC_BACKLOG_FLOOR
+# was LOWERED beneath a value this clone had already allocated against. Neither has a subject now
+# that the ledger and the constant have left the repository (BACKLOG #1250, #1754).
 #
-# A ratchet OUTSIDE the constant is the only instrument that can see this, and unlike the boundary
-# check it replaces, it is genuinely reachable: it triggers on an observable local fact (the value
-# moved down) rather than on an integer whose provenance cannot be recovered.
+# THE ORIGINAL LESSON STILL BINDS AND IS KEPT ON PURPOSE: a check must be evaluated ONCE so
+# -ShowFloor and a real allocation cannot disagree. They did once -- -ShowFloor printed a next
+# number while every real allocation threw, because the inspector did not run the checks it
+# previewed. Any guard added here later must sit above this line, not inside one branch.
 #
-# THREE QUANTITIES, THREE PURPOSES -- keep them strictly separate:
-#   $observed     (union max)      -> $start / the next number, ONLY
-#   $subFloorMax  (below boundary) -> the WARNING, ONLY
-#   $boundarySeen (highest floor)  -> the REFUSAL, ONLY
-$boundaryMark = Join-Path $alloc ".boundary-highwater"
-$boundarySeen = 0
-if (Test-Path $boundaryMark) { [void][int]::TryParse((Get-Content $boundaryMark -Raw).Trim(), [ref]$boundarySeen) }
-$boundaryLowered = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($PublicBacklogFloor -lt $boundarySeen)
+# An abandoned `.boundary-highwater` file may still sit beside the registry in an existing clone.
+# Nothing reads it any more; it is inert, not load-bearing.
 
 if ($ShowFloor) {
     # Name the SOURCES, not just the number. "Which files did this sweep actually read" is the
@@ -748,109 +588,22 @@ if ($ShowFloor) {
     # 353 looks identical whether it swept one path or two.
     Write-Host "kind     : $Kind"
     Write-Host "floor    : $observed"
-    if ($Kind -eq "backlog") {
-        Write-Host "paths    : docs/BACKLOG.md, docs/archive/backlog/BACKLOG-CLOSED.md"
-        Write-Host "sub-floor: $subFloorMax  (highest number BELOW the #$PublicBacklogFloor boundary; over-states the internal high-water)"
-        Write-Host "boundary : $PublicBacklogFloor  (highest ever seen on this clone: $boundarySeen)"
-        Write-Host "next     : $([Math]::Max($observed, $PublicBacklogFloor - 1) + 1)  (clamped to >= $PublicBacklogFloor)"
-    } else {
-        Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
-        Write-Host "next     : $($observed + 1)"
-    }
+    Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
+    Write-Host "next     : $($observed + 1)"
     Write-Host "watermark: $(Join-Path $alloc '.floor-highwater')"
-    if ($boundaryLowered) {
-        Write-Host ""
-        Write-Host "WOULD REFUSE: PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor but this clone has allocated against $boundarySeen." -ForegroundColor Red
-    }
-    if ($residualWarning) {
-        Write-Host ""
-        Write-Host "WOULD WARN: highest sub-boundary number $subFloorMax has reached 90% of #$PublicBacklogFloor." -ForegroundColor Yellow
-    }
     Write-Host ""
     Write-Host "Read-only: nothing was allocated." -ForegroundColor DarkGray
     return
 }
 
-if ($Kind -eq "backlog") {
-    if ($null -eq $PublicBacklogFloor) {
-        throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
-    }
+# NO CLAMP. The backlog kind clamped its start to the #1000 partition; ADR numbers have never had
+# a floor beyond the union maximum, and that maximum is what makes "never hand out a number that
+# exists anywhere" true.
+$start = $observed + 1
 
-    # WHY THE OLD "INTERNAL REACHED THE BOUNDARY" REFUSAL IS GONE.
-    #
-    # It compared the WHOLE-SET maximum against the floor, so the first legitimate public item filed at
-    # #1000 (BACKLOG #1000, 2026-08-03) made every subsequent backlog allocation throw, repo-wide. It
-    # was not detecting a breach; it was detecting the partition being used exactly as designed.
-    #
-    # It is NOT that this clone cannot see internal numbers -- that was suspected and is false.
-    # Measured 2026-08-03, while the vault-ish refs were still here: 490 present, 489 carrying
-    # docs/BACKLOG.md, and 67 item numbers living ONLY there, including the #242-#246 band ADR 0115
-    # cites. The sweep did reach them, and that is exactly why the floor was trustworthy. (Those 489
-    # refs were DELETED on 2026-08-05 -- docs/LEDGER-GATE.md has the provenance and the manifest's
-    # whereabouts -- so this clone is now case (c) below. Floor 1032 and sub-floor max 353 were measured
-    # unchanged across the deletion, for reason (d).)
-    #
-    # The premise fails for four other reasons, any ONE of them fatal:
-    #   (a) NO PROVENANCE. An integer does not say which sequence issued it. "Internal reached the
-    #       boundary" and "public was legitimately allocated at the boundary" are the SAME observation
-    #       -- which is why #1000, on origin/main and holding a registry claim, read as a breach.
-    #   (b) FOSSIL. The newest vault-ish ref was 2026-07-26 and the only configured refspec is
-    #       +refs/heads/*:refs/remotes/origin/*, so nothing could advance them. The partition landed
-    #       eight days later. (Measured: those refs said 314 while the real vault was at 315 -- the
-    #       fossil was already stale by one item.)
-    #   (c) CLONE-LOCAL. A fresh public clone has zero vault refs, so the term is absent entirely --
-    #       and since the 2026-08-05 deletion, so does this one.
-    #   (d) MASKED. Internal 314 < public 353, so the internal term never determined the sub-boundary
-    #       maximum -- which is why deleting those refs moved neither number.
-    #
-    # So the refusal moved to a trigger that IS observable and IS reachable -- the boundary ratchet
-    # above, which fires when PUBLIC_BACKLOG_FLOOR is lowered beneath a value this clone has already
-    # allocated against. What remains here is a warning only.
-    #
-    # $subFloorMax is "the highest number below the boundary", NOT "the internal maximum". It includes
-    # public pre-partition numbers, so it deliberately OVER-states the internal high-water: it warns
-    # early rather than late, which is the safe direction for a runway indicator.
-    if ($boundaryLowered) {
-        throw @"
-REFUSING TO ALLOCATE. PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor, but this clone has already
-allocated against a boundary of $boundarySeen. The constant was LOWERED beneath numbers that were
-issued under the higher value, so the next number handed out could collide with the maintainer-internal
-sequence -- and neither the pre-commit gate nor CI can see it, because both read only the current value
-of the constant and have no memory of the previous one.
-
-Restore PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py to at least $boundarySeen. If the
-reduction is deliberate, delete $boundaryMark and say why in the PR.
-"@
-    }
-    if ($residualWarning) {
-        Write-Host ""
-        Write-Host "WARNING: the highest sub-partition number ($subFloorMax) has reached 90% of the #$PublicBacklogFloor boundary." -ForegroundColor Yellow
-        Write-Host "         The maintainer-internal sequence is running out of room below the partition." -ForegroundColor Yellow
-        Write-Host "         Raise PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py (this script reads" -ForegroundColor Yellow
-        Write-Host "         it from there) BEFORE the two sequences meet, and say so in the PR. Once they" -ForegroundColor Yellow
-        Write-Host "         meet, nothing in this repository can tell the two apart." -ForegroundColor Yellow
-        Write-Host ""
-    }
-    # Record the boundary we are about to allocate under. Only rises; only on a real allocation.
-    if ($PublicBacklogFloor -gt $boundarySeen) {
-        Set-Content -Path $boundaryMark -Value $PublicBacklogFloor -Encoding ASCII
-    }
-
-    # $observed IS THE UNION MAXIMUM HERE, DELIBERATELY, AND MUST STAY THAT WAY.
-    #
-    # The tempting "fix" for the #1000 brick is to repoint $observed at the sub-boundary maximum, since
-    # that is what the guard should have read. Do not: $start would become max(353, 999) + 1 = 1000 --
-    # a number already merged on origin/main -- and in a FRESH clone, whose registry is empty, the
-    # atomic CreateNew has no claim file to collide with and would NOT catch the re-issue. The union
-    # maximum is what makes "never hand out a number that exists anywhere" true; the sub-boundary
-    # maximum answers a different question and belongs only to the warning above.
-    $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
-}
-else {
-    $start = $observed + 1
-}
 for ($i = $start; $i -lt $start + 500; $i++) {
-    $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
+    # Zero-padded to four digits: ADR filenames sort lexically in docs/adr/.
+    $name = "{0:D4}" -f $i
     $file = Join-Path $alloc "$name.json"
     try {
         # ATOMIC test-and-set. 'CreateNew' + FileShare::None throws IOException if a sibling got here

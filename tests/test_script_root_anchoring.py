@@ -103,25 +103,26 @@ def test_setup_leak_gate_arms_the_checkout_it_lives_in_not_the_cwd(tmp_path: Pat
 def _coord_checkout(path: Path, *, drafted: int, boundary: int) -> Path:
     """A minimal checkout carrying scripts/coord/ and the two files the allocator reads from ``$repo``.
 
-    ``drafted`` is a BACKLOG heading written to the working tree and committed NOWHERE -- the floor term
-    that exists to catch exactly that, and the one where reading the wrong tree is worse than
-    misattribution: a number invisible to the sweep is a number free to re-issue.
+    ``drafted`` is an ADR NUMBER, written as a file under ``docs/adr/`` and COMMITTED here. It used to
+    be a BACKLOG heading left uncommitted, because the retired backlog sweep read the working tree;
+    the ADR sweep reads refs, so the fixture commits it. What the test measures is unchanged -- which
+    checkout the allocator read -- and reading the wrong one is still worse than misattribution: a
+    number invisible to the sweep is a number free to re-issue.
 
-    ``boundary`` is the ``PUBLIC_BACKLOG_FLOOR`` the allocator parses out of ledger_check.py rather than
-    restating. A stub is faithful here because the allocator reads it with a regex over the raw text, and
-    it gives a second, independent signal for which checkout was consulted.
+    ``boundary`` is retained in the signature and no longer written anywhere. It was the
+    ``PUBLIC_BACKLOG_FLOOR`` the allocator parsed out of ledger_check.py, which went with the backlog
+    kind (BACKLOG #1250, #1754). The second, independent signal for which checkout was consulted is
+    now the watermark path alone -- one signal, and the assertion below says so rather than implying
+    two.
     """
+    del boundary  # kept in the signature so both call sites still read symmetrically
     (path / "scripts" / "coord").mkdir(parents=True)
     (path / "scripts" / "hooks").mkdir(parents=True)
-    (path / "docs").mkdir(parents=True)
+    (path / "docs" / "adr").mkdir(parents=True)
     shutil.copy2(_ALLOC, path / "scripts" / "coord" / "alloc.ps1")
     shutil.copy2(_CLAIM, path / "scripts" / "coord" / "claim.ps1")
-    (path / "scripts" / "hooks" / "ledger_check.py").write_text(
-        f"PUBLIC_BACKLOG_FLOOR = {boundary}\n", encoding="utf-8"
-    )
-    (path / "docs" / "BACKLOG.md").write_text(
-        f"# Backlog\n\n## {drafted}. A number drafted here and committed nowhere\n",
-        encoding="utf-8",
+    (path / "docs" / "adr" / f"{drafted}-a-number-drafted-in-this-checkout.md").write_text(
+        f"# ADR {drafted}\n", encoding="utf-8"
     )
     _git("init", "-b", "main", ".", cwd=path)
     _git("config", "user.email", "t@e.com", cwd=path)
@@ -155,7 +156,8 @@ def test_alloc_reads_the_floor_from_its_own_checkout_not_the_cwd(tmp_path: Path)
             str(named / "scripts" / "coord" / "alloc.ps1"),
             "-ShowFloor",
             "-Kind",
-            "backlog",
+            "adr",
+            "-NoFetch",
         ],
         cwd=str(caller),  # THE POINT: the shell is standing in the other checkout
         capture_output=True,
@@ -165,12 +167,11 @@ def test_alloc_reads_the_floor_from_its_own_checkout_not_the_cwd(tmp_path: Path)
     assert proc.returncode == 0, proc.stderr or proc.stdout
     out = proc.stdout
 
-    assert "floor    : 4242" in out, f"read the CALLER's working tree, not its own:\n{out}"
+    assert "floor    : 4242" in out, f"read the CALLER's tree, not its own:\n{out}"
     assert "7777" not in out, f"the caller's drafted number reached the floor:\n{out}"
-    # Independent second signal: the boundary comes from <repo>/scripts/hooks/ledger_check.py, so it
-    # answers "which checkout" without depending on the floor arithmetic at all.
-    assert "boundary : 1200" in out, f"parsed the CALLER's ledger_check.py:\n{out}"
-    # And the registry it would write to must live beside the named checkout's object store.
+    # The registry it would write to must live beside the named checkout's object store. This is the
+    # second signal, and since the boundary assertion retired with PUBLIC_BACKLOG_FLOOR it is the
+    # only one that does not depend on the floor arithmetic.
     watermark = next(line for line in out.splitlines() if line.startswith("watermark:"))
     assert str(named).replace("\\", "/").casefold() in watermark.replace("\\", "/").casefold(), (
         watermark
