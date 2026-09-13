@@ -149,7 +149,7 @@ Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendere
 > emitted at `lens parse --contract 2` and threaded through both IDE implementations; every AC-N below
 > carries the node id that proves it. §A.6's two known-wrong behaviours remain unfixed **by design** —
 > the build discharges §A.6's requirement by making notes non-movable rather than by landing the extent
-> fix. §A.8's #239 re-run is **still owed** and is NOT part of this build.
+> fix. §A.8's #1764 re-run is **still owed** and is NOT part of this build.
 
 §3's row enum ends at `{ "kind": "code", … } // verbatim, unrecognized`, and §4's ladder sends
 "everything else" there. A standalone comment is therefore projected as an opaque `Code` step. This
@@ -211,7 +211,7 @@ The coverage motivation is **reproducible from `main` as of PR #81 (merged 2026-
 scan (388 files · 145 handlers · 1,423 rows · 0 parse refusals; **editable share 42.0%**, **fully-typed
 handlers 14.5%**) can be re-run rather than taken on trust. Its comment-only split — **28% of opaque
 rows, 146 of 522** — was reported in PR #81's comments and is **not committed as data**, so it must be
-**re-derived by running the scan**, not quoted from this ADR, before it is used as a build warrant. Note also that #239's pre-registered rule fired RED and the RED prescription was overridden
+**re-derived by running the scan**, not quoted from this ADR, before it is used as a build warrant. Note also that #1764's pre-registered rule fired RED and the RED prescription was overridden
 on the "comment-only + helper delegation ≈ 70% of the opaque mass" argument — recorded on that same
 branch as **a delegated judgment call never explicitly ratified by the owner**.
 
@@ -337,8 +337,8 @@ must also be threaded through both implementations — `stepsModel.ts` (`359`, `
 ### A.8 Measurement discipline
 
 `note` rows are counted in **their own bucket** and are **excluded from the editable-share numerator**
-in the BACKLOG #239 scan. Reclassifying ~146 of 522 opaque rows as editable would move a P1 investment
-metric by roughly ten points without converting a single transform statement. #239 is re-run before and
+in the BACKLOG #1764 scan. Reclassifying ~146 of 522 opaque rows as editable would move a P1 investment
+metric by roughly ten points without converting a single transform statement. #1764 is re-run before and
 after so the delta is attributable.
 
 ### A.9 Consequence deltas
@@ -392,7 +392,7 @@ unfixed: a move/delete of a *recognized* row still re-attaches a neighbouring co
 and a comment at the END of an `if`/`for` body still projects at the PARENT nesting. A.6 required v1 to
 either land the extent fix or keep notes explicitly positional; this build takes the second option — **no
 note is movable**, in the engine and in the client — so the lens never renders a confidently
-mis-positioned caption. A.8's measurement discipline (the BACKLOG #239 re-run with `note` in its own
+mis-positioned caption. A.8's measurement discipline (the BACKLOG #1764 re-run with `note` in its own
 bucket, excluded from the editable-share numerator) is **not** part of this build and is still owed.
 
 ## Amendment B (DECLINED, 2026-07-30) — ADR 0089 Phase D "helper descent"
@@ -482,7 +482,7 @@ the *shape* of `rows`.
   functions / 87 files** (2026-07-13); the 2026-07-30 scan counts **1,423 rows / 145 handlers / 388
   files**; ADR 0104's scan cites **152 handlers**. "~66% opaque → 42.0% editable" is **not** a
   like-for-like delta and must not be presented as a measured lift. §4's "~80–90%" is of *transform
-  statements*; 42.0% is of *projected rows*. BACKLOG #239 already warns: "state which population any new
+  statements*; 42.0% is of *projected rows*. BACKLOG #1764 already warns: "state which population any new
   number describes."
 - **`218/522` (41.8%) is re-derivable but not committed as data** (see Amendment A.3) and is a **heuristic superset**:
   the scan's `classify_code_row` is explicitly "a HEURISTIC on source text, not a parse" and never
@@ -1019,7 +1019,7 @@ The reverse direction needs its own handling. A newer IDE meeting an older engin
   the item's original claim, and it becomes true of a shape the contract actually computes.
 - The editable share of the corpus moves. Per Amendment A §A.8's measurement discipline, templated
   arguments are counted in **their own bucket** rather than folded into the editable numerator, so this
-  amendment cannot flatter the #239 coverage figure without converting anything.
+  amendment cannot flatter the #1764 coverage figure without converting anything.
 - One new rewrite class enters `lens rewrite`, the first widening of §5's emit surface since this ADR was
   written. E.6.3 and E.6.4 are the gates that bound it.
 
