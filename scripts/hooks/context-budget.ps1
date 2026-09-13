@@ -94,6 +94,7 @@ try {
     # An explicit override exists so the guard can be tested without a transcript, and so a caller
     # that already knows the count does not pay for a re-parse.
     $used = 0
+    $modelId = ''
     if ($env:MEFOR_CONTEXT_BUDGET_TOKENS) {
         $parsed = 0
         if ([int]::TryParse($env:MEFOR_CONTEXT_BUDGET_TOKENS, [ref]$parsed)) { $used = $parsed }
@@ -113,6 +114,12 @@ try {
             try { $rec = $line | ConvertFrom-Json } catch { continue }
             $u = $rec.message.usage
             if (-not $u) { continue }
+            # The SAME record carries the model that produced it, so resolving the window costs
+            # nothing extra -- no second pass, no second file. Measured 2026-09-13 on a live
+            # transcript: 1,256 of 1,260 usage-bearing records name a real model and the record this
+            # walk lands on is one of them. The other four say "<synthetic>", which is not a model
+            # and must not match the table below.
+            if (-not $modelId -and $rec.message.model) { $modelId = [string]$rec.message.model }
             # input_tokens EXCLUDES the cached prefix, and the cache is most of a long session, so
             # input alone reads as a nearly-empty window on the fullest sessions. Sum all four.
             foreach ($f in 'input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens') {
@@ -127,16 +134,48 @@ try {
 
     $k = [math]::Round($used / 1000.0, 1)
 
+    # SECOND SOURCE: the model that wrote the transcript. Claude Code hands the STATUS LINE a
+    # resolved context_window_size and hands a HOOK neither the window nor the model, so this walks
+    # back to the model id in the transcript and maps it. Reported upstream; see the PR.
+    #
+    # AN ABSENT ENTRY IS SAFE, AND THAT IS THE DESIGN. A model this table does not know falls
+    # through to the no-percentage branch below, so the table may be incomplete or out of date
+    # without ever producing a wrong figure. It can only add correctness. THE ONE CHANGE THAT WOULD
+    # BREAK THAT IS GIVING IT A FALLBACK -- do not add an "else 200000", which is the exact defect
+    # this file was rewritten to remove.
+    #
+    # The windows differ across the roster, which is why one constant could never have worked:
+    # measured 2026-09-13 against the shipped build's own model registry, eight entries are 200k and
+    # eight are 1M. An operator override still wins over everything here.
+    if ($maxTokens -le 0 -and $modelId) {
+        # A "[1m]" suffix on any model id means the 1M variant, and it is checked first because it
+        # overrides whatever the base id would otherwise map to.
+        if ($modelId -match '\[1m\]') {
+            $maxTokens = 1000000
+        } else {
+            switch -Regex ($modelId) {
+                '^claude-(opus-5|sonnet-5|fable-5|mythos-5)' { $maxTokens = 1000000; break }
+                '^claude-opus-4-(7|8)'                       { $maxTokens = 1000000; break }
+                '^claude-haiku-4-5'                          { $maxTokens = 200000;  break }
+                '^claude-(opus|sonnet)-4'                    { $maxTokens = 200000;  break }
+                default { }
+            }
+        }
+    }
+
     # WINDOW UNKNOWN. Report the absolute count, which is measured, and NO percentage, which would be
     # invented. The absolute number is still worth printing -- a seat that knows it is holding 190k
     # tokens can judge for itself -- and naming the one-line fix is what eventually removes this
     # branch. What must never happen again is a confident percentage over an assumed denominator.
     if ($maxTokens -le 0) {
-        Write-Context ("[context-budget] NO WINDOW CONFIGURED, so no fullness figure is given -- one " +
+        $seen = if ($modelId) { "Model '$modelId' is not in this hook's window table." }
+                else { 'No model id was found in the transcript.' }
+        Write-Context ("[context-budget] NO WINDOW RESOLVED, so no fullness figure is given -- one " +
             "would be a percentage of a guess. This session holds about ${k}k tokens. That is the " +
-            "measured part; whether it is nearly full depends on a window this hook cannot read. Set " +
-            "MEFOR_CONTEXT_BUDGET_MAX_TOKENS to this model's real window (Opus 5 is 1000000) and the " +
-            "gauge comes back. This is the conversation's own window, NOT account pool headroom.")
+            "measured part; whether it is nearly full depends on a window this hook could not " +
+            "determine. $seen Set MEFOR_CONTEXT_BUDGET_MAX_TOKENS to this model's real window, or " +
+            "add the model to the table in this hook. This is the conversation's own window, NOT " +
+            "account pool headroom.")
         exit 0
     }
 

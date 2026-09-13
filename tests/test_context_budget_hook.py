@@ -31,7 +31,24 @@ PWSH = shutil.which("pwsh") or shutil.which("powershell")
 pytestmark = pytest.mark.skipif(PWSH is None, reason="PowerShell is not on PATH")
 
 
-def run_hook(env_overrides: dict[str, str]) -> str:
+def write_transcript(tmp_path: Path, model: str | None, tokens: int) -> str:
+    """One usage-bearing assistant record, the shape the hook's backward walk looks for."""
+    message: dict[str, object] = {
+        "usage": {
+            "input_tokens": tokens,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+        }
+    }
+    if model is not None:
+        message["model"] = model
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(json.dumps({"message": message}) + chr(10), encoding="utf-8")
+    return str(path)
+
+
+def run_hook(env_overrides: dict[str, str], transcript: str = "") -> str:
     """Run the hook with a token count injected, and return its additionalContext (or "")."""
     env = dict(os.environ)
     # Clear every knob this hook reads, so a developer's own shell cannot change the verdict.
@@ -43,7 +60,7 @@ def run_hook(env_overrides: dict[str, str]) -> str:
     assert PWSH is not None  # the module-level skipif guarantees this at runtime
     proc = subprocess.run(
         [PWSH, "-NoProfile", "-File", str(HOOK)],
-        input=json.dumps({"transcript_path": ""}),
+        input=json.dumps({"transcript_path": transcript}),
         capture_output=True,
         text=True,
         env=env,
@@ -117,31 +134,102 @@ def test_disable_flag_silences_the_hook() -> None:
     assert text == "", f"the disable flag did not silence the hook: {text}"
 
 
-def test_the_hook_carries_no_default_window() -> None:
-    """Grep the source. A default is the defect, so its absence is worth pinning directly.
+def test_the_unknown_model_arm_assigns_nothing() -> None:
+    """Grep the source for the one edit that would undo this fix: a fallback on the default arm.
 
-    A behavioural test cannot distinguish 'no default' from 'a default that happens to be huge',
-    and reintroducing a default is the specific regression this file guards against.
+    The behavioural tests above already catch most of it -- an unknown model with 950k tokens must
+    stay unresolved. But they cannot see INTENT, and the tempting change here is small and looks
+    like a tidy-up: filling in the empty `default { }` so the switch "handles every case". That arm
+    is empty on purpose, and this pins it.
     """
     source = HOOK.read_text(encoding="utf-8")
-    # Match an ASSIGNMENT to $maxTokens, anchored left. A looser "contains $maxTokens and ="
-    # also matches `$frac = [double]$used / [double]$maxTokens`, where $maxTokens is on the
-    # right-hand side -- which is a read, not a default.
-    assign = re.compile(r"^\s*\$maxTokens\s*=\s*(?P<rhs>.+?)\s*$")
-    live = [
-        m.group("rhs")
-        for line in source.splitlines()
-        if not line.strip().startswith("#")
-        for m in [assign.match(line)]
-        if m
-    ]
 
-    # Positive control: the assignments we DO expect must be found, or a zero here means the
-    # grep is broken rather than the source clean.
-    assert live, "found no $maxTokens assignment at all; this test's search is broken"
-    assert "0" in live, f"the unknown-window sentinel is gone: {live}"
+    sentinel = re.compile(r"^\s*\$maxTokens\s*=\s*0\s*$", re.MULTILINE)
+    assert sentinel.search(source), "the unknown-window sentinel ($maxTokens = 0) is gone"
 
-    for rhs in live:
-        if rhs in ("0", "$parsed"):
-            continue
-        pytest.fail(f"a default window was reintroduced: $maxTokens = {rhs}")
+    arm = re.search(r"^\s*default\s*\{(?P<body>[^}]*)\}", source, re.MULTILINE)
+    assert arm is not None, "the switch's default arm is gone; this test's search is broken"
+    assert "$maxTokens" not in arm.group("body"), (
+        f"the default arm assigns a fallback window: {arm.group('body')!r}. "
+        "An unmapped model must fall through to no percentage, never to a guess."
+    )
+
+
+def test_no_window_is_assigned_outside_a_model_match() -> None:
+    """Every window literal in the hook must sit inside the model table or be the sentinel."""
+    source = HOOK.read_text(encoding="utf-8")
+    assigns = re.findall(r"^\s*\$maxTokens\s*=\s*(?P<rhs>\S+)", source, re.MULTILINE)
+
+    # Positive control: a zero here means the search is broken, not the source clean.
+    assert assigns, "found no $maxTokens assignment at all; this test's search is broken"
+
+    allowed = {"0", "$parsed", "1000000", "200000"}
+    unexpected = [r for r in assigns if r.rstrip(";") not in allowed]
+    assert not unexpected, f"unrecognised window assignment(s): {unexpected}"
+
+
+# --- window resolved from the model in the transcript -------------------------------------------
+#
+# Claude Code hands the status line a resolved context_window_size and hands a hook neither the
+# window nor the model. These pin the workaround: read the model off the record the hook already
+# walks to, and map it. An unknown model must fall through to silence, never to a guess.
+
+
+def test_a_1m_model_in_the_transcript_resolves_its_own_window(tmp_path: Path) -> None:
+    tr = write_transcript(tmp_path, "claude-opus-5", 950_000)
+    text = run_hook({}, transcript=tr)
+
+    assert "95%" in text, f"claude-opus-5 should resolve to a 1M window: {text}"
+    assert "1000k tokens" in text, f"the resolved window should be reported: {text}"
+
+
+def test_a_200k_model_in_the_transcript_resolves_a_different_window(tmp_path: Path) -> None:
+    """The discriminating arm. If the table returned one constant, this and the test above cannot
+    both pass -- 190k is 19 percent of 1M (silent) and 95 percent of 200k (HARD)."""
+    tr = write_transcript(tmp_path, "claude-haiku-4-5-20251001", 190_000)
+    text = run_hook({}, transcript=tr)
+
+    assert "95%" in text, f"claude-haiku-4-5 should resolve to a 200k window: {text}"
+    assert "200k tokens" in text, f"the resolved window should be reported: {text}"
+
+
+def test_the_same_count_is_silent_on_the_1m_model(tmp_path: Path) -> None:
+    """Same 190k, other model. This is the real-world reading that started all of this."""
+    tr = write_transcript(tmp_path, "claude-opus-5", 190_000)
+    assert run_hook({}, transcript=tr) == "", "190k of 1M is 19 percent and must be silent"
+
+
+def test_a_1m_suffix_overrides_the_base_model(tmp_path: Path) -> None:
+    tr = write_transcript(tmp_path, "claude-sonnet-4-5-20250929[1m]", 950_000)
+    text = run_hook({}, transcript=tr)
+
+    assert "95%" in text, f"a [1m] suffix must win over the base id's 200k: {text}"
+
+
+def test_an_unknown_model_falls_through_to_silence_not_a_guess(tmp_path: Path) -> None:
+    """The safety property that lets the table be incomplete. A model it does not know must
+    produce NO percentage -- never a fallback constant."""
+    tr = write_transcript(tmp_path, "claude-something-not-shipped-yet", 950_000)
+    text = run_hook({}, transcript=tr)
+
+    assert "%" not in text, f"an unknown model produced a percentage: {text}"
+    assert "NO WINDOW RESOLVED" in text, f"expected the unresolved branch: {text}"
+    assert "claude-something-not-shipped-yet" in text, (
+        "the hook should name the model it could not map"
+    )
+
+
+def test_synthetic_is_not_treated_as_a_model(tmp_path: Path) -> None:
+    """Real transcripts carry '<synthetic>' on some records. It is not a model id."""
+    tr = write_transcript(tmp_path, "<synthetic>", 950_000)
+    text = run_hook({}, transcript=tr)
+
+    assert "%" not in text, f"'<synthetic>' was mapped to a window: {text}"
+
+
+def test_the_operator_override_beats_the_model_table(tmp_path: Path) -> None:
+    """A configured window wins, so an operator can correct a wrong or missing table entry."""
+    tr = write_transcript(tmp_path, "claude-opus-5", 190_000)
+    text = run_hook({"MEFOR_CONTEXT_BUDGET_MAX_TOKENS": "200000"}, transcript=tr)
+
+    assert "95%" in text, f"the override should have forced a 200k window: {text}"
