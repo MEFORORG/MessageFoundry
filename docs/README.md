@@ -124,7 +124,7 @@ describe plans that were superseded, and several state "next steps" that shipped
 |---|---|---|
 | [benchmarks/](benchmarks/) | ~42 files | Measurement records and inter-session review notes. The numbers are dated; the *method* is the reusable part. |
 | [design/](design/) | 4 files | Engineering design notes behind the threading and sharding ADRs. |
-| [archive/backlog/](archive/backlog/) | 1 file | Closed backlog items, moved here verbatim when an item closes. |
+| [archive/backlog/](BACKLOG.md) | 1 file | Closed backlog items, moved here verbatim when an item closes. |
 | [quality-gates/](quality-gates/) | 1 file | A single gate record. |
 
 `research/` and `archive/throughput/` were here until 2026-08-31, along with the maintainer

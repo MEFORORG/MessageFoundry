@@ -134,20 +134,23 @@ cla
 # The quoting in backlog-hygiene.yml is load-bearing: the job name contains " #", which YAML would
 # truncate at the comment marker, and the job NAME is the context string.
 #
-# THIS CONTEXT STRING NOW UNDER-DESCRIBES ITS JOB, deliberately. Since BACKLOG #1095 the job also runs
-# the diff-scoped CITATION gate: every backlog number a PR adds beside a ledger path must name the
-# file that item actually lives in. It rides this context rather than taking its own because a new
-# context would be UNREQUIRED and therefore decoration -- the promotion note above is that reasoning
-# -- and because renaming a job to describe both checks CHANGES the context string, which is the
-# required-but-absent trap and would wedge every PR. The name is frozen; what the job covers is
-# documented in backlog-hygiene.yml's header and here.
+# ***THIS CONTEXT STRING NO LONGER DESCRIBES ITS JOB AT ALL, AND THE STRING STILL MUST NOT CHANGE.***
+# The ledger left this repository on 2026-09-13 (BACKLOG #1250). Both of the job's checks -- the
+# banner rule this string names, and the diff-scoped citation gate added under BACKLOG #1095 -- read
+# files that are no longer here, so the job is now a no-op that prints why.
+#
+# It is kept because the string is an identifier in BRANCH PROTECTION, which is not an in-repo
+# setting. Deleting the job, renaming it, or dropping a trigger makes the context never report, and a
+# required context that never reports does not fail -- it WEDGES every pull request, in the queue and
+# out of it. Retiring it properly means removing it from branch protection FIRST and then from this
+# file, in that order, which is a deliberate act by whoever holds that setting.
+#
+# So the name is frozen and now inaccurate. That trade is the point: for an identifier, stability is
+# worth more than accuracy, and the inaccuracy is recorded here and in the workflow's own header
+# rather than repaired by an edit that would break the thing.
+#
+# The quoting note above still applies: the job name contains " #".
 a PR that implements BACKLOG #N must update BACKLOG.md
-
-# (Historical note, kept because it is the reasoning that made the promotion safe: it triggers on
-#   `pull_request: branches: [main]` with NO paths filter and no `if:`, so it always reports -- no
-#   required-but-absent trap. Its STRUCTURAL half, "every item declares
-#   exactly one status", is already enforced inside the required test legs by
-#   tests/test_backlog_status_check.py; only the behavioural half was unguarded.)
 #
 # ADDING ANOTHER ONE LATER: add the context to branch protection FIRST, then add the line here and
 # update the count pinned in tests/test_required_contexts.py, in the same PR. In that order, because

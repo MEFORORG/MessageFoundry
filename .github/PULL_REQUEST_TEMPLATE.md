@@ -6,10 +6,10 @@
 
 Closes #
 
-<!-- If this PR completes (or partly completes) a numbered item in docs/BACKLOG.md, name it here as
-     `BACKLOG #N`. CI then requires you to update that item's status banner in this same PR — the
-     step whose omission left #60 (turnkey DR) reading "PRE-RESERVED" long after it had shipped, and
-     that stale banner was later repeated as fact. Delete the line if no backlog item applies. -->
+<!-- Maintainers: if this PR implements a planned item, name it here as `BACKLOG #N`. The ledger
+     itself is not in this repository, so nothing here can check the number and its banner is
+     updated where the ledger lives. Outside contributors should delete this line — you do not need
+     a backlog item, and there is nothing you can look the number up in. See docs/BACKLOG.md. -->
 
 Implements: BACKLOG #
 
@@ -41,6 +41,5 @@ Implements: BACKLOG #
 - [ ] Uses **Connection / Router / Handler** vocabulary; no new declarative "channel" element; no
       GUI/web-framework imports in the engine packages; no Black.
 - [ ] Docs updated if behavior or configuration changed.
-- [ ] If this completes a `docs/BACKLOG.md` item, its status banner is updated in **this** PR
-      (`> ✅ **SHIPPED …**`), and the item no longer carries an open `🔢`/`🚧` banner. Every item must
-      declare exactly one status — enforced by `tests/test_backlog_status_check.py`.
+- [ ] Maintainers only: if this completes a planned item, its status banner is updated where the
+      ledger lives. Nothing in this repository can check that — the ledger is not here.
