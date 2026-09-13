@@ -376,8 +376,9 @@ no commit and no PR the worktree is the only record of what you saw.
 ## Nothing tells anyone your PR is waiting
 
 No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
-green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`, and nothing
-reads that label either.
+green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`. No workflow
+reads that label back, though `scripts/ci/report_ci_red.py` does when a seat runs it by hand, and it
+names the run that reddened each labelled PR. Nothing delivers that to you; you have to ask.
 
 `unread-signal.yml` used to report unread PRs. It outlived the review gate by a week: the owner ruled
 it off on 2026-09-08, the workflow was disabled on the server that day, and it was deleted on
