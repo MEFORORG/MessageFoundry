@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Ledger gate — stop two concurrent sessions from silently colliding on an ADR / BACKLOG number.
+"""Ledger gate — stop two concurrent sessions from silently colliding on an ADR number.
 
 THE DEFECT THIS EXISTS FOR. Two sessions each grep for "the next free number", both pick N, and create
-DIFFERENTLY-NAMED files (docs/adr/0084-alpha.md and docs/adr/0084-beta.md, or two `## 227.` headings
-1,600 lines apart in BACKLOG.md). Git merges both **cleanly** — there is no textual conflict — and the
-ledger is quietly corrupt. It has happened three times here (d1d0a5a #574, 5b7d046 #598, 9f3483d), and it
-is the one measured collision class that a worktree, a file lock, and `git merge-tree` are all blind to.
+DIFFERENTLY-NAMED files: docs/adr/0084-alpha.md and docs/adr/0084-beta.md. Git merges both **cleanly**
+— there is no textual conflict — and the ledger is quietly corrupt. It has happened three times here
+(d1d0a5a #574, 5b7d046 #598, 9f3483d), and it is the one measured collision class that a worktree, a
+file lock, and `git merge-tree` are all blind to.
+
+THE BACKLOG HALF IS GONE. Two of those three collisions were backlog items, not ADRs, and that arm
+was retired with the ledger itself (BACKLOG #1250) — see the note above `git()` for what went and
+why. The remaining risk is real and unchanged: ADRs still live in this repository.
 
 WHY A GIT PRE-COMMIT HOOK. Installed by scripts/coord/install-git-hooks.ps1 into the SHARED .git/hooks,
 one copy governs EVERY worktree at once — no branch, no merge, no propagation lag — and it sees every
@@ -25,184 +29,33 @@ worse than no gate. `git commit --no-verify` is the escape hatch; the --ci run i
 
 from __future__ import annotations
 
-import functools
-import importlib.util
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
 
-# THE ITEM NUMBER SPACE SPANS MORE THAN ONE FILE.
+# THE BACKLOG HALF OF THIS GATE IS RETIRED (BACKLOG #1250, BACKLOG #1754).
 #
-# docs/BACKLOG.md carries the OPEN items; retired ones are moved verbatim into docs/archive/backlog/.
-# A number is taken if it appears in EITHER, so every rule below reads their union. Keying on the one
-# published path was safe only while it was the only path, and would leave the archive an unpoliced
-# region: a commit touching only the archive would early-return having checked nothing, and two
-# sessions could file the same number there and merge clean -- the exact collision this gate exists
-# to stop, reintroduced through the back door of a file it does not look at.
+# The numbered-item ledger no longer lives in this repository. It moved to the maintainer-internal
+# one, and docs/BACKLOG.md is now a stub saying so. With no `## N.` items anywhere in this tree
+# there is no namespace for a collision rule to police, so check_backlog(), the item-destruction
+# reverse arm, and every helper only they used were removed rather than left to pass vacuously over
+# an empty corpus. A gate that cannot fail is worse than no gate: it licenses the behaviour while
+# withdrawing the caution its absence would have preserved.
 #
-# Reading the union on BOTH sides also disposes of a false positive that a base-only view would
-# create: the move commit RELOCATES 185 items, so head-union == base-union and `head - base` is
-# empty. A per-file view would instead see 185 numbers vanish from BACKLOG.md and, on any worktree
-# whose base straddles the move, report them -- with a remedy that would renumber cited items.
-BACKLOG_PATH = "docs/BACKLOG.md"
-BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
-
-# THE PUBLIC BACKLOG NUMBER SPACE IS PARTITIONED AT #1000.
+# PUBLIC_BACKLOG_FLOOR WENT WITH THEM, AND ITS READER WENT FIRST. `scripts/coord/alloc.ps1` used to
+# regex-match the literal out of this file so the floor was defined exactly once; that allocator no
+# longer accepts `-Kind backlog`, so the constant had no reader and no subject. Do not reintroduce
+# it to "preserve the contract" -- a floor guarding a number space this repository does not carry
+# is a compensating control resting on a false premise.
 #
-# docs/BACKLOG.md is a published baseline of a larger maintainer-internal ledger. The two sequences
-# diverged around #231 and have been allocated INDEPENDENTLY since, so one number can name two
-# unrelated items: public #248 and internal #248 are different work. That overlap is recorded, not
-# repaired -- renumbering would rewrite ratified ADRs and an operator-facing refusal string that ships
-# inside the wheel, and it would not stop the NEXT one. It would only make stale citations resolve
-# uniquely and WRONGLY, which is worse than resolving ambiguously.
-#
-# The partition stops the next one. New items here are allocated at #1000+, the internal sequence stays
-# below (high-water 314 when this landed), so the overlapping set is CLOSED at the numbers already
-# issued and a cited #N >= 1000 is unambiguously an item in THIS file.
-#
-# Why a constant and not a manifest of reserved numbers: a manifest cannot fire. `## 316.` is already
-# on origin/main and alloc.ps1's floor is max(...)+1 over a sweep that includes it, so every clone
-# issues >= 317 while a manifest of internal numbers tops out at 314 -- the reject set and the emit set
-# never intersect. A manifest would also be born stale (its source refs belong to a remote this clone
-# no longer lists), be regenerable on exactly one machine, and be the very instrument the erratum
-# convicts: "the published baseline is not a safe place to check a number against; only the allocator
-# is." A constant has no source data, so it cannot rot.
-#
-# This is the ONE backlog rule that also runs in --ci. The ownership rule cannot: it reads a per-clone
-# registry under .git and compares a worktree path, and a runner has neither -- which left the CI half
-# of check_backlog() computing a set and discarding it, i.e. unable to fail at all. A floor needs no
-# registry, no worktree, and no sight of the internal ledger (CI checks out origin only).
-#
-# KNOWN RESIDUAL, and it is NOT detected anywhere: this binds only the public side, and nothing in this
-# repository can stop -- or observe -- the maintainer-internal ledger allocating past #1000.
-#
-# This comment used to claim alloc.ps1 "warns at allocation time if the all-refs maximum ever reaches
-# this boundary". That was the wrong instrument twice over, and it was the defect written down:
-#   - The all-refs maximum has NO PROVENANCE. A public item legitimately allocated at the boundary and
-#     an internal breach are the same observation. That guard fired on BACKLOG #1000 -- correct input --
-#     and bricked every backlog allocation in the repo until 2026-08-03.
-#   - It claimed a liveness the ref store does not have. The vault-ish remote-tracking refs it would
-#     read are a FOSSIL: no configured refspec advances them, the newest is older than the partition
-#     itself, and a fresh clone has none at all.
-# alloc.ps1 now warns only on the highest number BELOW the boundary (which over-states the internal
-# high-water, so it warns early), and refuses only on a lowered boundary, which is locally observable.
-#
-# Raising this number is a one-line reviewable source change, deliberately not an allowlist file that
-# would rot out of sight. LOWERING it is the dangerous direction and is the one thing neither this gate
-# nor CI can catch -- both read only the current value and have no memory of the previous one -- so
-# alloc.ps1 keeps a `.boundary-highwater` ratchet beside its registry and refuses when the constant
-# drops beneath a value that clone has already allocated against.
-#
-# THIS LINE IS PARSED, not imported: scripts/coord/alloc.ps1 regex-matches it so the floor is defined
-# exactly once and the allocator can never emit a number this gate refuses. Keep the name and the
-# literal on ONE line. A type annotation is tolerated; splitting, computing, or renaming it is not, and
-# would make every backlog allocation refuse. tests/test_ledger_check.py pins the contract, so that
-# break lands in CI on whoever edits this line rather than on an unrelated session days later.
-PUBLIC_BACKLOG_FLOOR = 1000
-
-# WHAT COUNTS AS AN ITEM IS THE PARSER'S TO SAY, AND THIS GATE ASKS IT (BACKLOG #1470).
-#
-# This file used to carry `BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)` and scan with it.
-# That was a SECOND definition of item identity sitting beside `backlog_status_check.parse_items`,
-# which is the one CLAUDE.md section 11 names as the single source -- and the two do not agree:
-# the local regex counted a `### N.` SUB-heading inside an item's body as an item of its own, and
-# `parse_items` does not. Measured 2026-09-10 over both ledger files: the two readings return the
-# SAME 746 ids, so nothing changes today -- they agree on this corpus by luck, which is exactly the
-# hazard section 11 records, and the fix is to stop having two readings rather than to keep checking
-# that they still match. Positive control for that measurement: against a planted
-# `### 99999. a sub-heading`, the old regex reports 99999 and `parse_items` does not, so the
-# comparison can report a difference and the agreement above is a result rather than a broken probe.
-#
-# NOT REPO-WIDE, and claiming otherwise would be the thing this comment is about.
-# `scripts/coord/alloc_strand_sweep.py` still carries the identical regex, in a function that models
-# THIS gate's arithmetic; the divergence is recorded at that site rather than repaired from here.
-STATUS_CHECK = Path(__file__).resolve().parents[1] / "docs" / "backlog_status_check.py"
-
-# THE REMEDY DEPENDS ON WHICH TREE THE MARKER IS IN, so it is chosen at the read and not at the catch.
-# "Re-stage the file" is right for the index and UNPERFORMABLE for `origin/main` or a parent commit --
-# the marker is in committed history and there is nothing of yours to stage. That matters more here
-# than it looks: this gate's deny text is read by an agent that then does what it says (BACKLOG
-# #1040), and an instruction it cannot carry out leaves `--no-verify` as the only move, which run()'s
-# own footer forbids by name. A gate must not be unexitable by its own instructions.
-FIX_STAGED = "resolve the conflict, re-stage docs/BACKLOG.md, and commit again"
-FIX_COMMITTED_CONFLICT = (
-    "this marker is in COMMITTED history, not in your index -- there is nothing to re-stage. Find the "
-    "commit that carries it (git log -S '<<<<<<<' -- docs/BACKLOG.md) and repair the ledger there"
-)
-
-
-class ConflictedLedger(Exception):
-    """A ledger source that `parse_items` refuses to read -- it still carries a conflict marker.
-
-    Carries its own remedy because only the READ site knows which tree the marker is in.
-    """
-
-    def __init__(self, detail: str, remedy: str) -> None:
-        super().__init__(detail)
-        self.detail = detail
-        self.remedy = remedy
-
-
-@functools.cache
-def _load_status_check() -> Any:
-    """Import `backlog_status_check` by PATH -- `scripts/` is not an importable package.
-
-    This is the same by-path load `dangling_citation_check.py`, `banner_sha_check.py` and
-    `subject_exists_screen.py` use, and it keeps this file's stdlib-only promise: that module imports
-    only argparse/re/sys/pathlib, so a worktree with no .venv still runs the gate.
-
-    ***AN IMPORT IS SAFE HERE AND WOULD NOT BE IN EVERY HOOK, so do not copy this into a sibling
-    without re-checking.*** `_safe_for_message` below is a LOCAL COPY precisely because
-    `install-git-hooks.ps1` Copy-Items its file into the git hooks directory, where a relative import
-    resolves at development time and fails when the gate runs. That stopped being true of THIS file:
-    the installer now `Remove-Item`s a previously-installed `.git/hooks/ledger_check.py` and the gate
-    runs from the tree as a `local` pre-commit hook (`entry: python scripts/hooks/ledger_check.py`).
-    `claim_check.py` and `push_guard.py` are still copied, so the local-copy reasoning still binds
-    there.
-
-    Fails LOUDLY when the module is missing. A gate that silently skips is worse than no gate, and an
-    unreadable item set would read as "no numbers taken" -- the false clean this file exists to
-    prevent.
-    """
-    spec = importlib.util.spec_from_file_location("_backlog_status_check", STATUS_CHECK)
-    if spec is None or spec.loader is None:  # pragma: no cover - a broken checkout, not a state
-        raise RuntimeError(f"cannot load {STATUS_CHECK}")
-    module = importlib.util.module_from_spec(spec)
-    # Registered BEFORE execution, for the reason subject_exists_screen.py records: dataclass
-    # processing resolves sys.modules[cls.__module__] mid-class-body, and an unregistered module
-    # turns that into an AttributeError naming neither file.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def item_numbers(text: str, where: str, remedy: str) -> set[str]:
-    """Every `## N.` item id in ``text``, read through the parser that DEFINES what an item is.
-
-    Ids come back as STRINGS to match the rest of this file, which sorts with ``key=int`` and
-    compares against the floor with ``int(number)``.
-
-    `parse_items` REFUSES a source still carrying a conflict marker rather than miscounting it, and
-    that refusal is converted into a gate failure here instead of a traceback: this gate's own worst
-    recorded failure mode was crashing on the files it guards, and a traceback reads as "the hook is
-    broken" rather than "your ledger is conflicted".
-
-    ``where`` is a REF SPEC and is folded through :func:`_safe_for_message` at the RAISE, not at the
-    catch, so the invariant holds for every future catcher. It reaches deny prose an agent acts on,
-    and it is built from `git ls-tree` / `git ls-files` output -- the BACKLOG #1040 route.
-    """
-    try:
-        return {str(item.num) for item in _load_status_check().parse_items(text)}
-    except ValueError as exc:
-        raise ConflictedLedger(
-            f"{_safe_for_message(where, 120)}: {_safe_for_message(exc)}", remedy
-        ) from exc
+# THIS GATE STILL POLICES ADR NUMBERS, which is now the whole of its job. ADRs live in docs/adr/
+# here, they are public, and two sessions can still allocate one number and merge clean. Allocate
+# with `pwsh -NoProfile -File scripts/coord/alloc.ps1 -Kind adr -Title "<title>"`.
 
 
 def git(*args: str) -> str:
@@ -277,10 +130,9 @@ class Ledger:
         self.failures: list[str] = []
         # Per-run memos. Every entry is derived from a REF, and refs do not move inside one run of a
         # pre-commit hook -- so a repeat lookup is pure waste, and each one costs git subprocesses.
-        # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and
-        # `_backlog_numbers_at` is five spawns plus two full parses of a 30k-line file per ref.
+        # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
+        # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
-        self._numbers_at: dict[str, set[str]] = {}
 
     # -- tree access ---------------------------------------------------------------------------------
     #
@@ -304,41 +156,12 @@ class Ledger:
             return git("diff", "--name-only", "--diff-filter=A", self.base, "HEAD").split()
         return git("diff", "--cached", "--name-only", "--diff-filter=A").split()
 
-    def changed_files(self) -> list[str]:
-        if self.ci:
-            return git("diff", "--name-only", self.base, "HEAD").split()
-        return git("diff", "--cached", "--name-only").split()
-
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
         return git("show", f"HEAD:{path}") if self.ci else git("show", f":{path}")
 
     def base_text(self, path: str) -> str:
         return git("show", f"{self.base}:{path}")
-
-    def base_has(self, path: str) -> bool:
-        """Does the base ref contain ``path`` at all?
-
-        A ledger file being ADDED legitimately has no base version, and `git show base:path` exits 128
-        for that — indistinguishable, to :func:`git`, from a real failure, which it must keep raising on
-        (an error swallowed as "empty ledger" reads as "no numbers taken", the false-clean this gate
-        exists to prevent). So absence is probed EXPLICITLY here, and only after the base ref itself is
-        verified — otherwise a bad/unfetched base would quietly answer "absent" and disable the check.
-        """
-        git("rev-parse", "--verify", f"{self.base}^{{commit}}")
-        return _obj_exists(f"{self.base}:{path}")
-
-    def head_has(self, path: str) -> bool:
-        """Does the commit under test contain ``path``? Mirrors :meth:`head_text`'s ref.
-
-        The symmetric case to :meth:`base_has`, and it bites the moment a ledger file is FIRST
-        published. In CI the change set is `diff base HEAD`, so once ``origin/main`` gains a file that
-        a branch predates, that branch's diff lists it — as a DELETION relative to base — even though
-        the branch never touched it. The rule then reads HEAD for a copy that was never there and
-        `git show HEAD:path` exits 128. That is not a ledger violation; it is a stale branch, and it
-        broke every open branch the hour docs/BACKLOG.md landed.
-        """
-        return _obj_exists(f"HEAD:{path}" if self.ci else f":{path}")
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -406,46 +229,6 @@ class Ledger:
         # built on, and folding it in unconditionally would stop policing an ordinary second commit
         # that adds a number to a branch -- a real narrowing, and not this fix's business.
         return [*parents, "HEAD"]
-
-    def _backlog_numbers_at(self, ref: str) -> set[str]:
-        """Every ``## N.`` number carried by ``ref``, across the live file and the archive.
-
-        Mirrors :meth:`backlog_paths` for an arbitrary commit rather than for base/head, and probes each
-        path's existence for the same reason that method does: a listed-but-absent path makes `git show`
-        exit 128, which :func:`git` correctly raises on and which would read here as a crash rather than
-        as "this ref has no archive".
-
-        ***THE CALLER MUST ASK :meth:`_ref_is_readable` FIRST.*** An unreadable ref answers ``set()``
-        here, and empty means two opposite things -- "there is nothing prior" for an unborn HEAD,
-        which is truthful, and "this object was never fetched" on a shallow clone, which means the
-        rule did not run. This file raises rather than answer empty everywhere else for exactly that
-        reason, so the discrimination is the caller's and is not optional.
-
-        Memoized per ref: refs do not move inside one run, and each miss costs three `git` spawns plus
-        a full parse per ledger path.
-        """
-        cached = self._numbers_at.get(ref)
-        if cached is not None:
-            return cached
-        out: set[str] = set()
-        if self._ref_is_readable(ref):
-            paths = [BACKLOG_PATH] if _obj_exists(f"{ref}:{BACKLOG_PATH}") else []
-            listing = git("ls-tree", "-r", "--name-only", ref, f"{BACKLOG_ARCHIVE_DIR}/")
-            paths += [p for p in listing.split() if p.endswith(".md")]
-            for p in paths:
-                out |= item_numbers(git("show", f"{ref}:{p}"), f"{ref}:{p}", FIX_COMMITTED_CONFLICT)
-        self._numbers_at[ref] = out
-        return out
-
-    @staticmethod
-    def _ref_is_readable(ref: str) -> bool:
-        """Is ``ref``'s commit object actually in this clone?
-
-        False for an unborn HEAD (the first commit in a repository, which the test rig reaches) and
-        for a commit a shallow checkout never fetched. Those are different states and the caller must
-        keep them apart -- see :meth:`_backlog_numbers_at`.
-        """
-        return _obj_exists(f"{ref}^{{commit}}")
 
     def _carried_by_a_merge_parent(self, path: str) -> bool:
         """Does ``path`` already exist on a commit this merge is bringing in?"""
@@ -568,14 +351,15 @@ class Ledger:
 
     # -- rules ---------------------------------------------------------------------------------------
     def check_adrs(self) -> None:
-        """ADR rules. NOTE THE ASYMMETRY WITH check_backlog, WHICH IS DELIBERATE AND NOT AN OVERSIGHT.
+        """ADR rules -- now the only rules this gate has. See the retirement note at the top.
 
-        There is no ADR equivalent of the backlog REVERSE arm, because the two ledgers hide a deletion
-        differently. A backlog item is a HEADING inside a 30k-line file: absorb it into the line above
-        and the diffstat reads 5 insertions, 1 deletion, with the item's whole body still present and
-        re-attributed (BACKLOG #1470). An ADR is a FILE -- delete it and git prints
-        `D docs/adr/0084-x.md` in the diffstat and in the PR's file list. Building the same machinery
-        against a threat git already reports is not depth, it is noise.
+        THERE IS NO ADR REVERSE ARM, AND THAT WAS DELIBERATE BEFORE THE BACKLOG HALF LEFT. The two
+        ledgers hid a deletion differently. A backlog item was a HEADING inside a 30k-line file:
+        absorb it into the line above and the diffstat reads 5 insertions, 1 deletion, with the
+        item's whole body still present and re-attributed (BACKLOG #1470). An ADR is a FILE --
+        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list.
+        Building the same machinery against a threat git already reports is not depth, it is noise.
+        So the reverse arm went with the half that needed it, and nothing is owed here.
 
         WHAT IS GENUINELY UNCOVERED HERE, stated rather than implied: nothing checks the ROW -> FILE
         direction, so an index row in docs/adr/README.md can outlive the file it names and the number
@@ -644,231 +428,8 @@ class Ledger:
                 "remove the duplicate row",
             )
 
-    def backlog_paths(self, side: str) -> list[str]:
-        """Every file carrying numbered items on ``side`` ('head' or 'base').
-
-        Enumerated per side rather than assumed, because the archive does not exist on a base that
-        predates it, and a path listed but absent makes `git show` exit 128 — indistinguishable from
-        a real failure, which is the false-clean this gate must never produce.
-        """
-        if side == "base":
-            listing = git("ls-tree", "-r", "--name-only", self.base, f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.base_has(BACKLOG_PATH)
-        elif self.ci:
-            listing = git("ls-tree", "-r", "--name-only", "HEAD", f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.head_has(BACKLOG_PATH)
-        else:
-            # The INDEX, matching head_text() — a staged archive edit must be policed before it lands.
-            listing = git("ls-files", "--", f"{BACKLOG_ARCHIVE_DIR}/")
-            have_main = self.head_has(BACKLOG_PATH)
-        paths = [BACKLOG_PATH] if have_main else []
-        paths += [p for p in listing.split() if p.endswith(".md")]
-        return paths
-
-    def check_backlog(self) -> None:
-        changed = self.changed_files()
-        if not any(f == BACKLOG_PATH or f.startswith(f"{BACKLOG_ARCHIVE_DIR}/") for f in changed):
-            return
-        base_paths = self.backlog_paths("base")
-        if not base_paths:
-            # The base has no backlog at all — the file is being ADDED (it was gitignored until the
-            # cutover published it). Numbers that do not exist on base cannot be collided with, so
-            # there is nothing to police; without this, importing the ledger wholesale would report
-            # every one of its ~229 items as "not allocated to this worktree".
-            return
-        head_paths = self.backlog_paths("head")
-        if not head_paths:
-            # Present on base, absent here: a branch that PREDATES the file's publication. CI diffs
-            # against origin/main, so the file shows up as "changed" (a deletion relative to base)
-            # although the branch never touched it — and reading HEAD for a copy that was never there
-            # exits 128. A stale branch is not a ledger violation.
-            return
-        try:
-            head, base, prior = self._item_sets(head_paths, base_paths)
-        except ConflictedLedger as exc:
-            self.fail(
-                "the ledger under test does not parse",
-                f"{exc.detail} A conflicted ledger parses WITHOUT error into a census that counts "
-                "items from BOTH sides, so the number looks right -- which is why the reader refuses "
-                "instead. The item sets below could not be computed, so NOTHING was checked on this "
-                "run.",
-                exc.remedy,
-            )
-            return
-        # Only `head - base` is examined, so everything already on origin/main -- including the
-        # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
-        for number in sorted(head - base, key=int):
-            # Floor first: a below-floor number gets the reason that is actionable, rather than
-            # "not allocated to this worktree", which would send you to re-run the allocator and file
-            # at whatever it prints -- correct by luck rather than because you were told why.
-            if int(number) < PUBLIC_BACKLOG_FLOOR:
-                self.fail(
-                    f"BACKLOG item #{number} is below the public floor (#{PUBLIC_BACKLOG_FLOOR})",
-                    "Numbers under the floor belong to the maintainer-internal ledger this file is a "
-                    "published baseline of, or to the pre-partition overlap. Filing one means every "
-                    "citation of it resolves to two unrelated items -- and it looks like success. This "
-                    "also catches a branch cut before the partition whose number has since been "
-                    "re-allocated. See the Ledger erratum at the top of docs/BACKLOG.md.",
-                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind backlog -Title "<title>"'
-                    "   # issues >=1000 now; move your heading to the number it prints",
-                )
-            elif not self.ci and not self.owns("backlog", number):
-                self.fail(
-                    f"BACKLOG item #{number} was not allocated to this worktree",
-                    "BACKLOG numbers are '## N.' headings inside ONE 6.7k-line file. Two sessions adding "
-                    "#N land ~1,600 lines apart, merge CLEAN, and both ship (cf. 5b7d046 / #598).",
-                    self.ownership_remedy("backlog", number),
-                )
-        # THE REVERSE ARM. Everything above asks which numbers APPEARED; nothing asked which
-        # DISAPPEARED, and an item can be destroyed without any number appearing (BACKLOG #1470).
-        for number in sorted(prior - head, key=int):
-            self.fail(
-                f"BACKLOG item #{number} is on this change's parent and on {self.base}, and this "
-                "change DELETES it",
-                "An item is destroyed by losing its '## N.' heading, not by having its body deleted: "
-                "the banner, the fields and the whole body stay in the file, silently re-attributed to "
-                "the item ABOVE it. Measured on 642225f78, where an appended paragraph absorbed the "
-                "'## 1147.' heading -- the diffstat read 5 insertions and 1 deletion, the commit "
-                "message never named the item, and every wired gate stayed green while main carried "
-                "442 items where it should carry 443. Items are RETIRED by moving them verbatim into "
-                f"{BACKLOG_ARCHIVE_DIR}/, which keeps the number in this set, so a move is not this.",
-                f"restore the '## {number}.' heading line -- it goes ABOVE the blockquote carrying the "
-                "status banner, which is not always the earliest blockquote in the block",
-            )
-
-    def _parents_under_test(self) -> list[str]:
-        """The commits the change under test is built ON -- its parents, on either path.
-
-        In ``--ci`` the commit DOES exist -- HEAD is the PR merged into base -- so its parents are read
-        straight off it.
-
-        ***OFF THE RAW COMMIT OBJECT, NOT `git rev-list --parents`, AND THE DIFFERENCE IS WHETHER THIS
-        ARM RUNS IN CI AT ALL.*** `actions/checkout` takes `refs/pull/N/merge` at its default depth of
-        1, so HEAD is a SHALLOW GRAFT and rev-list honours the graft by reporting NO parents. An empty
-        parent list yields an empty prior set, which is indistinguishable from a clean answer -- the
-        arm would be dead in CI and every test would still pass. `git cat-file commit` prints the
-        object's own header, which lists every parent whether or not the graft hides them and whether
-        or not the objects are present.
-
-        **Measured 2026-09-10, and the FIRST measurement was wrong in the reassuring direction, which
-        is why both are recorded.** A rig where HEAD sat on `main` showed rev-list recovering the
-        parent after the deepen, i.e. "no problem". Re-run on the shape CI actually has -- a merge ref
-        cloned at depth 1, then `git fetch --no-tags --depth=200 origin main` exactly as the ledger
-        step runs it -- rev-list reported **1 token (no parents) both before and after the deepen**,
-        while cat-file reported **2 parents** in both states. After the deepen the FIRST parent's
-        object was PRESENT and the second's ABSENT, so the base tip -- where this arm's whole CI
-        coverage lives -- is readable and the PR head is the documented residual.
-
-        Parsing stops at the first blank line: that ends the commit header, and a message line may
-        legitimately begin with "parent ".
-
-        Pre-commit the commit does not exist yet, so its parents are ``HEAD`` plus, mid-merge,
-        whatever :meth:`_merge_parents` reads out of ``MERGE_HEAD`` (that method already appends HEAD
-        itself once a merge is confirmed, and returns empty outside one).
-        """
-        if not self.ci:
-            return self._merge_parents() or ["HEAD"]
-        parents: list[str] = []
-        for line in git("cat-file", "commit", "HEAD").splitlines():
-            if not line:
-                break
-            if line.startswith("parent "):
-                parents.append(line[len("parent ") :].strip())
-        return parents
-
-    def _prior_item_numbers(self) -> set[str]:
-        """The item ids the change under test is BUILT ON -- the left-hand side of the reverse arm.
-
-        ***THE PRIOR SIDE IS THE COMMIT'S OWN PARENTS, NOT ``origin/main``, AND THAT IS THE WHOLE
-        DESIGN.*** The forward arm can compare against ``origin/main`` because a number that is there
-        and not here is simply one you did not add. The reverse arm cannot, because a two-way
-        comparison cannot see WHICH SIDE MOVED. Both directions of that would have been live defects:
-
-        - Pre-commit, ``origin/main`` legitimately carries items a branch cut an hour ago has never
-          seen, so the arm would refuse a commit on every stale branch in the repository.
-        - In CI it is worse, because the leg is REQUIRED. HEAD is the merge ref computed when the
-          event fired; ``origin/main`` is fetched when the job starts. Anything that merges in
-          between is in ``base`` and not in ``head``, and a rule reading ``base - head`` would report
-          somebody else's landed item as destroyed by this PR. Under a merge queue that window is
-          minutes wide.
-
-        Asking the parents instead makes the rule local and one-sided: *a commit must not drop an id
-        one of its own parents had*. Main advancing afterwards changes nothing.
-
-        The caller intersects this with ``base``, which is the false-positive guard -- see
-        :meth:`_item_sets`.
-
-        ***ONE STATED RESIDUAL.*** In CI a parent whose commit object the shallow checkout never
-        fetched contributes nothing. In practice that is the PR head, whose ids are additions the
-        forward arm owns; the base tip -- where this arm's whole CI coverage lives -- arrives with the
-        workflow's ``git fetch --depth=200 origin main``. A run where NO parent is readable is not
-        narrowed silently: it is refused below, because "nothing prior" and "the rule did not run"
-        must not look alike.
-        """
-        refs = self._parents_under_test()
-        prior: set[str] = set()
-        for ref in refs:
-            prior |= self._backlog_numbers_at(ref)
-        if refs and not any(self._ref_is_readable(ref) for ref in refs):
-            # ***THIS IS THE ONE PLACE THE REVERSE ARM CAN GO BLIND, SO IT SAYS SO.*** In --ci the
-            # parents arrive only because ci.yml deepens origin/main; trim that fetch to --depth=1 as
-            # a plausible speedup and every parent goes unreadable, `prior` goes empty, the arm stops
-            # firing and every test still passes. An empty answer here would be indistinguishable
-            # from a clean one, which is the false clean this whole file is written against.
-            self.fail(
-                "the reverse arm could not read ANY parent of the commit under test",
-                f"Refs asked for: {_safe_for_message(' '.join(refs))}. None of their commit objects "
-                "is in this clone, so 'no item was deleted' could not be established -- it was merely "
-                "not observable. In CI this means the checkout is too shallow to reach the base tip.",
-                "deepen the checkout (ci.yml fetches origin main at --depth=200 for exactly this)",
-            )
-        return prior
-
-    def _item_sets(
-        self, head_paths: list[str], base_paths: list[str]
-    ) -> tuple[set[str], set[str], set[str]]:
-        """``(head, base, prior)`` -- the three id sets both arms of the backlog rule compare.
-
-        Raises :class:`ConflictedLedger` when any source still carries a conflict marker.
-        """
-        # The head side is the INDEX pre-commit and the HEAD COMMIT in --ci, matching head_text(), and
-        # only the first of those is something you can re-stage.
-        head_ref, head_fix = ("HEAD", FIX_COMMITTED_CONFLICT) if self.ci else ("", FIX_STAGED)
-        head: set[str] = set()
-        for p in head_paths:
-            head |= item_numbers(self.head_text(p), f"{head_ref}:{p}", head_fix)
-        base: set[str] = set()
-        for p in base_paths:
-            base |= item_numbers(self.base_text(p), f"{self.base}:{p}", FIX_COMMITTED_CONFLICT)
-        # A merge allocates nothing: numbers the other parent already carries are not new here. See
-        # the MERGE PARENTS block above for why this is safe and what it cost when it was missing.
-        for parent in self._merge_parents():
-            base |= self._backlog_numbers_at(parent)
-        # ***TWO SEPARATE THINGS ON ONE LINE, AND THE `& base` IS THE LOAD-BEARING ONE. DO NOT DELETE
-        # IT AS REDUNDANT WITH THE SHORT-CIRCUIT.***
-        #
-        # `& base` is BEHAVIOUR. It confines the reverse arm to numbers that reached shared history,
-        # which is what stops `git commit --amend` withdrawing an item you filed one commit ago from
-        # reading as destruction -- the parent has it, the index does not, and that is byte-for-byte
-        # the shape the arm refuses. Without it the gate falsely refuses a pre-commit on any branch
-        # that withdrew a number it invented. `_prior_item_numbers`' docstring states the rule; this
-        # is where it is applied. Pinned by
-        # test_a_number_this_branch_INVENTED_and_then_withdrew_is_not_a_deletion, and pinned ONLY
-        # because that test's rig keeps `base - head` non-empty: an earlier rig left it empty, so the
-        # short-circuit below fired first and the whole intersection could be deleted with every test
-        # green. Measured 2026-09-11 -- deleting `& base` reddens that one test and nothing else.
-        #
-        # `if base - head` is PERFORMANCE ONLY and changes no verdict. `prior - head` expands to
-        # `P & (base - head)`, so an empty difference makes the arm unable to report anything -- the
-        # shape of every ordinary commit, which adds items and deletes none. Measured 2026-09-10, the
-        # skip saves six git subprocesses (582 ms) and two full parses of a 30k-line file. A branch
-        # behind origin/main has a non-empty difference and pays.
-        prior = self._prior_item_numbers() & base if base - head else set()
-        return head, base, prior
-
     def run(self) -> int:
         self.check_adrs()
-        self.check_backlog()
         if not self.failures:
             return 0
         print("\nMessageFoundry ledger gate\n", file=sys.stderr)

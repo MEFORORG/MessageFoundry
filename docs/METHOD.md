@@ -15,7 +15,7 @@ is defined here and nowhere else, so other pages point at this line rather than 
 
 | Seat | Lives how long | What it does |
 |---|---|---|
-| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers: `docs/BACKLOG.md` here, and the `wshallwshall/claude-multisession` issues that track KORUS itself. Nothing pushes to it. |
+| Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes, opens the PR, and stops. That is you, most of the time. |
 | Regulator | Spawned on a red | Decides whose failure a red belongs to: the PR's, main's, a flake, or the queue's. Only a PR's own failure comes back to a Builder. |
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
@@ -116,7 +116,7 @@ checkout reaches nothing else.
 ## At least three things outlive your process
 
 1. **The commits on your branch**, pushed.
-2. **The pull request**, carrying your `docs/BACKLOG.md` update in the same PR as the code.
+2. **The pull request**. It used to carry your `docs/BACKLOG.md` update in the same PR as the code; the ledger left this repository (BACKLOG #1250), so the banner update happens where the ledger lives and no check here can see it.
 3. **The worktree**, which stays on disk after you exit. That is expected, not a leak.
 
 Three more land without your help. A Stop hook (`scripts/hooks/seat-record.ps1`, wired by
@@ -145,7 +145,6 @@ replacement for it, and hooks get added.
 | licence-header, control-char | A missing SPDX header, or a control character in a tracked file. |
 | gitleaks, bandit, actionlint | Secret scan, Python security lint, and workflow lint. |
 | username-access-key | A username used where an access key belongs. |
-| backlog-parses | Your `docs/BACKLOG.md` edit no longer parses. |
 | ledger gate (`scripts/hooks/ledger_check.py`) | You used an ADR or BACKLOG number you did not allocate. See below. |
 | claim gate (`commit-msg`, `scripts/hooks/claim_check.py`) | Your subject line says it implements `BACKLOG #N`, your diff touches code, and you hold no claim on N here. |
 | forbidden-content | The leak guard found customer or PHI-shaped content. See below. |
@@ -260,7 +259,7 @@ Two more measured facts about PR state, so you do not re-derive them:
 
 ## At least six actions break the fleet, so never take them
 
-Never rewrite `docs/BACKLOG.md` beyond your own item. Update the item your brief cites, in the same
+Never rewrite the ledger beyond your own item -- it is no longer in this repository (BACKLOG #1250), so this binds wherever you edit it. Update the item your brief cites, in the same
 PR as the code. Read the ledger from `origin/main`, not from your working tree, and fetch first. A
 working-tree copy 36 commits behind once reported 19 closed items as open.
 

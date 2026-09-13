@@ -584,11 +584,14 @@ but **no label any of them applies gates a merge**, and no seat has to clear one
   2026-08-01 rehearsal of that shape stayed "in force" for hours after its condition had resolved,
   while `main` moved four times underneath it ([`docs/WORKTREES.md`](docs/WORKTREES.md), "Announcing
   yourself").
-- **Never grep for the next free ADR / BACKLOG number.** Two sessions that both grep pick the *same*
-  number, create differently-named files, **merge clean**, and silently corrupt the ledger (it has
-  fired three times). Allocate it atomically with `pwsh -NoProfile -File scripts\coord\alloc.ps1
+- **Never grep for the next free ADR number.** Two sessions that both grep pick the *same* number,
+  create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
+  three times). Allocate it atomically with `pwsh -NoProfile -File scripts\coord\alloc.ps1
   -Kind adr -Title "<title>"`, and add the ADR's index row in the *same* commit. A `pre-commit` hook
   rejects a number you did not allocate; see [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md).
+  **BACKLOG NUMBERS ARE NOT ALLOCATED HERE ANY MORE (BACKLOG #1250, #1754).** `-Kind backlog` is
+  refused by parameter validation, and the ledger it would have written into is in the
+  maintainer-internal repository. Allocate a backlog number there.
 - **Never CITE a `#N` you have not allocated.** Allocate first, or write a reference that cannot
   resolve. While the number is unissued the citation resolves to nothing, which is honest. The day
   someone legitimately allocates it, that citation starts resolving to unrelated work, with nothing
@@ -757,13 +760,23 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
   separate failures in one session.
 
-  **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
-  `docs/archive/backlog/BACKLOG-CLOSED.md` encode item status as a banner alphabet
-  (`scripts/docs/backlog_status_check.py`: `_CLOSED = "✅⛔🪦"`, `_OPEN = "🔢🚧"`), and
-  `.github/workflows/backlog-hygiene.yml` quotes it in its remediation text. **283 banners across the
-  two files and 12 referencing files** — changing it is a migration with its own item, not a doc edit,
-  and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
-  and nothing outside those two files may adopt one.
+  **THE ONE HOLDOUT IS RETIRED, AND IT LEFT BY MIGRATION RATHER THAN BY EDIT (BACKLOG #1250).** It was
+  a machine-parsed contract: `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` encoded
+  item status as a banner alphabet, `scripts/docs/backlog_status_check.py` defined it, and
+  `.github/workflows/backlog-hygiene.yml` quoted it. All four went to the maintainer-internal
+  repository on 2026-09-13 with the ledger itself.
+
+  **SO NO GLYPH IN THIS REPOSITORY CARRIES MACHINE-PARSED MEANING ANY MORE, AND THE RULE ABOVE IS NOW
+  UNCONDITIONAL HERE.** Nothing reads a status banner; nothing may start.
+
+  **THAT IS NOT THE SAME AS THE GLYPHS BEING GONE, and the difference is the next person's trap.**
+  Measured 2026-09-13, git-tracked files, after the move: the five former status glyphs still appear
+  **557 times across 61 files** — 133 in `docs/FEATURE-MAP.md`, 124 in `docs/CONNECTIONS.md`, 63 in
+  one benchmark status page, and a long tail. Every one of them is now plain decoration, which the
+  rule forbids outright. They were tolerated only because a parser depended on them, and that parser
+  is gone. **Removing them is a migration with its own item, not a doc edit** — the same standing this
+  paragraph used to give the holdout — so do not start sweeping them out of files you are editing for
+  another reason. **No NEW glyph vocabulary may be introduced anywhere.**
 
   **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
   is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
@@ -772,32 +785,31 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   (the cp1252 gate covers `scripts/**/*.py`, which contains none of them).
 
   **The measured population is recorded here so nobody re-derives the false zero that stalled this
-  question once already. Censused over git-tracked files at `172b1327c`: 496 occurrences across 75
-  files, and 479 across 70 once #1265's first slice landed.** That slice was the five shipped operator
-  docs — `SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — now at zero
-  and pinned there by `tests/test_operator_docs_no_warning_sign.py`. What is left, re-measured
-  2026-09-11: 427 under `docs/` (125 in `BACKLOG.md`, 93 in `BACKLOG-CLOSED.md`, 37 in `docs/adr/`),
-  26 in `harness/`, 10 in `tests/`, 4 in `ide/`, 3 in engine source, 2 in the web console, 4 across
-  repository-root and `.github/` files, and **zero in `scripts/` and in this file**. Those buckets
-  sum to **476**, the population today. The 479 above is the figure at `172b1327c`, a dated
-  measurement rather than a current one, and the filed table's buckets did not sum at all. Two of
-  the three that have left `docs/` since came off `BACKLOG.md` in the 2026-09-11 #1003 repair; the
-  third, and the `docs/adr/` row, were drift that nothing reported.
+  question once already. Re-censused over git-tracked files 2026-09-13, after the ledger left: 256
+  occurrences across 67 files** — 172 under `docs/`, 37 in `docs/adr/`, 26 in `harness/`, 8 in
+  `tests/`, 4 in `ide/`, 3 in engine source, 3 at the repository root, 2 in the web console, 1 under
+  `.github/`, and **zero in `scripts/`**. 23 tracked files did not decode and were not counted.
 
-  **Two rows of the filed table were instrument errors, both SDS-3.8.** It read the web console as
-  zero by counting `packaging/`; the console's source is `messagefoundry_webconsole/`, which carries
-  **2**. And it had no `harness/` row at all, so **26** occurrences sat outside every bucket while the
-  buckets still printed a confident total.
+  **The previous figure was 476, and 218 of those left with the ledger rather than being fixed.** That
+  is the whole of the drop: `BACKLOG.md` carried 125 and `BACKLOG-CLOSED.md` 93. A migration is not
+  remediation, and reading the smaller number as progress on #1265 would be wrong.
 
-  **Census this population only with the ledger counts as a positive control** — the first attempt
-  returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere is
-  indistinguishable from a clean repo. `docs/BACKLOG.md` at 125 and `BACKLOG-CLOSED.md` at 93 are that
-  control: an instrument that cannot find those proves nothing by returning zero anywhere else.
+  Earlier slices were real: the five shipped operator docs — `SECURITY.md`, `PHI.md`,
+  `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md` — are at zero and pinned there by
+  `tests/test_operator_docs_no_warning_sign.py`.
 
-  **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
-  re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
-  blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
-  the same single-source rule `ledger_check.py` already states for `PUBLIC_BACKLOG_FLOOR`.
+  **Two rows of the filed table were instrument errors, both SDS-3.8, and they are kept because the
+  errors recur.** It read the web console as zero by counting `packaging/`; the console's source is
+  `messagefoundry_webconsole/`. And it had no `harness/` row at all, so 26 occurrences sat outside
+  every bucket while the buckets still printed a confident total.
+
+  **CENSUS THIS POPULATION WITH A POSITIVE CONTROL, AND THE OLD CONTROL IS GONE.** The first attempt
+  ever made returned a false zero off a broken shell escape, and a pattern that finds nothing anywhere
+  is indistinguishable from a clean repo. The control used to be the ledger's own counts; those files
+  are no longer here. Use `docs/FEATURE-MAP.md` and `docs/CONNECTIONS.md`, which carry 133 and 124
+  status glyphs: an instrument that cannot find those proves nothing by returning zero anywhere else.
+  **Do not print a glyph to a Windows console while measuring** — a stock cp1252 terminal raises
+  `UnicodeEncodeError` and kills the run mid-report, which happened during this very census.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
@@ -886,7 +898,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
   field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
   differentiator (BACKLOG #26 — closed, so it lives in
-  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  [the maintainer-internal ledger](docs/BACKLOG.md), not in the
   live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
   [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
   #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
@@ -901,7 +913,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
   (BACKLOG #27 — closed, so it lives in
-  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  [the maintainer-internal ledger](docs/BACKLOG.md), not in the
   live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
 - Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
   (2026-08-07)**, three reasons each independently sufficient: no free or open-source
@@ -913,13 +925,14 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
   pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
   legitimate; adopting the score is not. *(#1073 is closed, so it lives in
-  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md) once archived,
+  [the maintainer-internal ledger](docs/BACKLOG.md) once archived,
   not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
   construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
 - Don't add the `Co-Authored-By` trailer or the PR-body byline to a commit or PR — omit both
   (section 5). The project turns them off at source in `.claude/settings.json`.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
-  word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
-  `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.
+  word (§11). The status-banner alphabet was the one machine-parsed holdout and it
+  left with the ledger (BACKLOG #1250), so nothing here parses a glyph any more. Introduce no new
+  glyph vocabulary anywhere.
 
