@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """No shipped document may present a config key the loader REFUSES as a key to write.
 
 BACKLOG #1383. `_RELOCATED_TO_SECURITY` maps 15 legacy `[section] key` spellings to their
