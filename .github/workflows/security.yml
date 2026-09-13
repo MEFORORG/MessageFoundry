@@ -958,3 +958,541 @@ jobs:
             # loaded entries DOES fail: that is the vacuous pass, per class.
             python scripts/security/scan_forbidden.py --self-test
           fi
+
+  # ==================================================================================================
+  # THE TWO COMPOSITE JOBS BELOW ARE STEP 1 OF A FOUR-STEP CONSOLIDATION, AND NOTHING ABOVE THEM WAS
+  # DELETED TO MAKE ROOM. Read the sequence before editing either of them.
+  #
+  # WHY. A job holds a RUNNER SLOT for its whole life whatever its duration, and a slot is the scarce
+  # resource on this account: peak concurrency measured EXACTLY 20, which is the free-plan ceiling for
+  # an organisation, against round-the-clock demand for more. Five of the seven required jobs in this
+  # file finish inside 55 seconds, so seven acquisitions buy about four minutes of scanning. Measured
+  # 2026-09-13 over one week: this workflow spent about 8,211 slot-starts for about 4,770 execution-
+  # minutes. Collapsing seven acquisitions into two is worth roughly 4,700 to 5,900 slot-starts a week
+  # at ZERO coverage loss -- the same scanners, the same arguments, the same findings. Starvation is
+  # not hypothetical: healthy pull requests have been evicted from the merge queue for want of a
+  # runner.
+  #
+  # A REQUIRED STATUS CONTEXT IS A JOB NAME, WHICH IS WHY THIS IS STAGED. Deleting the seven jobs
+  # while branch protection still requires their names would wedge EVERY pull request in the
+  # repository: protection waits forever for a context that no workflow produces. Flipping protection
+  # first, to names nothing yet reports, wedges it identically. On 2026-07-30 ten required contexts
+  # sat on disabled workflows that still carried their files and job names, and
+  # tests/test_required_workflow_state.py exists because of it.
+  #
+  #   STEP 1 (THIS CHANGE)  add the composites ALONGSIDE the seven. Both sets run. The repository
+  #                         temporarily starts more jobs than it needs, which is transient and safe.
+  #   STEP 2 (THE OWNER)    add the two composite context names to branch protection.
+  #   STEP 3 (A LATER PR)   delete the seven original jobs, sync .github/required-contexts.txt and
+  #                         docs/CI.md, and move the two names in tests/test_security_posture.py from
+  #                         _PENDING_PROMOTION_SECURITY_JOBS to _BLOCKING_SECURITY_JOBS.
+  #   STEP 4 (THE OWNER)    remove the seven original context names from branch protection.
+  #
+  # At no point does a required context lack a producer. DO NOT COLLAPSE THESE STEPS.
+  #
+  # EVERY SCAN BODY BELOW IS A BYTE-IDENTICAL COPY of the one in the job it will replace, and
+  # tests/test_security_composite_parity.py fails if any pair drifts apart. That is the whole
+  # argument for the duplication being safe: every control this repository asserts about an original
+  # step holds of the copy for free, and step 3 becomes a deletion rather than a rewrite. Those
+  # controls are not enumerated here, because an enumeration is a second definition of the test
+  # suite and goes stale the first time somebody adds one.
+  #
+  # EACH SCAN STEP CARRIES AN `if:` THAT SURVIVES A SIBLING FAILURE, SO EVERY SCAN STILL REPORTS. A
+  # step that fails skips its successors under the default `if: success()`, which would turn a
+  # composite into a stop-at-the-first-finding gate -- a worse review experience than seven jobs,
+  # because the second finding only appears after the first is fixed. Running them all costs nothing
+  # and hides nothing: a failed step still fails the job, so the conclusion branch protection reads is
+  # unchanged. This is NOT `continue-on-error`, which discards a finding rather than deferring it --
+  # see the trap documented at the top of this file, and tests/test_security_posture.py.
+  # ==================================================================================================
+  repo-scan:
+    name: repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)
+    runs-on: ubuntu-latest
+    # Above this file-wide 10-minute floor because it runs FOUR scans in series where each original
+    # job ran one. The reasoning is the block above the `jobs:` key and is not restated: roughly 3x
+    # the observed steady state, rounded up. The four run 7 to 55 seconds each today, so 15 minutes is
+    # an order of magnitude clear of their sum. If it fires, read the run for a hang before raising
+    # the number.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Scan source for insecure patterns
+        if: ${{ !cancelled() }}
+        run: |
+          # HASH-PINNED from the lock (ADR 0034 §3); bandit's version is the findings baseline of a
+          # blocking gate — the `# nosec`-parsing incident behind that pin is recorded beside the pin
+          # itself, in pyproject.toml's [dependency-groups].ci-scanners. Bump there, then re-export.
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          # Skips are reviewed-safe project idioms. The subprocess sites (B603/B607) are annotated
+          # per-line with `# nosec` at the call instead of a wholesale skip, so a NEW unreviewed
+          # subprocess call is still flagged (review low-27):
+          #   B101 assert        — type-narrowing invariants, not security checks
+          #   B404 import subprocess — the calls themselves are per-line nosec'd (icacls/sc/ruff/mypy)
+          #   B311 random        — synthetic-data generators only; tokens use `secrets`
+          #   B110 try/except/pass — best-effort resource cleanup
+          #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
+          #                        params (verified — see security review STORE-4)
+          # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
+          # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
+          # fixed by operator config (default localhost), never message-derived.
+          #
+          # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
+          # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned
+          # everything except tests/harness/samples — so scripts/ (security tooling, subprocess-heavy)
+          # was gated locally and by nothing in CI. Touching a file there failed the commit on findings
+          # no CI run could report. Widening cost nothing: the repo is already clean at this bar.
+          #   tests/harness/samples — intentional non-production idioms (asserts, synthetic-data RNG)
+          #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper: 20 B105/B106
+          #                           "hardcoded password" hits that are all literal test credentials
+          #   ide/                  — TypeScript; no Python to scan
+          #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
+          bandit -r . --skip B101,B110,B311,B404,B608 \
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
+      - name: Run the MessageFoundry rules
+        if: ${{ !cancelled() }}
+        run: |
+          # PINNED to an exact version, not `~=1.90`. A compatible-release range silently adopts every
+          # new 1.x, and a new semgrep release can add rules or change taint propagation — which reds a
+          # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
+          # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
+          # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
+          python -m pip install --upgrade pip "semgrep==1.172.0"
+          # --error: any finding fails the step — and the job, now that this gate is blocking.
+          #
+          # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
+          # same file EXACTLY. It was the allow-list `messagefoundry tee`, which never covered
+          # scripts/ (the security tooling itself), messagefoundry_webconsole/ (the operator UI) or
+          # docker/ — 59 tracked .py files that the sibling bandit gate already scans, held to none of
+          # this project's own dangerous-sink rules. An allow-list cannot be kept in step with "the
+          # project" by hand; `.` minus explicit excludes cannot go stale when a package is added.
+          # `tee/` (in-tree vendored SOUP) stays in scope for the reason it always was: the standalone
+          # relay is held to the SAME bar as the engine. Widening cost nothing — clean at this bar.
+          #   tests/harness/samples — intentional non-production idioms. This exclude is here for
+          #                           PARITY WITH BANDIT — which is what the parity test enforces —
+          #                           NOT as a prediction about findings. semgrep's own default
+          #                           .semgrepignore already excludes tests/: that is the recorded
+          #                           fact scripts/ci/assert_semgrep_handler_taint.py:41 depends on,
+          #                           and the reason that step copies its fixture to a temp dir to
+          #                           get it analysed at all. So this flag is explicit and probably
+          #                           redundant, stated that way on purpose — a gate's scope must be
+          #                           readable from its own argv, never inherited from a tool default
+          #                           a version bump can change. (The only two sinks in the whole
+          #                           tree that match these rules do sit under tests/: an `eval`
+          #                           taint fixture and a `pickle.loads` sandbox test.)
+          #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
+          #   ide/                  — TypeScript; no Python to scan
+          #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
+          # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
+          # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
+          # then actually be SCANNED is the separate question the default .semgrepignore above
+          # answers; the point is that this gate's scope must not rest on that answer.)
+          # Whether those globs are root-anchored or match a bare directory NAME at any depth is not
+          # settled here, and is not load-bearing — measured over the WHOLE tracked tree, which is
+          # the population this scan now covers: the only nested directory matching any of these
+          # names is packaging/messagefoundry-webconsole/tests, excluded explicitly on both sides
+          # anyway (2026-08-04).
+          # tests/test_lint_scope_parity.py fails if this scope and bandit's drift apart again. It
+          # also asserts, separately, that no --exclude here carries the `./` prefix (its normalised
+          # set comparison would otherwise call `./tests` and `tests` identical), that no `--include`
+          # re-narrows the scan behind the positional `.`, and that `--error` survives.
+          semgrep --config .semgrep --error --metrics off \
+            --exclude tests --exclude harness --exclude samples --exclude ide \
+            --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude .venv --exclude node_modules \
+            .
+      - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)
+        if: ${{ !cancelled() }}
+        run: |
+          # semgrep is already installed by the step above (same job). This is why the packaged rules
+          # need NO project dependency to validate — the CI-installed semgrep is the authority.
+          RULES=messagefoundry/security/semgrep/handler-security.yml
+          semgrep --validate --config "$RULES"                            # rule-syntax gate
+          # Behavioural gate: the two recovered false-negatives (inter-statement taint + aliased-import)
+          # and the other rules fire exactly as annotated; the `# ok` cases stay clean. A --json assert
+          # (not `semgrep --test`, which crashes on Windows path-pairing) so it is deterministic.
+          python scripts/ci/assert_semgrep_handler_taint.py
+          semgrep --config "$RULES" --error --metrics off samples/config  # shipped samples stay clean
+      - name: Diff crypto call sites against the inventory
+        if: ${{ !cancelled() }}
+        # Stdlib-only (no install). Exits non-zero — failing the build — on any drift.
+        run: python scripts/security/crypto_inventory_check.py
+      - name: Scan the tracked tree for forbidden content
+        if: ${{ !cancelled() }}
+        # Stdlib-only scanner (no install).
+        #
+        # MEFOR_MIN_DETECTORS is what makes "fail-closed" mean anything. Requiring a token SOURCE only
+        # proves one arrived: a partially-mangled secret still loaded as few as 1 of 21 detectors and
+        # passed with a green tick, and losing just the final line silently disabled every site-code
+        # detector. The floor is PER-SECTION, not a bare total -- a total is a SUM, so growth in a cheap
+        # section masks collapse in an expensive one (names 7->1 alongside estate 13->19 still totals 21).
+        # It is a FLOOR: losing tokens fails the build.
+        #
+        # ADDING them USED TO need no CI change, and that is no longer quite true (BACKLOG #1368,
+        # SEC-04). A floor only constrains the list while it stays near it: 7 against a list of 40 is
+        # satisfied by any 7 detectors surviving, so the gate goes green while guarding almost nothing,
+        # and NOTHING NOTICED because the counts print and nothing compared them. The step below now
+        # fails when the floor falls behind, so growth is free until it outruns the floor and then asks
+        # for one line. That is a deliberate trade of convenience for a floor that keeps meaning
+        # something.
+        #
+        # zizmor: the secret is never interpolated into this run: body. It arrives as the step-level env
+        # var (an opaque value, not an Actions-expression sink).
+        env:
+          MEFOR_FORBIDDEN_TOKENS: ${{ secrets.MEFOR_FORBIDDEN_TOKENS }}
+          # Whether this run CANNOT legitimately see the secret. Empty on pushes and same-repo PRs.
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          if [ -n "$MEFOR_FORBIDDEN_TOKENS" ]; then
+            # Deliberately NOT written to scripts/security/scan-tokens.local.txt: the scanner resolves
+            # the env var first, so that file would never be read -- it would only drop the full real
+            # token list into the job workspace for every later step to see.
+            export MEFOR_REQUIRE_TOKENS=1
+            export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
+            echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
+          elif [ "$IS_FORK_PR" = "true" ]; then
+            echo "fork PR -- the secret is unavailable BY DESIGN; structural-only scan."
+          else
+            # Degrading here would be SILENT and PERMANENT: a renamed, deleted, environment-scoped or
+            # rotated secret takes the fork branch forever, scanning nothing while the REQUIRED context
+            # stays green. Absent-on-a-non-fork is a broken gate, not a mode.
+            echo "::error::MEFOR_FORBIDDEN_TOKENS is absent on a non-fork run. The customer-leak gate cannot run. Check the repository secret (repo-scoped, not environment-scoped)." >&2
+            exit 2
+          fi
+          python scripts/security/scan_forbidden.py --path .
+
+          # SEC-04 / BACKLOG #1368 -- is the FLOOR still tracking the list? The scan above asks whether
+          # the LIST fell below the FLOOR; this asks the opposite, which nothing did before.
+          #
+          # GUARDED ON THE FLOOR VARIABLE, NOT ON THE SECRET, and only the secret-present branch above
+          # exports it -- so a fork PR and a structural-only run skip this entirely. It must NOT run
+          # against the synthetic example set: that set populates every section and would fail the
+          # freshness rule on a contributor's machine, and a gate that fires on everyone gets switched
+          # off by the third person who hits it.
+          if [ -n "$MEFOR_MIN_DETECTORS" ]; then
+            python scripts/security/scan_forbidden.py --assert-floor-fresh
+
+            # BACKLOG #321 -- CAN THE TABLE THAT LOADED ACTUALLY MATCH? The two checks above both count
+            # detectors: one asks whether the list fell below the floor, the other whether it outgrew
+            # it. Neither can see a table that is fully populated, fully fresh and INERT, which is a
+            # real state and not a hypothetical -- every site-code detector becomes an empty negative
+            # lookahead when no prefix loads, and an empty lookahead reports exactly what a clean tree
+            # reports. This probes each loaded class with a string built from that class, and prints
+            # counts and class names only, never a token.
+            #
+            # HERE AND NOT IN branch-leak-scan.yml ON PURPOSE: same secret, same tables, so a second
+            # copy would answer the same question twice and give two places for the answer to rot.
+            # This is the BLOCKING context, so it is where an inert instrument has to stop a merge.
+            #
+            # The pytest arm that asks this same question (tests/test_scan_forbidden_loaded_set.py)
+            # can only ever skip in CI -- no pytest job is given this secret -- so this stdlib
+            # entrypoint is the only place the REAL table is ever probed.
+            #
+            # READ THE `coverage` LINE, NOT ONLY THE PER-CLASS RATIOS. Not every loaded entry can be
+            # probed: a [names] regex the prober cannot invert and an [estate_body_only] hold-out are
+            # both legitimate list shapes. Measured against the real table 2026-09-05, 3 of 24 loaded
+            # entries were unprobeable while all three class lines read a perfect ratio, so each class
+            # now states its own UNPROBED count and the last line states the total. A PARTIAL residual
+            # is reported and NOT failed, on purpose -- reddening this required context on a correct
+            # list is how a required context gets switched off. A class that could probe NONE of its
+            # loaded entries DOES fail: that is the vacuous pass, per class.
+            python scripts/security/scan_forbidden.py --self-test
+          fi
+
+  dependency-and-secret-scan:
+    name: dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)
+    runs-on: ubuntu-latest
+    # Above the floor for the same reason as its sibling, plus one specific to this group: npm-audit
+    # retries a registry that gave it no verdict, sleeping up to 150 seconds across five attempts
+    # before it fails closed, and that ladder is a deliberate control rather than slack (a 503 is not
+    # an audit verdict). So the steady state this is sized against is pip-audit at 79 seconds plus
+    # that worst case plus a full-history secret scan.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `fetch-depth: 0` IS THE GITLEAKS REQUIREMENT AND IT NOW GOVERNS THE WHOLE JOB. The scan
+          # walks every ancestor of HEAD, which a shallow clone has not fetched, so dropping this
+          # silently reduces a secret gate to one commit -- the coupling recorded at the original
+          # checkout further up this file. The other two scans read committed files and are
+          # indifferent to depth, so the only cost of hoisting it is a slower clone. That is why
+          # these three group cleanly.
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Check the lockfile is in sync with pyproject (DEP-1)
+        if: ${{ !cancelled() }}
+        run: |
+          # uv is PINNED: it is the resolver that produces every lockfile this job then audits, so an
+          # unpinned upgrade lets a new resolver silently change the exported set mid-PR and reds the
+          # `git diff --exit-code` below for a reason unrelated to the change. Bump deliberately.
+          python -m pip install --upgrade pip "uv==0.12.0"
+          # Fails if pyproject changed without re-running `uv lock` (drift guard).
+          uv lock --check
+          # Re-export to the same path and fail if it differs from what's committed (keeps the
+          # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
+          uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
+          # The container image installs from SCOPED, per-profile locks (not the all-extras lock above,
+          # which drags PySide6/dev/etc. into a slim runtime image) — keep them in sync too. The -o paths
+          # match the header recorded in each committed file, so re-export is byte-identical when in sync.
+          uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
+          uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
+          # same lock, so a fresh `uv pip install -e ".[extras]"` cannot drift to a newer upstream
+          # release. Re-export it here so it can never fall out of step with uv.lock.
+          uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
+          # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
+          # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
+          # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
+          uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
+          uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
+          # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
+          # here rather than inline in release.yml because release.yml runs ONLY on a tag push -- so a
+          # drift that lived there would first be observed during a release. Exported on every
+          # security run instead, where it is cheap to catch.
+          uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+      - name: Install from the hashed lockfile (DEP-1)
+        if: ${{ !cancelled() }}
+        run: |
+          # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
+          # reproducible, tamper-evident install. Exercises the lockfile as an actual install path
+          # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
+          python -m venv /tmp/lockcheck
+          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
+      - name: Audit the locked dependencies (DEP-1)
+        if: ${{ !cancelled() }}
+        run: |
+          # HASH-PINNED from the lock, not merely `==`-pinned: a version pin does not satisfy Scorecard
+          # PinnedDependenciesID, and the transitive closure floated regardless. Rationale for each pin
+          # lives in pyproject.toml's [dependency-groups]. THIS step's `--upgrade pip` bootstrap is gone
+          # rather than pinned — the lock hash-pins `pip` itself (a pip-audit → pip-api dependency).
+          # Scoped deliberately, because the unqualified claim was FALSE for this job: the DEP-1 step
+          # above still runs `pip install --upgrade pip "uv=="` in this same interpreter two steps
+          # earlier, and that unverified pip does the load-bearing work (the six exports + the diff
+          # gate); the line below then DOWNGRADES pip to the locked version after the fact. So this
+          # job's posture improves for the AUDITOR, not for the exporter. The `uv` bootstrap is circular
+          # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
+          # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+          # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
+          pip-audit -r requirements.lock --desc
+          # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
+          # without this a CVE in a pinned scanner is invisible to every gate — the "pinned, stale,
+          # unpatched is worse than floating" failure ADR 0034 section 3 names. `--ignore-vuln <ID>` is
+          # the escape hatch for a triaged advisory, exactly as for the lockfile audit above.
+          #
+          # CONSEQUENCE, stated rather than discovered later: this is a REQUIRED context, so a CVE in
+          # mutmut's or diff-cover's closure reds the merge gate over an ADVISORY tool. That is not a new
+          # posture — requirements.lock is exported `--all-extras`, so ruff, mypy and pytest already do
+          # exactly this — but it does add 40 distributions to the blocking set (23 from ci-scanners, 17
+          # from ci-quality; measured). Zero advisories at the time of writing. If the owner would rather
+          # the advisory half not block, move the ci-quality line alone to its own step.
+          pip-audit -r ci/locks/ci-scanners.lock --desc
+          pip-audit -r ci/locks/ci-quality.lock --desc
+          # THE SIGNING TOOLCHAIN, and it is the one that most needs this (BACKLOG #332). a9354808e
+          # added ci/locks/release-tools.lock to the export set and the byte-diff gate above but NOT
+          # here, so from 2026-08-29 until this line landed the release signing closure was the only
+          # committed lock nothing audited -- hash-pinned, therefore sticky, therefore exactly the
+          # "pinned, stale, unpatched is worse than floating" case the two lines above exist to stop.
+          # It is also load-bearing for .github/dependabot.yml's `sigstore` ignore entry: that entry
+          # suppresses the security track for >=4.5.0, and is only acceptable while this audit can
+          # still see an advisory in the pinned closure. REMOVE THIS LINE AND YOU MUST REMOVE THAT
+          # ENTRY -- the comment there says so from the other side.
+          #
+          # Same REQUIRED-context consequence as the two above, and a better-earned one: a CVE in
+          # sigstore's closure reds the merge gate. That closure signs the wheel, the sdist, the SBOM
+          # and the VEX with the job's OIDC identity, so blocking is the wanted behaviour, not a cost
+          # reluctantly accepted for an advisory tool. `--ignore-vuln <ID>` remains the escape hatch.
+          pip-audit -r ci/locks/release-tools.lock --desc
+      # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
+      # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
+      # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it
+      # only looks like it does.)
+      #
+      # This answers the question pip-audit above structurally cannot. pip-audit asks "does this pinned
+      # version have a known CVE"; a freshly registered hallucinated name has no advisory, so it
+      # resolves, locks, hashes and installs through every DEP-1 control clean. This project's
+      # dependencies are chosen by an AI, and docs/Secure_AI_Development_Standards.md has carried the
+      # check as the "highest-priority deferred gate" while verify-before-add stayed "enforced only by
+      # the human remembering".
+      #
+      # Stdlib-only (no install). Fails CLOSED: if PyPI is unreachable it exits 2 rather than passing,
+      # and it exits 2 if it examined zero distributions, so a schema change cannot read as a clean
+      # sweep. Its known blind spot — a real package that is not the INTENDED one — is documented in
+      # the script and pinned by tests/test_new_dependency_check.py.
+      - name: Verify every declared dependency is a real, established distribution
+        if: ${{ !cancelled() }}
+        run: python scripts/security/new_dependency_check.py
+      - name: Audit the locked npm dependencies (install-free)
+        if: ${{ !cancelled() }}
+        working-directory: ide
+        # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
+        # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
+        #
+        # RETRIED, BECAUSE A REGISTRY HICCUP IS NOT AN AUDIT VERDICT. `npm audit` exits non-zero BOTH
+        # when the advisory database reports a vulnerability AND when it cannot be reached, so the bare
+        # invocation this replaces made an unreachable registry indistinguishable from a finding. A red
+        # therefore said nothing about the dependencies, which is a control resting on a false premise.
+        # Measured 2026-09-04: of 34 failures of this required context in one night, 32 were
+        # `503 Service Unavailable` or `network timeout at .../advisories/bulk` and 2 were real; each
+        # one blocked a merge or evicted a merge-queue entry.
+        #
+        # STILL FAIL-CLOSED, which is the point. A verdict is honoured the moment it arrives, and
+        # exhausting the retries FAILS rather than passing. Nothing here can turn a real advisory green;
+        # the only behaviour that changes is that a transport error is retried instead of reported as a
+        # finding. The discriminator is `.metadata.vulnerabilities`, which a verdict carries and a
+        # transport failure does not -- exit status alone cannot tell them apart.
+        shell: bash
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if npm audit --package-lock-only --json > audit.json 2> audit.err; then
+              echo "advisory database reachable, no vulnerabilities (attempt ${attempt})"
+              rm -f audit.json audit.err
+              exit 0
+            fi
+            if jq -e '.metadata.vulnerabilities' audit.json > /dev/null 2>&1; then
+              echo "::error::npm audit reports vulnerabilities in the locked ide/ dependencies."
+              jq '.metadata.vulnerabilities' audit.json
+              exit 1
+            fi
+            echo "attempt ${attempt}: no verdict from the advisory database; retrying"
+            # No `|| true` here: tests/test_security_posture.py forbids discarding an exit code
+            # anywhere in a required job, and it is right to -- that one token is how a gate goes
+            # quiet. `2> audit.err` above always creates the file, so this cannot fail anyway.
+            head -c 400 audit.err
+            [ "${attempt}" -lt 5 ] && sleep "$((attempt * 15))"
+          done
+          echo "::error::Could not reach the npm advisory database after 5 attempts, so this run"
+          echo "::error::obtained NO audit verdict. Failing closed: this is not evidence of a clean tree."
+          exit 1
+      - name: Install gitleaks (pinned + checksum-verified)
+        if: ${{ !cancelled() }}
+        run: |
+          # Pin the release; bump deliberately. Verify the tag exists if this step 404s.
+          #
+          # VERIFIED, not just version-pinned. This was `curl ... | tar -xz` straight into a pipe: a
+          # tag pin says WHICH artifact to fetch, not that the bytes received are that artifact, and
+          # this runs inside a REQUIRED gate. The sbomqs step in this same file already had the answer
+          # (download the release's own checksums file and sha256sum -c it), so this was unfinished
+          # scope rather than an accepted risk. Mirroring that shape exactly.
+          # `set -o pipefail` for the reason the scan step below carries it, and this step is
+          # where the class was FOUND: the checksum line is selected with
+          # `grep ... | sha256sum -c -`, so without it a `grep` that matches NOTHING -- a renamed
+          # asset -- is discarded and this step's status is `sha256sum`'s. That happens to fail,
+          # because `sha256sum -c -` refuses empty input. Safe by the downstream tool rather than
+          # by design, inside a required gate whose whole job is verifying those bytes. Explicit,
+          # never `shell: bash` -- see the scan step (BACKLOG #1481).
+          set -o pipefail
+          VER=8.18.4
+          asset="gitleaks_${VER}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "$asset"
+          curl -sSfL "${base}/gitleaks_${VER}_checksums.txt" -o gitleaks_checksums.txt
+          # Keep the asset's canonical name: sha256sum -c verifies BY the filename in the line, so a
+          # renamed download would silently verify nothing.
+          grep " ${asset}$" gitleaks_checksums.txt | sha256sum -c -
+          tar -xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan the ref under test for secrets
+        if: ${{ !cancelled() }}
+        # `--log-opts HEAD` IS THE WHOLE POINT OF THIS LINE. With the flag unset gitleaks walks EVERY
+        # REF, and the `fetch-depth: 0` above has fetched every branch and tag -- so the job answered
+        # "does ANY ref in this repository contain a secret" while branch protection read the answer
+        # as "does THIS ref contain a secret". The job's own name and the comment above it both stated
+        # the narrower question; the configuration overshot it.
+        #
+        # MEASURED on the pinned 8.18.4 binary, in a repository whose `main` holds 3 commits and whose
+        # unmerged side branch holds 4 more (7 reachable in total). Unset, it reports "7 commits
+        # scanned"; with `--log-opts HEAD`, "3 commits scanned" -- exactly `git rev-list --count --all`
+        # and `git rev-list --count HEAD`. The commit COUNTS are the instrument here rather than the
+        # argv, because they answer the question actually being asked: which commits get graded.
+        #
+        # NOT A HYPOTHETICAL. On 2026-09-06 a synthetic redaction fixture at commit 0b47402cd --
+        # present only on the unmerged branch `origin/redact-domain-e1`, never an ancestor of `main`
+        # -- turned this required context red at 00:08Z after three clean runs. Because this workflow
+        # also runs on `merge_group`, it reddened the queue: the merge-group runs for pr-953, pr-954
+        # and pr-963 all failed here. Merging was frozen for over four hours and five entries were
+        # evicted. Reproduce the reachability with:
+        #     git branch -r --contains 0b47402cd
+        #     git merge-base --is-ancestor 0b47402cd origin/main    # false
+        #
+        # THE CLASS, WHICH IS WORSE THAN THE OUTAGE: anyone who can push a branch could red `main`'s
+        # required secret gate and stop all merging, with no pull request and no review. That is an
+        # availability lever, and here it fired by accident.
+        #
+        # THE COST, STATED RATHER THAN SOLD AS FREE. A branch nobody has opened a pull request for is
+        # no longer scanned -- that coverage is genuinely given up, not relocated. `branch-leak-scan.yml`
+        # is the workflow that already watches branch pushes with no pull request, and it runs only
+        # `scan_forbidden.py`; relocating secret detection there is the obvious follow-up and is NOT
+        # done here. Coverage of the MERGE PATH is unchanged: this workflow also runs on `pull_request`
+        # (where checkout resolves the merge ref, so HEAD's ancestors are the base plus the pull
+        # request's own commits) and under `merge_group`, where HEAD is the queue commit. So every
+        # path by which content can reach `main` is still walked in full.
+        #
+        # THIS PARAGRAPH ALSO NAMED A `push: branches: [main]` ARM, which was REMOVED on 2026-09-08 --
+        # the `merge_group` comment in the `on:` block records where that arm's coverage went. The
+        # sentence is corrected here rather than quietly deleted, because the shape is the lesson: a
+        # comment that describes the trigger set is a SECOND definition of it, free to go stale the
+        # moment the first one moves. That is the rule tests/test_security_posture.py enforces on this
+        # file's header (BACKLOG #1079), arriving one level down in a step body, where no test looks.
+        #
+        # WHAT SCOPING DOES NOT FIX, said plainly so nobody reads it as more than it is: HEAD's
+        # ancestry on a pull request INCLUDES all of `main`, so a secret that actually merges still
+        # reddens every pull request and every queue entry at once. The remedy for that is an
+        # allowlist entry or a history rewrite -- never a per-pull-request workaround.
+        #
+        # `HEAD` RATHER THAN AN EVENT-DEPENDENT RANGE, and the real reason is not the one you would
+        # guess: not every trigger above carries a base SHA. `pull_request` and `merge_group` do
+        # (`pull_request.base.sha` and `merge_group.base_sha`); the others carry none, so a range needs
+        # a fallback for them -- and on a trigger with no base, whatever the fallback picks is what
+        # gets graded. READ THE `on:` BLOCK for the live set; this paragraph used to count them and
+        # went stale in a day. The template-injection objection -- an expression interpolated into a `run:` body --
+        # is NOT the reason: this repo already hoists base SHAs into a step `env:` for exactly that
+        # (backlog-hygiene.yml, precommit-replay.yml), so a range would have been reachable.
+        run: |
+          # `set -o pipefail` EXPLICITLY, AND NOT BY WRITING `shell: bash` (BACKLOG #1481). The scan
+          # is piped into `tee` below so its own report can be read back, and GitHub's default `run:`
+          # shell here is `bash -e` WITHOUT pipefail. A pipeline's status is its LAST command's, so
+          # without this line a findings-exit of 1 is discarded by `tee` and this required gate
+          # reports success on a run that found secrets.
+          #
+          # THE SHORTCUT IS REJECTED RATHER THAN OVERLOOKED. Naming `shell: bash` makes GitHub
+          # substitute `bash --noprofile --norc -eo pipefail`, so the step would acquire pipefail as a
+          # side effect of naming the shell it was already using -- and a later edit deleting that key
+          # as redundant would take the guarantee with it, invisibly. Explicit is both the local
+          # idiom and the legible one; BACKLOG #1481 carries the census and is the copy allowed
+          # to age. Repeating a number here would be a second definition of it.
+          set -o pipefail
+          # `2>&1` because the count read back below is one of the scanner's own log lines, which go
+          # to STDERR, while `--verbose` findings go to stdout. Merging is correct under either
+          # reading of that split: a stdout-only pipe that captured no count would red every clean
+          # run, which is the one failure direction a required gate must not acquire by accident.
+          gitleaks detect --config .gitleaks.toml --log-opts HEAD --redact --verbose --no-banner 2>&1 | tee gitleaks-scan.log
+          # THE RANGE MUST HAVE WALKED SOMETHING. A range is a thing that can resolve EMPTY, and an
+          # empty one makes the scanner report `0 commits scanned` and exit 0 -- a green tick nothing
+          # downstream can tell from a clean scan. `--log-opts HEAD` above is a LITERAL and is measured
+          # safe on every trigger this workflow declares, including a two-parent merge-queue HEAD; the
+          # guard is for the NEXT edit to it. The comment above explains that an event-aware range was
+          # declined partly because not every trigger carries a base SHA -- and on a trigger with no
+          # base, a range built from one is exactly the empty range.
+          #
+          # IT READS THE SCANNER'S OWN REPORT AND NEVER RECOMPUTES ITS SUBJECT. `git rev-list --count`
+          # over the same range would be a SECOND copy of it, free to agree today and drift tomorrow,
+          # and to go on passing after the flag it guards has changed -- the same second-definition
+          # defect BACKLOG #1479 removed from this job's header. A count printed by the scanner cannot
+          # drift from what the scanner did. The tee'd log is also what a reader sees on a failure
+          # here: `0 commits scanned` sits directly above the refusal, so the diagnosis is in the log.
+          grep -qE '(^|[^0-9])[1-9][0-9]* commits scanned' gitleaks-scan.log
