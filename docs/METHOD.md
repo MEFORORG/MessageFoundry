@@ -52,8 +52,8 @@ each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
 Manager, Process Improvement and ASVS Tracker. **The Reviewer went on 2026-09-05**, with the
-`reviewed` label, `review-gate.yml` and `unread-signal.yml`. **The CONSOLE went on 2026-09-10, and
-the Manager above replaces it.** If a document names one, that document is stale.
+`reviewed` label and `review-gate.yml`. **The CONSOLE went on 2026-09-10, and the Manager above
+replaces it.** If a document names one, that document is stale.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
 this retirement was written to stop.** A Console's workers were separate sessions across several
@@ -376,10 +376,12 @@ no commit and no PR the worktree is the only record of what you saw.
 ## Nothing tells anyone your PR is waiting
 
 No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
-green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`, and nothing
-reads that label either.
+green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`. No workflow
+reads that label back, though `scripts/ci/report_ci_red.py` does when a seat runs it by hand, and it
+names the run that reddened each labelled PR. Nothing delivers that to you; you have to ask.
 
-`unread-signal.yml` used to report unread PRs. It was deleted on 2026-09-05 with the review gate,
-because "unread" stopped being a state anything tracked.
+`unread-signal.yml` used to report unread PRs. It outlived the review gate by a week: the owner ruled
+it off on 2026-09-08, the workflow was disabled on the server that day, and it was deleted on
+2026-09-13 (BACKLOG #1490), because "unread" stopped being a state anything tracked.
 
 So say in your PR body what state you left it in. For now the prose is the signal.

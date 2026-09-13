@@ -14,6 +14,22 @@ hand-maintained re-implementation, and ``security.yml`` says so in its own comme
 bandit call -- that ``tests/test_lint_scope_parity.py`` fails if the two drift apart *again*.
 ***THE WORD "AGAIN" IS THE EVIDENCE: THAT DRIFT HAS ALREADY HAPPENED ONCE.***
 
+***THAT MEASUREMENT WENT FALSE FOR AN INTERVAL AND IS TRUE AGAIN.***
+``.github/workflows/precommit-replay.yml`` did run ``pre-commit`` over the pull request diff, from
+2026-08-29 until it was retired on 2026-09-13. It was never a required context, so it gated nothing.
+Measured here 2026-09-13 from the Actions API over that workflow's own 852 runs (back to 2026-09-03):
+622 runs in the trailing seven days, 6,826 minutes of wall clock, a 5.1 minute median and an 11.0
+minute mean. ONE of the 852 failed. It failed on ``licence-header`` -- and on that same head sha the
+REQUIRED context ``test (ubuntu-latest, py3.14)`` failed too, because ci.yml runs that hook's mirror,
+``scripts/quality/licence_header_check.py``, over the WHOLE TREE rather than the diff. So the leg's
+only finding in the window was already reported by a required check over a broader corpus.
+
+***WHAT THE RETIREMENT GIVES UP IS EXECUTION, AND THAT IS A REAL LOSS RATHER THAN A FREE ONE.*** The
+replay ran THE HOOKS THEMSELVES, with their own args, from their own pinned environments, so for the
+nine it ran hook-versus-CI equivalence was true by construction instead of by a pattern. These arms
+check only that a mirror LOOKS right. The trade is stated again, at the point where it bites, in the
+``_MIRRORS`` bullet below.
+
 **THIS MATTERS BECAUSE THE LOCAL HOOK IS SKIPPABLE.** ``git`` never invokes ``pre-commit`` for a commit
 created by the sequencer, so a rebase or cherry-pick lands a commit with none of the eleven gates
 having run (BACKLOG #1395, reproduced independently by two seats). **The CI mirror is therefore the
@@ -36,7 +52,10 @@ from the rule they mirror with nothing failing.**
   matches the step that actually enforces the rule. A pattern matching the wrong line -- another
   job's, or an advisory copy -- satisfies its arm. Each arm asserts only that SOME non-comment line
   matches, never that it is the BLOCKING step: measured, ``ledger-gate`` matches exactly one line
-  today, but one is a property of this corpus and not of the assertion.
+  today, but one is a property of this corpus and not of the assertion. ***AND NOTHING BACKSTOPS IT
+  ANY MORE.*** While the replay leg ran, a pattern pointing at the wrong line still left the real rule
+  executing on every pull request. Since its retirement a mis-anchored pattern means the rule is
+  enforced NOWHERE and this file stays green.
 * **It does not verify that the sibling ASSERTS anything.** ``test_the_sibling_this_file_defers_to
   _still_exists`` checks that ``tests/test_lint_scope_parity.py`` exists and still NAMES each of the
   three ids. **It cannot tell an assertion from a mention**, so gutting that file's bandit arms while
@@ -57,28 +76,9 @@ import pytest
 
 yaml = pytest.importorskip("yaml")
 
-from tests._workflow_contexts import required_contexts  # noqa: E402
-
 _ROOT = Path(__file__).resolve().parents[1]
 _PRECOMMIT = _ROOT / ".pre-commit-config.yaml"
 _WORKFLOWS = _ROOT / ".github" / "workflows"
-
-#: The CI-side re-run of this same config -- BACKLOG #1395's PREFERRED fix, over the `post-rewrite` /
-#: `pre-merge-commit` hook pair the row lists second. A local hook is advisory by construction, which
-#: is the whole finding, so the remedy cannot be another local hook.
-_REPLAY = _WORKFLOWS / "precommit-replay.yml"
-
-#: The hook ids the replay leg may skip, and NOTHING ELSE. Pinned as a SET because the failure mode
-#: is growth: one convenient entry at a time until the leg runs nothing and still reports green -- a
-#: gate that cannot fail wearing the name of one that can.
-#:
-#: Both entries earn it by producing a WRONG answer on a runner rather than by being inconvenient.
-#: `ledger-gate`'s hook entry omits `--ci`, so its ownership arm would read an allocation registry
-#: that lives in `.git/mefor-coord/` and never reaches CI. `forbidden-content` fails closed on a
-#: git-ignored token file no runner has. Neither is left unguarded by the skip: ci.yml runs
-#: `ledger_check.py --ci` and security.yml's REQUIRED `forbidden-content` job scans the whole tree.
-#: precommit-replay.yml's header carries the reasoning; this is the enforcement.
-_REPLAY_SKIPS = frozenset({"ledger-gate", "forbidden-content"})
 
 #: The eight hooks this file owns, mapped to a regex that must match a NON-COMMENT workflow line.
 #: ruff-format, ruff-check and bandit are deliberately absent -- see the module docstring.
@@ -484,111 +484,3 @@ def test_the_release_install_anchor_can_return_no() -> None:
     fabricated = "there-is-no-such-org/there-is-no-such-tool"
     hits = [run for _f, run in _run_blocks() if f"{fabricated}/releases/download" in run]
     assert not hits, "the fabricated slug matched a release install -- the anchor is too loose"
-
-
-# --- the CI-side re-run itself (BACKLOG #1395's preferred fix) -------------------------------------
-
-
-def test_the_replay_leg_runs_pre_commit_over_the_diff() -> None:
-    """The leg must actually invoke `pre-commit run` scoped to the pull request's diff.
-
-    ***THE THREE TOKENS ARE ASSERTED OVER ONE RESOLVED COMMAND, NOT OVER THE FILE.*** A file-wide
-    substring check is satisfied by this workflow's own header, which names `--from-ref/--to-ref`
-    while explaining the choice -- so deleting the run step would leave the prose behind and the
-    assertion green. That is the exact defect `_workflow_lines()` was introduced to avoid one level
-    up, and the header here is long enough to make it a live risk rather than a theoretical one.
-
-    Scoping is part of the contract, not an optimisation: `pre-commit run` with neither ref runs
-    against STAGED files, and a runner stages nothing -- so the bare form exits 0 having checked
-    nothing at all. That is the worst available outcome, a green tick on an empty run.
-    """
-    assert _REPLAY.exists(), (
-        f"{_REPLAY.name} is gone. It is the CI-side re-run BACKLOG #1395 prefers over a second local "
-        "hook; without it, a rebase-created commit is screened only by the hand-written mirrors."
-    )
-    invocations = [
-        run
-        for name, run in _run_blocks()
-        if name == _REPLAY.name
-        and re.search(r"\bpre-commit\s+run\b", run)
-        and "--from-ref" in run
-        and "--to-ref" in run
-    ]
-    assert invocations, (
-        f"no `run:` step in {_REPLAY.name} invokes `pre-commit run` with BOTH --from-ref and "
-        "--to-ref. Without the refs pre-commit falls back to the STAGED file set, which is empty on "
-        "a runner -- the leg would report success having executed no hook."
-    )
-
-
-def test_the_replay_leg_skips_exactly_the_hooks_it_cannot_run() -> None:
-    """`SKIP` must name `_REPLAY_SKIPS` exactly -- no growth, no shrinkage, no typos.
-
-    THREE FAILURES IN ONE ARM, because they share a remedy and none is visible without it.
-
-    * GROWTH is the one that matters. Every added id silently subtracts a gate, the leg keeps
-      reporting green, and the report looks identical -- pre-commit prints "Skipped" for a skipped
-      hook, which nobody reads on a passing run. Left alone the list reaches all eleven.
-    * SHRINKAGE reds every pull request on a check no author can satisfy (the ledger gate's
-      ownership arm), which is how a leg gets disabled outright rather than fixed.
-    * A TYPO skips nothing -- pre-commit does not validate SKIP against declared ids -- so the hook
-      runs, the leg reds, and the printed cause names a hook the author believes is skipped. Every id
-      is therefore checked against the config, which is also what keeps this constant honest after a
-      hook is renamed.
-    """
-    steps = [
-        step
-        for job in (yaml.safe_load(_REPLAY.read_text(encoding="utf-8"))["jobs"] or {}).values()
-        for step in (job.get("steps") or [])
-        if "SKIP" in (step.get("env") or {})
-    ]
-    assert len(steps) == 1, (
-        f"expected exactly one step in {_REPLAY.name} to set SKIP, found {len(steps)}. Two steps "
-        "setting it means one of them is running a different set of hooks than this test describes."
-    )
-    declared = {s.strip() for s in str(steps[0]["env"]["SKIP"]).split(",") if s.strip()}
-    known = _hook_ids()
-
-    unknown = sorted(declared - known)
-    assert not unknown, (
-        f"{_REPLAY.name} skips {unknown}, which .pre-commit-config.yaml does not declare. pre-commit "
-        "does not validate SKIP, so a stale or misspelled id skips NOTHING while reading as coverage "
-        "that was deliberately dropped."
-    )
-    assert declared == set(_REPLAY_SKIPS), (
-        f"{_REPLAY.name} skips {sorted(declared)}; this file pins {sorted(_REPLAY_SKIPS)}.\n"
-        f"  ADDED: {sorted(declared - set(_REPLAY_SKIPS))}\n"
-        f"  REMOVED: {sorted(set(_REPLAY_SKIPS) - declared)}\n"
-        "Adding one subtracts a gate from the replay path while the leg still reports green. If the "
-        "addition is genuinely right, say WHY it produces a wrong answer on a runner -- not merely "
-        "that it is inconvenient -- in precommit-replay.yml's header, name the mirror that still "
-        "covers it, and move _REPLAY_SKIPS in the same commit."
-    )
-
-
-def test_the_replay_leg_adds_no_required_context() -> None:
-    """The leg must stay OFF branch protection's required set unless the owner decides otherwise.
-
-    Not a style rule. `.github/required-contexts.txt` mirrors a server-side setting, and the count
-    pinned in tests/test_required_contexts.py must move in the same pull request as any change to it
-    -- so a job that quietly acquires a required context reds that test leg for everyone. The
-    workflow also has no `merge_group:` trigger, which for a REQUIRED context is the total failure
-    codeql.yml's header records under BACKLOG #340: it would never report on a queue entry and
-    NOTHING would merge.
-
-    This is a one-directional check, and deliberately so: it reads the checked-in file, which is a
-    CLAIM about the server rather than the server itself. It catches the in-repo half of the mistake.
-    """
-    names = {
-        str(job.get("name", key))
-        for key, job in (yaml.safe_load(_REPLAY.read_text(encoding="utf-8"))["jobs"] or {}).items()
-    }
-    required = set(required_contexts())
-    overlap = sorted(names & required)
-    assert not overlap, (
-        f"{_REPLAY.name} declares job name(s) {overlap}, which .github/required-contexts.txt lists as "
-        "REQUIRED. This leg builds every pinned hook environment from scratch and is deliberately off "
-        "the critical path. Promoting it is the owner's decision, and it needs branch protection "
-        "moved FIRST, then that file, then the count in tests/test_required_contexts.py -- and this "
-        "workflow needs a `merge_group:` trigger before any of that, or the queue stops merging."
-    )
