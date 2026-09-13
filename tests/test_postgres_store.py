@@ -865,6 +865,34 @@ async def test_directory_binding_column_is_unconstrained_and_username_is_not(sto
     await _assert_the_binding_column_is_unconstrained_and_username_is_not(store)
 
 
+async def test_username_refresh_contract(store) -> None:
+    """BACKLOG #1532 ``set_user_username`` on the real Postgres backend.
+
+    Same gap as #1471's, found the same way: the method shipped covered on SQLite only, through
+    incidental service-level reconciler tests, and neither live suite mentioned it. The ``postgres
+    store`` leg was green throughout and said nothing about this method, because it never called it.
+
+    What this leg executes that no other does: the ``$1``/``$3`` placeholders REUSED inside the
+    ``NOT EXISTS`` subquery. Postgres is the only backend here with numbered parameters, and this
+    statement binds each of them twice -- once in the ``UPDATE`` and once in the guard. A renumbered
+    placeholder reads correct in the SQL text and silently changes which row the guard examines.
+    """
+    from tests._directory_identity_store_contract import _assert_username_refresh_contract
+
+    await _assert_username_refresh_contract(store)
+
+
+async def test_username_comparison_is_byte_exact_on_postgres(store) -> None:
+    """Postgres compares ``username`` byte-for-byte, so the guard does NOT refuse a case variant.
+
+    SQLite agrees. SQL Server delegates to the database collation and under a ``_CI_`` default
+    refuses a rename this backend permits -- recorded at ``store/sqlserver.py`` and pinned there.
+    """
+    from tests._directory_identity_store_contract import _assert_username_compare_is_byte_exact
+
+    await _assert_username_compare_is_byte_exact(store)
+
+
 async def _users_columns(store) -> set[str]:
     async with store._pool.acquire() as conn:
         return {

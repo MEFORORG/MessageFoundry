@@ -122,6 +122,44 @@ def normalise_object_guid(value: object) -> str | None:
     return None
 
 
+def object_guid_filter_value(object_id: str) -> str | None:
+    r"""Render a canonical ``objectGUID`` text form as an LDAP filter value, or ``None`` if it cannot.
+
+    A directory does not answer ``(objectGUID=b3e1...-...)``. The attribute's syntax is **octet
+    string**, so the filter carries the 16 raw bytes, each escaped as ``\hh`` (RFC 4515 section 3) --
+    the form Microsoft's own tooling emits. The bytes are ``bytes_le``, the same little-endian layout
+    :func:`normalise_object_guid` reads them back with, so a value that round-trips through the store
+    asks the directory about the account it came from.
+
+    **The output contains no caller-supplied text**, which is why it needs no
+    :func:`_escape_filter` pass: every character is one of ``\`` or a lower-case hex digit, produced
+    here from 16 validated bytes. A malformed id yields ``None`` rather than a filter, so a value the
+    parser cannot read can never reach a search string.
+    """
+    try:
+        raw = uuid.UUID(object_id.strip()).bytes_le
+    except (ValueError, AttributeError):
+        return None
+    return "".join(f"\\{b:02x}" for b in raw)
+
+
+def _principal_from(info: dict[str, Any], user_dn: str, groups: frozenset[str]) -> AdPrincipal:
+    """Build an :class:`AdPrincipal` from one ``_search_user`` mapping.
+
+    One construction for all three lookups. A new field on ``AdPrincipal`` otherwise has to be added
+    in three places, and the copy most likely to be missed is the reconciler's -- which carries
+    ``# pragma: no cover`` on its error path and has no real-AD coverage at all.
+    """
+    return AdPrincipal(
+        username=str(info["username"]),
+        display_name=info["display_name"],
+        email=info["email"],
+        dn=user_dn,
+        groups=groups,
+        directory_object_id=info["object_id"],
+    )
+
+
 #: Shapes of ``objectGUID`` already reported by :func:`_object_guid`, so the warning below fires once
 #: per distinct shape rather than once per read. ``_find_user`` is NOT login-only: the ADR 0079
 #: session reconciler probes it once per user per pass (``ad_session_recheck_seconds``, 300 by
@@ -328,16 +366,26 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException:
             return
 
-    def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
+    def _search_user(
+        self, conn: Any, search_filter: str, *, fallback_username: str
+    ) -> dict[str, Any] | None:
+        """Run one user search and extract the entry, or ``None`` for no match / a disabled account.
+
+        The filter is the caller's; everything after it -- the attribute list, the ACCOUNTDISABLE
+        rejection and the extraction -- is shared by both lookups on purpose. **The two lookups differ
+        only in which question they ask the directory**, and an attribute list that drifted between
+        them would give the name-keyed and id-keyed paths different views of the same account.
+
+        ``fallback_username`` is what to call the account when the entry carries no
+        ``sAMAccountName``. For the name-keyed lookup that is the name searched for; for the id-keyed
+        one it is the name already stored on the row, so a directory that answers with no name leaves
+        the cached one alone rather than inventing a rename.
+        """
         import ldap3
 
-        upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         conn.search(
             search_base=self._s.ad_user_search_base,
-            search_filter=(
-                f"(|(sAMAccountName={_escape_filter(username)})"
-                f"(userPrincipalName={_escape_filter(upn)}))"
-            ),
+            search_filter=search_filter,
             search_scope=ldap3.SUBTREE,
             attributes=[
                 "distinguishedName",
@@ -360,7 +408,7 @@ class LdapAuthenticator:
             return None
         return {
             "dn": str(e.entry_dn),
-            "username": _attr(e, "sAMAccountName") or username,
+            "username": _attr(e, "sAMAccountName") or fallback_username,
             # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
             # is given, which would render the raw 16 bytes as a Python bytes repr and store a
             # second, non-canonical spelling of the same identity.
@@ -369,6 +417,36 @@ class LdapAuthenticator:
             "email": _attr(e, "mail"),
             "memberOf": _multi(e, "memberOf"),
         }
+
+    def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
+        upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
+        return self._search_user(
+            conn,
+            (
+                f"(|(sAMAccountName={_escape_filter(username)})"
+                f"(userPrincipalName={_escape_filter(upn)}))"
+            ),
+            fallback_username=username,
+        )
+
+    def _find_user_by_object_id(
+        self, conn: Any, object_id: str, *, fallback_username: str
+    ) -> dict[str, Any] | None:
+        """Find a user by the directory's immutable ``objectGUID`` rather than by a name.
+
+        This is the lookup a **renamed** account needs. A name-keyed search asks a question the
+        directory stopped answering the moment the name changed, and its "no match" is the same answer
+        it gives for a deleted or disabled account -- so a rename read as an offboarding.
+        """
+        value = object_guid_filter_value(object_id)
+        if value is None:
+            # A stored id the filter builder cannot parse. Refusing to search is the honest answer:
+            # a search with no filter, or one falling back to the name, would report on a different
+            # question than the one asked.
+            return None
+        return self._search_user(
+            conn, f"({_OBJECT_GUID_ATTR}={value})", fallback_username=fallback_username
+        )
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:
         import ldap3
@@ -439,37 +517,47 @@ class LdapAuthenticator:
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
             raise LdapError(str(exc)) from exc
-        return AdPrincipal(
-            username=str(info["username"]),
-            display_name=info["display_name"],
-            email=info["email"],
-            dn=user_dn,
-            groups=groups,
-            directory_object_id=info["object_id"],
-        )
+        return _principal_from(info, user_dn, groups)
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
-        """Look a user up + resolve groups *without* a password — for Kerberos, where SSO already
-        proved the identity. Uses the service-account bind only."""
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        """Look a user up + resolve groups *without* a password. Uses the service-account bind only.
+
+        For Kerberos, where SSO already proved the identity, and for the ADR 0079 session reconciler.
+
+        **``object_id`` WINS WHEN GIVEN, and choosing here rather than at the call site is the point
+        (BACKLOG #1532).** ``username`` is a label a directory may reassign; ``objectGUID`` is not. A
+        caller that holds the account's id passes it and gets an answer that survives a rename -- the
+        returned principal carries the directory's **current** ``sAMAccountName``, so a caller holding
+        a stale cached name learns the new one here. A caller that has only a name passes only a name
+        and gets the old behaviour, which is all a directory returning no readable ``objectGUID`` can
+        ever support.
+
+        That matters because a name-keyed miss and a rename are the **same** answer: ``None``, which
+        the reconciler reads as "the account is gone". Letting each caller assemble its own key
+        preference is how that stayed wrong for a release; there is one rule and it lives here.
+
+        ``username`` is still required, and is what the principal reports when the matched entry
+        carries no ``sAMAccountName`` of its own -- an absent attribute is not the directory announcing
+        a rename to nothing.
+        """
         import ldap3
 
         try:
             with self._service_conn() as svc:
-                info = self._find_user(svc, username)
+                info = (
+                    self._find_user_by_object_id(svc, object_id, fallback_username=username)
+                    if object_id is not None
+                    else self._find_user(svc, username)
+                )
                 if info is None:
                     return None
                 user_dn = str(info["dn"])
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
             raise LdapError(str(exc)) from exc
-        return AdPrincipal(
-            username=str(info["username"]),
-            display_name=info["display_name"],
-            email=info["email"],
-            dn=user_dn,
-            groups=groups,
-            directory_object_id=info["object_id"],
-        )
+        return _principal_from(info, user_dn, groups)
 
 
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:

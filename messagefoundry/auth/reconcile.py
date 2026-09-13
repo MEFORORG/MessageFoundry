@@ -54,12 +54,35 @@ class ProbeOutcome(Enum):
 
 @dataclass(frozen=True)
 class Probe:
-    """One principal's probe result. ``groups`` is populated only for :attr:`ProbeOutcome.PRESENT`."""
+    """One principal's probe result. ``groups`` is populated only for :attr:`ProbeOutcome.PRESENT`.
+
+    ``username`` is the name **stored on the row**, which since BACKLOG #1471 is a cached label rather
+    than the key the probe was issued on. ``directory_username`` is the name the **directory** reported
+    for the same account, populated only for :attr:`ProbeOutcome.PRESENT` -- the two differ exactly
+    when the directory renamed the account since the row was last refreshed (BACKLOG #1532).
+    """
 
     user_id: str
     username: str
     outcome: ProbeOutcome
     groups: frozenset[str] = frozenset()
+    directory_username: str | None = None
+
+
+@dataclass(frozen=True)
+class UsernameRefresh:
+    """One planned refresh of a row's cached ``username`` after a directory-side rename (#1532).
+
+    **Not a revocation, and it must never be counted as one.** It leaves the account, its sessions and
+    its roles alone; it copies down a label the directory changed. It is counted against no breaker
+    budget for that reason -- a site that renames a department's worth of accounts in one afternoon has
+    done nothing suspicious, and aborting a pass over it would restore the revocation cycle this exists
+    to end.
+    """
+
+    user_id: str
+    old_username: str
+    new_username: str
 
 
 @dataclass(frozen=True)
@@ -78,6 +101,9 @@ class ReconcilePlan:
     """What a pass decided. Nothing here has been applied yet — see the module docstring."""
 
     revocations: tuple[SessionRevocation, ...] = ()
+    #: Cached usernames to copy down from the directory (BACKLOG #1532). Empty on an aborted pass,
+    #: like every other write this plan carries -- an abort leaves the store byte-identical.
+    renames: tuple[UsernameRefresh, ...] = ()
     #: Strikes to record: ``user_id -> consecutive ABSENT count``. A PRESENT probe maps to 0 (reset);
     #: an UNAVAILABLE probe is absent from this mapping entirely, leaving whatever strike the user
     #: already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
@@ -196,6 +222,16 @@ def plan_pass(
 
     return ReconcilePlan(
         revocations=tuple(revocations),
+        # BACKLOG #1532. Built HERE, in the one return that applies anything: both early returns above
+        # are aborts, and an aborted pass must leave the store byte-identical. Planned only from a
+        # PRESENT probe -- an ABSENT or UNAVAILABLE one carries no directory-reported name, so there is
+        # nothing to copy down and no evidence a rename happened. A renamed account is PRESENT under
+        # the id-keyed probe; that re-keying is what makes this reachable at all.
+        renames=tuple(
+            UsernameRefresh(p.user_id, p.username, p.directory_username)
+            for p in present
+            if p.directory_username is not None and p.directory_username != p.username
+        ),
         strikes=strikes,
         probed=len(probes),
         unavailable=len(unavailable),

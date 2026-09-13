@@ -6450,6 +6450,52 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=$1", object_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
+    async def set_user_username(
+        self, user_id: str, username: str, *, now: float | None = None
+    ) -> None:
+        # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the
+        # UniqueViolationError that UNIQUE(username) would raise on a background pass.
+        #
+        # IT NARROWS THE WINDOW; IT DOES NOT CLOSE IT, AND THE WINDOW IS WIDE. An earlier version of
+        # this comment said "one statement, so the guard and the write are evaluated together and a
+        # concurrent claim cannot slip between them". That is false, and this is the one place the
+        # measurement lives -- the sibling backends and `base.py` cite it rather than restate it.
+        #
+        # MECHANISM: under READ COMMITTED a single statement is atomic with respect to COMMITTED
+        # data, which is NOT atomic against a concurrent UNCOMMITTED claim. The subquery evaluates
+        # against the snapshot at its own statement start, so it cannot see a row another connection
+        # has written but not committed: the guard passes, the write then blocks on the unique index,
+        # and it raises the moment the other side commits.
+        #
+        # MEASURED on live PostgreSQL 16, 200 concurrent pairs / 400 calls, in the AUTOCOMMIT shape
+        # this method actually uses (pool acquire, no explicit transaction):
+        #     200  UPDATE 1              one side of each pair wins
+        #     119  UniqueViolationError  the LOSING side raises -- about 60% of contended pairs
+        #      81  UPDATE 0              the losing side's guard held
+        # Both outcomes on one run is the signature of a race, not of a deterministic bug. The
+        # sequential property the guard exists for DID hold throughout: exactly one UPDATE 1 per
+        # pair, so it never lost a row and never double-renamed.
+        #
+        # THE GAP, STATED SO NOBODY OVERSTATES THIS: the run replicated this STATEMENT's shape on an
+        # asyncpg pool; it did not drive `set_user_username` itself. The wrapper adds a `time.time()`
+        # default and nothing else to the race, so it transfers -- but that step is inference.
+        # Everything above is PostgreSQL 16 at its DEFAULT isolation, and READ COMMITTED is the
+        # mechanism, so a deployment running a different default may behave differently again.
+        #
+        # The residual is absorbed at the call site (`_refresh_cached_username`), by MRO name, the
+        # way the ADR 0068 section 4 duplicate-label race and the BACKLOG #1256 federated-subject
+        # bind already are. At 60% per contended pair that absorb is load-bearing, not defensive.
+        # Do not restore the stronger claim here.
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET username=$1, updated_at=$2 WHERE id=$3 AND NOT EXISTS "
+            "(SELECT 1 FROM users other WHERE other.username=$1 AND other.id<>$3)",
+            username,
+            now,
+            user_id,
+        )
+
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
         # issuer, so a subject-only match would refuse two unrelated people sharing an opaque

@@ -6881,7 +6881,13 @@ def create_managed_app(
                     )
                 if auth.directory_reconcile_enabled:
                     # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
-                    # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
+                    # ON whenever a directory is wired -- `ad_session_recheck_seconds` defaults to
+                    # 300, which `tests/test_ad_session_reconcile.py::test_reconciler_is_on_by_default`
+                    # pins. This comment said "Default OFF (ad_session_recheck_seconds = 0)", matching
+                    # a stale claim in `AuthService.directory_reconcile_enabled` corrected under
+                    # BACKLOG #1532. Reading it as opt-in makes every defect in this loop sound like
+                    # it needs an operator to enable it first. Setting the knob to 0 does disable the
+                    # task, and `security_loosenings()` names that as a loosening.
                     _log.info(
                         "Directory session reconciliation is ENABLED: live AD sessions are "
                         "re-resolved every %ds; a principal absent from the directory for %d "
