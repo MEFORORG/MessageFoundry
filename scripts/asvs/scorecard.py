@@ -1971,7 +1971,7 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
     #
     # So EVERY engine commit changes this line, and this line is COMMITTED. The render-drift gate
     # would then be red on every unrelated engine merge -- a gate whose resting state is red, which is
-    # the exact antipattern filed as BACKLOG #320 the same day, reintroduced by its own author.
+    # the exact antipattern filed as BACKLOG #1765 the same day, reintroduced by its own author.
     #
     # A committed artifact may only carry facts derived from the RECORD, which change when the record
     # changes. The distance is genuinely useful and is not discarded: it prints to stderr in the verify
