@@ -191,9 +191,11 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #     reddened NOTHING and 65 tests passed. That is why a trigger list is load-bearing and needs its
 #     own test, which is true of every workflow here, not only the one that taught it.
 #
-# THE `reviewed` LABEL STILL HAS A CONSUMER, and it is deliberately left running:
-# .github/workflows/unread-signal.yml and scripts/ci/check_unread_prs.py both key on it. They now
-# report on a signal nothing enforces. Retiring them is a product decision the owner has not made.
+# THE `reviewed` LABEL HAS NO CONSUMER LEFT. .github/workflows/unread-signal.yml and
+# scripts/ci/check_unread_prs.py were its last readers. The owner ruled the signal off on 2026-09-08,
+# the workflow was disabled on the server the same day, and both files were deleted on 2026-09-13
+# (BACKLOG #1490). A `reviewed` label still sitting on an open pull request is an inert leftover:
+# nothing adds it, removes it, or reads it.
 
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR

@@ -103,13 +103,13 @@ zero hits for each of `requested_reviewers`, `review_requested`, `pull_request_r
 and `gh pr review` across the workflow directory, against a `runs-on` positive control that hit every
 file (BACKLOG #1413).
 
-**The `reviewed` label still exists, and one workflow still keys on it.** With `review-gate.yml` gone,
+**The `reviewed` label still exists, and nothing reads it any more.** With `review-gate.yml` gone,
 nothing adds or removes the label -- labels already sitting on open PRs are inert leftovers, and the
 `synchronize` strip is gone with the workflow that did it. `unread-signal.yml` and
-`scripts/ci/check_unread_prs.py` still comment on and label an otherwise-mergeable PR that carries no
-`reviewed` label, so **that signal now reports against a standard nothing enforces**. It is left
-running deliberately rather than by oversight: retiring a shipped feature is a product decision the
-owner has not made.
+`scripts/ci/check_unread_prs.py` were the last readers: they commented on and labelled an
+otherwise-mergeable PR that carried no `reviewed` label, so **that signal reported against a standard
+nothing enforces**. The owner ruled it off on 2026-09-08, the workflow was disabled on the server that
+day, and both files were deleted on 2026-09-13 (BACKLOG #1490).
 
 ### "What was required when this merged" is not answerable
 
