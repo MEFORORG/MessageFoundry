@@ -373,8 +373,8 @@ The brief is disposable. The BACKLOG item is the record.
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
 green-but-unmergeable PRs on a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a
 PR whose required check went red, and no workflow reads that label back. Some workflows do comment on
-a PR -- at least `failure-signal.yml`, `nightly-notice.yml` and `unread-signal.yml` (BACKLOG #1413) --
-but **no label any of them applies gates a merge**, and no seat has to clear one.
+a PR -- at least `failure-signal.yml` and `nightly-notice.yml` -- but **no label any of them applies
+gates a merge**, and no seat has to clear one.
 
 ### A Builder gets one turn, and a brief that forgets this deadlocks it
 

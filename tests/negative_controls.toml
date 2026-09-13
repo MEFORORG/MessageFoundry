@@ -688,10 +688,11 @@ core.autocrlf, and PATH ordered so the WSL bash comes first).
 #          test_the_absence_detector_fires_on_a_trigger_set_that_can_go_quiet  <-- KEPT
 #          test_the_label_rerun_detector_fires_on_a_types_list_that_ignores_the_label
 #
-# ONE THING THE RETIREMENT DID NOT SETTLE, flagged rather than acted on. `.github/workflows/
-# unread-signal.yml` and `scripts/ci/check_unread_prs.py` still key on the `reviewed` label. They now
-# report on a signal nothing enforces. Deleting a feature is the owner's call, so that cluster is left
-# working and untouched here.
+# ONE THING THE RETIREMENT DID NOT SETTLE, and the owner settled it a week later. `.github/workflows/
+# unread-signal.yml` and `scripts/ci/check_unread_prs.py` kept keying on the `reviewed` label after the
+# gate went, reporting on a signal nothing enforces. Deleting a feature is the owner's call: the ruling
+# came on 2026-09-08, the workflow was disabled on the server that day, and the cluster was deleted on
+# 2026-09-13 (BACKLOG #1490). Nothing reads the `reviewed` label now.
 
 # --- codeql.yml: NO ENTRY, BECAUSE ITS CONTEXTS ARE NOT REQUIRED -----------------------------------
 #

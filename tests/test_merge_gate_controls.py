@@ -1404,9 +1404,10 @@ def test_no_required_context_sits_in_a_workflow_that_can_go_absent() -> None:
 # automated control requires that a change be read before it merges. That is the owner's decision, and
 # docs/CI.md records it in the same terms.
 #
-# The `reviewed` label itself still exists and still drives .github/workflows/unread-signal.yml, which
-# REPORTS on unread pull requests and gates nothing. Seeing the label in the tree is not evidence the
-# merge gate came back; `.github/required-contexts.txt` is.
+# The `reviewed` label itself still exists on old pull requests and nothing reads it. Its last reader,
+# .github/workflows/unread-signal.yml, REPORTED on unread pull requests and gated nothing; it was
+# deleted on 2026-09-13 (BACKLOG #1490). Seeing the label in the tree is not evidence the merge gate
+# came back; `.github/required-contexts.txt` is.
 #
 # THREE FINDINGS SURVIVE THE MECHANISM. Each was paid for once and applies to the next control anyone
 # adds here, so they are kept rather than deleted with the tests that produced them.
