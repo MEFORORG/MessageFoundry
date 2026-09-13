@@ -34025,3 +34025,234 @@ The weight nonetheless sits on the written control rather than on the sessions, 
 **Duplicate search.** #1752 is the sibling coordination-gate defect filed the same day and is a different predicate in a different guard. #1293 is the worktree-ownership keying hole. #1065 is a rule-3c matching fix inside `worktree_gate.ps1` and touches the Bash arm, not its scope. Searched `PreToolUse`, `collision_gate`, `worktree_gate`, `deny the Write`, `mefor-coord`, `route around`, `SDS-3.7`.
 
 **Source.** Reported by three sessions on 2026-09-12, with the dead-end proposal credited to the Lander session. The guard sources, the live hook registration and the deny log were read by the filing seat the same day. No findings report was written; this item is the record.
+
+## 1754. moving the ledger out of the engine strands its allocator: the floor loses both ledger terms and the ratchet is untracked, so a fresh clone re-issues from the boundary silently
+
+> 🔢 **Filed 2026-09-12 from a four-arm execution experiment against the shipped allocator, run in throwaway repositories. Open; not started. FUTURE-CONDITIONAL -- nothing is broken today; this fires on the first fresh clone taken AFTER the move.** Value **7/10**, Difficulty **3/10**. #1250 moves both ledger files to the vault. `scripts/coord/alloc.ps1` computes its backlog floor as the maximum over four terms; **two of them read the ledger and the other two live in an untracked directory**, so a fresh clone taken after the move has no floor at all. Measured rather than reasoned: with both ledger files absent and the boundary constant left at 1000, the allocator hands out **#1000** -- live in this file today -- at **exit 0**, with no warning. #1250's decision 4 brings `PUBLIC_BACKLOG_FLOOR` into scope. Nothing in the plan brings the allocator itself into scope.
+> Verdict: build
+> Research: none outstanding; all four arms below are measured
+> Closing-act: code, landed as part of the #1250 move rather than after it
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this blocks. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- no engine code is involved and nothing shipped changes. The exposure is number-space corruption in a ledger, conditional on the move landing.
+
+### What the plan covers, and the one thing it does not
+
+#1250's amendment of 2026-09-12 records four owner decisions. Decision 4 retires the #1000 partition and names `PUBLIC_BACKLOG_FLOOR` in `scripts/hooks/ledger_check.py` as in scope. Decision 1 moves the whole ledger; decision 2 leaves a stub.
+
+The item's blast-radius paragraph already lists `scripts/coord/alloc.ps1` under machinery that reads the ledger and would break on a move. **What it does not do is say what happens to it.** The four decisions cover the ledger files, the stub, the published history and the partition constant. The allocator is named as a casualty and never dispositioned, and that omission is this item.
+
+**A correction to the brief this was filed from, recorded because the difference matters.** The brief said nothing in the plan retires `PUBLIC_BACKLOG_FLOOR`. Decision 4 does exactly that. The gap is narrower than the brief drew it and sharper for it: the constant has an owner decision attached, and the tool that parses that constant does not.
+
+### The four terms, read from `Get-Floor`
+
+`Get-Floor` in `scripts/coord/alloc.ps1` builds a `$seen` list seeded with `0` and takes its maximum. On the backlog branch the contributions are:
+
+| term | source | survives the move? |
+| --- | --- | --- |
+| a | `docs/BACKLOG.md` and `docs/archive/backlog/BACKLOG-CLOSED.md` at every local and remote ref | no |
+| b | the same two files in the working tree | no |
+| c | `*.json` claim files under `<git-common-dir>/mefor-coord/alloc/backlog` | untracked |
+| d | the `.floor-highwater` ratchet in that same directory | untracked |
+
+**Term (a) reads ref TIPS, not history.** The specs are built as `"${ref}:${path}"` and resolved with `cat-file --batch-check`, so a ref whose tip is post-move contributes nothing even though its history still carries the file. The term empties as the last pre-move tip is deleted, not on the day the move lands.
+
+**Terms (c) and (d) do not travel.** Measured on this tree: `git ls-files | grep -c 'floor-highwater'` returns **0** and `git ls-files | grep -c 'mefor-coord/alloc'` returns **0**, against a control that `git ls-files | grep -c 'coord/alloc.ps1'` returns **1**. The registry lives beside the shared object store by design, so it is per-clone and correct to be untracked. That design is also why a fresh clone starts with nothing.
+
+**A second untracked guard sits in the same directory and nobody has named it.** `.boundary-highwater` feeds `$boundarySeen`, and `$boundaryLowered` -- the one refusal `alloc.ps1` raises for a lowered constant -- is `$PublicBacklogFloor -lt $boundarySeen`. In a fresh clone `$boundarySeen` is 0, so that comparison is false for every possible value of the constant. **The guard written to catch a lowered boundary cannot fire on the clone that most needs it.**
+
+### The four arms, measured 2026-09-12
+
+Each arm is a throwaway git repository carrying its own copy of `alloc.ps1`, its own `ledger_check.py` and its own registry -- the rig shape `tests/test_ledger_check.py` already uses, so the real registry is never reached. Every arm's registry was confirmed to resolve to its own `.git` before anything was allocated.
+
+| arm | ledger files | constant | floor | number handed out | exit |
+| --- | --- | --- | --- | --- | --- |
+| control | present, max #1200 | 1000 | 1200 | #1201 | 0 |
+| C: move lands, constant unchanged | absent | 1000 | **0** | **#1000** | **0** |
+| B: partition retired by lowering | absent | 1 | **0** | **#1** | **0** |
+| A: partition retired by deletion | absent | absent | 0 | none | **1** |
+
+**The control is the point of the table.** An allocator that returned nothing in every arm would produce the same three zeros and prove nothing. It allocated #1201 from a ledger whose maximum was #1200, so the instrument works and the collapse in the other arms is a real collapse.
+
+**Arm C is the shape to read first.** #1000 is live in `docs/BACKLOG.md` today, and the clamp `[Math]::Max($observed, $PublicBacklogFloor - 1) + 1` is what lands on it: with `$observed` collapsed to 0, the clamp alone determines the number. That is the wipe-the-registry-and-re-issue hole `docs/LEDGER-GATE.md` says the ratchet exists to close, arriving by a route the ratchet does not cover -- it defends a clone that has one, and a fresh clone has none.
+
+**Arm B is worse and quieter.** Retiring the partition by lowering the constant rather than deleting it restarts the sequence at #1 over a vault holding every number up to #1755, and the lowered-boundary refusal stays disarmed for the reason above.
+
+**Arm A is the safe one, and it is safe by accident rather than by design.** With no constant to parse, the backlog path throws at `alloc.ps1:523` (`throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile..."`, inside the `if ($Kind -eq "backlog")` block) and refuses. That refusal was written to stop the allocator guessing a floor the pre-commit gate would not honour. It happens to also be the only thing standing between a post-move public clone and a re-issued number, which is a great deal of weight for a side effect to carry.
+
+**Only the backlog kind is affected.** The ADR branch takes `$start = $observed + 1` with no floor, and `docs/adr/` is not moving.
+
+### A separate defect the experiment surfaced, and it needs its own number
+
+In arm A, `-ShowFloor` exits **0** and prints a next number of 1 with an empty boundary field, while a real allocation on the same repository exits 1 and refuses. The script's own comment above `$residualWarning` states that both checks are evaluated once so that `-ShowFloor` and a real allocation cannot disagree, and cites an earlier version of exactly this disagreement as the reason it was written. **The unreadable-constant path was not brought under that guarantee.** This is not conditional on the move -- it holds in the shipped script whenever the constant cannot be parsed -- so it is a different subject and belongs in its own row. No number is cited for it here because none has been allocated; the subject is the `-ShowFloor` preview disagreeing with the allocation when `PUBLIC_BACKLOG_FLOOR` is unreadable.
+
+### The recommendation, which is a recommendation and not a decision
+
+**Retire the engine's backlog allocation path in the same change that moves the ledger, rather than in a follow-up.** Three reasons, and the first is the one that matters:
+
+1. **Sequencing is the whole of it.** Any ordering that lands the move first opens a window in which a fresh public clone can allocate, and the window closes only when somebody remembers to close it. Landing both together means the window never exists.
+2. There is nothing for the engine to allocate into once both ledger files are gone. An allocator whose output cannot be written anywhere is not a partial capability, it is a trap.
+3. Arm A shows the fail-closed refusal exists, but it arrives as an error about a floor the gate will not honour, which will not read as intentional to whoever hits it. An explicit refusal saying the ledger moved is a better artifact than an accident that behaves correctly.
+
+**What retiring it means concretely, so this is costed rather than gestured at.** The backlog branch of `alloc.ps1` refuses with a message naming the vault; `PUBLIC_BACKLOG_FLOOR` and the backlog arm of `scripts/hooks/ledger_check.py` go with decision 4; and `tests/test_ledger_check.py` couples the two -- it asserts `alloc.ps1` still reads the constant out of the gate and that its regex tolerates a type annotation, so removing the constant reds that test until the test moves with it. The ADR arm of both tools stays.
+
+### What was NOT verified
+
+- **The rig is `git init`, not a clone of the post-move engine repository.** It models the end state: no ledger file at any ref tip, empty registry. A real fresh clone taken the day after the move may still carry branches whose tips predate it, and term (a) would keep working until those are gone. The window opens when the last pre-move tip is deleted, and nothing announces that moment.
+- **Which of the three arms the move will actually produce is unknown**, because decision 4 says the partition is retired without saying whether the constant is deleted or set to a lower value. Arms A and B are the two readings of the same sentence and they differ by everything.
+- No change was made to `alloc.ps1`, to `ledger_check.py`, to the real registry or to either ratchet file. The real registry was read for its two ratchet values and its claim count; nothing was written to it.
+- The `-ShowFloor` disagreement above was measured in one arm only, and not tested against other ways the constant can fail to parse.
+
+**Duplicate search.** #1250 is the move this blocks, and it names `alloc.ps1` as a casualty without dispositioning it. #1751 is the other #1250 blocker and is about reconciling shared numbers, not about who issues them. #1293 is worktree-path ownership keying inside the same gate, a different mechanism. #1480 is the append-absorbs-a-heading filing hazard. Searched `alloc.ps1`, `floor-highwater`, `high-water`, `PUBLIC_BACKLOG_FLOOR`, `boundary-highwater`, `fresh clone`, `re-issue`.
+
+**Source.** Dispatched as a brief naming the gap. The term list, the tracked-file counts, the two ratchet values and all four execution arms were measured by the filing seat on 2026-09-12 against the working tree, and the brief was corrected where it disagreed with the source. No findings report was written; this item is the record.
+
+## 1755. the public stub decision rests on a contributor route the project does not use: 7 GitHub issues ever against a 1700-number ledger
+
+> 🔢 **Filed 2026-09-12. Open; not started. The decision is not being challenged -- the reasoning under one limb of it does not hold, and the remedy is a sentence in a file rather than a reversal.** Value **5/10**, Difficulty **1/10**. #1250's decision 2 keeps a stub in the public engine repository where the ledger was. Part of the case for a stub was that contributors have somewhere else to go, on the strength of `blank_issues_enabled: true` and two templates in `.github/ISSUE_TEMPLATE`. **That is configuration, and configuration records what is possible, never what is practised.** Measured: this repository has **7 issues in its entire history** against **1084 pull requests**. The owner has since stated the project does not use GitHub Issues and does not want to. After the move the public repository would hold no ledger and no tracker in practice, with a stub pointing at a repository outside readers cannot open.
+> Verdict: build
+> Research: none; the measurement is complete and the owner has ruled on the practice
+> Closing-act: docs, plus an owner decision on what the stub should say
+
+**Cluster:** Ledger / repository topology. **Priority:** P2, matching #1250, which this rides with. **Verdict:** build (small).
+**Severity:** no deployment axis (§0). The exposure is a public-facing document that would describe a route into the project that does not exist.
+
+### What decision 2 says, and the claim underneath it
+
+#1250's amendment of 2026-09-12 records it in one line: the engine keeps a stub pointing at the vault, rather than nothing.
+
+The reasoning offered for it included that contributors are routed to GitHub Issues, so a stub only has to redirect ledger readers rather than replace a tracker. The evidence given was the repository's issue configuration: `.github/ISSUE_TEMPLATE/config.yml` sets `blank_issues_enabled: true`, and `bug_report.md` and `feature_request.md` sit beside it. **All three files exist and say what was claimed.** The step that fails is the next one.
+
+### The measurement, with its control
+
+GitHub numbers issues and pull requests in one sequence per repository, which lets this repository check itself.
+
+| query | result |
+| --- | --- |
+| `is:issue` | **7** |
+| `is:pr` | **1084** |
+| highest number in the shared sequence | **1091** |
+
+**7 plus 1084 is 1091, and 1091 is the highest number the sequence has reached.** That is the control, and it is a strong one: the instrument accounted for every number in the namespace with none left over, so the 7 is a real 7 rather than a query that happened to find little. A `gh issue list --repo MEFORORG/MessageFoundry --state all` enumeration returns the same seven -- #98, #288, #455, #657, #720, #1002 and #1011 -- three open and four closed.
+
+A second, weaker control from outside this repository: the private vault carries **42**. The two are configured comparably and used very differently, which is the distinction this item turns on.
+
+Against that, the ledger has issued numbers up to **#1755**. Whatever tracks this project, it is not the issue tracker.
+
+### The owner has ruled on the practice, so this is not an inference
+
+**OWNER STATEMENT, 2026-09-12: the project does not use GitHub Issues and does not want to.** Recorded as a statement rather than derived from the counts above. The counts and the statement are independent and they agree; neither is offered as evidence for the other.
+
+That closes the only reading under which the configuration claim could have survived. Seven issues in a repository's history is consistent with a tracker used rarely, and rarely is still a route. It is not consistent with a tracker the project has decided against.
+
+### The gap this leaves in decision 2
+
+Decision 2 is not wrong. **It was costed against a route that does not exist.** A stub is cheap and correct when the reader it redirects has somewhere else to go; the case for one here assumed a tracker was carrying the traffic the ledger no longer would.
+
+After the move, an outside reader of the public repository would find no ledger, no archive, a tracker the project does not use, and a stub naming a repository they cannot open. **A pointer to a place the reader cannot reach is not a pointer.** It reads as a door and it is a wall with a sign on it.
+
+### The recommendation, for the owner to decide
+
+**Let the stub say what is true.** One file, in the ledger's old place, stating plainly that planning happens in a private repository, that the private ledger is not readable from here, and that the way in is a pull request or a discussion rather than a tracker. No link a reader cannot follow, and no implication that filing an issue will reach anyone.
+
+Two details worth settling in the same decision, because they are the parts a stub gets wrong by omission:
+
+1. **Whether the issue templates stay.** Leaving `blank_issues_enabled: true` and two templates in place next to a stub that says the tracker is unused is a contradiction a contributor meets before they meet the stub.
+2. **Whether the stub says anything about the published history.** Decision 3 already rules that it is accepted and stated plainly, and the stub is the natural place for that sentence. Leaving it out should be a choice rather than an oversight.
+
+Neither is decided here. This item's ask is that the stub's wording be settled deliberately rather than inherited from the assumption above.
+
+### The general lesson, kept short because it is not this item's subject
+
+A configuration file records what is **possible**, never what is **practised**, and reading one as the other produced three wrong supporting claims in a single session on 2026-09-12. The check is one query against the artifact the configuration would have produced, and it costs seconds.
+
+### What was NOT verified
+
+- The reasoning that supported decision 2 was relayed to the filing seat rather than read from a document; #1250's amendment records the decision, not the argument. If the argument was written down elsewhere, this item has not read it.
+- The owner statement above reached the filing seat through its dispatching brief, not directly.
+- The seven issues were counted, not read. Whether any of them is a contributor report a stub would need to accommodate is unexamined.
+- That an outside reader cannot open the vault was taken as given from its being the private maintainer repository. No attempt was made to reach it as an unauthenticated reader.
+- No file was changed. The stub does not exist yet, so nothing was edited to match this recommendation.
+
+**Duplicate search.** #1250 carries decision 2 and is the only item that names a stub. #1751 is the other #1250 blocker and concerns shared numbers between the two ledgers. #1754 is the sibling filed alongside this one and concerns the allocator rather than the stub. ADR 0160 sets the public-repository content policy and is the document a stub's wording would have to satisfy. Searched `stub`, `blank_issues_enabled`, `ISSUE_TEMPLATE`, `GitHub Issues`, `contributor`, `decision 2`.
+
+**Source.** Dispatched as a brief naming the gap. The issue and pull-request counts, the shared-sequence arithmetic, the vault comparison and the three configuration files were measured by the filing seat on 2026-09-12. No findings report was written; this item is the record.
+
+## 1756. the vault CI docs-only short-circuit skips the ledger structure test on exactly the PRs that edit the ledger, and the move makes the vault the ledger's only home
+
+> 🔢 **Filed 2026-09-12 from a read of both repositories' `.github/workflows/ci.yml` at `origin/main`. Open; not started. FUTURE-CONDITIONAL -- nothing is broken today; this fires once #1250 makes the vault the ledger's only home.** Value **6/10**, Difficulty **2/10**. The vault's `test` job takes `needs: changes` for a docs-only short-circuit: on a pull request touching only `docs/`, `changes.outputs.code == 'false'` and the install, lint, type-check and pytest steps all skip while the required context still reports green, in seconds. **Exactly one step in that job is deliberately ungated** -- `Ledger gate (ADR / BACKLOG number space)`, whose own comment explains that an ADR-only pull request is by definition docs-only, so gating it would skip it on precisely the changes it polices. **The protection therefore splits in two and only half survives.** The number-space gate runs; the structure test that catches a malformed banner, an item declaring two statuses or a conflicted ledger does not, because it is reachable only through pytest. **The engine closed this same gap in August with two ungated steps of its own. The vault never received them.**
+> Verdict: build
+> Research: none outstanding on the mechanism; both workflows were read at `origin/main` on 2026-09-12
+> Closing-act: a CI change in the vault, plus a floor constant the vault does not yet carry
+
+**Cluster:** Ledger / CI gating. **Priority:** P2, matching #1250, which this rides with. **Verdict:** build (small).
+**Severity:** no deployment axis (§0). The exposure is a malformed ledger merging green -- a bad banner, an item declaring two statuses, a duplicated field, an unresolved conflict -- in the repository that would by then be the ledger's only home.
+
+### The split, read out of the vault's own `test` job
+
+Every step in that job carries the same condition except one. The table is the whole finding.
+
+| step | `if:` | runs on a docs-only PR |
+| --- | --- | --- |
+| `Ledger gate (ADR / BACKLOG number space)` | `runner.os == 'Linux'` | **yes** |
+| `Install Qt offscreen system libraries` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Set up uv` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Install project` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Lint (ruff)`, `Format check (ruff)` | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Type-check (mypy)`, both platforms | `code == 'true' \|\| push \|\| workflow_dispatch` (+ Linux) | no |
+| `Tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+| `Web console tests (pytest)` | `code == 'true' \|\| push \|\| workflow_dispatch` | no |
+
+The ledger gate runs `python scripts/hooks/ledger_check.py --ci` and needs only git and stdlib python, which is why it costs seconds and why leaving it ungated was free.
+
+The structure check is a different program. The vault already carries **both** `scripts/docs/backlog_status_check.py` and `tests/test_backlog_status_check.py` on `origin/main`, from an earlier slice of the #1250 port. Neither is invoked by anything outside `pytest`, and `pytest` is in the gated column. **The file is present and the check is unreachable on the one change shape that needs it.**
+
+### The engine already fixed this, twice, and that changes what the fix is
+
+This is the part the finding turns on, because it means the remedy is a port rather than a design.
+
+The engine's `test` job carries **three** steps that run on a docs-only pull request, not one:
+
+1. `Ledger gate (ADR / BACKLOG number space)` -- the same step, same condition.
+2. `Backlog status invariant (ungated -- see above)`, `if: runner.os == 'Linux'`, running `python scripts/docs/backlog_status_check.py --min-items 300`. This is the structure check invoked through its own CLI, so it inherits the ledger gate's cost profile exactly: no install, git and stdlib only.
+3. `Doc guards (ungated -- the docs-only blind spot; see above)`, conditioned `runner.os == 'Linux' && needs.changes.outputs.code != 'true' && github.event_name == 'pull_request'` -- that is, it fires **only** on the docs-only PRs the gated steps skip. It runs `pytest -q -rs` over a named list of **21** modules, and `tests/test_backlog_status_check.py` is one of them. A preceding `Install (minimal -- for the doc guards on a docs-only PR)` step, under the same condition, installs `-e ".[dev]" --constraint constraints.lock`.
+
+The engine's workflow records why each was added, and both reasons are incidents rather than theory. Step 2 came from **2026-08-01**: a docs-only pull request added a `#320` entry whose banner used a glyph the invariant does not accept, went green in seconds without compiling the suite, merged, and reddened `main` for every other session. Step 3 came from **2026-08-04**, when four docs-only pull requests merged with none of the ten document guards running, and it **recurred on 2026-08-11** when the curated list turned out not to name `tests/test_dast_claims.py`.
+
+### What the move would undo
+
+#1250 moves both ledger files to the vault. After that the vault is the only place a `## N.` heading exists, so it is the only place a ledger defect can be introduced -- and the vault's CI is the August engine, before either fix.
+
+Stated as the shape of the regression rather than as a present fault: **the protection would not be lost to a bug, it would be lost to a relocation.** Nothing in the vault breaks, nothing in the engine breaks, and no check anywhere reports that a guard stopped covering the file it guards. The engine keeps two ungated steps over a ledger it no longer holds; the vault holds the ledger with one.
+
+The engine's own comment names the residual hazard that survives even a complete port: the doc-guards list is a **curated allowlist**, and a green run never says "a guard exists that I did not run." That is what let the 2026-08-11 recurrence through. A vault port inherits it.
+
+### What the port costs, stated honestly
+
+The two engine steps do not cost the same, and collapsing them into one recommendation would misprice the work.
+
+- **The CLI invocation is effectively free.** `backlog_status_check.py` imports only `argparse`, `re`, `sys` and `pathlib` and has its own CLI, so an ungated `python scripts/docs/backlog_status_check.py --min-items N` step needs no install and sits beside the ledger gate at the same cost. This is the recommended first slice.
+- **The pytest lane is not free.** It needs a Python install where the ledger gate needs only git and stdlib. In the engine that is a minimal `[dev]` install rather than the full extras set, and `[dev]` specifically because `pyproject` sets `asyncio_mode = "auto"` and a `--timeout` addopt, so a bare `pip install pytest` errors on an unknown option before collecting anything.
+- **A floor has to be chosen, and it lives in two places.** The engine passes `--min-items 300` in the workflow and pins `_MIN_TOTAL_ITEMS = 300` in the test, and its own comment warns that nothing compares the two, so the lower one becomes the only floor that binds. The vault's copy of the test carries **no** floor constant today, so a port that adds the CLI step without one adds a check that a shrinking corpus satisfies.
+
+Recommended, and offered as a recommendation rather than a decision: ungate the structure check in the vault the same way the ledger gate is already ungated, taking the CLI slice first because it is free, and treat the doc-guards lane as a separate decision with its own install cost.
+
+### A correction to the framing this item was dispatched with
+
+Recorded because the wrong version is the more quotable one and would propagate.
+
+The engine's `scripts/docs/backlog_status_check.py` carries an in-file comment saying the gate runs "UNGATED on every pull request including docs-only ones". **In the engine that sentence is true of both halves**, not just the number-space gate: the CLI step is ungated and the pytest module rides the ungated doc-guards lane. The same comment already qualifies itself, noting that the pytest guard "rides a lane that a curated allowlist could silently drop it from."
+
+It is the **vault** where that sentence would be true of the gate and false of the test, and the ported copy on the open PR 1497 branch already says so in its own words, ending with a warning not to read the engine's paragraph as cover for the vault. The value this item adds over that comment is that a comment in a file is not a tracked row: nothing schedules it, and the port that carries it can merge without the CI change it describes.
+
+### What was NOT verified
+
+- No CI run was observed. The gating was read out of both workflow files at `origin/main`; a source read shows which branch exists, not that a given run took it. No skipped-step log from a real vault docs-only pull request was pulled.
+- The vault's `changes` job allowlist was read as allowlisting `^docs/`; the exact filter was not exercised against a sample changed-file list, so "a PR touching only `docs/BACKLOG.md` sets `code=false`" is taken from the filter's own comment rather than from a run.
+- Whether the vault's copy of `tests/test_backlog_status_check.py` would pass unchanged against the vault's ledger was not run. The port is mid-flight.
+- The engine's 2026-08-01, 2026-08-04 and 2026-08-11 incidents are quoted from the engine workflow's own comments. The pull requests named there were not opened and read.
+- Nothing was changed in either repository. This item is a filing.
+
+**Duplicate search.** #1250 is the move this rides with and carries the phase plan. #1754 and #1755 are its other two filed gaps and concern the allocator and the public stub; neither touches CI gating. #1470 concerns the ledger gate's fetch depth, which is the same step and a different failure. Searched `docs-only`, `changes.outputs.code`, `Ledger gate`, `backlog_status_check`, `DOC_GUARDS`, `short-circuit`, `min-items`.
+
+**Source.** Found during the vault status-checker port, PR 1497 on `wshallwshall/MessageFoundry-vault`, which was **open** when this was filed and touches only the two ported files, not `ci.yml`. Both workflows, both copies of the status checker, the vault's ported test file and the engine's doc-guards list were read at `origin/main` by the filing seat on 2026-09-12. No findings report was written; this item is the record.
