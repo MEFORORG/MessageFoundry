@@ -1274,7 +1274,7 @@ suite("Steps toolbar — the top-of-lens INSERT toolbar (Corepoint-style Add)", 
 //
 // The webview's MIRRORS of these pure functions — menu enablement, walkMove/blockExtent/captureBlock,
 // canDrop/resolveDrop/barAnchor/scopeLabel — are no longer "verified manually": `steps-mirror.test.ts`
-// (BACKLOG #233) loads media/stepsWebview.js under jsdom and asserts each one against its model
+// (BACKLOG #1758) loads media/stepsWebview.js under jsdom and asserts each one against its model
 // counterpart. What genuinely REMAINS manual is the menu's positioning/viewport clamping, submenu
 // flipping, dismissal and keyboard navigation (STEPS-76) — DOM behaviour with no pure counterpart.
 suite("Steps context menu — explicit before/after insert (right-click, ADR 0103)", () => {
@@ -1662,11 +1662,11 @@ suite("Steps cross-suite — canDropRow / resolveDrop / scopeLabel (the pure dro
     assert.strictEqual(canDropRow(block, bodyA), false, "a block can't be dropped into its own body");
   });
 
-  test("canDropRow: a read-only CODE row is never a drop target, even though it is DRAGGABLE (#233)", () => {
+  test("canDropRow: a read-only CODE row is never a drop target, even though it is DRAGGABLE (#1758)", () => {
     // renderRowHtml marks a `code` row draggable="true" ON PURPOSE — solely so a drag ATTEMPT can be
     // intercepted and answered with "edit it in the code editor" (stepsWebview.js:469-473). So
     // `target.draggable` does NOT already exclude it, and the model's own contract ("never treats a code
-    // row as a drop target") needs an explicit rule. Before #233 the model returned true here while the
+    // row as a drop target") needs an explicit rule. Before #1758 the model returned true here while the
     // CSP-isolated mirror (stepsWebview.js:388) returned false — a deploying site would have seen the
     // insertion indicator refuse a code row while the model-side resolution accepted it.
     const codeTarget = ctx({ lineStart: 3, lineEnd: 3, kind: "code", draggable: true });

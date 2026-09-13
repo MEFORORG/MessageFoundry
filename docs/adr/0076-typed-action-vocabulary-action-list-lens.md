@@ -295,7 +295,7 @@ the comment merged into an unrelated row. **The build lands failing tests for (1
   leading comment breaks `_find_stmt` / `_locate_stmt` exact-span matching, so `set_params` and
   `delete_row` would begin failing with "internal: could not locate the statement" on **every** action
   that has a leading comment. Attachment ("a statement travels with its leading comment block") is a
-  separate, larger item and is gated on BACKLOG #233 — `blockExtent` / `walkMove` / `resolveDrop` are
+  separate, larger item and is gated on BACKLOG #1758 — `blockExtent` / `walkMove` / `resolveDrop` are
   implemented twice (`blockExtent` in `ide/src/stepsModel.ts` vs `ide/media/stepsWebview.js:68`) with no
   differential test. *(2026-08-04: the "no differential test" half is closed —
   `ide/src/test/suite/steps-mirror.test.ts` is that test. The duplication itself stands; the owner chose

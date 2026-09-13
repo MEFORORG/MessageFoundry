@@ -1772,7 +1772,7 @@ export interface DropResolution {
  * code editor" (see the comment at renderRowHtml, "never treats a code row as a drop target"). Without
  * this line the model contradicted that stated contract while the webview mirror (`canDrop` in
  * `media/stepsWebview.js`) honoured it — the one divergence `src/test/suite/steps-mirror.test.ts`
- * found (BACKLOG #233).
+ * found (BACKLOG #1758).
  */
 export function canDropRow(drag: RowDropContext, target: RowDropContext): boolean {
   return (
@@ -1938,7 +1938,7 @@ export function insertionBarAnchor(res: DropResolution, rows: readonly RowDropCo
  * send/return contributes no "after" slot (a block never lands after the return). elif/else headers are
  * CONTINUATIONS (consumed with their `if`), never standalone slots.
  *
- * Exported (BACKLOG #233) so a parity suite can compare it against the CSP-isolated copy of
+ * Exported (BACKLOG #1758) so a parity suite can compare it against the CSP-isolated copy of
  * `buildDropSlots` in `media/stepsWebview.js`; it has no production caller outside {@link walkMove}.
  */
 export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {

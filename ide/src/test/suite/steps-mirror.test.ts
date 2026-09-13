@@ -35,7 +35,7 @@ import {
 } from "../../stepsModel";
 
 // ---------------------------------------------------------------------------------------------------
-// BACKLOG #233 — the webview↔model MIRROR-PARITY differential suite (master test plan
+// BACKLOG #1758 — the webview↔model MIRROR-PARITY differential suite (master test plan
 // docs/testing/master-test-plan/13-steps-editor.md §S2, STEPS-06..12).
 //
 // `ide/media/stepsWebview.js` is loaded as a plain script into a `default-src 'none'` webview (the

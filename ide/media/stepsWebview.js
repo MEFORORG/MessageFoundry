@@ -839,7 +839,7 @@
       vscode.postMessage({ command: 'stepsDiag', level: 'error', text: 'context-menu wiring failed: ' + e });
     }
 
-    // ---- TEST-ONLY EXPORT HOOK (BACKLOG #233; master test plan 13-steps-editor.md §S2 step 3) --------
+    // ---- TEST-ONLY EXPORT HOOK (BACKLOG #1758; master test plan 13-steps-editor.md §S2 step 3) --------
     // The ten functions above MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
     // source of truth) because this script is loaded into a `default-src 'none'` webview and cannot
     // import across that boundary. The differential suite (ide/src/test/suite/steps-mirror.test.ts) loads
