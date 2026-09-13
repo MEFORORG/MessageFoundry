@@ -42,7 +42,8 @@ reaches `docs/adr/README.md`, so the ADR becomes invisible. Three had already be
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr      -Title "Worktree gate"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -Title "Ledger allocator"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
-pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # read-only: allocates nothing
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # allocates nothing; still fetches
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor -NoFetch   # offline, and stale by design
 ```
 
 `-ShowFloor` prints the computed floor, **the paths it swept**, the sub-partition maximum and the number
@@ -61,8 +62,18 @@ allocations, and a different clone automatically gets its own.
 
 The floor is the maximum over: `origin/main`, **every local and remote ref**, every existing
 allocation, and a **persisted high-water mark**. The all-refs term closes the "wipe the registry →
-re-issue a number that only exists on an unpushed branch" hole. It costs about a second, once per ADR —
-not per edit.
+re-issue a number that only exists on an unpushed branch" hole **within one clone**. The cost is per
+allocation, not per edit: measured on the maintainer clone 2026-09-12, about 21s for an ADR and about
+38s for a backlog number.
+
+**Every one of those terms reads refs this clone already has, so the allocator FETCHES `origin` first**
+(BACKLOG #1616). Without that, a clone that has not fetched since a sibling clone pushed cannot see the
+sibling's number, reads it as free, and takes it — and both ledger gates then pass, correctly, because
+each registry genuinely holds its own claim. A fetch that FAILS **refuses** rather than allocating, after
+retrying, because allocate-and-shout was the control in place the day two PRs took one number. `-NoFetch`
+skips the fetch for a genuinely offline box; it prints the hazard and asks you to say in the PR why you
+skipped it. The reasoning, the flags, and what the fetch still does not close live once, in the
+pre-flight block at `alloc.ps1`'s single `Get-Floor` call site.
 
 **The all-refs term is only as good as the refs this clone still has, so the floor ratchets.** Measured
 on the maintainer clone: the backlog floor is **314** counting every ref, but **252** counting only
@@ -105,8 +116,13 @@ internal `#1001` from a public `#1001` was impossible either way.)*
 
 Two consequences worth knowing before you tidy refs:
 
-- **`git fetch origin --prune` is safe** — it prunes only `refs/remotes/origin/*`, which is not where the
-  high numbers live. It is also what you *should* run before allocating.
+- **`git fetch origin --prune` leaves the ratchet alone** — it prunes only `refs/remotes/origin/*`, which
+  is not where the 62 missing numbers above live. **This bullet used to end "it is also what you should
+  run before allocating", and that sentence is withdrawn** (BACKLOG #1616). The allocator fetches for
+  itself now, and it passes `--no-prune` on purpose: a prune before allocating deletes remote-tracking
+  refs that DO carry ledger rows. Measured on this clone: one `git fetch origin --prune` deleted six
+  refs, among them a `gh-readonly-queue` branch for one of the two PRs that collided on `#1546` — and a
+  queue branch carries the row. Prune when you are tidying refs, never as a step before allocating.
 - **Removing a non-`origin` remote, deleting its refs, or an aggressive `gc` / `reflog expire` that drops
   unreachable objects is what the ratchet defends against.** It keeps the number space correct, but the
   underlying history would still be gone — the ratchet is a backstop, not a substitute for the refs.

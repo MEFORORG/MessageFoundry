@@ -12,6 +12,13 @@ restating its numbers here is how two copies of one measurement start to drift.
 are batched now for the same reason, and a guard aimed at the branch that happened to break leaves
 the other free to regress in silence. The invariant belongs to ``Get-Floor``, not to one of its arms.
 
+**A SECOND INVARIANT LIVES HERE TOO, and it is the opposite failure.** The sweep must also read refs
+this clone does NOT yet have, which means a pre-flight ``git fetch origin`` -- see the pre-flight
+block at ``alloc.ps1``'s single ``Get-Floor`` call site for why, where and how it fails closed. The
+cases at the end of this file pin that fetch in both directions, pin the no-origin skip, pin the
+refusal on a fetch that cannot succeed, and pin ``-List`` staying offline. They are the ones that
+break if the fetch is deleted as dead weight.
+
 ``-ShowFloor`` is used throughout: allocation is a one-way door and a test that allocated would leave
 permanent holes in a shared registry.
 """
@@ -22,6 +29,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -37,6 +46,20 @@ pytestmark = pytest.mark.skipif(
 def _git(*args: str, cwd: Path) -> str:
     proc = subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
     return proc.stdout
+
+
+def _invocations(trace: Path) -> list[str]:
+    """Every git process the traced run started. ``GIT_TRACE`` writes one such line per invocation."""
+    return [
+        line
+        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        if "built-in: git " in line
+    ]
+
+
+def _fetches(trace: Path) -> list[str]:
+    """Just the fetch invocations, which is a count the retry cases assert on."""
+    return [line for line in _invocations(trace) if "built-in: git fetch" in line]
 
 
 def _checkout(path: Path, adrs: dict[str, str]) -> Path:
@@ -65,23 +88,37 @@ def _checkout(path: Path, adrs: dict[str, str]) -> Path:
     return path
 
 
-def _floor(repo: Path, kind: str = "adr", env: dict[str, str] | None = None) -> int:
-    proc = subprocess.run(
+def _run(
+    repo: Path, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the fixture's OWN copy of alloc.ps1, from inside the fixture.
+
+    One copy of the invocation, because the cases below drive it three ways -- ``-ShowFloor``, a real
+    allocation, and ``-List`` -- and a second spelling is a second thing to keep in step.
+    """
+    return subprocess.run(
         [
             "pwsh",
             "-NoProfile",
             "-NonInteractive",
             "-File",
             str(repo / "scripts" / "coord" / "alloc.ps1"),
-            "-ShowFloor",
-            "-Kind",
-            kind,
+            *args,
         ],
         cwd=str(repo),
         capture_output=True,
         text=True,
         env=env,
     )
+
+
+def _floor(
+    repo: Path,
+    kind: str = "adr",
+    env: dict[str, str] | None = None,
+    extra: Sequence[str] = (),
+) -> int:
+    proc = _run(repo, "-ShowFloor", "-Kind", kind, *extra, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     match = re.search(r"^floor\s*:\s*(\d+)$", proc.stdout, re.MULTILINE)
     assert match, f"no floor line in:\n{proc.stdout}"
@@ -156,6 +193,12 @@ def test_the_sweep_does_not_spawn_a_git_process_per_ref(
     and the batched one made **6**, none of them ``ls-tree``. The 200 refs are there only to make a
     per-ref sweep unmistakable.
 
+    Re-measured 2026-09-12, when the pre-flight fetch landed: **8** on both arms. This fixture has no
+    remote, so the block adds one ``config --get remote.origin.url`` probe and, on that skip path, one
+    ``git remote`` to decide whether to warn about an upstream under another name -- and no fetch. The
+    bound is deliberately not tightened to 8: it exists to catch proportionality to the REF count, and
+    a bound one process above the current total reds on any unrelated single-process addition.
+
     **WHAT THIS CASE CANNOT SEE, stated because the bound looks more general than it is.** All 200
     refs here point at ONE commit, so the fixture holds exactly ONE distinct ledger blob. Since
     BACKLOG #1535 the backlog sweep runs one ``git grep`` per 128 distinct BLOBS, so on this fixture
@@ -186,11 +229,7 @@ def test_the_sweep_does_not_spawn_a_git_process_per_ref(
     env = {**os.environ, "GIT_TRACE": str(trace)}
     assert _floor(repo, kind=kind, env=env) == expected
 
-    invocations = [
-        line
-        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
-        if "built-in: git " in line
-    ]
+    invocations = _invocations(trace)
     assert any("cat-file" in line for line in invocations), (
         "GIT_TRACE captured no cat-file invocation, so it is not measuring the sweep:\n"
         + "\n".join(invocations[:20])
@@ -287,11 +326,7 @@ def test_the_backlog_sweep_chunks_over_distinct_blobs(tmp_path: Path) -> None:
     env = {**os.environ, "GIT_TRACE": str(trace)}
     assert _floor(repo, kind="backlog", env=env) == planted
 
-    invocations = [
-        line
-        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
-        if "built-in: git " in line
-    ]
+    invocations = _invocations(trace)
     greps = [line for line in invocations if "built-in: git grep" in line]
     expected_greps = -(-_BLOBS // _GREP_CHUNK)  # ceil
     assert len(greps) == expected_greps, (
@@ -536,3 +571,375 @@ def test_a_number_written_but_committed_nowhere_is_taken(tmp_path: Path) -> None
     assert "888" not in _git("show", "HEAD:docs/BACKLOG.md", cwd=repo)
 
     assert _floor(repo, kind="backlog") == 888
+
+
+# ---------------------------------------------------------------------------------------------
+# The pre-flight fetch (BACKLOG #1616). The invariant these cases hold is the MIRROR of the one
+# above: the sweep must read refs this clone does not yet have.
+#
+# Until 2026-09-12 the script executed zero fetches, so the floor came from whatever refs happened
+# to be on disk. Clone B that had not fetched since clone A pushed read A's number as FREE, took it,
+# and B's ledger gate then passed CORRECTLY -- the number genuinely was allocated in B's own
+# registry. Two machines, one number, every gate green on both sides. It happened on 2026-09-11:
+# PR 1061 wrote "## 1546." over a number claimed to PR 1060.
+#
+# NOTHING HERE TOUCHES A NETWORK. Where a case needs a remote it is a LOCAL PATH; one case has no
+# remote at all, and one points at a path where no repository exists. (That is a property of every
+# case, not of "all three": an earlier version of this line said all three fixtures used a local
+# path as the remote while the no-origin case asserted, 30 lines down, that it had none.)
+# ---------------------------------------------------------------------------------------------
+
+_PLANTED_ON_THE_REMOTE = 1234
+_UPSTREAM_BRANCH = "upstream-item"
+
+
+def _upstream_with_a_high_number_on_a_branch(tmp_path: Path) -> Path:
+    """An upstream repo whose high ledger number lives on a BRANCH, not on main.
+
+    A branch rather than main because ``origin/main`` is one of the sweep's two named specs, so a
+    number on main could be argued to arrive by a different route. On a branch it can only reach the
+    floor through the configured ``+refs/heads/*:refs/remotes/origin/*`` refspec that a bare
+    ``git fetch origin`` uses -- which is the exact path both #1546 items travelled.
+    """
+    upstream = _checkout(tmp_path / "upstream", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", _UPSTREAM_BRANCH, cwd=upstream)
+    (upstream / "docs" / "BACKLOG.md").write_text(
+        f"# Backlog\n\n## {_PLANTED_ON_THE_REMOTE}. allocated in the other clone\n",
+        encoding="utf-8",
+    )
+    _git("add", "-A", cwd=upstream)
+    _git("commit", "-m", "the other clone's item", "--no-verify", cwd=upstream)
+    _git("checkout", "-q", "main", cwd=upstream)
+    return upstream
+
+
+def _downstream_pointing_at(upstream: Path, path: Path) -> Path:
+    """A fresh clone-shaped fixture with ``origin`` set and DELIBERATELY never fetched.
+
+    ``protocol.file.allow=always`` is set LOCALLY, on the fixture, because the fetch under test runs
+    inside ``alloc.ps1`` and no ``-c`` from here could reach it. Git's default already allows the
+    file transport for a plain fetch -- measured -- but a hardened runner or a developer with
+    ``protocol.file.allow=never`` in ``~/.gitconfig`` would otherwise see the allocator's own
+    refusal and read it as a network problem. ``tests/test_worktree_gate_control_plane.py`` sets the
+    same knob for the same reason.
+    """
+    downstream = _checkout(path, {"0001-first.md": "# First\n"})
+    _git("config", "protocol.file.allow", "always", cwd=downstream)
+    _git("remote", "add", "origin", upstream.as_posix(), cwd=downstream)
+    return downstream
+
+
+def _assert_the_planted_number_is_not_here(repo: Path) -> None:
+    """The POSITIVE CONTROL. Without it the case could pass on a fixture that was already fetched.
+
+    Two independent checks, because either one alone leaves a way to pass vacuously: the
+    remote-tracking ref must be ABSENT, and the number must appear in no local ref's ledger and not
+    in the working tree.
+    """
+    missing = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/remotes/origin/{_UPSTREAM_BRANCH}"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode != 0, (
+        f"fixture has already fetched refs/remotes/origin/{_UPSTREAM_BRANCH}, so the fetch under "
+        "test is not what supplies the number"
+    )
+    heading = f"## {_PLANTED_ON_THE_REMOTE}."
+    for ref in _git("for-each-ref", "--format=%(refname)", cwd=repo).split():
+        blob = subprocess.run(
+            ["git", "show", f"{ref}:docs/BACKLOG.md"], cwd=str(repo), capture_output=True, text=True
+        )
+        assert heading not in blob.stdout, (
+            f"{_PLANTED_ON_THE_REMOTE} is already reachable from {ref}"
+        )
+    assert heading not in (repo / "docs" / "BACKLOG.md").read_text(encoding="utf-8")
+
+
+def test_the_floor_sees_a_number_that_only_the_remote_carries(tmp_path: Path) -> None:
+    """THE CASE THAT FAILS IF THE PRE-FLIGHT FETCH IS REMOVED.
+
+    Every other case in this file is satisfied by a sweep that reads local refs only, which is
+    exactly why the missing fetch survived a whole release: nothing here could see it. Here the
+    planted number exists ONLY on the upstream's branch, so the floor can reach it by one route and
+    no other.
+
+    Delete the fetch and this returns 77, the fixture's own seed -- the same silent, merely-lower
+    floor every other failure mode in this sweep produces.
+    """
+    upstream = _upstream_with_a_high_number_on_a_branch(tmp_path)
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream")
+    _assert_the_planted_number_is_not_here(downstream)
+
+    trace = tmp_path / "git-trace-fetch.log"
+    env = {**os.environ, "GIT_TRACE": str(trace)}
+    assert _floor(downstream, kind="backlog", env=env) == _PLANTED_ON_THE_REMOTE
+
+    invocations = _invocations(trace)
+    assert _fetches(trace), (
+        "the floor was right but no fetch was traced, so something else supplied the number:\n"
+        + "\n".join(invocations)
+    )
+    # ITS OWN BOUND, LOOSER THAN THE SIBLING CASES', because a fetch is not one process: measured 12
+    # here 2026-09-12, git spawning upload-pack, pack-objects, unpack-objects and rev-list beneath
+    # it. Those are git's children over a local remote and their number is not this script's to fix,
+    # so the bound only has to stay far below one-process-per-ref. It was 13 until the fetch started
+    # passing `-c maintenance.auto=false`, which is why the number moved DOWN when a fix landed.
+    assert len(invocations) <= 30, (
+        f"{len(invocations)} git invocations for a four-ref fetch:\n" + "\n".join(invocations)
+    )
+
+
+def test_nofetch_really_does_not_fetch(tmp_path: Path) -> None:
+    """-NoFetch pinned in BOTH directions, so the sibling case cannot be satisfied by a no-op flag.
+
+    The cheapest way to make the case above pass is to fetch unconditionally and let ``-NoFetch``
+    mean nothing. Then a genuinely offline box has no way out and the switch is a lie in the
+    parameter block. So this asserts the STALE floor -- proving the flag reaches the branch -- and
+    that GIT_TRACE carries no fetch.
+
+    The ``config --get`` assertion is the other half: with ``-NoFetch`` the whole pre-flight block is
+    skipped, so the guard does not run either. An implementation that still probed the remote and
+    merely skipped the fetch would leave that line in the trace.
+    """
+    upstream = _upstream_with_a_high_number_on_a_branch(tmp_path)
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream-nofetch")
+    _assert_the_planted_number_is_not_here(downstream)
+
+    trace = tmp_path / "git-trace-nofetch.log"
+    env = {**os.environ, "GIT_TRACE": str(trace)}
+    assert _floor(downstream, kind="backlog", env=env, extra=("-NoFetch",)) == 77
+
+    invocations = _invocations(trace)
+    assert invocations, "GIT_TRACE captured nothing, so this case is measuring nothing"
+    assert not _fetches(trace), "-NoFetch still fetched:\n" + "\n".join(invocations)
+    assert not [line for line in invocations if "remote.origin.url" in line], (
+        "-NoFetch still probed the remote, so the whole pre-flight block was not skipped:\n"
+        + "\n".join(invocations)
+    )
+
+
+def test_a_repo_with_no_origin_still_returns_a_floor(tmp_path: Path) -> None:
+    """No origin is not a failure, stated explicitly so nobody makes the fetch unconditional.
+
+    Every other fixture here is also originless, so this property is already load-bearing across the
+    whole module -- and that is the problem: it holds by accident, as a side effect of how the
+    fixtures happen to be built, and an unguarded ``git fetch origin`` exits 128 and would red the
+    entire file at once. A reader seeing a dozen reds does not conclude "the guard was dropped".
+
+    So the guard gets a case that names it. The floor is the fixture's own seed, and the trace must
+    show the ``config --get`` probe running and no fetch following it: that pair is what proves the
+    block was entered and chose to skip, rather than being skipped wholesale.
+    """
+    repo = _checkout(tmp_path / "no-origin", {"0001-first.md": "# First\n"})
+    assert _git("remote", cwd=repo).strip() == "", "fixture must have no remote at all"
+
+    trace = tmp_path / "git-trace-no-origin.log"
+    env = {**os.environ, "GIT_TRACE": str(trace)}
+    assert _floor(repo, kind="backlog", env=env) == 77
+
+    invocations = _invocations(trace)
+    assert [line for line in invocations if "remote.origin.url" in line], (
+        "the no-origin guard did not run, so this case is not exercising it:\n"
+        + "\n".join(invocations)
+    )
+    assert not _fetches(trace), "a repo with no origin still tried to fetch:\n" + "\n".join(
+        invocations
+    )
+
+
+def test_a_fetch_that_cannot_succeed_refuses_and_allocates_nothing(tmp_path: Path) -> None:
+    """THE CONTROL THE WHOLE DESIGN ARGUMENT RESTS ON, and nothing was asserting it.
+
+    The three cases above all cover a fetch that WORKS. An editor who decides the refusal is too
+    aggressive -- and there is a real reason to think so, since a concurrent git process in any
+    worktree of one clone can fail a fetch on a ref lock -- can convert this back to
+    allocate-and-shout with every one of them staying green. Allocate-and-shout is the control that
+    was already in the script when #1546 collided, so restoring it would reinstall a control that
+    cannot reach the case. That is worth a case of its own.
+
+    This one really ALLOCATES, unlike every other case in the file, because "there is no partial
+    state" is half the claim and only a real allocation can leave any. It is safe here: the registry
+    lives under the throwaway fixture's own ``.git``.
+
+    THE POSITIVE CONTROL IS THE SECOND RUN. The same fixture with ``-NoFetch`` allocates fine, so the
+    refusal is caused by the fetch and not by anything else about a fixture with no real remote.
+    """
+    repo = _checkout(tmp_path / "dead-origin", {"0001-first.md": "# First\n"})
+    _git("remote", "add", "origin", (tmp_path / "no-repository-here").as_posix(), cwd=repo)
+    registry = repo / ".git" / "mefor-coord" / "alloc"
+
+    refused = _run(repo, "-Kind", "adr", "-Title", "refusal probe")
+    combined = refused.stdout + refused.stderr
+    assert refused.returncode != 0, f"a fetch that cannot succeed allocated anyway:\n{combined}"
+    assert "REFUSING TO ALLOCATE" in combined, (
+        "the refusal must say which operation it refused, in its first words:\n" + combined
+    )
+    assert "-NoFetch" in combined, (
+        "the refusal must name the escape, or an offline operator has no way past it:\n" + combined
+    )
+    assert sorted(p.name for p in registry.rglob("*.json")) == [], (
+        "the refusal left a claimed number behind, so it does not fail closed"
+    )
+
+    allowed = _run(repo, "-Kind", "adr", "-Title", "control probe", "-NoFetch")
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    assert [p.name for p in registry.rglob("*.json")], (
+        "the control run allocated nothing either, so the case above proves nothing about the fetch"
+    )
+
+
+def test_list_reaches_no_network(tmp_path: Path) -> None:
+    """``-List`` must stay offline, and the placement that keeps it offline is one line's distance.
+
+    The pre-flight block sits AFTER the ``-List`` early return, which is the only thing making this
+    true -- move it four hundred lines up and ``-List`` becomes a network call. Nothing in the
+    repository pinned that, and the no-origin case exists on exactly this argument: name the property
+    so nobody later makes the fetch unconditional.
+    """
+    upstream = _upstream_with_a_high_number_on_a_branch(tmp_path)
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream-list")
+
+    trace = tmp_path / "git-trace-list.log"
+    env = {**os.environ, "GIT_TRACE": str(trace)}
+    listed = _run(downstream, "-List", env=env)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+
+    invocations = _invocations(trace)
+    assert invocations, "GIT_TRACE captured nothing, so this case is measuring nothing"
+    assert not _fetches(trace), "-List fetched:\n" + "\n".join(invocations)
+    assert not [line for line in invocations if "remote.origin.url" in line], (
+        "-List probed the remote, so the pre-flight block now runs before the early return:\n"
+        + "\n".join(invocations)
+    )
+
+
+def test_the_fetch_cannot_be_turned_into_a_prune_by_config(tmp_path: Path) -> None:
+    """``fetch.prune`` in config makes a bare ``git fetch`` prune, so ``--no-prune`` is not optional.
+
+    Leaving ``--prune`` off the command line does not leave pruning off: ``fetch.prune`` and
+    ``remote.<name>.prune`` turn it on from any config scope. The allocator would then DELETE the
+    remote-tracking ref carrying a number as part of computing the floor -- destroying its own
+    evidence mid-run, in the one direction the block argues can never happen ("an added ref can only
+    RAISE the floor").
+
+    Measured before the flag was passed explicitly: this fixture's floor fell from 9999 to 77 and
+    the witness was gone. The ratchet cannot cover it, because the witness dies before any high-water
+    for it exists.
+    """
+    doomed = 9999
+    upstream = _checkout(tmp_path / "upstream-prune", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "doomed", cwd=upstream)
+    (upstream / "docs" / "BACKLOG.md").write_text(
+        f"# Backlog\n\n## {doomed}. allocated, then its branch was deleted\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=upstream)
+    _git("commit", "-m", "the doomed item", "--no-verify", cwd=upstream)
+    _git("checkout", "-q", "main", cwd=upstream)
+
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream-prune")
+    _git("fetch", "origin", cwd=downstream)
+    assert _floor(downstream, kind="backlog") == doomed, "fixture did not see the doomed number"
+    _git("branch", "-D", "doomed", cwd=upstream)  # gone upstream; the NUMBER is still spent
+    _git("config", "fetch.prune", "true", cwd=downstream)
+
+    assert _floor(downstream, kind="backlog") == doomed, (
+        "the pre-flight fetch pruned the ref carrying the number it was run to find"
+    )
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "--verify", "refs/remotes/origin/doomed"],
+            cwd=str(downstream),
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    ), "the witness ref was deleted by the allocator's own fetch"
+
+
+def test_a_narrowed_refspec_cannot_hide_a_number(tmp_path: Path) -> None:
+    """The wide refspec is the DEFAULT VALUE of ``remote.origin.fetch``, not a property of the verb.
+
+    ``git clone --single-branch`` (which ``--depth`` implies) and ``actions/checkout`` both narrow it
+    to main alone. A bare ``git fetch origin`` in such a clone runs, exits 0, updates one ref, prints
+    nothing unusual -- and leaves the floor exactly as stale as no fetch at all. That is the ``fetch
+    origin main`` behaviour the block rejects by argument, reached by config instead, and it is worse
+    than the no-origin skip because the operator can see a fetch happen and conclude it worked.
+
+    Measured before the refspec was passed explicitly: floor 77, the remote carrying 1234, exit 0, no
+    warning. So the command line names the refspec and this case holds it there.
+    """
+    upstream = _upstream_with_a_high_number_on_a_branch(tmp_path)
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream-narrow")
+    _git(
+        "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main", cwd=downstream
+    )
+    _assert_the_planted_number_is_not_here(downstream)
+
+    assert _floor(downstream, kind="backlog") == _PLANTED_ON_THE_REMOTE, (
+        "a clone whose refspec is narrowed to main got the pre-fix behaviour: the fetch ran, "
+        "succeeded, and the number on the other branch stayed invisible"
+    )
+
+
+def test_a_transient_fetch_failure_is_retried_rather_than_refused(tmp_path: Path) -> None:
+    """A failed fetch is not evidence of a broken remote, and refusing on the first one costs a turn.
+
+    ``git fetch`` takes a per-ref lock, and worktrees of one clone share one ref store. So two
+    allocations overlapping in the same clone -- the ordinary case on this fleet, measured at one
+    allocation about every 36s against a ~38s sweep -- make the loser exit 1 with "cannot lock ref"
+    while the WINNER brings the refs in. Measured 2026-09-12 before the retry existed: four
+    concurrent ``-ShowFloor`` runs, two of them refused. A Builder gets one turn, so a spurious
+    refusal is a turn spent with nothing pushed -- and the escape from it is ``-NoFetch``, which
+    trades a transient lock for exactly the staleness this whole block exists to prevent.
+
+    THE FIXTURE HOLDS A REAL REF LOCK and releases it only once the trace shows a SECOND fetch
+    starting, so the first attempt fails for the real reason rather than a timed one. The run must
+    still end at the planted number, and the trace must carry at least two fetches -- an outcome
+    assertion alone would pass against a single lucky attempt.
+
+    IF THIS EVER REDS ON A DIFFERENT GIT, read here first: it assumes creating
+    ``<gitdir>/refs/remotes/origin/<branch>.lock`` makes a fetch that must update that ref exit
+    non-zero. That is git's own lockfile protocol and it held on git 2.x here, but a build that
+    ignored the lock would let attempt one succeed and leave one fetch in the trace. That is a
+    fixture that stopped reproducing the hazard, not the retry regressing.
+    """
+    upstream = _upstream_with_a_high_number_on_a_branch(tmp_path)
+    downstream = _downstream_pointing_at(upstream, tmp_path / "downstream-locked")
+    locks = [
+        downstream / ".git" / "refs" / "remotes" / "origin" / name
+        for name in ("main.lock", f"{_UPSTREAM_BRANCH}.lock")
+    ]
+    for lock in locks:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("", encoding="utf-8")
+
+    trace = tmp_path / "git-trace-locked.log"
+    done = threading.Event()
+
+    def release_once_a_retry_is_under_way() -> None:
+        while not done.wait(0.05):
+            if trace.exists() and len(_fetches(trace)) >= 2:
+                break
+        for lock in locks:
+            lock.unlink(missing_ok=True)
+
+    releaser = threading.Thread(target=release_once_a_retry_is_under_way)
+    releaser.start()
+    try:
+        floor = _floor(downstream, kind="backlog", env={**os.environ, "GIT_TRACE": str(trace)})
+    finally:
+        done.set()
+        releaser.join(timeout=10)
+        for lock in locks:
+            lock.unlink(missing_ok=True)
+
+    assert floor == _PLANTED_ON_THE_REMOTE, (
+        "a held ref lock made the allocator refuse instead of retrying, so a concurrent git process "
+        "in any worktree of this clone can cost a session its allocation"
+    )
+    assert len(_fetches(trace)) >= 2, (
+        "only one fetch was traced, so the retry did not run and this case proved nothing:\n"
+        + "\n".join(_invocations(trace))
+    )
