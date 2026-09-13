@@ -122,6 +122,24 @@ function Stop-Cannot([string]$Reason) {
     exit 2
 }
 
+# THE WIRED COMMAND IS READ BY WHICHEVER SHELL CLAUDE CODE PICKS, so every path baked into it has to
+# mean the same thing in both. Both bash and pwsh expand $ and a backtick inside double quotes, both
+# read \" as an escaped quote, and neither can carry a literal " in a path anyway -- so there is no
+# spelling of those characters that survives the pair. Refuse at install time, in front of a human,
+# rather than emit a command that fails silently in a status bar forever.
+#
+# A PRE-PASS OVER EVERY TARGET, NOT A CHECK INSIDE THE WRITE LOOP. Aborting halfway through -AllRoots
+# would leave some roots on the new command and some on the old -- the mixed state the readers now have
+# to tell apart -- so the run either wires all of its targets or writes nothing.
+function Assert-ShellQuotable([string]$Path, [string]$What) {
+    if ($Path -match '["$`]' -or $Path.EndsWith('\')) {
+        Stop-Cannot ("$What cannot be quoted for both bash and pwsh: $Path" +
+            "`n              It carries a double quote, a dollar sign, a backtick, or a trailing" +
+            "`n              backslash. A statusLine has no shell key, so one string has to satisfy" +
+            "`n              both shells. Move it somewhere plainer and re-run.")
+    }
+}
+
 function Assert-RootExists([string]$Path, [string]$What) {
     if (Test-Path -LiteralPath $Path -PathType Container) { return }
     $msg = "$What does not exist: $Path"
@@ -193,15 +211,28 @@ function Get-Ownership($Settings) {
 }
 
 function New-WiredCommand([string]$Collector, [string]$StateDir) {
-    # The guard is inline so a missing script degrades to a marker rather than erroring into the status
-    # bar on every single message -- a statusLine that shouts an exception is worse than one that says
-    # nothing. $d is a VARIABLE at the call site, not an interpolation, which is what makes a state dir
-    # containing spaces safe.
+    # ONE STRING, TWO SHELLS, AND THAT IS THE WHOLE CONSTRAINT ON THIS FUNCTION. A statusLine entry has
+    # NO `shell` key -- its keys are exactly command/refreshInterval/type -- so unlike a hook it cannot
+    # declare PowerShell, and Claude Code runs it under bash on any box where Git Bash is installed.
+    # This used to emit PowerShell SOURCE, which bash cannot parse. Measured twice, by two sessions, on
+    # the bytes taken straight out of a live settings.json: under bash, "syntax error near unexpected
+    # token `{'" and exit 2, with pwsh never launched; under pwsh, exit 0 and a complete latest.json
+    # published beside history.jsonl. So a root wired that way would publish nothing on a box with Git
+    # Bash, and every reader downstream would report UNKNOWN with no instrument anywhere naming the
+    # shell as the cause.
+    #
+    # WHAT THE SHELL-AGNOSTIC FORM COSTS, STATED RATHER THAN QUIETLY DROPPED: the inline Test-Path
+    # guard is gone, because no single string expresses a conditional in both shells. A collector that
+    # disappears AFTER wiring now surfaces whatever pwsh says about a -File it cannot open, in the
+    # status bar, instead of the friendly "mefor-usage: collector missing" line. Two things still cover
+    # that state -- this script refuses to wire a collector that is not there (the Test-Path before the
+    # install loop), and usage.ps1 still diagnoses one that vanishes later as WIRED_COLLECTOR_MISSING.
+    #
+    # DOUBLE QUOTES ARE ONLY SAFE BECAUSE Assert-ShellQuotable RAN FIRST, over every path this run will
+    # bake in. Both shells expand $ and a backtick inside double quotes, and both read a trailing
+    # backslash as escaping the closing quote; a path carrying one would be mangled by both.
     return "# $MARKER`n" +
-    "`$s = '$($Collector -replace "'", "''")'; " +
-    "`$d = '$($StateDir  -replace "'", "''")'; " +
-    "if (Test-Path -LiteralPath `$s) { & pwsh -NoProfile -File `$s -StateDir `$d } " +
-    "else { Write-Output '${MARKER}: collector missing' }"
+    "pwsh -NoProfile -NonInteractive -File `"$Collector`" -StateDir `"$StateDir`""
 }
 
 # --- resolve the target set, ONCE ------------------------------------------------------------------
@@ -410,6 +441,11 @@ if (-not $CollectorPath) {
 if (-not (Test-Path -LiteralPath $CollectorPath)) {
     Stop-Cannot "collector not found at $CollectorPath. The primary checkout does not carry it yet -- merge the branch that adds it, or advance the primary, before installing."
 }
+
+# BEFORE THE FIRST WRITE. See Assert-ShellQuotable: the paths going into the command have to survive
+# both bash and pwsh, and a partial run would leave the box in a mixed state.
+Assert-ShellQuotable $CollectorPath "the collector path"
+foreach ($t in $targets) { Assert-ShellQuotable (Get-UsageStateDir $t.Root) "the publish path for $($t.Root)" }
 
 $wrote = 0; $rewired = 0; $unchanged = 0; $refusing = 0; $failed = 0; $would = 0
 Write-Host ""
