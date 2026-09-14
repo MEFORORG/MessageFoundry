@@ -239,7 +239,7 @@ retention_keep = 7               # keep-N: prune the oldest archives beyond N af
 snapshot_method = "vacuum_into"  # "vacuum_into" (default, writer-lock under off-peak schedule) | "online_backup" (low-contention)
 include_config = true            # bundle the loaded --config dir into the archive
 verify_after_backup = true       # run the lightweight restore-verify after each backup (default ON)
-full_restore_verify = false      # the heavier restore-to-temp through open_store; on-demand / opt-in extra
+full_restore_verify = false      # the heavier open through open_store + a decrypt pass; on-demand / opt-in extra
 config_only_on_server_db = true  # on postgres/sqlserver, back up config only; the DB is DBA-delegated (#52)
 allow_unencrypted = false        # audited escape: permit a clear archive ONLY for a no-key synthetic instance
 ```
@@ -325,9 +325,28 @@ The owner-locked posture is **lightweight verification after each backup**, with
    the keep-N prune does not count it as the latest good backup** (so a failing backup never silently evicts
    the last *good* one).
 
-`full_restore_verify` (opt-in / on-demand) additionally restores the snapshot to a throwaway temp DB and opens
-it through the real `open_store` path (cipher + migrations) to prove an end-to-end restore — heavier, so not
-the per-backup default.
+### Full restore-verify (opt-in / on-demand)
+
+`full_restore_verify` additionally opens the extracted snapshot through the real `open_store` path — **under
+this instance's LIVE `[store]` settings, with only the path and the backend substituted** — and then decrypts
+**and authenticates** every cipher-covered cell it holds. Heavier, so not the per-backup default.
+
+Two properties of that sentence are load-bearing, and the shipped code got both wrong until they were named
+here:
+
+- **The settings must be the live ones.** A bare `StoreSettings(path=…)` resolves no key, so an encrypted
+  snapshot opens under the identity cipher. Substituting *only* the path is what carries `cipher_provider`,
+  `key_provider`, the active + retired keyring and `aad_bind` into the verify, and it is why this is a
+  `model_copy` rather than a rebuilt object: a field added to `StoreSettings` later rides along instead of
+  being silently dropped. `backend` is the one other substitution — the archive member is a SQLite file by
+  construction, so an instance that has since moved to a server DB still verifies its older SQLite archive
+  against SQLite.
+- **Opening the store is not reading the PHI.** `PRAGMA quick_check` and the row counts are blind to a
+  bit-flipped AEAD cell, so without the decrypt pass a full verify would report `PASS` on an archive whose
+  bodies no longer decrypt. Each cell is opened with the same cell-bound AAD the store writes (ASVS 11.3.3),
+  and the result reports a **count** of cells opened — never a plaintext — so a `PASS` states which claim it
+  is making. The covered cells are the store's own `_CIPHER_COLUMNS` declaration; its cipher-covered tables
+  whose AAD binds to a composite/natural key are out of scope until the store publishes them as data too.
 
 ## Acceptance Criteria
 
@@ -386,6 +405,16 @@ the per-backup default.
 - **AC-12** — WHILE clustered (active-passive HA) AND not the leader, THE SYSTEM SHALL NOT take a backup or
   prune the shared destination; WHILE single-node (`NullCoordinator`), THE SYSTEM SHALL always run.
   → `tests/test_backup_runner.py::test_backup_is_leader_gated`
+- **AC-13** — WHEN `full_restore_verify` runs, THE SYSTEM SHALL open the extracted snapshot under this
+  instance's live `[store]` settings (only the path and the backend substituted) AND decrypt **and
+  authenticate** every cipher-covered cell in it, reporting the number of cells opened; IF a cell fails its
+  AEAD tag, OR the settings resolve no key for a snapshot that holds sealed cells, OR no live settings are
+  supplied, THEN THE SYSTEM SHALL return `FAIL` naming that cause. A good encrypted archive SHALL verify
+  `PASS`, and a good unencrypted archive SHALL verify `PASS` with zero cells opened.
+  → `tests/test_restore_verify.py::test_full_verify_passes_on_a_good_encrypted_archive`
+  → `tests/test_restore_verify.py::test_full_verify_fails_on_a_corrupted_aead_cell`
+  → `tests/test_restore_verify.py::test_full_verify_fails_when_the_snapshot_opens_without_its_key`
+  → `tests/test_restore_verify.py::test_full_verify_passes_on_a_good_unencrypted_archive`
 
 ## Options considered
 
