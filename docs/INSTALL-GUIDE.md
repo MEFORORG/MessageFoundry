@@ -91,27 +91,57 @@ $V = "0.1.0"   # the exact version you intend to install
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
   --pattern "messagefoundry-$V-*.whl" --pattern "messagefoundry-$V-*.whl.sigstore*"
+if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
 gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry
+if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
 python -m sigstore verify identity "messagefoundry-$V-py3-none-any.whl" `
   --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$V" `
   --cert-oidc-issuer "https://token.actions.githubusercontent.com"
+if ($LASTEXITCODE -ne 0) { throw "sigstore identity verification FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # Only if BOTH pass, install the exact file you verified
 pip install ".\messagefoundry-$V-py3-none-any.whl"
+if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 ```
 
+> **Check every exit code.** PowerShell does **not** stop a script when a native command like `gh` or
+> `python` returns a nonzero exit code — it falls straight through to the next line. Every block in
+> this section checks `$LASTEXITCODE` after each verification step and `throw`s before `pip install`
+> ever runs, so a failed check actually stops the install. Do not drop those checks when you copy this
+> into your own script.
+
 The same attestation also covers the **public PyPI** copy of the wheel (it is byte-identical to the
-GitHub-built artifact, so the digest matches), so you can download-verify-then-install from the index:
+GitHub-built artifact, so the digest matches), so you can download-verify-then-install from the index.
+Resolve the download to **exactly one file** first, then verify and install that same file — never
+re-resolve the package name against the folder at install time, or `pip` could silently pick a
+different file than the one you just checked:
 
 ```powershell
 $V = "0.1.0"
 pip download "messagefoundry==$V" --no-deps -d .\verify
-gh attestation verify (Get-ChildItem ".\verify\messagefoundry-$V-*.whl").FullName --repo MEFORORG/MessageFoundry
-pip install --no-index --find-links .\verify "messagefoundry==$V"
+if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
+
+# Resolve to exactly one file — zero or several matches means something is wrong with .\verify
+$wheels = Get-ChildItem ".\verify\messagefoundry-$V-*.whl"
+if ($wheels.Count -eq 0) {
+    throw "no file matching messagefoundry-$V-*.whl in .\verify — nothing to verify"
+}
+if ($wheels.Count -gt 1) {
+    throw "found $($wheels.Count) files matching messagefoundry-$V-*.whl in .\verify — " +
+        "clear the folder and re-download so exactly one file is verified"
+}
+$wheel = $wheels[0].FullName
+
+gh attestation verify $wheel --repo MEFORORG/MessageFoundry
+if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
+
+# Install the EXACT file you just verified, not a re-resolution of the package name via --find-links
+pip install $wheel
+if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 ```
 
 A registry/mirror substitution or a relabelled file **fails** the check. For a fully pinned deploy, pair
