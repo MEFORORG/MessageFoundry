@@ -249,7 +249,16 @@ async def test_ack_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> No
         await asyncio.wait_for(source.stop(), timeout=5.0)
         elapsed = asyncio.get_running_loop().time() - started
     # Nothing was left in flight, so stop() must not have spent its shutdown grace waiting.
-    assert elapsed < mllp_mod._CLIENT_SHUTDOWN_GRACE
+    #
+    # A LITERAL ceiling, deliberately NOT _CLIENT_SHUTDOWN_GRACE -- do not "tidy" it back to the
+    # constant. Deriving it from the shutdown grace is what made the previous version inert: the
+    # grace is 5.0 and so is the wait_for above, so a stop() slow enough to matter raised
+    # TimeoutError there before the assert was ever reached. It could only ever be evaluated in
+    # worlds where it already held. Measured: with a 2.5 s stop() injected, `elapsed < 5.0` passed.
+    # 2.0 sits far below that 5.0, so the assert is REACHED and can fail, and far above the 0.05 s
+    # _ACK_DRAIN_GRACE plus scheduling slack on a loaded runner, so it is not flaky. PR 1122 uses
+    # the same 2.0 for the same reason in the TCP/X12 twins of this test; keep the three in step.
+    assert elapsed < 2.0
 
 
 async def test_tcp_emits_established_then_closed() -> None:
