@@ -1249,6 +1249,25 @@ def _check_dryrun(
     if errors:
         detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
+    if total == 0:
+        # BACKLOG #1671: fixtures exist (the "no *.hl7" skip above already returned) yet the inner
+        # loop never ran, so the success return below would report "0 run(s) clean" — a REQUIRED
+        # check claiming a pass over a verification it never performed. Every sibling marks "I
+        # established nothing" with `skipped=True`, which `CheckResult.blocking` excludes; this was
+        # the one path reaching a non-skipped success on zero work. Keep it a postcondition on
+        # `total`: an equivalent precondition on `deployed_inbounds` would have to be kept in
+        # lockstep with the loop's branching, and it would miss any other path to zero.
+        #
+        # `read_message_sets` only ever pins a fixture to a name drawn from `reg.inbound`, so a
+        # pinned fixture always contributes a run — reaching here means every fixture is unmapped
+        # AND nothing is deployed. The counts below are read, not inferred, so the detail stays
+        # true even if some later path arrives here for a different reason.
+        detail = (
+            f"{len(message_sets)} fixture(s) read but 0 dry-run(s) executed — only "
+            f"{len(deployed_inbounds)} of {len(inbound_names)} inbound(s) are deployed and no "
+            f"fixture is feed-pinned, so every target list was empty"
+        )
+        return CheckResult("dryrun", ok=False, required=True, detail=detail)
     pin_note = f", {pinned} feed-pinned" if pinned else ""
     exp_note = f", {asserted} expectation-checked" if asserted else ""
     detail = f"{total} run(s) clean across {len(message_sets)} message(s){pin_note}{exp_note}"
