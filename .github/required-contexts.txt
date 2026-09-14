@@ -121,6 +121,30 @@ semgrep (project SAST rules)
 crypto-inventory (ASVS 11.1.3 discovery gate)
 forbidden-content (customer/PHI leak guard)
 
+# TWO MORE CONTEXTS FROM THIS FILE ARE REPORTING AND ARE DELIBERATELY ABSENT FROM THE LIST ABOVE:
+#
+#     repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)
+#     dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)
+#
+# They are COMPOSITE jobs running the same seven scans in two runner slots instead of seven, staged
+# alongside the originals rather than replacing them. So they are reporting on every pull request and
+# a red one BLOCKS NOTHING TODAY, which is exactly the question this file exists to answer -- and the
+# answer a reader would otherwise guess wrong, because a security context that goes red looks
+# blocking. docs/CI.md carries the reasoning and the runner-slot measurement.
+#
+# THE ORDER IS THE POINT AND IT IS THE SAME ORDER THE `ADDING ANOTHER ONE LATER` PARAGRAPH BELOW
+# PRESCRIBES. A required context is a JOB NAME: deleting the seven while protection still names them
+# wedges every pull request, and recording these two here before protection carries them is the lie
+# this file exists to prevent. So the composites report first, protection moves second, the seven
+# originals are deleted third -- and this file is edited in that third change, together with the
+# pinned count in tests/test_required_contexts.py, docs/CI.md, and the job classification in
+# tests/test_security_posture.py.
+#
+# UNTIL THEN THIS FILE AND THE SERVER STILL AGREE, at thirteen. That is the property worth keeping:
+# the file is accurate at every moment except the window between steps 2 and 3, which the owner opens
+# deliberately. A file that described the intended end state early would be wrong for as long as the
+# staging takes, and wrong in the direction that reads as reassuring.
+
 # --- cla.yml --------------------------------------------------------------------------------------
 cla
 
@@ -191,9 +215,11 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #     reddened NOTHING and 65 tests passed. That is why a trigger list is load-bearing and needs its
 #     own test, which is true of every workflow here, not only the one that taught it.
 #
-# THE `reviewed` LABEL STILL HAS A CONSUMER, and it is deliberately left running:
-# .github/workflows/unread-signal.yml and scripts/ci/check_unread_prs.py both key on it. They now
-# report on a signal nothing enforces. Retiring them is a product decision the owner has not made.
+# THE `reviewed` LABEL HAS NO CONSUMER LEFT. .github/workflows/unread-signal.yml and
+# scripts/ci/check_unread_prs.py were its last readers. The owner ruled the signal off on 2026-09-08,
+# the workflow was disabled on the server the same day, and both files were deleted on 2026-09-13
+# (BACKLOG #1490). A `reviewed` label still sitting on an open pull request is an inert leftover:
+# nothing adds it, removes it, or reads it.
 
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR

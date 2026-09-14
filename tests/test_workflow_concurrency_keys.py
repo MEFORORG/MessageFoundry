@@ -41,8 +41,8 @@ repository: it runs ``on: workflow_run`` over CI, Security, CodeQL and backlog-h
 runs on ``pull_request``, so it fires once per pull request run -- and a workflow_run event's
 ``github.ref`` is the default branch, shared by every pull request exactly as
 ``pull_request_target``'s is. ``check_suite`` is included for the same reason. Neither is a current
-offender (``failure-signal.yml`` keys on ``github.event.workflow_run.id`` and ``unread-signal.yml``
-on the head ref), so including them costs nothing today and covers the next file.
+offender (``failure-signal.yml`` keys on ``github.event.workflow_run.id``), so including them costs
+nothing today and covers the next file.
 """
 
 from __future__ import annotations
@@ -79,8 +79,9 @@ COLLAPSING_EVENTS = ("pull_request_target", "issue_comment", "workflow_run", "ch
 # `github.repository` are constants, which is the same failure with no branch in it at all.
 #
 # `github.event.pull_request.head.ref` is deliberately NOT here: a head ref is per-pull-request, and
-# it is what unread-signal.yml keys on. The `.base.ref` pattern must not match it, which is why that
-# entry is anchored on `base` rather than matching any trailing `.ref`.
+# it is what the retired unread-signal.yml keyed on. The `.base.ref` pattern must not match it, which
+# is why that entry is anchored on `base` rather than matching any trailing `.ref`. The shape outlives
+# the workflow it was taken from, so the rule stays whether or not that file is in the tree.
 _SHARED_CONTEXTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github.ref", re.compile(r"(?<![.\w])github\.ref(?![_\w])")),
     ("github.ref_name", re.compile(r"(?<![.\w])github\.ref_name(?![\w])")),
@@ -352,8 +353,9 @@ def test_the_cla_group_puts_the_number_on_the_pull_request_arm_and_run_id_on_the
         # workflow_run is a collapsing event: its ref is the default branch and failure-signal.yml
         # fires it once per pull request run. The real failure-signal key is not this.
         ("failure-signal-${{ github.ref }}", "workflow_run", True),
-        # Near-misses that must NOT match. A head ref IS per-pull-request and is unread-signal.yml's
-        # real key; a naive `.ref` or `base` pattern hits it.
+        # Near-misses that must NOT match. A head ref IS per-pull-request and was the key of the
+        # retired unread-signal.yml; a naive `.ref` or `base` pattern hits it. The row is kept as a
+        # control because the SHAPE is what it discriminates, not that workflow's existence.
         ("unread-signal-${{ github.event.pull_request.head.ref }}", "pull_request_target", False),
         ("ingress-rate-probe", "pull_request_target", False),
     ],
@@ -396,8 +398,10 @@ def test_an_unmodelled_expression_naming_a_shared_context_fails_closed() -> None
     assert collapses_across_pull_requests(
         "x-${{ fromJSON(something) }}", "pull_request_target"
     ) is (False)
-    # unread-signal.yml's real key is an unmodelled `||` chain naming no shared context. It must pass,
-    # or the fail-closed rule would redden a correct workflow and be deleted.
+    # The retired unread-signal.yml's key was an unmodelled `||` chain naming no shared context. It
+    # must pass, or the fail-closed rule would redden a correct workflow and be deleted. Kept after
+    # that workflow was deleted (BACKLOG #1490): a fail-closed rule needs a passing case or it cannot
+    # discriminate, and this is the one real expression measured to exercise that path.
     real = "unread-signal-${{ github.event.workflow_run.head_branch || github.event.pull_request.head.ref || inputs.pr }}"
     assert collapses_across_pull_requests(real, "pull_request_target") is False
     assert collapses_across_pull_requests(real, "workflow_run") is False

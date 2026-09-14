@@ -73,7 +73,7 @@ sys.path.insert(0, str(_ROOT))
 # The rollup vocabulary is GitHub's, not ours, so one module owns it rather than each reader keeping a
 # copy — a conclusion string an unclassified copy let through would read as GREEN, which is the exact
 # defect this script exists to catch. check_unread_prs.py was the second reader until it was deleted on
-# 2026-09-05; _pr_checks.py records why the split outlived it.
+# 2026-09-13 (BACKLOG #1490); _pr_checks.py records why the split outlived it.
 from scripts.ci._pr_checks import counts as _counts  # noqa: E402
 
 #: The merge state that means "head is behind base". GitHub computes this server-side; it is not
