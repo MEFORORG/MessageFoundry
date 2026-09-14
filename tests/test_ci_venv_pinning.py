@@ -280,7 +280,14 @@ SECURITY_YML_ACCEPTED_UNPINNED = frozenset({"pip"})
 #: floor: `SECURITY_YML_ACCEPTED_UNPINNED` registers the *name* `pip`, so it cannot distinguish two
 #: accepted bootstraps from twenty. Both survivors are named in the docstring above and in ADR 0034 §3's
 #: residuals table; a third must be a decision, and lowering this number is the receipt for removing one.
-SECURITY_YML_PIP_BOOTSTRAPS = 2
+SECURITY_YML_PIP_BOOTSTRAPS = 4
+#:
+#: FOUR SINCE THE SECURITY-JOB CONSOLIDATION, AND THE TWO NEW ONES ARE COPIES RATHER THAN DECISIONS.
+#: `security.yml` now carries two composite jobs beside the seven they will replace, and each copied
+#: scan body is byte-identical to its original (tests/test_security_composite_parity.py asserts it),
+#: so the `uv` bootstrap in the DEP-1 step and the `semgrep` bootstrap each appear twice. The count
+#: goes back to 2 in the step-3 change that deletes the originals. Raising it for any other reason is
+#: a decision, exactly as before: this pin cannot tell two accepted bootstraps from twenty.
 
 #: ``(workflow, lock, install sites)`` triples where a CI toolchain is installed from a hash-pinned
 #: `uv export`.
@@ -307,7 +314,10 @@ SECURITY_YML_PIP_BOOTSTRAPS = 2
 #: run with — restating it here would be a second copy free to drift, and the first draft of this comment
 #: got it wrong in exactly that way.
 LOCK_INSTALLED_TOOLCHAINS = (
-    ("security.yml", "ci/locks/ci-scanners.lock", 3),
+    # FIVE, NOT THREE, DURING THE SECURITY-JOB CONSOLIDATION. The three original sites are the
+    # pip-audit step, the bandit step and released-line-audit; the two composite jobs staged beside
+    # them carry byte-identical copies of the first two. Back to 3 when step 3 deletes the originals.
+    ("security.yml", "ci/locks/ci-scanners.lock", 5),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
     ("release.yml", "ci/locks/release-tools.lock", 5),

@@ -50,7 +50,21 @@ def _audit_step() -> dict[str, object]:
         for step in (job.get("steps") or [])
         if isinstance(step, dict) and step.get("name") == _STEP_NAME
     ]
-    assert len(steps) == 1, f"expected exactly one {_STEP_NAME!r} step, found {len(steps)}"
+    assert steps, f"no step named {_STEP_NAME!r} in {_SECURITY.name}"
+    # SEVERAL COPIES ARE ALLOWED ONLY WHILE THEY ARE THE SAME STEP. The security-job consolidation
+    # runs two composite jobs beside the seven they will replace, so this step is present twice until
+    # the originals are deleted. An exact-one assertion would red on the staging change; dropping the
+    # count entirely would let this module grade one copy while a divergent other copy ran. So the
+    # copies are required to agree, and every assertion below then holds of all of them.
+    #
+    # tests/test_security_composite_parity.py asserts the same identity from the other side, over
+    # every copied scan rather than this one. Both are kept: that module can be pointed elsewhere, and
+    # this one must not quietly start grading an arbitrary copy if it is.
+    bodies = {str(s.get("run")) for s in steps}
+    assert len(bodies) == 1, (
+        f"{len(steps)} steps named {_STEP_NAME!r} and {len(bodies)} distinct bodies among them. The "
+        "copies have drifted, so this module would be grading whichever one it happened to pick."
+    )
     return steps[0]
 
 
