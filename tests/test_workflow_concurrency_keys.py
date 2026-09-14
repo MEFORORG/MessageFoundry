@@ -37,7 +37,7 @@ so a ``github.ref`` key there groups a branch or a scheduled line with itself, w
 
 ``workflow_run`` IS INSIDE IT, and an earlier draft of this file had that wrong. The draft said
 workflow_run "does not fire per pull request", which ``failure-signal.yml`` refutes in this very
-repository: it runs ``on: workflow_run`` over CI, Security, CodeQL and backlog-hygiene, each of which
+repository: it runs ``on: workflow_run`` over CI, Security and backlog-hygiene, each of which
 runs on ``pull_request``, so it fires once per pull request run -- and a workflow_run event's
 ``github.ref`` is the default branch, shared by every pull request exactly as
 ``pull_request_target``'s is. ``check_suite`` is included for the same reason. Neither is a current
