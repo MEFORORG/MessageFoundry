@@ -3569,6 +3569,30 @@ def inbound_binding_conflicts(
     return messages
 
 
+# --- declared text-encoding validation (BACKLOG #1613) -----------------------
+# A connection's `encoding` names a Python text codec. It is read once when the connector is built
+# and then used PER MESSAGE, so a name Python cannot resolve is invisible at load and at connection
+# start and would first fail on the first real message — where the ingress decode catches only
+# UnicodeDecodeError, so the LookupError escapes uncaught instead of dead-lettering that one message.
+# Registry.encoding_problems catches it statically; the probe below is how.
+
+
+def _is_text_codec(value: str) -> bool:
+    """True if ``value`` names a codec ``str.encode`` / ``bytes.decode`` will accept.
+
+    ``"".encode(value)`` is the probe, deliberately rather than ``codecs.lookup(value)``: it is the
+    same call the connectors make, so it also rejects a registered **non-text** codec (``base64``,
+    ``hex``, ``rot13``, ``zlib``), which ``codecs.lookup`` accepts and the transports do not. The
+    mirror-image probe ``b"".decode(value)`` is no probe at all — CPython short-circuits an empty
+    decode without consulting the codec, so it returns cleanly for *every* string including
+    ``"not-a-real-codec"``."""
+    try:
+        "".encode(value)
+    except LookupError:
+        return False
+    return True
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -3672,6 +3696,9 @@ class Registry:
             if hname not in self.handlers:
                 raise WiringError(f"accepts= predicate declared for unknown handler {hname!r}")
             _check_accepts_predicate(hname, pred)
+        problems = self.encoding_problems()
+        if problems:
+            raise WiringError(problems[0])
         collisions = self.port_collisions()
         if collisions:
             port, first, second = collisions[0]
@@ -3699,6 +3726,73 @@ class Registry:
             and not isinstance(port, bool)
         ]
         return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
+
+    def encoding_problems(self) -> list[str]:
+        """Human-readable messages for declared ``encoding`` values naming no usable text codec.
+
+        Caught statically, naming the connection and the offending string, the way
+        :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
+        (see the section comment above for the runtime failure this pre-empts).
+
+        **Literal names only**, exactly like :meth:`port_collisions`. An :func:`env` reference is
+        skipped **deliberately, not by oversight**: it carries no value here (``resolve_env_settings``
+        needs the instance's environment values and :func:`validate_config` is handed only a
+        directory). Nothing checks it later either — the resolved counterpart is unbuilt, and would
+        belong in ``build_check_registry`` alongside :func:`inbound_binding_conflicts`, which is where
+        the same second pass already happens for ``env()`` ports. So the skip is *unchecked*, not
+        deferred, and :meth:`encoding_census` is what keeps it from being silent.
+
+        A ``deployed=False`` connection IS checked: parking a feed does not make a typo'd codec name
+        correct, and the ``inbound -> router`` check above treats a parked connection the same way.
+        (``port_collisions`` excludes it for a reason that does not apply here — it never binds, so it
+        genuinely cannot collide.)"""
+        problems: list[str] = []
+        for kind, name, value in self._declared_encodings():
+            if isinstance(value, EnvRef):
+                # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
+                # try/except wide enough to catch that could not tell it from a real failure.
+                continue
+            if not isinstance(value, str):
+                continue  # not a literal codec name — nothing this pass can probe
+            if not _is_text_codec(value):
+                problems.append(
+                    f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
+                    f"message would fail at decode/encode; use a codec name such as 'utf-8', "
+                    f"'latin-1' or 'cp1252'"
+                )
+        return problems
+
+    def encoding_census(self) -> tuple[int, int]:
+        """Declared ``encoding`` values, as ``(checked, unchecked)``.
+
+        A pass that examined **nothing** and one that examined everything and found it good both
+        return no problems, so this count is what tells them apart. ``unchecked`` is the ``env()``
+        refs :meth:`encoding_problems` skips; it is derived from the total, so no entry can fall into
+        a silent third bucket. Only a connector type with no ``encoding`` argument at all is in
+        neither number — every other factory writes its ``utf-8`` default into ``settings``, so
+        leaving the argument off still counts as checked."""
+        declared = list(self._declared_encodings())
+        checked = sum(1 for *_, value in declared if isinstance(value, str))
+        return checked, len(declared) - checked
+
+    def _declared_encodings(self) -> Iterator[tuple[str, str, Any]]:
+        """``(kind, name, value)`` for every registry entry whose settings carry an ``encoding``.
+
+        Every settings-bearing table, because an unusable codec name is a property of the setting and
+        not of the direction it is read in. The table list is the same one
+        ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
+        together, since a sixth settings-bearing table added to one and missed here reads as clean."""
+        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any]]]]] = [
+            ("inbound connection", ((n, c.spec.settings) for n, c in self.inbound.items())),
+            ("outbound connection", ((n, c.spec.settings) for n, c in self.outbound.items())),
+            ("database lookup", ((n, s.settings) for n, s in self.lookups.items())),
+            ("fhir lookup", ((n, s.settings) for n, s in self.fhir_lookups.items())),
+            ("reference set", ((n, r.source.settings) for n, r in self.references.items())),
+        ]
+        for kind, entries in tables:
+            for name, settings in entries:
+                if "encoding" in settings:
+                    yield kind, name, settings["encoding"]
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -5380,6 +5474,8 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
             _check_accepts_predicate(hname, pred)
         except WiringError as exc:
             diagnostics.append(Diagnostic(message=str(exc)))
+    # Mirror Registry.encoding_problems as editor diagnostics (BACKLOG #1613).
+    diagnostics.extend(Diagnostic(message=m) for m in registry.encoding_problems())
     for port, first, second in registry.port_collisions():  # low-13
         diagnostics.append(
             Diagnostic(
