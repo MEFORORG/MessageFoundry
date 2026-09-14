@@ -2888,7 +2888,7 @@ class AuthService:
         {STEP_UP_ACTION_MFA_ENROLL, STEP_UP_ACTION_MFA_CONFIRM, STEP_UP_ACTION_WEBAUTHN_ENROLL}
     )
 
-    async def _factor_binding_is_blocked(self, token: str, purpose: str) -> bool:
+    async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
         """Whether a factor-binding step-up grant must be REFUSED for this session (ASVS 6.3.3).
 
         Closes a bypass the 6.3.3 access gate would otherwise leave open. The gate's carve-out
@@ -2908,6 +2908,8 @@ class AuthService:
         """
         if purpose not in self._FACTOR_BINDING_ACTIONS:
             return False
+        if not token:
+            return True  # no session to bind a factor to — fail closed, as below
         if await self.mfa_satisfied(token):
             return False
         session = await self._store.get_session(hash_token(token))
@@ -2917,6 +2919,21 @@ class AuthService:
         if user is None:
             return True
         return await self._second_factor_enrolled(user)
+
+    async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
+        """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.
+
+        Public on purpose, not as a convenience alias. Both step-up decision helpers must apply the
+        refusal -- ``api.security._action_step_up_ok`` and the web console's
+        ``_ui_action_step_up_ok`` -- and the console reaches the engine only across its PUBLISHED
+        surface. Without this method that console-side copy is written from scratch, and a rule
+        living in two packages is a rule that drifts in one of them.
+
+        ``action`` is the route's step-up action, which is the same vocabulary ``POST /me/reauth``
+        spells ``purpose``, so it passes straight through rather than being fixed per call site --
+        which would mean exporting :data:`_FACTOR_BINDING_ACTIONS` or shutting the non-factor lanes
+        with it."""
+        return await self._factor_binding_is_blocked(token, action)
 
     def _grant_action_step_up(self, token_hash: str, action: str) -> None:
         """Mint a single-use per-action step-up grant (ADR 0077), bounded + TTL'd, process-local.

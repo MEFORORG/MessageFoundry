@@ -3455,6 +3455,89 @@ async def test_ui_factor_bind_opt_out_uses_window(engine: Engine) -> None:
         assert r.status_code == 200 and "Secret:" in r.text
 
 
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """The /ui twin of the engine's 6.3.3 factor-binding refusal.
+
+    RED when: the ``factor_binding_is_blocked`` refusal leaves ``_ui_action_step_up_ok``. The
+    ``opted-out`` arm is the regression that matters: under
+    ``[auth].require_action_step_up = false`` this lane's whole gate is the session window, so a
+    refreshed window alone would let an MFA-pending session bind a NEW factor on an account that
+    already holds one -- and the confirm ceremony then promotes it to MFA-satisfied.
+
+    The window is stamped directly rather than staged through a ceremony, because the reachable
+    chain crosses planes and the crossing is not what this test is about: /ui and the JSON API share
+    one session store, so somebody holding the password signs in at /ui, replays that same session
+    token as a Bearer to ``POST /me/reauth`` (MFA-exempt, and purpose-less so the mint-time guard
+    never fires), and comes back to the cookie lane with the window fresh. What this pins is that
+    the /ui gate must not open on a fresh window alone, however the window got there.
+
+    The victim holds a PASSKEY rather than a TOTP secret for the reason the JSON twin gives: against
+    a TOTP holder the enroll route refuses on its own with a 400, so a 303 assertion would grade a
+    gate that is wide open. Measured against the unfixed code, the opted-out arm stages a secret and
+    returns **200** on the TOTP enroll lane.
+    """
+    from messagefoundry.store.store import WebAuthnCredential
+
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, require_action_step_up=action_step_up)
+    )
+    await service.initialize()
+    await _add(service, "vic", Role.OPERATOR)
+
+    # The victim really holds a factor, so the enrollment deadlock carve-out does not cover them.
+    uid = await _uid(service, "vic")
+    await engine.store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash="ui-vic-passkey-hash",
+            credential_id="ui-vic-passkey-id-b64url",
+            user_id=uid,
+            rp_id="t",
+            public_key="cose-public-key-b64url",
+            sign_count=0,
+            transports=None,
+            device_type="multi_device",
+            backed_up=True,
+            label="yubikey",
+            aaguid="aaguid-0000",
+            created_at=1000.0,
+            last_used_at=None,
+        )
+    )
+    assert await service.store.has_webauthn_credentials(uid) is True
+
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "vic")  # the attacker knows the password and nothing else
+        assert r.status_code == 303
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await service.store.mark_session_reauthed(hash_token(tok))
+        # The positive controls. Without them a refusal for some OTHER reason -- a stale window, a
+        # spent grant -- would read as this guard working and the opted-out arm would pass anyway.
+        assert await service.has_recent_step_up(tok) is True
+        assert await service.mfa_satisfied(tok) is False
+
+        for path, continuation in (
+            ("/ui/account/mfa/enroll", "/ui/account/mfa/enroll"),
+            ("/ui/account/webauthn/enroll", "/ui/account/webauthn/enroll"),
+        ):
+            r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+            assert r.status_code == 303, f"{path} bound a factor on the password alone"
+            assert r.headers["location"] == f"/ui/reauth?next={continuation}"
+        # The confirm lane is refused on its own, not merely starved of a staged secret.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "000000"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        # No promotion happened: the session is still behind the 6.3.3 gate.
+        assert await service.mfa_satisfied(tok) is False
+
+
 # --- L4b review-driven regressions (adversarial review: 2 behavior bugs + coverage gaps) -----------
 
 
