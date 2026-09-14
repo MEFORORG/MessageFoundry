@@ -36,6 +36,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from typing import Never
 
 import pytest
 
@@ -177,6 +178,7 @@ pynetdicom = pytest.importorskip(
     "pynetdicom", reason="the DICOM association bound needs the [dicom] extra"
 )
 
+from messagefoundry.transports import dicom as dicom_module  # noqa: E402
 from messagefoundry.transports.dicom import (  # noqa: E402
     DEFAULT_MAX_ASSOCIATIONS_PER_SECOND,
     DicomScpSource,
@@ -314,7 +316,9 @@ _PACED_BURST = 1.0
 _PACED_STEPS = _ECHOES - 1 - _PACED_BURST
 #: How far the pacing floor is held above the MEASURED control. It sets the test's wall time (about
 #: ``_SEPARATION`` times the control arm) and it sets how much slower per association the paced arm
-#: would have to run, for a reason other than pacing, before either timing arm stopped discriminating.
+#: would have to run, for a reason other than pacing, before the WALL-CLOCK arm stopped
+#: discriminating. It no longer reaches the decision arm, which :class:`_PacingClock` took off the
+#: runner's clock entirely.
 _SEPARATION = 4.0
 #: Below this the floor no longer separates from the control and the wall-clock arm could be
 #: satisfied by machine speed alone, so the test says that rather than passing.
@@ -323,15 +327,21 @@ _MIN_SEPARATION = 2.0
 #: measured to be far too loose: the paced arm's own work hands it ``floor / 4`` for free, so at 0.75
 #: pacing need only supply 60 percent of what it honestly supplies and a wait capped at half a step
 #: would still pass. The floor is exact bucket arithmetic rather than a measurement -- ``paced_elapsed
-#: == floor + 2w``, so the honest arm measured 1.03 to 1.21 times the floor over five runs, its low
+#: == floor + N * w`` under :class:`_PacingClock`, and ``floor + 2w`` on the runner's clock before it,
+#: so the honest arm measured 1.03 to 1.21 times the floor over five runs, its low
 #: end of 1.03 being the arithmetic one rather than a lucky sample. Read that spread as the host and
 #: not the pacer: the control arms behind it ranged 0.165 s to 0.436 s inside ONE process, which is
 #: contention visible within the measurement itself. A later reading on the same host found 117
 #: processes and 5,308 CPU-seconds, but load was not sampled at the moment those five ran, so the two
 #: are consistent rather than one measurement -- and an ``Event.wait``
 #: returns LATE on Windows, never early (0 of 240, ``tests/_pace_probe.py``). So the slack buys
-#: nothing against a false red and costs discrimination on the one mutation class the decision arm
-#: below cannot see: a wait asked for and then shortened.
+#: nothing against a false red.
+#:
+#: **What it no longer buys is the shortened-wait mutation, and this number is kept anyway.** That
+#: was this arm's exclusive catch on the runner's clock; :class:`_PacingClock` moved it to the
+#: per-wait equality, which reads the shortfall as debt rather than as elapsed seconds, and left this
+#: arm measuring the one thing that equality cannot -- whether the box actually slept. Tightening
+#: 0.95 further would test the host, and loosening it would give away a bound that now costs nothing.
 _PACED_MARGIN = 0.95
 #: Shortest step the schedule may be squeezed to, in seconds. Windows' timer granularity is about
 #: 15.6 ms, so a shorter step stops being the thing measured. Clamping here only RAISES separation.
@@ -344,26 +354,80 @@ _STEP_FLOOR_S = 0.1
 _STEP_CEILING_S = 5.0
 
 
+class _PacingClock:
+    """Stand-in for ``dicom.time``, exposing only ``monotonic()`` and advanced only by the pacer's
+    own decided waits.
+
+    This is the second half of the ``tests/_pace_probe.py`` rule -- a decision read "on a clock the
+    test owns, which no runner can influence". The draft this replaces took the first half only, and
+    :func:`test_a_paced_scp_still_establishes_every_association` carries what that cost and the
+    figures behind it.
+
+    ``dicom.py`` reads ``time`` at exactly two call sites, both of them on this path
+    (``_pace_association``'s ``deficit`` and ``_charge_association``'s ``charge``), which is what
+    makes a module-level swap surgical rather than sweeping. Give it a third and the swap stops being
+    invisible, so :meth:`__getattr__` says that in place of an ``AttributeError`` naming neither
+    pacing nor this file.
+
+    **The origin is the REAL ``time.monotonic()``, not the arbitrary constant ``_pace_probe`` uses,
+    and that difference is load-bearing.** ``_MessagePacer.for_rate`` stamps ``_last`` from ``mllp``'s
+    own ``time`` when the source is CONSTRUCTED, which this swap does not reach. A clock starting
+    anywhere else would hand the bucket a nonsense first interval -- and the same property is what
+    still catches a handler that stops passing a real clock at all, since a constant ``now`` is then
+    incommensurable with ``_last`` rather than merely frozen.
+    """
+
+    def __init__(self) -> None:
+        #: Read and advanced from N concurrent pynetdicom association threads.
+        self._lock = threading.Lock()
+        self._now = time.monotonic()
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self._now += seconds
+
+    def __getattr__(self, name: str) -> Never:
+        raise AttributeError(
+            f"this test models only time.monotonic, but the DICOM pacing path read time.{name}. "
+            f"The module swap in _echo_run is no longer invisible and needs rethinking, not just a "
+            f"wider stand-in."
+        )
+
+
 class _WaitRecorder(threading.Event):
-    """A ``DicomScpSource._stopping`` that records every pacing wait the SCP is asked to take.
+    """A ``DicomScpSource._stopping`` that records every pacing wait the SCP is asked to take, and
+    advances :class:`_PacingClock` by exactly that much.
 
     ``_stopping.wait`` has exactly ONE caller -- the wait in ``_pace_association`` -- so what lands
     here is the pacer's decision and nothing else. The wait still happens: this records what the seam
     DECIDED without changing what the peer experiences, which is the distinction
     ``tests/_pace_probe.py`` draws for the egress pacer (BACKLOG #82). Recording rather than
     substituting is why both timing arms below can be read from one run.
+
+    **The clock advances by the wait REQUESTED, before the wait is taken, and both halves of that are
+    deliberate.** By the request, because the bucket's schedule is then the pacer's own arithmetic and
+    nothing else -- a handler that shortens its wait accrues the shortfall as debt the next arrival
+    inherits, which the decision arm reads directly instead of inferring from the wall clock. Before
+    it, because whether the box actually slept is the OTHER arm's question, and answering it here
+    would put the runner back inside the schedule this class exists to keep it out of.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: _PacingClock) -> None:
         super().__init__()
         #: Driven from N concurrent pynetdicom association threads, so the list needs its own lock.
         self._lock = threading.Lock()
         self._asked: list[float] = []
+        self._clock = clock
 
     def wait(self, timeout: float | None = None) -> bool:
         if timeout is not None:
             with self._lock:
                 self._asked.append(timeout)
+            self._clock.advance(timeout)
         return super().wait(timeout)
 
     @property
@@ -372,46 +436,58 @@ class _WaitRecorder(threading.Event):
             return list(self._asked)
 
 
-async def _echo_run(**settings: object) -> tuple[list[bool], float, list[float]]:
+async def _echo_run(
+    monkeypatch: pytest.MonkeyPatch, **settings: object
+) -> tuple[list[bool], float, list[float]]:
     """Open ``_ECHOES`` C-ECHO associations against one SCP; return what established, the elapsed
     seconds, and every wait the pacer asked for. Serial on purpose: the bound is on the ACCEPTANCE
-    rate, so the arrivals must queue."""
+    rate, so the arrivals must queue.
+
+    The swap is scoped to the run and restored on the way out, so the sibling tests above -- which
+    exercise the pacing wait on the real clock -- are untouched by it.
+    """
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
     src = _scp(**settings)
+    # Built AFTER _scp(), so its origin is at or after the epoch _MessagePacer.for_rate stamped into
+    # `_last` during construction. See _PacingClock for why that ordering is load-bearing.
+    clock = _PacingClock()
     # Installed before start(), which only clear()s it. An unpaced source registers no pacing handler
-    # at all, so its record stays empty -- that emptiness is this recorder's own negative control.
-    recorder = _WaitRecorder()
+    # at all, so its record stays empty -- that emptiness is this recorder's own negative control, and
+    # it is also why swapping the clock on the unpaced arm is a no-op rather than a special case.
+    recorder = _WaitRecorder(clock)
     src._stopping = recorder
 
     async def handler(raw: bytes) -> str | None:  # pragma: no cover - C-ECHO stores nothing
         return None
 
-    await src.start(handler)
-    port = src.sockport
-    try:
+    with monkeypatch.context() as swap:
+        swap.setattr(dicom_module, "time", clock)
+        await src.start(handler)
+        port = src.sockport
+        try:
 
-        def run() -> list[bool]:
-            scu = AE(ae_title="MODALITY1")
-            scu.add_requested_context(Verification)
-            out: list[bool] = []
-            for _ in range(_ECHOES):
-                assoc = scu.associate("127.0.0.1", port, ae_title=_SCP_AE)
-                out.append(bool(assoc.is_established))
-                if assoc.is_established:
-                    assoc.release()
-            return out
+            def run() -> list[bool]:
+                scu = AE(ae_title="MODALITY1")
+                scu.add_requested_context(Verification)
+                out: list[bool] = []
+                for _ in range(_ECHOES):
+                    assoc = scu.associate("127.0.0.1", port, ae_title=_SCP_AE)
+                    out.append(bool(assoc.is_established))
+                    if assoc.is_established:
+                        assoc.release()
+                return out
 
-        start = time.monotonic()
-        established = await asyncio.to_thread(run)
-        return established, time.monotonic() - start, recorder.asked
-    finally:
-        await src.stop()
+            start = time.monotonic()
+            established = await asyncio.to_thread(run)
+            return established, time.monotonic() - start, recorder.asked
+        finally:
+            await src.stop()
 
 
 async def test_a_paced_scp_still_establishes_every_association(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """THE LOAD-BEARING DICOM TEST: pacing waits, it never refuses.
 
@@ -426,10 +502,10 @@ async def test_a_paced_scp_still_establishes_every_association(
     down the debt; and the LAST association's token is charged after it is accepted, with nobody left
     to wait on it.
 
-    **The third draft asserted a fixed absolute difference, ``paced - unpaced >= 0.5``, and this is
-    the rewrite of that (BACKLOG #1536).** Simulating :class:`_MessagePacer` against this connector's
-    call order -- ``EVT_CONN_OPEN`` waits off ``deficit()``, then ``EVT_ACCEPTED`` charges one --
-    gives the schedule exactly, for per-association work ``w``::
+    **The third draft asserted a fixed absolute difference, ``paced - unpaced >= 0.5`` (BACKLOG
+    #1536).** Simulating :class:`_MessagePacer` against this connector's call order --
+    ``EVT_CONN_OPEN`` waits off ``deficit()``, then ``EVT_ACCEPTED`` charges one -- gives the schedule
+    on the RUNNER's clock exactly, for per-association work ``w``::
 
         paced_elapsed == max(N * w, (N - 1 - capacity) / rate + 2 * w)
 
@@ -448,37 +524,73 @@ async def test_a_paced_scp_still_establishes_every_association(
     **So this asserts what the pacer DECIDED before it asserts how long the box took to obey** --
     the rule ``tests/_pace_probe.py`` established for the egress pacer after the same class of flake
     ejected a pull request from the merge queue (BACKLOG #82). ``_stopping.wait`` has one caller, so
-    :class:`_WaitRecorder` turns the pacing wait into a list no runner can influence, and the
-    unpaced control's own record must come back EMPTY -- that pair is what catches a recorder which
-    has stopped recording as well as one that over-records.
+    :class:`_WaitRecorder` turns the pacing wait into a list, and the unpaced control's own record
+    must come back EMPTY -- that pair is what catches a recorder which has stopped recording as well
+    as one that over-records.
 
-    **The wall-clock arm is kept, because the decision arm cannot see a wait that is asked for and
-    not taken.** It is made runner-proof the same way the rate is: choose ``rate`` so the floor lands
-    ``_SEPARATION`` times the measured control and the algebra cancels, since ``floor ==
-    _SEPARATION * unpaced_elapsed`` by construction and ``paced_elapsed >= floor`` exactly, for any
-    ``w``. A spuriously slow control buys a proportionally lower rate and a proportionally larger
-    floor, so control noise moves both sides together. Simulated across a hundredfold swing in the
-    paced arm's speed relative to the control, the ratio never fell below 4.03.
+    **The fourth draft recorded the decision but left it on the RUNNER's clock, and that is half a
+    rule, not a small gap.** ``_pace_probe``'s finding is a decision read "on a clock the test owns,
+    which no runner can influence"; a record kept while the bucket still refills over real elapsed
+    time satisfies the first clause and not the second. The formula above says what it costs. A wait
+    is skipped whenever one association's non-wait work reaches ``1 / rate``, and deriving ``rate ==
+    _PACED_STEPS / (_SEPARATION * unpaced_elapsed)`` makes ``1 / rate`` equal to the control arm's
+    WHOLE elapsed time, so a single association costing about ``N`` times the control's per-
+    association average removes one scheduled wait. Correct pacing, and a red on an equality that
+    said four.
+
+    **Measured, because the arithmetic alone would not say how often.** Twice on 2026-09-13,
+    ``test (windows-2025, py3.14)``: runs 34774731804 and 34784598646, each reporting two waits of
+    about 0.2 s at 3.504/s where the schedule says four, each green on a re-run. Reproduced locally
+    2 times in 33 runs of both arms, worst case ONE wait of four with the paced arm's non-wait work
+    at 0.26 s per association against a 0.322 s step. Synthetic load did not reproduce it: 20 runs
+    under 24 CPU burners and 80 runs across four concurrent workers were all 4 of 4, so the trigger
+    is a scheduling burst rather than steady pressure, which is why widening a band was not the fix.
+
+    **:class:`_PacingClock` takes the missing half, and the schedule then has no runner in it.** The
+    bucket advances by the waits the pacer decides and by nothing else, so every arrival past the
+    burst meets the same debt, the record is exactly ``_PACED_STEPS`` entries of exactly one step,
+    and both assertions below can be equalities. It also turns the competing formula above into an
+    ADDITION, ``paced_elapsed == floor + N * w``, which makes the wall-clock arm strictly stronger
+    than the form it replaces rather than merely unbroken by the change.
 
     **What must hold exactly is that all six associate in both arms** -- a bound on this plane may
     delay a modality, never turn one away.
 
-    **The residual, stated because a threshold that hides one is worse than no threshold.** Both
-    timing arms scale the schedule off the CONTROL arm's work, never the paced arm's, so a paced arm
-    running several times slower per association than the control would stop discriminating: the
-    bucket would refill between arrivals, fewer waits would be asked for, and the wall clock would
-    clear the floor on work. That is a silent loss of power, never a false red, which is the right
-    way round for a required context. The mutation arms are what keep it honest.
+    **The wall-clock arm is kept, because the decision arm cannot see a wait that is asked for and
+    not taken.** Its floor is still scaled off the measured control, because that arm reads real
+    elapsed time and a box slow enough to spend ``floor`` on work alone would satisfy it without any
+    pacing at all: choose ``rate`` so the floor lands ``_SEPARATION`` times the measured control and
+    the algebra cancels. A spuriously slow control buys a proportionally lower rate and a
+    proportionally larger floor, so control noise moves both sides together, and ``_MIN_SEPARATION``
+    says so out loud when a clamp breaks that scaling.
 
-    **Mutation arms, measured 2026-09-11, quiet and under 24-way CPU load.** With
-    ``_pace_association`` returning before it consults the bucket, and again with its
-    ``EVT_CONN_OPEN`` handler never registered, the decision record comes back empty. With the wait
-    HALVED rather than removed the record is still four entries and only the wall clock sees it, at
-    0.86 of the floor -- which is why ``_PACED_MARGIN`` is 0.95 and not the 0.75 an earlier draft
-    used, since 0.75 passes that mutation. Recorded because a test nobody watched fail is not
-    evidence, and because the three do not land on the same assertion.
+    **The residual, stated because a threshold that hides one is worse than no threshold.** The
+    pinned clock costs the decision arm its view of the connector's own clock READ, so a handler
+    swapped onto a different real clock of the same shape would still be paced correctly here. What
+    is lost is narrower than that sounds: :meth:`_PacingClock.__getattr__` refuses any other ``time``
+    attribute outright, and a constant ``now`` is incommensurable with the ``_last`` the pacer stamped
+    from ``mllp``'s untouched clock at construction, so both of those still red. The remaining runner
+    sensitivity all sits in the wall-clock arm, and it is one-sided: a slow box can only overshoot
+    the floor.
+
+    **Mutation arms, measured 2026-09-13 against this pinned clock, each planted alone and reverted.**
+    With ``_pace_association`` returning before it consults the bucket, and again with its
+    ``EVT_CONN_OPEN`` handler never registered, the decision record comes back EMPTY: the count
+    assertion reds, and the wall clock reds behind it at 0.25 and 0.27 of the floor. With the wait
+    HALVED rather than removed the count stays at four and the shortfall becomes debt the next
+    arrival inherits, so the record reads exactly ``[0.5, 0.75, 0.875, 0.9375]`` steps and the
+    per-wait assertion reds on every entry.
+
+    **The halved-wait arm is the one that changed hands, and saying which arm holds it is the point
+    of recording these.** On the runner's clock it was the wall clock's alone, at 0.86 of the floor,
+    which is why ``_PACED_MARGIN`` is 0.95 and not the 0.75 an earlier draft used. Under the pinned
+    clock that arm no longer sees it -- the honest work the paced arm does now ADDS to the elapsed
+    rather than competing with the pacing, so the halved run measured 1.018 of the floor and passed
+    the margin. The per-wait equality is what catches it now, and it catches it on an exact number
+    instead of a threshold. Recorded because a test nobody watched fail is not evidence, and because
+    the three still do not all land on the same assertion.
     """
-    unpaced, unpaced_elapsed, unpaced_waits = await _echo_run()
+    unpaced, unpaced_elapsed, unpaced_waits = await _echo_run(monkeypatch)
     assert unpaced == [True] * _ECHOES, "the control arm could not associate; the fixture is broken"
 
     # Derived in floor-space, because both clamps are reasoned in step DURATIONS and the connector's
@@ -497,8 +609,9 @@ async def test_a_paced_scp_still_establishes_every_association(
         f"runner is too slow for that arm to discriminate"
     )
 
+    step = 1.0 / rate
     paced, paced_elapsed, paced_waits = await _echo_run(
-        max_associations_per_second=rate, association_burst=_PACED_BURST
+        monkeypatch, max_associations_per_second=rate, association_burst=_PACED_BURST
     )
 
     # REPORTED, NOT GATED. A green that used 3 percent of its headroom and a green that used 95
@@ -515,16 +628,16 @@ async def test_a_paced_scp_still_establishes_every_association(
     summary = (
         f"control {unpaced_elapsed:.3f}s -> {rate:.3f}/s, floor {floor:.3f}s | paced "
         f"{paced_elapsed:.3f}s = {realised:.3f}x floor against a {_PACED_MARGIN} bound | waits "
-        f"{len(paced_waits)}/{int(_PACED_STEPS)}"
+        f"{len(paced_waits)}/{int(_PACED_STEPS)} of {step:.3f}s"
     )
     with capsys.disabled():
         print(f"\n[BACKLOG #1536 margin] {summary}")
 
     # The trigger is the ARITHMETIC and not a guessed band: an honest run cannot come in below the
-    # floor, because `paced_elapsed == floor + 2w` for a positive `w`. So a realised fraction under
-    # 1.0 that still clears `_PACED_MARGIN` is pacing already partly degraded, passing on the slack
-    # -- the only state where this test is green and should not be trusted. Healthy runs sit at 1.03
-    # and up and say nothing.
+    # floor, because the pinned clock makes `paced_elapsed == floor + N * w` for a positive `w`. So a
+    # realised fraction under 1.0 that still clears `_PACED_MARGIN` is pacing already partly degraded,
+    # passing on the slack -- the only state where this test is green and should not be trusted.
+    # Healthy runs sit at 1.03 and up and say nothing.
     if realised < 1.0:
         warnings.warn(
             f"DICOM pacing passed BELOW its own arithmetic floor, which an honest run cannot do: "
@@ -540,6 +653,15 @@ async def test_a_paced_scp_still_establishes_every_association(
     assert len(paced_waits) == int(_PACED_STEPS), (
         f"the pacer decided on {len(paced_waits)} wait(s) where the schedule says "
         f"{int(_PACED_STEPS)} at {rate:.3f}/s with a burst of {_PACED_BURST}: {paced_waits}"
+    )
+    # An EQUALITY only because _PacingClock keeps the runner out of the bucket: every arrival past the
+    # burst meets a debt of exactly one token. The tolerance is float noise and nothing else -- the
+    # clock's origin is a real monotonic reading, so `(origin + step) - origin` loses about an ulp of
+    # it per step. This is the arm that separates a wait SHORTENED from a wait skipped: a halved wait
+    # keeps the count at four and lands here on the first entry.
+    assert paced_waits == pytest.approx([step] * int(_PACED_STEPS), rel=1e-6), (
+        f"the pacer decided waits of {paced_waits} where the schedule says {int(_PACED_STEPS)} of "
+        f"exactly {step:.6f}s at {rate:.3f}/s with a burst of {_PACED_BURST}"
     )
     assert paced_elapsed >= floor * _PACED_MARGIN, (
         f"the pacer asked for {sum(paced_waits):.3f}s of waiting but the paced arm took only "
