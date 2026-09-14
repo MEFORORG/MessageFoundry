@@ -1079,7 +1079,7 @@ def _check_handler_security(
 
 
 def _check_validate(config_dir: str | Path) -> CheckResult:
-    from messagefoundry.config.wiring import validate_config
+    from messagefoundry.config.wiring import load_config, validate_config
 
     errors = [d for d in validate_config(config_dir) if d.severity == "error"]
     if errors:
@@ -1087,7 +1087,15 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    return CheckResult("validate", ok=True, required=True, detail="no problems")
+    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
+    # examined NOTHING and one that examined everything and found it good both report no problems.
+    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
+    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # load_config here rather than a second return value out of validate_config, matching the sibling
+    # checks above; the config is known to load, since every error diagnostic returned already.
+    checked, unchecked = load_config(config_dir).encoding_census()
+    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
 # Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
