@@ -107,11 +107,14 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # ``_AUTH_SCHEME`` is worth ZERO and should stay unscoped: its only case-bearing part IS the span that
 # would be scoped, and the two spellings compile to the same program. ``_DSN_PASSWORD`` would pay --
 # it scans two classes under its fold -- but its ``[a-z]`` classes depend on the global fold, so
-# scoping it means rewriting them, and it has a larger and separate problem: ``[a-z0-9+.\-]*`` is
-# unbounded over "." and "-", which is the quadratic shape ``_LABEL_PREFIX``'s ``{0,6}`` bound exists
-# to stop. Measured on a hyphen run, 4.00x the time for 2x the length at every step from 512 B to
-# 8 KB: 0.30, 1.18, 4.72, 18.75, 74.96 ms. That is a fix with its own reasoning and its own test, not
-# a line to fold into this one.
+# scoping it means rewriting them, and that is still a separate change from the one it needed first.
+#
+# THE LARGER PROBLEM THAT SENTENCE NAMED IS FIXED, AND THE NUMBERS ARE KEPT RATHER THAN DELETED.
+# ``[a-z0-9+.\-]*`` was unbounded over "." and "-" -- the quadratic shape ``_LABEL_PREFIX``'s ``{0,6}``
+# bound exists to stop. Measured on a hyphen run, 4.00x the time for 2x the length at every step from
+# 512 B to 8 KB: 0.30, 1.18, 4.72, 18.75, 74.96 ms. It carries a ``{0,63}`` bound now (BACKLOG #1547);
+# what the bound reaches and what it silently costs are stated on the pattern itself, below. The fold
+# scoping stays declined, so this paragraph's conclusion is unchanged.
 #
 # EVERY ALTERNATION OF LITERAL WORDS NEEDS ITS OWN ``(?i:...)``, AND THIS PATTERN HAS TWO. Scope only
 # the first and the optional ``(?:bearer|basic|digest)\s+`` scheme group goes case-SENSITIVE: it stops
@@ -239,7 +242,18 @@ _KEY_MATERIAL = re.compile(
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
 # survive so an operator can still tell which connection failed.
-_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+#
+# THE SCHEME REPETITION BOUND IS LOAD-BEARING, and unlike ``_LABEL_PREFIX``'s it is NOT restated here:
+# both copies of this vocabulary carried the same unbounded class and the same quadratic, so the
+# reasoning, the measurements and what the bound silently costs are stated ONCE, on
+# ``messagefoundry/secretscrub.py``'s ``_DSN_PASSWORD`` (BACKLOG #1547). Two things are local to this
+# surface and worth saying. This pattern is NOT admission-gated the way the write-time copy is, so it
+# scans every line ``GET /logs/tail`` and the support bundle carry, marker or no marker -- measured on
+# a 16 KB hyphen-and-dot run, ``redact_log_line`` cost 429 ms with a ``://`` and 516 ms without one,
+# which is why a no-marker input is a CONTROL for the gated copy and not for this one. And the shared
+# PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so the
+# quadratic was this module's own rather than inherited.
+_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,63}://[^\s:/@]+):[^\s/@]+@")
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
