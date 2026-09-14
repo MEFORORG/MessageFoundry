@@ -2472,13 +2472,19 @@ class SqlServerStore:
         # A DEDICATED EXECUTOR, sized to this pool -- see _build_pool_executor for why sharing the
         # event loop's default one deadlocks rather than merely throttling.
         executor = _build_pool_executor(settings)
-        pool = await aioodbc.create_pool(
-            dsn=connection_string(settings, posture=posture),
-            minsize=1,
-            maxsize=max(1, settings.pool_size),
-            autocommit=False,
-            executor=executor,
-        )
+        try:
+            pool = await aioodbc.create_pool(
+                dsn=connection_string(settings, posture=posture),
+                minsize=1,
+                maxsize=max(1, settings.pool_size),
+                autocommit=False,
+                executor=executor,
+            )
+        except Exception:
+            # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
+            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
+            executor.shutdown(wait=False)
+            raise
         store = cls(
             pool,
             settings,
@@ -2511,9 +2517,15 @@ class SqlServerStore:
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6).
-            pool.close()
-            await pool.wait_closed()
+            # Don't leak the pool if first-open initialization fails (M-6). The executor is released
+            # in a finally, same as close() above: wait_closed() cannot complete while the pool is
+            # wedged, so releasing the executor only on the success path would leak its threads in
+            # exactly the case this except exists for.
+            try:
+                pool.close()
+                await pool.wait_closed()
+            finally:
+                executor.shutdown(wait=False)
             raise
         return store
 

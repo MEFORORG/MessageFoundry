@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1627: ``SqlServerStore.open()`` must release BOTH the ``aioodbc`` pool and its dedicated
-thread-pool executor when a post-pool-creation initialization step fails -- even when closing the
-pool itself hangs.
+"""BACKLOG #1627: ``SqlServerStore.open()`` must release the dedicated thread-pool executor it built
+whenever ANYTHING after it fails -- whether the ``aioodbc`` pool itself never comes up, or a
+post-pool-creation initialization step fails, even when closing the pool hangs.
 
 ``open()`` already wrapped the post-pool-creation awaits in ``try``/``except`` and closed the pool on
 failure (M-6), but the executor built for that pool (``_build_pool_executor`` / ``store._pool_executor``)
 was released nowhere on this path -- a hung ``pool.wait_closed()`` (a connection stuck in a bad state)
 left its threads running with nothing left to reach them, and even a clean ``wait_closed()`` never
 freed them either. The fix moves ``executor.shutdown(wait=False)`` into a ``finally`` wrapped around
-the pool-close sequence, mirroring the ordering ``close()`` already uses.
+the pool-close sequence, mirroring the ordering ``close()`` already uses -- and, found during the same
+pass, ``aioodbc.create_pool()`` itself failing (bad DSN, connect timeout, auth failure) left the
+executor built one line earlier just as orphaned, since nothing referenced it yet; that call is now
+wrapped too.
 
 **Why the fake.** ``aioodbc`` is the optional ``sqlserver`` extra and CI does not install it on every
 leg, so this test stands a recording module in for it -- the lazy ``import aioodbc`` inside ``open()``
@@ -71,6 +74,17 @@ def _install_fake_aioodbc(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> N
     monkeypatch.setitem(sys.modules, "aioodbc", module)
 
 
+def _install_fake_aioodbc_that_never_connects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``create_pool()`` itself raises, the way a bad DSN / connect timeout / auth failure would."""
+
+    async def _create_pool(**kwargs: Any) -> Any:
+        raise RuntimeError("connect boom")
+
+    module = types.ModuleType("aioodbc")
+    module.create_pool = _create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+
+
 def _settings() -> StoreSettings:
     return StoreSettings(
         backend=StoreBackend.SQLSERVER, server="localhost", database="mefor_test", username="sa"
@@ -122,4 +136,21 @@ async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
     assert pool.closed == 1
     assert pool.wait_closed_called == 1
     # The executor shutdown must still fire even though wait_closed() raised instead of returning.
+    assert fake_executor.shutdown_calls == [False]
+
+
+async def test_open_shuts_down_the_executor_when_create_pool_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DIFFERENT leak window than the two tests above: the executor is built before
+    ``aioodbc.create_pool()`` is even called, so a failure THERE (no pool, ever) has to release the
+    executor through its own guard -- the post-pool-creation except block never runs because there is
+    no ``pool`` local to close."""
+    _install_fake_aioodbc_that_never_connects(monkeypatch)
+    fake_executor = _FakeExecutor()
+    monkeypatch.setattr(sqlserver_module, "_build_pool_executor", lambda settings: fake_executor)
+
+    with pytest.raises(RuntimeError, match="connect boom"):
+        await SqlServerStore.open(_settings())
+
     assert fake_executor.shutdown_calls == [False]
