@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 # (mirrors MLLPSource/TcpSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
 
+# Seconds one reply gets to drain to the sender before the connection is dropped. Same value, and the
+# same reasoning, as TcpSource's `_REPLY_DRAIN_GRACE` — see transports/tcp.py for why this is the
+# shutdown grace rather than a new per-connection knob, and why reusing `receive_timeout` would
+# reopen the hole through a supported setting.
+_REPLY_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
 
 # --- destination -------------------------------------------------------------
 
@@ -539,6 +545,24 @@ class X12Source(SourceConnector):
                 logger.warning("X12 server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
+    async def _drain_reply(self, writer: asyncio.StreamWriter) -> None:
+        """Flush one already-written reply to the sender under :data:`_REPLY_DRAIN_GRACE`.
+
+        Re-raises rather than handling the timeout, for the reason spelled out on
+        :meth:`TcpSource._drain_reply`. The delta here is the logging: unlike the MLLP and raw-TCP
+        listeners, ``X12Source`` emits no ADR 0021 ``connection_event`` at all, so this warning is
+        the whole of the engine-side evidence — without it the drop would leave no record anywhere.
+        """
+        try:
+            await asyncio.wait_for(writer.drain(), _REPLY_DRAIN_GRACE)
+        except TimeoutError:
+            logger.warning(
+                "X12 reply to %s not drained within %.1fs; dropping the connection",
+                writer.get_extra_info("peername"),
+                _REPLY_DRAIN_GRACE,
+            )
+            raise
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         task = asyncio.current_task()
@@ -579,7 +603,7 @@ class X12Source(SourceConnector):
                             reply = await self._handler(interchange)
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
-                                await writer.drain()
+                                await self._drain_reply(writer)
                         # Charge AFTER the interchanges in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)
