@@ -14,9 +14,16 @@ stop). For partners who *do* wrap each interchange in a fixed sentinel (STX/ETX,
 The payload is relayed **opaquely**: each received interchange's raw bytes are handed to the pipeline
 handler and routed as a :class:`~messagefoundry.parsing.message.RawMessage` (pair it with
 ``content_type="x12"`` on the inbound, ADR 0004); a Router/Handler parses it on demand via the pure
-:mod:`messagefoundry.parsing.x12` codec. There is **no X12 acknowledgment** (TA1/997/999 are deferred)
-— if a Handler returns a reply it is written back verbatim, otherwise nothing is sent. Delivery is
-at-least-once, so the receiving system must be **idempotent**.
+:mod:`messagefoundry.parsing.x12` codec. There is **no X12 acknowledgment** (TA1/997/999 are deferred).
+Delivery is at-least-once, so the receiving system must be **idempotent**.
+
+**A Handler does not reply down the inbound socket, and must not try.** The reply this connector
+writes back is whatever the *pipeline* handler it was given returns (:data:`InboundHandler`,
+``bytes -> str | None``), and the engine's is ``None`` for every non-HL7 content type — routing runs
+after the ingress commit, not inside this call. A Handler reaches a partner by returning
+``Send("X12-OUT_...", payload)`` to an **outbound** connection; returning the payload BARE is an
+authoring error and raises rather than delivering (BACKLOG #1687). For a synchronous 270/271 use the
+capturing *outbound* (``capture_response``/``reingress_to``, ADR 0016) documented below.
 """
 
 from __future__ import annotations
@@ -462,8 +469,11 @@ class X12Destination(DestinationConnector):
 
 class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
-    **raw bytes** to the pipeline handler. No HL7/X12 ACK: if the handler returns a non-``None`` reply,
-    it is written back verbatim on the same connection; otherwise nothing is sent (fire-and-forget)."""
+    **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
+    (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
+    back verbatim on the same connection; the engine's returns ``None`` for every non-HL7 content type,
+    so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
+    see this module's docstring."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings

@@ -403,8 +403,11 @@ class TcpDestination(DestinationConnector):
 
 class TcpSource(SourceConnector):
     """Listen for inbound raw-TCP connections, deframe each message with the configured codec, and
-    hand its **raw bytes** to the pipeline handler. No HL7 ACK: if the handler returns a non-``None``
-    reply, frame and send it on the same connection; otherwise send nothing (fire-and-forget)."""
+    hand its **raw bytes** to the pipeline handler. No HL7 ACK: if that *pipeline* handler
+    (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply, frame and
+    send it on the same connection. The engine's returns ``None`` for every non-HL7 content type, so a
+    raw-TCP intake is fire-and-forget in practice, and a config **Handler**'s return never reaches
+    here — it goes to an outbound (see :class:`~messagefoundry.config.wiring.Tcp`)."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings
