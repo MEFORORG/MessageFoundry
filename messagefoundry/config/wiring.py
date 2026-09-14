@@ -213,13 +213,70 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
+#: The spellings a ``cast = "bool"`` environment value may carry, case-folded. An operator writes a
+#: boolean into ``environments/<env>.toml`` or a ``MEFOR_VALUE_*`` variable as TEXT, and each of these
+#: reads unambiguously as one side or the other in a config file.
+_BOOL_SPELLINGS: dict[str, bool] = {
+    "true": True,
+    "1": True,
+    "yes": True,
+    "on": True,
+    "false": False,
+    "0": False,
+    "no": False,
+    "off": False,
+}
+
+
+def _cast_bool(raw: Any) -> bool:
+    """Parse an environment value's boolean spelling — the ``cast = "bool"`` named cast (ADR 0007).
+
+    The builtin ``bool`` cannot do this job. An environment value arrives as a **string**, and
+    ``bool(str)`` is true for every non-empty one, so ``MEFOR_VALUE_X=false`` (and ``0``/``no``/``off``)
+    would resolve to ``True`` — the inverse of what the operator wrote, silently, with only an unset or
+    empty value ever reading as ``False``. Recognize the spellings instead, and refuse an unrecognized
+    one rather than guessing a side.
+
+    A value that is already a ``bool`` passes through: ``environments/<env>.toml`` is TOML, so a native
+    ``flag = true`` reaches here typed, and re-parsing it would be the same mistake in reverse. The
+    integers ``0``/``1`` are taken for the same reason — TOML types ``flag = 1`` as an ``int`` and the
+    strings ``"0"``/``"1"`` are already accepted, so refusing only the typed form would be an arbitrary
+    seam. Any other int (``2``, ``-1``) has no unambiguous reading and raises.
+
+    Raises ``ValueError`` — what both cast call sites already catch, so the failure is batched and
+    redacted by :func:`resolve_env_settings` rather than propagating raw. See the raise below for why
+    the message must not name the value."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        spelled = _BOOL_SPELLINGS.get(raw.strip().lower())
+        if spelled is not None:
+            return spelled
+    if isinstance(raw, int) and raw in (0, 1):
+        return raw == 1
+    # NEVER put ``raw`` in this message, and do not rely on the caller to strip it. The value can be a
+    # store password or a connector key, and ``resolve_env_settings`` renders only ``type(exc).__name__``
+    # -- so a value included here would be dropped TODAY, but by that handler's choice rather than by
+    # anything here. That is one edit away from being false: the same value used to leak twice from that
+    # block, once from its own f-string and once from inside ``int``'s "invalid literal for int() with
+    # base 10: '<value>'", and BACKLOG #1183 had to remove both halves. Keeping the value out at the
+    # source makes the invariant hold whatever the handler renders later.
+    raise ValueError(f"not one of {', '.join(sorted(_BOOL_SPELLINGS))} (value withheld)")
+
+
+# ``resolve_env_settings`` builds its operator diagnostic from the cast's ``__name__`` ("value is not a
+# valid <name>"), so this has to read as the cast the operator actually wrote in ``connections.toml`` —
+# "not a valid bool" — rather than naming this private helper.
+_cast_bool.__name__ = "bool"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
     "int": int,
     "float": float,
-    "bool": bool,
+    "bool": _cast_bool,
     "str": str,
 }
 
