@@ -396,13 +396,18 @@ async def _read_request(
 
 
 async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
-    """Read exactly ``n`` body bytes; tolerate a short/early close (return what arrived)."""
+    """Read exactly ``n`` declared Content-Length body bytes, or refuse.
+
+    A peer that closes before sending all of it has broken its own declared framing — the same
+    class of defect :func:`_read_head` already refuses via :class:`HttpRequestError`, just on the
+    body side. Silently returning the short ``exc.partial`` bytes would let a truncated body flow
+    on to become an ingress row and a 202, understating what the sender actually declared."""
     if n == 0:
         return b""
     try:
         return await reader.readexactly(n)
     except asyncio.IncompleteReadError as exc:
-        return exc.partial
+        raise HttpRequestError(400, "incomplete request body", kind="framing_error") from exc
 
 
 async def _read_to_eof(reader: asyncio.StreamReader, cap: int | None) -> bytes:
