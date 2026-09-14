@@ -69,8 +69,13 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # A reply is engine-generated and receipt-sized (`InboundHandler` returns a `str`, never a
 # partner-sized body), so there is nothing to size an operator budget against; and reusing
 # `receive_timeout` would be worse than useless, since its documented `None`/`0` = "no timeout"
-# (see `__init__`) would restore the unbounded drain through a supported setting. The outbound half of
-# this file already bounds its own drains with `self.timeout`; the inbound reply was the outlier.
+# (see `__init__`) would restore the unbounded drain through a supported setting.
+# The gap was an asymmetry worth naming, because it is the wrong way round: every bounded drain in
+# this file and in x12.py sat in a `DestinationConnector`, every unbounded one in a `SourceConnector`.
+# The engine bounded what it INITIATES and not what it RESPONDS TO — yet the responding side is the
+# one a hostile peer controls. An outbound drain stalls because a partner the operator CHOSE is slow;
+# an inbound one stalls because a client nobody vetted stopped reading. So the inbound reply was the
+# outlier rather than the convention, and it was the half that needed the bound most.
 # Named apart from the grace it equals because the two answer different questions — how long one reply
 # may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
 # one must not silently shrink the other.
