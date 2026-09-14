@@ -131,9 +131,31 @@ def run_gate(
             f"PWSH LAUNCH TIMED OUT after {GATE_TIMEOUT_S}s (BACKLOG #1304).\n"
             "This is a PROCESS LAUNCH that never returned. It is NOT an assertion failure and NOT "
             "evidence that the gate's behaviour changed: no gate logic ran.\n"
-            "The observed correlation is with TIME rather than with repository content -- runner "
-            "contention, xdist worker pressure and a pwsh startup regression are all consistent with "
-            "it and NONE is evidenced.\n"
+            # THIS LINE USED TO SAY "runner contention, xdist worker pressure and a pwsh startup
+            # regression are all consistent with it and NONE is evidenced." Two of the three are now
+            # settled, measured 2026-09-13 over five windows-2025 harness jobs plus a pinned local
+            # reproduction.
+            #
+            # CONTENTION IS EVIDENCED. tests/test_session_mail.py::_race starts RACERS=16 concurrent
+            # pwsh processes, three times per job, on a 4-vCPU runner. In every run examined EVERY
+            # test over 20s completes inside the window where the four spawn-heavy files overlap --
+            # 2.4 to 3.1 percent of the run. Held within ONE file, so worker, fixtures and code are
+            # constant and only the clock moves:
+            #     test_worktree_gate_control_plane  inside  n=20  p50 4.39s  max 67.94s
+            #                                       outside n=151 p50 1.98s  max  5.20s
+            # Locally, 16 racers pinned to 4 CPUs move a gate launch from 0.60s to 5.63s median.
+            #
+            # THE STARTUP-REGRESSION CANDIDATE IS REFUTED: all six recorded occurrences report the
+            # same interpreter, and the median launch in those same jobs was about 1s.
+            #
+            # NOT ESTABLISHED: the size of the CI tail. The local arm reproduces the direction and
+            # order of magnitude, not the 34x-68x maximum CI shows. Defender real-time scanning is
+            # off on the box that measured it and on in CI; that gap is untested either way.
+            "The observed correlation is with TIME rather than with repository content. RUNNER "
+            "CONTENTION IS THE EVIDENCED CAUSE, measured 2026-09-13: a 16-process pwsh storm from "
+            "tests/test_session_mail.py::_race, three times per job on a 4-vCPU runner. Every test "
+            "over 20s in every run examined lands inside that overlap window. A pwsh startup "
+            "regression is REFUTED. The SIZE of the tail is not established.\n"
             "DO NOT read this as a regression in the change under test, and DO NOT rerun until green "
             "without recording that you did: a manufactured green and an earned one are "
             "indistinguishable afterwards.\n"
