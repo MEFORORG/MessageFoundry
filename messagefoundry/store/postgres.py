@@ -150,10 +150,12 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
+    _opt_float,
     audit_mac_bytes,
     audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
+    next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
@@ -6799,6 +6801,45 @@ class PostgresStore:
             now,
             user_id,
         )
+
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction, so concurrent attempts --
+        even cross-node, which is the case only this backend has -- serialize on the row rather than
+        each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
+        the reason this has to be one call rather than three. Returns ``(0, False)`` for an unknown
+        user."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT failed_attempts, locked_until FROM users WHERE id=$1 FOR UPDATE", user_id
+            )
+            if row is None:
+                return 0, False
+            state = next_lockout_state(
+                failed_attempts=int(row["failed_attempts"]),
+                locked_until=_opt_float(row["locked_until"]),
+                now=now,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+            )
+            await conn.execute(
+                "UPDATE users SET failed_attempts=$1, locked_until=$2, updated_at=$3 WHERE id=$4",
+                state.attempts,
+                state.locked_until,
+                now,
+                user_id,
+            )
+            return state.attempts, state.just_locked
 
     async def upsert_role(
         self,

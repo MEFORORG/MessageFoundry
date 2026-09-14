@@ -83,6 +83,7 @@ def test_messagestore_satisfies_store_protocol() -> None:
         "delete_user",
         "record_login_success",
         "record_login_failure",
+        "increment_login_failure",
         "upsert_role",
         "list_roles",
         "get_user_role_ids",

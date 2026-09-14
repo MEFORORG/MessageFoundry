@@ -470,6 +470,18 @@ async def test_totp_store_contract(store) -> None:
     await _assert_totp_contract(store)
 
 
+async def test_lockout_store_contract(store) -> None:
+    """The account-lockout counter on the real SQL Server backend.
+
+    ``increment_login_failure`` collapsed a read-modify-write that let parallel failures each read the
+    same pre-increment count and evade the lockout. This leg is the only thing that executes its
+    UPDLOCK body at all -- the shared contract is otherwise proven on SQLite, where the row lock this
+    backend needs does not exist."""
+    from tests._lockout_store_contract import _assert_lockout_contract
+
+    await _assert_lockout_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real SQL Server backend.
 

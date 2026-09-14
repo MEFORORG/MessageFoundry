@@ -1764,6 +1764,12 @@ class AuthStore(Protocol):
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
+    # The RAW lockout-state write: it sets exactly the values it is handed. Its remaining caller is
+    # the offline administrator unlock (ADR 0171), which clears the lock by passing zero and None.
+    # **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
+    # the point.** A caller that computes the next count itself has already lost the increment: the
+    # read it computed from is one await away from the write, and another attempt reads the same
+    # value in between.
     async def record_login_failure(
         self,
         user_id: str,
@@ -1772,6 +1778,20 @@ class AuthStore(Protocol):
         locked_until: float | None,
         now: float | None = None,
     ) -> None: ...
+
+    # The failed-attempt path: read, lapsed-window reset, increment, lockout decision and write, in
+    # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
+    # UPDATE, SQL Server under UPDLOCK). Returns ``(failed_attempts, just_locked)``; ``just_locked``
+    # is decided INSIDE that atomic section and must not be recomputed outside it, where it is only
+    # the stale read again. See ``store.next_lockout_state`` for the policy.
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]: ...
 
     # --- roles / AD-group maps -----------------------------------------------
     async def upsert_role(
