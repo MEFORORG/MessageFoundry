@@ -206,6 +206,12 @@ handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Se
 a list is the idiom shown throughout these docs, but **any non-`str` iterable** delivers the same
 `Send`s (a tuple, a set, or a generator that `yield`s them). An **empty** one (`return []` /
 `return ()`) is the filter: nothing is delivered and the message is logged `FILTERED`.
+
+A Handler returns a `Send`, a `SetState`, a `SetMeta`, an iterable of those, or `None` — **and
+nothing else**. Returning the message itself, `msg.encode()`, a `dict`, or a `(name, message)` tuple
+is an authoring error: the engine raises, naming the handler and the type, and the message is
+`ERROR`/dead-lettered and replayable. It is never silently `FILTERED`, which would be
+indistinguishable from a Handler that deliberately declined it.
 Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
 duplicate name (across **any** of these files) and an inbound that binds a router that doesn't exist.
 
@@ -441,9 +447,11 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
         router="x12_router", content_type="x12")
 ```
 
-- **No HL7 ACK.** A `Tcp(...)` source does **not** generate an HL7 acknowledgement. If a Handler
-  returns a payload it is framed back to the sender on the same connection (so a framed
-  application-level reply is possible); returning `None` sends nothing.
+- **No HL7 ACK, and no reply at all.** A `Tcp(...)` source does **not** generate an HL7
+  acknowledgement, and the engine writes nothing back on the inbound socket — routing runs after the
+  ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
+  returning `Send("<outbound>", payload)`; returning the payload bare is an authoring error and
+  raises (ERROR / dead-letter, replayable) rather than delivering.
 - **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
   validation, or content sniffing in the connector.
 - **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
@@ -519,9 +527,12 @@ inbound("X12-IN_PARTNER_270", X12(port=2710, max_messages_per_second=10, message
 See `samples/config/IB_PARTNER_X12.py` + `samples/messages/x12_270_eligibility.edi` for a runnable
 example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 
-- **No X12 ACK on the *inbound*.** An `X12(...)` source does **not** generate a TA1/997/999. If a
-  Handler returns a payload it is written back **verbatim** on the same connection; returning `None`
-  sends nothing.
+- **No X12 ACK on the *inbound*, and no reply at all.** An `X12(...)` source does **not** generate a
+  TA1/997/999, and the engine writes nothing back on the inbound socket — routing runs after the
+  ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
+  returning `Send("X12-OUT_...", payload)` to an **outbound**; returning the payload bare is an
+  authoring error and raises (ERROR / dead-letter, replayable) rather than delivering. For a
+  synchronous 270/271 use the capturing outbound below.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
