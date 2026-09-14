@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The eight pre-commit gates whose CI mirror nothing else compares (BACKLOG #1395).
+"""The pre-commit gates whose CI mirror nothing else compares (BACKLOG #1395).
 
 ``tests/test_lint_scope_parity.py`` already pins hook-versus-CI equivalence for ``ruff-format``,
 ``ruff-check`` and ``bandit``. **THAT LEAVES EVERY OTHER HOOK WITH A HAND-WRITTEN CI MIRROR AND
@@ -33,7 +33,7 @@ check only that a mirror LOOKS right. The trade is stated again, at the point wh
 **THIS MATTERS BECAUSE THE LOCAL HOOK IS SKIPPABLE.** ``git`` never invokes ``pre-commit`` for a commit
 created by the sequencer, so a rebase or cherry-pick lands a commit with none of the gates in that
 file having run (BACKLOG #1395, reproduced independently by two seats). **The CI mirror is therefore the
-only enforcement left on a replayed commit, and until this file eight of those mirrors could drift away
+only enforcement left on a replayed commit, and until this file those mirrors could drift away
 from the rule they mirror with nothing failing.**
 
 ***WHAT THIS FILE DOES NOT DO, STATED HERE RATHER THAN DISCOVERED LATER.***
@@ -61,7 +61,7 @@ from the rule they mirror with nothing failing.**
   three ids. **It cannot tell an assertion from a mention**, so gutting that file's bandit arms while
   leaving the word in place stays green here. Closing it needs the sibling to publish what its arms
   exercise -- a change there, not here.
-* **The six script-path patterns are safe BY THE CURRENT CORPUS, not by construction.** They were
+* **The script-path patterns are safe BY THE CURRENT CORPUS, not by construction.** They were
   measured at 1-3 hits each, all run lines. Nothing stops a future workflow from mentioning one of
   those paths on a non-comment line that is not an invocation, which is exactly how ``gitleaks`` and
   ``actionlint`` failed before they were anchored on their invocations.
@@ -96,7 +96,7 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 #: CURRENT CORPUS, not by construction, which is why they are regexes too rather than substrings.
 #:
 #: ***THE COUNTS THAT USED TO BE WRITTEN THROUGH THIS FILE -- eight arms, eleven hooks, six patterns
-#: -- ARE GONE ON PURPOSE.*** They were restated in six places and every one of them had to move
+#: -- ARE GONE ON PURPOSE.*** They were restated throughout this file and every one of them had to move
 #: whenever a hook was added, which is a fact with nobody maintaining it. The characterisations that
 #: replaced them stay true whatever `.pre-commit-config.yaml` declares, and the exhaustiveness arm
 #: below is what actually holds the set together.
