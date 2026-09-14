@@ -40,11 +40,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from messagefoundry.config.settings import BackupSettings, StoreBackend
+from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc
-from messagefoundry.store import Store
+from messagefoundry.store import MessageStore, Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
     BackupCodecError,
@@ -56,9 +56,11 @@ from messagefoundry.store.backup_codec import (
 )
 from messagefoundry.store.base import (
     DbaDelegatedError,
+    build_store_cipher,
     resolve_active_key,
     resolve_decrypt_keys,
 )
+from messagefoundry.store.crypto import MARKER_PREFIX, CipherError, cell_aad
 
 __all__ = [
     "BackupRunner",
@@ -108,6 +110,11 @@ class VerifyResult:
     row_counts: dict[str, int] = field(default_factory=dict)
     manifest_counts: dict[str, int] = field(default_factory=dict)
     reason: str | None = None
+    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot. A
+    #: count, never a plaintext. ``0`` on a lightweight verify (it does not run the pass) and on an
+    #: unencrypted store (there is nothing sealed to open) — so it distinguishes "read the PHI" from
+    #: "opened the file", which is the whole difference a full verify is meant to prove.
+    decrypted_cells: int = 0
 
     @property
     def ok(self) -> bool:
@@ -353,6 +360,9 @@ class BackupRunner:
                 keys=[key] if key is not None else [],
                 full=s.full_restore_verify,
                 allow_unencrypted=s.allow_unencrypted,
+                # The LIVE store settings, so a full verify opens the snapshot under this instance's
+                # real cipher/keyring/provider rather than a bare default (see _full_open_check).
+                store_settings=self._store_settings,
             )
             if not verify.ok:
                 # A verify FAIL means the archive is unusable — but it must NOT be counted as the latest
@@ -534,6 +544,9 @@ class BackupRunner:
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
             "verify_integrity_ok": verify.integrity_ok if verify is not None else None,
+            # A COUNT of cipher-covered cells the full verify opened — PHI-free, and the one field that
+            # distinguishes "the snapshot opened" from "its PHI was readable".
+            "verify_decrypted_cells": verify.decrypted_cells if verify is not None else None,
             "pruned": result.pruned,
         }
         await self._store.record_audit(
@@ -644,8 +657,23 @@ def _select_decrypt_key(keys: list[bytes], header_key_id: str) -> bytes | None:
     return None
 
 
+def _as_store_settings(settings: object) -> StoreSettings | None:
+    """Narrow the loosely-typed ``store_settings`` seam to the real model, or ``None``.
+
+    The public entry points (:class:`BackupRunner`, :func:`run_restore_verify`) type it as ``object``,
+    and that annotation is left alone so no caller has to change. The FULL verify needs the real model
+    to reach the cipher/keyring/provider, and anything else must fail the verify rather than quietly
+    fall back to defaults."""
+    return settings if isinstance(settings, StoreSettings) else None
+
+
 def _verify_archive_blocking(
-    *, archive_path: str, keys: list[bytes], full: bool, allow_unencrypted: bool = False
+    *,
+    archive_path: str,
+    keys: list[bytes],
+    full: bool,
+    allow_unencrypted: bool = False,
+    store_settings: object | None = None,
 ) -> VerifyResult:
     """Lightweight (or full) restore-verify of a ``.mfbak`` archive — runs OFF the event loop.
 
@@ -659,10 +687,15 @@ def _verify_archive_blocking(
     archive for an unauthenticated one) and is refused here as ``KEY_MISMATCH`` — unless ``allow_unencrypted``
     is set for a synthetic/no-PHI box.
 
+    ``store_settings`` is this instance's live :class:`StoreSettings`. It is what a ``full`` verify opens
+    the snapshot with, so the snapshot is read under the real cipher, keyring and key provider; without
+    it a ``full`` verify FAILs rather than opening keyless (see :func:`_full_open_check`).
+
     Steps (ADR 0049): (1) key-fingerprint precheck — a mismatch is a clean ``KEY_MISMATCH`` BEFORE any
     decrypt; (2) decrypt the archive; (3) extract + open ``store.db`` read-only, run
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
-    re-opens the snapshot through the real ``open_store`` path (cipher + migrations) — heavier."""
+    re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
+    authenticates every cipher-covered cell in it — heavier."""
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -745,10 +778,14 @@ def _verify_archive_blocking(
                     manifest_counts=manifest_counts,
                     reason=f"row-count mismatch: snapshot={row_counts} manifest={manifest_counts}",
                 )
+            decrypted_cells = 0
             if full:
                 # The heavier end-to-end restore: open the snapshot through the real open_store path
-                # (cipher + migrations) to prove it restores, then discard it.
-                full_ok, full_msg = _full_open_check(snap)
+                # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
+                # discard it.
+                full_ok, full_msg, decrypted_cells = _full_open_check(
+                    snap, _as_store_settings(store_settings)
+                )
                 if not full_ok:
                     return VerifyResult(
                         "FAIL",
@@ -762,6 +799,7 @@ def _verify_archive_blocking(
                 integrity_ok=True,
                 row_counts=row_counts,
                 manifest_counts=manifest_counts,
+                decrypted_cells=decrypted_cells,
             )
     except BackupKeyMismatch as exc:
         return VerifyResult("KEY_MISMATCH", reason=safe_exc(exc))
@@ -802,6 +840,9 @@ async def run_restore_verify(
         keys=keys,
         full=full,
         allow_unencrypted=allow_unencrypted,
+        # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
+        # the keyring above was resolved from, instead of a bare default (see _full_open_check).
+        store_settings=store_settings,
     )
 
 
@@ -863,24 +904,110 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
     return ok, "ok" if ok else "; ".join(results)[:500]
 
 
-def _full_open_check(snap: Path) -> tuple[bool, str]:
-    """Open the snapshot through the real ``open_store`` path (cipher + migrations) on a copy, to prove
-    an end-to-end restore. Heavier; only run for ``full_restore_verify``."""
-    from messagefoundry.config.settings import StoreSettings
+def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[bool, str, int]:
+    """Open the snapshot through the real ``open_store`` path, then decrypt + authenticate its PHI.
+    Returns ``(ok, message, decrypted_cells)``. Heavier; only run for ``full_restore_verify``.
+
+    ``settings`` must be the LIVE store settings, with **only** the path (and the backend, below)
+    substituted. A bare ``StoreSettings(path=...)`` resolves no key, so an ENCRYPTED snapshot opens under
+    the identity cipher: the open succeeds, ``quick_check`` passes, and the verify reports PASS having
+    proved nothing about whether a single PHI cell is readable. Substituting only the path is what keeps
+    every field that governs HOW the bytes are read — ``cipher_provider``, ``key_provider``, the active +
+    retired keyring, ``aad_bind`` — and it is why this is a ``model_copy`` rather than a rebuilt object:
+    a field added to ``StoreSettings`` later rides along instead of being silently dropped.
+
+    ``backend`` is the one other substitution. The extracted member is a SQLite file by construction
+    (``Store.snapshot_to`` writes one, and the integrity/row-count steps above already read it with
+    ``sqlite3``), so an instance that has since moved to a server DB must still verify its older SQLite
+    archive against SQLite rather than dialling Postgres/SQL Server with a file path."""
     from messagefoundry.store.base import open_store
 
+    if settings is None:
+        # Fail-closed. The only thing available without the live settings is a keyless open, and a PASS
+        # from one says nothing about an encrypted archive — which is the archive worth verifying.
+        return False, "no live store settings were supplied for the full restore-verify", 0
+    snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
+
     async def _open() -> tuple[bool, str]:
-        store = await open_store(StoreSettings(path=str(snap)))
+        # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
+        # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
+        # a store that was never created, and not the temp-directory cleanup error a leaked handle
+        # raises over the top of it on Windows one frame up.
+        store = await open_store(snap_settings)
         try:
-            ok, msg = await store.integrity_check()
-            return ok, msg
+            return await store.integrity_check()
         finally:
             await store.close()
 
     try:
-        return asyncio.run(_open())
+        ok, msg = asyncio.run(_open())
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
-        return False, safe_exc(exc)
+        return False, safe_exc(exc), 0
+    if not ok:
+        return False, msg, 0
+    return _decrypt_check(snap, snap_settings)
+
+
+def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[bool, str, int]:
+    """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
+    cipher. Returns ``(ok, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
+
+    Opening the store proves the file is a readable SQLite database. It does not prove the PHI inside it
+    is readable, and those are the two different claims a disaster-recovery check gets confused about: a
+    bit-flipped AEAD cell passes ``PRAGMA quick_check`` and every row count, so without this pass a full
+    verify would report PASS on an archive whose bodies no longer decrypt. Each value is opened with the
+    same cell-bound AAD the store writes (ASVS 11.3.3), so a ciphertext moved between cells fails its tag
+    here exactly as it would at a live read.
+
+    The cell list is the store's own ``MessageStore._CIPHER_COLUMNS`` — what the store declares
+    encrypted-at-rest — rather than a list invented here, so a column added to the cipher's coverage is
+    covered by this pass without a second edit. Its cipher-covered tables whose AAD binds to a
+    composite/natural key (``response``, ``state``, ``reference``, ``shared_body``, ``attachment_chunk``,
+    ``message_events``, ``connection_event``, ``alert_instance``) are NOT in that tuple and are therefore
+    out of scope here: each is a bespoke pass inside the store rather than data any caller can read.
+    Widening this means giving the store one declaration to publish, not copying its private passes into
+    this module."""
+    import sqlite3
+
+    cipher = build_store_cipher(settings)
+    cells = 0
+    conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table, column in MessageStore._CIPHER_COLUMNS:
+            if table not in tables:
+                continue  # an older snapshot predating the table — not a verify failure
+            names = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}  # constant table
+            if column not in names or "id" not in names:
+                continue
+            # table/column are constants from _CIPHER_COLUMNS; only the marker prefix is a parameter.
+            rows = conn.execute(
+                f"SELECT id, {column} FROM {table} WHERE {column} LIKE ?", (f"{MARKER_PREFIX}%",)
+            )
+            for row_id, stored in rows:
+                try:
+                    plain = cipher.decrypt(str(stored), aad=cell_aad(table, column, row_id))
+                except CipherError as exc:
+                    return (
+                        False,
+                        f"{table}.{column} id={row_id} did not decrypt: {safe_exc(exc)}",
+                        cells,
+                    )
+                if cipher.is_encrypted(plain):
+                    # The identity cipher hands an mfenc: value straight back (the #241 F2 keyless-open
+                    # trap): the snapshot holds sealed cells and this open resolved no key for them.
+                    return (
+                        False,
+                        f"{table}.{column} is encrypted at rest but the store settings resolved no key "
+                        "to open it (keyless open of an encrypted snapshot)",
+                        cells,
+                    )
+                cells += 1
+    except sqlite3.Error as exc:
+        return False, safe_exc(exc), cells
+    finally:
+        conn.close()
+    return True, "ok", cells
 
 
 def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
