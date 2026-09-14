@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -386,3 +386,86 @@ def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
     while out_segments and out_segments[-1] == "":
         out_segments.pop()
     return "\r".join(out_segments)
+
+
+# --- the OBX-5 preserve allowlist (shared by both adapters) ---------------------------------------
+
+#: OBX-5 carries a value of the type named in OBX-2, and the ``FREETEXT`` rule redacts it wholesale
+#: (ADR 0030 §3). These are the ONLY value types whose OBX-5 may be left intact — an **allowlist**,
+#: because the inverse (a blocklist of the types known to be narrative) silently preserves every type
+#: nobody thought of: an embedded document (``ED``, an OBX-5 base64 payload — ADR 0028 §7), a
+#: reference pointer (``RP``), a vendor Z-type, or an OBX with no OBX-2 at all. Under a blocklist an
+#: ED document would reach a fixture un-redacted on first use; under the allowlist it is redacted.
+_NUMERIC_OBX_TYPES = frozenset({"NM", "SN", "DT", "TM", "TS"})
+_CODED_OBX_TYPES = frozenset({"ID", "IS"})
+_CODED_ELEMENT_OBX_TYPES = frozenset({"CE", "CWE"})
+
+#: The 1-based TEXT components of a ``CE``/``CWE`` value: 2 *text*, 5 *alternate text*, 9 *original
+#: text*. A coded element carrying free text in any of them is free text, so it is redacted. Component
+#: 9 belongs to CWE only; requiring it empty costs a conformant CE nothing (it has no 9th component)
+#: and fails closed on one that is not conformant.
+_CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
+
+#: The characters a conformant NM/SN/DT/TM/TS subcomponent is drawn from: digits, sign, decimal point,
+#: and the comparator / range / timezone-offset punctuation. No letters and no whitespace, so prose
+#: cannot pass. Separators are excluded because the value is split on the message's OWN separators
+#: (read from MSH) before a part is matched — this class never sees one.
+_NUMERIC_OBX_VALUE: re.Pattern[str] = re.compile(r"[0-9+\-.:/<>=]*")
+
+
+def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
+    """Every subcomponent of every component of every repetition of an OBX-5 value, split on the
+    message's own separators (never a hardcoded ``|^~\\&``). Lazy, so a caller's ``all()`` stops at
+    the first part that fails — a narrative or base64 value is rejected without decomposing it."""
+    return (
+        sub
+        for rep in value.split(seps.repetition)
+        for comp in _components(rep, seps)
+        for sub in comp.split(seps.subcomponent)
+    )
+
+
+def _is_bare_token(part: str) -> bool:
+    """True if ``part`` is at most one whitespace-free token — a table code, never a sentence."""
+    return len(part.split(None, 1)) <= 1
+
+
+def _coded_element_is_bare(value: str, seps: Seps) -> bool:
+    """True if a CE/CWE value carries no narrative: every TEXT component empty, and every other part
+    a bare token. One pass over the value's structure."""
+    for rep in value.split(seps.repetition):
+        for index, comp in enumerate(_components(rep, seps), start=1):
+            if index in _CODED_ELEMENT_TEXT_COMPONENTS:
+                if comp.strip():
+                    return False
+            elif not all(_is_bare_token(sub) for sub in comp.split(seps.subcomponent)):
+                return False
+    return True
+
+
+def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -> bool:
+    """True if an OBX-5 carrying ``value`` under declared type ``value_type`` may be left INTACT.
+
+    The fail-closed half of the OBX-5 free-text rule, shared byte-for-byte by the engine and tee
+    adapters (ADR 0030 §1 parity) so the two can never disagree about a value type. Two gates, and
+    anything that clears neither is redacted:
+
+    * the declared type must be on the preserve allowlist above — an absent, empty or unknown OBX-2
+      falls straight through to ``False``; and
+    * the value must LOOK like the type it claims. A declared type is never taken on trust, because
+      an OBX labelled ``NM`` whose OBX-5 carries a sentence is exactly the narrative the ``FREETEXT``
+      rule exists to redact. Numeric and temporal values are matched against their character class;
+      a coded value must be a bare token; a coded ELEMENT must additionally carry no text component.
+    """
+    declared = (value_type or "").strip().upper()
+    text = value or ""
+    if declared in _NUMERIC_OBX_TYPES:
+        return all(
+            _NUMERIC_OBX_VALUE.fullmatch(part.strip()) is not None
+            for part in _obx5_parts(text, seps)
+        )
+    if declared in _CODED_OBX_TYPES:
+        return all(_is_bare_token(part) for part in _obx5_parts(text, seps))
+    if declared in _CODED_ELEMENT_OBX_TYPES:
+        return _coded_element_is_bare(text, seps)
+    return False
