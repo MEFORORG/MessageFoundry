@@ -151,18 +151,62 @@ def test_a_healthy_repo_passes(tmp_path: Path) -> None:
     assert _run(tmp_path, [_pr(1, merge_state="CLEAN"), _pr(2, merge_state="BLOCKED")]) == 0
 
 
-def test_an_empty_result_fails_closed(tmp_path: Path) -> None:
-    """Zero PRs is a broken query, not a clean repo.
+def test_an_empty_result_is_a_clean_repository(tmp_path: Path) -> None:
+    """Zero open pull requests is a drained queue, and this row used to assert the opposite.
 
-    The repo has had open PRs continuously; a sweep that finds none has failed to look. Reporting
-    success there is the 'nothing pending means all settled' error this codebase keeps re-learning.
+    The old guard returned 2 on an empty list, on the premise that this repository always has
+    something open. The premise expired. Five of the ten scheduled runs before 2026-09-13 failed on
+    it -- run 34475291763 on 2026-09-10 among them, whose open set was reconstructed afterwards as
+    GENUINELY zero -- and because nightly-notice.yml watches this workflow, each red opened an issue
+    about a repository with nothing wrong with it.
     """
-    assert _run(tmp_path, []) == 2
+    assert _run(tmp_path, []) == 0
+
+
+def test_an_empty_sweep_still_says_it_examined_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The discriminating half of the row above, and the reason it is safe.
+
+    Exiting 0 quietly would restore, as a SILENCE, the very conflation the old guard was reaching
+    for. The receipt is what keeps "nothing is stalled" and "nothing was looked at" apart now that
+    the exit code no longer does it.
+    """
+    _run(tmp_path, [])
+    out = capsys.readouterr().out
+    assert "scanned 0 open pull request" in out
+    assert "no open pull requests" in out
 
 
 def test_an_unreadable_payload_fails_closed(tmp_path: Path) -> None:
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
+    assert int(sp.main(["--prs-json", str(bad)])) == 2
+
+
+@pytest.mark.parametrize("payload", ['{"message": "Not Found"}', '"nope"', "null", "12"])
+def test_a_listing_that_is_not_an_array_fails_closed(tmp_path: Path, payload: str) -> None:
+    """A broken query must not arrive downstream wearing an empty list.
+
+    This is the guard the empty-COUNT check was standing in for, moved to where the question is
+    decidable. It is the load-bearing half of relaxing that check: without it, a GitHub error object
+    would be handed back as "nothing is open" -- the FALSE GREEN direction, which is strictly worse
+    than the false red it replaces.
+    """
+    bad = tmp_path / "prs.json"
+    bad.write_text(payload, encoding="utf-8")
+    assert int(sp.main(["--prs-json", str(bad)])) == 2
+
+
+def test_a_listing_row_that_is_not_an_object_fails_closed(tmp_path: Path) -> None:
+    """Dropping an unreadable row silently would under-report stalls with nothing saying so.
+
+    The same defect class as the truncation guard: "I could not see all of it" must never render as
+    "there was nothing to see". Note the payload contains a REAL stall, so a run that silently
+    dropped the bad row would return 1 and look like it had worked.
+    """
+    bad = tmp_path / "prs.json"
+    bad.write_text(json.dumps([_pr(74), "not-an-object"]), encoding="utf-8")
     assert int(sp.main(["--prs-json", str(bad)])) == 2
 
 
