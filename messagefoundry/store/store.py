@@ -117,6 +117,105 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
+# How long a writer-transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
+# thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
+# `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
+# "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
+_WRITER_ROLLBACK_TIMEOUT = 5.0
+
+
+def _drain_detached_rollback(fut: asyncio.Future[None]) -> None:
+    """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        log.warning("sqlite: detached writer rollback failed: %s", exc)
+
+
+async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
+    """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
+    cancellation was swallowed to finish the job.
+
+    Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
+    connection mid-rollback.
+
+    The rollback is **shielded** because a cancellation is the common reason we are here, and an
+    unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
+    half-open transaction this exists to close. It is **bounded** because aiosqlite runs the ROLLBACK
+    on a worker thread that may still be stuck on the abandoned statement.
+
+    A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
+    and the wait resumes for what is left of the bound. This is where SQLite parts company with the
+    pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
+    returns immediately): there the connection is already quarantined out of the pool, so returning
+    early is safe. Here there is exactly ONE writer connection behind one lock, so returning early
+    would release the lock over a half-open transaction and the next writer would inherit it."""
+    loop = asyncio.get_running_loop()
+    rollback = asyncio.ensure_future(db.rollback())
+    deadline = loop.time() + _WRITER_ROLLBACK_TIMEOUT
+    swallowed_cancel = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            rollback.add_done_callback(_drain_detached_rollback)
+            log.warning(
+                "sqlite: writer rollback did not complete within %.1fs; it will finish detached and"
+                " the next writer may inherit an open transaction",
+                _WRITER_ROLLBACK_TIMEOUT,
+            )
+            return swallowed_cancel
+        try:
+            await asyncio.wait_for(asyncio.shield(rollback), remaining)
+        except TimeoutError:
+            continue  # the loop head re-reads the deadline and gives up there
+        except asyncio.CancelledError:
+            swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
+            continue
+        except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
+            log.warning("sqlite: writer rollback failed", exc_info=True)
+        return swallowed_cancel
+
+
+@asynccontextmanager
+async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+    """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    This is the store's single writer-transaction shape. The handler is ``BaseException`` and not
+    ``Exception`` on purpose: :class:`asyncio.CancelledError` derives from ``BaseException``, so an
+    ``except Exception`` rollback never fires on a cancellation and the block would unwind with its
+    transaction still open. SQLite has ONE writer connection behind ``lock``, so the next writer to
+    take the lock would inherit that transaction — its statements would join work the cancelled
+    caller never committed, and the first ``COMMIT`` would make the pair durable together. Under the
+    staged pipeline (ADR 0001) that is how a cancelled stage handoff would lose or duplicate work on
+    first deployment, which is why the unwind is part of the reliability invariant, not hygiene.
+
+    ``BEGIN`` is INSIDE the ``try`` deliberately: aiosqlite runs it on a worker thread, so a
+    cancellation delivered at that await can leave the transaction open with nothing written. A
+    ``ROLLBACK`` with no transaction open is a no-op, so covering it costs nothing.
+
+    The block owns its own ``COMMIT`` (nothing here commits for it), so an early ``return`` after an
+    explicit ``rollback()`` — the idempotent no-op exits — still runs that rollback under the lock."""
+    async with lock:
+        try:
+            await db.execute("BEGIN")
+            yield
+        except BaseException as exc:
+            swallowed_cancel = await _unwind_writer_txn(db)
+            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
+                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
+                # only that failure would drop the cancellation and leave the task running through a
+                # shutdown, so the cancellation wins and carries the original failure as its cause.
+                raise asyncio.CancelledError from exc
+            raise
+
+
+class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Raised inside the group-commit batch's writer transaction when a member failed, so the shared
+    transaction unwinds through :func:`_writer_txn` (under the lock) instead of being rolled back by
+    hand. Caught by :meth:`_GroupCommitter._flush`, which then rejects every member's future."""
+
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Raised inside a grouped member body to short-circuit it WITHOUT failing the batch.
@@ -162,10 +261,13 @@ class _GroupCommitter:
     Coalesces N grouped stage-handoff mutations into ONE ``COMMIT`` under the store's single writer
     lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
     enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
-    runs each member's statements inside one ``BEGIN`` … ``COMMIT``, then resolves every member's
-    future. If ANY member raises (other than :class:`_AbortMember`), or the commit itself fails, the
-    whole batch is rolled back and EVERY member's future is rejected — each caller re-runs (a
-    coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+    runs each member's statements inside one :func:`_writer_txn` (``BEGIN`` … ``COMMIT``), then
+    resolves every member's future. If ANY member raises (other than :class:`_AbortMember`), or the
+    commit itself fails, or the committer task is CANCELLED, the whole batch is rolled back and EVERY
+    member's future is rejected — each caller re-runs (a coordinated form of the crash-re-run the
+    INFLIGHT-guarded idempotent handoffs already tolerate). Resolving the futures on the cancellation
+    path matters as much as the rollback does: a member's caller parks on its future (the ACK gate
+    among them), so a batch abandoned without rejection would park every one of them forever.
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -260,9 +362,8 @@ class _GroupCommitter:
             return
         self._pending = self._pending[len(batch) :]
         results: list[Any] = []
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
+        try:
+            async with _writer_txn(self._db, self._lock):
                 for member in batch:
                     try:
                         results.append((member, await member.run(), None))
@@ -274,22 +375,31 @@ class _GroupCommitter:
                 # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
                 # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
                 # the good members — they share one transaction with the failed mutation.
-                first_error = next((e for _, _, e in results if e is not None), None)
-                if first_error is not None:
-                    await self._db.rollback()
-                    self._reject_all(batch, results)
-                    return
+                if any(e is not None for _, _, e in results):
+                    raise _GroupPoisoned
                 await self._db.commit()
                 # A1 live cost counter: one physical commit covers the whole batch (group-commit's whole
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
-            except Exception as exc:  # noqa: BLE001 — commit/rollback failure fails the whole group
-                try:
-                    await self._db.rollback()
-                except Exception:  # noqa: BLE001 — best-effort; the connection may be unusable
-                    log.warning("group-commit rollback failed", exc_info=True)
-                self._reject_all(batch, results, fallback=exc)
-                return
+        except _GroupPoisoned:
+            self._reject_all(batch, results)
+            return
+        except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
+            self._reject_all(batch, results, fallback=exc)
+            return
+        except BaseException:
+            # Cancellation (shutdown). _writer_txn has already rolled the batch back under the lock;
+            # what is left is that every member's future MUST still be resolved or its caller parks on
+            # it forever — the ACK gate among them. Then re-raise so the committer task really dies.
+            # The fallback is a plain error, not the CancelledError: a member's caller may not itself
+            # be shutting down, and it should see a failure to re-run rather than a cancellation of
+            # its own that it would propagate.
+            self._reject_all(
+                batch,
+                results,
+                fallback=RuntimeError("group commit rolled back (committer cancelled)"),
+            )
+            raise
         # Commit succeeded → publish each member's read-through cache delta (committer frame, durable
         # write in hand) then resolve its future, OUTSIDE the lock. The publish runs BEFORE the future
         # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
@@ -2381,10 +2491,11 @@ class MessageStore:
     ) -> Any:
         """Run one grouped stage-handoff ``body`` (statements only — NO BEGIN/commit/rollback).
 
-        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline under ``self._lock``
-        inside its own ``BEGIN`` … ``commit`` with an except-rollback — byte-identical to the
-        pre-feature path. An :class:`_AbortMember` (the idempotent no-op early-exit) rolls back and
-        returns its carried result, exactly mirroring the old explicit ``rollback(); return <sentinel>``.
+        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline in one
+        :func:`_writer_txn` — its own ``BEGIN`` … ``commit`` under ``self._lock``, unwound on any
+        ``BaseException`` (cancellation included). An :class:`_AbortMember` (the idempotent no-op
+        early-exit) unwinds that transaction and returns its carried result, exactly mirroring the old
+        explicit ``rollback(); return <sentinel>``.
 
         Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
         ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
@@ -2400,17 +2511,13 @@ class MessageStore:
         detached into the committer)."""
         gc = self._group_commit
         if gc is None:
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            try:
+                async with _writer_txn(self._db, self._lock):
                     result = await body()
                     await self._commit()
-                except _AbortMember as abort:
-                    await self._db.rollback()
-                    return abort.result  # zero-mutation no-op: nothing committed → no publish
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember as abort:
+                # Zero-mutation no-op: _writer_txn rolled it back under the lock → nothing to publish.
+                return abort.result
             # Commit landed and the lock is released — publish the committed delta in this same frame,
             # with no await between commit and publish, so a cancel can't interpose and strand the cache.
             if on_commit is not None:
@@ -4222,31 +4329,26 @@ class MessageStore:
         keeps the method a safe no-op if it is ever invoked for an already-consumed row. Returns
         ``True`` if this call performed the handoff, ``False`` if it was a no-op."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
-                )
-                if not cur.rowcount:
-                    # Already handed off by a prior run (crash-restart) — idempotent no-op.
-                    await self._db.rollback()
-                    return False
-                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
-                await self._db.execute(
-                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
-                )
-                event = {
-                    MessageStatus.ROUTED: "routed",
-                    MessageStatus.FILTERED: "filtered",
-                    MessageStatus.UNROUTED: "unrouted",
-                }.get(disposition, "routed")
-                await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
-                await self._commit()
-            except Exception:
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
+                # Already handed off by a prior run (crash-restart) — idempotent no-op.
                 await self._db.rollback()
-                raise
+                return False
+            await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
+            await self._db.execute(
+                "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
+            )
+            event = {
+                MessageStatus.ROUTED: "routed",
+                MessageStatus.FILTERED: "filtered",
+                MessageStatus.UNROUTED: "unrouted",
+            }.get(disposition, "routed")
+            await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
+            await self._commit()
         return True
 
     async def route_handoff(
@@ -5263,16 +5365,14 @@ class MessageStore:
 
         if _standalone:
             # Inline immediate commit (mirrors the disabled path) — never enrol in the committer.
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            # This is the ONE grouped writer with a second transaction of its own, so routing only
+            # _run_grouped would have left this arm with the `except Exception` shape it copied.
+            try:
+                async with _writer_txn(self._db, self._lock):
                     await _body()
                     await self._commit()
-                except _AbortMember:
-                    await self._db.rollback()
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember:
+                pass  # vanished row: _writer_txn rolled it back under the lock
             return
         await self._run_grouped(_body)
 

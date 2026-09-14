@@ -161,9 +161,27 @@ the next reader does not re-derive the wrong precedent from the same comment.
   the intended outcome. What is fixed is pool integrity and the silent EMPTY-all yield.
 - **Backend scope: SQL Server only.** Postgres is structurally safe twice over — `async with
   conn.transaction()` rolls back on any `BaseException` (asyncpg's `__aexit__` tests `extype is not None`,
-  with no `Exception` filter), and asyncpg's pool additionally resets under `asyncio.shield`. SQLite shares
-  the `except Exception` shape but has a single writer connection under an `asyncio.Lock` and no pool, so
-  there is no next-borrower to inherit anything.
+  with no `Exception` filter), and asyncpg's pool additionally resets under `asyncio.shield`.
+
+  **CORRECTED 2026-09-14 (BACKLOG #1548).** This bullet used to end: *"SQLite shares the `except
+  Exception` shape but has a single writer connection under an `asyncio.Lock` and no pool, so there is
+  no next-borrower to inherit anything."* The first clause was right and the conclusion was wrong.
+  **One connection does not remove the next borrower — it makes every later writer the next
+  borrower**, because they all inherit that one connection as soon as the lock is released. A SQLite
+  writer cancelled mid-transaction left it open; the next writer took the lock and its statements
+  joined it. Most of the store's short writers issue no `BEGIN` of their own, so their `COMMIT` would
+  make the abandoned statements durable too. On a stage handoff that is **work loss**, not pool
+  damage: the ingress row's guarded `DELETE` would commit while the routed rows it should have
+  produced never existed. What is genuinely SQL-Server-only is this ADR's **remedy** — quarantine-and-
+  reopen presupposes a pool with spare connections, and SQLite has one writer it cannot throw away.
+  It unwinds in place instead, through the single `_writer_txn` context manager in
+  `messagefoundry/store/store.py`, which carries the mechanism and the reasoning.
+
+  One difference there is worth naming here, because it looks like a copy of `_release_dirty` and is
+  not: both shield the cleanup, but `_release_dirty` swallows a SECOND cancellation and returns at
+  once, which is safe only because the connection is already out of the pool. SQLite's unwind keeps
+  waiting out its bound instead — returning early would release the lock over a half-open
+  transaction, which is the whole hazard.
 - **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
   instance 2, found independently and concurrently). That work traced the other end of this same chain:
   a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),
