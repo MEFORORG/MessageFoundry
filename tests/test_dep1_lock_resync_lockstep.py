@@ -44,8 +44,18 @@ def _exports(path: Path) -> dict[str, str]:
     found: dict[str, str] = {}
     for match in _EXPORT_RE.finditer(text):
         target = match.group("path")
-        assert target not in found, f"{path.name} exports {target} twice"
-        found[target] = match.group("flags")
+        flags = match.group("flags")
+        # A REPEATED EXPORT IS ALLOWED ONLY WHEN IT IS THE SAME EXPORT. `security.yml` carries a
+        # composite job with a byte-identical copy of the DEP-1 step while the security-job
+        # consolidation is in progress, so every lock is exported twice there. Two exports of one
+        # lock with DIFFERENT flags is the real defect this guard was written for -- the two would
+        # write byte-different files and the second would red the diff gate the first just passed --
+        # and that is still refused.
+        assert found.get(target, flags) == flags, (
+            f"{path.name} exports {target} twice with different flags:\n"
+            f"  uv export {found[target]} -o {target}\n  uv export {flags} -o {target}"
+        )
+        found[target] = flags
     assert found, f"no `uv export ... -o <path>` lines found in {path.name}"
     return found
 
@@ -53,10 +63,16 @@ def _exports(path: Path) -> dict[str, str]:
 def _paths(pattern: re.Pattern[str], path: Path) -> tuple[str, ...]:
     text = path.read_text(encoding="utf-8")
     matches = pattern.findall(text)
-    assert len(matches) == 1, (
-        f"expected exactly one {pattern.pattern!r} in {path.name}, got {len(matches)}"
+    assert matches, f"no match for {pattern.pattern!r} in {path.name}"
+    # SAME RULE AS `_exports`: repeats are fine while they agree. The verification list is duplicated
+    # into the composite job for the duration of the security-job consolidation, and a SECOND,
+    # DIFFERENT list is what would actually break -- one step verifying a set the other does not.
+    distinct = {tuple(m.split()) for m in matches}
+    assert len(distinct) == 1, (
+        f"{len(matches)} matches for {pattern.pattern!r} in {path.name} naming "
+        f"{len(distinct)} different path sets: {sorted(distinct)}"
     )
-    return tuple(matches[0].split())
+    return distinct.pop()
 
 
 def test_the_resync_exports_exactly_what_the_gate_exports() -> None:

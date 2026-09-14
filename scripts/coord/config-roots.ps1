@@ -373,9 +373,23 @@ function Get-WiredStateDir {
         publish paths were per-root, or one the out-of-repo propagate stopgap copied. That is a real,
         reportable state (the collector then chooses at run time), and folding it into "wired" is how
         it would go silent.
+
+        TWO SHAPES, BOTH ACCEPTED, AND THE LEGACY ONE IS STILL ON DISK RIGHT NOW. The installer emits a
+        shell-agnostic command -- `pwsh ... -File "<collector>" -StateDir "<state>"` -- because a
+        statusLine entry has no `shell` key and bash cannot parse PowerShell source. Roots wired before
+        that change carry the PowerShell-only `$d = '<state>'` form and keep it until somebody re-runs
+        the installer against each one. Matching only the new shape would report every correctly wired
+        legacy root as carrying no -StateDir at all: the mis-wire diagnosis in usage.ps1 would go blind
+        while still rendering, which is a worse failure than the parse defect the new shape fixes,
+        because nothing anywhere would say so.
     #>
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    # CURRENT SHAPE FIRST. The two cannot cross-match: the legacy command passes the bare variable
+    # `-StateDir $d`, which this pattern rejects for want of the opening quote, and the current command
+    # contains no `$d =` assignment at all.
+    $m = [regex]::Match($Command, '-StateDir\s+"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
     $m = [regex]::Match($Command, "\`$d = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
     return ($m.Groups[1].Value -replace "''", "'")
@@ -385,9 +399,16 @@ function Get-WiredCollectorPath {
     <#
     .SYNOPSIS
         The collector script a root's wired command NAMES. $null when the shape is unrecognised.
+    .DESCRIPTION
+        BOTH SHAPES, for the reason spelled out under Get-WiredStateDir: the current command names the
+        collector as a quoted `-File "<path>"` argument, a legacy one assigns it to `$s` first. Reading
+        only the current shape would report every legacy root's collector as UNKNOWN, and -Status would
+        stop being able to say that a root points at a collector that is gone.
     #>
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    $m = [regex]::Match($Command, '-File\s+"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
     $m = [regex]::Match($Command, "\`$s = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
     return ($m.Groups[1].Value -replace "''", "'")

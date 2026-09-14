@@ -446,6 +446,158 @@ def test_the_installer_refuses_to_replace_someone_elses_statusline(tmp_path: Pat
     )
 
 
+# --- the shell the statusLine is actually run under ------------------------------------------------
+
+BASH = shutil.which("bash")
+
+# THE FORM THAT SHIPPED BEFORE THE SHELL-AGNOSTIC ONE, kept here as a literal so the bash check below
+# carries its own positive control. An instrument that cannot reject this string proves nothing by
+# accepting the current command, and a check that has never failed is not evidence. The paths are
+# stand-ins; what bash chokes on is the PowerShell syntax around them, not their contents.
+LEGACY_POWERSHELL_COMMAND = (
+    "# mefor-usage\n"
+    r"$s = 'C:\Code\usage-collect.ps1'; "
+    r"$d = 'C:\Roots\.claude-account-4\mefor-usage'; "
+    "if (Test-Path -LiteralPath $s) { & pwsh -NoProfile -File $s -StateDir $d } "
+    "else { Write-Output 'mefor-usage: collector missing' }"
+)
+
+
+def bash_parse(tmp_path: Path, command: str, name: str) -> tuple[int, str]:
+    """Does bash ACCEPT this string as a script? ``bash -n`` parses it and runs nothing.
+
+    Written to a file rather than passed through ``-c`` so the bytes bash reads are the bytes out of
+    settings.json, newline and all.
+    """
+    f = tmp_path / name
+    f.write_bytes(command.encode("utf-8"))
+    proc = subprocess.run(
+        [str(BASH), "-n", str(f)], capture_output=True, text=True, timeout=TIMEOUT, check=False
+    )
+    return proc.returncode, proc.stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="the other shell has to be present to check it")
+def test_the_wired_command_parses_under_bash_and_the_form_it_replaced_does_not(
+    tmp_path: Path,
+) -> None:
+    """THE PROPERTY NOTHING IN THIS FILE ASSERTED, which is exactly why the defect survived.
+
+    A statusLine entry has no ``shell`` key -- its keys are ``command``, ``refreshInterval`` and
+    ``type`` -- so unlike the hook entries beside it in the same settings.json it cannot declare
+    PowerShell. Claude Code runs it under bash wherever Git Bash is installed. The command wired until
+    now was PowerShell SOURCE, so bash died at ``{`` and pwsh was never launched: a root wired that way
+    would publish nothing, and every reader downstream would report UNKNOWN without naming the shell.
+
+    THE POSITIVE CONTROL IS HALF OF THIS TEST. ``bash -n`` returning 0 on the current command means
+    nothing unless the same call returns non-zero on the form it replaced. Both readings live in one
+    test so they cannot drift apart.
+    """
+    legacy_rc, legacy_err = bash_parse(tmp_path, LEGACY_POWERSHELL_COMMAND, "legacy.sh")
+    assert legacy_rc != 0, (
+        "bash ACCEPTED the PowerShell-source command, so this check cannot see the class of defect "
+        f"it exists for and its verdict on the current command is worthless: {legacy_err!r}"
+    )
+    assert "syntax error" in legacy_err, f"rejected for some other reason: {legacy_err!r}"
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    assert install("-SettingsPath", str(settings), pin=None).returncode == 0
+    rc, err = bash_parse(tmp_path, wired(settings), "wired.sh")
+    assert rc == 0, f"bash cannot parse the wired statusLine, so it never reaches pwsh: {err!r}"
+
+
+@pytest.mark.skipif(BASH is None, reason="the other shell has to be present to check it")
+def test_bash_runs_the_wired_command_end_to_end_and_it_publishes(tmp_path: Path) -> None:
+    """PARSING IS NOT RUNNING. ``bash -n`` would happily accept a command whose quoting split a path
+    containing a space, or whose backslashes were eaten -- and the collector would then publish
+    nowhere, or into some other directory, with the status bar looking fine. So drive the production
+    string through bash for real and assert the reading lands where the command says it will.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    assert install("-SettingsPath", str(settings), pin=None).returncode == 0
+
+    script = tmp_path / "run-wired.sh"
+    script.write_bytes(wired(settings).encode("utf-8"))
+    payload = json.dumps({"session_id": "bash", "rate_limits": {"five_hour": window(44.0, 3600)}})
+    proc = subprocess.run(
+        [str(BASH), str(script)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+    assert proc.returncode == 0, f"bash could not run the wired command: {proc.stderr!r}"
+    assert "44" in proc.stdout, f"no reading came out of the wired command: {proc.stdout!r}"
+    assert (tmp_path / "mefor-usage" / "latest.json").exists(), (
+        "bash ran the wired command and nothing was published"
+    )
+
+
+def test_both_command_shapes_read_back_their_publish_path_and_collector(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    """CHANGING THE EMITTER WITHOUT THE READERS WOULD BE A WORSE DEFECT THAN THE ONE IT FIXES.
+
+    ``Get-WiredStateDir`` and ``Get-WiredCollectorPath`` matched ``$d = '...'`` and ``$s = '...'``,
+    neither of which the shell-agnostic command contains. Ship part one alone and every correctly
+    wired root reports "legacy command, no -StateDir": the mis-wire diagnosis goes blind while still
+    rendering a confident line, and nothing anywhere says so.
+
+    LEGACY ROOTS ARE NOT HYPOTHETICAL. A root wired before this change keeps the old command until
+    somebody re-runs the installer against it, so both shapes have to read back for as long as one of
+    them is on a disk somewhere.
+    """
+    pin = fake_home / ".claude-account-1"
+    elsewhere = tmp_path / "some-other-root" / "mefor-usage"
+    shapes = {
+        "legacy": f"# mefor-usage\n$s = 'c.ps1'; $d = '{elsewhere}'; x",
+        "current": (
+            f'# mefor-usage\npwsh -NoProfile -NonInteractive -File "c.ps1" -StateDir "{elsewhere}"'
+        ),
+    }
+    for label, command in shapes.items():
+        (pin / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": command}}), encoding="utf-8"
+        )
+        proc = install("-Status", pin=pin, home=fake_home, collector=None)
+        assert str(elsewhere) in proc.stdout, f"the {label} shape's publish path did not read back"
+        assert "ELSEWHERE" in proc.stdout, f"the {label} shape lost the mis-wire diagnosis"
+        assert "legacy command, no -StateDir" not in proc.stdout, (
+            f"the {label} shape was misread as carrying no -StateDir"
+        )
+        assert "collector     : c.ps1" in proc.stdout, (
+            f"the {label} shape's collector did not read back"
+        )
+
+
+def test_a_path_the_two_shells_would_quote_differently_is_refused_before_anything_is_written(
+    tmp_path: Path,
+) -> None:
+    """The cost of one string serving two shells, paid at install time in front of a person.
+
+    Both bash and pwsh expand ``$`` and a backtick inside double quotes, and both read a trailing
+    backslash as escaping the closing quote. No spelling of those survives the pair, so the alternative
+    to refusing is a command that fails in a status bar forever with nothing reporting it. A REFUSAL
+    MUST WRITE NOTHING: the check runs over every target before the first write, because a run that
+    aborted halfway through ``-AllRoots`` would leave the box in exactly the mixed state the
+    both-shapes test above has to tell apart.
+    """
+    root = tmp_path / "has$dollar"
+    root.mkdir()
+    settings = root / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    proc = install("-SettingsPath", str(settings), pin=None)
+    assert proc.returncode == 2, proc.stdout
+    assert "cannot be quoted for both bash and pwsh" in proc.stdout
+    assert json.loads(settings.read_text(encoding="utf-8")) == {}, (
+        "a root the installer refused was written anyway"
+    )
+
+
 def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> None:
     """A wired command that resolves to nothing is this repo's most-repeated defect — the announce hook
     sat merged-and-never-installed for hours, and its own missing-script notice could not fire because it
@@ -485,7 +637,9 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
     state = tmp_path / "mefor-usage"
     # The publish path is baked into the command, so assert it points where this root reads — a
     # recomputed expectation would agree with a wrong wiring.
-    assert f"$d = '{state}'" in cmd, f"the wired command names no per-root publish path: {cmd!r}"
+    assert f'-StateDir "{state}"' in cmd, (
+        f"the wired command names no per-root publish path: {cmd!r}"
+    )
 
     payload = json.dumps({"session_id": "wired", "rate_limits": {"five_hour": window(55.0, 3600)}})
     proc = subprocess.run(
@@ -744,8 +898,8 @@ def test_each_root_is_wired_to_its_own_publish_path_and_they_do_not_bleed(
     b = wired(fake_home / ".claude-account-2" / "settings.json")
     pa = str(fake_home / ".claude-account-1" / "mefor-usage")
     pb = str(fake_home / ".claude-account-2" / "mefor-usage")
-    assert f"$d = '{pa}'" in a
-    assert f"$d = '{pb}'" in b
+    assert f'-StateDir "{pa}"' in a
+    assert f'-StateDir "{pb}"' in b
     assert pb not in a and pa not in b, "one root's wired command names another root's publish path"
 
 

@@ -76,6 +76,30 @@ _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 # discard its findings.
 _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 
+# PENDING PROMOTION: hard-failing, running on every pull request, and NOT YET in branch protection --
+# the transient fourth posture that step 1 of the security-job consolidation creates. The two
+# composites run the same scans as the seven jobs they will replace, and
+# tests/test_security_composite_parity.py asserts each copied body is byte-identical to its original,
+# so during the overlap the repository runs every scan twice and grades one copy.
+#
+# IT IS A STAGING BUCKET, NOT A THIRD PERMANENT POSTURE, and the difference from
+# _ADVISORY_BY_PLACEMENT_SECURITY_JOBS is the whole reason it is a separate list. That bucket says a
+# job CANNOT be required (it never reports on a pull request). This one says a job is not required
+# YET, and must become required: the consolidation only pays once branch protection reads the
+# composite and the seven originals are gone.
+#
+# WHY THE OVERLAP EXISTS AT ALL. A required status context is a JOB NAME. Deleting the seven while
+# protection still names them wedges every pull request in the repository, and moving protection
+# first, to names nothing yet reports, wedges it identically. The workflow header carries the four
+# steps in order.
+#
+# EMPTYING THIS LIST IS STEP 3. When the owner adds a composite context to branch protection and a
+# pull request records it in .github/required-contexts.txt, that same pull request moves the name
+# into _BLOCKING_SECURITY_JOBS -- which drags it under every rule in this module for the first time.
+# `test_pending_promotion_jobs_are_not_recorded_as_required` below is the forcing function for that
+# move, so the two halves cannot be done separately.
+_PENDING_PROMOTION_SECURITY_JOBS = frozenset({"repo-scan", "dependency-and-secret-scan"})
+
 # Job-level `if:` expressions that CANNOT skip the job on a pull_request, with the reason each is safe.
 # Anything else on a required job is a way for the context to silently not report.
 _JOB_IF_ALLOWLIST = {
@@ -146,13 +170,16 @@ def test_every_security_job_is_classified() -> None:
     """
     actual = set(jobs_of(_SECURITY))
     classified = (
-        _BLOCKING_SECURITY_JOBS | _ADVISORY_SECURITY_JOBS | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+        _BLOCKING_SECURITY_JOBS
+        | _ADVISORY_SECURITY_JOBS
+        | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+        | _PENDING_PROMOTION_SECURITY_JOBS
     )
     print(f"[security-posture] classified {len(classified)} of {len(actual)} jobs in {_SECURITY}")
     assert actual == classified, (
         f"security.yml jobs are not all classified.\n"
-        f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS or "
-        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS): "
+        f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS, "
+        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS or _PENDING_PROMOTION_SECURITY_JOBS): "
         f"{sorted(actual - classified)}\n"
         f"  named here but gone from the workflow: {sorted(classified - actual)}"
     )
@@ -244,6 +271,63 @@ def test_advisory_security_jobs_keep_continue_on_error() -> None:
             "_BLOCKING_SECURITY_JOBS, add its context to .github/required-contexts.txt and branch "
             "protection, and remove the schedule/dispatch `if:` gate so it reports on PRs."
         )
+
+
+def test_pending_promotion_jobs_carry_no_continue_on_error() -> None:
+    """The overlap must not be a hole. These scan for real while they wait for protection."""
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_PENDING_PROMOTION_SECURITY_JOBS):
+        job = jobs[key]
+        assert job.get("continue-on-error") in (None, False), (
+            f"security.yml job {key!r} is staged for promotion and declares continue-on-error, which "
+            "discards its findings. A job nobody grades yet is the easiest place for that line to go "
+            "unnoticed, and it would arrive in branch protection already neutered."
+        )
+        for step in job.get("steps") or []:
+            name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            assert (step or {}).get("continue-on-error") in (None, False), (
+                f"security.yml job {key!r}, step {name!r} declares continue-on-error"
+            )
+
+
+def test_pending_promotion_jobs_can_report_on_a_pull_request() -> None:
+    """Promotion is only safe for a job that already reports. This is the precondition, checked early.
+
+    A required context that never reports blocks every pull request forever, and the cheapest moment
+    to find out is before the owner edits branch protection -- not after, when the repository is
+    already wedged and the remedy is another protection edit.
+    """
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_PENDING_PROMOTION_SECURITY_JOBS):
+        expr = jobs[key].get("if")
+        assert expr is None, (
+            f"security.yml job {key!r} is staged for promotion but carries a job-level `if:` "
+            f"({str(expr).strip()!r}). An `if:` that evaluates false SKIPS the job, so as a required "
+            "context it would wedge every pull request it skipped. Gate the expensive STEPS instead."
+        )
+
+
+def test_pending_promotion_jobs_are_not_recorded_as_required() -> None:
+    """The forcing function for step 3: recording the context and reclassifying are ONE change.
+
+    While a job sits in this bucket, nothing in this module grades it the way a blocking job is
+    graded. So a context recorded in .github/required-contexts.txt while its job stayed staged would
+    be a required gate outside the rules written for required gates -- passing here for the sole
+    reason that it is filed in the wrong list.
+    """
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    promoted = sorted(
+        context_of(k, jobs[k])
+        for k in _PENDING_PROMOTION_SECURITY_JOBS
+        if context_of(k, jobs[k]) in required
+    )
+    assert not promoted, (
+        f"{promoted} is recorded as required but is still classified as pending promotion. That is "
+        "step 3 of the consolidation, half done: move the job key into _BLOCKING_SECURITY_JOBS in "
+        "the same change, delete the original jobs it consolidates, and update the distinct-job "
+        "count pinned in test_required_jobs_carry_no_continue_on_error below."
+    )
 
 
 def test_required_jobs_carry_no_continue_on_error() -> None:
