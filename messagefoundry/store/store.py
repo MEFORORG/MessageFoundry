@@ -189,10 +189,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     they hold an implicit transaction with the same exposure. Converting those is deferred work
     (ADR 0159) — do not read this helper's existence as covering them.
 
-    The handler is ``BaseException`` and not
-    ``Exception`` on purpose: :class:`asyncio.CancelledError` derives from ``BaseException``, so an
-    ``except Exception`` rollback never fires on a cancellation and the block would unwind with its
-    transaction still open. SQLite has ONE writer connection behind ``lock``, so the next writer to
+    The handler is ``BaseException`` and not ``Exception`` on purpose:
+    :class:`asyncio.CancelledError` derives from ``BaseException``, so an ``except Exception``
+    rollback never fires on a cancellation and the block would unwind with its transaction still
+    open. SQLite has ONE writer connection behind ``lock``, so the next writer to
     take the lock would inherit that transaction — its statements would join work the cancelled
     caller never committed, and the first ``COMMIT`` would make the pair durable together. Under the
     staged pipeline (ADR 0001) that is how a cancelled stage handoff would lose or duplicate work on
