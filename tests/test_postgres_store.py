@@ -682,6 +682,24 @@ async def test_dead_letter_missing_destinations(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
 
 
+async def test_dead_letter_missing_inbounds(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
+
+
 async def test_audit_chain_verifies(store) -> None:
     await store.record_audit("message_view", actor="alice", detail="view 1")
     await store.record_audit("export", actor="bob", detail="export 1")

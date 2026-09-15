@@ -5955,6 +5955,64 @@ class SqlServerStore:
         )
         return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal channel-keyed queue rows (ingress/routed/response) whose
+        channel_id is no longer in the registry (a removed/renamed inbound) — no router, transform or
+        re-ingress worker is spawned for it and no dispatcher claims its lane, so they'd strand
+        forever. Outbound rows key on destination_name and drain regardless of origin, so they are
+        excluded. Call ONCE at startup, AFTER reset_stale_inflight. ``valid_names`` is the WHOLE
+        deployment's inbound names, never one engine shard's slice. Per-message finalize applocks are
+        pre-acquired in sorted id order to avoid multi-message deadlock; a killed row -> DEAD -> the
+        finalizer resolves the message to ERROR."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT id, message_id, channel_id FROM queue"
+                    " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
+                    (
+                        Stage.INGRESS.value,
+                        Stage.ROUTED.value,
+                        Stage.RESPONSE.value,
+                        OutboxStatus.PENDING.value,
+                        OutboxStatus.INFLIGHT.value,
+                    ),
+                )
+                rows = await cur.fetchall()  # positional: (id, message_id, channel_id)
+                orphans = [r for r in rows if r[2] not in valid_names]
+                if not orphans:
+                    await self._commit(conn)
+                    return 0
+                error = "inbound removed from registry"
+                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                for row in orphans:
+                    await cur.execute(
+                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
+                            now,
+                            row[0],
+                        ),
+                    )
+                    await self._event(cur, row[1], "dead", None, error, now)
+                    await self._maybe_finalize(cur, row[1], now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        log.warning(
+            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+            " inbound(s): %s",
+            len(orphans),
+            ", ".join(sorted({r[2] for r in orphans})),
+        )
+        return len(orphans)
+
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     # The RetentionRunner drives these once the staged pipeline is enabled. Bodies are blanked to ''
     # (not deleted) so cipher re-encrypt scans skip them and the FK to messages stays intact. SQL

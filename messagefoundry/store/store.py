@@ -6459,6 +6459,67 @@ class MessageStore:
             )
             return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter every non-terminal **channel-keyed** row whose ``channel_id`` is no longer in
+        the registry (a removed/renamed inbound). The third startup sweep beside
+        :meth:`dead_letter_missing_destinations` and :meth:`dead_letter_missing_handlers`, closing the
+        one lane key the other two cannot see.
+
+        Scoped to the stages whose lane key IS ``channel_id`` — ingress, routed and response (the
+        outbound stage keys on ``destination_name`` and its delivery worker drains regardless of where
+        the message came from, so an outbound row is never swept here). No router, transform or
+        re-ingress worker is spawned for an unknown inbound and the pooled lane provider for those
+        stages is the live registry's inbound set, so such a row would otherwise sit ``pending``
+        forever — never claimed, never dead-lettered, and invisible to the buildup and stall alerts,
+        which only ask ``pending_depth`` about registry lanes. Call once at startup, after
+        :meth:`reset_stale_inflight`. Returns the rows killed; the message shows ``ERROR`` and an
+        operator replays it (per-message :meth:`replay`) once the inbound is restored — a replay
+        re-pends each row at its own stage, so a routed orphan resumes at transform rather than
+        re-running routing.
+
+        ``valid_names`` must be the WHOLE deployment's inbound names, not one engine shard's slice:
+        a shard's ``registry.inbound`` holds only its own inbounds (ADR 0037), so keying off that map
+        would dead-letter every sibling shard's live rows on a unified store. ``Registry
+        .inbound_names()`` is the pinned whole-config set; the caller passes it."""
+        now = time.time() if now is None else now
+        channel_keyed = (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT id, message_id, channel_id FROM queue"
+                " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
+                (*channel_keyed, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
+            )
+            # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
+            # channel-keyed backlog is small relative to message history.
+            orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "inbound removed from registry"
+            for row in orphans:
+                await self._db.execute(
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                    " WHERE id=?",
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                        now,
+                        row["id"],
+                    ),
+                )
+                await self._event(row["message_id"], "dead", None, error, now)
+                await self._maybe_finalize_message(row["message_id"], now)
+            await self._commit()
+            log.warning(
+                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+                " inbound(s): %s",
+                len(orphans),
+                ", ".join(sorted({r["channel_id"] for r in orphans})),
+            )
+            return len(orphans)
+
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset) — the message-level
         recovery path. **Two modes, by whether anything is stuck:**
