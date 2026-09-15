@@ -1700,12 +1700,15 @@ offer.
 `[security].allowed_client_networks` is a pre-auth network
 gate that applies to **every** pathway equally, so it is a note here rather than a column.
 
-**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** The engine's per-account lockout
-protects **Local** accounts only, and only the password and TOTP/recovery legs **feed** it; WebAuthn
-assertion failures deliberately do not (signatures are not guessable secrets, and a flaky authenticator
+**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** Only the **Local** password and
+TOTP/recovery legs **feed** the engine's per-account lockout, but the lock they set is **enforced
+wherever a pathway reaches an engine account row, directory accounts included** — `verify_mfa` and
+`finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
+OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
+assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
-`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every local factor even
+`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every factor leg even
 though only two legs feed it. Neither fed nor enforced on `POST /me/reauth` or
 `POST /me/password` — which now matters more, because since the AD sign-in was retired the step-up
 re-auth route is the **only** place an AD password is still bound, and it is covered by a per-actor

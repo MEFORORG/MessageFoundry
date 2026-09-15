@@ -19,6 +19,7 @@ nothing here touches PHI.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -944,3 +945,269 @@ def test_an_id_keyed_miss_does_not_fall_back_to_the_name() -> None:
         "which would resolve a reissued name to a different person and never revoke the departed one"
     )
     assert conn.searches[0]["search_filter"].startswith("(objectGUID=")
+
+
+async def _no_sleep(deadline: float) -> None:
+    """Stands in for ``service._sleep_until``: the failure-equalizing pad, without the wall clock."""
+
+
+# --- BACKLOG #1637 / #1638: an ineligible mirror row does not complete a directory login ----------
+#
+# The engine-side account state -- disabled, or locked by the failure counter -- was invisible to
+# ``_complete_ad_login``, which checked provider and directory id and neither of these. These tests
+# drive the SERVICE, where the store is real, so a green means the refusal happened against a row
+# that was written and read back rather than against a double.
+
+
+async def test_a_disabled_mirror_row_does_not_complete_a_directory_login() -> None:
+    """BACKLOG #1637, the name-keyed arm. A disabled row must not mint a session or a success audit.
+
+    Four assertions, because each alone is satisfiable by a wrong implementation: a not-ok outcome is
+    produced by any refusal, so the reason pins WHICH refusal fired; the absent token and the empty
+    session list pin that nothing was issued; and the success-audit count pins the half of this defect
+    an operator would otherwise have read as a completed sign-in.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        user_id = first.identity.user_id
+        await store.set_user_disabled(user_id, disabled=True)
+        # The count BEFORE, not zero. The first login's session is still on the row and this fix does
+        # not revoke it -- disabling an account does not reach back through its live sessions here.
+        # ``identity_for_token`` refuses that session on its next use and the ADR 0079 reconciler
+        # sweeps it; what is asserted below is only that the REFUSAL mints nothing new.
+        before = len(await store.list_sessions(user_id))
+
+        out = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert not out.ok, "an engine-disabled mirror row completed a directory login"
+        assert out.reason == "disabled"
+        assert out.token is None
+        assert len(await store.list_sessions(user_id)) == before, (
+            "the refused login minted a session for a disabled row"
+        )
+        successes = await store.list_audit(action="auth.login_success", actor="jsmith")
+        assert len(successes) == 1, (
+            "the refused attempt wrote a second auth.login_success row; only the first login, "
+            "before the account was disabled, may appear"
+        )
+        failures = await store.list_audit(action="auth.login_failed", actor="jsmith")
+        assert len(failures) == 1 and "disabled" in str(dict(failures[0])["detail"])
+    finally:
+        await store.close()
+
+
+async def test_a_renamed_disabled_account_is_refused_by_the_resolver_before_any_write() -> None:
+    """BACKLOG #1637, THE ARM THAT MATTERS -- the one a check on ``existing`` alone cannot reach.
+
+    On a directory-side rename the caller's name-keyed read MISSES, so ``existing`` is None and the
+    caller's own guard never fires. The row the login lands on comes from the id-keyed lookup inside
+    ``_upsert_ad_user``, and the refusal has to happen there, before that method's writes.
+
+    **The stored-name assertion is the point of this test.** A check written on
+    ``_upsert_ad_user``'s RETURN VALUE would also produce a not-ok outcome, and would have copied the
+    directory's new name onto the row on its way out -- so the username in the store is what
+    separates a refusal sited before the writes from one sited after them.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        user_id = first.identity.user_id
+        await store.set_user_disabled(user_id, disabled=True)
+        before = len(await store.list_sessions(user_id))  # the first login's, which this fix leaves
+
+        # Same immutable id, new sAMAccountName: the rename path.
+        out = await service._complete_ad_login(
+            _principal("jsmith-married", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert not out.ok, "a renamed disabled account completed a directory login"
+        assert out.reason == "disabled"
+        assert out.token is None
+        assert await store.get_user_by_username("jsmith-married") is None, (
+            "the rename was written before the refusal, so the guard is sited after the writes"
+        )
+        row = await store.get_user_by_username("jsmith")
+        assert row is not None and row.id == user_id and row.disabled
+        assert len(await store.list_sessions(user_id)) == before
+    finally:
+        await store.close()
+
+
+async def test_a_refused_disabled_login_does_not_mint_a_replacement_row() -> None:
+    """The must-not-fire control: a refusal must not fall through to the create branch.
+
+    An implementation that refused by making the resolver return None, or by skipping the id-keyed
+    lookup, would mint a SECOND row for the same directory object -- an ineligible account quietly
+    replaced by an eligible new one, which is worse than the defect being fixed.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        await store.set_user_disabled(first.identity.user_id, disabled=True)
+        for name in ("jsmith", "jsmith-married", "jsmith"):
+            out = await service._complete_ad_login(
+                _principal(name, GUID_A_TEXT), None, mfa_verified=True
+            )
+            assert not out.ok and out.reason == "disabled"
+        ad_rows = [u for u in await store.list_users() if u.auth_provider == AuthProvider.AD.value]
+        assert len(ad_rows) == 1, "a refused login minted a replacement row"
+    finally:
+        await store.close()
+
+
+async def test_a_locked_mirror_row_is_refused_and_the_re_login_does_not_clear_the_lock() -> None:
+    """BACKLOG #1638's second half: a directory re-login used to CLEAR a second-factor lock.
+
+    ``record_login_success`` zeroes ``failed_attempts`` and NULLs ``locked_until`` in one UPDATE, and
+    ``_complete_ad_login`` called it unconditionally -- so five wrong codes locked a directory account
+    and a single re-login unlocked it. Both halves are asserted, and the second is the one that
+    fails under a fix that only adds the refusal: the attempt is refused, AND the lock survives it.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        user_id = first.identity.user_id
+        locked_until = time.time() + 900.0
+        await store.record_login_failure(user_id, failed_attempts=5, locked_until=locked_until)
+
+        out = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert not out.ok, "a locked directory account completed a login"
+        assert out.reason == "locked"
+        row = await store.get_user(user_id)
+        assert row is not None
+        assert row.locked_until == pytest.approx(locked_until), "the re-login cleared the lock"
+        assert row.failed_attempts == 5, "the re-login reset the failure counter"
+    finally:
+        await store.close()
+
+
+async def test_a_lapsed_lock_lets_the_directory_login_through_again() -> None:
+    """The must-not-fire arm of the lock guard: the lock releases itself, as control 1 promises.
+
+    Without this arm a ``locked_until`` in the past would refuse forever, converting a 15-minute
+    lockout into a permanent one that no documented operator action would lift.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        await store.record_login_failure(
+            first.identity.user_id, failed_attempts=5, locked_until=time.time() - 1.0
+        )
+        out = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert out.ok, "a lapsed lock still refused the login"
+    finally:
+        await store.close()
+
+
+class _ResolvingLdap:
+    """A directory that ANSWERS, so the Kerberos leg gets past its ``not_in_directory`` branch."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        self._principal = principal
+
+    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+        return None
+
+    def resolve_principal(self, username: str) -> AdPrincipal | None:
+        return self._principal if username == self._principal.username else None
+
+
+async def _kerberos_service(store: MessageStore, principal: AdPrincipal) -> AuthService:
+    settings = AuthSettings(
+        ad_enabled=True,
+        kerberos_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+    service = AuthService(store, settings, ldap=_ResolvingLdap(principal))  # type: ignore[arg-type]
+    await service.initialize()
+    await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+    return service
+
+
+async def test_a_disabled_mirror_row_does_not_complete_a_kerberos_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1637's KERBEROS leg, driven through ``authenticate_kerberos``.
+
+    The Kerberos caller is the one that reaches ``_complete_ad_login`` with NO mechanism slug, which
+    is why the refusal is audited in the ``local_account_conflict`` shape rather than through
+    ``_directory_reject_audit`` -- that helper requires a ``mech`` this leg does not supply. Driving
+    the real entry point is what proves the audit row this leg writes is well-formed.
+    """
+    principal = _principal("jsmith", GUID_A_TEXT)
+    # The failure-equalizing pad is real time; the deadline suite owns that property, so this test
+    # replaces the one sleep site rather than paying for it.
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+    monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "jsmith")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _kerberos_service(store, principal)
+        first = await service.authenticate_kerberos(b"spnego-token")
+        assert first.ok and first.identity is not None, "the Kerberos leg did not complete at all"
+        await store.set_user_disabled(first.identity.user_id, disabled=True)
+
+        out = await service.authenticate_kerberos(b"spnego-token")
+        assert not out.ok, "a disabled mirror row completed a Kerberos login"
+        assert out.reason == "disabled"
+        assert out.token is None
+        successes = await store.list_audit(action="auth.login_success", actor="jsmith")
+        assert len(successes) == 1, "the refused Kerberos login wrote a second success row"
+        failures = await store.list_audit(action="auth.login_failed", actor="jsmith")
+        assert len(failures) == 1
+        assert '"reason": "disabled"' in str(dict(failures[0])["detail"])
+    finally:
+        await store.close()
+
+
+async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1638's Kerberos leg, with the lock-survives half asserted alongside the refusal."""
+    principal = _principal("jsmith", GUID_A_TEXT)
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+    monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "jsmith")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _kerberos_service(store, principal)
+        first = await service.authenticate_kerberos(b"spnego-token")
+        assert first.ok and first.identity is not None
+        user_id = first.identity.user_id
+        locked_until = time.time() + 900.0
+        await store.record_login_failure(user_id, failed_attempts=5, locked_until=locked_until)
+
+        out = await service.authenticate_kerberos(b"spnego-token")
+        assert not out.ok and out.reason == "locked"
+        row = await store.get_user(user_id)
+        assert row is not None
+        assert row.locked_until == pytest.approx(locked_until), "the Kerberos re-login unlocked it"
+        assert row.failed_attempts == 5
+    finally:
+        await store.close()
