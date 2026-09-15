@@ -1013,18 +1013,25 @@ class PostgresStore:
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
-        await store._ensure_schema()
-        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
-        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
-        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
-        # the cipher carries no bound (keyless / `vault_transit`).
-        await store.checkpoint_cipher_invocations()
-        await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-        await (
-            store._load_state_cache()
-        )  # populate the in-memory state read-through cache (ADR 0005)
-        await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
+        try:
+            await store._ensure_schema()
+            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
+            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
+            # since on a store that is having a key enabled for the first time it is itself a large
+            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
+            await store.checkpoint_cipher_invocations()
+            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            await (
+                store._load_state_cache()
+            )  # populate the in-memory state read-through cache (ADR 0005)
+            await (
+                store._load_reference_cache()
+            )  # populate the reference-snapshot read cache (ADR 0006)
+        except Exception:
+            # Don't leak the pool if first-open initialization fails (M-6).
+            await pool.close()
+            raise
         return store
 
     async def _ensure_schema(self) -> bool:

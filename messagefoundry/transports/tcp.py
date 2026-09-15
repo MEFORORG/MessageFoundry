@@ -61,6 +61,26 @@ logger = logging.getLogger(__name__)
 # stop()/reload before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
 
+# Seconds one reply gets to drain to the sender before the connection is dropped.
+# `receive_timeout` bounds the READ and nothing bounded the WRITE, so a peer that stops consuming —
+# its receive window full, the connection still open — would pin the client task and the
+# `max_connections` slot it holds for as long as it liked: the slow-READER half of the slow-loris the
+# read bound exists to stop. Deliberately the shutdown grace rather than a new per-connection knob.
+# A reply is engine-generated and receipt-sized (`InboundHandler` returns a `str`, never a
+# partner-sized body), so there is nothing to size an operator budget against; and reusing
+# `receive_timeout` would be worse than useless, since its documented `None`/`0` = "no timeout"
+# (see `__init__`) would restore the unbounded drain through a supported setting.
+# The gap was an asymmetry worth naming, because it is the wrong way round: every bounded drain in
+# this file and in x12.py sat in a `DestinationConnector`, every unbounded one in a `SourceConnector`.
+# The engine bounded what it INITIATES and not what it RESPONDS TO — yet the responding side is the
+# one a hostile peer controls. An outbound drain stalls because a partner the operator CHOSE is slow;
+# an inbound one stalls because a client nobody vetted stopped reading. So the inbound reply was the
+# outlier rather than the convention, and it was the half that needed the bound most.
+# Named apart from the grace it equals because the two answer different questions — how long one reply
+# may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
+# one must not silently shrink the other.
+_REPLY_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
+
 
 def _codec_from_settings(settings: dict[str, object]) -> FrameCodec:
     """Resolve the connection's :class:`FrameCodec` from its settings (preset OR explicit bytes).
@@ -403,8 +423,11 @@ class TcpDestination(DestinationConnector):
 
 class TcpSource(SourceConnector):
     """Listen for inbound raw-TCP connections, deframe each message with the configured codec, and
-    hand its **raw bytes** to the pipeline handler. No HL7 ACK: if the handler returns a non-``None``
-    reply, frame and send it on the same connection; otherwise send nothing (fire-and-forget)."""
+    hand its **raw bytes** to the pipeline handler. No HL7 ACK: if that *pipeline* handler
+    (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply, frame and
+    send it on the same connection. The engine's returns ``None`` for every non-HL7 content type, so a
+    raw-TCP intake is fire-and-forget in practice, and a config **Handler**'s return never reaches
+    here — it goes to an outbound (see :class:`~messagefoundry.config.wiring.Tcp`)."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -497,6 +520,26 @@ class TcpSource(SourceConnector):
         except Exception as exc:
             logger.warning("TCP connection-event emit failed: %s", safe_exc(exc))
 
+    async def _drain_reply(self, writer: asyncio.StreamWriter) -> None:
+        """Flush one already-written reply to the sender under :data:`_REPLY_DRAIN_GRACE`.
+
+        Re-raises the ``TimeoutError`` rather than handling it here. That is deliberate: a
+        ``TimeoutError`` IS an ``OSError``, so a peer that stopped reading is released down the
+        **same** path a real reset already takes — ``_on_client``'s outer ``OSError`` arm frees the
+        ``max_connections`` slot, emits ``peer_reset`` and closes the socket. A second release path
+        beside that one is how a slot leaks. Only the warning is added here, where the peer is still
+        in hand and the outer arm's redacted ``peer_reset`` alone would not say which bound fired.
+        """
+        try:
+            await asyncio.wait_for(writer.drain(), _REPLY_DRAIN_GRACE)
+        except TimeoutError:
+            logger.warning(
+                "TCP reply to %s not drained within %.1fs; dropping the connection",
+                writer.get_extra_info("peername"),
+                _REPLY_DRAIN_GRACE,
+            )
+            raise
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection (H-2).
@@ -547,7 +590,7 @@ class TcpSource(SourceConnector):
                             reply = await self._handler(message)
                             if reply is not None:
                                 writer.write(self.codec.frame(reply, self.encoding))
-                                await writer.drain()
+                                await self._drain_reply(writer)
                         # Charge AFTER the messages in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)

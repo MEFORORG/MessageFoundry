@@ -22,8 +22,9 @@ name: quality-advisory
 #   * signal  7 - mutation testing (highest leverage)   -> BUILT and WORKING on mutmut 3 (2.5.1 crashed on
 #                                                         Python 3.14 before producing a mutant, and `|| true`
 #                                                         made that look green for months). Measured: 461
-#                                                         mutants in 3s -- 87 killed, 19 survived. Runs on
-#                                                         PRs too; survivor table in the step summary.
+#                                                         mutants in 3s -- 87 killed, 19 survived. OFF pull
+#                                                         requests since the runner-slot pass; survivor table
+#                                                         in the step summary of the nightly cron.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
 # TWO JOBS HERE ARE NOT RUBRIC SIGNALS, AND BOTH ARE HERE ON PURPOSE. `dangling-citations` (BACKLOG
@@ -67,8 +68,14 @@ on:
   workflow_dispatch:
   schedule:
     # Nightly sweep. Every job here is cheap (mutation is ~3s of actual mutating; complexity and clone
-    # are seconds), so the cron is a safety net that catches drift on `main` rather than a cost dodge.
-    # Coverage is PR-only -- it needs a base ref to diff against -- so it no-ops here.
+    # are seconds), and for `clone` and `mutation` this cron is now the ONLY place they run -- both
+    # are gated off pull requests, each in its own header, to stop an advisory job holding a runner
+    # slot the merge queue wants. So this is no longer only a safety net for drift on `main`.
+    #
+    # Coverage is PR-only -- it needs a base ref to diff against -- so it no-ops here. `complexity`
+    # runs on BOTH: its whole-repo triage is the measurement here, and its merge-base delta is the
+    # measurement on a pull request. That split is why gating the whole job would delete a signal
+    # rather than defer one, and it is why it was left on pull requests.
     - cron: "23 4 * * *"
 
 concurrency:
@@ -265,17 +272,27 @@ jobs:
     # queue entries. The scan is not removed; it moves to the cron, which is where a whole-repo
     # duplication report belongs anyway.
     #
-    # SAFE TO SKIP HERE AND NOT IN ITS FOUR SIBLINGS, and the difference is the whole reason this
-    # change gates two jobs rather than the five originally proposed:
+    # SAFE TO SKIP HERE AND NOT IN EVERY SIBLING. These are the three tests, and they are quoted by
+    # `mutation`'s header, which now carries the same `if:` for the same reasons:
     #   * this job reads NO base ref and has NO step gated on `github.event_name == 'pull_request'`,
     #     so nothing inside it becomes unreachable when the job stops running on pull requests;
-    #   * it carries no recorded decision to run on pull requests -- `complexity`, `mutation` and
-    #     `verdict-divergence` each do, in their own headers, and those are left alone;
+    #   * it carries no recorded decision to run on pull requests. `complexity` and `mutation` each
+    #     did, in their own headers. `mutation`'s was OVERTURNED -- see there for the reason it
+    #     never weighed -- while `complexity`'s stands, because the first test is what fails for it:
+    #     its delta step IS gated on `pull_request`, and gating the job would leave that step
+    #     permanently unreachable, deleting the only diff-scoped complexity signal rather than
+    #     deferring it. That is the same objection that keeps `coverage` on pull requests, and it is
+    #     structural, not a preference;
     #   * `liveness` lists this job in `needs:` and tolerates the skip: scripts/quality/liveness.py
     #     excuses a job whose result is in `_DID_NOT_RUN` AND that emitted no receipt, and a job
     #     skipped by this `if:` is exactly that shape. Its own comment names the case ("coverage is
     #     PR-only"). The excuse is conditional on the MISSING RECEIPT, so this does not re-open the
     #     silent-gate hole #1410 closed -- a job that never started cannot have written one.
+    #
+    # THE SIBLING COUNT THAT USED TO STAND IN THIS HEADING IS GONE. It read "its FOUR siblings" and
+    # "the five originally proposed", and three of those jobs -- dangling-citations,
+    # verdict-divergence, deferral-resolution -- retired with the ledger before this sentence was
+    # re-read. A count of jobs written into one job's comment is a fact nothing maintains.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -623,9 +640,30 @@ jobs:
     # NOT expensive, contrary to the note that used to sit here. MEASURED on Python 3.14 (linux, the
     # bounded scope below): 461 mutants in 3 SECONDS -- 87 killed, 19 survived, 355 not covered by the
     # scoped test file. mutmut 3 only runs the tests that actually cover each mutant, so the old
-    # "runs the suite once per mutant" cost model does not apply. That is why this now runs on PRs too:
-    # a real signal for seconds of runtime is worth having in review, which is where survivors get fixed.
+    # "runs the suite once per mutant" cost model does not apply.
+    #
+    # IT USED TO RUN ON PULL REQUESTS, on the recorded ground that "a real signal for seconds of
+    # runtime is worth having in review, which is where survivors get fixed". That decision is
+    # OVERTURNED here, and the reason is one it never weighed: the cost of a job is not its runtime,
+    # it is a RUNNER SLOT held for as long as the job lives -- and the slot is what the merge queue
+    # competes for. This account's peak concurrency was measured at exactly 20, which IS the
+    # free-plan ceiling, so an advisory job on every pull request is paid for in queue entries that
+    # wait. Seconds of mutating still cost a checkout, a Python setup, a uv install and the Qt
+    # headless deps before the first mutant exists.
+    #
+    # IT MEETS THE THREE TESTS THE `clone` JOB'S HEADER SETS OUT, which is why this one moves and
+    # `complexity` does not: it reads NO base ref, it has NO step gated on
+    # `github.event_name == 'pull_request'` -- so nothing inside it becomes unreachable -- and
+    # `liveness` tolerates the skip, because scripts/quality/liveness.py excuses a job whose result
+    # is in `_DID_NOT_RUN` AND that emitted no receipt, which is exactly the shape of a job skipped
+    # by this `if:`. The third one holds only because the excuse is conditional on the MISSING
+    # RECEIPT; a job that never starts cannot have written one, so this does not re-open the
+    # silent-gate hole that condition closed.
+    #
+    # NO SCAN IS DROPPED. The nightly cron runs the same bounded scope over the same tree; the
+    # survivor table arrives in the morning instead of in review.
     name: mutation (advisory)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

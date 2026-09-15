@@ -71,8 +71,14 @@ async def _http(
     body: bytes = b"",
     extra_headers: dict[str, str] | None = None,
     raw_override: bytes | None = None,
+    half_close: bool = False,
 ) -> _Response:
-    """Open one connection, send a request, read the full response (Connection: close)."""
+    """Open one connection, send a request, read the full response (Connection: close).
+
+    ``half_close`` sends a TCP FIN right after the request bytes (via ``write_eof``) while the read
+    side stays open — simulating a peer that stops mid-body rather than one that never connects, so
+    the server's ``readexactly`` sees a real EOF instead of blocking for more bytes that never come.
+    """
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
         if raw_override is not None:
@@ -86,6 +92,8 @@ async def _http(
             head.extend(["", ""])
             writer.write("\r\n".join(head).encode("ascii") + body)
         await writer.drain()
+        if half_close:
+            writer.write_eof()
         try:
             data = await asyncio.wait_for(reader.read(-1), 5.0)  # read to EOF
         except (ConnectionResetError, OSError):
@@ -294,6 +302,35 @@ async def test_malformed_request_refused_and_event(store: MessageStore) -> None:
     assert any(kind == "framing_error" for kind, *_ in events)
 
 
+async def test_incomplete_declared_body_refused_and_event(store: MessageStore) -> None:
+    """A POST declares a larger Content-Length than it actually sends, then closes -- a broken
+    framing declaration on the body side, the twin of the header framing refusals above. It must
+    not flow on to become an ingress row and a 202 receipt for a body shorter than declared
+    (BACKLOG #1657)."""
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0),
+        router="r",
+        content_type=ContentType.TEXT,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        # Declares 100 bytes, sends 5, then half-closes -- the server's readexactly sees a real EOF.
+        resp = await _http(
+            src.sockport,
+            raw_override=b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\nshort",
+            half_close=True,
+        )
+    finally:
+        await src.stop()
+    assert resp.status == 400
+    assert any(kind == "framing_error" for kind, *_ in events)
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    assert (await cur.fetchone())["n"] == 0  # refused BEFORE any ingress row -- no handler ran
+
+
 # --- AC-5: peer-IP allowlist refuse + connection_event -----------------------
 
 
@@ -479,6 +516,17 @@ async def test_read_head_then_read_body_reassembles_the_request() -> None:
     head = await _read_head(reader, max_header_bytes=8192)
     assert head.body == b""
     assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b"HELLO"
+
+
+async def test_read_body_rejects_incomplete_declared_body() -> None:  # BACKLOG #1657
+    # Content-Length declares 10 bytes; the peer sends 5 and the stream ends there (feed_eof). Must
+    # raise rather than silently return the short bytes -- a truncated body must not become an
+    # ingress row and a 202 for a peer that broke its own declared framing.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nshort")
+    head = await _read_head(reader, max_header_bytes=8192)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES)
+    assert excinfo.value.status == 400 and excinfo.value.kind == "framing_error"
 
 
 async def test_read_body_keeps_the_get_before_chunked_ordering() -> None:

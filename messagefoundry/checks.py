@@ -1079,7 +1079,7 @@ def _check_handler_security(
 
 
 def _check_validate(config_dir: str | Path) -> CheckResult:
-    from messagefoundry.config.wiring import validate_config
+    from messagefoundry.config.wiring import load_config, validate_config
 
     errors = [d for d in validate_config(config_dir) if d.severity == "error"]
     if errors:
@@ -1087,7 +1087,15 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    return CheckResult("validate", ok=True, required=True, detail="no problems")
+    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
+    # examined NOTHING and one that examined everything and found it good both report no problems.
+    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
+    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # load_config here rather than a second return value out of validate_config, matching the sibling
+    # checks above; the config is known to load, since every error diagnostic returned already.
+    checked, unchecked = load_config(config_dir).encoding_census()
+    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
 # Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
@@ -1248,6 +1256,25 @@ def _check_dryrun(
                 errors.append(f"{label} @ {ic_name}: {result.error or result.disposition.value}")
     if errors:
         detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
+        return CheckResult("dryrun", ok=False, required=True, detail=detail)
+    if total == 0:
+        # BACKLOG #1671: fixtures exist (the "no *.hl7" skip above already returned) yet the inner
+        # loop never ran, so the success return below would report "0 run(s) clean" — a REQUIRED
+        # check claiming a pass over a verification it never performed. Every sibling marks "I
+        # established nothing" with `skipped=True`, which `CheckResult.blocking` excludes; this was
+        # the one path reaching a non-skipped success on zero work. Keep it a postcondition on
+        # `total`: an equivalent precondition on `deployed_inbounds` would have to be kept in
+        # lockstep with the loop's branching, and it would miss any other path to zero.
+        #
+        # `read_message_sets` only ever pins a fixture to a name drawn from `reg.inbound`, so a
+        # pinned fixture always contributes a run — reaching here means every fixture is unmapped
+        # AND nothing is deployed. The counts below are read, not inferred, so the detail stays
+        # true even if some later path arrives here for a different reason.
+        detail = (
+            f"{len(message_sets)} fixture(s) read but 0 dry-run(s) executed — only "
+            f"{len(deployed_inbounds)} of {len(inbound_names)} inbound(s) are deployed and no "
+            f"fixture is feed-pinned, so every target list was empty"
+        )
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
     pin_note = f", {pinned} feed-pinned" if pinned else ""
     exp_note = f", {asserted} expectation-checked" if asserted else ""

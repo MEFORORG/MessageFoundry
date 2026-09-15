@@ -5,10 +5,11 @@
 Does the *same thing* as ``messagefoundry/anon/hl7.py`` but through a tiny pure-stdlib splitter, so
 the tee needs no ``python-hl7`` / ``messagefoundry`` import (the write-side companion to the existing
 read-only ``tee/hl7_fields.py``). It shares the ``normalized_message`` / ``read_message_seps`` /
-``scrub_message_site_codes`` helpers and the **same fail-closed contract** as the engine adapter: a
-message with no parseable MSH / encoding characters is **refused** (:class:`AnonError`, body-free) —
-never passed through un-anonymized. The golden-corpus + adversarial parity tests pin the two to the
-same output / same refusal.
+``scrub_message_site_codes`` / ``preserve_obx5_value`` helpers and the **same fail-closed contract** as
+the engine adapter: a message with no parseable MSH / encoding characters is **refused**
+(:class:`AnonError`, body-free) — never passed through un-anonymized, and an OBX-5 is preserved only
+against the shared **allowlist** of value types, so an unrecognized or absent OBX-2 is redacted. The
+golden-corpus + adversarial parity tests pin the two to the same output / same refusal.
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
 (read from MSH) and replaces whole fields — surrogate values never contain a field separator.
@@ -19,14 +20,13 @@ from __future__ import annotations
 from .keying import Keyer
 from .rules import AnonError, FieldRule, SurrogateKind
 from .surrogates import (
+    Seps,
     normalized_message,
+    preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
     surrogate_field,
 )
-
-#: OBX-5 is free text only when OBX-2 names a textual value type (see the engine adapter).
-_TEXTUAL_OBX_TYPES = frozenset({"TX", "FT", "ST", "CF"})
 
 
 def _segment_id(path: str) -> str:
@@ -55,7 +55,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
         for fields in segments:
             if not fields or fields[0] != seg_id or seg_id == "MSH":
                 continue  # rules never target MSH (its field numbering is offset by MSH-1)
-            if _skip_obx5(rule, fields):
+            if _skip_obx5(rule, fields, seps):
                 continue
             if fnum < len(fields):
                 fields[fnum] = surrogate_field(rule.kind, fields[fnum], keyer, seps)
@@ -63,9 +63,14 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
     return scrub_message_site_codes(encoded, keyer)
 
 
-def _skip_obx5(rule: FieldRule, fields: list[str]) -> bool:
-    """True if this is the OBX-5 free-text rule but THIS OBX's value type (OBX-2) is non-textual."""
+def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
+    """True if this is the OBX-5 free-text rule and the shared allowlist says THIS OBX's value may be
+    preserved — see :func:`preserve_obx5_value`. Only the way the two adapters reach OBX-2/OBX-5
+    differs; the decision itself is shared."""
     if rule.path != "OBX-5" or rule.kind is not SurrogateKind.FREETEXT:
         return False
-    value_type = (fields[2] if len(fields) > 2 else "").upper()
-    return value_type not in _TEXTUAL_OBX_TYPES
+    return preserve_obx5_value(
+        fields[2] if len(fields) > 2 else None,
+        fields[5] if len(fields) > 5 else None,
+        seps,
+    )

@@ -175,24 +175,38 @@ $V = "0.1.0"   # the exact version you intend to install
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
   --pattern "messagefoundry-$V-*.whl" --pattern "messagefoundry-$V-*.whl.sigstore*"
+if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
 gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry
+if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
 python -m sigstore verify identity "messagefoundry-$V-py3-none-any.whl" `
   --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$V" `
   --cert-oidc-issuer "https://token.actions.githubusercontent.com"
+if ($LASTEXITCODE -ne 0) { throw "sigstore identity verification FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # Only if BOTH pass, install the exact file you verified
 pip install ".\messagefoundry-$V-py3-none-any.whl"
+if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 ```
 
+**Check every exit code.** PowerShell does not stop a script when a native command like `gh` or
+`python` returns a nonzero exit code — it falls straight through to the next line. The block above
+checks `$LASTEXITCODE` after every step and `throw`s before `pip install` ever runs, so a failed
+check actually stops the install; do not drop those checks when you copy this into your own script.
+
 The same attestation also covers the **public PyPI** copy (it is byte-identical), so you can
-`pip download "messagefoundry==$V" --no-deps -d .\verify`, `gh attestation verify` the
-downloaded wheel, then `pip install --no-index --find-links .\verify "messagefoundry==$V"`. A
-registry/mirror substitution or a relabelled file **fails** the check. (The `--cert-identity` ref must
-match the tag you install — e.g. `refs/tags/v0.1.0-rc1` for a pre-release.)
+download-verify-then-install from the index instead: `pip download` the wheel, resolve the download
+folder to **exactly one file** (treat zero matches or several as an error, not a guess), `gh
+attestation verify` that one file, then `pip install` that same resolved file path — never a
+`--find-links` install of the bare package name, which re-resolves against the whole folder and could
+silently pick a different file than the one you verified. See
+[INSTALL-GUIDE.md §3](INSTALL-GUIDE.md#verify-the-release-before-you-install-supply-chain-integrity)
+for the exact script, exit-code checks included. A registry/mirror substitution or a relabelled file
+**fails** the check. (The `--cert-identity` ref must match the tag you install — e.g.
+`refs/tags/v0.1.0-rc1` for a pre-release.)
 
 For a **reproducible pinned** deploy, generate a hash-locked requirements file scoped to the extras you
 actually run and install it with `--require-hashes`. The scaffolded config repo (`messagefoundry init`,

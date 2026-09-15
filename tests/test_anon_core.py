@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Core anonymizer behaviour (ADR 0030): keying, the rule model, surrogates, the HL7 adapter, and the
-fail-closed leak-check — engine side."""
+fail-closed leak-check — engine side, with one exception. The OBX-5 preserve allowlist is asserted on
+BOTH adapters here, because the rule is a property of the shared predicate rather than of either
+seam's plumbing; engine/tee whole-message equality stays in ``test_anon_parity.py``."""
 
 from __future__ import annotations
 
 import secrets
 import string
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,10 @@ from messagefoundry.anon.keying import (
     _estimated_entropy_bits,
 )
 from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_field
+
+# The OBX-5 allowlist below is asserted on BOTH adapters. The tee copy is a standalone vendored
+# sibling (ADR 0030 §1) that cannot import `messagefoundry`, so it is imported here by its own name.
+from tee.anon import anonymize as tee_anonymize
 
 # The leak-check delegates to scripts/security/scan_forbidden.py (the relocated forbidden-content
 # scanner). It ships on the public mirror but loads its real customer/vendor token list from a
@@ -284,12 +290,91 @@ def test_anonymize_scrubs_phi_keeps_structure_and_routing() -> None:
     assert pid.split("|")[3].count("~") == 1
 
 
-def test_obx5_freetext_only_when_value_type_textual() -> None:
+def test_obx5_freetext_preserved_only_for_allowlisted_value_type() -> None:
     out = anonymize(_SAMPLE, salt=_SALT)
     obx = [line for line in out.split("\r") if line.startswith("OBX")]
     assert "128" in obx[0]  # NM result kept
     assert "[REDACTED]" in obx[1]  # TX note redacted
     assert "[REDACTED]" in next(line for line in out.split("\r") if line.startswith("NTE"))
+
+
+# --- OBX-5 preserve allowlist (both adapters) -------------------------------------------------------
+#
+# The rule, and why it is an allowlist rather than a blocklist, is stated once at
+# `messagefoundry.anon.surrogates.preserve_obx5_value`. What is pinned here is that BOTH adapters
+# apply it: the engine drives a parsed `Message`, the tee a pure stdlib splitter, and the two reach
+# OBX-2/OBX-5 differently, so each case runs through both. Whole-message engine/tee equality stays
+# in tests/test_anon_parity.py, which carries these fixtures in its own corpus.
+
+_ADAPTERS = (anonymize, tee_anonymize)
+
+
+def _obx_message(obx: str) -> str:
+    """One OBX under a synthetic ORU (no real PHI — CLAUDE.md §9)."""
+    return _msg(
+        r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260101120000||ORU^R01|MSGCTRL|P|2.5.1",
+        r"PID|1||12345^^^HOSP^MR||DOE^JOHN||19800101|M",
+        obx,
+    )
+
+
+def _obx5_of(message: str, field_sep: str = "|") -> str:
+    """The OBX-5 field of the first OBX — read positionally, so a substring that happens to survive
+    elsewhere in the message cannot make a redaction assertion pass by luck."""
+    line = next(seg for seg in message.split("\r") if seg.startswith("OBX"))
+    fields = line.split(field_sep)
+    return fields[5] if len(fields) > 5 else ""
+
+
+# Every one of these must be REDACTED. `JVBERi0xLjQK` is the base64 of a PDF header ("%PDF-1.4"),
+# which is what an ED document looks like on the wire; the narrative values are fabricated.
+_OBX5_REDACTED = {
+    "embedded document (ED)": "OBX|1|ED|DOC^Report^L||SENDER^AP^PDF^Base64^JVBERi0xLjQK|",
+    "reference pointer (RP)": "OBX|1|RP|DOC^Report^L||http://example.invalid/r^^^^|",
+    "empty value type": "OBX|1||DOC^Report^L||Patient JOHN DOE seen|",
+    "unknown value type": "OBX|1|ZZZ|DOC^Report^L||Patient JOHN DOE seen|",
+    # A DECLARED type is not taken on trust: the label says numeric, the value is a sentence.
+    "NM label over prose": "OBX|1|NM|8480-6^Systolic^LN||Patient JOHN DOE seen|",
+    "CWE with text component": "OBX|1|CWE|DX^Diagnosis^L||I10^Essential hypertension^ICD10|",
+}
+
+# Every one of these must be PRESERVED. Asserting these is not optional: over-redaction destroys
+# legitimate coded and numeric results, and a scrubbed corpus still looks scrubbed, so nothing else
+# in the suite would notice.
+_OBX5_PRESERVED = {
+    "numeric (NM)": ("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]", "128"),
+    "structured numeric (SN)": ("OBX|1|SN|RG^Range^L||>^100|", ">^100"),
+    "timestamp (TS)": ("OBX|1|TS|CL^Collected^L||20260101120000|", "20260101120000"),
+    "coded id (ID)": ("OBX|1|ID|SX^Sex^L||F|", "F"),
+    "CWE with no text component": ("OBX|1|CWE|DX^Diagnosis^L||I10^^ICD10|", "I10^^ICD10"),
+}
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@pytest.mark.parametrize("case", sorted(_OBX5_REDACTED), ids=lambda c: c.replace(" ", "_"))
+def test_obx5_redacts_everything_off_the_allowlist(adapter: Callable[..., str], case: str) -> None:
+    out = adapter(_obx_message(_OBX5_REDACTED[case]), salt=_SALT)
+    assert _obx5_of(out) == "[REDACTED]", f"{case} left OBX-5 intact"
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@pytest.mark.parametrize("case", sorted(_OBX5_PRESERVED), ids=lambda c: c.replace(" ", "_"))
+def test_obx5_preserves_allowlisted_value_types(adapter: Callable[..., str], case: str) -> None:
+    obx, expected = _OBX5_PRESERVED[case]
+    out = adapter(_obx_message(obx), salt=_SALT)
+    assert _obx5_of(out) == expected, f"{case} was over-redacted"
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+def test_obx5_allowlist_is_separator_aware(adapter: Callable[..., str]) -> None:
+    """The allowlist reads the message's OWN encoding characters (CLAUDE.md §8), never ``|^~\\&``:
+    the same CWE decision must hold under a message that declares different separators."""
+    message = _msg(
+        "MSH!*~\\&!SAPP!SFAC!RAPP!RFAC!20260101120000!!ORU*R01!MSGCTRL!P!2.5.1",
+        "PID!1!!12345*x*x*HOSP*MR!!DOE*JOHN!!19800101!M",
+        "OBX!1!CWE!DX*Diagnosis*L!!I10*Essential hypertension*ICD10!",
+    )
+    assert _obx5_of(adapter(message, salt=_SALT), field_sep="!") == "[REDACTED]"
 
 
 def test_anonymize_is_deterministic_and_salt_sensitive() -> None:
