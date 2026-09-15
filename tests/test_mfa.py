@@ -20,6 +20,7 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import (
+    ACCOUNT_LOCKED,
     MFA_DISABLED,
     MFA_ENABLED,
     RECOVERY_CODE_USED,
@@ -384,6 +385,68 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         results = await asyncio.gather(*(service.verify_mfa(t, codes[0]) for t in tokens))
         assert sum(1 for r in results if r.ok) == 1  # one caller wins the single-use code
         assert (await service.mfa_status(identity)).recovery_codes_remaining == 2  # consumed once
+    finally:
+        await store.close()
+
+
+async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout() -> None:
+    """Security review (TOCTOU): N wrong credentials submitted AT ONCE must still lock the account.
+
+    This is the concurrency proof for the atomic failure counter; ``store.next_lockout_state`` carries
+    the race it closes and why the count cannot be computed outside the store's own lock.
+
+    **Both legs feed that one counter, so both are asserted** -- wrong passwords through ``login`` and
+    wrong TOTP codes through ``verify_mfa``. Each arm ends on whether the account is LOCKED, never on
+    the count alone: a counter that reaches the threshold while ``locked_until`` stays NULL admits the
+    very next guess, so the count cannot discriminate a fixed engine from a broken one. The burst is
+    deliberately LARGER than the threshold, which is also what pins the one-notice-per-lockout
+    contract -- past the threshold every further attempt lands while the lock is live, and only the
+    attempt that crossed may notify.
+    """
+    store = await _store()
+    try:
+        threshold, burst = 3, 5
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store,
+            AuthSettings(
+                lockout_threshold=threshold, lockout_minutes=15, mfa_recovery_code_count=3
+            ),
+            security_notifier=notifier,
+        )
+        identity, token, password = await _bootstrap_login(service)
+
+        # --- arm 1: parallel wrong PASSWORDS ------------------------------------------------------
+        outs = await asyncio.gather(*(service.login("admin", "wrong") for _ in range(burst)))
+        assert not any(o.ok for o in outs)
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == burst  # not one increment was lost
+        refused = await service.login("admin", password)
+        assert not refused.ok and refused.error == "account locked"  # the RIGHT password is refused
+        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+
+        # Clear the lock the way a lapsed window would, so arm 2 starts from an unlocked account.
+        # This is the raw lockout-state write (ADR 0171's offline unlock), not the counting path.
+        await store.record_login_failure(identity.user_id, failed_attempts=0, locked_until=None)
+
+        # --- arm 2: parallel wrong TOTP codes -----------------------------------------------------
+        enroll = await service.begin_mfa_enrollment(identity)
+        enrolled = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert enrolled.ok
+        # A live code with its first digit advanced: guaranteed not to be the current step's code, so
+        # this arm cannot flake on the 1-in-a-million chance a hard-coded "000000" is genuinely valid.
+        live = fresh_totp(enroll.secret)
+        wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"
+        tokens = [(await service.login("admin", password)).token for _ in range(burst)]
+        assert all(tokens)
+        results = await asyncio.gather(*(service.verify_mfa(t, wrong_code) for t in tokens))
+        assert not any(r.ok for r in results)
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == burst
+        locked_out = await service.login("admin", password)
+        assert not locked_out.ok and locked_out.error == "account locked"
     finally:
         await store.close()
 
