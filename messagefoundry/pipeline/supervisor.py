@@ -6,8 +6,8 @@
 :mod:`messagefoundry.pipeline.sharding`) and spawns ONE ``messagefoundry serve --shard <id>``
 subprocess per shard, each with its own SQLite db file (``<stem>_<id>.db``) and its own API port
 (``<base>+offset``). It then **monitors** the children on the asyncio loop, **restarts** any that
-exit unexpectedly, and on a shutdown signal **stops them all cleanly** (terminate, then kill after a
-grace period).
+exit unexpectedly, and on a shutdown signal **stops them all cleanly**: ask, wait
+``terminate_grace`` seconds, then force whatever is still running.
 
 Why a supervisor (and not just N hand-run ``serve`` commands): an operator tags connections with a
 shard name and runs one command; the supervisor turns the shard discovery into a fixed, reproducible
@@ -16,8 +16,9 @@ tears it down together. A single (default) shard yields a single subprocess — 
 a plain ``serve``, so sharding is opt-in and invisible until used.
 
 Concurrency: every child is an :class:`asyncio.subprocess.Process`; the supervise loop is pure
-asyncio (no blocking the loop, cooperative cancellation). Each shard has a watcher task awaiting its
-child's exit and relaunching it; shutdown cancels the watchers and drains the children.
+asyncio (no blocking the loop, cooperative cancellation). Each shard has a watcher task that races
+its child's exit against the stop event and relaunches on a crash, so either :meth:`Supervisor.stop`
+or a cancellation ends the watchers and the supervisor then drains the children.
 
 Deferred (noted for follow-up, not built here): restart backoff / crash-loop breaker, per-shard
 structured logging aggregation, graceful in-flight drain on restart, and a shared single-db
@@ -28,7 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -171,7 +174,22 @@ SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
 
 
 async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
-    """Launch one shard subprocess from its argv (inherits stdout/stderr → NSSM/console)."""
+    """Launch one shard subprocess from its argv (inherits stdout/stderr → NSSM/console).
+
+    On Windows the child goes into its OWN process group. That is what makes a *cooperative* stop
+    deliverable at all: ``Process.terminate()`` there is ``TerminateProcess`` — a force with no
+    request before it — so the supervisor asks with a ``CTRL_BREAK`` console event instead, and
+    ``GenerateConsoleCtrlEvent`` can only be aimed at a process GROUP. Without the flag the child
+    shares the console's group and the event would reach every process on that console, the sender
+    included. POSIX needs no flag: ``terminate()`` is already SIGTERM.
+
+    The new group also stops the console's own Ctrl-C from reaching the child, which is why
+    :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
+    """
+    if sys.platform == "win32":
+        return await asyncio.create_subprocess_exec(
+            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        )
     return await asyncio.create_subprocess_exec(*spec.argv)
 
 
@@ -187,7 +205,8 @@ class Supervisor:
 
     Inject ``spawn`` for tests (default: launch a real ``serve``). ``restart`` controls whether an
     unexpectedly-exited child is relaunched (the operator runtime sets it True; a one-shot smoke may
-    set it False). ``terminate_grace`` is the seconds to wait after terminate() before kill().
+    set it False). ``terminate_grace`` is the seconds to wait after the stop request before forcing
+    the child.
     """
 
     specs: Sequence[ShardSpec]
@@ -203,7 +222,8 @@ class Supervisor:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
 
         Each shard runs under its own watcher task that relaunches it on an unexpected exit (when
-        ``restart``). Cancelling :meth:`run` (or signalling stop) drains all children cleanly.
+        ``restart``). Either route drains all children cleanly: :meth:`stop` ends the watchers so
+        ``gather`` returns and the ``else`` branch drains, and a cancellation takes the branch above.
         """
         self._stopping.clear()
         watchers = [
@@ -224,19 +244,30 @@ class Supervisor:
             await self._terminate_all()
 
     async def _watch(self, spec: ShardSpec) -> None:
-        """Keep one shard alive: spawn it, await exit, relaunch on an unexpected exit."""
+        """Keep one shard alive: spawn it, await exit OR a stop request, relaunch on a crash.
+
+        The wait races the child's exit against ``_stopping``, so :meth:`stop` alone ends this
+        watcher — awaiting the exit on its own left ``run``'s ``gather`` blocked until something
+        cancelled it, and the event woke nobody.
+        """
         while not self._stopping.is_set():
             child = _Child(spec, await self.spawn(spec))
             self._children[spec.shard] = child
             logger.info(
                 "shard %r started (pid=%s, port=%d)", spec.shard, child.process.pid, spec.port
             )
+            exited = asyncio.ensure_future(child.process.wait())
+            stopping = asyncio.ensure_future(self._stopping.wait())
             try:
-                rc = await child.process.wait()
-            except asyncio.CancelledError:
-                raise  # shutdown — leave the child for _terminate_all to drain
+                await asyncio.wait({exited, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                # Both are cancelled on EVERY exit path, this watcher's own cancellation included,
+                # so neither outlives the loop iteration — no abandoned cleanup task, no shield.
+                exited.cancel()
+                stopping.cancel()
             if self._stopping.is_set():
-                return
+                return  # shutdown — leave the child for _terminate_all to drain
+            rc = exited.result()
             if not self.restart:
                 logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
                 return
@@ -249,18 +280,40 @@ class Supervisor:
             )
 
     def stop(self) -> None:
-        """Signal a cooperative shutdown (idempotent). Watchers stop relaunching; children are drained
-        by the running :meth:`run` once its watchers are cancelled. Safe to call from a signal handler."""
+        """Signal a cooperative shutdown (idempotent). The watchers stop relaunching and return, so
+        the running :meth:`run` drains the children itself — no cancellation needed. Safe to call
+        from a signal handler."""
         self._stopping.set()
 
+    def _request_stop(self, child: _Child) -> None:
+        """Ask one child to stop — the request half of request, wait, force.
+
+        POSIX: ``terminate()`` is SIGTERM, already a request. Windows: ``terminate()`` is
+        ``TerminateProcess``, so the request is a ``CTRL_BREAK`` aimed at the child's own process
+        group. The send is gated on ``spawn is _default_spawn`` because that is the only launch here
+        that sets ``CREATE_NEW_PROCESS_GROUP`` — an injected spawn's child shares the console's group,
+        where the event would reach every process on that console, this one included. A refused break
+        falls through to the force rather than leaving the child running.
+        """
+        if sys.platform == "win32" and self.spawn is _default_spawn:
+            try:
+                os.kill(child.process.pid, signal.CTRL_BREAK_EVENT)
+            except OSError as exc:
+                logger.warning(
+                    "shard %r: CTRL_BREAK refused (%s) — forcing instead", child.spec.shard, exc
+                )
+            else:
+                return
+        try:  # noqa: SIM105
+            child.process.terminate()
+        except ProcessLookupError:
+            pass  # already gone
+
     async def _terminate_all(self) -> None:
-        """Terminate every live child, escalating to kill() after ``terminate_grace`` seconds."""
+        """Ask every live child to stop, then force what is still running after ``terminate_grace``."""
         live = [c for c in self._children.values() if c.process.returncode is None]
         for child in live:
-            try:  # noqa: SIM105
-                child.process.terminate()
-            except ProcessLookupError:
-                pass  # already gone
+            self._request_stop(child)
         for child in live:
             try:
                 await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
