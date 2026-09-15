@@ -2176,7 +2176,7 @@ def create_app(
             # the moment an operator reached for it and recovery would mean the JSON API. Recording the
             # state unconditionally also means a state added later surfaces here with no edit.
             #
-            # `rr.running` gates the tri-state because `outbound_status` reports "running" for any lane
+            # `rr.running` gates the live state because `outbound_status` reports "running" for any lane
             # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
             # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
