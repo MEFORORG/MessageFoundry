@@ -198,6 +198,35 @@ def _is_lock_timeout(exc: BaseException) -> bool:
     return f"({_LOCK_TIMEOUT_NATIVE_ERROR})" in str(exc)
 
 
+# SQL Server native error 1205 = deadlock victim: the server rolled this transaction back to break a
+# deadlock cycle. Like a lock timeout it leaves NO committed effect, so a re-issue is safe.
+_DEADLOCK_NATIVE_ERROR = 1205
+
+
+def _is_transient_write_conflict(exc: BaseException) -> bool:
+    """True iff ``exc`` is a transient SQL Server write conflict that is SAFE TO RETRY after a rollback:
+    a client-side query timeout (SQLSTATE ``HYT00`` — the statement gave up WAITING for a lock, having
+    committed nothing) or a deadlock-victim rollback (native error 1205). Both leave the transaction
+    with no persisted effect, so re-issuing an increment cannot double-apply it. Matched on the stable
+    driver substrings (rather than importing pyodbc, the lazy extra), like :func:`_is_lock_timeout`.
+
+    NOT the same predicate as ``transports.database._is_transient``, and deliberately not shared with
+    it: that one keys on a parsed SQLSTATE instead of this module's driver-substring convention, and it
+    is broader by design -- it admits the ``08`` connection-exception class, which is precisely where
+    you CANNOT prove the transaction committed nothing. Retrying an increment on an ``08`` would risk
+    the double-count this method exists to prevent."""
+    s = str(exc)
+    return "HYT00" in s or f"({_DEADLOCK_NATIVE_ERROR})" in s
+
+
+# add_cipher_invocations bounds: a HOLDLOCK-serialized burst of concurrent increments on ONE key can
+# make a waiter give up (HYT00) or be a deadlock victim (1205) on a slow/contended server — the very
+# engine-shard fleet the method promises to survive. Both roll back with no committed effect, so a
+# bounded retry-with-backoff is safe and no-double-count. Backoff is per-1-based-attempt.
+_CIPHER_MERGE_ATTEMPTS = 5
+_CIPHER_MERGE_BACKOFF = 0.05
+
+
 # The lane column is NVARCHAR(256); a longer requested lane name can never match a real lane. On
 # the ADR 0114 proc path the lane list rides one JSON parameter through a server-side CAST — a
 # TRUNCATING cast could make an oversized name's prefix match a REAL lane, a shard-safety contract
@@ -9221,29 +9250,58 @@ class SqlServerStore:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
         NEGATIVE ``count`` refunds an unspent reserve at settlement). See the SQLite twin. MERGE with
         HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an engine-shard
-        fleet (a bare IF EXISTS/INSERT races)."""
+        fleet (a bare IF EXISTS/INSERT races).
+
+        That serialized fleet can make a waiter time out (HYT00) or lose a deadlock (1205) on a slow or
+        contended server; both roll the statement back with NO committed effect, so we retry (bounded,
+        with backoff). ``merged`` is the no-double-count guard: it is set the instant the MERGE returns
+        its OUTPUT — after that a failure could be a completed-but-unacknowledged COMMIT, so we NEVER
+        retry then (a re-issue would double-count the security-critical GCM invocation bound)."""
         now = time.time()
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "MERGE cipher_meta WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
-                    " ON t.key_id = s.key_id"
-                    " WHEN MATCHED THEN UPDATE SET"
-                    " t.invocations = t.invocations + s.invocations, t.updated_at = s.updated_at"
-                    " WHEN NOT MATCHED THEN"
-                    " INSERT (key_id, invocations, updated_at)"
-                    " VALUES (s.key_id, s.invocations, s.updated_at)"
-                    " OUTPUT INSERTED.invocations;",
-                    (key_id, int(count), now),
-                )
-                row = await cur.fetchone()
-                total = int(row[0]) if row is not None else int(count)
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return total
+        for attempt in range(_CIPHER_MERGE_ATTEMPTS):
+            merged = False
+            retry = False
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "MERGE cipher_meta WITH (HOLDLOCK) AS t"
+                        " USING (SELECT ? AS key_id, ? AS invocations, ? AS updated_at) AS s"
+                        " ON t.key_id = s.key_id"
+                        " WHEN MATCHED THEN UPDATE SET"
+                        " t.invocations = t.invocations + s.invocations, t.updated_at = s.updated_at"
+                        " WHEN NOT MATCHED THEN"
+                        " INSERT (key_id, invocations, updated_at)"
+                        " VALUES (s.key_id, s.invocations, s.updated_at)"
+                        " OUTPUT INSERTED.invocations;",
+                        (key_id, int(count), now),
+                    )
+                    row = await cur.fetchone()
+                    merged = True  # MERGE ran + OUTPUT the total; past here a failure is a COMMIT
+                    total = int(row[0]) if row is not None else int(count)
+                    await self._commit(conn)
+                    return total
+                except Exception as exc:
+                    await conn.rollback()
+                    if (
+                        not merged
+                        and _is_transient_write_conflict(exc)
+                        and attempt < _CIPHER_MERGE_ATTEMPTS - 1
+                    ):
+                        retry = True
+                    else:
+                        raise
+            # The backoff sleeps with the pooled connection ALREADY RELEASED (the rollback above ran
+            # inside the block, so there is nothing left to hold). Two engine-specific reasons, neither
+            # of which applies to the vault's plain `pool.acquire()` twin this was ported from: this
+            # store's `_acquire` bounds every OTHER caller's pool wait at `[store].acquire_timeout` and
+            # then raises, so sleeping on a borrowed connection spends a resource its peers time out
+            # on -- under exactly the contention this retry exists for; and a cancellation landing in
+            # the sleep would reach `_acquire`'s `except BaseException` and quarantine the connection
+            # via `_release_dirty`, destroying it to protect a transaction that was already rolled
+            # back. Holding nothing across the sleep dissolves both.
+            if retry:
+                await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
+        raise RuntimeError("unreachable: the add_cipher_invocations retry loop returns or raises")
 
     async def reserve_upload_quota(
         self,
