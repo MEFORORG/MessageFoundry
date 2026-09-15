@@ -23,6 +23,8 @@ import ast
 import collections
 import pathlib
 
+from _ast_sites import find_funcs
+
 from messagefoundry.config.settings import _RELOCATED_TO_SECURITY, _REMOVED_KEYS
 
 _ENGINE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
@@ -161,9 +163,7 @@ def test_the_two_fixed_refusals_name_the_key_the_loader_accepts() -> None:
     # satisfied by the docstring alone and stays green after the MESSAGE is reverted. Mutation-testing
     # caught exactly that: reverting the fix left this test passing and only the count ceiling red.
     raised: list[str] = []
-    for node in ast.walk(ast.parse(settings_src)):
-        if not (isinstance(node, ast.FunctionDef) and node.name == "_oidc_requires_public_origin"):
-            continue
+    for node in find_funcs(ast.parse(settings_src), "_oidc_requires_public_origin"):
         for child in ast.walk(node):
             if isinstance(child, ast.Raise):
                 raised.extend(

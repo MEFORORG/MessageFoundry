@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _ast_sites import call_sites, named_func
+
 #: Synthetic HL7 (never real PHI). HL7-shaped so ``redact`` rewrites the span.
 SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
 
@@ -74,19 +76,11 @@ def test_the_stdout_rebind_sits_between_the_frame_capture_and_the_boot_read() ->
     source = (
         Path(__file__).resolve().parents[1] / "messagefoundry" / "pipeline" / "_sandbox_worker.py"
     ).read_text(encoding="utf-8")
-    main = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
-    )
+    main = named_func(ast.parse(source), "main")
     nodes = list(ast.walk(main))
 
     def _call_line(name: str) -> int:
-        lines = [
-            n.lineno
-            for n in nodes
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
-        ]
+        lines = [n.lineno for n in call_sites(main, name, bare_only=True)]
         assert lines, f"main() contains no call to {name}()"
         return min(lines)
 

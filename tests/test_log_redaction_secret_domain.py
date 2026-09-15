@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass, field
 
 import pytest
+from _ast_sites import named_func
 
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
@@ -390,11 +391,7 @@ def _applied_pattern_names() -> set[str]:
     a list: a pattern defined and never applied cannot silently count as coverage, and a pattern applied
     without a fixture cannot hide."""
     tree = ast.parse(inspect.getsource(redact_mod))
-    func = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "redact_log_line"
-    )
+    func = named_func(tree, "redact_log_line")
     module_patterns = {
         name for name, value in vars(redact_mod).items() if isinstance(value, re.Pattern)
     }
