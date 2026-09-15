@@ -226,9 +226,12 @@ def test_classify_self_smoke() -> None:
         # from MAINHOSP, so a Router keyed on another feed declines it legitimately.
         assert "--inbound" in r.detail, bad
 
-    # FAIL CLOSED. `disposition_for` returns only the three members above, so these are the members
-    # somebody adds to the pipeline later. Each must fail NAMING itself rather than fall through to
-    # the PASS arm -- that fall-through is the defect, so the fix must not leave a door in.
+    # FAIL CLOSED. Each of these must fail NAMING itself rather than fall through to the PASS arm --
+    # that fall-through is the defect, so the fix must not leave a door in. NOT_DEPLOYED is no longer
+    # hypothetical: `disposition_for` started returning it for a routed run whose every Send addressed
+    # a present-but-not-deployed destination (BACKLOG #1690), and this arm is what already handled it
+    # correctly -- no delivery, so no PASS, and no "--inbound" remedy that flag could act on. Splitting
+    # it out with a reason of its own is packet 14's P14-09, a separate item.
     for unknown in (MessageStatus.ERROR, MessageStatus.NOT_DEPLOYED, MessageStatus.ROUTED):
         r = smoke._classify_self_smoke(unknown, "SUMMARY")
         assert r.status is Status.FAIL, unknown

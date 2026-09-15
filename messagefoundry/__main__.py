@@ -3628,6 +3628,11 @@ def _dryrun(args: argparse.Namespace) -> int:
                         {"to": d.to, "payload": d.payload if show_phi else _redact_body(d.payload)}
                         for d in result.deliveries
                     ],
+                    # Destinations a Handler addressed that are present but NOT deployed (#233,
+                    # BACKLOG #1690). Printed beside `deliveries` because that list is empty for
+                    # exactly these, and without the names a NOT_DEPLOYED row says what happened but
+                    # not to which connection. Connection names carry no PHI, so no --show-phi gate.
+                    "declined": result.declined,
                     # Declared state writes (ADR 0005). The value can be PHI (e.g. an MRN→anon
                     # mapping), so gate it behind --show-phi exactly like a delivery payload.
                     "state_ops": [
