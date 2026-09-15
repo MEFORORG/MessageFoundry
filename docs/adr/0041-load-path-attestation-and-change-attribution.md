@@ -205,6 +205,27 @@ fingerprint+git-HEAD covers more cheaply for now.
   engine starts, THE SYSTEM SHALL treat attestation as a no-op/advisory and SHALL NOT fail or alert — dev is
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
+- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
+  against a baseline on an install that does not declare itself editable — an absent, empty or
+  package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
+  root — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
+  and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
+  → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
+  → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
+
+> **Amendment 2026-09-15 (BACKLOG #1679) — AC-12's "editable = no `RECORD` baseline" equation is
+> incomplete.** AC-12 reads the two as one condition, so the shipped code took *any* absent baseline as a
+> dev install and returned a clean no-op. Three shapes reach that no-op without a dev checkout in sight: a
+> deleted or emptied `RECORD`, a `RECORD` stripped of its package rows, and a package imported from
+> outside the install root. AC-13 splits them off: only an install that **declares** itself editable (a
+> PEP 610 `direct_url.json`, or an `__editable__`/`.pth` finder row) keeps the AC-12 no-op; "no baseline"
+> on its own is now attested-nothing, which warns, audits, alerts, and refuses under fail-closed.
+>
+> **Open, and NOT settled by this amendment:** the baseline sits in the same install the stated adversary
+> can write, so should a `RECORD` re-sealed after an in-place edit be trusted at all — and if not, what
+> out-of-domain anchor replaces it without bricking an editable dev install? Owner decision; the module
+> docstring states the boundary (an inconsistent edit is detected, a consistent one is not) rather than
+> resolving it.
 
 ## Options considered
 

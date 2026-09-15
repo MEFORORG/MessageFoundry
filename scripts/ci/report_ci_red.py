@@ -44,7 +44,11 @@ TWO RULES ARE COPIED FROM THE WRITER ON PURPOSE, because a reader that classifie
 the writer reports causes the label was never applied for:
 
   * **The watched workflows** (``_WATCHED``) match ``failure-signal.yml``'s ``workflows:`` list. CLA
-    Assistant is excluded there, deliberately, and so is excluded here.
+    Assistant is excluded there, deliberately, and so is excluded here. **CodeQL left that list**
+    because the label says a REQUIRED check went red and no CodeQL context is required, so the
+    sentence was false on every CodeQL red; it is therefore out of this set too. The two must move
+    together -- ``tests/test_ci_red_reader.py`` reads the workflow and compares, rather than
+    trusting a copy.
   * **Only ``failure`` counts** (``_RED``). A CANCELLED run is not a red -- branch protection gates on
     the latest head, so a cancelled predecessor says nothing about the current one. Counting it would
     misattribute every merge-queue ejection, which cancels its siblings on the way out.
@@ -90,7 +94,7 @@ CI_RED_LABEL = "ci-red"
 
 #: Workflows whose failure earns the label. Mirrors ``failure-signal.yml``'s ``workflows:`` list --
 #: see the module docstring for why CLA Assistant is not in it.
-_WATCHED = frozenset({"CI", "Security", "CodeQL", "backlog-hygiene"})
+_WATCHED = frozenset({"CI", "Security", "backlog-hygiene"})
 
 #: The only conclusion that is a red. Mirrors the writer's ``conclusion == 'failure'`` gate.
 _RED = "failure"

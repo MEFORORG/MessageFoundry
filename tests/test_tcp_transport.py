@@ -11,6 +11,7 @@ framing behavior is unchanged after refactoring it onto the shared codec."""
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_egress_allowed
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination, build_source
+from messagefoundry.transports import tcp as tcp_mod
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.framing import (
     MLLP_CODEC,
@@ -90,6 +92,113 @@ def test_decoder_rejects_oversize_open_frame() -> None:
     dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
     with pytest.raises(FrameError):
         list(dec.feed(b"\x02" + b"toolong"))
+
+
+def test_decoder_in_frame_tracks_the_open_frame() -> None:
+    # in_frame is the ADR 0067 reuse-desync guard, so assert it directly rather than leaning on the
+    # persistent-connection tests that only observe it through a desync verdict.
+    dec = STX_ETX_CODEC.decoder()
+    assert not dec.in_frame
+    assert list(dec.feed(b"\x02MSH|par")) == []
+    assert dec.in_frame  # start byte seen, end byte not yet: a partial payload is buffered
+    assert list(dec.feed(b"tial\x03")) == [b"MSH|partial"]
+    assert not dec.in_frame
+    assert list(dec.feed(b"trailing noise")) == []
+    assert not dec.in_frame
+
+
+def test_decoder_resets_state_after_an_oversize_frame() -> None:
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
+    with pytest.raises(FrameError):
+        list(dec.feed(b"\x02" + b"toolong"))
+    assert not dec.in_frame  # state reset on the raise, so the decoder is reusable
+    assert list(dec.feed(STX_ETX_CODEC.frame("ok"))) == [b"ok"]
+
+
+def test_decoder_is_split_invariant_at_every_read_boundary() -> None:
+    # A frame must decode identically however the reads fall -- including a delimiter landing as the
+    # last byte of one read, and a start byte inside a payload, which is content and not a new frame.
+    payload = "first|" + chr(0x02) + "|a start byte inside a frame is payload"
+    stream = (
+        b"lead-in noise" + STX_ETX_CODEC.frame(payload) + b"\r\n" + STX_ETX_CODEC.frame("second")
+    )
+    expected = [payload.encode(), b"second"]
+    assert list(STX_ETX_CODEC.decoder().feed(stream)) == expected
+    for cut in range(len(stream) + 1):
+        dec = STX_ETX_CODEC.decoder()
+        out: list[bytes] = []
+        out.extend(dec.feed(stream[:cut]))
+        out.extend(dec.feed(stream[cut:]))
+        assert out == expected, f"a read boundary at byte {cut} decoded differently"
+        assert not dec.in_frame
+
+
+def test_decoder_cap_admits_exactly_max_frame_bytes() -> None:
+    # The cap bounds the payload: exactly max_frame_bytes is accepted and one byte more raises.
+    # Pinned because checking a whole slice's length sits one byte away from the per-byte check.
+    whole = STX_ETX_CODEC.decoder(max_frame_bytes=4).feed(STX_ETX_CODEC.frame("ABCD"))
+    assert list(whole) == [b"ABCD"]
+    with pytest.raises(FrameError):
+        list(STX_ETX_CODEC.decoder(max_frame_bytes=4).feed(STX_ETX_CODEC.frame("ABCDE")))
+
+
+def test_decoder_cap_ignores_an_end_delimiter_beyond_it() -> None:
+    # The end delimiter is present in this read but sits past the cap. Locating it first must not
+    # rescue an over-cap frame: the cap is charged against the payload before the frame closes.
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=2)
+    with pytest.raises(FrameError):
+        list(dec.feed(b"\x02" + b"far beyond the cap" + b"\x03"))
+
+
+def test_decoder_yields_earlier_frames_before_an_over_cap_frame_in_the_same_read() -> None:
+    # Both inbound listeners iterate feed() lazily and await the handler plus the ACK between
+    # frames, so a frame that completed earlier in the read must already be handed over when a
+    # later frame in that same read blows the cap.
+    dec = STX_ETX_CODEC.decoder(max_frame_bytes=4)
+    seen: list[bytes] = []
+    with pytest.raises(FrameError):
+        for message in dec.feed(STX_ETX_CODEC.frame("AAA") + b"\x02" + b"far too long"):
+            seen.append(message)
+    assert seen == [b"AAA"]
+
+
+def test_decoder_decodes_16_mib_without_a_per_byte_walk() -> None:
+    """16 MiB in 4 KiB reads must cost a fraction of a per-byte walk over the same bytes.
+
+    The budget is calibrated on the machine running the test rather than hard-coded, so a slow or
+    loaded runner scales both halves together instead of flaking (BACKLOG #1728).
+    """
+    mib = 1024 * 1024
+    framed = MLLP_CODEC.frame(b"A" * (16 * mib))
+
+    # Baseline: the shape feed() used to have -- one Python loop step per inbound byte.
+    sample = bytes(mib)
+    buf = bytearray()
+    started = time.perf_counter()
+    for byte in sample:
+        if byte == MLLP_CODEC.end:
+            buf.clear()
+        else:
+            buf.append(byte)
+    per_byte_one_mib = time.perf_counter() - started
+
+    dec = MLLP_CODEC.decoder(max_frame_bytes=32 * mib)
+    decoded = 0
+    started = time.perf_counter()
+    for offset in range(0, len(framed), 4096):
+        for message in dec.feed(framed[offset : offset + 4096]):
+            decoded += len(message)
+    elapsed = time.perf_counter() - started
+
+    assert decoded == 16 * mib
+    assert not dec.in_frame
+    # A per-byte decoder costs 16 baseline units to walk these 16 MiB. Half that is a loose ceiling
+    # -- roughly 8x headroom on the measured slice-based cost, and still red on a per-byte relapse.
+    budget = 8 * per_byte_one_mib
+    assert elapsed < budget, (
+        f"16 MiB in 4 KiB reads took {elapsed:.3f}s against a {budget:.3f}s budget "
+        f"({per_byte_one_mib * 1000:.0f}ms per MiB per-byte baseline)"
+    )
 
 
 def test_codec_validates_bytes_and_distinct_delimiters() -> None:
@@ -229,6 +338,105 @@ async def test_source_drops_oversize_frame() -> None:
     finally:
         await source.stop()
     assert received == []
+
+
+# --- the reply write is bounded ----------------------------------------------
+
+
+class _StalledPeer:
+    """A sender that takes the reply bytes and then never drains them.
+
+    A fake rather than a real socket: wedging a real loopback peer means filling its receive window,
+    which takes hundreds of KiB of a size the OS picks, so the wedge would be slow and
+    platform-dependent. The bound under test is on ``drain()``, and this reproduces exactly that.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        # TEST-NET-2 (RFC 5737) — a documentation address, never a routable one.
+        return ("198.51.100.7", 2575) if name == "peername" else default
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        await asyncio.sleep(3600)  # the peer is not reading; nothing here ever completes
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+class _OneFrameThenSilent:
+    """Hands over one framed message, then holds the connection open without reaching EOF."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, _n: int) -> bytes:
+        if self._data:
+            chunk, self._data = self._data, b""
+            return chunk
+        await asyncio.sleep(3600)
+        return b""
+
+
+async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sender that stops reading must not pin the connection or the slot it holds.
+
+    ``receive_timeout`` bounds the READ. The reply write's ``drain()`` was unbounded, so a peer whose
+    receive window filled while it kept the connection open would hold its ``max_connections`` slot
+    for as long as it liked, with nothing to time it out. ``TcpDestination``'s own drains were
+    already bounded by ``self.timeout``, so the inbound reply was the outlier, not the convention.
+    ``MLLPSource`` carries the same defect and is fixed on PR 1117, which is **not merged** — do not
+    read this test as covering it.
+    """
+    # The release the fix rides on, asserted rather than assumed: were TimeoutError to stop being an
+    # OSError, _on_client's existing arm would miss it and the slot would leak, while the outcome
+    # assertions below could still pass on a cancelled task.
+    assert issubclass(TimeoutError, OSError)
+
+    events: list[str] = []
+
+    async def capture(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append(kind)
+
+    async def reply_handler(raw: bytes) -> str:
+        return "REPLY"
+
+    source = _source(max_connections=1)
+    source.on_connection_event = capture
+    await source.start(reply_handler)
+    # Bound the reply write ONLY. Shrinking _CLIENT_SHUTDOWN_GRACE instead would also shrink the
+    # teardown measured at the end, and a stop() that returned fast because its own grace was 0.05 s
+    # would say nothing about the connection.
+    monkeypatch.setattr(tcp_mod, "_REPLY_DRAIN_GRACE", 0.05)
+    peer = _StalledPeer()
+    try:
+        framed = STX_ETX_CODEC.frame("PING", "utf-8")
+        client = asyncio.create_task(
+            source._on_client(_OneFrameThenSilent(framed), peer)  # type: ignore[arg-type]
+        )
+        # Unbounded, this never returns. The 2 s is how the regression FAILS, not the assertion.
+        await asyncio.wait_for(client, timeout=2.0)
+        assert peer.closed  # dropped, not left open on a peer that had stopped reading
+        assert source._active == 0  # ... and the max_connections slot went back
+        # Pins the order and the absence of anything else; "established" is the only other kind on
+        # this path, and a failure must not also be reported as a clean "closed".
+        assert events == ["established", "peer_reset"]
+    finally:
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+        elapsed = asyncio.get_running_loop().time() - started
+    # Nothing was left in flight, so stop() must not have spent its shutdown grace waiting. The
+    # threshold is deliberately well UNDER _CLIENT_SHUTDOWN_GRACE (5.0) rather than equal to it:
+    # the wait_for above already raises at 5.0, so `elapsed < 5.0` could never fail and would pin
+    # nothing. 2 s leaves a wide margin for a slow runner while still catching a teardown that waits.
+    assert elapsed < 2.0
 
 
 # --- build via the registry --------------------------------------------------

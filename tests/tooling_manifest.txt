@@ -99,6 +99,7 @@ tests/test_gate_rule_scan_agreement.py
 tests/test_ide_licence_packaging.py
 tests/test_incomplete_run_banner.py
 tests/test_install_gate_wiring.py
+tests/test_install_guide_verify_gate.py
 tests/test_installed_coord_hooks.py
 tests/test_key_usage_scope_inventory.py
 tests/test_ledger_check.py

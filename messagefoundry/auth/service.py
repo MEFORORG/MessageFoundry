@@ -1278,25 +1278,27 @@ class AuthService:
 
     async def _register_failure(self, user: UserRecord, now: float) -> tuple[int, bool]:
         """Record a failed attempt; return ``(attempts, just_locked)``. ``just_locked`` is True only on
-        the attempt that crosses the threshold (the caller reaches here only when not already locked),
-        so it fires exactly one lockout notification per lockout."""
-        # A lapsed lockout window restarts the counter, so one post-lockout failure cannot re-lock
-        # immediately (and the stale lock is cleared whenever the count is back below threshold).
-        prior = (
-            0
-            if (user.locked_until is not None and now >= user.locked_until)
-            else user.failed_attempts
+        the attempt that takes the account from unlocked to locked, so it fires exactly one lockout
+        notification per lockout.
+
+        **THE COUNT, THE POLICY AND THE WRITE ARE ONE STORE CALL, AND THAT IS THE WHOLE OF THIS
+        METHOD.** It used to read ``user.failed_attempts`` off a row fetched before the argon2 verify,
+        add one in Python, then write the sum back -- three steps with awaits between them. Every one
+        of those awaits is a window in which another attempt reads the SAME pre-increment count, so N
+        wrong passwords submitted in parallel all wrote 1, the account never reached the threshold,
+        and an attacker who parallelizes would evade the lockout entirely on a first deployment. The
+        lapsed-window reset, the increment and the crossing test now run inside the store, against the
+        row the store re-read under the lock that also carries the write.
+
+        ``user`` is therefore read for its id alone. **Do not recompute ``just_locked`` out here** --
+        outside the atomic section it is the stale read again, which is the defect rather than a
+        cheaper way to reach the same answer."""
+        return await self._store.increment_login_failure(
+            user.id,
+            threshold=self._policy.lockout_threshold,
+            lockout_seconds=self._policy.lockout_minutes * 60,
+            now=now,
         )
-        attempts = prior + 1
-        locked_until = (
-            now + self._policy.lockout_minutes * 60
-            if attempts >= self._policy.lockout_threshold
-            else None
-        )
-        await self._store.record_login_failure(
-            user.id, failed_attempts=attempts, locked_until=locked_until, now=now
-        )
-        return attempts, locked_until is not None
 
     async def authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
@@ -2888,7 +2890,7 @@ class AuthService:
         {STEP_UP_ACTION_MFA_ENROLL, STEP_UP_ACTION_MFA_CONFIRM, STEP_UP_ACTION_WEBAUTHN_ENROLL}
     )
 
-    async def _factor_binding_is_blocked(self, token: str, purpose: str) -> bool:
+    async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
         """Whether a factor-binding step-up grant must be REFUSED for this session (ASVS 6.3.3).
 
         Closes a bypass the 6.3.3 access gate would otherwise leave open. The gate's carve-out
@@ -2908,6 +2910,8 @@ class AuthService:
         """
         if purpose not in self._FACTOR_BINDING_ACTIONS:
             return False
+        if not token:
+            return True  # no session to bind a factor to — fail closed, as below
         if await self.mfa_satisfied(token):
             return False
         session = await self._store.get_session(hash_token(token))
@@ -2917,6 +2921,21 @@ class AuthService:
         if user is None:
             return True
         return await self._second_factor_enrolled(user)
+
+    async def factor_binding_is_blocked(self, token: str | None, action: str) -> bool:
+        """PUBLIC contract boundary over :meth:`_factor_binding_is_blocked`, for the ROUTE gates.
+
+        Public on purpose, not as a convenience alias. Both step-up decision helpers must apply the
+        refusal -- ``api.security._action_step_up_ok`` and the web console's
+        ``_ui_action_step_up_ok`` -- and the console reaches the engine only across its PUBLISHED
+        surface. Without this method that console-side copy is written from scratch, and a rule
+        living in two packages is a rule that drifts in one of them.
+
+        ``action`` is the route's step-up action, which is the same vocabulary ``POST /me/reauth``
+        spells ``purpose``, so it passes straight through rather than being fixed per call site --
+        which would mean exporting :data:`_FACTOR_BINDING_ACTIONS` or shutting the non-factor lanes
+        with it."""
+        return await self._factor_binding_is_blocked(token, action)
 
     def _grant_action_step_up(self, token_hash: str, action: str) -> None:
         """Mint a single-use per-action step-up grant (ADR 0077), bounded + TTL'd, process-local.

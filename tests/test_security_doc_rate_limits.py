@@ -426,7 +426,7 @@ _SCOPE_TOKENS = ("**in-process**", "**store-backed**", "**stateless**", "**n/a**
 #: Limits whose state lives in the STORE, mapped to the ``self._store`` method that proves it. If a
 #: mechanism stops being store-backed the assertion below fails and the row must be re-scoped.
 _STORE_BACKED_LIMITS: dict[str, str] = {
-    "lockout_threshold": "record_login_failure",
+    "lockout_threshold": "increment_login_failure",
     "max_sessions_per_user": "enforce_session_cap",
     "bootstrap_expiry_hours": "set_user_disabled",
 }
@@ -1142,15 +1142,23 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     "Threshold / window" cell, so a replacement row that says something else cannot pass.
     """
     # --- derived: no lock COUNTER is persisted, so nothing can accumulate across cycles ------------
-    # Signature-based on purpose. ``record_login_failure`` writes ``locked_until=?`` and CLEARS the
-    # lock when passed None, so any grep for a literal like "locked_until=NULL" is a SPELLING and
-    # would miss it (and would miss a future unlock built on the same write).
-    params = inspect.signature(Store.record_login_failure).parameters
-    keywords = {name for name, p in params.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
-    assert keywords == {"failed_attempts", "locked_until", "now"}, (
-        f"Store.record_login_failure now takes {sorted(keywords)}. The persisted lockout state is "
+    # Signature-based on purpose, on BOTH writers of the lockout columns. They write ``locked_until``
+    # and CLEAR the lock — ``record_login_failure`` when passed None, ``increment_login_failure``
+    # whenever a lapsed window puts the restarted count back below the threshold — so any grep for a
+    # literal like "locked_until=NULL" is a SPELLING and would miss both.
+    raw = inspect.signature(Store.record_login_failure).parameters
+    raw_keywords = {name for name, p in raw.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert raw_keywords == {"failed_attempts", "locked_until", "now"}, (
+        f"Store.record_login_failure now takes {sorted(raw_keywords)}. The persisted lockout state is "
         "the whole basis for the 6.1.1 note that re-locking is unbounded; if a lock COUNT landed, "
         "re-derive that note in the same change."
+    )
+    counted = inspect.signature(Store.increment_login_failure).parameters
+    keywords = {name for name, p in counted.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert keywords == {"threshold", "lockout_seconds", "now"}, (
+        f"Store.increment_login_failure now takes {sorted(keywords)}. This is the counting path, so "
+        "it is where a cross-cycle ceiling would land; if one did, the 6.1.1 note that re-locking is "
+        "unbounded is stale and must be re-derived in the same change."
     )
 
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
@@ -1167,9 +1175,17 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         and isinstance(node.value, ast.Name)
         and node.value.id == "user"
     }
-    assert user_reads == {"failed_attempts", "locked_until", "id"}, (
-        f"_register_failure now consults {sorted(user_reads)} on the user row. If a cross-cycle "
-        "ceiling landed, the 6.1.1 note that re-locking is unbounded is stale."
+    # ``id`` ALONE, and that narrowing is itself the fix this pins. ``_register_failure`` used to read
+    # ``failed_attempts`` and ``locked_until`` off a user row fetched before the argon2 verify, add one
+    # in Python and write the sum back — so parallel attempts all computed from the same stale count
+    # and the account never crossed the threshold. Every one of those reads now happens inside
+    # ``increment_login_failure``, against the row that call re-read under the lock carrying its write.
+    # A read of any other user field reappearing here means the read-modify-write came back.
+    assert user_reads == {"id"}, (
+        f"_register_failure now consults {sorted(user_reads)} on the user row. It must read the id "
+        "and nothing else: the count, the lapsed-window reset and the lock decision belong inside the "
+        "store's atomic increment, and computing any of them from this stale row is the race itself. "
+        "If a cross-cycle ceiling landed instead, the 6.1.1 note that re-locking is unbounded is stale."
     )
 
     # --- derived: the counter has exactly the two LOCAL feeders the note scopes it to --------------
