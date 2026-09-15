@@ -189,3 +189,82 @@ def test_claim_unique_copy_fallback_removes_a_half_written_file(
     # either. The guard removes the file it created, it does not step around it.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["src.bin"]
     assert source.read_bytes() == b"PAYLOAD" * 1000  # the claim never consumes its source
+
+
+def test_claim_unique_never_deletes_the_file_it_lost_the_name_race_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup above must NOT cover the exclusive create.
+
+    `FileExistsError` from `os.open` is the loop's NORMAL control flow, not a rare lost race: it is
+    how a taken name advances to `name-1.ext`. So a guard widened to enclose the create deletes the
+    winner's file on EVERY collision, turning a no-clobber claim into a clobbering one. That is a
+    worse defect than the truncation the guard exists to fix, and the comment in the source is not
+    enough on its own - nothing executable pinned the placement until this test.
+
+    TWO names are taken, not one, and the second is what makes the test discriminate. The two
+    plausible spellings of the widened guard destroy files ONE ITERATION APART: binding the cleanup
+    to the name the create ATTEMPTED destroys `out.hl7`, while letting it read the already-reassigned
+    loop variable destroys `out-1.hl7`. Both mutations were run here; with a single pre-existing file
+    the first reds and the second PASSES, so a one-file version of this test would license exactly
+    half the defect it appears to cover.
+
+    Mutation: widen the `try` to enclose the `os.open`, either spelling. Red: one of the two taken
+    names is gone."""
+
+    def _no_hard_links(*_a: object, **_k: object) -> None:
+        raise OSError("hard links unsupported on this filesystem")
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    source = tmp_path / "src.part"
+    source.write_bytes(b"PAYLOAD")
+    (tmp_path / "out.hl7").write_bytes(b"first winner")
+    (tmp_path / "out-1.hl7").write_bytes(b"second winner")
+
+    claimed = _claim_unique(source, tmp_path / "out.hl7")
+
+    assert claimed.name == "out-2.hl7"
+    assert claimed.read_bytes() == b"PAYLOAD"
+    assert (tmp_path / "out.hl7").read_bytes() == b"first winner"
+    assert (tmp_path / "out-1.hl7").read_bytes() == b"second winner"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "out-1.hl7",
+        "out-2.hl7",
+        "out.hl7",
+        "src.part",
+    ]
+
+
+def test_a_failed_unlink_does_not_displace_the_error_that_caused_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup reports the COPY's failure, never its own.
+
+    Our handle is closed before the unlink, so a sharing violation cannot come from us. It can come
+    from anyone else, and a drop directory is one other processes watch BY DESIGN - a scanner or a
+    reader holding the partial open is ordinary here. An unescaped unlink error inside the `finally`
+    would replace the full volume or dropped share with a cleanup message, so the operator would
+    debug the wrong failure.
+
+    Mutation: drop the `try/except OSError` around the unlink. Red: PermissionError surfaces and the
+    ENOSPC that actually happened is gone."""
+
+    def _no_hard_links(*_a: object, **_k: object) -> None:
+        raise OSError("hard links unsupported on this filesystem")
+
+    def _die_mid_copy(src: object, dst: BinaryIO, *_a: object, **_k: object) -> None:
+        dst.write(b"TRUNC")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def _unlink_denied(_self: Path, **_k: object) -> None:
+        raise PermissionError(errno.EACCES, "another process has the file open")
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(shutil, "copyfileobj", _die_mid_copy)
+    monkeypatch.setattr(Path, "unlink", _unlink_denied)
+    source = tmp_path / "src.bin"
+    source.write_bytes(b"PAYLOAD")
+
+    # The COPY's error, not the unlink's: ENOSPC must survive the cleanup attempt.
+    with pytest.raises(OSError, match="No space left on device"):
+        _claim_unique(source, tmp_path / "dst.hl7")

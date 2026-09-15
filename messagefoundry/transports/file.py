@@ -1058,7 +1058,19 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
             # missed. It runs after the `with` has closed the handle, which Windows requires.
             if not placed:
-                candidate.unlink(missing_ok=True)
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    # Cleanup must never DISPLACE the failure that caused it. Our own handle is
+                    # closed by now, but a drop directory is one other processes watch by design, so
+                    # a scanner or a reader holding the partial open is ordinary here, not exotic —
+                    # and an escaping unlink error would hide the full volume or dropped share behind
+                    # a cleanup message. Log it and let the real exception propagate.
+                    logger.warning(
+                        "could not remove the partial file %s after a failed claim: %s",
+                        candidate,
+                        unlink_exc,
+                    )
         return candidate
 
 
