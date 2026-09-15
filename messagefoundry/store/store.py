@@ -2329,50 +2329,80 @@ class MessageStore:
                 f"invalid synchronous mode {synchronous!r}; expected 'NORMAL' or 'FULL'"
             )
         db = await aiosqlite.connect(str(path))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power loss,
-        # never corruption) and avoids an fsync per commit — a large write-throughput win vs FULL.
-        # `sync` is validated above, so this f-string can't inject. FULL is available for the
-        # paranoid (every commit fsynced) via [store] synchronous = "full".
-        await db.execute(f"PRAGMA synchronous={sync}")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute("PRAGMA busy_timeout=5000")
-        await db.executescript(_SCHEMA)
-        await cls._migrate(db)
-        await db.commit()
-        # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        if str(path) != ":memory:":
-            main = Path(path)
-            for f in (main, main.with_name(main.name + "-wal"), main.with_name(main.name + "-shm")):
-                if f.exists():
-                    _secure_file(f)
-        store = cls(
-            db,
-            path=path,
-            cipher=cipher,
-            group_commit_window_ms=group_commit_window_ms,
-            group_commit_max_batch=group_commit_max_batch,
-            synchronous=sync,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
-        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
-        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
-        # the cipher carries no bound (keyless / `vault_transit`).
-        await store.checkpoint_cipher_invocations()
-        await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-        await (
-            store._load_state_cache()
-        )  # populate the in-memory state read-through cache (ADR 0005)
-        await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
-        await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
-        if store._group_commit is not None:
-            store._group_commit.start()  # spin the committer coroutine (needs the running loop)
-        return store
+        # Everything past `connect` runs under the cleanup below (#1670). aiosqlite drives each
+        # statement on a background thread created WITHOUT `daemon=True`, so a connection nobody
+        # closes parks a non-daemon thread forever and interpreter exit then blocks in
+        # `threading._shutdown` joining it — the process hangs instead of reporting the error. The
+        # very first PRAGMA is where a path that is not a database raises, and that is already past
+        # `connect`, so an operator typo reaches this on an ordinary run.
+        store: MessageStore | None = None
+        try:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power
+            # loss, never corruption) and avoids an fsync per commit — a large write-throughput win
+            # vs FULL. `sync` is validated above, so this f-string can't inject. FULL is available
+            # for the paranoid (every commit fsynced) via [store] synchronous = "full".
+            await db.execute(f"PRAGMA synchronous={sync}")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.executescript(_SCHEMA)
+            await cls._migrate(db)
+            await db.commit()
+            # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            if str(path) != ":memory:":
+                main = Path(path)
+                for f in (
+                    main,
+                    main.with_name(main.name + "-wal"),
+                    main.with_name(main.name + "-shm"),
+                ):
+                    if f.exists():
+                        _secure_file(f)
+            store = cls(
+                db,
+                path=path,
+                cipher=cipher,
+                group_commit_window_ms=group_commit_window_ms,
+                group_commit_max_batch=group_commit_max_batch,
+                synchronous=sync,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
+            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
+            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
+            # since on a store that is having a key enabled for the first time it is itself a large
+            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
+            await store.checkpoint_cipher_invocations()
+            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            await (
+                store._load_state_cache()
+            )  # populate the in-memory state read-through cache (ADR 0005)
+            await (
+                store._load_reference_cache()
+            )  # populate the reference-snapshot read cache (ADR 0006)
+            await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+            if store._group_commit is not None:
+                store._group_commit.start()  # spin the committer coroutine (needs the running loop)
+            return store
+        except BaseException:
+            # Close the store when one was constructed — it owns the read pool's connections too,
+            # each with its own worker thread — then the writer either way. `Connection.close` is
+            # idempotent (it returns immediately once the connection is gone), so the second call
+            # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
+            # cleaning up must never replace the error the caller needs to see.
+            if store is not None:
+                try:
+                    await store.close()
+                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                    log.warning("error closing a partially-opened store", exc_info=True)
+            try:
+                await db.close()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                log.warning("error closing the connection after a failed store open", exc_info=True)
+            raise
 
     async def _open_read_pool(self, path: str) -> None:
         """Open the bounded read-only connection pool for a file-backed WAL store (lockfree-reads).
