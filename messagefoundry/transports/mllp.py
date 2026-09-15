@@ -43,6 +43,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     RevocationHopGuard,
     TrustAnchorPolicy,
+    apply_connection_tls_ciphers,
     build_verifying_client_context,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
@@ -578,6 +579,10 @@ def _mllp_ssl_context(
             if crl := s.get("tls_crl_file"):
                 harden_crl_check(ctx, str(crl))
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
+        # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below
+        # the assertion this seam has always made on the inherited suite list.
+        apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
         harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
@@ -617,6 +622,10 @@ def _mllp_ssl_context(
     if cert:  # optional client identity for mTLS
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
+    # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a
+    # suite, and an operator who narrowed this connection meant that hop as much as any other.
+    apply_connection_tls_ciphers(ctx, s, connector="MLLP destination")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="MLLP destination")  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert

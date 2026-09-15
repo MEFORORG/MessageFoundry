@@ -19,6 +19,13 @@ starts no server. Contents (each a small text/JSON member):
 HARD RULE (do not break): no raw message bodies and no secrets. The config summary emits counts/names
 only; the status snapshot is the metadata-only status models; the log tail is run through the redaction
 pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
+
+That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
+exception's **message** never enters the bundle: config loading wraps text raised by arbitrary operator
+modules, a store failure quotes the DSN, and a filesystem error quotes the deployment path, so the
+string is deployment- and attacker-shaped. Each branch emits :func:`_diagnostic` instead -- a fixed
+code plus the exception TYPE. Late heuristic redaction over the assembled JSON is deliberately NOT the
+answer here: the content is already known to be arbitrary, so no pattern set can be argued complete.
 """
 
 from __future__ import annotations
@@ -44,6 +51,23 @@ __all__ = ["BundleResult", "build_bundle", "config_summary", "status_snapshot"]
 DEFAULT_LOG_TAIL_LINES = 500
 
 
+def _diagnostic(code: str, exc: BaseException) -> str:
+    """What a failed bundle section reports: a fixed ``code`` plus the exception TYPE, never its text.
+
+    The codes are stable strings a support reader can look up, and they name the branch precisely
+    enough that dropping the message costs no triage:
+
+    * ``MF-BUNDLE-CFG-001`` -- the config did not wire up (``WiringError``).
+    * ``MF-BUNDLE-CFG-002`` -- loading the config raised something else.
+    * ``MF-BUNDLE-DB-001`` -- the store could not be opened or queried.
+    * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed.
+    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read.
+
+    A type name is a class defined in this project or the standard library, so it is bounded input; an
+    exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
+    return f"{code} {type(exc).__name__}"
+
+
 @dataclass(frozen=True)
 class BundleResult:
     """What :func:`build_bundle` wrote — the zip path + the member names (for the CLI summary/tests)."""
@@ -57,16 +81,18 @@ def config_summary(config_dir: str | Path) -> dict[str, Any]:
 
     Deliberately omits every settings value (hosts, ports, paths, credentials, ``env()`` data) — only
     the shape of the graph is carried, so the summary can never leak a connection string or secret. A
-    config that fails to load is reported as an ``error`` string rather than raising, so a bundle is
-    still produced for a broken config (which is exactly when support is wanted)."""
+    config that fails to load is reported as an ``error`` diagnostic rather than raising, so a bundle is
+    still produced for a broken config (which is exactly when support is wanted). That diagnostic
+    carries no exception text: the config dir holds arbitrary operator Python, so whatever it raised is
+    arbitrary too (BACKLOG #1571)."""
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
         reg = load_config(config_dir)
     except WiringError as exc:
-        return {"error": str(exc), "loaded": False}
+        return {"error": _diagnostic("MF-BUNDLE-CFG-001", exc), "loaded": False}
     except Exception as exc:  # never let a config problem abort the whole bundle
-        return {"error": f"{type(exc).__name__}: {exc}", "loaded": False}
+        return {"error": _diagnostic("MF-BUNDLE-CFG-002", exc), "loaded": False}
 
     return {
         "loaded": True,
@@ -116,10 +142,11 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
     try:
         db_info = asyncio.run(_db_info(settings))
     except Exception as exc:  # a missing/locked DB must not abort the bundle
+        # No driver text: a store failure routinely quotes the whole DSN, host and login (#1571).
         return {
             "engine": engine.model_dump(),
             "db": None,
-            "db_error": f"{type(exc).__name__}: {exc}",
+            "db_error": _diagnostic("MF-BUNDLE-DB-001", exc),
         }
     status = SystemStatus(engine=engine, db=db_info, logs=None)
     return status.model_dump()
@@ -164,7 +191,14 @@ async def _db_info(settings: ServiceSettings) -> Any:
 def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     """A redacted tail of the newest app-log file under ``log_dir`` (one level). ``None`` when no log
     dir is configured or it holds no readable log file. **Never** raises — a log read problem is logged
-    into the tail text, not propagated."""
+    into the tail text, not propagated.
+
+    EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
+    ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
+    the redactor with the configured path, the file name and the OS error text inline, so a bundle's
+    ``app-log.txt`` could carry an unredacted deployment path (BACKLOG #1571). They now report the
+    branch, not the circumstances: the operator knows their own ``log_dir``, and the code says which
+    step failed."""
     from messagefoundry.support.redact import redact_log_text
 
     if not log_dir:
@@ -173,7 +207,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     try:
         files = [p for p in directory.iterdir() if p.is_file() and p.suffix in (".log", ".txt")]
     except OSError as exc:
-        return f"(could not list log dir {log_dir!r}: {exc})"
+        return redact_log_text(_diagnostic("MF-BUNDLE-LOG-001", exc))
     if not files:
         return None
     newest = max(files, key=lambda p: p.stat().st_mtime)
@@ -181,7 +215,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
         # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
         text = newest.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return f"(could not read {newest.name!r}: {exc})"
+        return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
     tail = text.splitlines()[-lines:]
     return redact_log_text("\n".join(tail))
 
@@ -231,7 +265,8 @@ def build_bundle(
         # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract).
         "phi_contract": (
             "no raw message bodies, no secrets; config summary is counts/names only; status is the "
-            "metadata-only status models; the app-log tail is redacted"
+            "metadata-only status models; the app-log tail is redacted; a section that failed reports "
+            "a fixed MF-BUNDLE-* code plus the exception type, never the exception message"
         ),
     }
     members["manifest.json"] = json.dumps(manifest, indent=2, sort_keys=True)

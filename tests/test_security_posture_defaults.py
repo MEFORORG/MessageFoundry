@@ -284,6 +284,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     # gates tls/tls_verify below. A reader that merely reported "no CRL configured" would be strictly
     # weaker than the refusal that already exists.
     "tls_crl_file": "material/path; its absence is gated by #1005's posture-keyed revocation refusal",
+    # ADR 0188. A TIGHTENING, which is why it is exempt rather than reported: setting it applies the
+    # strict AEAD allow-list to that one hop, and leaving it unset is the shipped posture every other
+    # connection already has. A reader that reported it would be reporting operators who hardened.
+    "tls_ciphers": "opt-in AEAD allow-list on one hop -- a tightening, not a deviation to report",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses
