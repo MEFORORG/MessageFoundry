@@ -202,6 +202,33 @@ below), containing:
   escape (parallel to `[store].allow_unencrypted_phi`) for a synthetic/non-PHI box. A synthetic instance with
   no key may back up in the clear; a PHI instance may not, silently.
 
+#### Two key USES, one key SOURCE — which path holds which (BACKLOG #1561)
+
+`pipeline/dr_backup.py` reaches key material in two places, and they are different operations. Stated here
+so the next reader does not re-derive it from the imports, and because a guard was once written on the
+premise that there was only one:
+
+| Operation | Where | Key material | Does `cipher_provider` apply? |
+|---|---|---|---|
+| **Seal / unseal the `.mfbak`** | `_do_backup` to `_resolve_key` to `_build_archive_blocking` to `encrypt_stream`; `_verify_archive_blocking` to `decrypt_stream` | **Raw DEK bytes** from `resolve_active_key`, handed to `store/backup_codec.py` | **No.** The codec takes bytes and builds its own `AESGCM`. `vault_transit` is never consulted, so a Transit posture does not protect (or reach) the archive frames |
+| **Read the extracted snapshot's cells** (`full_restore_verify` only) | `_full_open_check` to `open_store` / `_decrypt_check` | **The store cipher** from `build_store_cipher`, with the store's own per-cell AAD | **Yes.** It is a store read, so it dispatches on `cipher_provider` exactly as a live read does — including Transit |
+
+Three consequences worth stating rather than inferring:
+
+- **The snapshot read is not a second at-rest tier.** `_decrypt_check` decrypts into memory and returns a
+  **count** of cells opened, never a plaintext, and writes nothing. The extracted `store.db` keeps the
+  store's own column cipher; `docs/PHI.md` §2 already inventories that staging dir.
+- **`open_store` builds a store cipher too.** That is why the table lists it beside `build_store_cipher`:
+  a "does this file touch the store cipher" question answered by searching for one name gets the wrong
+  answer. The full verify has called `open_store` since this ADR shipped; what #1561 changed is that it
+  now passes the LIVE settings, so an encrypted snapshot opens under a real key instead of the identity
+  cipher.
+- **The guard is scoped to the seal, and it is an AST call-path check, not a token scan.**
+  `tests/test_phi_at_rest_inventory.py::test_the_mfbak_seal_never_reaches_for_the_store_cipher` asserts
+  that every archive-codec call sits in the seal/unseal region, that no store-cipher constructor is
+  reached from it, and that the bytes handed to `encrypt_stream` are the unmodified `resolve_active_key`
+  DEK. Both seams are registered in `scripts/security/crypto_inventory_check.py` (ASVS 11.1.3).
+
 > **Key-availability consequence for #61's cold seed (addressed by design).** Because the archive is encrypted
 > under the store DEK, **the DR site must have that DEK available to restore the cold seed.** ADR 0048's cold
 > path **requires the same `KeyProvider` posture at the DR site** — env var / DPAPI key file / or reachability

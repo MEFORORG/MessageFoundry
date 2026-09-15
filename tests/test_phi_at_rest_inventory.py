@@ -743,12 +743,194 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
             "so vault_transit never applies), and allow_unencrypted writes a CLEARTEXT archive."
         )
     source = (_PKG / "pipeline" / "dr_backup.py").read_text(encoding="utf-8")
-    assert "resolve_active_key" in source and "build_store_cipher" not in source, (
-        "dr_backup now uses build_store_cipher; the doc says vault_transit never applies to a "
-        "backup — re-derive it."
+    assert "resolve_active_key" in source, (
+        "dr_backup no longer resolves the archive key through resolve_active_key; §3 says the "
+        "`.mfbak` DEK comes from there and not from the store cipher — re-derive it."
     )
     assert ".mfbak.plain" in source, (
         "the cleartext-archive path is gone; remove the carve-out from §3 in the same change."
+    )
+
+
+#: ``dr_backup`` functions that SEAL or UNSEAL the ``.mfbak`` archive itself. §3's carve-out
+#: ("the key is resolved by `resolve_active_key` and not `build_store_cipher`, so `vault_transit`
+#: never applies") is a claim about THESE functions and no others.
+_MFBAK_CODEC_FUNCS = frozenset({"_do_backup", "_resolve_key", "_build_archive_blocking"})
+#: ``dr_backup`` functions that read the EXTRACTED snapshot's own store cells during a full
+#: restore-verify. Reading a store cell is what the store cipher is FOR, so these are where
+#: ``build_store_cipher`` (and ``open_store``, which builds one internally) belong.
+_SNAPSHOT_READ_FUNCS = frozenset({"_full_open_check", "_decrypt_check"})
+#: Names that construct or obtain the STORE cipher. ``open_store`` is in the list because it calls
+#: ``build_store_cipher`` itself — the old token scan could not see that, which is half of why it
+#: was the wrong instrument.
+_STORE_CIPHER_CTORS = frozenset(
+    {"build_store_cipher", "make_cipher", "build_transit_cipher", "open_store"}
+)
+#: The archive codec's own entry points (``store/backup_codec.py``), which take RAW DEK BYTES.
+_ARCHIVE_CODEC_CALLS = frozenset({"encrypt_stream", "decrypt_stream"})
+
+
+def _callee_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _dr_backup_tree() -> ast.Module:
+    return ast.parse((_PKG / "pipeline" / "dr_backup.py").read_text(encoding="utf-8"))
+
+
+def _named_func(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    found = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name
+    ]
+    assert len(found) == 1, (
+        f"pipeline/dr_backup.py declares {len(found)} functions named {name!r}; this guard names the "
+        "backup's key paths by function, so a rename or a duplicate must be re-derived here, not "
+        "silently skipped."
+    )
+    return found[0]
+
+
+def _split_call_sites(
+    tree: ast.Module, funcs: frozenset[str], names: frozenset[str]
+) -> tuple[list[str], list[str]]:
+    """``(inside, outside)`` — call sites of ``names``, split by whether they sit in ``funcs``.
+
+    Keyed on AST node identity, not on a line range, so a nested helper (``_full_open_check._open``)
+    counts as INSIDE its enclosing function and nothing is double-counted."""
+    inside_nodes: set[int] = set()
+    for name in funcs:
+        for sub in ast.walk(_named_func(tree, name)):
+            if isinstance(sub, ast.Call):
+                inside_nodes.add(id(sub))
+    inside: list[str] = []
+    outside: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _callee_name(node)
+        if callee not in names:
+            continue
+        where = inside if id(node) in inside_nodes else outside
+        where.append(f"{callee} at line {node.lineno}")
+    return inside, outside
+
+
+def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
+    """§3's `.mfbak` carve-out, pinned by CALL PATH rather than by a file-wide token.
+
+    RULE: sealing a `.mfbak` under the store cipher would make §3's "`vault_transit` never applies to
+    a backup" false and would put a per-value string cipher on a multi-GB stream. That is the thing
+    forbidden, and this asserts it where it happens — the functions that write and read the archive.
+
+    WHAT THIS NO LONGER COVERS, AND WHY THAT IS SAFE. Until BACKLOG #1561 the assertion was
+    ``"build_store_cipher" not in dr_backup.py`` — the whole file, by token. That scan was wrong in
+    both directions. It **under-fired**: ``_full_open_check`` has always called ``open_store``, which
+    builds a store cipher internally, so the token scan could never have caught a seal that obtained
+    its cipher that way, nor one that aliased the import. And it **over-fired**: a full restore-verify
+    now decrypts the extracted snapshot's own cells, which is a store read and legitimately needs the
+    store cipher — a different operation from sealing the archive, in a different function, on a
+    different key material. A file-wide token cannot tell those two apart. This guard can, so the
+    narrowing is a strengthening: the permitted region is named and closed, and a seal that reaches
+    for the store cipher by ANY of the four constructor names now fails.
+    """
+    tree = _dr_backup_tree()
+
+    # (1) The archive codec is called ONLY from the seal/unseal region. A new sealing site added
+    # elsewhere lands in `outside` and reds, rather than escaping a region named once and forgotten.
+    codec_inside, codec_outside = _split_call_sites(
+        tree, _MFBAK_CODEC_FUNCS | frozenset({"_verify_archive_blocking"}), _ARCHIVE_CODEC_CALLS
+    )
+    assert {c.split()[0] for c in codec_inside} == set(_ARCHIVE_CODEC_CALLS), (
+        f"the instrument did not find both archive-codec entry points; it saw {codec_inside}. A guard "
+        "that cannot see the thing it guards proves nothing by passing."
+    )
+    assert not codec_outside, (
+        f"pipeline/dr_backup.py seals or unseals a .mfbak outside the named codec region: "
+        f"{codec_outside}. Add the function to _MFBAK_CODEC_FUNCS and re-derive §3's carve-out for it."
+    )
+
+    # (2) The store cipher is constructed ONLY on the snapshot-read path. This is the prohibition the
+    # old token scan was written for, now scoped to where it is true.
+    cipher_inside, cipher_outside = _split_call_sites(
+        tree, _SNAPSHOT_READ_FUNCS, _STORE_CIPHER_CTORS
+    )
+    assert cipher_inside, (
+        "the instrument found no store-cipher construction anywhere in pipeline/dr_backup.py, so its "
+        "'none outside the snapshot-read path' result is vacuous. Re-derive which functions open the "
+        "extracted snapshot."
+    )
+    assert not cipher_outside, (
+        f"pipeline/dr_backup.py builds the STORE cipher outside the snapshot-read path: "
+        f"{cipher_outside}. §3 says the `.mfbak` seal is keyed by resolve_active_key and NOT by "
+        "build_store_cipher, so `cipher_provider = vault_transit` never applies to the archive — "
+        "sealing with the store cipher makes that sentence false."
+    )
+
+    # (3) The key reaching the seal is the resolve_active_key DEK, link by link. Without this a seal
+    # could swap its key source for anything at all and (2) would still be green.
+    resolve = _named_func(tree, "_resolve_key")
+    assert "resolve_active_key" in [
+        _callee_name(n) for n in ast.walk(resolve) if isinstance(n, ast.Call)
+    ], (
+        "BackupRunner._resolve_key no longer calls resolve_active_key; §3 names it as the archive DEK."
+    )
+
+    do_backup = _named_func(tree, "_do_backup")
+    assert any(
+        isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)
+        and isinstance(n.value, ast.Call)
+        and _callee_name(n.value) == "_resolve_key"
+        for n in ast.walk(do_backup)
+    ), "BackupRunner._do_backup no longer binds `key` from self._resolve_key()."
+    # The seal runs off the loop, so the call is `asyncio.to_thread(self._build_archive_blocking,
+    # ..., key=key, ...)` — _build_archive_blocking is an ARGUMENT, not the callee. Match the call
+    # that names it anywhere in its own subtree and carries `key=key`.
+    assert any(
+        isinstance(n, ast.Call)
+        and any(
+            isinstance(s, ast.Attribute) and s.attr == "_build_archive_blocking"
+            for s in ast.walk(n)
+        )
+        and any(
+            kw.arg == "key" and isinstance(kw.value, ast.Name) and kw.value.id == "key"
+            for kw in n.keywords
+        )
+        for n in ast.walk(do_backup)
+    ), "BackupRunner._do_backup no longer hands that same `key` to _build_archive_blocking."
+
+    build = _named_func(tree, "_build_archive_blocking")
+    params = {a.arg for a in (*build.args.posonlyargs, *build.args.args, *build.args.kwonlyargs)}
+    assert "key" in params, "_build_archive_blocking no longer takes the resolved DEK as `key`."
+    rebound = [
+        n.lineno
+        for n in ast.walk(build)
+        if (
+            isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)
+        )
+        or (isinstance(n, ast.AugAssign | ast.NamedExpr) and getattr(n.target, "id", None) == "key")
+    ]
+    assert not rebound, (
+        f"_build_archive_blocking rebinds `key` at line(s) {rebound}; the DEK the caller resolved is "
+        "then not the one that seals the archive."
+    )
+    seals = [
+        n
+        for n in ast.walk(build)
+        if isinstance(n, ast.Call) and _callee_name(n) == "encrypt_stream"
+    ]
+    assert len(seals) == 1, f"_build_archive_blocking makes {len(seals)} encrypt_stream calls."
+    key_arg = seals[0].args[2] if len(seals[0].args) > 2 else None
+    assert isinstance(key_arg, ast.Name) and key_arg.id == "key", (
+        "encrypt_stream is no longer sealed with the unmodified `key` parameter, so the archive's key "
+        "material is no longer provably the resolve_active_key DEK §3 claims it is."
     )
 
 
