@@ -2357,7 +2357,8 @@ def DICOM(
     ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
-    rejects an object over ``max_object_bytes`` with a DIMSE failure before the commit. A non-loopback
+    rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
+    the commit. A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 
