@@ -1556,3 +1556,33 @@ def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
     assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
     assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
     assert scrubbed == "before\tafter\\nnext"
+
+
+# --- BACKLOG #1572: the installed chain must scrub a CUSTOM-delimiter body --------------------------
+
+#: The same realistic vector as ``_PHI_RAW``, with the delimiters the message DECLARES rather than the
+#: defaults: ``*`` field, ``$`` component, ``@`` repetition, ``#`` escape, ``%`` subcomponent. Synthetic
+#: identifiers only (PHI.md §9). Before #1572 the redactor recognised only ``| ^ ~ &``, so nothing here
+#: matched and every identifier reached the sink; a deploying site with a custom-delimiter feed would
+#: have logged them whenever a Router or Handler raised carrying the body.
+_PHI_RAW_CUSTOM_DELIMS = (
+    "MSH*$@#%*A*B*C*D*20260101**ADT$A01*MSG1*P*2.5.1\rPID*1**Z9998887$$$H$MR**DOE$JANE*19800101*M\r"
+)
+
+
+def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
+    """End to end through the chain ``_install_phi_filters`` builds, not through ``redact`` alone.
+
+    The unit coverage lives in ``tests/test_redaction.py``; this arm exists because the acceptance
+    criterion names the final logging chain, and because the filters run in an order a unit test cannot
+    see -- ``RedactionFilter`` renders ``exc_info`` into ``exc_text`` for the passes behind it."""
+    try:
+        raise ValueError(f"cannot transform {_PHI_RAW_CUSTOM_DELIMS}")
+    except ValueError:
+        rec = logging.LogRecord(
+            "mefor.demo", logging.ERROR, __file__, 1, "transform worker failed", (), sys.exc_info()
+        )
+    out = "\n".join(_production_lines(rec))
+    for identifier in ("Z9998887", "DOE", "JANE"):
+        assert identifier not in out, f"{identifier!r} reached the sink through the installed chain"
+    assert "ValueError" in out and "cannot transform" in out  # type + non-PHI context kept

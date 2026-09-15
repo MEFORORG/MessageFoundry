@@ -293,6 +293,212 @@ def test_the_linear_scan_guard_does_not_change_what_is_redacted(line: str) -> No
     )
 
 
+# --- BACKLOG #1572: read the delimiters MSH declares, do not assume them ----------------------------
+
+#: A message whose FIELD separator is custom (``*``) but whose encoding characters are the defaults
+#: (``^~\&``). The MSH segment still carries ``^``, ``~`` and ``&``, so the hardcoded field-run pattern
+#: fires on that one line by coincidence and the header looks scrubbed. The PID segment carries no
+#: default delimiter at all, so its identifiers walk straight through.
+#:
+#: **Calibrate to the fixture below, not to this one.** The BACKLOG row's own example had this shape
+#: and therefore understated the defect.
+ADT_CUSTOM_FIELD_SEP = (
+    "MSH*^~\\&*SENDINGAPP*FAC*RECV*RFAC*20260604**ADT^A01*MSG1*P*2.5.1\r"
+    "PID*1**MRN12345*DOE*JANE*19800101*M\r"
+)
+
+#: A message whose encoding characters are custom TOO (``$`` component, ``@`` repetition, ``#`` escape,
+#: ``%`` subcomponent). Nothing here contains ``| ^ ~ &``, so before #1572 the only thing the redactor
+#: removed was the 8-digit date run: the record identifier, the surname and the given name all survived
+#: ``safe_exc``, the installed four-filter logging chain, and the support-bundle redactor.
+ADT_FULLY_CUSTOM = (
+    "MSH*$@#%*SENDINGAPP*FAC*RECV*RFAC*20260604**ADT$A01*MSG1*P*2.5.1\r"
+    "PID*1**MRN12345$$$H$MR**DOE$JANE**19800101*M\r"
+)
+
+#: The synthetic identifiers both fixtures carry. No real PHI (PHI.md §9).
+_CUSTOM_IDENTIFIERS = ("MRN12345", "DOE", "JANE")
+
+#: Ordinary operational text a redactor must never touch, and the reason this fix SNIFFS rather than
+#: widening :data:`~messagefoundry.redaction._HL7_FIELD_RUN`'s character class. Widening it to cover
+#: ``*``/``$``/``@``/``%`` costs almost nothing in CPU and scrubs every line below, wrecking the two
+#: artefacts designed to leave the box (the support bundle and the forwarded log stream).
+_OPERATIONAL_LINES = (
+    "2026-09-11T04:12:07Z INFO     messagefoundry.pipeline: IB_ACME_ADT started",
+    "loaded config from C:/ProgramData/MessageFoundry/config/connections.toml",
+    "GET https://fhir.example.org/Patient?identifier=urn:oid:1.2.3 -> 200 in 41ms",
+    "connect 192.0.2.10:2575 failed: WinError 10061",
+    "retry 3/5 scheduled at 04:12:37 (backoff 2.5s)",
+    "ValueError raised in Handler archive",
+    "hl7 version 2.5.1 != expected 2.3",
+)
+
+
+def _pre_sniff_redact(text: str) -> str:
+    """``redact`` exactly as it shipped BEFORE #1572: the four hardcoded-delimiter passes, in order.
+
+    This is the byte-identity control. The fix must add a pass that fires only when MSH declares a
+    delimiter outside ``| ^ ~ &``; on everything else the output has to be unchanged down to the byte,
+    or the fix has quietly become the character-class widening it was chosen instead of."""
+    if not text:
+        return text
+    scrubbed = redaction._HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|[redacted]", text)
+    scrubbed = redaction._HL7_FIELD_RUN.sub("[redacted]", scrubbed)
+    scrubbed = redaction._DATE_RUN.sub("[redacted]", scrubbed)
+    return redaction._NAME_RUN.sub("[redacted]", scrubbed)
+
+
+def _custom_delimiter_message(segments: int) -> str:
+    """A fully-custom-delimiter message of ``segments`` OBX segments, for the cost arm. Long, one
+    whitespace-free token per line -- the shape the separator-aware scan is measured against."""
+    header = "MSH*$@#%*SENDINGAPP*FAC*RECV*RFAC*20260604**ORU$R01*MSG1*P*2.5.1\r"
+    body = "".join(
+        f"OBX*{i}*NM*GLU$Glucose$L**99*mg/dL*70-110*N***F\r" for i in range(1, segments + 1)
+    )
+    return header + body
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_redact_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """Both custom-delimiter shapes: the identifiers must be gone, the segment IDs must stay.
+
+    A deploying site with a custom-delimiter feed would otherwise have these reach its logs whenever a
+    Router or Handler raised carrying the body."""
+    out = redact(message)
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out, f"{identifier!r} survived redaction of {message!r}"
+    assert "PID" in out and "[redacted]" in out  # segment IDs kept (not PHI, useful)
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_safe_exc_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """The realistic vector, end to end: user code raises with the body interpolated in."""
+    out = safe_exc(ValueError(f"cannot transform {message}"), limit=10_000)
+    assert out.startswith("ValueError:")
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_the_support_bundle_redactor_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """The support path (``messagefoundry.support.redact``) delegates its PHI pass to ``redact``, so it
+    inherits the fix. Pinned here because a support bundle is one of the two artefacts designed to
+    leave the box, and it reads a log line at a time."""
+    from messagefoundry.support.redact import redact_log_line
+
+    out = redact_log_line(f"ERROR pipeline: cannot transform {message}")
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_redact_is_a_fixed_point_on_a_custom_delimiter_message(message: str) -> None:
+    """``safe_text`` re-applies ``redact`` at the store-layer chokepoint, so the separator-aware pass
+    must not keep rewriting its own output. The second pass sniffs an already-scrubbed MSH, finds no
+    delimiter declaration, and does nothing."""
+    assert redact(redact(message)) == redact(message)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        *_OPERATIONAL_LINES,
+        ADT,
+        "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1",
+        "PID|1||100^^^H^MR||DOE^JANE||19800101|M",
+        "patient DOE JANE dob 1980-05-05 not found",
+        "mrn 100^^^H^MR here",
+        "abc|def",
+        "a|b|c",
+        "[redacted]",
+        "no-delims-at-all",
+        "",
+        # Prose that MENTIONS a segment id. A looser sniff read a delimiter set out of these and
+        # over-redacted the line -- measured against this module's own docstrings while building the
+        # fix, and the reason the encoding-characters field is pinned to its conformant width.
+        "#: a 3-char segment ID (``MSH``/``PID``/``OBX``) followed by the field separator",
+        "the delimiters are **read from MSH** rather than assumed",
+        "see MSH-1 and MSH-2, at the offsets HL7 declares them",
+        "MSH||A|B",  # a degenerate empty MSH-2: nothing to recover, and all defaults anyway
+    ],
+)
+def test_the_separator_sniff_leaves_default_delimiter_output_byte_identical(line: str) -> None:
+    """The sniff must be inert on everything that does not declare a non-default delimiter.
+
+    This is the arm that fails if someone reaches for the obvious fix and widens the hardcoded
+    character class instead. Widening scrubs ISO timestamps, ``C:/`` paths, ``https://`` URLs and
+    ``host:port`` out of ordinary operational text; sniffing cannot, because the extra pass never runs
+    on text with no custom-delimiter MSH in it."""
+    assert redact(line) == _pre_sniff_redact(line)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("MSH|^~\\&|A|B", frozenset("|^~&")),  # the defaults, read rather than assumed
+        ("MSH|^~\\&#|A|B", frozenset("|^~&")),  # 2.7 truncation char is not a field boundary
+        ("MSH*$@#%*A*B", frozenset("*$@%")),  # fully custom; the escape char (#) is skipped
+        ("MSH*^~\\&*A*B", frozenset("*^~&")),  # custom field separator, default encoding chars
+        ("BHS+$@#%+A", frozenset("+$@%")),  # a batch header declares the same delimiters
+        ("no header here at all", frozenset()),  # the headerless residual
+        ("the delimiters are **read from MSH** rather than assumed", frozenset()),
+    ],
+)
+def test_the_sniff_reads_what_the_header_declares(text: str, expected: frozenset[str]) -> None:
+    """Isolates the sniff from the passes that consume it, so a regression in either is visible."""
+    assert redaction._sniff_delimiters(text) == expected
+
+
+def test_disabling_the_sniff_restores_the_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live negative control, and the reason the arms above are not vacuous.
+
+    With the sniff stubbed out to find nothing, the separator-aware pass never runs and the fully-custom
+    fixture leaks every identifier again -- while the default-delimiter output is unchanged either way.
+    That pairing is the whole claim: the new pass is what closes #1572, and it is doing nothing at all
+    to the default path."""
+    monkeypatch.setattr(redaction, "_sniff_delimiters", lambda text: frozenset())
+    leaked = redaction.redact(ADT_FULLY_CUSTOM)
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier in leaked, (
+            f"{identifier!r} was scrubbed with the sniff disabled, so something OTHER than the "
+            f"separator-aware pass is removing it and the arms above are not measuring the fix"
+        )
+    assert redaction.redact(ADT) == _pre_sniff_redact(ADT)
+
+
+def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
+    """Cost, on the two inputs that matter: a block of ordinary operational text carrying no MSH (the
+    sniff runs and finds nothing) and a long fully-custom message (the sniff runs and the extra pass
+    fires). Both share the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, and best-of-5 for the same
+    reason: a scheduling hiccup can only inflate a sample."""
+    ops_block = "\n".join(_OPERATIONAL_LINES * 40)  # about 10 KB, no MSH anywhere
+    assert len(ops_block) > 9_000
+    custom = _custom_delimiter_message(300)
+
+    for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
+        best = float("inf")
+        for _ in range(5):
+            start = time.perf_counter()
+            redact(text)
+            best = min(best, time.perf_counter() - start)
+        assert best < _SCAN_BUDGET_SECONDS, (
+            f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
+            f"a {_SCAN_BUDGET_SECONDS}s budget"
+        )
+
+    assert "MRN12345" not in redact(custom) and "Glucose" not in redact(custom)
+
+
+def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> None:
+    """DOCUMENTED RESIDUAL, pinned so a future change to it is deliberate.
+
+    The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
+    nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
+    completeness: the "never put PHI in an exception message" convention remains the control for a
+    headerless fragment, exactly as it does for a bare single-token identifier."""
+    assert redact("mrn MRN123$$$H$MR here") == "mrn MRN123$$$H$MR here"
+
+
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
 
 
