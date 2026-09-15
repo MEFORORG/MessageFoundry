@@ -3,11 +3,14 @@
 """Shared TLS hardening policy (ASVS 11.6.2 key exchange + 12.1.4 strict X.509, WP-L3-10 code half).
 
 Pure stdlib ``ssl`` helpers, importable by ``api/`` and ``transports/`` (and the ``config`` settings
-validator) without crossing the engine's one-way dependency boundaries. Three controls:
+validator) without crossing the engine's one-way dependency boundaries. The controls include, at least:
 
 * :func:`validate_tls_ciphers` — reject an operator ``tls_ciphers`` string that would admit a
   non-forward-secret (non-ECDHE/DHE) key exchange, so a misconfiguration cannot widen the suite below
   policy. Run from the ``[api].tls_ciphers`` settings validator, so a bad value fails loud at load.
+* :func:`harden_connection_cipher_suites` — the same policy on a **partner hop**, opt-in per
+  connection (``tls_ciphers`` on MLLP / DICOM, ADR 0188). Unset it does nothing at all, so the
+  inherited default suite list is untouched; set, it applies the allow-list to that one hop.
 * :func:`harden_kex_groups` — *attempt* to pin the approved ECDHE groups on a built context, and
   **report whether it managed to**. ``SSLContext.set_groups`` is a **Python 3.15** API (this said
   "3.13+" and was wrong), so today it pins nothing on every supported runtime and the contexts inherit
@@ -55,6 +58,7 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
+    "CONNECTION_TLS_CIPHERS_SETTING",
     "TLS_REVOCATION_ATTESTED_ENV",
     "fips_attestation",
     "HopDisposition",
@@ -78,6 +82,7 @@ __all__ = [
     "current_hop_posture",
     "enforce_insecure_hop",
     "harden_cipher_suites",
+    "harden_connection_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
     "kex_groups_report",
@@ -633,6 +638,57 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
             f"above can see them."
         )
+
+
+#: The connector setting :func:`harden_connection_cipher_suites` reads. Named ONCE, here, so the four
+#: seams that opt in (MLLP listener/destination, DICOM listener/destination) cannot spell it differently
+#: -- a misspelled key on one seam would read as "operator set nothing" and never fail.
+CONNECTION_TLS_CIPHERS_SETTING = "tls_ciphers"
+
+
+def harden_connection_cipher_suites(
+    ctx: ssl.SSLContext, settings: Mapping[str, Any], *, connector: str
+) -> None:
+    """Apply a connection's **opt-in** ``tls_ciphers`` to ``ctx``, then assert the result (ADR 0188).
+
+    The partner-hop counterpart to the ``[api].tls_ciphers`` knob. Until this existed
+    :data:`_APPROVED_TLS_SUITES` governed exactly ONE operator setting -- the engine's own API
+    listener -- while every partner-facing hop ran on an inherited suite list with no lever at all, so
+    an operator who needed a narrower set toward one hospital peer had nowhere to say so.
+
+    **Unset is the shipped default and changes nothing.** With no ``tls_ciphers`` in ``settings`` this
+    is a plain call to :func:`harden_cipher_suites`: no ``set_ciphers``, so the context keeps the
+    interpreter's inherited default suite list -- **including the six CBC-SHA2 suites the allow-list
+    deliberately excludes**. That retention is the decision recorded at length in
+    :func:`harden_cipher_suites`, and it stands: the allow-list governs what an operator may
+    CONFIGURE, never what an inherited default may contain, and retiring those six is gated on a peer
+    census nobody has run. Opting in is the operator asking for the stricter list; it is not the
+    engine imposing it on anyone who says nothing.
+
+    **Set runs the SAME policy as the API knob**, allow-list included -- :func:`validate_tls_ciphers`
+    itself, not a second copy that could drift -- so an operator cannot put a NULL, anonymous,
+    non-forward-secret or under-strength suite on a hop that carries PHI. A hop is the one place that
+    would matter most and was the one place nothing checked.
+
+    One helper rather than the option threaded into four context builders, because the **order** is
+    the part that breaks quietly: the assertion has to run on the context the connector will actually
+    use, which is the post-``set_ciphers`` one. Here that order cannot drift.
+
+    Raises :class:`ValueError` at construction (surfaced by ``check`` / dry-run / ``serve``), like
+    every sibling assertion in this module. The message names ``connector`` because
+    :func:`validate_tls_ciphers` speaks about a generic ``tls_ciphers`` and an operator running
+    several connections needs to know WHICH one is at fault."""
+    ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
+    if ciphers is not None:
+        text = str(ciphers)
+        try:
+            validate_tls_ciphers(text)
+            ctx.set_ciphers(text)
+        except (ValueError, ssl.SSLError) as exc:
+            raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
+    # ALWAYS, opted in or not: the assertion is what turns an inherited property into a checked one,
+    # and an operator-supplied list is no more trusted than an inherited one.
+    harden_cipher_suites(ctx, connector=connector)
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
