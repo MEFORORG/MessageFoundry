@@ -317,6 +317,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
+  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
+  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
+  walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
+  meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
+  scheduled compliance job reads the exit code, so a first deployment with one would have reported
+  OK forever while the real audit log went unchecked. All three subcommands now probe the path over
+  a **read-only** SQLite handle before the store opens — it can neither create the file nor migrate
+  it — and exit **2** when there is no `audit_log` table, naming which of absent, zero-byte or
+  not-a-database it found.
+  **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
+  empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
+  anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
+  no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
+  log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
+  only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
 - **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
   `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
   strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and

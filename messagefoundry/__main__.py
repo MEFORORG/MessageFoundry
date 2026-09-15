@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sqlite3  # stdlib; only for the exception type the store-opening subcommands translate (#1670)
+import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
 import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
 from pathlib import (
@@ -662,6 +662,13 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     audit_verify.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    audit_verify.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
+        "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
+        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store')",
+    )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
     audit_verify_anchor = audit_verify.add_mutually_exclusive_group()
@@ -4595,9 +4602,68 @@ def _provision_admin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_a_store_that_is_not_an_audit_log(
+    *, is_sqlite: bool, path: str, refusal: str, as_json: bool = False
+) -> int | None:
+    """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
+
+    Two ways it cannot be one, and the second is the one that used to pass: the file is ABSENT (a
+    typo'd path, which ``open_store`` would create), or the file EXISTS but carries no ``audit_log``
+    table. A zero-byte file is the second case -- it is a valid, empty SQLite database, so every
+    existence check says yes, and ``open_store`` then runs the schema migration INTO the file that
+    was supposed to be the evidence and reports a clean chain of nothing.
+
+    The probe opens a ``mode=ro`` URI on stdlib ``sqlite3``, which is load-bearing twice over: a
+    read-only handle can neither create the file nor migrate it, so the check cannot write to the
+    evidence it is checking, and it never reaches the engine's own store layer at all. Only SQLite
+    is probed; a server backend's connection string is not a file and cannot be conjured by opening
+    it. ``audit_log`` is the table the three callers actually read, so its absence is the exact
+    question, not a proxy for it.
+
+    This probe runs BEFORE the ``sqlite3.DatabaseError`` catch each caller inherits from #1670, and
+    the two answer different questions -- "this is a database but not an audit log" here, "this is
+    not a database at all" there -- so both stay. Where they overlap, on a path SQLite cannot read,
+    the probe reaches it first and hands it to ``_emit_store_open_error`` so the operator sees one
+    line for one condition, whichever guard happened to catch it.
+    """
+    import contextlib
+
+    # `sqlite3` and `Path` are module-level (see the header imports) -- re-importing them here would
+    # shadow the same objects for no gain.
+    if not is_sqlite:
+        return None
+
+    tail = "(check --db / [store].path)"
+    if not Path(path).exists():
+        print(f"error: no audit database at {path} — {refusal} {tail}", file=sys.stderr)
+        return 2
+
+    try:
+        # `as_uri()` percent-encodes, which SQLite decodes back -- a bare f-string would misread a
+        # Windows path holding `?`, `#` or `%`. `resolve()` is safe here: the file exists.
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+            found = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+            ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        # `OperationalError` subclasses this, so an unreadable path lands here too. #1670 owns the
+        # general case of a non-database at `--db`; refusing it before the store opens is a side
+        # effect of probing first, not this item's fix -- so it reports in #1670's words and with
+        # #1670's exit code rather than minting a second message for one condition.
+        return _emit_store_open_error(exc, path, as_json=as_json)
+
+    if found is None:
+        print(
+            f"error: {path} is a SQLite database with no audit_log table — {refusal} {tail}",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4620,36 +4686,57 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # A SQLite store would otherwise be CREATED on open: a compliance job pointed at a typo'd path
-    # would silently get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31).
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one and report "
-            f"a false 'verified 0 rows' (check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # A SQLite store would otherwise be CREATED (or schema-migrated) on open: a compliance job
+    # pointed at a typo'd path, or at the zero-byte file a touch/failed copy leaves behind, would
+    # get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31, #1669).
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one and report a false 'verified 0 rows'",
+    )
+    if refused is not None:
+        return refused
 
-    async def run() -> tuple[bool, str | None]:
+    async def run() -> tuple[bool, str | None, int]:
         store = await open_store(settings.store)
         try:
-            return await store.verify_audit_chain(expected_anchor=expected_anchor)
+            ok, message = await store.verify_audit_chain(expected_anchor=expected_anchor)
+            if not ok:
+                return ok, message, -1  # a FAIL exits 1 whatever the count; don't query for it
+            # The row count decides the empty-log exit below. Ask the store for an integer rather
+            # than pattern-matching "verified 0 " out of a human-readable message.
+            count, _head = await store.audit_anchor()
+            return ok, message, count
         finally:
             await store.close()
 
     try:
-        ok, message = asyncio.run(run())
+        ok, message, count = asyncio.run(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
+        # ONLY SQLite; this catch is what a server backend and any error raised after the open
+        # still land in, so both guards stay live.
         return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + (message or ""))
-    if ok and message and "verified 0 " in message:
-        # An empty log on a real DB is legitimate but worth flagging — it's indistinguishable at a
-        # glance from pointing at the wrong database (M-31).
-        print(
-            "warning: the audit log is empty — confirm this is the intended database.",
-            file=sys.stderr,
-        )
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    if count:
+        return 0
+
+    # An empty log on a real audit database is legitimate, and at a glance indistinguishable from
+    # having verified the wrong database (M-31). An operator who says so gets exit 0 -- either with
+    # --allow-empty, or by passing an expected anchor, which on a chain that verified clean can only
+    # have been `0:` and is therefore already an explicit assertion that the log holds nothing.
+    expected_empty = args.allow_empty or expected_anchor is not None
+    print(
+        "warning: the audit log is empty — confirm this is the intended database."
+        + ("" if expected_empty else " Exiting 3; pass --allow-empty if that is expected."),
+        file=sys.stderr,
+    )
+    # EXIT 3, NOT 1. This command already spends 1 on a BROKEN CHAIN and 2 on "could not start", so
+    # a compliance job keying on the exit code would otherwise read an empty log as detected tamper
+    # or as its own misconfiguration. 3 says "ran, and found nothing to verify" (#1669).
+    return 0 if expected_empty else 3
 
 
 def _audit_anchor(args: argparse.Namespace) -> int:
@@ -4662,7 +4749,6 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     a ticket, an object store, or a compliance job's own database.
     """
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4678,16 +4764,20 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # The SAME M-31 guard as _audit_verify, and it matters MORE here: opening a SQLite store creates
-    # it, so a typo'd path would mint a fresh empty DB and print `0:` — an anchor OF NOTHING, which a
-    # later verify against the wrong database would then happily confirm.
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one and print "
-            f"an anchor of an empty log (check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # The SAME guard as _audit_verify, and it matters MORE here: opening a SQLite store creates or
+    # migrates it, so a typo'd path or a zero-byte file would mint a fresh empty DB and print `0:` —
+    # an anchor OF NOTHING, which a later verify against the wrong database would happily confirm.
+    # Unlike the verify twin this keeps exit 0 on a REAL store whose log is legitimately empty:
+    # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse.
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one and print an anchor of an empty log",
+        # Only this one of the three callers has --json, and #1670 routes its store-open error there.
+        as_json=args.json,
+    )
+    if refused is not None:
+        return refused
 
     async def run() -> tuple[int, str]:
         store = await open_store(settings.store)
@@ -4725,7 +4815,6 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
     stopped so no concurrent append races the watermark move."""
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4741,14 +4830,15 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path (mirrors _audit_verify M-31).
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one "
-            f"(check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path or a zero-byte file
+    # (mirrors the _audit_verify guard).
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one",
+    )
+    if refused is not None:
+        return refused
 
     async def run() -> tuple[bool, str]:
         store = await open_store(settings.store)
