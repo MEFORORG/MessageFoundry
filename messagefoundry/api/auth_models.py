@@ -155,6 +155,13 @@ class PasswordResetResponse(BaseModel):
 
     temp_password: str
     must_change_password: bool = True
+    #: BACKLOG #1141 (ASVS 6.4.5): the Unix instant this credential stops working, so the renewal
+    #: instruction ships WITH the credential on the one artifact that reaches the issuing
+    #: administrator. It is ``AuthService.initial_credential_deadline`` over the stored
+    #: ``password_changed_at`` — the same value the login gate refuses on, never a second
+    #: computation. ``None`` when ``[auth].initial_password_expiry_hours`` is 0, which is the
+    #: documented value that genuinely removes the deadline.
+    expires_at: float | None = None
 
 
 # --- MFA: native TOTP second factor (WP-14, ASVS 6.3.3) ----------------------
