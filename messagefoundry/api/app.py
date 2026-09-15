@@ -468,6 +468,23 @@ def _is_toml_managed(source_file: str | None) -> bool:
     return source_file is not None and source_file.endswith(CONNECTIONS_FILE_NAME)
 
 
+def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for a resend into an outbound that is not delivering — one place, because both
+    resend routes ask the identical question and a second copy would drift.
+
+    It NAMES THE CAUSE for a #122 log halt (ADR 0189), and that is the point of the helper rather than
+    a nicety. "start it before resending" is the right instruction for an operator-paused lane and the
+    WRONG one for a halted engine, where the same door the message points at is refused until the
+    application log is writable again — a 409 that sends an operator to a control that cannot help is
+    the compensating-control-on-a-false-premise shape (SDS-3.7)."""
+    if rr.outbound_status(name) == "log_halted":
+        return (
+            f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
+            "is being delivered anywhere — fix the log, then start the connection, then resend"
+        )
+    return f"outbound {name!r} is not running — start it before resending"
+
+
 def _backlog(depth: int, recent: int) -> float | None:
     """Estimated seconds to clear the queue: 0 if empty, None if queued but nothing draining."""
     if depth == 0:
@@ -3974,9 +3991,7 @@ def create_app(
             )
         try:
             if not rr.outbound_running(body.to):
-                raise HTTPException(
-                    409, f"outbound {body.to!r} is not running — start it before resending"
-                )
+                raise HTTPException(409, _outbound_down_detail(rr, body.to))
         except KeyError:  # neither declared nor draining (mirrors the control handlers)
             raise HTTPException(404, f"no such outbound connection: {body.to}") from None
         try:
@@ -4059,9 +4074,7 @@ def create_app(
                 )
             try:
                 if not rr.outbound_running(body.to):
-                    raise HTTPException(
-                        409, f"outbound {body.to!r} is not running — start it before resending"
-                    )
+                    raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
             try:
