@@ -15,9 +15,12 @@ non-default config the item names: two FILE sources sharing one `processed_dir`.
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import threading
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -148,3 +151,41 @@ def test_claim_unique_copy_fallback_streams_the_bytes(
     claimed = _claim_unique(source, tmp_path / "dst.bin")
 
     assert claimed.read_bytes() == payload
+
+
+def test_claim_unique_copy_fallback_removes_a_half_written_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that dies mid-stream must leave nothing at the name it claimed.
+
+    The `O_EXCL` create succeeds, then `copyfileobj` raises: a full volume, a dropped SMB share.
+    Without the cleanup guard that would leave a TRUNCATED, PHI-bearing file at the target on first
+    deployment, beside a reported failure. Worse, it would consume the name permanently: the
+    `name-1.ext` bumping loop skips a name that already exists, so every later delivery would route
+    around the debris rather than replace it.
+
+    Deliberately ASCII-only, comments included: pytest echoes this body into the failure report, and
+    a stock Windows cp1252 console mangles a non-ASCII character there (measured on the negative
+    control run, where an em dash printed as a replacement character).
+
+    Mutation: drop the `try/finally` around the copy. Red: the truncated file is still there."""
+
+    def _no_hard_links(*_a: object, **_k: object) -> None:
+        raise OSError("hard links unsupported on this filesystem")
+
+    def _die_mid_copy(src: object, dst: BinaryIO, *_a: object, **_k: object) -> None:
+        dst.write(b"TRUNC")  # bytes really land, so an unguarded failure leaves real debris
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(shutil, "copyfileobj", _die_mid_copy)
+    source = tmp_path / "src.bin"
+    source.write_bytes(b"PAYLOAD" * 1000)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        _claim_unique(source, tmp_path / "dst.hl7")
+
+    # Nothing but the untouched source: no truncated PHI at `dst.hl7`, and no bumped `dst-1.hl7`
+    # either. The guard removes the file it created, it does not step around it.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["src.bin"]
+    assert source.read_bytes() == b"PAYLOAD" * 1000  # the claim never consumes its source
