@@ -2354,7 +2354,8 @@ def DICOM(
     | EnvRef
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
-    # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
+    # failure BEFORE the object is decoded, and so before the durable commit (the X12
+    # max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
@@ -2372,7 +2373,8 @@ def DICOM(
     ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
-    rejects an object over ``max_object_bytes`` with a DIMSE failure before the commit. A non-loopback
+    rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
+    the commit. A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 

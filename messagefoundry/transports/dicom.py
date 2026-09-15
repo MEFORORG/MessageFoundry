@@ -29,7 +29,8 @@ DIMSE failure (the sender was already told Success).
 **Security (§9):** the calling-AE allowlist (``require_calling_aet``, association-level) + a peer-IP
 allowlist (the per-connection ``source_ip_allowlist`` passed to ``inbound(...)`` — there is no
 ``[inbound].source_ip_allowlist`` service key — checked before any commit) + ``require_called_aet`` +
-a ``max_object_bytes`` cap (over-cap → DIMSE failure **before** commit) + an **opt-in association-rate
+a ``max_object_bytes`` cap (charged against the **raw received Data Set, before it is decoded**, so an
+over-cap object is refused before any decode, re-encode or commit) + an **opt-in association-rate
 bound** (``max_associations_per_second``, ASVS 2.4.1 / BACKLOG #1114 — off by default, waits before the
 association request is read, and never drops or refuses; see :meth:`DicomScpSource._pace_association`
 for why the unit is an association and not a message) + DICOM-over-TLS. A non-loopback
@@ -106,8 +107,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Per-object size cap default (bounds what is persisted; pynetdicom buffers the object during receive,
-#: which max_associations + max_pdu_size bound). Overridable via DICOM(max_object_bytes=...).
+#: Per-object size cap default: it bounds what is persisted, and — charged against the raw received Data
+#: Set before decode (see DicomScpSource._raw_over_cap) — what one received object costs in memory.
+#: max_pdu_size bounds a fragment, NOT the object: pynetdicom accumulates every fragment of an incoming
+#: object with no ceiling of its own. Overridable via DICOM(max_object_bytes=...).
 DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
 
 #: Association-rate pacing for the SCP ships OFF, for exactly the reason
@@ -401,12 +404,19 @@ class DicomScpSource(SourceConnector):
                     calling_ae,
                 )
                 return _STATUS_NOT_AUTHORIZED
+            # BACKLOG #1727: charge max_object_bytes against the RAW received Data Set FIRST. The
+            # post-encode check below fires only after event.dataset has copied and decoded the whole
+            # buffer and save_as has re-encoded it, so an over-cap object would be held several times
+            # over before the cap refused it. This also bounds the raw bytes the deflate guard copies.
+            raw_over_cap = self._raw_over_cap(event, peer_ip=peer_ip, calling_ae=calling_ae)
+            if raw_over_cap is not None:
+                return raw_over_cap
             # ASVS 5.2.3 (the network-facing SCP): when the negotiated presentation context is Deflated
             # Explicit VR LE, pynetdicom would inflate the received Data Set UNBOUNDED the instant we
-            # touch event.dataset (max_object_bytes is checked only AFTER the post-inflation save_as
-            # re-encode). Pre-check the inflate in bounded memory over the RAW event.request.DataSet bytes
-            # BEFORE event.dataset — an over-cap deflate bomb is a DIMSE failure (never committed, never
-            # decoded). Bound by the object-size policy the SCP already enforces.
+            # touch event.dataset, and the raw-length charge above bounds only the COMPRESSED bytes, which
+            # say nothing about how far they inflate. Pre-check the inflate in bounded memory over the RAW
+            # event.request.DataSet bytes BEFORE event.dataset — an over-cap deflate bomb is a DIMSE
+            # failure (never committed, never decoded). Bound by the object-size policy the SCP enforces.
             deflate_bomb = self._deflated_over_cap(event, peer_ip=peer_ip, calling_ae=calling_ae)
             if deflate_bomb is not None:
                 return deflate_bomb
@@ -427,8 +437,10 @@ class DicomScpSource(SourceConnector):
                 return _STATUS_CANNOT_UNDERSTAND
             sop_instance = str(getattr(dataset, "SOPInstanceUID", "") or "")
             sop_class = str(getattr(dataset, "SOPClassUID", "") or "")
-            # Size cap BEFORE the durable commit (the X12 max_interchange_bytes analog) — refuse an
-            # over-cap object rather than persist it (count-and-log-safe; the SCU sees the failure).
+            # Second charge, on the re-encoded Part-10 bytes the store would hold — the raw-length charge
+            # above cannot see what the preamble, DICM and file meta add. Still BEFORE the durable commit
+            # (the X12 max_interchange_bytes analog): refuse an over-cap object rather than persist it
+            # (count-and-log-safe; the SCU sees the failure).
             if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
                 logger.warning(
                     "DICOM C-STORE from %s (AE %r, SOP %s): object %d bytes over max_object_bytes %d",
@@ -445,6 +457,32 @@ class DicomScpSource(SourceConnector):
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
             logger.error("DICOM C-STORE failed unexpectedly: %s", safe_exc(exc))
             return _STATUS_CANNOT_UNDERSTAND
+
+    def _raw_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
+        """Charge ``max_object_bytes`` against the RAW ``event.request.DataSet`` length BEFORE
+        ``event.dataset`` decodes it, returning a DIMSE **failure** status for an over-cap object — else
+        ``None`` (proceed). The re-encode below writes these same Data Set bytes with a preamble, ``DICM``
+        and file meta in front, so a raw length over the cap means an over-cap Part-10 object. Reads the
+        length through ``getbuffer()``, which does not copy (unlike ``getvalue()``). PHI-safe: logs the cap
+        + routing identifiers, never bytes."""
+        if self._max_object_bytes is None:
+            return None
+        data_set = getattr(getattr(event, "request", None), "DataSet", None)
+        if data_set is None:
+            return None  # nothing received; the normal decode path handles an empty request
+        with data_set.getbuffer() as raw:
+            raw_bytes: int = raw.nbytes
+        if raw_bytes <= self._max_object_bytes:
+            return None
+        logger.warning(
+            "DICOM C-STORE from %s (AE %r): raw data set %d bytes over max_object_bytes %d — "
+            "refusing before decode",
+            peer_ip,
+            calling_ae,
+            raw_bytes,
+            self._max_object_bytes,
+        )
+        return _STATUS_OUT_OF_RESOURCES
 
     def _deflated_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
         """ASVS 5.2.3 SCP guard. When the accepted context's transfer syntax is Deflated Explicit VR LE,
