@@ -4315,3 +4315,23 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock, under real concurrency -----------------------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message ``sp_getapplock`` finalize lock as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism and the measurement behind
+    the round count; the shared module is what keeps this leg and the Postgres one asking the same
+    question rather than two hand-synced copies drifting apart.
+
+    THIS BACKEND'S NUMBER IS UNMEASURED. The 30 rounds were measured against Postgres, whose lock is
+    a different mechanism under a different snapshot rule. What this leg establishes on a real SQL
+    Server, nobody has yet read -- the gated ``sqlserver-store`` CI job carries its first result.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)

@@ -19,7 +19,10 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -4214,3 +4217,153 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+# --- the per-message finalize lock + the audit chain, under real concurrency ------------------------
+
+
+async def test_concurrent_mark_done_finalizes_processed_every_round(store) -> None:
+    """Both destinations of ONE message complete at the same moment, every round -> PROCESSED.
+
+    Pins the per-message finalize advisory lock (H-7/H-8) as the SINGLE authority on disposition.
+    ``tests/_finalize_race_contract`` carries the property, the mechanism, and the paired-arm
+    measurement behind the round count -- read it there rather than here.
+
+    THIS is the backend that measurement was taken on, so a red here is the shared contract's first
+    and best signal.
+    """
+    from tests._finalize_race_contract import assert_concurrent_finalize_reaches_processed
+
+    await assert_concurrent_finalize_reaches_processed(store)
+
+
+# The appender each subprocess runs: open the SAME store this test's fixture opened, append N chained
+# audit rows, close. Carried as source rather than a helper module so the child's whole contract is
+# readable beside the assertions that depend on it, and because `[sys.executable, "-c", <source>]` is
+# already the house form for a child probe. Synthetic actor/detail only, never PHI.
+_AUDIT_APPENDER_SRC = """\
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+
+from messagefoundry.config.settings import load_settings
+from messagefoundry.store.postgres import PostgresStore
+
+
+def rendezvous(latch_dir, tag, peers, timeout=60.0):
+    # MEASURED, and the test is worthless without it. Each child's whole append window is ~0.03s,
+    # while interpreter start plus the messagefoundry import desynchronizes the two by up to 0.5s --
+    # so unlatched, the two write windows simply do not meet. With the chain lock patched out to
+    # check that this test can fail at all, an unlatched pair forked the chain in only 1 run of 5;
+    # the other 4 passed having never raced. This latch is taken AFTER the store is open, so every
+    # fixed cost is paid before it, and both children leave it within a poll interval of each other.
+    d = Path(latch_dir)
+    (d / (tag + ".ready")).write_text("1", encoding="utf-8")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(list(d.glob("*.ready"))) >= peers:
+            return
+        time.sleep(0.002)
+    raise SystemExit("rendezvous timed out waiting for %d peers in %s" % (peers, d))
+
+
+async def main() -> None:
+    tag, rows, latch_dir, peers = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        rendezvous(latch_dir, tag, peers)
+        for i in range(rows):
+            await store.record_audit("message_view", actor=tag, detail=f"{tag}-{i}")
+    finally:
+        await store.close()
+
+
+asyncio.run(main())
+"""
+
+_AUDIT_ROWS_PER_PROCESS = 25
+
+#: Bound on ONE appender's wait, sized to stay under the suite's own ``--timeout=60`` watchdog (the
+#: gated ``postgres-store`` job adds no ``--timeout=`` of its own, so the pyproject value is what
+#: binds). The ordering is the whole point: at the watchdog the ``thread`` method dumps stacks and
+#: hard-exits the interpreter, which orphans both children AND takes the rest of this file's tests
+#: down with it. A bound above the watchdog would be dead code.
+_APPENDER_TIMEOUT_SECONDS = 30.0
+
+
+def _await_appender(proc: subprocess.Popen[str]) -> tuple[bool, str]:
+    """Wait for one appender under a finite bound. Returns ``(exited_clean, detail)``."""
+    try:
+        out, _ = proc.communicate(timeout=_APPENDER_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        return False, f"did not exit within {_APPENDER_TIMEOUT_SECONDS}s, killed; output:\n{out}"
+    return proc.returncode == 0, f"exited {proc.returncode}; output:\n{out}"
+
+
+_AUDIT_APPENDER_TAGS = ("proc-a", "proc-b")
+
+
+async def test_audit_chain_survives_two_process_append(store, tmp_path: Path) -> None:
+    """Two OS PROCESSES append to one audit chain at once and the chain still verifies.
+
+    ``record_audit`` hash-links every row to the chain tail, so two appenders that read the same tail
+    fork it: two rows claiming one predecessor, and ``verify_audit_chain`` goes false. What stops that
+    is ``pg_advisory_xact_lock`` on the chain (H-7), taken in the DATABASE -- and only a second OS
+    process can show the database is what does the work. A single-interpreter test cannot tell the
+    advisory lock apart from any Python-level lock, so it would stay green over a store whose
+    serialization lives entirely in one process. Two processes over one store is also the shipped
+    engine-shard topology (ADR 0037), where that in-process lock would not exist at all.
+
+    This SUBSUMES a Postgres copy of ``test_sqlserver_store.py``'s single-process
+    ``test_audit_chain_no_fork_under_concurrent_record_audit``: anything a one-interpreter gather
+    would prove here, two processes prove strictly harder. Do not add that as missing parity.
+
+    Measured on a local PostgreSQL 16.14 over the LATCHED form below, 5 paired runs each way, with a
+    positive control confirming the mutation landed in both children every run: lock intact,
+    ``verify_audit_chain`` clean over 50 rows 5 times out of 5; chain lock patched out inside both
+    children, broken 5 times out of 5. Disjoint reds, so the arms discriminate rather than merely
+    differ. The row COUNT was 50 in BOTH arms, so the count assertion below does not catch the fork
+    -- it is there only to refuse the vacuous pass where a child wrote nothing and an empty chain
+    verified clean.
+
+    The children RENDEZVOUS on ``tmp_path`` before their first append, and that latch is what makes
+    this test able to fail at all -- see the comment in ``_AUDIT_APPENDER_SRC`` for the measurement
+    that put it there. Spawn order alone does not make two processes race.
+    """
+    # cwd is sys.path[0] for `python -c`, so this is what makes the children import THIS tree rather
+    # than any other installed copy. One mechanism, not two: PYTHONPATH would land BEHIND sys.path[0]
+    # and could never be the entry that wins. MEFOR_STORE_* reaches them via the inherited environ.
+    repo_root = Path(__file__).resolve().parents[1]
+    peers = len(_AUDIT_APPENDER_TAGS)
+    procs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _AUDIT_APPENDER_SRC,
+                tag,
+                str(_AUDIT_ROWS_PER_PROCESS),
+                str(tmp_path),
+                str(peers),
+            ],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for tag in _AUDIT_APPENDER_TAGS
+    ]
+    # Both are already spawned; communicate() blocks, and this suite runs on ONE shared session loop,
+    # so hand the two bounded waits to threads. That keeps the loop free and the children concurrent.
+    results = await asyncio.gather(*(asyncio.to_thread(_await_appender, p) for p in procs))
+    for ok, detail in results:
+        assert ok, f"audit appender {detail}"
+
+    ok, detail = await store.verify_audit_chain()
+    assert ok is True, detail
+    count, _head = await store.audit_anchor()
+    assert count == 2 * _AUDIT_ROWS_PER_PROCESS
