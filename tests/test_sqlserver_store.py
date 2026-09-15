@@ -482,6 +482,18 @@ async def test_lockout_store_contract(store) -> None:
     await _assert_lockout_contract(store)
 
 
+async def test_pending_approval_store_contract(store) -> None:
+    """BACKLOG #1540 ``pending_approvals.requester_user_id`` on the real SQL Server backend.
+
+    This backend is the one where getting the migration wrong is SILENT: the ADR 0064 schema marker
+    skips the whole batch once it matches, so an ``ALTER`` placed outside ``_SCHEMA`` never runs and
+    the column simply never appears. ``test_store_schema_hash.py`` pins the DDL text; only this leg
+    proves the column is really there and that the ``INSERT``/``SELECT`` carry it."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real SQL Server backend.
 

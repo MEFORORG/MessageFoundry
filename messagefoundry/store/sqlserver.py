@@ -1409,11 +1409,21 @@ _SCHEMA: list[str] = [
         uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
         since FLOAT NOT NULL)""",
+    # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
+    # self-approval refusal compares (the Store protocol's create_pending_approval says why).
+    # NVARCHAR(64) matches users.id and this table's own id column.
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
+        requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
+    # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
+    # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
+    # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
+    # matches and the column never appears, with no error.
+    """IF COL_LENGTH('pending_approvals','requester_user_id') IS NULL
+        ALTER TABLE pending_approvals ADD requester_user_id NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -9583,27 +9593,37 @@ class SqlServerStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES (?,?,?,?,?,'pending',?)",
-            (approval_id, operation, params, requester, requested_at, expires_at),
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES (?,?,?,?,?,?,'pending',?)",
+            (
+                approval_id,
+                operation,
+                params,
+                requester,
+                requester_user_id,
+                requested_at,
+                expires_at,
+            ),
         )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
             " decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
