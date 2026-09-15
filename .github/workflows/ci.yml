@@ -2098,6 +2098,7 @@ jobs:
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
           tests/test_sqlserver_legacy_outbox_migration.py
+          tests/test_sqlserver_audit_applock.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:

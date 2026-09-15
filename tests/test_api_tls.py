@@ -6,7 +6,9 @@ serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is c
 from __future__ import annotations
 
 import datetime
+import errno
 import json
+import logging
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -31,7 +33,11 @@ from messagefoundry.api.security import (
     require_service_cert,
     resolve_client_cert_identity,
 )
-from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
+from messagefoundry.api.tls import (
+    _GENERATED_CERT_NAME,
+    build_api_ssl_context,
+    ensure_api_tls_material,
+)
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     client_cert_http_protocol_class,
@@ -2027,6 +2033,106 @@ def test_the_minted_certificate_verifies_against_itself_as_a_ca_file(tmp_path: P
     # above could pass on a client that verifies nothing.
     with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):
         _handshake(server, ssl.create_default_context(), client_cert=None, server_hostname=api.host)
+
+
+def test_a_failed_cert_write_leaves_no_orphaned_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE MINT IS ALL-OR-NOTHING. The key is written first, so a cert write that fails would leave
+    a lone key.pem, and that half-pair would brick every later start rather than degrade it.
+
+    The reuse branch needs BOTH files. With only the key present, a next start falls through to
+    re-mint, and `_write_private_key`'s O_EXCL then refuses the surviving key -- so the engine would
+    raise FileExistsError on every start, forever, naming no cause and no remedy. On a deploying
+    site whose disk filled during first-run mint, that is an engine that will not come up again
+    until someone finds and deletes a file nothing told them about.
+
+    Mutation: drop the `try/finally` around `cert_path.write_bytes`. Red: the key survives alone."""
+    from messagefoundry.api import tls as tls_mod
+
+    def _cert_write_dies(_self: Path, _data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", _cert_write_dies)
+    api = ApiSettings()
+
+    with pytest.raises(OSError, match="No space left on device"):
+        ensure_api_tls_material(api, state_dir=tmp_path)
+
+    monkeypatch.undo()  # read the directory with the real Path again
+    key_path = tmp_path / tls_mod._GENERATED_KEY_NAME
+    cert_path = tmp_path / tls_mod._GENERATED_CERT_NAME
+    assert not key_path.exists(), "a lone key.pem would make every later start die on O_EXCL"
+    assert not cert_path.exists()
+
+    # The state it must leave behind is a re-mintable one, which is the whole point of removing it.
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+
+
+def test_a_lone_key_from_a_crashed_mint_is_discarded_and_re_minted(tmp_path: Path) -> None:
+    """THE CRASH WINDOW, which the mint's own `try/finally` cannot reach.
+
+    That guard unwinds an EXCEPTION. A SIGKILL, a power loss or an OOM kill between the key write
+    and the cert write runs no `finally` at all, and leaves exactly the same lone key.pem. So the
+    guard tidies up the failures it can see, and THIS is what makes the engine recoverable from the
+    ones it cannot.
+
+    Without the discard, the next start finds cert missing, falls through to re-mint, and
+    `_write_private_key`'s O_EXCL refuses the surviving key. That is a FileExistsError on every
+    start, forever, naming no file to delete -- and since ADR 0172 makes the generated pair the
+    default first-run path, it is a fresh deployment that never comes up.
+
+    The crash is simulated by its RESULT rather than by killing a process: mint a real pair, then
+    remove the cert. A test that patched the write to raise would exercise the `finally` instead,
+    which is the path already covered and not the one at issue here.
+
+    Mutation: drop the `_discard_half_minted_pair` call. Red: FileExistsError."""
+    api = ApiSettings()
+    first_cert, first_key = ensure_api_tls_material(api, state_dir=tmp_path)
+    orphan_key_bytes = Path(first_key).read_bytes()
+    Path(first_cert).unlink()  # what a crash between the two writes leaves behind
+
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+
+    # A usable pair, not a refusal: this is the whole point.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    # RE-minted, not reused. A cert minted against a different key would load here and fail at the
+    # handshake, so asserting the key actually changed is what separates recovery from a half-fix.
+    assert Path(key).read_bytes() != orphan_key_bytes
+
+
+def test_a_lone_cert_from_a_crashed_mint_is_discarded_too(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The symmetric half, asserted on the LOG because nothing else observes it.
+
+    A lone cert bricks nothing: the key is absent, so the mint writes it and `write_bytes` overwrites
+    the stale file either way. The first version of this test asserted the new cert differed from the
+    stale one, which is true whether or not the cert half is discarded -- a test that could not fail
+    for the reason its own docstring gave. Running its stated control is what caught that, so the
+    control is recorded here rather than the claim.
+
+    What the discard actually buys on this half is the invariant "either both or neither", and the
+    only place that is observable is the warning. Asserting it keeps the cleanup symmetric, so a
+    later edit narrowing it to the key half reds here instead of silently leaving the pair's two
+    halves governed by different rules.
+
+    Mutation: narrow the loop to `(key_path,)`. Red: no warning names the cert."""
+    api = ApiSettings()
+    first_cert, first_key = ensure_api_tls_material(api, state_dir=tmp_path)
+    Path(first_key).unlink()  # what a crash before the key write leaves behind
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    discards = [r.getMessage() for r in caplog.records if "half-minted TLS pair" in r.getMessage()]
+    assert len(discards) == 1, f"expected exactly one discard warning, got {discards}"
+    assert _GENERATED_CERT_NAME in discards[0]  # the CERT half, not only the key
 
 
 def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:

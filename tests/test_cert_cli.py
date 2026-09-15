@@ -11,7 +11,9 @@ passphrase, and that a bad/missing password never leaks into the error output.
 from __future__ import annotations
 
 import datetime
+import errno
 import json
+import os
 import time
 from pathlib import Path
 
@@ -621,3 +623,76 @@ def test_inventory_does_not_crash_or_leak_on_non_valueerror_parse_failure(
     assert rc == 1
     assert "could not read or parse certificate" in combined
     assert "SECRET-LOOKING-TEXT" not in combined  # exception text never echoed
+
+
+# --- the key write is all-or-nothing --------------------------------------------------------
+
+
+class _HandleThatDiesMidWrite:
+    """Wraps the real file object so the fd is still closed by the `with`, but `write` lands some
+    bytes and then raises. Writing through the real handle first is the point: it makes the failure
+    leave genuine truncated debris rather than an empty file, which is what the guard must remove.
+
+    The fixtures below deliberately carry NO `BEGIN PRIVATE KEY` header. `_write_private_key` writes
+    opaque bytes and never parses them, so a real PEM header would add nothing and would trip the
+    gitleaks private-key rule in the commit gate."""
+
+    def __init__(self, fh: object) -> None:
+        self._fh = fh
+
+    def __enter__(self) -> _HandleThatDiesMidWrite:
+        self._fh.__enter__()  # type: ignore[attr-defined]
+        return self
+
+    def __exit__(self, *exc: object) -> object:
+        return self._fh.__exit__(*exc)  # type: ignore[attr-defined]
+
+    def write(self, _data: bytes) -> int:
+        self._fh.write(b"KEY-MATERIAL-STAND-IN\nTRUNC")  # type: ignore[attr-defined]
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_a_key_write_that_dies_midway_leaves_no_truncated_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_write_private_key` must leave nothing behind when the write fails.
+
+    The O_EXCL create succeeds, then the write raises on a full volume. Without the cleanup guard a
+    TRUNCATED private key would be left at `path` on first deployment, and because the same O_EXCL
+    then refuses to overwrite it, nothing could ever re-mint over it: the caller would get a bare
+    FileExistsError naming no cause, on every retry, until someone deleted the file by hand.
+
+    Mutation: drop the `try/finally`. Red: the truncated key is still there."""
+    from messagefoundry.__main__ import _write_private_key
+
+    real_fdopen = os.fdopen
+
+    def _dying_fdopen(fd: int, *a: object, **k: object) -> _HandleThatDiesMidWrite:
+        return _HandleThatDiesMidWrite(real_fdopen(fd, *a, **k))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "fdopen", _dying_fdopen)
+    key_path = tmp_path / "key.pem"
+
+    with pytest.raises(OSError, match="No space left on device"):
+        _write_private_key(key_path, b"KEY-MATERIAL-STAND-IN\nREAL\n")
+
+    assert not key_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_pre_existing_key_is_refused_and_never_deleted(tmp_path: Path) -> None:
+    """The invariant the cleanup guard must not have widened. "Never clobber a key" means the O_EXCL
+    refusal fires on an existing file AND leaves it intact. The create therefore has to stay OUTSIDE
+    the guard: inside it, the FileExistsError would unlink the very key the refusal protects, turning
+    a safe refusal into the silent key loss it was written to prevent.
+
+    Mutation: move `os.open` inside the `try`. Red: the operator's key is gone."""
+    from messagefoundry.__main__ import _write_private_key
+
+    key_path = tmp_path / "key.pem"
+    key_path.write_bytes(b"KEY-MATERIAL-STAND-IN\nTHE-OPERATORS-REAL-KEY\n")
+
+    with pytest.raises(FileExistsError):
+        _write_private_key(key_path, b"KEY-MATERIAL-STAND-IN\nREPLACEMENT\n")
+
+    assert key_path.read_bytes() == b"KEY-MATERIAL-STAND-IN\nTHE-OPERATORS-REAL-KEY\n"

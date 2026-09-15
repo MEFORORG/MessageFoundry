@@ -668,7 +668,16 @@ async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) 
     """The step-up decision for a per-action route (ADR 0077): when action-binding is enforced
     (default), a fresh **single-use grant BOUND to** ``action`` (consumed here); when the org opted
     out (``[auth].require_action_step_up = false``), the legacy session-window recency. Split out so
-    ``require_step_up_action`` and ``require_reauth_only_action`` share one place for the fallback."""
+    ``require_step_up_action`` and ``require_reauth_only_action`` share one place for the fallback.
+
+    The factor-binding refusal below sits ABOVE that fork, so no knob reaches it (ASVS 6.3.3; the
+    bypass it closes is the ADR 0077 amendment of 2026-09-14)."""
+    # Above the fork rather than inside each branch, for two reasons. A control a config knob can
+    # switch off is not a control, and the opt-out branch is where the hole was. And `new_ip` aside,
+    # this is the one check that must precede `has_action_step_up`, which POPS the grant: refusing
+    # after it would burn the proof the caller just minted and re-prompt them into the same wall.
+    if await auth.factor_binding_is_blocked(token, action):
+        return False
     if auth.action_step_up_required:
         return await auth.has_action_step_up(token, action)
     return await auth.has_recent_step_up(token)

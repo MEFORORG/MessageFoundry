@@ -51,7 +51,8 @@ A `pynetdicom` Application Entity C-STORE SCP so modalities/PACS can **send** ob
 server **off the asyncio event loop**, bridges each received object back onto the loop, and returns C-STORE
 **Success only after** the object is durably committed to the ingress stage (**commit-before-SUCCESS** — the
 DIMSE analog of MLLP's commit-before-ACK; nothing is accepted-and-dropped). Security: calling-AE allowlist +
-peer-IP allowlist + `require_called_ae_title` + a `max_object_bytes` cap (over-cap → DIMSE failure *before*
+peer-IP allowlist + `require_called_ae_title` + a `max_object_bytes` cap (charged against the raw received
+Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before any decode, re-encode or
 commit) + DICOM-over-TLS. A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
 ### Outbound — C-STORE SCU + C-ECHO (`DICOM()` outbound)

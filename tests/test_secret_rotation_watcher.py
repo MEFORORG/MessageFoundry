@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hmac
+
+import pytest
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.models import ConnectorType
@@ -30,6 +33,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.secret_rotation import (
     SecretRotationRunner,
     SecretStamp,
+    _fingerprint_bytes,
     _keyed_fingerprint,
     held_env_secret_values,
     reconcile_rotation_meta,
@@ -472,3 +476,84 @@ def test_real_store_meta_roundtrip_and_reconcile(tmp_path) -> None:  # type: ign
             await store.close()
 
     asyncio.run(_go())
+
+
+# --- ASVS 11.2.4 (BACKLOG #1167): the fingerprint comparison ----------------
+# `reconcile_rotation_meta` decides "did this secret rotate" by comparing the STORED keyed MAC against
+# the freshly computed one. Those operands are keyed and secret-derived (`_keyed_fingerprint` is an
+# HMAC-SHA256 over a live secret value), so the comparison must be constant-time — and it must be
+# TOTAL, because `hmac.compare_digest`'s str overload raises on non-ASCII input and the engine's
+# reconcile call site swallows every exception from this function into one log line.
+
+
+class _CompareCounter:
+    """Counts (and delegates) ``hmac.compare_digest`` calls made while installed. Same idiom as
+    ``tests/test_asvs_audit_constant_time.py``."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._real = hmac.compare_digest
+
+    def __call__(self, a: object, b: object) -> bool:
+        self.calls += 1
+        return bool(self._real(a, b))  # type: ignore[arg-type]
+
+
+def test_fingerprint_comparison_goes_through_compare_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Asserted by counting calls to a monkeypatched comparator, not by grepping source. fp_key=None
+    # keeps the class set to the DEK alone, so the expected count is exact.
+    prior = SecretRotationMetaRow(_DEK, "dekid-SAME", "2025-01-01", "2025-03-01")
+    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    counter = _CompareCounter()
+    monkeypatch.setattr(hmac, "compare_digest", counter)
+    _reconcile(store, dek_key_id="dekid-SAME")
+    assert counter.calls == 1
+
+
+def test_counted_comparator_would_catch_a_plain_equality() -> None:
+    # Positive control for the assertion above: a plain operator counts ZERO, so that test genuinely
+    # fails if the comparison regresses to `!=`.
+    counter = _CompareCounter()
+    assert "dekid-SAME" == "dekid-SAME"  # noqa: PLR0133
+    assert counter.calls == 0
+
+
+def test_compare_digest_str_overload_raises_on_non_ascii() -> None:
+    # The refusal case the bytes normalisation exists to prevent, measured rather than asserted: a
+    # naive `hmac.compare_digest(prior.fingerprint, fingerprint)` would raise on a non-ASCII stored
+    # value.
+    with pytest.raises(TypeError):
+        hmac.compare_digest("brøken", "dekid-aaa")
+    assert hmac.compare_digest("dekid-aaa", "dekid-aaa")  # control: the ASCII form works
+
+
+def test_non_ascii_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
+    # `secret_rotation_meta.fingerprint` is TEXT NOT NULL but writable out of band. A planted
+    # non-ASCII value must read as "the fingerprint changed", never raise — a raise here is swallowed
+    # by the engine's reconcile handler, which would silently stop rotation tracking for every class.
+    prior = SecretRotationMetaRow(_DEK, "brøken", "2025-01-01", "2025-01-01")
+    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    stamps = _reconcile(store, dek_key_id="dekid-aaa")
+    dek = stamps[_DEK]  # type: ignore[index]
+    assert dek.last_rotated == _TODAY  # type: ignore[attr-defined]
+    assert dek.tracked_since == datetime.date(2025, 1, 1)  # type: ignore[attr-defined]
+    assert store.rows[_DEK].fingerprint == "dekid-aaa"
+
+
+def test_lone_surrogate_stored_fingerprint_is_a_rotation_not_a_type_error() -> None:
+    # A lone surrogate is a str CPython can hold but cannot UTF-8 encode by default; `surrogatepass`
+    # keeps the mapping total.
+    prior = SecretRotationMetaRow(_DEK, "\ud800", "2025-01-01", "2025-01-01")
+    store = _FakeMetaStore(rows={_DEK: prior}, fp_key=None)
+    stamps = _reconcile(store, dek_key_id="dekid-aaa")
+    assert stamps[_DEK].last_rotated == _TODAY  # type: ignore[index,attr-defined]
+
+
+def test_fingerprint_bytes_is_total_and_injective() -> None:
+    assert _fingerprint_bytes("dekid-aaa") == b"dekid-aaa"
+    assert _fingerprint_bytes("") == b""
+    # Distinct strs never collide onto the same bytes, so an "equal MAC" cannot be forged by encoding.
+    assert _fingerprint_bytes("brøken") != _fingerprint_bytes("broken")
+    assert _fingerprint_bytes("\ud800") != _fingerprint_bytes("\ud801")

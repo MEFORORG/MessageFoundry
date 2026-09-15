@@ -186,6 +186,39 @@ def plan_api_tls_material(api: ApiSettings, *, state_dir: Path) -> ApiTlsPlan:
     return ApiTlsPlan(source, str(cert_path), str(key_path))
 
 
+def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
+    """Remove a lone half of a previously generated pair, so the mint that follows can re-run.
+
+    Called only once the reuse branch has established that BOTH files are not present, so at most
+    one of these exists. A half-pair is unusable -- reuse needs both -- and the key half is also a
+    TRAP: the mint falls through, :func:`_write_private_key`'s ``O_EXCL`` refuses the surviving key,
+    and the engine fails to start. On EVERY start, permanently, naming no file to delete. ADR 0172
+    makes the generated pair the default first-run path, so that is a fresh deployment that never
+    comes up rather than an edge case.
+
+    **This is the durable half of the fix, and the ``try/finally`` around the mint is not.** That
+    guard unwinds an EXCEPTION. It does not run on a SIGKILL, a power loss, or an OOM kill, and each
+    of those leaves exactly the same half-pair. Recovery therefore cannot hang off the failure; it
+    has to sit on the path that runs next, which is this one. Attaching it here also makes the
+    recovery indifferent to how the half-pair arose, which is the property that matters, since the
+    causes are not enumerable.
+
+    **Deleting a private key is safe here and only here.** An operator-supplied ``tls_cert_file``
+    returned far above, so operator material never reaches this function; these are the engine's own
+    fixed generated names under its own state dir, and a lone one is engine-written debris by
+    construction. It is still logged at warning, because a deleted key must never be silent.
+    """
+    for orphan in (cert_path, key_path):
+        if not orphan.exists():
+            continue
+        log.warning(
+            "discarding a half-minted TLS pair: %s exists without its counterpart, so it is "
+            "unusable and would refuse every later start. Re-minting both.",
+            orphan,
+        )
+        orphan.unlink()
+
+
 def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
@@ -209,6 +242,10 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
     ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
     files and loads them; it does not re-mint, and it cannot clobber a key.
+
+    **A HALF-PAIR IS THE EXCEPTION, and it re-mints rather than refusing** -- see
+    :func:`_discard_half_minted_pair`. Reuse needs BOTH files, so one alone is unusable AND a trap:
+    the O_EXCL refusal above would fire on the survivor at every later start, permanently.
 
     **The generated certificate is a PLACEHOLDER TO BE REPLACED, not an endorsed production
     terminator.** It is self-signed, so it carries no chain of trust: strictly better than
@@ -234,6 +271,7 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     cert_path, key_path = _generated_pair(state_dir)
     if cert_path.exists() and key_path.exists():
         return str(cert_path), str(key_path)
+    _discard_half_minted_pair(cert_path, key_path)
 
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
@@ -243,7 +281,18 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     # lifetime for the same primitive.
     cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
     _write_private_key(key_path, key_pem)
-    cert_path.write_bytes(cert_pem)
+    paired = False
+    try:
+        cert_path.write_bytes(cert_pem)
+        paired = True
+    finally:
+        # THE MINT IS ALL-OR-NOTHING. An orphaned key.pem is not merely untidy: the reuse branch
+        # above needs BOTH files, so a next start finds cert_path missing, falls through, re-mints,
+        # and dies on _write_private_key's O_EXCL refusal. That repeats on every start until an
+        # operator deletes a file nothing told them about, so a half-written pair would brick the
+        # engine rather than degrade it. `finally`, not `except`, so no failure mode is missed.
+        if not paired:
+            key_path.unlink(missing_ok=True)
     log.warning(
         "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
         "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "

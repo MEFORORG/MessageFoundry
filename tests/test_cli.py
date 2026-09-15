@@ -2426,3 +2426,36 @@ def test_admin_unlock_writes_an_audit_row(
             await s.close()
 
     assert "auth.admin_unlocked" in asyncio.run(rows())
+
+
+def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -> None:
+    """BACKLOG #1670: the measured symptom, and the assertion is that the PROCESS ENDS.
+
+    ``MessageStore.open`` connects before its first ``PRAGMA``, so a path that is not a database
+    raised with the aiosqlite connection still live. That worker thread is not a daemon, so the
+    interpreter blocked in ``threading._shutdown`` joining it -- two hung ``audit-verify`` processes
+    were measured at 319 seconds and killed by hand. A scheduled compliance job pointed at the wrong
+    file would neither pass nor fail; it would pile up one stuck process per tick.
+
+    A CHILD interpreter with a hard timeout is the only honest shape. Asserting that ``close`` was
+    called does not prove the process exits, and an in-process check would hang pytest's own exit.
+
+    Exit 2, not 1: ``audit-verify`` spends 1 on a BROKEN CHAIN, so a job keying on exit codes would
+    read "not a database" as "tamper detected".
+    """
+    import subprocess
+    import sys
+
+    bad = tmp_path / "not-a-db.txt"
+    bad.write_text("not a db\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "messagefoundry", "audit-verify", "--db", str(bad)],
+        cwd=tmp_path,  # away from the repo, so no stray ./messagefoundry.toml is picked up
+        capture_output=True,
+        text=True,
+        timeout=30,  # well under the 60s pytest-timeout watchdog, so THIS reports the failure
+    )
+    assert proc.returncode == 2, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "cannot open the store" in proc.stderr
+    assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"

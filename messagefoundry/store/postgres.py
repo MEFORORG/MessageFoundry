@@ -230,6 +230,12 @@ _EPOCH_GUARD_RESOLVE = (
     " <= ${h}"
 )
 
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The Postgres
+#: twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced into
+#: :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a delivery
+#: whose content retention has erased.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
 
 class _FencedWrite(Exception):
     """Sentinel raised INSIDE the enclosing ``conn.transaction()`` so asyncpg rolls the whole
@@ -5239,7 +5245,12 @@ class PostgresStore:
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
-        ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued."""
+        ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued.
+
+        A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
+        idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -5259,13 +5270,15 @@ class PostgresStore:
                 # completed as a crash-re-run duplicate. Scoped to this message only.
                 await conn.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    " (SELECT id FROM queue WHERE message_id=$1 AND status=$2)",
+                    f" (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
+                    f" AND ({_REPLAYABLE_BODY}))",
                     message_id,
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                " updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])",
+                f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
+                f" AND ({_REPLAYABLE_BODY})",
                 OutboxStatus.PENDING.value,
                 now,
                 message_id,
@@ -5627,13 +5640,19 @@ class PostgresStore:
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
-        Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued."""
+        Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued.
+
+        Rows whose body retention has ERASED are excluded (:data:`_REPLAYABLE_BODY`, BACKLOG #1560).
+        Unlike the SQLite and SQL Server backends this spells its two statements out separately, so the
+        predicate is written TWICE on purpose: the affected message set comes from the ``SELECT
+        DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
+        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
-                " AND ($4::text IS NULL OR destination_name=$4)",
+                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})",
                 Stage.OUTBOUND.value,
                 OutboxStatus.DEAD.value,
                 channel_id,
@@ -5646,7 +5665,7 @@ class PostgresStore:
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 " updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
-                " AND ($6::text IS NULL OR destination_name=$6)",
+                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})",
                 OutboxStatus.PENDING.value,
                 now,
                 Stage.OUTBOUND.value,
