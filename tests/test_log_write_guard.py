@@ -35,6 +35,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry import logging_guard
+from messagefoundry.api.app import _outbound_down_detail
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy, load_settings
 from messagefoundry.config.wiring import (
@@ -1420,6 +1421,11 @@ async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
         # The lane also reports the CAUSE rather than an operator pause it never had.
         assert runner.outbound_status(OUTBOUND) == "log_halted"
         assert not runner.outbound_running(OUTBOUND)
+        # …and a resend's 409 names the log rather than pointing at a start button that is refused
+        # while the sinks are dead. The old wording is the one this must NOT be.
+        detail = _outbound_down_detail(runner, OUTBOUND)
+        assert "application log" in detail
+        assert "start it before resending" not in detail
 
         # THE CONTROL, and it carries the attribution: the ONLY difference between these two arms is
         # whether the log works. The same rig, the same queued row, delivered once the disk is fixed —
@@ -1433,6 +1439,10 @@ async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
         assert await _until(lambda: any(outdir.iterdir())), "the repaired restart never delivered"
         assert await _until_processed(store, message_id), "delivered but never finalized"
         assert runner.outbound_status(OUTBOUND) == "running"
+        # The NEGATIVE control on the 409 wording: a lane that is merely operator-paused must still
+        # get the start-it instruction, so the branch above is a discrimination and not a rewrite.
+        await runner.stop_outbound(OUTBOUND)
+        assert "start it before resending" in _outbound_down_detail(runner, OUTBOUND)
     finally:
         await runner.stop()
 
