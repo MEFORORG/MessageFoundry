@@ -4953,8 +4953,10 @@ def _restore_verify(args: argparse.Namespace) -> int:
     """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049, #60 — 0049's owned
     primitive that ADR 0048's cold-seed activation calls): key-fingerprint precheck (a clean
     ``KEY_MISMATCH`` before any decrypt) -> decrypt -> open the embedded store read-only ->
-    ``integrity_check`` + per-table row-count vs the manifest. Reports ``PASS``/``FAIL``/
-    ``KEY_MISMATCH``; PHI-safe (counts + a reason only, never a body)."""
+    ``integrity_check`` + per-table row-count vs the manifest. ``--full`` additionally re-opens the
+    snapshot under THIS instance's real store settings (cipher, keyring, key provider) and decrypts +
+    authenticates its cipher-covered cells. Reports ``PASS``/``FAIL``/``KEY_MISMATCH``; PHI-safe (counts
+    + a reason only, never a body)."""
     import asyncio
     from pathlib import Path
 
@@ -4981,6 +4983,10 @@ def _restore_verify(args: argparse.Namespace) -> int:
         "integrity_ok": result.integrity_ok,
         "row_counts": result.row_counts,
         "manifest_counts": result.manifest_counts,
+        # A count of the cipher-covered cells --full decrypted AND authenticated (0 on a lightweight
+        # verify, and on an unencrypted store). It is what separates "the snapshot opened" from "its
+        # PHI was readable", so an operator can see which claim a PASS is making.
+        "decrypted_cells": result.decrypted_cells,
         "reason": result.reason,
     }
     if args.json:
@@ -4989,6 +4995,8 @@ def _restore_verify(args: argparse.Namespace) -> int:
         print(f"{result.status}: {result.reason or 'archive verified'}")
         if result.row_counts:
             print(f"  row_counts={result.row_counts}")
+        if result.decrypted_cells:
+            print(f"  decrypted_cells={result.decrypted_cells}")
     # exit 0 only on PASS; FAIL/KEY_MISMATCH are non-zero so a script/cold-seed activation can gate on it.
     return 0 if result.ok else 1
 
