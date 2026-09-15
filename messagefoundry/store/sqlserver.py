@@ -1117,6 +1117,11 @@ class _ClaimHolder:
 # guards below are check-then-create and do NOT serialize concurrent creators on a virgin DB — see
 # _ensure_schema.
 _SCHEMA_LOCK = "mefor:schema_init"
+# Audit-chain append lock (BACKLOG #1605) — the T-SQL analog of the Postgres store's
+# ``pg_advisory_xact_lock`` on the audit chain. One fixed resource for the whole chain: the
+# read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
+# process, queues on the same name.
+_AUDIT_APPEND_LOCK = "mefor:audit_append"
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -3153,9 +3158,14 @@ class SqlServerStore:
                 # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
                 # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
                 # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped (the autocommit=False pool means this
-                # first statement opens the txn), so it auto-releases on the commit/rollback below; the
-                # second node then runs the now-no-op guarded CREATEs cleanly.
+                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
+                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
+                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
+                # path probe above already ran one or two table-reading SELECTs on this connection with
+                # no commit between, so the autocommit=False pool has an open transaction for
+                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
+                # statement opens the txn" — it predated the probe and was stale, not a contradiction
+                # of the applock rule record_audit now follows.)
                 await self._applock(cur, _SCHEMA_LOCK)
                 # Double-check under the lock: the peer we queued behind may have just applied this
                 # exact batch and committed its marker — then this open has nothing to do.
@@ -9150,17 +9160,38 @@ class SqlServerStore:
         client: str | None = None,
         now: float | None = None,
     ) -> None:
-        """``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
+        """Append a row to the audit hash chain. Takes the audit-append applock first, so concurrent
+        writers — including writers in OTHER engine-shard processes — serialize on the read-tail +
+        insert and cannot fork the chain (H-7, BACKLOG #1605).
+
+        ``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
         :meth:`~messagefoundry.store.base.AuditStore.record_audit`."""
         now = time.time() if now is None else now
-        # Serialize the read-prev-then-insert append in-process so two concurrent audited actions can't
-        # read the same prev hash and FORK the hash chain (H-7). The store is the single audit writer
-        # per engine process (active-passive = one active node), so an in-process lock is sufficient and
-        # reliable — unlike a txn-scoped sp_getapplock taken as the connection's first statement, which
-        # does not release on commit and strands under concurrent contention.
+        # Serialize the read-prev-then-insert append so two concurrent audited actions can't read the
+        # same prev hash and FORK the hash chain (H-7). TWO locks, and only the second one is
+        # sufficient: `_audit_lock` is an asyncio.Lock, so it holds within ONE process, and engine
+        # sharding (`serve --shard`, ADR 0037 + ADR 0063 — the built default scaling axis) runs one
+        # process per shard over ONE unified store. N shards are N independent asyncio.Locks over one
+        # chain, so the appends have to queue at the DATABASE (BACKLOG #1605). The in-process lock is
+        # kept as the cheap near gate that keeps this process's own concurrent audits off the
+        # server-side lock queue; `_AUDIT_APPEND_LOCK` is what actually holds across shards, exactly as
+        # the Postgres twin's `pg_advisory_xact_lock` already does.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
+                    # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
+                    # `@LockOwner='Transaction'`, which requires one already open. The autocommit=False
+                    # pool begins a transaction on the first statement that touches a table, so this is
+                    # a real one-row read of audit_log's PK index rather than a bare `SELECT 1`: under
+                    # the driver's implicit-transactions mode a SELECT with no FROM begins nothing, and
+                    # the applock would then be scoped to a transaction that does not exist. Nor
+                    # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
+                    # below decrements it once, leaving the lock held on a pooled connection. The value
+                    # read here is deliberately discarded — it is read OUTSIDE the lock and only the
+                    # re-read below is authoritative.
+                    await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                    await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                    await self._applock(cur, _AUDIT_APPEND_LOCK)
                     await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
                     last = await cur.fetchone()
                     prev = last[0] if last and last[0] else ""
