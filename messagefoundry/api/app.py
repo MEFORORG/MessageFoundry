@@ -4898,6 +4898,13 @@ def create_app(
             committed_txns=getattr(engine.store, "committed_txns", 0),
             body_copies=getattr(engine.store, "body_copies", 0),
             fenced_writes=getattr(engine.store, "fenced_writes", 0),
+            # #122 (ADR 0189). 0 with no runner attached, the same default the B11 counters take: a
+            # graph-less engine has no claim gate to refuse anything at. getattr-with-default for the
+            # same reason the counters above use it — an alternative or older runner object reports 0
+            # rather than 500ing the whole stats read on one missing attribute.
+            halted_claim_gate_hits=getattr(rr, "halted_claim_gate_hits", 0)
+            if rr is not None
+            else 0,
         )
 
     @app.get("/metrics")

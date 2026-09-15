@@ -54,6 +54,7 @@ from messagefoundry.logging_guard import (
     set_active_guard,
 )
 from messagefoundry.logging_setup import LogFile, configure_logging
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -65,6 +66,10 @@ OUTBOUND = "OB_TEST"
 # The outbound a reload ADDS while the halt is latched (ADR 0189 door six) — a second, distinct lane
 # so the door-six test can assert on a destination the halt provably never saw.
 OUTBOUND_ADDED = "OB_TEST_ADDED"
+# What the door-six test patches `_WORKER_ERROR_BACKOFF_SECONDS` down to, so its absence-of-a-spin
+# window covers many claim cycles rather than one. Named here so the window and the cadence it is
+# measured against can never be edited apart.
+_BACKOFF = 0.05
 
 
 # --- helpers -----------------------------------------------------------------
@@ -715,7 +720,24 @@ def _break_sink_and_replacement(handler: GuardedFileHandler, directory: Path) ->
     directory.write_text("not a directory", encoding="utf-8")
 
 
-def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry:
+def _file_outbound(name: str, directory: Path, *, auto_start: bool) -> OutboundConnection:
+    """One FILE outbound writing ``{MSH-10}.hl7`` into ``directory``."""
+    return OutboundConnection(
+        name,
+        ConnectionSpec(
+            ConnectorType.FILE, {"directory": str(directory), "filename": "{MSH-10}.hl7"}
+        ),
+        auto_start=auto_start,
+    )
+
+
+def _e2e_registry(
+    outdir: Path,
+    *,
+    outbound_auto_start: bool = True,
+    added_outdir: Path | None = None,
+    added_auto_start: bool = True,
+) -> Registry:
     """A real graph: MLLP inbound -> router -> handler -> FILE outbound writing into ``outdir``.
 
     The inbound binds an ephemeral port and is never connected to; every message in these tests is
@@ -724,17 +746,18 @@ def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry
 
     ``outbound_auto_start=False`` engine-PARKS the delivery lane at boot (#115), which is the one
     down state a log-failure halt skips — the lane is already paused, so the halt never reaches it
-    and its ``_gate_parked`` marker survives. The default leaves every other caller unchanged."""
+    and its ``_gate_parked`` marker survives. The default leaves every other caller unchanged.
+
+    ``added_outdir`` declares a SECOND file outbound (``OUTBOUND_ADDED``) and makes the handler fan
+    out to both — the lane ADR 0189's door-six test has a later reload add. It is a knob here rather
+    than a post-hoc ``reg.handlers[...]`` write in the caller, because that write would bypass
+    ``add_handler``'s duplicate guard and its ``handler_accepts`` bookkeeping.
+    ``added_auto_start=False`` engine-parks that second lane at boot, so a runner can queue it a
+    genuine row without delivering one."""
     reg = Registry()
-    reg.add_outbound(
-        OutboundConnection(
-            OUTBOUND,
-            ConnectionSpec(
-                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
-            ),
-            auto_start=outbound_auto_start,
-        )
-    )
+    reg.add_outbound(_file_outbound(OUTBOUND, outdir, auto_start=outbound_auto_start))
+    if added_outdir is not None:
+        reg.add_outbound(_file_outbound(OUTBOUND_ADDED, added_outdir, auto_start=added_auto_start))
     reg.add_inbound(
         InboundConnection(
             INBOUND,
@@ -743,7 +766,10 @@ def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry
         )
     )
     reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send(OUTBOUND, m))
+    if added_outdir is None:
+        reg.add_handler("h", lambda m: Send(OUTBOUND, m))
+    else:
+        reg.add_handler("h", lambda m: [Send(OUTBOUND, m), Send(OUTBOUND_ADDED, m)])
     return reg
 
 
@@ -757,22 +783,14 @@ async def _until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
     return True
 
 
-async def _until_outbound_row(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
-    """Wait for the message to reach the OUTBOUND stage — i.e. the router and transform ran."""
-    elapsed = 0.0
-    while not await store.outbox_for(message_id):
-        if elapsed > timeout:
-            return False
-        await asyncio.sleep(0.02)
-        elapsed += 0.02
-    return True
-
-
-async def _until_outbound_rows(
-    store: MessageStore, message_id: str, count: int, timeout: float = 5.0
+async def _until_outbound_row(
+    store: MessageStore, message_id: str, timeout: float = 5.0, *, count: int = 1
 ) -> bool:
-    """Wait for a fan-out to produce ``count`` outbound rows — the multi-destination form of
-    :func:`_until_outbound_row`, which would return on the first row and race the second."""
+    """Wait for the message to reach the OUTBOUND stage — i.e. the router and transform ran.
+
+    ``count`` is the number of rows to wait FOR: the default of 1 is every single-destination caller,
+    and a fan-out passes its destination count, because waiting for "any row" would return on the
+    first one and race the second."""
     elapsed = 0.0
     while len(await store.outbox_for(message_id)) < count:
         if elapsed > timeout:
@@ -782,13 +800,15 @@ async def _until_outbound_rows(
     return True
 
 
-def _added_row(rows: list[dict[str, object]]) -> dict[str, object]:
-    """The ``OUTBOUND_ADDED`` delivery row, for comparing a whole row across a time window.
+async def _added_row(store: MessageStore, message_id: str) -> dict[str, object]:
+    """The ``OUTBOUND_ADDED`` delivery row, for comparing a WHOLE row across a time window.
 
     Whole-row equality is deliberate: a claim/reschedule cycle rewrites ``next_attempt_at``,
     ``updated_at`` and ``status``, and naming only the fields we expect to move would let a future
     cycle that moves a different one pass unnoticed."""
-    matched = [r for r in rows if r["destination_name"] == OUTBOUND_ADDED]
+    matched = [
+        r for r in await store.outbox_for(message_id) if r["destination_name"] == OUTBOUND_ADDED
+    ]
     assert len(matched) == 1, f"expected one {OUTBOUND_ADDED} row, found {len(matched)}"
     return matched[0]
 
@@ -1474,28 +1494,6 @@ async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
         await runner.stop()
 
 
-def _two_outbound_registry(
-    outdir: Path, outdir_added: Path, *, added_auto_start: bool = True
-) -> Registry:
-    """:func:`_e2e_registry`'s graph plus a SECOND file outbound, with the handler fanning out to both.
-
-    The second lane is what a later reload ADDS. ``added_auto_start=False`` engine-parks it at boot, so
-    the first runner can queue a genuine row to it without delivering one — the pre-existing row the
-    door-six test needs."""
-    reg = _e2e_registry(outdir)
-    reg.add_outbound(
-        OutboundConnection(
-            OUTBOUND_ADDED,
-            ConnectionSpec(
-                ConnectorType.FILE, {"directory": str(outdir_added), "filename": "{MSH-10}.hl7"}
-            ),
-            auto_start=added_auto_start,
-        )
-    )
-    reg.handlers["h"] = lambda m: [Send(OUTBOUND, m), Send(OUTBOUND_ADDED, m)]
-    return reg
-
-
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
     store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
@@ -1527,7 +1525,7 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
     # producing the condition under test. Phase 2 is the only call here that opens the file sink.
     configure_logging("INFO")
     seeding = RegistryRunner(
-        _two_outbound_registry(outdir, added, added_auto_start=False),
+        _e2e_registry(outdir, added_outdir=added, added_auto_start=False),
         store,
         poll_interval=0.02,
         claim_mode=claim_mode,
@@ -1535,7 +1533,9 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
     await seeding.start()
     try:
         message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
-        assert await _until_outbound_rows(store, message_id, 2), "never fanned out to both lanes"
+        assert await _until_outbound_row(store, message_id, count=2), (
+            "never fanned out to both lanes"
+        )
         assert await _until(lambda: any(outdir.iterdir())), "the first lane never delivered"
     finally:
         await seeding.stop()
@@ -1556,13 +1556,21 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
             "the halt cannot have paused a lane that is not in its registry — the rig is wrong"
         )
 
-        before = _added_row(await store.outbox_for(message_id))
+        before = await _added_row(store, message_id)
+
+        # A margin of TEN claim cycles, not one, and the patch goes on BEFORE the reload. The pooled
+        # gate parks its lane for `_WORKER_ERROR_BACKOFF_SECONDS`, read from the module at call time —
+        # so patching works, and patching it AFTER the reload would not: the reload's own notify_work
+        # arms the lane immediately and the first park would already have taken the shipped 1.0 s.
+        # A window merely LONGER than one backoff buys a margin of one claim, and a test that
+        # discriminates by exactly one event is one scheduling hiccup from proving nothing. Ten cycles
+        # is a real margin AND finishes in half the wall clock a single un-patched cycle would need.
+        monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", _BACKOFF)
+        assert runner.halted_claim_gate_hits == 0, "the rig spun before the door was even opened"
 
         # THE DOOR: a reload ADDS the connection, deployed and auto-start, with nothing repaired.
-        await runner.reload(_two_outbound_registry(outdir, added))
-        await asyncio.sleep(
-            1.2
-        )  # > _WORKER_ERROR_BACKOFF_SECONDS, so a spinning lane would re-claim
+        await runner.reload(_e2e_registry(outdir, added_outdir=added))
+        await asyncio.sleep(10 * _BACKOFF)
 
         # THE LOAD-BEARING ASSERTION. The lane must land where the halt put every other lane: PAUSED,
         # with NO engine-park marker. The marker is the half that matters — `_park_outbound_lane`
@@ -1573,9 +1581,12 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
         assert OUTBOUND_ADDED not in runner._gate_parked, (
             "parked, not stopped — a later reload would lift this marker and re-open the door"
         )
-        # …and it never reached the claim gate: a claim+reschedule cycle rewrites `next_attempt_at`
-        # and `updated_at`, so an untouched row is the absence of the spin.
-        assert _added_row(await store.outbox_for(message_id)) == before, (
+        # …and it never reached the claim gate, from the engine's side and the store's. The counter
+        # names the event; the row is the independent cross-check (see :func:`_added_row`).
+        assert runner.halted_claim_gate_hits == 0, (
+            "a delivery lane reached the claim gate while halted — a door is missing"
+        )
+        assert await _added_row(store, message_id) == before, (
             "the lane claimed and rescheduled its head while the process was refusing to work"
         )
         # The latch is intact and no byte moved (true with or without the gate — see the note above).
