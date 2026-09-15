@@ -166,6 +166,10 @@ async def test_a_leftover_younger_than_the_floor_is_left_alone(tmp_path: Path) -
 # --- the sweep refuses everything it cannot positively identify ---------------------------------
 
 
+# Every value below must stay a LITERAL. A parametrize list is evaluated at COLLECTION time and each
+# pytest-xdist worker collects independently, so a generated id differs per worker and aborts the
+# whole run with "Different tests were collected between gw0 and gwN". The file_id below only has to
+# be 32 hex characters to stand for a real one; nothing here depends on it being fresh.
 @pytest.mark.parametrize(
     "name",
     [
@@ -173,7 +177,7 @@ async def test_a_leftover_younger_than_the_floor_is_left_alone(tmp_path: Path) -
         "scratch.tmp",  # a temp, but not one of ours
         ".nope.blob.zz.tmp",  # our shape, wrong id and wrong tag alphabet
         "not-a-file-id.blob",  # a .blob whose stem is not a 32-hex file_id
-        f"{secrets.token_hex(16)}.blob.bak",  # an operator's copy of a body
+        "0f1e2d3c4b5a69788796a5b4c3d2e1f0.blob.bak",  # an operator's copy of a body
     ],
 )
 async def test_the_sweep_never_unlinks_a_file_that_is_not_ours(tmp_path: Path, name: str) -> None:
