@@ -21,12 +21,23 @@ kept out of this pure helper.
 
 On Windows the stdlib has no system tz database, so :mod:`zoneinfo` needs the ``tzdata`` PyPI package
 (a project dependency) — without it :class:`zoneinfo.ZoneInfoNotFoundError` is raised.
+
+**Reading a wall clock in a named zone refuses the daylight-saving edges rather than guessing.** A
+named source zone is only a complete instant for wall-clock times that happen exactly once. Twice a
+year a local time happens *twice* (the fall-back overlap) or *never* (the spring-forward gap), and
+there is no instant in the input to choose between them. :func:`convert_hl7_timestamp` raises
+:class:`AmbiguousLocalTimeError` / :class:`NonExistentLocalTimeError` on those rather than resolving
+to a plausible, well-formed, possibly hour-wrong timestamp; a caller that wants one resolved anyway
+names the rule with ``on_dst_edge``. This covers the one place the module marries a naive wall clock
+to a named zone — it is **not** a module-wide guarantee, and :func:`length_of_stay` documents its own
+naive-pair limit separately.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
+from typing import Final, Literal, get_args
 from zoneinfo import ZoneInfo
 
 __all__ = [
@@ -36,7 +47,54 @@ __all__ = [
     "hl7_now",
     "age_from_dob",
     "length_of_stay",
+    "DstEdgePolicy",
+    "DstTransitionError",
+    "AmbiguousLocalTimeError",
+    "NonExistentLocalTimeError",
 ]
+
+#: How to treat a wall-clock time that a named zone does not map to exactly one instant.
+DstEdgePolicy = Literal["raise", "earlier", "later"]
+
+#: The policy names, derived from the alias so the runtime guard cannot drift from the type. Both
+#: layers are wanted: the type rejects a wrong literal at author time, the guard catches a value a
+#: dynamically-authored Handler supplies at run time (the convention in :mod:`messagefoundry.actions`).
+_DST_EDGE_POLICIES: Final[tuple[str, ...]] = get_args(DstEdgePolicy)
+
+#: Which precisions carry a time field the *sender* wrote. Below these the module fills ``00`` itself,
+#: so there is no sender-asserted wall clock to validate or refuse.
+_TIME_PRECISIONS: Final[tuple[str, ...]] = ("hour", "minute", "second")
+
+#: The two ways a named zone fails to map a wall clock to one instant. Named so the type layer, not
+#: proofreading, keeps :func:`_classify_dst_edge` and its caller spelling them the same way.
+_DstEdge = Literal["ambiguous", "nonexistent"]
+
+
+class DstTransitionError(ValueError):
+    """A naive HL7 wall time does not name exactly one instant in its source zone.
+
+    Subclasses :class:`ValueError` so a caller already guarding this module's malformed-input path
+    keeps catching it, while code that cares about the distinction can catch this family (or one of
+    the two subclasses) specifically.
+
+    Attributes:
+        ts: the offending HL7 timestamp, as supplied.
+        tz: the IANA source zone name it was read against.
+    """
+
+    def __init__(self, message: str, *, ts: str, tz: str) -> None:
+        super().__init__(message)
+        self.ts = ts
+        self.tz = tz
+
+
+class AmbiguousLocalTimeError(DstTransitionError):
+    """The wall time occurs **twice** in the source zone (the daylight-saving fall-back overlap)."""
+
+
+class NonExistentLocalTimeError(DstTransitionError):
+    """The wall time **never** occurs in the source zone (the daylight-saving spring-forward gap)."""
+
 
 #: HL7 v2 timestamp grammar: a contiguous date/time stem at variable precision (4-, 6-, 8-, 10-, 12-,
 #: or 14-digit: year → seconds), an optional ``.``-prefixed fractional-seconds run, and an optional
@@ -167,7 +225,63 @@ def _render(dt: datetime, precision: str, frac: str | None) -> str:
     return f"{stem}{sign}{total_minutes // 60:02d}{total_minutes % 60:02d}"
 
 
-def convert_hl7_timestamp(ts: str, to_tz: str, *, from_tz: str | None = None) -> str:
+def _classify_dst_edge(naive: datetime, zone: ZoneInfo) -> _DstEdge | None:
+    """Say whether ``naive`` sits on a daylight-saving edge of ``zone``.
+
+    Returns ``"ambiguous"`` (the wall time occurs twice), ``"nonexistent"`` (it never occurs), or
+    ``None`` (it occurs exactly once — the ordinary case, including every zone that has no DST).
+
+    Both tests come straight from PEP 495. ``fold`` selects between the offsets in force either side
+    of a transition, so a wall time whose two folds disagree on ``utcoffset()`` is *on* a transition;
+    a gap is then told apart from an overlap by round-tripping through UTC, which lands back on the
+    input only for a wall time that really happened.
+    """
+    earlier = naive.replace(tzinfo=zone, fold=0)
+    later = naive.replace(tzinfo=zone, fold=1)
+    if earlier.utcoffset() == later.utcoffset():
+        return None
+    round_tripped = earlier.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
+    return "ambiguous" if round_tripped == naive else "nonexistent"
+
+
+def _attach_source_zone(
+    naive: datetime, from_tz: str, *, ts: str, on_dst_edge: DstEdgePolicy, precision: str
+) -> datetime:
+    """Read ``naive`` as a wall-clock time in ``from_tz``, applying the ``on_dst_edge`` policy."""
+    zone = ZoneInfo(from_tz)
+    edge = _classify_dst_edge(naive, zone)
+    if edge is None:
+        return naive.replace(tzinfo=zone)
+    if on_dst_edge != "raise":
+        return naive.replace(tzinfo=zone, fold=0 if on_dst_edge == "earlier" else 1)
+    if precision not in _TIME_PRECISIONS:
+        # Only a wall time the SENDER wrote is worth refusing. Below hour precision the ambiguity is
+        # in this module's own "00" filler — reachable only in a zone whose transition falls at
+        # midnight (Havana, Santiago) — so keep the pre-transition offset rather than dead-lettering
+        # a date the sender stated unambiguously. An explicit on_dst_edge is still honoured above.
+        return naive.replace(tzinfo=zone)
+
+    stamp = ts.strip()
+    if edge == "ambiguous":
+        raise AmbiguousLocalTimeError(
+            f"HL7 timestamp {stamp!r} is ambiguous in {from_tz!r}: that wall-clock time occurs twice "
+            "on the daylight-saving fall-back day, and the timestamp carries no offset to say which. "
+            "Supply the sender's offset, or pass on_dst_edge='earlier'/'later' to choose.",
+            ts=stamp,
+            tz=from_tz,
+        )
+    raise NonExistentLocalTimeError(
+        f"HL7 timestamp {stamp!r} does not exist in {from_tz!r}: that wall-clock time is skipped by "
+        "the daylight-saving spring-forward transition. Fix the source value, or pass "
+        "on_dst_edge='earlier'/'later' to resolve it to an adjacent offset.",
+        ts=stamp,
+        tz=from_tz,
+    )
+
+
+def convert_hl7_timestamp(
+    ts: str, to_tz: str, *, from_tz: str | None = None, on_dst_edge: DstEdgePolicy = "raise"
+) -> str:
     """Convert an HL7 v2 timestamp from one named zone to another, DST-correctly.
 
     The instant's source offset is taken from, in order: the offset embedded in ``ts`` (if present),
@@ -178,24 +292,47 @@ def convert_hl7_timestamp(ts: str, to_tz: str, *, from_tz: str | None = None) ->
         ts: HL7 v2 timestamp, ``YYYYMMDD[HHMM[SS[.S+]]][+/-ZZZZ]`` at variable precision.
         to_tz: target IANA zone name (e.g. ``"America/Chicago"``).
         from_tz: source IANA zone name; required only when ``ts`` carries no embedded offset.
+        on_dst_edge: what to do when ``from_tz`` does not map the wall-clock time to exactly one
+            instant — twice a year it maps to two (the fall-back overlap) or none (the spring-forward
+            gap). ``"raise"`` (the default) refuses, with the two cases told apart by exception type.
+            ``"earlier"`` and ``"later"`` name the **offset** to use: the one in force *before* the
+            transition, or *after* it. For an overlap those read as expected — ``"earlier"`` is the
+            first of the two occurrences (daylight), ``"later"`` the second (standard). For a gap they
+            invert, because the wall time itself never happened: ``"earlier"`` keeps the pre-gap offset
+            and so lands *after* the gap, ``"later"`` keeps the post-gap offset and lands *before* it.
+            Only ever consulted on the ``from_tz`` path — an embedded offset already pins the
+            instant. Refusal is further limited to a ``ts`` that carries a time field: below hour
+            precision the time is this module's own ``00`` filler, so the default resolves it
+            quietly instead of dead-lettering a date the sender stated unambiguously, while an
+            explicit ``"earlier"``/``"later"`` is still honoured there.
 
     Returns:
         An HL7 v2 timestamp string in ``to_tz`` at the same precision, with the target offset appended.
 
     Raises:
-        ValueError: ``ts`` is malformed, or it has no offset and no ``from_tz`` was supplied.
+        AmbiguousLocalTimeError: the wall time occurs twice in ``from_tz`` and ``on_dst_edge`` is
+            ``"raise"``.
+        NonExistentLocalTimeError: the wall time never occurs in ``from_tz`` and ``on_dst_edge`` is
+            ``"raise"``.
+        ValueError: ``ts`` is malformed, ``on_dst_edge`` is not one of the three policies, or ``ts``
+            has no offset and no ``from_tz`` was supplied. (Both errors above are ``ValueError``s
+            too, so an existing broad guard still catches them.)
         zoneinfo.ZoneInfoNotFoundError: a zone name is unknown (on Windows, also if ``tzdata`` is
             missing).
     """
+    if on_dst_edge not in _DST_EDGE_POLICIES:
+        raise ValueError(f"on_dst_edge must be one of {_DST_EDGE_POLICIES}, got {on_dst_edge!r}")
     naive, precision, embedded_offset = _parse_hl7_timestamp(ts)
 
     if embedded_offset is not None:
         # An explicit offset pins the instant directly; the source zone is then irrelevant.
         aware = naive.replace(tzinfo=timezone(_offset_to_timedelta(embedded_offset)))
     elif from_tz is not None:
-        # No embedded offset: attach the source zone so zoneinfo picks the DST-correct offset for the
-        # naive wall-clock time at that date.
-        aware = naive.replace(tzinfo=ZoneInfo(from_tz))
+        # No embedded offset: read the wall clock in the source zone, refusing (or resolving under
+        # on_dst_edge) the two dates a year where that reading is not a single instant.
+        aware = _attach_source_zone(
+            naive, from_tz, ts=ts, on_dst_edge=on_dst_edge, precision=precision
+        )
     else:
         raise ValueError(
             "HL7 timestamp has no embedded offset; a source zone (from_tz) is required to convert it"
@@ -261,13 +398,18 @@ def hl7_now(*, precision: str = "second", tz: str | None = None, with_offset: bo
     This is the **one** clock-reading helper; keep it out of routing/transform decisions (it would
     break re-run purity) — use it to stamp a freshly built outbound message.
 
+    The bare default (no ``tz``, no ``with_offset``) emits a wall clock with no offset, which is the
+    very shape :func:`convert_hl7_timestamp` refuses to read back through a named zone during a
+    fall-back hour. Pass ``tz`` or ``with_offset=True`` for any stamp something downstream will
+    convert.
+
     Raises:
         ValueError: ``precision`` is not one of the six field names.
         zoneinfo.ZoneInfoNotFoundError: ``tz`` is unknown (on Windows, also if ``tzdata`` is missing).
     """
     if precision not in ("year", "month", "day", "hour", "minute", "second"):
         raise ValueError(f"precision must be a stem field name, got {precision!r}")
-    has_time = precision in ("hour", "minute", "second")
+    has_time = precision in _TIME_PRECISIONS
     if tz is not None and has_time:
         # _render appends the zone's DST-correct numeric offset; only meaningful with a time field.
         return _render(datetime.now(ZoneInfo(tz)), precision, None)
