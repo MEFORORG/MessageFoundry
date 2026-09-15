@@ -220,3 +220,30 @@ re-prompt, fail-safe) now applies to the /ui lanes too, unchanged from Consequen
   window (byte-identical to pre-amendment /ui behaviour).
 - **AC-9** — WHEN PATCH /users/{user_id} is called inside the login window, THE SYSTEM SHALL 403 +
   X-Step-Up-Action: admin_user_update until POST /me/reauth carries that purpose (single-use).
+
+## Amendment (2026-09-14, ASVS 6.3.3): the opt-out never reaches a factor bind
+
+**AC-4 and AC-8 were too wide, and the gap was an authentication bypass in shipped code.** They say
+the opt-out falls back to the session window, full stop. `AuthService.reauth` already refuses to MINT
+a factor-binding grant for an MFA-pending session on an account that already holds a factor, so the
+enforced branch was closed — but that guard is keyed on the re-auth's `purpose`, and the opt-out
+branch asks only for session-window recency. A purpose-LESS `POST /me/reauth` walks past the guard
+and refreshes the window, after which a password holder would be able to bind a NEW second factor on
+an already-enrolled account from an MFA-pending session, and be promoted to MFA-satisfied by the
+confirm ceremony. Measured on an unfixed tree with `require_action_step_up = false`: `POST
+/me/mfa/enroll` answered **200** against an account holding a passkey, on the JSON lane and the /ui
+lane alike. Nothing is deployed, so nothing was exposed; it is wrong in the shipped code.
+
+**So both fallbacks are now bounded.** `api.security._action_step_up_ok` and the console's
+`_ui_action_step_up_ok` refuse a factor-binding action — `mfa_enroll`, `mfa_confirm`,
+`webauthn_enroll` — for an MFA-pending session on an account that already holds a factor, ABOVE the
+opt-out fork, through the public `AuthService.factor_binding_is_blocked`. **No setting reaches this
+refusal**, which is the point: a control a config knob can switch off is not a control. Everything
+else about the opt-out is unchanged, and the bootstrap carve-out is untouched — an account with no
+factor at all still enrols its first one from a password-only session.
+
+- **AC-10** — WHERE `[auth].require_action_step_up` is either value, WHILE a session is MFA-pending
+  AND its account already holds a second factor of either kind, WHEN it reaches a factor-binding
+  lane on either surface, THE SYSTEM SHALL refuse until the EXISTING factor is proven.
+  → `tests/test_mfa_access_gate.py::test_the_existing_factor_is_required_whatever_the_step_up_knob_says`,
+  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says`

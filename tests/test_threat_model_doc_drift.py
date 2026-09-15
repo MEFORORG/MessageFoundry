@@ -1014,7 +1014,7 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "checks.py": "advisory ruff/mypy gate, list-form argv, 120 s bound, skipped when absent",
     "pipeline/dr.py": "[dr].takeover_hook / release_hook — the deliberate SHELL exception",
     "pipeline/sandbox.py": "ADR 0087 sandbox worker, fixed argv, close_fds=True",
-    "pipeline/supervisor.py": "engine-shard supervisor, fixed argv",
+    "pipeline/supervisor.py": "engine-shard supervisor, fixed argv, own Windows process group",
     "service.py": "elevated cmd.exe / powershell.exe — the deliberate ELEVATION exception",
     "service_status.py": "`sc query`, list-form argv, 5 s bound",
     "store/store.py": "`icacls` store-file ACL lockdown, one argv token per grant",

@@ -719,7 +719,13 @@ async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: st
     ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
     grant BOUND to ``action`` (consumed here); when the org opted out
     (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
-    ``AuthService`` members, so no cross-package private import is needed."""
+    ``AuthService`` members, so no cross-package private import is needed.
+
+    The factor-binding refusal below sits ABOVE that fork, so no knob reaches it (ASVS 6.3.3; the
+    bypass it closes is the ADR 0077 amendment of 2026-09-14). Closing it only on the JSON twin
+    would have left the surface a human actually uses open."""
+    if await auth.factor_binding_is_blocked(token, action):
+        return False
     if auth.action_step_up_required:
         return await auth.has_action_step_up(token, action)
     return await auth.has_recent_step_up(token)

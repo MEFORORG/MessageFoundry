@@ -821,3 +821,62 @@ async def test_replay_resend_is_not_deduped(store: MessageStore) -> None:
     await store.mark_done(again.id, now=201.0)
     # A fresh ledger row is written for the re-delivery (seq recomputes to 1 after the delete).
     assert len(await _ledger_rows(store)) == 1
+
+
+def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path) -> None:
+    """BACKLOG #1670: ``MessageStore.open`` connects BEFORE its first ``PRAGMA``, so a path that is
+    not a database raises with the connection still live and nothing closes it.
+
+    aiosqlite drives every statement on a background thread created WITHOUT ``daemon=True``, so a
+    connection nobody closed parks a non-daemon thread forever. Interpreter exit then blocks in
+    ``threading._shutdown`` joining it and the process never returns -- measured at 319 seconds
+    before a kill by hand.
+
+    This runs in a CHILD interpreter on purpose. A leaked worker would otherwise hang the pytest
+    process itself at exit, turning a clear failure into a stalled run with no report. It is also
+    the only shape that actually proves the claim: asserting ``close`` was called does not prove
+    the process exits.
+    """
+    import subprocess
+    import textwrap
+
+    bad = tmp_path / "not-a-db.txt"
+    bad.write_text("not a db\n", encoding="utf-8")
+
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import sqlite3
+        import sys
+        import threading
+
+        from messagefoundry.store import MessageStore
+
+        async def main() -> None:
+            try:
+                await MessageStore.open(sys.argv[1])
+            except sqlite3.DatabaseError:
+                return
+            raise SystemExit("open succeeded on a file that is not a database")
+
+        asyncio.run(main())
+        # Only a non-daemon thread can block interpreter exit, so that is what is reported.
+        left = [
+            t.name
+            for t in threading.enumerate()
+            if t is not threading.main_thread() and not t.daemon
+        ]
+        print(",".join(left))
+        """
+    )
+    # A hard timeout is the assertion: on the leaking build the child never exits and this raises
+    # subprocess.TimeoutExpired. 30s sits well under the 60s pytest-timeout watchdog so THIS reports
+    # the failure rather than a thread-stack dump; a healthy child finishes in about two seconds.
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(bad)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"a failed open left live thread(s): {proc.stdout.strip()}"
