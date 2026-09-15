@@ -11,6 +11,10 @@ can't restart its own host over the API (stopping it kills the API). Windows-onl
 
 Neutral (stdlib-only) so both :mod:`messagefoundry.config` (name validation) and :mod:`messagefoundry.api`
 (the endpoint) may import it without crossing a layer boundary.
+
+Being the neutral leaf is also why :func:`_system_exe` lives here rather than beside the elevated
+callers: :mod:`messagefoundry.service` imports it, so the two modules share one System32 pin instead
+of drifting apart (BACKLOG #1680). It is private, and it has an importer — do not read it as dead.
 """
 
 from __future__ import annotations
