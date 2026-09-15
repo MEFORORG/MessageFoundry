@@ -803,7 +803,10 @@ def main(argv: list[str] | None = None) -> int:
         "--smoke",
         default="self",
         choices=["self", "live", "none"],
-        help="self = dry-run through the config (safe anywhere); live = MLLP to a running engine; none",
+        help=(
+            "self = dry-run through the config (safe anywhere), PASS only if the message would "
+            "reach a destination; live = MLLP to a running engine; none"
+        ),
     )
     verify.add_argument("--engine-host", default="127.0.0.1", help="live smoke: engine host")
     verify.add_argument("--mllp-port", type=int, default=2575, help="live smoke: inbound MLLP port")

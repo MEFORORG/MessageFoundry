@@ -10,6 +10,9 @@ mapping — by monkeypatching `_runas_wait`.
 
 from __future__ import annotations
 
+import ctypes
+import os
+
 import pytest
 
 import messagefoundry.service as service
@@ -42,18 +45,21 @@ def test_off_windows_is_unsupported_without_dispatch(monkeypatch: pytest.MonkeyP
     assert tripped == []  # never elevated
 
 
-@pytest.mark.parametrize(
-    ("action", "expected_params"),
-    [
-        ("start", '/c net start "MyEngine"'),
-        ("stop", '/c net stop "MyEngine"'),
-        ("restart", '/c net stop "MyEngine" & net start "MyEngine"'),
-    ],
-)
+_SYSDIR = service._system_dir()
+_CMD = os.path.join(_SYSDIR, "cmd.exe")
+_NET = os.path.join(_SYSDIR, "net.exe")
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "restart"])
 def test_builds_system32_command_and_delegates(
-    monkeypatch: pytest.MonkeyPatch, action: str, expected_params: str
+    monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
-    # Elevation must target System32 cmd.exe with the validated name — never a user-writable path.
+    """Elevation must target the system directory's ``cmd.exe`` and ``net.exe``, with the validated
+    name — never a program a search path resolves out of the caller's working directory.
+
+    This test's name claimed System32 while it asserted the bare names; BACKLOG #1680 made the code
+    match the claim. The ``/s`` and the extra quote pair are how a quoted absolute path survives
+    ``cmd``'s own parsing — see ``service._elevated_cmd_params``."""
     recorded: list[tuple[str, str]] = []
 
     def fake_runas(file: str, params: str) -> ServiceControlOutcome:
@@ -62,9 +68,47 @@ def test_builds_system32_command_and_delegates(
 
     monkeypatch.setattr(service, "_runas_wait", fake_runas)
     monkeypatch.setattr(service.sys, "platform", "win32")
+    tail = (
+        f'"{_NET}" stop "MyEngine" & "{_NET}" start "MyEngine"'
+        if action == "restart"
+        else f'"{_NET}" {action} "MyEngine"'
+    )
 
     assert control_service_ex(action, "MyEngine") is ServiceControlOutcome.DISPATCHED
-    assert recorded == [("cmd.exe", expected_params)]
+    assert recorded == [(_CMD, f'/s /c "{tail}"')]
+
+
+def test_runas_wait_pins_the_image_and_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_runas_wait`` itself: the struct it hands ShellExecuteExW names an absolute image and the
+    system directory. A null ``lpDirectory`` would start the elevated child in the caller's working
+    directory — the directory a planted program would sit in (BACKLOG #1680).
+
+    No real elevation: ``ctypes.WinDLL`` is replaced, so ShellExecuteExW is never loaded."""
+    seen: list[service._SHELLEXECUTEINFOW] = []
+
+    class _Func:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, ref: object) -> int:
+            seen.append(ref._obj)  # type: ignore[attr-defined]  # byref() keeps the struct here
+            return 1  # success, hProcess left NULL -> DISPATCHED without touching kernel32
+
+    class _FakeDll:
+        def __init__(self, _name: str, **_kw: object) -> None:
+            self.ShellExecuteExW = _Func()
+
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(service.ctypes, "WinDLL", _FakeDll, raising=False)
+
+    assert service._runas_wait(_CMD, "/s /c rem") is ServiceControlOutcome.DISPATCHED
+    info = seen[0]
+    assert info.lpVerb == "runas"
+    assert info.lpFile == _CMD
+    assert info.lpDirectory == _SYSDIR
+    assert info.cbSize == ctypes.sizeof(service._SHELLEXECUTEINFOW)
 
 
 @pytest.mark.parametrize(
