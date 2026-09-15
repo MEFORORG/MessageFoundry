@@ -1398,11 +1398,17 @@ async def test_service_cert_grant_writes_no_authorization_row(tmp_path: Path) ->
 
 
 def _handshake(
-    server_ctx: ssl.SSLContext, client_ctx: ssl.SSLContext, *, client_cert: tuple[Path, Path] | None
+    server_ctx: ssl.SSLContext,
+    client_ctx: ssl.SSLContext,
+    *,
+    client_cert: tuple[Path, Path] | None,
+    server_hostname: str = "localhost",
 ) -> str | None:
     """Drive a REAL TLS handshake over a loopback socket using ``server_ctx`` (the exact context the serve
     path builds via :func:`build_api_ssl_context`). Returns the negotiated cipher name on success; raises
-    ``ssl.SSLError`` when the handshake is refused. ``client_cert`` presents a client cert (mTLS)."""
+    ``ssl.SSLError`` when the handshake is refused. ``client_cert`` presents a client cert (mTLS).
+    ``server_hostname`` is the name the client verifies against -- it must be a SAN of the server's
+    certificate, so the minted-pair arms pass ``[api].host`` rather than the ``localhost`` default."""
     import socket
     import threading
 
@@ -1447,7 +1453,7 @@ def _handshake(
     client_err: BaseException | None = None
     try:
         with socket.create_connection((host, port), timeout=5) as raw:  # noqa: SIM117
-            with client_ctx.wrap_socket(raw, server_hostname="localhost") as cs:
+            with client_ctx.wrap_socket(raw, server_hostname=server_hostname) as cs:
                 cipher = cs.cipher()
                 client_cipher = cipher[0] if cipher else None
                 cs.recv(
@@ -1935,6 +1941,98 @@ def test_a_second_start_reuses_the_pair_and_never_re_mints(tmp_path: Path) -> No
     assert (second_cert, second_key) == (first_cert, first_key)
     assert Path(second_cert).read_bytes() == cert_bytes
     assert Path(second_key).read_bytes() == key_bytes
+
+
+def test_the_plan_answers_the_same_three_postures_without_touching_the_disk(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1695. `plan_api_tls_material` is what a READ-ONLY caller asks, and it must agree
+    with the minting path exactly -- it is the same branch order, which is why `ensure` consumes it.
+
+    A client (the VS Code extension, via `cert inventory --json`) needs the served certificate's path
+    to verify the handshake, and asking must not mint a key. So the pure function is graded on both
+    halves: the same answer, and no file created.
+    """
+    from messagefoundry.api.tls import plan_api_tls_material
+
+    operator = ApiSettings(tls_cert_file="/etc/mf/chain.pem", tls_key_file="/etc/mf/key.pem")
+    plan = plan_api_tls_material(operator, state_dir=tmp_path)
+    assert (plan.source, plan.cert_file, plan.key_file) == (
+        "operator",
+        "/etc/mf/chain.pem",
+        "/etc/mf/key.pem",
+    )
+    assert plan.scheme == "https"
+    assert plan.material() == ("/etc/mf/chain.pem", "/etc/mf/key.pem")
+
+    proxied = ApiSettings(tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"])
+    upstream = plan_api_tls_material(proxied, state_dir=tmp_path)
+    assert upstream.source == "upstream"
+    assert upstream.material() is None
+    assert upstream.scheme == "http"  # the one posture a client must NOT dial over https
+
+    generated = plan_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    assert generated.source == "generated" and generated.scheme == "https"
+    assert generated.cert_file is not None and Path(generated.cert_file).parent == tmp_path
+    # PURE: naming the pair must not create it. This is the whole reason the function exists -- a
+    # `cert inventory` that minted would write a private key on a read-only command.
+    assert not any(tmp_path.iterdir())
+
+    # And now the agreement. Minting returns exactly what the plan named, for the same settings.
+    assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path) == generated.material()
+    assert ensure_api_tls_material(operator, state_dir=tmp_path) == (
+        "/etc/mf/chain.pem",
+        "/etc/mf/key.pem",
+    )
+    assert ensure_api_tls_material(proxied, state_dir=tmp_path) is None
+
+
+def test_the_branch_order_is_callable_without_the_settings_machinery(tmp_path: Path) -> None:
+    """`api_tls_source` is the order itself, over two values rather than an `ApiSettings`.
+
+    It exists because the tray asks the same question of a raw, possibly-malformed TOML dict and
+    cannot afford this module's imports (ADR 0113). The shape is graded here so that convergence
+    stays available: an operator cert wins even when an upstream terminator is ALSO declared, which
+    is the one ordering a reader is most likely to get backwards.
+    """
+    from messagefoundry.api.tls import api_tls_source, plan_api_tls_material
+
+    assert api_tls_source(cert_file="/x.pem", tls_terminated_upstream=False) == "operator"
+    assert api_tls_source(cert_file="/x.pem", tls_terminated_upstream=True) == "operator"
+    assert api_tls_source(cert_file=None, tls_terminated_upstream=True) == "upstream"
+    assert api_tls_source(cert_file=None, tls_terminated_upstream=False) == "generated"
+    assert api_tls_source(cert_file="", tls_terminated_upstream=False) == "generated"
+
+    # And the planner really is built on it, rather than repeating the order beside it.
+    both = ApiSettings(
+        tls_cert_file="/x.pem", tls_terminated_upstream=True, trusted_proxies=["10.0.0.7"]
+    )
+    assert plan_api_tls_material(both, state_dir=tmp_path).source == "operator"
+
+
+def test_the_minted_certificate_verifies_against_itself_as_a_ca_file(tmp_path: Path) -> None:
+    """BACKLOG #1695, the property every first-party client's trust seam rests on.
+
+    A client cannot import the minted certificate into an OS trust store on the user's behalf, so it
+    hands the PEM to its TLS layer as the anchor for that one engine instead. That only works if a
+    SELF-SIGNED leaf with `CA:FALSE` is accepted when it IS the trust anchor. It is -- but nothing
+    pinned it, and the whole client half would fail silently at handshake time if the minting
+    primitive ever grew a constraint that broke it.
+    """
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    server = build_api_ssl_context(
+        api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    )
+    client = ssl.create_default_context(cafile=cert)
+    assert client.verify_mode is ssl.CERT_REQUIRED  # verification stays ON; only the anchor changed
+    assert _handshake(server, client, client_cert=None, server_hostname=api.host)
+
+    # NEGATIVE CONTROL: the stock trust store does NOT accept it, which is the defect being fixed
+    # (Node reports the same refusal as DEPTH_ZERO_SELF_SIGNED_CERT). Without this arm the assertion
+    # above could pass on a client that verifies nothing.
+    with pytest.raises(ssl.SSLError, match="self.signed|unable to get local issuer"):
+        _handshake(server, ssl.create_default_context(), client_cert=None, server_hostname=api.host)
 
 
 def test_a_failed_cert_write_leaves_no_orphaned_key(

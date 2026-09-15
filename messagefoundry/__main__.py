@@ -27,6 +27,7 @@ import logging
 import sqlite3  # stdlib; only for the exception type the store-opening subcommands translate (#1670)
 import sys
 import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+from collections.abc import Sequence
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -567,7 +568,8 @@ def main(argv: list[str] | None = None) -> int:
     cert_inventory = cert_sub.add_parser(
         "inventory",
         help="read-only certificate inventory: print subject / issuer / notAfter / SAN / days-remaining "
-        "/ expired per cert. Sources: --cert PATH (repeatable) and/or the wired TLS certs of --config",
+        "/ expired per cert. Sources: --cert PATH (repeatable), the [api] TLS material of "
+        "--service-config, and/or the wired TLS certs of --config",
     )
     cert_inventory.add_argument(
         "--cert",
@@ -584,7 +586,9 @@ def main(argv: list[str] | None = None) -> int:
     cert_inventory.add_argument(
         "--service-config",
         default=None,
-        help="service settings TOML — supplies the [api] TLS cert path added to the --config inventory",
+        help="service settings TOML — a source in its own right: the [api] TLS cert the bind serves "
+        "with (an operator chain, or the pair the engine mints beside the store) plus the "
+        "service-caller certs, and under --json an `api_tls` object naming the scheme and that cert",
     )
     cert_inventory.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -3307,12 +3311,14 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
-    from pathlib import Path as _Path
-
-    from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
+    from messagefoundry.api.tls import (
+        build_api_ssl_context,
+        ensure_api_tls_material,
+        generated_state_dir,
+    )
 
     _material = ensure_api_tls_material(
-        settings.api, state_dir=_Path(settings.store.path).resolve().parent
+        settings.api, state_dir=generated_state_dir(settings.store.path)
     )
     if _material is not None:
         _cert, _key = _material
@@ -4042,50 +4048,76 @@ def _cert_import(args: argparse.Namespace) -> int:
 def _cert_inventory(args: argparse.Namespace) -> int:
     """`cert inventory` — read-only listing of cert facts (subject/issuer/notAfter/SAN/days/expired).
 
-    Sources (at least one required): explicit ``--cert PATH`` (repeatable, always included) and/or the
-    wired TLS certs of ``--config`` (loaded like ``validate``/``graph`` via ``load_config`` →
-    ``certs_from_registry``; ``--service-config`` adds the ``[api]`` TLS cert). Reads only public certs.
-    An unreadable/unparseable cert is reported per-row (no secret text) and makes the command exit 1."""
+    Sources (at least one required): explicit ``--cert PATH`` (repeatable, always included), the
+    ``[api]`` TLS material of ``--service-config``, and/or the wired TLS certs of ``--config``
+    (loaded like ``validate``/``graph`` via ``load_config`` → ``certs_from_registry``). Reads only
+    public certs. An unreadable/unparseable cert is reported per-row (no secret text) and makes the
+    command exit 1.
+
+    ``--service-config`` additionally makes ``--json`` emit an ``api_tls`` object -- the scheme the
+    API bind serves and the certificate it presents. **That is what a CLIENT needs and could not get
+    anywhere else** (BACKLOG #1695): since ADR 0172 an engine with no operator chain configured mints
+    a self-signed pair beside its store, and a client with no way to name that file cannot verify the
+    handshake. Reporting it engine-side keeps the generated filename and the ``[store].path`` rule in
+    ONE language -- a client re-deriving either is a copy that drifts."""
     import time
 
     from messagefoundry import pki
+    from messagefoundry.api.tls import ApiTlsPlan, generated_state_dir, plan_api_tls_material
     from messagefoundry.pipeline.cert_expiry import certs_from_registry
 
     explicit = args.cert or []
-    if not explicit and not args.config:
+    if not explicit and not args.config and not args.service_config:
         return _cert_fail(
-            "no certificate source: pass --cert PATH (repeatable) and/or --config DIR",
+            "no certificate source: pass --cert PATH (repeatable), --config DIR and/or "
+            "--service-config FILE",
             as_json=args.json,
         )
 
     # (label, path) pairs — explicit --cert first (label = the path), then the wired TLS certs.
     pairs: list[tuple[str, str]] = [(p, p) for p in explicit]
 
+    api_plan: ApiTlsPlan | None = None
+    cert_present = False
+    served: str | None = None
+    client_certs: Sequence[str] = ()
+    if args.service_config:
+        from pydantic import ValidationError
+
+        from messagefoundry.config.settings import load_settings
+
+        try:
+            settings = load_settings(config_path=args.service_config)
+        except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+            return _cert_fail(f"cannot load --service-config: {exc}", as_json=args.json)
+        # The cert the bind SERVES with, which is no longer the same question as
+        # `[api].tls_cert_file`.
+        api_plan = plan_api_tls_material(
+            settings.api, state_dir=generated_state_dir(settings.store.path)
+        )
+        # Stat-ed ONCE: the JSON's `cert_present` and the decision below must not be able to
+        # disagree. Minting between two separate checks would report a certificate as present that
+        # the `certs` list omitted, and the IDE's reader trusts exactly that pairing.
+        cert_present = api_plan.cert_file is not None and Path(api_plan.cert_file).exists()
+        # An OPERATOR cert is inventoried even when it is not there -- a configured path that does
+        # not resolve is a real fault and earns its error row. A GENERATED one that is not there yet
+        # is not a fault: the engine has simply never started, so listing it would turn a clean
+        # inventory red for no defect. Either way `api_tls` below still reports the path.
+        if api_plan.source == "operator" or cert_present:
+            served = api_plan.cert_file
+        # ASVS 6.4.5: inventory the service-caller certs the operator listed, too.
+        client_certs = settings.api.tls_client_cert_files
+
+    reg = None
     if args.config:
-        api_tls_cert_file: str | None = None
-        api_tls_client_cert_files: list[str] = []
-        if args.service_config:
-            from pydantic import ValidationError
-
-            from messagefoundry.config.settings import load_settings
-
-            try:
-                settings = load_settings(config_path=args.service_config)
-            except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-                return _cert_fail(f"cannot load --service-config: {exc}", as_json=args.json)
-            api_tls_cert_file = settings.api.tls_cert_file
-            # ASVS 6.4.5: inventory the service-caller certs the operator listed, too.
-            api_tls_client_cert_files = list(settings.api.tls_client_cert_files)
         from messagefoundry.config.wiring import WiringError, load_config
 
         try:
             reg = load_config(args.config)
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
-        pairs.extend(
-            (mc.label, mc.path)
-            for mc in certs_from_registry(reg, api_tls_cert_file, api_tls_client_cert_files)
-        )
+
+    pairs.extend((mc.label, mc.path) for mc in certs_from_registry(reg, served, client_certs))
 
     now = time.time()
     entries: list[dict[str, object]] = []
@@ -4133,7 +4165,21 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             _safe_print(f"  SAN(DNS): {', '.join(facts.sans) if facts.sans else '(none)'}")
 
     if args.json:
-        _print_json({"certs": entries}, compact=True)
+        result: dict[str, object] = {"certs": entries}
+        if api_plan is not None:
+            result["api_tls"] = {
+                "scheme": api_plan.scheme,
+                "source": api_plan.source,
+                "cert": api_plan.cert_file,
+                "cert_present": cert_present,
+            }
+        _print_json(result, compact=True)
+    elif api_plan is not None:
+        where = api_plan.cert_file or "(none — a reverse proxy terminates TLS in front)"
+        _safe_print(f"API bind: serves {api_plan.scheme}")
+        _safe_print(f"  certificate ({api_plan.source}): {where}")
+        if api_plan.source == "generated" and not cert_present:
+            _safe_print("  not minted yet — the engine writes it on its first run")
     elif not entries:
         _safe_print("no certificates to inventory")
     return 1 if had_error else 0

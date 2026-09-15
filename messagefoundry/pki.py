@@ -224,8 +224,11 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
     **An IP literal becomes an** ``iPAddress`` **entry, not a** ``DNSName``. Hostname verification for
     an IP-literal URL matches only against ``iPAddress``; a DNS entry spelling the same characters
     does not satisfy it. This is load-bearing rather than pedantic here — ``[api].host`` binds
-    ``127.0.0.1`` and every shipped first-party client defaults to ``http://127.0.0.1:8765``, so a
-    DNS-only certificate could not verify against a single one of them (BACKLOG #1179)."""
+    ``127.0.0.1`` and every shipped first-party client defaults to the IP LITERAL ``127.0.0.1:8765``,
+    so a DNS-only certificate could not verify against a single one of them (BACKLOG #1179). The
+    scheme those clients default to is a separate question that is still moving -- the VS Code
+    extension went to ``https://`` under BACKLOG #1695 -- and naming it here would go stale; the HOST
+    is what this paragraph rests on."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     names = list(dict.fromkeys([cn, *sans]))  # CN first, de-duped, order preserved
