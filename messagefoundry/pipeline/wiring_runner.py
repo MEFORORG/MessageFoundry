@@ -1869,11 +1869,13 @@ class RegistryRunner:
         ``_start_outbound_unsafe`` RAISES (``NotDeployedError``) while this one returns QUIETLY, so
         fusing them would make "it returned normally" stop meaning "it started".
 
-        A reload is untouched either way, and not because of this placement: its outbound
-        reconciliation resumes a lane through :meth:`_unpark_outbound_lane`, never through
-        ``_start_outbound_unsafe``. What makes THAT safe is ``_stop_outbound_unsafe`` dropping the
-        ``_gate_parked`` marker, so a halt-paused lane reads as operator-paused and no reload
-        resumes it (#115/#233)."""
+        A reload is untouched by this placement: its outbound reconciliation resumes a lane through
+        :meth:`_unpark_outbound_lane`, never through ``_start_outbound_unsafe``. ``_stop_outbound_
+        unsafe`` dropping the ``_gate_parked`` marker covers the lane the HALT paused — it reads as
+        operator-paused, so no reload resumes it (#115/#233). **It says nothing about the lane the
+        halt never touched**: a lane the ENGINE parked is already in ``_outbound_paused`` when the
+        halt runs, so the halt skips it and its marker survives, and the reload was lifting exactly
+        that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             if not self._outbound_start_permitted(name):
@@ -2530,7 +2532,7 @@ class RegistryRunner:
         exactly this loop and a fourth copy is how they drift: the halt itself
         (:meth:`_halt_inbound_processing`), the fresh dispatchers at start
         (:meth:`_start_pooled_dispatchers` step 2.6), and the reload re-apply
-        (:meth:`_reconcile_pooled_dispatchers`). A stage with no dispatcher is skipped -- per_lane
+        (:meth:`_reload_pooled_dispatchers`). A stage with no dispatcher is skipped -- per_lane
         mode builds none, and a graph with no loopback inbound has no RESPONSE dispatcher.
         ``pause_lane`` on an unregistered key registers it ALREADY-PAUSED, so calling this before a
         dispatcher starts is what makes step 2.6 work at all (#115)."""
@@ -2627,20 +2629,27 @@ class RegistryRunner:
             log.exception("alert sink raised on a refused log-failure restart for %r", name)
 
     def _outbound_start_permitted(self, name: str) -> bool:
-        """The #122 (ADR 0162) log-recovery gate on the two per-connection doors into resuming
-        delivery — :meth:`start_outbound` and :meth:`restart_outbound`.
+        """The #122 (ADR 0162) log-recovery gate on the doors into resuming delivery —
+        :meth:`start_outbound`, :meth:`restart_outbound`, and the reload's un-park in
+        :meth:`_reconcile_outbounds`.
 
-        **Scoped to those two deliberately, and NOT a claim that nothing else can resume delivery.**
-        At least :meth:`start`'s own outbound spawn does not pass through here, which is a separate
-        open gap rather than an exemption this helper grants; an absolute here would be a
-        compensating control resting on a false premise.
+        **Not a claim that nothing else can resume delivery.** :meth:`start`'s own outbound spawn
+        still does not pass through here; what keeps it honest is
+        :meth:`_park_delivery_for_log_failure`, which pauses the tier before those lanes are built,
+        because ``start`` has just probed the guard itself and a second probe would be a second write.
+        An absolute here would be a compensating control resting on a false premise.
 
         One shared helper rather than the check spelled out in each door, because the defect this
-        closes was precisely two doors and one gate: ``start_outbound`` asked, ``restart_outbound``
-        called ``_start_outbound_unsafe`` straight through, and a restart would therefore resume a
-        log-halted lane and deliver rows with no application log behind them — silently defeating the
-        count-and-log invariant on a first deployment. Two copies of a check can drift apart with
-        nothing reporting it; one cannot.
+        closes was precisely several doors and one gate: ``start_outbound`` asked, ``restart_outbound``
+        called ``_start_outbound_unsafe`` straight through, and the reload lifted an engine-park with
+        no gate at all — so a restart or a re-deploy would resume a log-halted lane and deliver rows
+        with no application log behind them, silently defeating the count-and-log invariant on a first
+        deployment. Copies of a check can drift apart with nothing reporting it; one cannot.
+
+        **Every caller must ask at most once per operator action.** This is not a predicate:
+        :meth:`_log_recovery_ok` performs a synchronous re-validation WRITE and clears the halt latch,
+        and a refusal PAGES. A caller that loops over lanes memoises the answer (see
+        :meth:`_reconcile_outbounds`) rather than probing per lane.
 
         Returns True when delivery may resume. A refusal PAGES through the notifier
         (:meth:`_log_write_refused_restart`) and the caller then returns quietly — a raise here would
@@ -2650,13 +2659,49 @@ class RegistryRunner:
         self._log_write_refused_restart(name)
         return False
 
+    def _park_delivery_for_log_failure(self) -> None:
+        """Take the DELIVERY tier down when :meth:`start` came up into an unwritable application log
+        (#122) — the third tier of the start-time halt, beside :meth:`_unbind_for_log_failure`'s
+        intake half and the internal-stage halt ``start`` records in :attr:`_log_halted`.
+
+        **A teardown drops the pause, so a start-after-stop has to write it again.**
+        :meth:`_teardown_body` clears ``_outbound_paused`` on purpose (an operator pause is in-memory
+        and must not outlive the process's graph), and the mid-run halt's own pause goes with it — so
+        ``stop()`` + ``start()`` against still-dead sinks rebuilt every lane RUNNING and drained the
+        backlog the halt was retaining. MEASURED in both claim modes, on a rig with a real delivery row
+        already on the outbound stage: the row was written to the destination while ``guard.can_log()``
+        read False throughout. A service restart, an HA demote-then-promote, or ``stop()``+``start()``
+        from the API would each have delivered unlogged on a first deployment.
+
+        **Called BEFORE the outbound lanes are built, and that placement is the fix rather than a
+        detail.** Pooled replays ``_outbound_paused`` onto the fresh OUTBOUND dispatcher at
+        :meth:`_start_pooled_dispatchers` step 2.5, and a per_lane delivery worker reads
+        ``_outbound_resume`` at its loop-top gate from the moment :meth:`_spawn_worker` starts it.
+        Pausing after the build loop — where the intake half runs — would leave a window in both modes
+        for exactly the delivery this refuses.
+
+        Routes through :meth:`_stop_outbound_unsafe`, so these lanes read as an OPERATOR pause
+        (``_gate_parked`` dropped) and no reload resumes them, which is the same property that makes
+        the mid-run halt safe. Nothing is dead-lettered: queued rows stay PENDING and drain once
+        :meth:`start_outbound` / :meth:`restart_outbound` lift the pause on a working log."""
+        for name in self.registry.outbound:
+            if not self._owns_destination(name):
+                continue  # ADR 0073: another shard owns this lane; pausing it here would be a lie
+            try:
+                self._stop_outbound_unsafe(name)
+            except Exception:
+                # One lane refusing to pause must not leave the others delivering: a fail-closed halt
+                # is better partial than abandoned (same rule as _stop_all_for_log_failure).
+                log.exception("log-failure start: outbound %r did not pause cleanly", name)
+
     async def _unbind_for_log_failure(self) -> None:
         """Take intake back down when :meth:`start` came up into an unwritable application log (#122).
 
         The counterpart of :meth:`_stop_all_for_log_failure`'s inbound half, for the one case that
         method cannot cover: at ``start`` there was no halt to fire, the log was *already* dead. Called
         with the reload lock held, AFTER the dispatchers exist, so the internal stages are halted
-        before the listeners go down rather than after.
+        before the listeners go down rather than after. The delivery tier is NOT here — it has to be
+        paused before the lanes are built, which is why it is :meth:`_park_delivery_for_log_failure`.
 
         **Unbinding is not belt-and-braces.** Leaving intake up with the internal stages halted would
         ACK a sender into a lane nothing is draining — the same reason
@@ -2683,8 +2728,9 @@ class RegistryRunner:
                 stage="unwritable",
                 reason=(
                     "the engine started while the application log was unwritable, so it is running "
-                    "HALTED: intake is down and nothing is being routed or transformed. Fix the log, "
-                    "then restart the connections"
+                    "HALTED: intake is down, nothing is being routed or transformed, and every "
+                    "delivery lane is paused with its queued rows retained. Fix the log, then "
+                    "restart the connections"
                 ),
                 stopped=len(bound),
             )
@@ -2899,6 +2945,12 @@ class RegistryRunner:
                 # still comes up (a failed connection must not crash the engine). The outer except below
                 # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
                 # lookup executor), which still unwind + raise.
+                # #122 (ADR 0162): this runner came up into an unwritable application log, so the
+                # delivery tier is paused BEFORE its lanes are built — see
+                # :meth:`_park_delivery_for_log_failure` for why "before" is load-bearing. The intake
+                # half runs at the end of this block, once the listeners exist to be unbound.
+                if self._log_write_stopped:
+                    self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
                     await self._start_outbound(name, oc)
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
@@ -3886,6 +3938,18 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
+        # #122 (ADR 0162) THE THIRD DOOR INTO RESUMING DELIVERY, and the only one a reload can open.
+        # `_stop_all_for_log_failure` pauses the lanes that are RUNNING; a lane the ENGINE parked
+        # (auto_start=False #115 / deployed=False #233) is already in `_outbound_paused`, so the halt
+        # skips it and its `_gate_parked` marker survives. `_unpark_outbound_lane` below then lifts
+        # exactly that marker — MEASURED: a reload flipping the flag back with both sinks still dead
+        # resumed the lane and shipped its queued row with no application log behind it.
+        #
+        # Probed at most ONCE per reload, which is why the answer is memoised here rather than asked
+        # inside `_unpark_outbound_lane`: `_outbound_start_permitted` is not a predicate — it performs
+        # a synchronous re-validation WRITE and PAGES on refusal — so a per-lane call would probe and
+        # page N times for one operator action. None = not asked yet; no park to lift, no probe.
+        unpark_permitted: bool | None = None
         for name, oc in new.outbound.items():
             # workers read retry + ordering + internal-error policy live each item, so a reload
             # retunes (incl. re-arming a previously stopped connection) without a restart
@@ -3939,6 +4003,17 @@ class RegistryRunner:
             # change) would silently not deploy it. A no-op for an OPERATOR pause (not in _gate_parked):
             # a reload never undoes an operator action. Placed ABOVE the DR gate so a DR park applies its
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
+            #
+            # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
+            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
+            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
+            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
+            # so the next reload on a repaired log lifts it.
+            if name in self._gate_parked:
+                if unpark_permitted is None:
+                    unpark_permitted = self._outbound_start_permitted(name)
+                if not unpark_permitted:
+                    continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
@@ -3978,12 +4053,27 @@ class RegistryRunner:
                     )
                 self._failed.pop(name, None)
                 self._spawn_worker(name)
-            elif failed or old.outbound.get(name) is None or old.outbound[name].spec != oc.spec:
+            elif (
+                failed
+                or name not in self._destinations
+                or old.outbound.get(name) is None
+                or old.outbound[name].spec != oc.spec
+            ):
                 # live worker but a missing/mismatched connector → (re)build it in place, close any old
                 # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
                 # is alive with no connector, so a reload once the cause is fixed self-heals the lane
                 # (build_check above already re-validated the whole new registry, so this build can't
                 # fail here — a still-broken connector would have raised before any quiesce).
+                #
+                # `name not in self._destinations` is the other way a live worker ends up with no
+                # connector, and the condition used to test only `failed` while its own first line
+                # promised "missing OR mismatched". In PER_LANE the boot gates pop the connector and
+                # still spawn the worker (auto_start=False #115, deployed=False #233), so `live` above
+                # — worker-keyed in per_lane — is True on the reload that re-deploys the lane, the spec
+                # is unchanged, and nothing rebuilt it: AC-4's "flip the flag back with no other
+                # change" un-parked a lane that could then never deliver, and its rows retried against
+                # a connector-less lane forever. MEASURED on a per_lane rig; POOLED is untouched
+                # (`live` is connector-keyed there, so reaching this elif already means it is built).
                 old_conn = self._destinations.get(name)
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
