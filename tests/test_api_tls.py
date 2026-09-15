@@ -6,6 +6,7 @@ serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is c
 from __future__ import annotations
 
 import datetime
+import errno
 import json
 import ssl
 from collections.abc import Awaitable, Callable
@@ -1929,6 +1930,42 @@ def test_a_second_start_reuses_the_pair_and_never_re_mints(tmp_path: Path) -> No
     assert (second_cert, second_key) == (first_cert, first_key)
     assert Path(second_cert).read_bytes() == cert_bytes
     assert Path(second_key).read_bytes() == key_bytes
+
+
+def test_a_failed_cert_write_leaves_no_orphaned_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE MINT IS ALL-OR-NOTHING. The key is written first, so a cert write that fails would leave
+    a lone key.pem, and that half-pair would brick every later start rather than degrade it.
+
+    The reuse branch needs BOTH files. With only the key present, a next start falls through to
+    re-mint, and `_write_private_key`'s O_EXCL then refuses the surviving key -- so the engine would
+    raise FileExistsError on every start, forever, naming no cause and no remedy. On a deploying
+    site whose disk filled during first-run mint, that is an engine that will not come up again
+    until someone finds and deletes a file nothing told them about.
+
+    Mutation: drop the `try/finally` around `cert_path.write_bytes`. Red: the key survives alone."""
+    from messagefoundry.api import tls as tls_mod
+
+    def _cert_write_dies(_self: Path, _data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", _cert_write_dies)
+    api = ApiSettings()
+
+    with pytest.raises(OSError, match="No space left on device"):
+        ensure_api_tls_material(api, state_dir=tmp_path)
+
+    monkeypatch.undo()  # read the directory with the real Path again
+    key_path = tmp_path / tls_mod._GENERATED_KEY_NAME
+    cert_path = tmp_path / tls_mod._GENERATED_CERT_NAME
+    assert not key_path.exists(), "a lone key.pem would make every later start die on O_EXCL"
+    assert not cert_path.exists()
+
+    # The state it must leave behind is a re-mintable one, which is the whole point of removing it.
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
 
 
 def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:

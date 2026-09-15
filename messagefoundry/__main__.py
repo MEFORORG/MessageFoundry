@@ -3921,10 +3921,28 @@ def _write_private_key(path: Path, pem: bytes) -> None:
 
     from messagefoundry.store.store import _secure_file
 
+    # The exclusive create sits OUTSIDE the cleanup guard on purpose: a pre-existing key raises
+    # FileExistsError HERE, and that file is the operator's real key — unlinking it is precisely the
+    # clobber the O_EXCL refusal exists to prevent.
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(pem)
-    _secure_file(path)
+    placed = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(pem)
+        # Inside the guard for breadth, not because it raises today: _secure_file is best-effort and
+        # non-fatal by contract (it logs a failed restriction rather than raising, so the engine can
+        # still start). Were that ever to change, the key it could not lock down must not be the one
+        # thing left behind.
+        _secure_file(path)
+        placed = True
+    finally:
+        # A write that dies partway (a full volume) would otherwise leave a TRUNCATED key that
+        # nothing removes, and the O_EXCL refusal above then fires on it forever: the caller cannot
+        # re-mint, and all it gets is a FileExistsError naming no cause. `finally`, not `except`, so
+        # nothing is caught or relabelled. It runs after the `with` closed the handle, which Windows
+        # requires before an unlink.
+        if not placed:
+            path.unlink(missing_ok=True)
 
 
 def _cert(args: argparse.Namespace) -> int:

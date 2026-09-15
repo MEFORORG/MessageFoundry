@@ -141,7 +141,18 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     # lifetime for the same primitive.
     cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
     _write_private_key(key_path, key_pem)
-    cert_path.write_bytes(cert_pem)
+    paired = False
+    try:
+        cert_path.write_bytes(cert_pem)
+        paired = True
+    finally:
+        # THE MINT IS ALL-OR-NOTHING. An orphaned key.pem is not merely untidy: the reuse branch
+        # above needs BOTH files, so a next start finds cert_path missing, falls through, re-mints,
+        # and dies on _write_private_key's O_EXCL refusal. That repeats on every start until an
+        # operator deletes a file nothing told them about, so a half-written pair would brick the
+        # engine rather than degrade it. `finally`, not `except`, so no failure mode is missed.
+        if not paired:
+            key_path.unlink(missing_ok=True)
     log.warning(
         "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
         "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "
