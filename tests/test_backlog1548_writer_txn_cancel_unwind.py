@@ -11,7 +11,9 @@ is how a cancelled route would lose work on first deployment: the ingress row's 
 becomes durable while the routed rows it should have produced never existed.
 
 These drive :func:`messagefoundry.store.store._writer_txn` through the store's public API at three
-distinct cancel points, and each arm proves the same things:
+distinct cancel points, on both of the store's stage handoffs -- ``route_handoff`` (ingress ->
+routed) and ``ingress_handoff`` (the re-ingress edge, ADR 0013 Increment 2). Each arm proves the
+same things:
 
 1. the failure propagates;
 2. NO transaction is left open;
@@ -46,6 +48,10 @@ from messagefoundry.store.store import (
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 CH = "IB_TEST_ADT"
+# The re-ingress lanes: an outbound that captures a reply, and the loopback inbound it re-enters on.
+DEST = "OB_TEST_REPLY"
+LOOPBACK = "IB_TEST_LOOP"
+REPLY = "MSH|^~\\&|F|RF|S|F|20260101||RSP^K11|RSP1|P|2.5.1\rMSA|AA|MSG1\r"
 # A non-zero window is what flips the store from inline-commit to the committer coroutine.
 GC_WINDOW_MS = 5.0
 # Bound on every handshake with the trapped writer. Generous (these are sub-millisecond in practice)
@@ -293,6 +299,151 @@ async def test_standalone_dead_letter_writer_unwinds(tmp_path: Path, arm: str) -
         await _dead()
         cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
         assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    finally:
+        await store.close()
+
+
+# --- the re-ingress stage handoff (ADR 0013 Increment 2) ----------------------------------------
+
+
+async def _prepare_reingress(store: MessageStore) -> tuple[str, str]:
+    """One delivered message whose captured reply produced a claimed ``Stage.RESPONSE`` work-row.
+
+    Built through the real path rather than by inserting the row, so the state under test is the
+    state the re-ingress worker actually hands to :meth:`MessageStore.ingress_handoff`."""
+    origin = await store.enqueue_message(
+        channel_id=CH, raw=RAW, deliveries=[(DEST, RAW)], now=100.0
+    )
+    item = (await store.claim_ready(destination_name=DEST, now=100.0))[0]
+    await store.complete_with_response(
+        item.id, body=REPLY, outcome="accepted", reingress_to=LOOPBACK, now=101.0
+    )
+    work = await store.claim_next_fifo(LOOPBACK, now=102.0, stage=Stage.RESPONSE.value)
+    assert work is not None  # now INFLIGHT -- the token this handoff consumes
+    return origin, work.id
+
+
+async def _reingress(store: MessageStore, work_id: str, *, now: float = 110.0) -> bool:
+    return bool(
+        await store.ingress_handoff(
+            response_row_id=work_id,
+            loopback_channel_id=LOOPBACK,
+            correlation_depth_cap=8,
+            control_id="RSP1",
+            message_type="RSP^K11",
+            summary="reply",
+            now=now,
+        )
+    )
+
+
+async def _message_count(store: MessageStore) -> int:
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    return int((await cur.fetchone())["n"])
+
+
+async def _assert_reingress_unwound_and_recovered(
+    store: MessageStore, origin: str, work_id: str, *, probe: str
+) -> None:
+    """The post-conditions a failed ``ingress_handoff`` must meet -- cancel arm and control arm alike.
+
+    The work-row's existence IS the exactly-once token, so the load-bearing assertion is that the
+    guarded ``DELETE`` did not become durable. Had it, the reply would be consumed with no child
+    produced: the re-ingress is gone, and nothing re-derives it."""
+    # 1. The invariant itself. Asserted first, because the probe below closes whatever is open and
+    #    would mask this at the `begin` point.
+    assert not store._db.in_transaction, "the failed writer left its transaction open"
+
+    # 2. The connection is usable by the NEXT writer. record_connection_event takes the write lock
+    #    and issues its INSERT with no BEGIN of its own, so if the failed transaction were still open
+    #    this INSERT would join it and the commit below would make the abandoned DELETE durable.
+    await store.record_connection_event(
+        connection=probe, transport="mllp", direction="inbound", kind="probe"
+    )
+    assert len(await store.list_connection_events(connection=probe)) == 1
+
+    # 3. ...and it did NOT carry the abandoned work with it: the token survived.
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (work_id,))
+    row = await cur.fetchone()
+    assert row is not None, "the failed handoff consumed the work-row -- the reply is lost"
+    assert row["status"] == OutboxStatus.INFLIGHT.value
+
+    # 4. Nothing the failed handoff would have produced leaked: no child message, no ingress row for
+    #    it, and the origin did not finalize on the strength of a handoff that never committed.
+    assert await _message_count(store) == 1
+    assert (await store.pending_depth(LOOPBACK, stage=Stage.INGRESS.value))[0] == 0
+    assert (await store.get_message(origin))["status"] != MessageStatus.PROCESSED.value
+
+    # 5. Recovery: the in-flight token re-pends and the SAME handoff re-runs to success. This is the
+    #    at-least-once contract -- a rolled-back handoff must be re-runnable, not merely harmless.
+    assert await store.reset_stale_inflight(stage=Stage.RESPONSE.value, now=120.0) >= 1
+    again = await store.claim_next_fifo(LOOPBACK, now=121.0, stage=Stage.RESPONSE.value)
+    assert again is not None and again.id == work_id
+    assert await _reingress(store, work_id, now=122.0)
+    assert await _message_count(store) == 2
+    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    assert (await store.pending_depth(LOOPBACK, stage=Stage.INGRESS.value))[0] == 1
+
+
+@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_ingress_handoff_writer_unwinds(tmp_path: Path, point: str, arm: str) -> None:
+    """``ingress_handoff`` is the second stage handoff, and its own docstring calls it a clone of
+    ``route_handoff`` -- but it was left on the ``except Exception`` shape when the unwind first
+    landed. A cancellation at any of the three cancel points now unwinds it, and an ordinary
+    exception at the same await does exactly the same thing.
+
+    The ``body`` point lands on the guarded ``DELETE``, which is where this handoff would do its
+    damage: the child message and its ingress row are written and uncommitted at that moment, so a
+    transaction left open would let the next writer's COMMIT make the token's consumption durable
+    while the child it should have produced was never there."""
+    store = await MessageStore.open(tmp_path / f"reingress-{point}-{arm}.db")
+    try:
+        origin, work_id = await _prepare_reingress(store)
+        trap = _Trap(store._db)
+        trap.arm(point, raise_instead=arm == "control")
+
+        if arm == "cancel":
+            task = asyncio.create_task(_reingress(store, work_id))
+            await asyncio.wait_for(trap.reached.wait(), WAIT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(_Boom):
+                await _reingress(store, work_id)
+
+        await _assert_reingress_unwound_and_recovered(
+            store, origin, work_id, probe=f"reingress-{point}-{arm}"
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_ingress_handoff_survives_a_second_cancellation(tmp_path: Path, point: str) -> None:
+    """A SECOND cancellation landing inside the shielded rollback leaves the re-ingress token intact,
+    exactly as it does for ``route_handoff``. Without the shield the second cancel would kill the
+    rollback and leave the half-open transaction the first cancel's unwind was closing."""
+    store = await MessageStore.open(tmp_path / f"reingress-twice-{point}.db")
+    try:
+        origin, work_id = await _prepare_reingress(store)
+        trap = _Trap(store._db)
+        trap.stall_rollback = 0.05  # hold the ROLLBACK open long enough to cancel into it
+        trap.arm(point)
+
+        task = asyncio.create_task(_reingress(store, work_id))
+        await asyncio.wait_for(trap.reached.wait(), WAIT)
+        task.cancel()
+        await asyncio.wait_for(trap.rollback_started.wait(), WAIT)
+        task.cancel()  # lands while the unwind is parked on the shielded rollback
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert trap.rollback_finished.is_set(), "the second cancellation killed the rollback"
+        await _assert_reingress_unwound_and_recovered(
+            store, origin, work_id, probe=f"reingress-twice-{point}"
+        )
     finally:
         await store.close()
 
