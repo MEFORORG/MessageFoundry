@@ -755,7 +755,9 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
 #: ``dr_backup`` functions that SEAL or UNSEAL the ``.mfbak`` archive itself. §3's carve-out
 #: ("the key is resolved by `resolve_active_key` and not `build_store_cipher`, so `vault_transit`
 #: never applies") is a claim about THESE functions and no others.
-_MFBAK_CODEC_FUNCS = frozenset({"_do_backup", "_resolve_key", "_build_archive_blocking"})
+_MFBAK_CODEC_FUNCS = frozenset(
+    {"_do_backup", "_resolve_key", "_build_archive_blocking", "_verify_archive_blocking"}
+)
 #: ``dr_backup`` functions that read the EXTRACTED snapshot's own store cells during a full
 #: restore-verify. Reading a store cell is what the store cipher is FOR, so these are where
 #: ``build_store_cipher`` (and ``open_store``, which builds one internally) belong.
@@ -796,28 +798,40 @@ def _named_func(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunct
     return found[0]
 
 
+def _binds(node: ast.AST, name: str) -> bool:
+    """True when ``node`` assigns to the bare name ``name`` — plain, augmented or walrus."""
+    if not isinstance(node, ast.Assign | ast.AugAssign | ast.NamedExpr):
+        return False
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return any(isinstance(t, ast.Name) and t.id == name for t in targets)
+
+
+def _sites(calls: list[ast.Call]) -> list[str]:
+    """Call nodes rendered for a failure message — the callee and the line it sits on."""
+    return [f"{_callee_name(c)} at line {c.lineno}" for c in calls]
+
+
 def _split_call_sites(
     tree: ast.Module, funcs: frozenset[str], names: frozenset[str]
-) -> tuple[list[str], list[str]]:
-    """``(inside, outside)`` — call sites of ``names``, split by whether they sit in ``funcs``.
+) -> tuple[list[ast.Call], list[ast.Call]]:
+    """``(inside, outside)`` — call sites of ``names``, split by whether they sit LEXICALLY in one of
+    ``funcs``. No call is followed: a helper defined outside ``funcs`` and called from inside one
+    lands in ``outside``, which errs toward reporting rather than toward a false green.
 
-    Keyed on AST node identity, not on a line range, so a nested helper (``_full_open_check._open``)
-    counts as INSIDE its enclosing function and nothing is double-counted."""
-    inside_nodes: set[int] = set()
-    for name in funcs:
-        for sub in ast.walk(_named_func(tree, name)):
-            if isinstance(sub, ast.Call):
-                inside_nodes.add(id(sub))
-    inside: list[str] = []
-    outside: list[str] = []
+    Keyed on AST node identity (``ast`` nodes hash by identity), not on a line range, so a nested
+    helper such as ``_full_open_check._open`` counts as INSIDE its enclosing function and nothing is
+    double-counted."""
+    inside_nodes = {
+        sub
+        for name in funcs
+        for sub in ast.walk(_named_func(tree, name))
+        if isinstance(sub, ast.Call)
+    }
+    inside: list[ast.Call] = []
+    outside: list[ast.Call] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        callee = _callee_name(node)
-        if callee not in names:
-            continue
-        where = inside if id(node) in inside_nodes else outside
-        where.append(f"{callee} at line {node.lineno}")
+        if isinstance(node, ast.Call) and _callee_name(node) in names:
+            (inside if node in inside_nodes else outside).append(node)
     return inside, outside
 
 
@@ -838,21 +852,49 @@ def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
     different key material. A file-wide token cannot tell those two apart. This guard can, so the
     narrowing is a strengthening: the permitted region is named and closed, and a seal that reaches
     for the store cipher by ANY of the four constructor names now fails.
+
+    SCOPE. ``_split_call_sites`` buckets a call by the function it sits in LEXICALLY; it follows no
+    calls. A helper extracted out of ``_decrypt_check`` would therefore land outside and red, which
+    is conservative in the safe direction — the verdict is never falsely green — but it is why the
+    ADR table and this test say "in" rather than "reached".
     """
+    # (0) The doc limb. Every sibling in this file pins the §3 prose before it pins the code, and a
+    # code-only guard would stay green if the narrowed sentence were deleted — pinning a claim the
+    # document no longer makes, which is the defect this whole file exists to catch.
+    section3 = _section(3)
+    for token in ("sealing or unsealing an archive", "resolve_active_key", "build_store_cipher"):
+        assert token in section3, (
+            f"§3's PL-1 encryption rule no longer states {token!r}. The `.mfbak` carve-out is now "
+            "SCOPED — the store cipher is off the archive seal and on the full restore-verify's "
+            "snapshot read — and the code assertions below pin only the second half of that claim."
+        )
+
+    # (0b) The forbidden-constructor list is hand-named, so pin each name to a real symbol. Without
+    # this a rename in store/ leaves an entry matching nothing and the arm below passes on a list of
+    # dead strings — the same shape of defect as the token scan this test replaced.
+    store_pkg = "".join(
+        (_PKG / "store" / name).read_text(encoding="utf-8")
+        for name in ("base.py", "crypto.py", "crypto_transit.py")
+    )
+    unresolved = sorted(n for n in _STORE_CIPHER_CTORS if f"def {n}(" not in store_pkg)
+    assert not unresolved, (
+        f"_STORE_CIPHER_CTORS names {unresolved}, which messagefoundry/store/ no longer defines. "
+        "Re-derive the store-cipher entry points; a stale name guards nothing."
+    )
+
     tree = _dr_backup_tree()
 
     # (1) The archive codec is called ONLY from the seal/unseal region. A new sealing site added
     # elsewhere lands in `outside` and reds, rather than escaping a region named once and forgotten.
-    codec_inside, codec_outside = _split_call_sites(
-        tree, _MFBAK_CODEC_FUNCS | frozenset({"_verify_archive_blocking"}), _ARCHIVE_CODEC_CALLS
-    )
-    assert {c.split()[0] for c in codec_inside} == set(_ARCHIVE_CODEC_CALLS), (
-        f"the instrument did not find both archive-codec entry points; it saw {codec_inside}. A guard "
-        "that cannot see the thing it guards proves nothing by passing."
+    codec_inside, codec_outside = _split_call_sites(tree, _MFBAK_CODEC_FUNCS, _ARCHIVE_CODEC_CALLS)
+    assert {_callee_name(c) for c in codec_inside} == set(_ARCHIVE_CODEC_CALLS), (
+        f"the instrument did not find both archive-codec entry points; it saw {_sites(codec_inside)}. "
+        "A guard that cannot see the thing it guards proves nothing by passing."
     )
     assert not codec_outside, (
         f"pipeline/dr_backup.py seals or unseals a .mfbak outside the named codec region: "
-        f"{codec_outside}. Add the function to _MFBAK_CODEC_FUNCS and re-derive §3's carve-out for it."
+        f"{_sites(codec_outside)}. Add the function to _MFBAK_CODEC_FUNCS and re-derive §3's carve-out "
+        "for it."
     )
 
     # (2) The store cipher is constructed ONLY on the snapshot-read path. This is the prohibition the
@@ -867,8 +909,8 @@ def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
     )
     assert not cipher_outside, (
         f"pipeline/dr_backup.py builds the STORE cipher outside the snapshot-read path: "
-        f"{cipher_outside}. §3 says the `.mfbak` seal is keyed by resolve_active_key and NOT by "
-        "build_store_cipher, so `cipher_provider = vault_transit` never applies to the archive — "
+        f"{_sites(cipher_outside)}. §3 says the `.mfbak` seal is keyed by resolve_active_key and NOT "
+        "by build_store_cipher, so `cipher_provider = vault_transit` never applies to the archive — "
         "sealing with the store cipher makes that sentence false."
     )
 
@@ -883,20 +925,18 @@ def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
 
     do_backup = _named_func(tree, "_do_backup")
     assert any(
-        isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)
+        _binds(n, "key")
         and isinstance(n.value, ast.Call)
         and _callee_name(n.value) == "_resolve_key"
         for n in ast.walk(do_backup)
+        if isinstance(n, ast.Assign)
     ), "BackupRunner._do_backup no longer binds `key` from self._resolve_key()."
     # The seal runs off the loop, so the call is `asyncio.to_thread(self._build_archive_blocking,
-    # ..., key=key, ...)` — _build_archive_blocking is an ARGUMENT, not the callee. Match the call
-    # that names it anywhere in its own subtree and carries `key=key`.
+    # ..., key=key, ...)` — _build_archive_blocking is a positional ARGUMENT, not the callee.
     assert any(
         isinstance(n, ast.Call)
         and any(
-            isinstance(s, ast.Attribute) and s.attr == "_build_archive_blocking"
-            for s in ast.walk(n)
+            isinstance(a, ast.Attribute) and a.attr == "_build_archive_blocking" for a in n.args
         )
         and any(
             kw.arg == "key" and isinstance(kw.value, ast.Name) and kw.value.id == "key"
@@ -908,23 +948,15 @@ def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
     build = _named_func(tree, "_build_archive_blocking")
     params = {a.arg for a in (*build.args.posonlyargs, *build.args.args, *build.args.kwonlyargs)}
     assert "key" in params, "_build_archive_blocking no longer takes the resolved DEK as `key`."
-    rebound = [
-        n.lineno
-        for n in ast.walk(build)
-        if (
-            isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)
-        )
-        or (isinstance(n, ast.AugAssign | ast.NamedExpr) and getattr(n.target, "id", None) == "key")
-    ]
+    rebound = [n.lineno for n in ast.walk(build) if _binds(n, "key")]
     assert not rebound, (
         f"_build_archive_blocking rebinds `key` at line(s) {rebound}; the DEK the caller resolved is "
         "then not the one that seals the archive."
     )
     seals = [
-        n
-        for n in ast.walk(build)
-        if isinstance(n, ast.Call) and _callee_name(n) == "encrypt_stream"
+        c
+        for c in ast.walk(build)
+        if isinstance(c, ast.Call) and _callee_name(c) == "encrypt_stream"
     ]
     assert len(seals) == 1, f"_build_archive_blocking makes {len(seals)} encrypt_stream calls."
     key_arg = seals[0].args[2] if len(seals[0].args) > 2 else None

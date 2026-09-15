@@ -225,9 +225,11 @@ Three consequences worth stating rather than inferring:
   cipher.
 - **The guard is scoped to the seal, and it is an AST call-path check, not a token scan.**
   `tests/test_phi_at_rest_inventory.py::test_the_mfbak_seal_never_reaches_for_the_store_cipher` asserts
-  that every archive-codec call sits in the seal/unseal region, that no store-cipher constructor is
-  reached from it, and that the bytes handed to `encrypt_stream` are the unmodified `resolve_active_key`
-  DEK. Both seams are registered in `scripts/security/crypto_inventory_check.py` (ASVS 11.1.3).
+  that every archive-codec call sits in the seal/unseal region, that no store-cipher constructor sits
+  in it, and that the bytes handed to `encrypt_stream` are the unmodified `resolve_active_key` DEK.
+  "Sits in" is lexical and deliberate: the guard follows no calls, so a cipher construction moved into
+  a helper called from the seal lands OUTSIDE the permitted region and reds. Both seams are registered
+  in `scripts/security/crypto_inventory_check.py` (ASVS 11.1.3).
 
 > **Key-availability consequence for #61's cold seed (addressed by design).** Because the archive is encrypted
 > under the store DEK, **the DR site must have that DEK available to restore the cold seed.** ADR 0048's cold
