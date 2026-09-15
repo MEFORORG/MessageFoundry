@@ -100,30 +100,52 @@ class FrameDecoder:
         return self._in_block
 
     def feed(self, data: bytes) -> Iterator[bytes]:
+        """Yield each payload completed by ``data``, carrying any partial frame to the next call.
+
+        Delimiters are located with :meth:`bytes.find` and payloads copied a slice at a time, so a
+        read costs two C-level scans per frame rather than one Python loop iteration per byte.
+        Still a lazy generator: a listener that awaits between frames sees each payload as its end
+        delimiter is reached, and an over-cap frame later in the same read cannot retract one
+        already yielded.
+        """
         start, end = self._codec.start, self._codec.end
-        for byte in data:
+        cap = self.max_frame_bytes
+        view = memoryview(data)
+        size = len(data)
+        pos = 0
+        while True:
             if not self._in_block:
-                if byte == start:
-                    self._in_block = True
-                    self._buf.clear()
-                # else: discard inter-frame noise (trailer after end, keep-alives, etc.)
-                continue
-            if byte == end:
-                # End of block. Any trailer that follows is left to be discarded as inter-frame
-                # noise, so a missing/extra trailer is tolerated.
+                opened = data.find(start, pos)
+                if opened < 0:
+                    return  # nothing opens a frame in the rest: inter-frame noise, discarded
+                self._in_block = True
+                self._buf.clear()
+                pos = opened + 1
+            closed = data.find(end, pos)
+            # Charge the cap against what this frame would hold, so an end delimiter sitting past
+            # the cap cannot rescue an over-cap frame. The buffer may reach exactly max_frame_bytes;
+            # one byte beyond it raises, the boundary the per-byte scan drew.
+            pending = (size if closed < 0 else closed) - pos
+            if cap is not None and len(self._buf) + pending > cap:
+                # Oversized open frame: a peer that never sends the end delimiter would grow the
+                # buffer without bound. Reset state and signal the caller to drop the connection.
+                self._buf.clear()
                 self._in_block = False
-                yield bytes(self._buf)
+                raise self.error_class(f"frame exceeded {cap} bytes before the end delimiter")
+            if closed < 0:
+                self._buf += view[pos:]  # frame still open — resume on the next read
+                return
+            if self._buf:
+                self._buf += view[pos:closed]
+                payload = bytes(self._buf)
                 self._buf.clear()
             else:
-                if self.max_frame_bytes is not None and len(self._buf) >= self.max_frame_bytes:
-                    # Oversized open frame: a peer that never sends the end delimiter would grow the
-                    # buffer without bound. Reset state and signal the caller to drop the connection.
-                    self._buf.clear()
-                    self._in_block = False
-                    raise self.error_class(
-                        f"frame exceeded {self.max_frame_bytes} bytes before the end delimiter"
-                    )
-                self._buf.append(byte)
+                payload = bytes(view[pos:closed])  # whole frame in this read: no staging copy
+            # End of block. Any trailer that follows is left to be discarded as inter-frame
+            # noise, so a missing/extra trailer is tolerated.
+            self._in_block = False
+            pos = closed + 1
+            yield payload
 
 
 #: MLLP preset: VT start, FS end, CR trailer (``0x0B``/``0x1C``/``0x0D``).

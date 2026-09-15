@@ -117,6 +117,105 @@ _RELEASE_CHUNK = 500
 # fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
 _RESET_LANE_CHUNK = 500
 
+# How long a writer-transaction unwind waits for its shielded ROLLBACK before giving up on it. A
+# cancellation is usually a shutdown, so the unwind must never be able to hang shutdown on a worker
+# thread that is wedged on the abandoned statement. 5s matches the SQL Server store's
+# `_DIRTY_CLOSE_TIMEOUT` (ADR 0159) and the read pool's `busy_timeout`, so the store's three
+# "stop waiting on a stuck connection" bounds agree rather than each carrying its own number.
+_WRITER_ROLLBACK_TIMEOUT = 5.0
+
+
+def _drain_detached_rollback(fut: asyncio.Future[None]) -> None:
+    """Retrieve a detached rollback's outcome so asyncio does not log it as never-retrieved."""
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        log.warning("sqlite: detached writer rollback failed: %s", exc)
+
+
+async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
+    """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
+    cancellation was swallowed to finish the job.
+
+    Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
+    connection mid-rollback.
+
+    The rollback is **shielded** because a cancellation is the common reason we are here, and an
+    unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
+    half-open transaction this exists to close. It is **bounded** because aiosqlite runs the ROLLBACK
+    on a worker thread that may still be stuck on the abandoned statement.
+
+    A FURTHER cancellation (shutdown cancels a task, then the gather cancels it again) is swallowed
+    and the wait resumes for what is left of the bound. This is where SQLite parts company with the
+    pooled SQL Server path (ADR 0159's ``_release_dirty``, which swallows the second cancel and
+    returns immediately): there the connection is already quarantined out of the pool, so returning
+    early is safe. Here there is exactly ONE writer connection behind one lock, so returning early
+    would release the lock over a half-open transaction and the next writer would inherit it."""
+    loop = asyncio.get_running_loop()
+    rollback = asyncio.ensure_future(db.rollback())
+    deadline = loop.time() + _WRITER_ROLLBACK_TIMEOUT
+    swallowed_cancel = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            rollback.add_done_callback(_drain_detached_rollback)
+            log.warning(
+                "sqlite: writer rollback did not complete within %.1fs; it will finish detached and"
+                " the next writer may inherit an open transaction",
+                _WRITER_ROLLBACK_TIMEOUT,
+            )
+            return swallowed_cancel
+        try:
+            await asyncio.wait_for(asyncio.shield(rollback), remaining)
+        except TimeoutError:
+            continue  # the loop head re-reads the deadline and gives up there
+        except asyncio.CancelledError:
+            swallowed_cancel = True  # re-cancelled mid-unwind; keep waiting out the bound
+            continue
+        except Exception:  # noqa: BLE001 — a rollback failure must not mask the original failure
+            log.warning("sqlite: writer rollback failed", exc_info=True)
+        return swallowed_cancel
+
+
+@asynccontextmanager
+async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+    """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    This is the store's single writer-transaction shape. The handler is ``BaseException`` and not
+    ``Exception`` on purpose: :class:`asyncio.CancelledError` derives from ``BaseException``, so an
+    ``except Exception`` rollback never fires on a cancellation and the block would unwind with its
+    transaction still open. SQLite has ONE writer connection behind ``lock``, so the next writer to
+    take the lock would inherit that transaction — its statements would join work the cancelled
+    caller never committed, and the first ``COMMIT`` would make the pair durable together. Under the
+    staged pipeline (ADR 0001) that is how a cancelled stage handoff would lose or duplicate work on
+    first deployment, which is why the unwind is part of the reliability invariant, not hygiene.
+
+    ``BEGIN`` is INSIDE the ``try`` deliberately: aiosqlite runs it on a worker thread, so a
+    cancellation delivered at that await can leave the transaction open with nothing written. A
+    ``ROLLBACK`` with no transaction open is a no-op, so covering it costs nothing.
+
+    The block owns its own ``COMMIT`` (nothing here commits for it), so an early ``return`` after an
+    explicit ``rollback()`` — the idempotent no-op exits — still runs that rollback under the lock."""
+    async with lock:
+        try:
+            await db.execute("BEGIN")
+            yield
+        except BaseException as exc:
+            swallowed_cancel = await _unwind_writer_txn(db)
+            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
+                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
+                # only that failure would drop the cancellation and leave the task running through a
+                # shutdown, so the cancellation wins and carries the original failure as its cause.
+                raise asyncio.CancelledError from exc
+            raise
+
+
+class _GroupPoisoned(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Raised inside the group-commit batch's writer transaction when a member failed, so the shared
+    transaction unwinds through :func:`_writer_txn` (under the lock) instead of being rolled back by
+    hand. Caught by :meth:`_GroupCommitter._flush`, which then rejects every member's future."""
+
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Raised inside a grouped member body to short-circuit it WITHOUT failing the batch.
@@ -162,10 +261,13 @@ class _GroupCommitter:
     Coalesces N grouped stage-handoff mutations into ONE ``COMMIT`` under the store's single writer
     lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
     enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
-    runs each member's statements inside one ``BEGIN`` … ``COMMIT``, then resolves every member's
-    future. If ANY member raises (other than :class:`_AbortMember`), or the commit itself fails, the
-    whole batch is rolled back and EVERY member's future is rejected — each caller re-runs (a
-    coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+    runs each member's statements inside one :func:`_writer_txn` (``BEGIN`` … ``COMMIT``), then
+    resolves every member's future. If ANY member raises (other than :class:`_AbortMember`), or the
+    commit itself fails, or the committer task is CANCELLED, the whole batch is rolled back and EVERY
+    member's future is rejected — each caller re-runs (a coordinated form of the crash-re-run the
+    INFLIGHT-guarded idempotent handoffs already tolerate). Resolving the futures on the cancellation
+    path matters as much as the rollback does: a member's caller parks on its future (the ACK gate
+    among them), so a batch abandoned without rejection would park every one of them forever.
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -260,9 +362,8 @@ class _GroupCommitter:
             return
         self._pending = self._pending[len(batch) :]
         results: list[Any] = []
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
+        try:
+            async with _writer_txn(self._db, self._lock):
                 for member in batch:
                     try:
                         results.append((member, await member.run(), None))
@@ -274,22 +375,31 @@ class _GroupCommitter:
                 # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
                 # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
                 # the good members — they share one transaction with the failed mutation.
-                first_error = next((e for _, _, e in results if e is not None), None)
-                if first_error is not None:
-                    await self._db.rollback()
-                    self._reject_all(batch, results)
-                    return
+                if any(e is not None for _, _, e in results):
+                    raise _GroupPoisoned
                 await self._db.commit()
                 # A1 live cost counter: one physical commit covers the whole batch (group-commit's whole
                 # point is fewer fsyncs), so count ONE committed transaction here, not one per member.
                 self._note_commit()
-            except Exception as exc:  # noqa: BLE001 — commit/rollback failure fails the whole group
-                try:
-                    await self._db.rollback()
-                except Exception:  # noqa: BLE001 — best-effort; the connection may be unusable
-                    log.warning("group-commit rollback failed", exc_info=True)
-                self._reject_all(batch, results, fallback=exc)
-                return
+        except _GroupPoisoned:
+            self._reject_all(batch, results)
+            return
+        except Exception as exc:  # noqa: BLE001 — a commit failure fails the whole group
+            self._reject_all(batch, results, fallback=exc)
+            return
+        except BaseException:
+            # Cancellation (shutdown). _writer_txn has already rolled the batch back under the lock;
+            # what is left is that every member's future MUST still be resolved or its caller parks on
+            # it forever — the ACK gate among them. Then re-raise so the committer task really dies.
+            # The fallback is a plain error, not the CancelledError: a member's caller may not itself
+            # be shutting down, and it should see a failure to re-run rather than a cancellation of
+            # its own that it would propagate.
+            self._reject_all(
+                batch,
+                results,
+                fallback=RuntimeError("group commit rolled back (committer cancelled)"),
+            )
+            raise
         # Commit succeeded → publish each member's read-through cache delta (committer frame, durable
         # write in hand) then resolve its future, OUTSIDE the lock. The publish runs BEFORE the future
         # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
@@ -469,6 +579,29 @@ REINGRESS_TARGET_PREFIX = "@reingress:"
 #: forever. Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse;
 #: ``base`` re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
+
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
+#: negation — ``payload = '' AND body_ref IS NULL`` — is exactly what retention leaves behind, and
+#: three facts make that an exact discriminator rather than a heuristic:
+#:
+#: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
+#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
+#: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
+#:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
+#: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
+#:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
+#:
+#: Spliced into :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can re-queue
+#: a delivery whose content no longer exists: the connector would be handed a zero-byte frame and the
+#: finalizer would record it as a successful send.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
+#: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
+#: the attachment GC already treated a purged row as unreplayable while ``replay`` replayed it anyway.
+_REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
+    "body_ref", "q.body_ref"
+)
 
 
 @dataclass(frozen=True)
@@ -2329,18 +2462,20 @@ class MessageStore:
                 f"invalid synchronous mode {synchronous!r}; expected 'NORMAL' or 'FULL'"
             )
         db = await aiosqlite.connect(str(path))
-        # A FAILED open must never strand this handle. An open aiosqlite connection keeps the DB file
-        # (and its -wal/-shm siblings) locked, so a caller unwinding a temp directory around the failure
-        # — the DR restore-verify is the live case — hits a Windows PermissionError from the cleanup
-        # that REPLACES the real reason the open failed. Both guards below close what they own and
-        # re-raise, so the caller sees the original error.
+        # Everything past `connect` runs under the cleanup below (#1670). aiosqlite drives each
+        # statement on a background thread created WITHOUT `daemon=True`, so a connection nobody
+        # closes parks a non-daemon thread forever and interpreter exit then blocks in
+        # `threading._shutdown` joining it — the process hangs instead of reporting the error. The
+        # very first PRAGMA is where a path that is not a database raises, and that is already past
+        # `connect`, so an operator typo reaches this on an ordinary run.
+        store: MessageStore | None = None
         try:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
-            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power loss,
-            # never corruption) and avoids an fsync per commit — a large write-throughput win vs FULL.
-            # `sync` is validated above, so this f-string can't inject. FULL is available for the
-            # paranoid (every commit fsynced) via [store] synchronous = "full".
+            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power
+            # loss, never corruption) and avoids an fsync per commit — a large write-throughput win
+            # vs FULL. `sync` is validated above, so this f-string can't inject. FULL is available
+            # for the paranoid (every commit fsynced) via [store] synchronous = "full".
             await db.execute(f"PRAGMA synchronous={sync}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
@@ -2357,26 +2492,17 @@ class MessageStore:
                 ):
                     if f.exists():
                         _secure_file(f)
-        except BaseException:
-            try:
-                await db.close()
-            except Exception:  # noqa: BLE001 — cleanup must never mask the open's own error
-                log.warning(
-                    "could not close the connection after a failed store open", exc_info=True
-                )
-            raise
-        store = cls(
-            db,
-            path=path,
-            cipher=cipher,
-            group_commit_window_ms=group_commit_window_ms,
-            group_commit_max_batch=group_commit_max_batch,
-            synchronous=sync,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        try:
+            store = cls(
+                db,
+                path=path,
+                cipher=cipher,
+                group_commit_window_ms=group_commit_window_ms,
+                group_commit_max_batch=group_commit_max_batch,
+                synchronous=sync,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
             # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
             # block BEFORE anything on this handle encrypts — the at-rest migration below included,
             # since on a store that is having a key enabled for the first time it is itself a large
@@ -2391,21 +2517,25 @@ class MessageStore:
                 store._load_reference_cache()
             )  # populate the reference-snapshot read cache (ADR 0006)
             await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+            if store._group_commit is not None:
+                store._group_commit.start()  # spin the committer coroutine (needs the running loop)
+            return store
         except BaseException:
-            # The eager warm-ups above are the ones that FAIL CLOSED on a keyless/undecryptable open
-            # (`_load_state_cache` / `_load_reference_cache` raise StoreKeylessError or CipherError),
-            # and `_open_read_pool` opens further handles. Closing the half-built store here is what
-            # keeps that fail-closed error the one the caller sees: leaving the handles open locks the
-            # DB file on Windows, so a caller unwinding a temp directory around the failure — the DR
-            # restore-verify — reports a PermissionError from the cleanup instead of the missing key.
+            # Close the store when one was constructed — it owns the read pool's connections too,
+            # each with its own worker thread — then the writer either way. `Connection.close` is
+            # idempotent (it returns immediately once the connection is gone), so the second call
+            # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
+            # cleaning up must never replace the error the caller needs to see.
+            if store is not None:
+                try:
+                    await store.close()
+                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                    log.warning("error closing a partially-opened store", exc_info=True)
             try:
-                await store.close()
-            except Exception:  # noqa: BLE001 — cleanup must never mask the open's own error
-                log.warning("could not close the store after a failed open", exc_info=True)
+                await db.close()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                log.warning("error closing the connection after a failed store open", exc_info=True)
             raise
-        if store._group_commit is not None:
-            store._group_commit.start()  # spin the committer coroutine (needs the running loop)
-        return store
 
     async def _open_read_pool(self, path: str) -> None:
         """Open the bounded read-only connection pool for a file-backed WAL store (lockfree-reads).
@@ -2467,10 +2597,11 @@ class MessageStore:
     ) -> Any:
         """Run one grouped stage-handoff ``body`` (statements only — NO BEGIN/commit/rollback).
 
-        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline under ``self._lock``
-        inside its own ``BEGIN`` … ``commit`` with an except-rollback — byte-identical to the
-        pre-feature path. An :class:`_AbortMember` (the idempotent no-op early-exit) rolls back and
-        returns its carried result, exactly mirroring the old explicit ``rollback(); return <sentinel>``.
+        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline in one
+        :func:`_writer_txn` — its own ``BEGIN`` … ``commit`` under ``self._lock``, unwound on any
+        ``BaseException`` (cancellation included). An :class:`_AbortMember` (the idempotent no-op
+        early-exit) unwinds that transaction and returns its carried result, exactly mirroring the old
+        explicit ``rollback(); return <sentinel>``.
 
         Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
         ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
@@ -2486,17 +2617,13 @@ class MessageStore:
         detached into the committer)."""
         gc = self._group_commit
         if gc is None:
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            try:
+                async with _writer_txn(self._db, self._lock):
                     result = await body()
                     await self._commit()
-                except _AbortMember as abort:
-                    await self._db.rollback()
-                    return abort.result  # zero-mutation no-op: nothing committed → no publish
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember as abort:
+                # Zero-mutation no-op: _writer_txn rolled it back under the lock → nothing to publish.
+                return abort.result
             # Commit landed and the lock is released — publish the committed delta in this same frame,
             # with no await between commit and publish, so a cancel can't interpose and strand the cache.
             if on_commit is not None:
@@ -4008,11 +4135,15 @@ class MessageStore:
         row is blanked — whichever of :meth:`purge_message_bodies` (``done``/``cancelled`` case) or
         :meth:`purge_dead_letters` (``dead`` case) does so. Gating on replayability (not merely status,
         and not merely a non-blank inline ``payload``) is what makes it correct under either purge order
-        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live."""
+        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live.
+
+        The replayability half is :data:`_REPLAYABLE_BODY`, shared with :meth:`replay` /
+        :meth:`replay_dead` (BACKLOG #1560) so the attachment GC and the replay guard can never
+        disagree about which rows are still deliverable."""
         return (
             "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
             f"{msg_col} AND (q.status IN (?, ?) OR "
-            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}))))"
         )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -4102,6 +4233,13 @@ class MessageStore:
         row_id = uuid4().hex
         # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
         # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        #
+        # DO NOT "simplify" the else-arm to `self._enc(...)`. `_enc` short-circuits a falsy value to
+        # itself, so a legitimately EMPTY body would land as '' — indistinguishable at rest from a
+        # retention erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The
+        # direct `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two
+        # apart on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
+        # guard is replay-only, so a first delivery is unaffected either way.)
         stored_payload = (
             ""
             if body_ref is not None
@@ -4308,31 +4446,26 @@ class MessageStore:
         keeps the method a safe no-op if it is ever invoked for an already-consumed row. Returns
         ``True`` if this call performed the handoff, ``False`` if it was a no-op."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
-                )
-                if not cur.rowcount:
-                    # Already handed off by a prior run (crash-restart) — idempotent no-op.
-                    await self._db.rollback()
-                    return False
-                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
-                await self._db.execute(
-                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
-                )
-                event = {
-                    MessageStatus.ROUTED: "routed",
-                    MessageStatus.FILTERED: "filtered",
-                    MessageStatus.UNROUTED: "unrouted",
-                }.get(disposition, "routed")
-                await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
-                await self._commit()
-            except Exception:
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
+                # Already handed off by a prior run (crash-restart) — idempotent no-op.
                 await self._db.rollback()
-                raise
+                return False
+            await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
+            await self._db.execute(
+                "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
+            )
+            event = {
+                MessageStatus.ROUTED: "routed",
+                MessageStatus.FILTERED: "filtered",
+                MessageStatus.UNROUTED: "unrouted",
+            }.get(disposition, "routed")
+            await self._event(message_id, event, None, f"{len(deliveries)} destination(s)", now)
+            await self._commit()
         return True
 
     async def route_handoff(
@@ -5349,16 +5482,14 @@ class MessageStore:
 
         if _standalone:
             # Inline immediate commit (mirrors the disabled path) — never enrol in the committer.
-            async with self._lock:
-                try:
-                    await self._db.execute("BEGIN")
+            # This is the ONE grouped writer with a second transaction of its own, so routing only
+            # _run_grouped would have left this arm with the `except Exception` shape it copied.
+            try:
+                async with _writer_txn(self._db, self._lock):
                     await _body()
                     await self._commit()
-                except _AbortMember:
-                    await self._db.rollback()
-                except Exception:
-                    await self._db.rollback()
-                    raise
+            except _AbortMember:
+                pass  # vanished row: _writer_txn rolled it back under the lock
             return
         await self._run_grouped(_body)
 
@@ -6508,7 +6639,21 @@ class MessageStore:
 
         ``cancelled`` rows are never touched (an operator purged them). A message with no re-queueable
         rows (parse/validation ERROR, FILTERED, or UNROUTED with no queue rows) returns 0, status
-        untouched. Returns rows requeued."""
+        untouched. Returns rows requeued.
+
+        **A row whose body retention has ERASED is never re-queued** (:data:`_REPLAYABLE_BODY`,
+        BACKLOG #1560). Re-pending one handed the connector a zero-byte frame and had the finalizer
+        record it as a successful delivery. The predicate rides the existing ``WHERE``, so a MIXED
+        batch simply SKIPS the erased rows and recovers the rest — it never aborts the whole call, and
+        an operator recovering a partly-purged message still gets back what is left. When *every*
+        candidate row is erased the UPDATE matches nothing, so this returns 0 and — because the status
+        write and the audit event both hang off ``rowcount`` — the message keeps its disposition and no
+        ``replayed`` event is written for a replay that did not happen.
+
+        The ``stuck`` count deliberately does NOT carry the predicate. An unreplayable ``dead`` row
+        still means something is stuck, so the message stays in RECOVER mode and this returns 0.
+        Excluding it would fall through to RE-SEND and re-transmit the message's *delivered* siblings,
+        which the operator did not ask for — a worse outcome than doing nothing."""
         now = time.time() if now is None else now
         async with self._lock:
             cur = await self._db.execute(
@@ -6529,14 +6674,18 @@ class MessageStore:
                 # their idempotency-ledger entries FIRST so the re-claimed rows are NOT skip-and-completed
                 # as crash-re-run duplicates — a replay must actually re-deliver. Scoped to THIS message's
                 # DONE rows (the exact set the UPDATE below re-pends), so no other message is affected.
+                # It carries the erased-body predicate for exactly that reason: the UPDATE skips a purged
+                # row, so dropping its ledger entry would disarm the duplicate guard for a delivery that
+                # is never going to run again (#1560).
                 await self._db.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                    f" (SELECT id FROM queue WHERE message_id=? AND status=? AND ({_REPLAYABLE_BODY}))",
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
-                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})",
+                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                f" AND ({_REPLAYABLE_BODY})",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
@@ -6979,9 +7128,17 @@ class MessageStore:
         match the dead-letter view (:meth:`list_dead` is outbound-only): this is the bulk DLQ replay,
         so it must only touch rows the operator can actually see. Dead **ingress** rows (processing
         failures) are recovered via the per-message :meth:`replay`, not here. Unlike :meth:`replay`
-        this never touches rows that already delivered. Returns the number of dead rows requeued."""
+        this never touches rows that already delivered. Returns the number of dead rows requeued.
+
+        **Rows whose body retention has ERASED are excluded** (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the predicate lives in the shared ``clause`` so it reaches BOTH statements. That is
+        the point: the affected message set is computed by a separate ``SELECT DISTINCT message_id``
+        before the UPDATE, so guarding only the write would revert a purged message from ``ERROR`` to
+        ``ROUTED`` with nothing actually re-queued — a NEW false disposition, worse than the zero-byte
+        send it replaced, and invisible to a ``rowcount`` check. A mixed batch replays the rows that
+        still have a body and leaves the rest dead."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")

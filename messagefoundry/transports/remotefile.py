@@ -76,6 +76,7 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
@@ -1196,8 +1197,15 @@ class RemoteFileSource(SourceConnector):
                 # consumer set grew at every measurement pass and never shrank.
                 # NOT quarantined: moving it would join the hostile name onto a directory, which is
                 # the very operation being refused. Left in place and logged, so an operator sees it
-                # every poll rather than once. PHI-safe: names are not logged at INFO+ elsewhere in
-                # this source, so this stays WARNING-with-no-name — the count is the signal.
+                # every poll rather than once. No name is logged: this arm has refused the name as an
+                # unsafe path component, so it is the one place that must not hand it to `safe_name`
+                # either — the host:dir and the fact of a refusal are the signal.
+                #
+                # This comment used to justify that by asserting "names are not logged at INFO+
+                # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
+                # which made a real control rest on a false premise (CLAUDE.md §11, SDS-3.7). Those
+                # sites now route through `safe_name`, so the claim would be true today — it is gone
+                # anyway, because this arm's reason never depended on what the others do.
                 logger.warning(
                     "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                     "(not a single safe name); left in place, not retrieved",
@@ -1221,8 +1229,10 @@ class RemoteFileSource(SourceConnector):
                 # hostile or malfunctioning share passes it by under-reporting; the same budget is
                 # therefore charged again below against the bytes actually read.
                 logger.warning(
-                    "REMOTEFILE file %s exceeds max_file_bytes (%s); routing to error dir",
-                    name,
+                    "REMOTEFILE file %s (listed at %s bytes) exceeds max_file_bytes (%s); routing "
+                    "to error dir",
+                    safe_name(name),
+                    size,
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
@@ -1240,7 +1250,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE file %s delivered more than max_file_bytes (%s) despite a smaller "
                     "listed size; routing to error dir",
-                    name,
+                    safe_name(name),
                     self._max_file_bytes,
                 )
                 await self._move(path, self._error_dir, name)
@@ -1250,7 +1260,9 @@ class RemoteFileSource(SourceConnector):
                 # Transient (locked / vanished mid-poll): leave it in place to retry next poll rather
                 # than quarantine a healthy file. Logged, never silently swallowed.
                 logger.warning(
-                    "REMOTEFILE could not retrieve %s (will retry next poll): %s", name, exc
+                    "REMOTEFILE could not retrieve %s (will retry next poll): %s",
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
             # Content-vs-type magic-byte check (ASVS 5.2.2), mirroring the local File source's
@@ -1267,7 +1279,7 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE file %s does not match its declared content type %r "
                     "(no matching magic bytes); routing to error dir",
-                    name,
+                    safe_name(name),
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._move(path, self._error_dir, name)
@@ -1282,8 +1294,8 @@ class RemoteFileSource(SourceConnector):
                 # became a "received message", so there's no store disposition.
                 logger.warning(
                     "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
-                    name,
-                    exc,
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 await self._move(path, self._error_dir, name)
                 disposed += 1
@@ -1297,8 +1309,8 @@ class RemoteFileSource(SourceConnector):
                 # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
                 logger.warning(
                     "REMOTEFILE file %s: pre-ingest scan hook errored (%s); leaving in place, will retry",
-                    name,
-                    exc,
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
             try:
@@ -1309,7 +1321,9 @@ class RemoteFileSource(SourceConnector):
                 # file in place so the next poll retries (at-least-once) — moving it would drop a
                 # received-but-unrecorded message (mirrors the File source's M-15).
                 logger.warning(
-                    "REMOTEFILE handler failed for %s (will retry next poll): %s", name, exc
+                    "REMOTEFILE handler failed for %s (will retry next poll): %s",
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
                 )
                 continue
             await self._after_processing(path, name)
@@ -1403,7 +1417,11 @@ class RemoteFileSource(SourceConnector):
                 await asyncio.to_thread(self._client.remove, path)
             except _RemoteError as exc:
                 # A processed file we can't delete will be re-read (a duplicate); surface it.
-                logger.warning("REMOTEFILE could not delete processed file %s: %s", name, exc)
+                logger.warning(
+                    "REMOTEFILE could not delete processed file %s: %s",
+                    safe_name(name),
+                    safe_exc(exc, file_name=name),
+                )
         elif self._after_read == "leave":
             # #142 process-in-place: never move/delete — the durable dedup ledger (recorded by
             # _poll_once AFTER this returns) is what stops it being re-ingested next poll.
@@ -1417,7 +1435,12 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.rename, path, dst)
         except _RemoteError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it.
-            logger.warning("REMOTEFILE could not move %s to %s: %s", name, dest_dir, exc)
+            logger.warning(
+                "REMOTEFILE could not move %s to %s: %s",
+                safe_name(name),
+                dest_dir,
+                safe_exc(exc, file_name=name),
+            )
 
 
 register_destination(ConnectorType.REMOTEFILE, RemoteFileDestination)

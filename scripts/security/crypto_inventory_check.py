@@ -323,6 +323,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # `_inspect` delegates its load/notAfter/days path here too (read_cert_facts), so it no longer imports
     # `cryptography` directly — this is the single cert-tooling crypto call site.
     "messagefoundry/pki.py": frozenset({"cryptography"}),
+    # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,
+    # stable label in a log line where the cleartext name (which can embed an MRN) must never go. The
+    # same derived-id, never-a-secret use as transports/file.py's dedup key below, and likewise not a
+    # keyed primitive; it identifies a file across log lines, it does not de-identify one.
+    "messagefoundry/redaction.py": frozenset({"hashlib"}),
     # ASVS 6.4.5: the expiry monitor's PEM path still delegates to pki.read_cert_facts above, but the
     # service-caller arm inspects a cert the engine only ever SEES at the mTLS handshake, which arrives
     # as an `ssl.getpeercert()` DICT rather than PEM bytes. `ssl.cert_time_to_seconds` parses that dict's
