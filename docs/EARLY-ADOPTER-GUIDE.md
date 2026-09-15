@@ -568,26 +568,39 @@ becomes the bottleneck.
 
 ## 10. Backup, restore & disaster recovery
 
-> **No existing repo doc covers this** — it is part of *your* operational responsibility. Rehearse a
-> full restore before you carry real data.
+> Rehearse a full restore before you carry real data. The engine ships the SQLite half of this
+> ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]`); the schedule, the off-box copy, and the drill are
+> still yours.
 
 **Back up the store.**
 
-- **SQLite:** the WAL backend means three files must be captured **consistently** — `.db`, `.db-wal`,
-  `.db-shm`. Use `sqlite3 <db> ".backup '<dest>'"` against the live DB, or take a **quiesced cold copy**
-  (graceful stop → copy → restart). A naive copy of just the `.db` while the service runs can be
-  inconsistent.
+- **SQLite:** use the engine's own DR backup — `messagefoundry backup --destination <local-or-UNC dir>`,
+  or the daily `[backup]` schedule. It takes a consistent snapshot, bundles the loaded config dir,
+  encrypts the whole thing to one `.mfbak` archive under the store key, and restore-verifies it. Doing it
+  by hand instead means capturing three files consistently — `.db`, `.db-wal`, `.db-shm` — with
+  `sqlite3 <db> ".backup '<dest>'"` or a quiesced cold copy (graceful stop → copy → restart). A naive copy
+  of just the `.db` while the service runs can be inconsistent.
 - **PostgreSQL:** use your standard DB backups — `pg_dump` for logical backups and/or WAL archiving /
   PITR for point-in-time recovery. The engine is greenfield-only on server DBs, so the DB tier owns
-  store-level DR here.
+  store-level DR here. A `.mfbak` taken against a server DB is **config-only** and cannot restore the
+  database.
 
-**Escrow the encryption key SEPARATELY.** If you enabled at-rest encryption (§6), a restored store is
-**unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI key file**. Back the key up in a
-different location/system from the data, with its own access control.
+**Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
+decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
+`-shm` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
+`--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
+with `messagefoundry restore-verify <archive>`.
 
-**Restore-and-verify drill (do this in the lab, §11 Stage 0):** restore the store + key into a clean
-host, start the engine, confirm `/health`, run `/status/integrity-check` (SQLite `PRAGMA quick_check`),
-and spot-check `/messages` and dispositions.
+**Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
+same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI
+key file**. Back the key up in a different location/system from the data, with its own access control.
+DPAPI is machine-bound, so a DR box needs the environment variable or an external key provider.
+
+**Restore-and-verify drill (do this in the lab, §11 Stage 0):** `messagefoundry restore` the archive + the
+key into a clean host, start the engine against the restored store, confirm `/health`, run
+`/status/integrity-check` (SQLite `PRAGMA quick_check`), and spot-check `/messages` and dispositions. A DR
+standby (`[dr]`) needs this restore done **before** you activate it: activation verifies the archive, and
+refuses when the box's store does not carry it.
 
 **Keep the store bounded.** `[retention]` is **off by default (kept forever)**. Set `max_db_mb` (drives
 a `storage_threshold` alert), `messages_days` / `dead_letter_days` (body purge), and the daily VACUUM

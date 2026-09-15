@@ -773,6 +773,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     restore_verify.add_argument("--json", action="store_true", help="emit JSON")
 
+    restore = sub.add_parser(
+        "restore",
+        help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
+        "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+    )
+    restore.add_argument("archive", help="path to the .mfbak archive to restore")
+    restore.add_argument(
+        "--to",
+        required=True,
+        help="destination store path to write. It must NOT already exist — restoring over a live store "
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused",
+    )
+    restore.add_argument(
+        "--config-to",
+        default=None,
+        help="also restore the archive's config bundle into this directory (must be empty or absent). "
+        "Refused when the archive carries no config bundle",
+    )
+    restore.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
+        "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
+        "this writes, and the decrypt key comes from [store] regardless of any path",
+    )
+    restore.add_argument("--json", action="store_true", help="emit JSON")
+
     ai_policy = sub.add_parser(
         "ai-policy", help="print the effective AI-assistance policy (for the IDE gate)"
     )
@@ -5033,6 +5060,63 @@ def _restore_verify(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _restore(args: argparse.Namespace) -> int:
+    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
+
+    The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
+    is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
+    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
+    overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
+    counts, fingerprints — never a body or key bytes)."""
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.pipeline.dr_backup import BackupError, run_restore
+
+    try:
+        settings = load_settings(config_path=args.service_config)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    try:
+        # allow_unencrypted is deliberately NOT passed: the downgrade guard (a plaintext archive on a
+        # box that has a store key) stays at its strictest on the one path that writes bytes to disk,
+        # matching `restore-verify` and DR activation.
+        result = asyncio.run(
+            run_restore(
+                args.archive,
+                dest_store_path=args.to,
+                store_settings=settings.store,
+                config_dest=args.config_to,
+            )
+        )
+    except BackupError as exc:
+        return _emit_error(f"restore failed ({exc.kind}): {exc}", as_json=args.json)
+
+    payload = {
+        "archive": result.archive_path,
+        "store": result.store_path,
+        "store_bytes": result.store_bytes,
+        "encrypted": result.encrypted,
+        "key_id": result.key_id,
+        "row_counts": result.row_counts,
+        "config_dir": result.config_dir,
+        "config_files": result.config_files,
+    }
+    if args.json:
+        _print_json(payload, compact=True)
+    else:
+        print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
+        print(
+            f"  encrypted={result.encrypted} key_id={result.key_id} row_counts={result.row_counts}"
+        )
+        if result.config_dir is not None:
+            print(f"  config: {result.config_files} file(s) into {result.config_dir}")
+    return 0
+
+
 def _ai_policy(args: argparse.Namespace) -> int:
     """Print the effective AI-assistance policy resolved from local service settings.
 
@@ -5794,6 +5878,7 @@ _DISPATCH = {
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,
+    "restore": _restore,
     "ai-policy": _ai_policy,
     "verify": _verify,
     "support-bundle": _support_bundle,

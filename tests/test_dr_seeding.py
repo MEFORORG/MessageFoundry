@@ -15,7 +15,7 @@ import pytest
 
 from messagefoundry.config.settings import BackupSettings, DrSettings, StoreSettings
 from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupRunner, run_restore
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
 
@@ -214,3 +214,98 @@ async def test_keyprovider_unreachable_at_dr_site_fails_closed(
         assert "dr_activation_aborted" in await _actions(store)
     finally:
         await store.close()
+
+
+# --- the cold-seed LOAD gate: a verified archive is not a restored store -----
+
+
+async def test_verified_seed_but_empty_store_aborts(tmp_path: Path) -> None:
+    # The silent-success defect this gate closes: activation VERIFIES the .mfbak seed and never LOADS
+    # it (the restore is the operator's separate `messagefoundry restore` step). A DR box that skipped
+    # the restore opens an EMPTY store, every archive check still PASSes, and activation used to record
+    # a dr_seed marker for an archive it had never loaded -- reporting success having restored nothing.
+    # Now it aborts before any store mutation or VIP step.
+    key = generate_key()
+    primary, archive, _ = await _make_seed(tmp_path, key)
+    await primary.close()
+    # A fresh, never-restored DR box: its own empty store, the same DEK, the primary's good archive.
+    dr_store = await MessageStore.open(tmp_path / "dr.db", cipher=make_cipher(key))
+    try:
+        dr_ss = StoreSettings(path=str(tmp_path / "dr.db"), encryption_key=key)
+        coord, state = _coord(dr_store, dr_ss, seed_archive=archive, takeover_hook="exit 0")
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(actor="bob")
+        assert exc.value.kind == "seed"
+        assert "never restored" in str(exc.value)
+        assert not coord.active and not state["active"]
+        actions = await _actions(dr_store)
+        assert "dr_activation_aborted" in actions
+        # The whole point: no seed marker and no activation row for an archive nothing loaded.
+        assert "dr_seed" not in actions and "dr.activate" not in actions
+    finally:
+        await dr_store.close()
+
+
+async def test_partially_restored_store_aborts(tmp_path: Path) -> None:
+    # The neighbouring case: the store carries FEWER messages than the verified seed declares -- a
+    # partial restore, or a store that came from a different archive. Also fail-closed.
+    key = generate_key()
+    primary, _, ss = await _make_seed(tmp_path, key)
+    try:
+        # A second message makes the NEXT archive declare 2 while the store still shows 1 to the gate.
+        await primary.enqueue_message(
+            channel_id="c1",
+            raw="MSH|^~\\&|x2",
+            deliveries=[("d1", "OUT|y2")],
+            control_id="CID-2",
+            now=2.0,
+        )
+        runner = BackupRunner(
+            primary,
+            BackupSettings(enabled=True, destination=str(tmp_path / "b2")),
+            store_settings=ss,
+            config_dir=None,
+        )
+        two_row = await runner.run_once(now=2.0)
+        assert two_row is not None
+        thin = await MessageStore.open(tmp_path / "thin.db", cipher=make_cipher(key))
+        try:
+            await thin.enqueue_message(
+                channel_id="c1",
+                raw="MSH|^~\\&|x",
+                deliveries=[("d1", "OUT|y")],
+                control_id="CID-1",
+                now=1.0,
+            )
+            thin_ss = StoreSettings(path=str(tmp_path / "thin.db"), encryption_key=key)
+            coord, state = _coord(thin, thin_ss, seed_archive=two_row.archive_path)
+            with pytest.raises(DrActivationError) as exc:
+                await coord.activate(actor="bob")
+            assert exc.value.kind == "seed"
+            assert "partial" in str(exc.value)
+            assert not coord.active and not state["active"]
+        finally:
+            await thin.close()
+    finally:
+        await primary.close()
+
+
+async def test_restored_store_activates(tmp_path: Path) -> None:
+    # The positive control for the two aborts above: a DR store actually RESTORED from the archive
+    # (via the run_restore primitive the `messagefoundry restore` CLI drives) activates cleanly. Without
+    # this arm the gate could refuse everything and the aborts would still pass.
+    key = generate_key()
+    primary, archive, _ = await _make_seed(tmp_path, key)
+    await primary.close()
+    dest = tmp_path / "dr" / "msg.db"
+    dr_ss = StoreSettings(path=str(dest), encryption_key=key)
+    result = await run_restore(archive, dest_store_path=dest, store_settings=dr_ss)
+    assert result.store_bytes > 0
+    dr_store = await MessageStore.open(dest, cipher=make_cipher(key))
+    try:
+        coord, state = _coord(dr_store, dr_ss, seed_archive=archive)
+        activated = await coord.activate(actor="alice")
+        assert activated.active and state["active"]
+        assert "dr_seed" in await _actions(dr_store)
+    finally:
+        await dr_store.close()
