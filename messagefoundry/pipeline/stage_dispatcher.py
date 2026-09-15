@@ -71,7 +71,7 @@ class LaneResultKind(Enum):
 
     # terminal for this pass (handed off / delivered / dead-lettered) — advance to the next item.
     RESOLVED = auto()
-    # re-pended with backoff (the body already called mark_failed) — PARK the lane until retry_until.
+    # re-pended with backoff by the body (see LaneItemResult for which primitive) — PARK until retry_until.
     RETRY = auto()
     # the lane must halt (a STOP internal-error policy / missing-inbound exit) — STOP the lane.
     STOP = auto()
@@ -80,10 +80,17 @@ class LaneResultKind(Enum):
 @dataclass(frozen=True)
 class LaneItemResult:
     """The dispatcher's input contract (ADR 0066 §4.5). The body owns the *head's* terminal store write
-    per outcome BEFORE returning — RETRY: it has already ``mark_failed``'d the head and returns that
-    additive ``next_attempt_at`` as ``retry_until``; RESOLVED: it has marked the head done /
-    dead-lettered; STOP: it has ``mark_failed``'d (or left) the head per policy. The dispatcher only
-    handles the unprocessed *tail* (``release_claimed``) and the lane state transition."""
+    per outcome BEFORE returning — RETRY: it has returned the head to PENDING with a future
+    ``next_attempt_at``, which it passes back as ``retry_until``; RESOLVED: it has marked the head done
+    / dead-lettered; STOP: it has ``mark_failed``'d (or left) the head per policy. The dispatcher only
+    handles the unprocessed *tail* (``release_claimed``) and the lane state transition.
+
+    **RETRY has TWO producers and they differ in whether a retry is SPENT.** ``mark_failed`` spends one
+    and its additive backoff can eventually write terminal DEAD under a finite ``max_attempts``;
+    ``reschedule_claimed`` (the ADR 0070 fix A machinery-fault primitive, which ADR 0189's delivery
+    halt gate reuses) undoes the claim's ``attempts`` increment and spends none. The dispatcher reads
+    ``retry_until`` only as a park deadline and cannot tell them apart, so a body may return either —
+    but a caller reasoning about the poison ceiling must ask which one ran."""
 
     kind: LaneResultKind
     retry_until: float | None = None
@@ -1062,7 +1069,7 @@ class StageDispatcher:
                             LaneResultKind.RETRY, result.retry_until, made_progress=made_progress
                         ),
                         tail,
-                        None,  # the body already re-pended the head (mark_failed); no reschedule here
+                        None,  # the body already re-pended the head itself; no reschedule here
                     )
                 return (
                     _LaneOutcome(LaneResultKind.STOP, made_progress=made_progress),
