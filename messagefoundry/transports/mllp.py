@@ -579,11 +579,9 @@ def _mllp_ssl_context(
             if crl := s.get("tls_crl_file"):
                 harden_crl_check(ctx, str(crl))
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
-        # Narrow FIRST, assert SECOND, and keep both calls here rather than behind one wrapper: the
-        # 12.1.2 call-site guard reads every context builder for harden_cipher_suites BY NAME, so a
-        # wrapper would hide this seam from it. Unset -- the default -- applies nothing at all and the
-        # line below is the assertion this seam already made: the suite list stays the interpreter's
-        # inherited one, six CBC-SHA2 suites included (ADR 0188).
+        # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
+        # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below
+        # the assertion this seam has always made on the inherited suite list.
         apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
         harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)

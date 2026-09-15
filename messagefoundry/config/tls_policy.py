@@ -650,8 +650,8 @@ CONNECTION_TLS_CIPHERS_SETTING = "tls_ciphers"
 
 def apply_connection_tls_ciphers(
     ctx: ssl.SSLContext, settings: Mapping[str, Any], *, connector: str
-) -> str | None:
-    """Apply a connection's **opt-in** ``tls_ciphers`` to ``ctx`` (ADR 0188). Returns what it applied.
+) -> None:
+    """Apply a connection's **opt-in** ``tls_ciphers`` to ``ctx`` (ADR 0188).
 
     The partner-hop counterpart to the ``[api].tls_ciphers`` knob. Until this existed
     :data:`_APPROVED_TLS_SUITES` governed exactly ONE operator setting -- the engine's own API
@@ -659,7 +659,7 @@ def apply_connection_tls_ciphers(
     an operator who needed a narrower set toward one hospital peer had nowhere to say so.
 
     **Unset is the shipped default and changes nothing.** With no ``tls_ciphers`` in ``settings`` this
-    returns ``None`` having touched ``ctx`` not at all: no ``set_ciphers``, so the context keeps the
+    returns having touched ``ctx`` not at all: no ``set_ciphers``, so the context keeps the
     interpreter's inherited default suite list -- **including the six CBC-SHA2 suites the allow-list
     deliberately excludes**. That retention is the decision recorded at length in
     :func:`harden_cipher_suites`, and it stands: the allow-list governs what an operator may
@@ -693,14 +693,13 @@ def apply_connection_tls_ciphers(
     several connections needs to know WHICH one is at fault."""
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
     if ciphers is None:
-        return None
+        return
     text = str(ciphers)
     try:
         validate_tls_ciphers(text)
         ctx.set_ciphers(text)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
-    return text
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).

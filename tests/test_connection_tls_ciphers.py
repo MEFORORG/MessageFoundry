@@ -28,8 +28,8 @@ inherited default, which is precisely the overshoot ADR 0188 forbids.
 from __future__ import annotations
 
 import datetime
+import re
 import ssl
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -143,7 +143,7 @@ def _suites(ctx: ssl.SSLContext) -> set[str]:
 
 
 @pytest.fixture
-def set_ciphers_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+def set_ciphers_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record every ``SSLContext.set_ciphers`` argument, and still perform the call.
 
     Patched on the CLASS, so it sees the call whoever makes it -- the seam, a helper it delegates to,
@@ -158,7 +158,7 @@ def set_ciphers_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
         real(self, value)
 
     monkeypatch.setattr(ssl.SSLContext, "set_ciphers", spy)
-    yield seen
+    return seen
 
 
 # --- AC-1 / AC-2: the opt-in applies, on all four seams -----------------------------------------
@@ -213,20 +213,16 @@ def test_a_suite_the_shared_policy_refuses_is_refused_here(
     generic ``tls_ciphers``, and an operator running several connections needs the error to say which
     one. A raise without the label would satisfy a looser test and leave that operator guessing.
     """
-    with pytest.raises(ValueError, match=re_escape_seam(seam)) as excinfo:
+    # re.escape because `match` is a regex: seam labels carry no metacharacter today, and this keeps
+    # that from becoming a silent partial match if one is ever added.
+    with pytest.raises(ValueError, match=re.escape(seam)) as excinfo:
         _build(seam, tmp_path, spec)
     assert "tls_ciphers" in str(excinfo.value), f"{seam}: refusal does not name the setting ({why})"
 
 
-def re_escape_seam(seam: str) -> str:
-    """``pytest.raises(match=...)`` takes a regex; a seam label is plain text with no metacharacters
-    today, and escaping it keeps that true if one is ever added."""
-    import re
-
-    return re.escape(seam)
-
-
-def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(tmp_path: Path) -> None:
+def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The reuse claim, checked rather than trusted. ADR 0188 says the seam runs
     ``validate_tls_ciphers`` ITSELF -- the same function ``[api].tls_ciphers`` runs -- so a future
     tightening of the allow-list reaches both surfaces at once. A seam carrying its own copy would
@@ -238,13 +234,10 @@ def test_the_refusal_is_the_shared_validator_and_not_a_second_copy(tmp_path: Pat
         calls.append(value)
         return real(value, require_approved_suites=require_approved_suites)
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    original = tls_policy.validate_tls_ciphers
-    tls_policy.validate_tls_ciphers = spy  # type: ignore[assignment]
-    try:
-        apply_connection_tls_ciphers(ctx, {"tls_ciphers": NARROW}, connector="probe")
-    finally:
-        tls_policy.validate_tls_ciphers = original  # type: ignore[assignment]
+    monkeypatch.setattr(tls_policy, "validate_tls_ciphers", spy)
+    apply_connection_tls_ciphers(
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER), {"tls_ciphers": NARROW}, connector="probe"
+    )
     assert calls == [NARROW], "the seam did not run the shared validator on the operator string"
 
 
@@ -307,10 +300,14 @@ def test_unset_still_offers_the_suites_the_allow_list_excludes(seam: str, tmp_pa
     present = _suites(_reference(seam)) & CBC_SHA2_SUITES
     if not present:  # pragma: no cover - build-dependent
         pytest.skip(f"this OpenSSL ({ssl.OPENSSL_VERSION}) enables no CBC-SHA2 suite by default")
-    assert _suites(_build(seam, tmp_path, None)) >= present, (
-        f"{seam}: leaving tls_ciphers unset RETIRED CBC-SHA2 suite(s) "
-        f"{sorted(present - _suites(_build(seam, tmp_path, None)))}. ADR 0188 forbids this: the "
-        f"allow-list governs what an operator may configure, never what a default may contain."
+    # Bound once and reused in the message. Building a SECOND context to describe the failure would
+    # report a different object than the one that failed, which is how a message misleads the reader
+    # it exists for.
+    got = _suites(_build(seam, tmp_path, None))
+    assert got >= present, (
+        f"{seam}: leaving tls_ciphers unset RETIRED CBC-SHA2 suite(s) {sorted(present - got)}. "
+        f"ADR 0188 forbids this: the allow-list governs what an operator may configure, never what "
+        f"a default may contain."
     )
 
 
