@@ -1970,7 +1970,16 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
 previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
 detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. It does **not** mean nothing was removed: deleting the *newest*
+surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
+path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers an absent
+path, a zero-byte file, and a file carrying no `audit_log` table — the verifier refuses all three
+rather than creating or migrating the evidence it was asked to check, and it opens read-only so it
+cannot write to that file either way. Exit 3 exists because "there was nothing to verify" is not a
+pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
+pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
+exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
+non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
 audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it

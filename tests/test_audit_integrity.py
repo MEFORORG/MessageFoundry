@@ -368,6 +368,95 @@ def test_audit_verify_cli_refuses_missing_db(
     assert not missing.exists()  # we refused before opening, so no empty DB was littered
 
 
+# --- BACKLOG #1669: a zero-byte database, and "verified nothing" as its own exit code ------------
+#
+# The M-31 guard above only asks whether the path EXISTS. A zero-byte file exists and is a valid,
+# empty SQLite database -- what a `touch` in an install script, a failed copy, or a log-rotation
+# mistake leaves behind -- so it walked straight past the guard, `open_store` wrote 372,736 bytes of
+# schema into the file that was supposed to be the evidence, and the command reported
+# "OK: verified 0 audit row(s)" with exit 0. A scheduled compliance job reads the exit code.
+#
+# Three exit codes are now distinct, because a job cannot tell them apart otherwise: 1 is a BROKEN
+# CHAIN, 2 is "this is not an audit database", 3 is "ran clean and found nothing to verify".
+
+
+def _empty_store(db: Path) -> None:
+    """Create a real, fully-migrated store at ``db`` holding zero audit rows."""
+
+    async def _run() -> None:
+        s = await MessageStore.open(db)
+        await s.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor", "rekey-audit"])
+def test_audit_cli_refuses_a_zero_byte_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], subcommand: str
+) -> None:
+    zero = tmp_path / "zero.db"
+    zero.write_bytes(b"")
+
+    assert main([subcommand, "--db", str(zero)]) == 2
+    assert "no audit_log table" in capsys.readouterr().err
+    # The other half of the finding: the check must not write to the evidence it is checking. The
+    # probe is a `mode=ro` handle, so it can neither migrate the file nor leave WAL siblings behind.
+    assert zero.stat().st_size == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["zero.db"]
+
+
+@pytest.mark.parametrize("subcommand", ["audit-verify", "audit-anchor", "rekey-audit"])
+def test_audit_cli_refuses_a_file_that_is_not_a_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], subcommand: str
+) -> None:
+    # Adjacent to the zero-byte case and reached by the same probe: a path that is not SQLite at all
+    # is refused here, before the engine's store layer opens it. #1670 owns that story in general.
+    text = tmp_path / "notes.txt"
+    text.write_text("this is not a database\n", encoding="utf-8")
+
+    assert main([subcommand, "--db", str(text)]) == 2
+    assert "cannot read an audit database" in capsys.readouterr().err
+
+
+def test_audit_verify_cli_exits_3_on_an_empty_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A REAL store with a real audit_log table holding nothing. Exit 3, never 1: a job that read an
+    # empty log as exit 1 would have logged a detected tamper that never happened.
+    db = tmp_path / "fresh.db"
+    _empty_store(db)
+
+    assert main(["audit-verify", "--db", str(db)]) == 3
+    captured = capsys.readouterr()
+    assert "OK: verified 0 audit row(s)" in captured.out
+    assert "the audit log is empty" in captured.err and "--allow-empty" in captured.err
+
+
+def test_audit_verify_cli_allow_empty_accepts_the_empty_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "fresh.db"
+    _empty_store(db)
+
+    assert main(["audit-verify", "--db", str(db), "--allow-empty"]) == 0
+    # The warning survives the flag: the operator suppressed the exit code, not the observation.
+    assert "the audit log is empty" in capsys.readouterr().err
+
+
+def test_audit_anchor_cli_keeps_exit_0_on_an_empty_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The anchor twin is deliberately NOT given the verify twin's exit 3. Anchoring a fresh instance
+    # as `0:` is the supported #328 workflow, and the row it seals is the absence of rows.
+    db = tmp_path / "fresh.db"
+    _empty_store(db)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "0:"
+    assert "the audit log is empty" in captured.err
+
+
 # --- BACKLOG #328: `audit-anchor` + `audit-verify --expected-anchor` -----------------------------
 #
 # The hash chain links each row to its predecessor, so deleting the NEWEST rows leaves a shorter chain
