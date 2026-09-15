@@ -2916,8 +2916,10 @@ class RegistryRunner:
                     # recovery path live in a RUNNING engine, and tearing them down is how an operator
                     # loses the explanation for why the engine went quiet — the same reason ADR 0162
                     # rejects halting the whole engine. The per_lane workers read this set at their
-                    # loop top; the pooled lanes are paused in :meth:`_start_pooled_dispatchers`, and
-                    # the listeners that bound above come back down in :meth:`_unbind_for_log_failure`.
+                    # loop top; the pooled lanes are paused in :meth:`_start_pooled_dispatchers`; the
+                    # DELIVERY tier is paused in :meth:`_park_delivery_for_log_failure` before its
+                    # lanes are built; and the listeners that bind below come back down in
+                    # :meth:`_unbind_for_log_failure`. All three tiers, as the mid-run halt does.
                     self._log_write_stopped = True
                     self._log_halted.update(self.registry.inbound)
                 guard.set_escalation(self._on_log_sink_event)
