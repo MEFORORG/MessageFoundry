@@ -2276,24 +2276,42 @@ class MessageStore:
                 f"invalid synchronous mode {synchronous!r}; expected 'NORMAL' or 'FULL'"
             )
         db = await aiosqlite.connect(str(path))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power loss,
-        # never corruption) and avoids an fsync per commit — a large write-throughput win vs FULL.
-        # `sync` is validated above, so this f-string can't inject. FULL is available for the
-        # paranoid (every commit fsynced) via [store] synchronous = "full".
-        await db.execute(f"PRAGMA synchronous={sync}")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute("PRAGMA busy_timeout=5000")
-        await db.executescript(_SCHEMA)
-        await cls._migrate(db)
-        await db.commit()
-        # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        if str(path) != ":memory:":
-            main = Path(path)
-            for f in (main, main.with_name(main.name + "-wal"), main.with_name(main.name + "-shm")):
-                if f.exists():
-                    _secure_file(f)
+        # A FAILED open must never strand this handle. An open aiosqlite connection keeps the DB file
+        # (and its -wal/-shm siblings) locked, so a caller unwinding a temp directory around the failure
+        # — the DR restore-verify is the live case — hits a Windows PermissionError from the cleanup
+        # that REPLACES the real reason the open failed. Both guards below close what they own and
+        # re-raise, so the caller sees the original error.
+        try:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            # NORMAL is crash-safe under WAL (only risk is losing the last txn on OS crash/power loss,
+            # never corruption) and avoids an fsync per commit — a large write-throughput win vs FULL.
+            # `sync` is validated above, so this f-string can't inject. FULL is available for the
+            # paranoid (every commit fsynced) via [store] synchronous = "full".
+            await db.execute(f"PRAGMA synchronous={sync}")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.executescript(_SCHEMA)
+            await cls._migrate(db)
+            await db.commit()
+            # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
+            if str(path) != ":memory:":
+                main = Path(path)
+                for f in (
+                    main,
+                    main.with_name(main.name + "-wal"),
+                    main.with_name(main.name + "-shm"),
+                ):
+                    if f.exists():
+                        _secure_file(f)
+        except BaseException:
+            try:
+                await db.close()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the open's own error
+                log.warning(
+                    "could not close the connection after a failed store open", exc_info=True
+                )
+            raise
         store = cls(
             db,
             path=path,
@@ -2305,18 +2323,33 @@ class MessageStore:
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
-        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
-        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
-        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
-        # the cipher carries no bound (keyless / `vault_transit`).
-        await store.checkpoint_cipher_invocations()
-        await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
-        await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-        await (
-            store._load_state_cache()
-        )  # populate the in-memory state read-through cache (ADR 0005)
-        await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
-        await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+        try:
+            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
+            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
+            # since on a store that is having a key enabled for the first time it is itself a large
+            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
+            await store.checkpoint_cipher_invocations()
+            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            await (
+                store._load_state_cache()
+            )  # populate the in-memory state read-through cache (ADR 0005)
+            await (
+                store._load_reference_cache()
+            )  # populate the reference-snapshot read cache (ADR 0006)
+            await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+        except BaseException:
+            # The eager warm-ups above are the ones that FAIL CLOSED on a keyless/undecryptable open
+            # (`_load_state_cache` / `_load_reference_cache` raise StoreKeylessError or CipherError),
+            # and `_open_read_pool` opens further handles. Closing the half-built store here is what
+            # keeps that fail-closed error the one the caller sees: leaving the handles open locks the
+            # DB file on Windows, so a caller unwinding a temp directory around the failure — the DR
+            # restore-verify — reports a PermissionError from the cleanup instead of the missing key.
+            try:
+                await store.close()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the open's own error
+                log.warning("could not close the store after a failed open", exc_info=True)
+            raise
         if store._group_commit is not None:
             store._group_commit.start()  # spin the committer coroutine (needs the running loop)
         return store

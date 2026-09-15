@@ -408,13 +408,28 @@ here:
 - **AC-13** — WHEN `full_restore_verify` runs, THE SYSTEM SHALL open the extracted snapshot under this
   instance's live `[store]` settings (only the path and the backend substituted) AND decrypt **and
   authenticate** every cipher-covered cell in it, reporting the number of cells opened; IF a cell fails its
-  AEAD tag, OR the settings resolve no key for a snapshot that holds sealed cells, OR no live settings are
-  supplied, THEN THE SYSTEM SHALL return `FAIL` naming that cause. A good encrypted archive SHALL verify
-  `PASS`, and a good unencrypted archive SHALL verify `PASS` with zero cells opened.
+  AEAD tag, OR no live settings are supplied, THEN THE SYSTEM SHALL return `FAIL` naming that cause; IF the
+  settings resolve **no** key for a snapshot that holds sealed cells, THEN THE SYSTEM SHALL return
+  `KEY_MISMATCH` naming that cause. A good encrypted archive SHALL verify `PASS` — including one holding
+  `state` or `reference` rows, which the store decrypts eagerly at open — and a good unencrypted archive
+  SHALL verify `PASS` with zero cells opened.
   → `tests/test_restore_verify.py::test_full_verify_passes_on_a_good_encrypted_archive`
+  → `tests/test_restore_verify.py::test_full_verify_passes_on_a_snapshot_holding_state_and_reference_rows`
   → `tests/test_restore_verify.py::test_full_verify_fails_on_a_corrupted_aead_cell`
   → `tests/test_restore_verify.py::test_full_verify_fails_when_the_snapshot_opens_without_its_key`
   → `tests/test_restore_verify.py::test_full_verify_passes_on_a_good_unencrypted_archive`
+
+  **Why the keyless case is `KEY_MISMATCH` and a failed tag is not.** With no key resolved, nothing could
+  have opened those cells: the archive is fine and the operator's key configuration is not, so `FAIL` would
+  send them looking for a bad backup. A keyring that *does* hold keys and still cannot open a cell is a
+  different matter — `CipherError` cannot separate a corrupted ciphertext from a key that was never
+  supplied, and bit rot on a PHI cell is the reading that must not be talked down.
+
+- **AC-14** — IF the full open FAILS, THEN THE SYSTEM SHALL report the cause of the failed open. The
+  snapshot is opened inside a temp directory the verify unwinds on the way out, and `MessageStore.open`
+  closes its connection when a warm-up raises, so the open's own error is what reaches the operator rather
+  than a Windows `PermissionError` from the cleanup of a file a leaked handle still held.
+  → `tests/test_restore_verify.py::test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error`
 
 ## Options considered
 

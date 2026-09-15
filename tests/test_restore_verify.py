@@ -21,8 +21,9 @@ from messagefoundry.pipeline.dr_backup import (
     _verify_archive_blocking,
     run_restore_verify,
 )
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import Stage
 
 
 async def _backup(
@@ -191,7 +192,10 @@ async def test_full_verify_fails_on_a_corrupted_aead_cell(tmp_path) -> None:
 
 
 def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> None:
-    """A keyless or wrong-key open of an ENCRYPTED snapshot is FAIL, with the real cause named.
+    """A keyless open of an ENCRYPTED snapshot is KEY_MISMATCH; a wrong-key one is FAIL. Both name the
+    real cause, and the split is the point: with no key resolved nothing could have opened the cells, so
+    the operator's key configuration is at fault and the archive is fine. A keyring that DOES hold keys
+    and still cannot open a cell is indistinguishable from bit rot, so it keeps the harder verdict.
 
     This calls the blocking verify directly because that is the only way to reach the shipped defect's
     shape: the codec key is in hand (the archive itself decrypts fine), while the settings threaded into
@@ -218,7 +222,7 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
         full=True,
         store_settings=StoreSettings(path="unused"),
     )
-    assert keyless.status == "FAIL"
+    assert keyless.status == "KEY_MISMATCH"
     assert "keyless open" in (keyless.reason or ""), keyless.reason
 
     wrong = _verify_archive_blocking(
@@ -234,6 +238,107 @@ def test_full_verify_fails_when_the_snapshot_opens_without_its_key(tmp_path) -> 
     absent = _verify_archive_blocking(archive_path=archive, keys=[codec_key], full=True)
     assert absent.status == "FAIL"
     assert "no live store settings" in (absent.reason or ""), absent.reason
+
+
+async def _state_and_reference_store(db: Path, key_b64: str) -> MessageStore:
+    """A keyed store carrying a transform-``state`` row and a ``reference`` snapshot as well as a
+    message. Both tables are warmed EAGERLY by ``MessageStore.open`` and both decrypt through the
+    fail-closed helper, so they are what turns a keyless open from a false PASS into a hard raise."""
+    store = await MessageStore.open(db, cipher=make_cipher(key_b64))
+    mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|^~\\&|x")
+    ingress = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert ingress is not None
+    await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id="IB",
+        handlers=[("H", "MSH|^~\\&|x")],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo("IB", stage=Stage.ROUTED.value)
+    assert routed is not None
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[("d1", "OUT|y")],
+        state_ops=[("ns", "k", {"seq": 7})],
+    )
+    await store.write_reference_snapshot(name="prov", version="1", rows={"NPI1": "Dr Who"})
+    return store
+
+
+async def test_full_verify_passes_on_a_snapshot_holding_state_and_reference_rows(tmp_path) -> None:
+    """A good encrypted archive that holds transform state must verify PASS — the half of the shipped
+    defect that failed in the opposite direction.
+
+    ``MessageStore.open`` warms the ``state`` and ``reference`` caches eagerly and both decrypt through
+    the fail-closed ``decrypt_json_cell`` helper, so opening this snapshot keyless does not merely prove
+    too little: it RAISES ``StoreKeylessError``. Under the shipped code every scheduled backup of a keyed
+    store that had ever written state failed its own verify, with the missing key reported as a bad
+    archive."""
+    key_b64 = generate_key()
+    db = tmp_path / "msg.db"
+    store = await _state_and_reference_store(db, key_b64)
+    ss = StoreSettings(path=str(db), encryption_key=key_b64)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+        store_settings=ss,
+        config_dir=None,
+    )
+    result = await runner.run_once(now=1.0)
+    assert result is not None
+    await store.close()
+
+    res = await run_restore_verify(result.archive_path, store_settings=ss, full=True)
+    assert res.status == "PASS", res.reason
+    assert res.decrypted_cells >= 1
+
+
+def test_full_verify_on_a_failed_open_reports_the_open_error_not_a_cleanup_error(tmp_path) -> None:
+    """A full open that FAILS must report why it failed. The snapshot lives in a temp directory the
+    verify unwinds on the way out, and ``MessageStore.open`` used to leave its aiosqlite handle open
+    when a warm-up raised — on Windows that handle holds the file, the unlink is refused, and the
+    ``PermissionError`` from the cleanup REPLACES the missing-key error one frame up. The operator then
+    reads a file-locking complaint about a temp path that no longer exists.
+
+    A ``state`` row is what makes this reachable: it is the eager warm-up that raises. Synchronous for
+    the same reason as the keyless test above — the full open runs its own loop."""
+    import asyncio
+
+    key_b64 = generate_key()
+    db = tmp_path / "msg.db"
+
+    async def _setup() -> str:
+        store = await _state_and_reference_store(db, key_b64)
+        ss = StoreSettings(path=str(db), encryption_key=key_b64)
+        runner = BackupRunner(
+            store,
+            BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+            store_settings=ss,
+            config_dir=None,
+        )
+        result = await runner.run_once(now=1.0)
+        assert result is not None
+        await store.close()
+        return result.archive_path
+
+    archive = asyncio.run(_setup())
+
+    res = _verify_archive_blocking(
+        archive_path=archive,
+        keys=[
+            base64.b64decode(key_b64)
+        ],  # the ARCHIVE decrypts; only the store settings are keyless
+        full=True,
+        store_settings=StoreSettings(path="unused"),
+    )
+    assert res.status == "KEY_MISMATCH", res.reason
+    reason = res.reason or ""
+    assert "encryption key" in reason, reason
+    # The negative half, and the point of the test: no leaked handle, so no cleanup error over the top.
+    assert "another process" not in reason and "WinError" not in reason, reason
 
 
 async def test_full_verify_passes_on_a_good_unencrypted_archive(tmp_path) -> None:

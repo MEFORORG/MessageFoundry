@@ -344,8 +344,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
     # CRYPTO_SEAM_MODULES import, so that delegation is now a first-class inventory token.
+    # ADR 0049 AC-13 adds the store-cipher seam (store/crypto.py): the FULL restore-verify opens the
+    # snapshot's cipher-covered cells through the store's own cipher, under the same cell-bound AAD the
+    # store writes (cell_aad, ASVS 11.3.3), to prove the PHI is readable and not merely that a SQLite
+    # file opened. No primitive is implemented here — the cipher is built by build_store_cipher and the
+    # AEAD runs inside it; this module holds only the marker prefix, the AAD constructor and the
+    # fail-closed CipherError/StoreKeylessError verdicts.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
-        {"hashlib", "messagefoundry.store.backup_codec"}
+        {"hashlib", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
     ),
     # ADR 0073: rendezvous (HRW) outbound-lane ownership for engine shards — sha256 as a STABLE,
     # process-independent hash (the salted builtin hash() differs per process, which would let two
