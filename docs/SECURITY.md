@@ -1705,7 +1705,7 @@ TOTP/recovery legs **feed** the engine's per-account lockout, but the lock they 
 wherever a pathway reaches an engine account row, directory accounts included** — `verify_mfa` and
 `finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
 OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
-assertion failures deliberately do not feed it (signatures are not guessable secrets, and a flaky authenticator
+assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
 `auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every factor leg even
