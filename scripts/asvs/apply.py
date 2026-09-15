@@ -179,6 +179,32 @@ def _control_keys() -> tuple[str, ...]:
 _EVIDENCE_ORDERED = ("path", "line", "expect")
 _ABSENCE_ORDERED = ("pattern", "positive_control", "mutation")
 
+#: The ordered keys per sub-table, so the preservation guard can exclude them one level down exactly
+#: as it excludes `_ORDERED` one level up: `render()` COERCES these by design -- `line` through
+#: `int()`, the rest through `toml_str` -- so a payload stating another type there is NORMALISED, and
+#: refusing it would be the false refusal that gets a guard disabled.
+_SUBTABLE_ORDERED: dict[str, tuple[str, ...]] = {
+    "evidence": _EVIDENCE_ORDERED,
+    "absence": _ABSENCE_ORDERED,
+}
+
+#: An ordered key that cannot IDENTIFY an entry, because re-pointing it is the whole purpose of an
+#: anchor repair. Identifying by `line` would leave every repaired entry matching nothing.
+_NOT_IDENTIFYING = ("line",)
+
+#: How an entry is IDENTIFIED when the guard compares the record against the rewritten file --
+#: `(path, expect)` for evidence, DERIVED from the ordered tuple rather than listed, so a new
+#: sub-table brings its own identity and this line never changes.
+#:
+#: #1242: the comparison used to pair entry `i` against entry `i`. A DECLARED retirement of the first
+#: anchor then lined the record's anchor 0 up against the file's anchor 1 -- two different anchors --
+#: so the entry that SURVIVED was never compared against itself, and a field dropped from it read as
+#: green. `strict=False` meant the length change did not even raise.
+_IDENTITY: dict[str, tuple[str, ...]] = {
+    sub: tuple(k for k in ordered if k not in _NOT_IDENTIFYING)
+    for sub, ordered in _SUBTABLE_ORDERED.items()
+}
+
 
 #: A TOML bare key. Anything else must be QUOTED, and the reason is not cosmetic: a DOTTED key is not
 #: a syntax error in TOML, it is a NESTING OPERATOR. `{1.2.2 = "x"}` is VALID and parses to
@@ -327,6 +353,54 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
             raise SystemExit(f"a [[cell]] block at offset {s} has no id")
         spans[m.group(1)] = (s, e)
     return spans
+
+
+def _entry_pairs(sub: str, was: list[Any], now: list[Any]) -> list[tuple[int, Any, int]]:
+    """Pair the record's sub-table entries against the rewritten file's BY IDENTITY (#1242).
+
+    Yields ``(record index, record entry, file index)`` ordered by the record index, which is what a
+    refusal names -- an operator reads the record, so "evidence[1]" has to mean the entry they can
+    find there.
+
+    IDENTITY FIRST, POSITION AS A FALLBACK, and the fallback is load-bearing rather than tidiness. An
+    anchor repair moves ``path`` by design, so a repaired entry matches nothing by identity --
+    identity matching ALONE would then silently stop comparing it, trading a loud comparison for a
+    quiet always-pass. Unmatched record entries are therefore paired, in order, against whatever the
+    file has left over: exactly what the index pairing did, kept for precisely the entries identity
+    cannot place.
+
+    Duplicate identities degrade to the same thing among themselves, first-come, which is the most a
+    comparison can do when two entries claim to be the same anchor.
+    """
+    keys = _IDENTITY.get(sub, ())
+
+    def ident(entry: Any) -> tuple[Any, ...] | None:
+        if not isinstance(entry, dict) or not keys or any(k not in entry for k in keys):
+            return None
+        return tuple(entry[k] for k in keys)
+
+    index: dict[tuple[Any, ...], list[int]] = {}
+    for j, entry in enumerate(now):
+        key = ident(entry)
+        if key is not None:
+            index.setdefault(key, []).append(j)
+
+    pairs: list[tuple[int, Any, int]] = []
+    unmatched: list[tuple[int, Any]] = []
+    taken: set[int] = set()
+    for i, entry in enumerate(was):
+        key = ident(entry)
+        candidates = index.get(key) if key is not None else None
+        if candidates:
+            j = candidates.pop(0)
+            taken.add(j)
+            pairs.append((i, entry, j))
+        else:
+            unmatched.append((i, entry))
+    leftover = [j for j in range(len(now)) if j not in taken]
+    for (i, entry), j in zip(unmatched, leftover, strict=False):
+        pairs.append((i, entry, j))
+    return sorted(pairs, key=lambda pair: pair[0])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -686,7 +760,9 @@ def main(argv: list[str] | None = None) -> int:
         # _ORDERED is excluded because render() deliberately COERCES those -- `int(cell['level'])`
         # and the quoted emissions -- so a payload stating another type there is NORMALISED BY
         # DESIGN, and refusing it would be the false-refusal this scoping exists to prevent.
-        # _SUBTABLES are excluded because they have their own key comparison below.
+        # _SUBTABLES are excluded because they have their own key AND type comparison below, one
+        # level further in, where the entries are matched by identity. That comparison used to be
+        # key-only, which is what made this exclusion a hole rather than a delegation (#1242).
         retyped = sorted(
             k
             for k in was
@@ -746,11 +822,51 @@ def main(argv: list[str] | None = None) -> int:
             # FIELD vanish from inside one, so a sub-table entry could be rewritten with fewer keys
             # while the count matched and this invariant reported green -- exactly the state the
             # top-level `set(was) - set(now)` above exists to prevent.
-            for i, (wsub, nsub) in enumerate(zip(was.get(sub, []), now.get(sub, []), strict=False)):
+            #
+            # MATCHED BY IDENTITY, NOT BY INDEX (#1242, see `_entry_pairs`). Pairing entry `i` against
+            # entry `i` compared two DIFFERENT anchors the moment a declared retirement removed one
+            # from the middle, so the entry that survived was never compared against itself.
+            #
+            # The payload entries line up 1:1 with the file's by construction -- `render` emits one
+            # block per payload entry, in order -- so `j` indexes both.
+            pay_entries = c.get(sub) or []
+            now_entries = now.get(sub, [])
+            ordered = _SUBTABLE_ORDERED.get(sub, ())
+            for i, wsub, j in _entry_pairs(sub, was.get(sub, []), now_entries):
+                nsub = now_entries[j]
                 lost_sub = set(wsub) - set(nsub)
                 if lost_sub:
                     print(
                         f"REFUSING: cell {c['id']} {sub}[{i}] would LOSE field(s) {sorted(lost_sub)}"
+                    )
+                    return 1
+                # ...and the VALUE question one level down, which the top-level type check excludes
+                # `_SUBTABLES` from BY NAME, deferring to "their own key comparison below" -- a key
+                # comparison, which a type-mangled field passes because it KEEPS ITS KEY. So the
+                # writer and the guard were blind in the same place one level down, and this item is
+                # explicit that leaving it there reproduces its founding defect: green while lossy.
+                #
+                # AGAINST THE TYPE THE PAYLOAD STATED, for the reason the top-level check gives: an
+                # intentional retype inside an entry is an EDIT, and a guard that refuses legitimate
+                # writes is a guard someone disables. The retracted scoping the comment above
+                # describes -- skip every key the payload carries -- has no variant here, and it
+                # would be worse than it was at the top level: `_carried` reads the PAYLOAD
+                # entry alone, with no union against the live entry, so a payload that OMITS a field
+                # loses the KEY (caught above) and a type mangle is reachable ONLY while the payload
+                # CARRIES the field. Skipping carried keys would leave this check dead on every input.
+                psub = pay_entries[j] if j < len(pay_entries) else None
+                retyped_sub = []
+                for k in wsub:
+                    if k in nsub and k not in ordered:
+                        want = psub[k] if isinstance(psub, dict) and k in psub else wsub[k]
+                        if type(want) is not type(nsub[k]):  # noqa: E721
+                            retyped_sub.append(k)
+                retyped_sub.sort()
+                if retyped_sub:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub}[{i}] would CHANGE the TYPE of field(s) "
+                        f"{retyped_sub} (key kept, value corrupted -- the key comparison this "
+                        "check sits beside cannot see it)"
                     )
                     return 1
 
