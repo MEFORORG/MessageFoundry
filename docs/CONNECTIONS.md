@@ -2341,6 +2341,13 @@ passes, and the engine starts **healthy** rather than DEGRADED. `stopped` means 
 connection — deploying it is a **config change** (flip the flag, supply the values, reload), not a runtime
 action.
 
+One more outbound state sits outside that ladder: **`log_halted`** ([ADR 0189](adr/0189-a-delivery-tier-log-halt-latch-read-at-the-claim-gate-rather-than-a-gate-at-every-door.md)).
+The engine cannot write its application log and has fail-closed (#122, [ADR 0162](adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)),
+so no lane in the process delivers and every outbound reports it at once. It is deliberately not
+`stopped`: nothing on that row is the fix, and start is refused until the disk is. Queued rows are
+retained PENDING throughout. `failed`, `filtered` and `not_deployed` still win over it on the display,
+because each of those is a fact about that one connection. See [SERVICE.md](SERVICE.md) for recovery.
+
 ```python
 from messagefoundry import MLLP, env, inbound, outbound
 
