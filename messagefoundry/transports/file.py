@@ -1044,32 +1044,26 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
         # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
         # in memory on exactly the filesystems that already can't hard-link.
         #
-        # The exclusive create above sits OUTSIDE this guard on purpose. FileExistsError there is the
-        # loop's NORMAL control flow — it is how a taken name advances to name-1.ext — and the file
-        # sitting at that name belongs to whoever won it. Widening the guard to cover the create would
-        # delete a concurrent writer's delivery, or a previously archived message, on every collision.
-        placed = False
+        # The exclusive create above sits OUTSIDE this guard on purpose: FileExistsError there is the
+        # loop's NORMAL control flow, and the file at a taken name belongs to whoever won it. See
+        # tests/test_file_archive_claim.py's name-race test for what widening the guard destroys.
         try:
             with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
                 shutil.copyfileobj(source, handle)
-            placed = True
-        finally:
-            # A copy that dies mid-stream (a full volume, a dropped SMB share) would otherwise leave a
-            # TRUNCATED file at the DELIVERED name: a partial message handed to a downstream system,
-            # which the retry cannot correct because the retry claims name-1.ext and the fragment keeps
-            # the name. `finally`, not `except`, so nothing is caught and no failure mode is missed; it
-            # runs after `with` has closed the handle, which Windows requires before an unlink.
-            if not placed:
-                try:
-                    candidate.unlink()
-                except OSError as exc:
-                    # Never replace the in-flight copy error with a cleanup error — that one names the
-                    # cause. Log the fragment instead so an operator knows it is there.
-                    logger.warning(
-                        "could not remove the partial file %s left by a failed claim copy: %s",
-                        candidate,
-                        exc,
-                    )
+        except BaseException:
+            # Without this, a copy that died part-way left the fragment at the claimed name and the
+            # retry could not correct it — the retry claims name-1.ext, so the fragment keeps the
+            # delivered name. BaseException (the house idiom here, cf. mllp.py / tcp.py / x12.py) so a
+            # cancellation cleans up too; the `with` has already closed the handle, which Windows
+            # requires before an unlink.
+            try:
+                candidate.unlink()
+            except OSError as exc:
+                # Log, never raise: a cleanup failure must not displace the error that names the cause.
+                logger.warning(
+                    "could not remove the partial %s after a failed claim: %s", candidate, exc
+                )
+            raise
         return candidate
 
 

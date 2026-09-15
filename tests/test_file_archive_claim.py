@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
@@ -35,6 +36,28 @@ from messagefoundry.transports.file import FileSource, _claim_unique
 #: (Windows, NTFS, 2026-08-10): five runs of this shape archived 61, 61, 64, 63 and 62 of 120 —
 #: roughly half of every archived message lost or refused. Post-fix: 120 of 120, five runs of five.
 _ROUNDS = 60
+
+
+def _names(directory: Path) -> list[str]:
+    """Every name in `directory`, sorted. Asserting the whole directory rather than one file is what
+    catches a guard that deletes a bystander, or one that deletes and re-creates on a lucky ordering."""
+    return sorted(p.name for p in directory.iterdir())
+
+
+def _no_hard_links(*_a: object, **_k: object) -> None:
+    """Stand in for FAT/exFAT and the many SMB/NAS mounts where `os.link` raises a non-
+    `FileExistsError` `OSError`, which is what sends `_claim_unique` down the copy fallback."""
+    raise OSError("hard links unsupported on this filesystem")
+
+
+def _dying_copy(prefix: int) -> Callable[[IO[bytes], IO[bytes]], None]:
+    """A `copyfileobj` that writes `prefix` bytes and then fails the way a full volume does."""
+
+    def _copy(fsrc: IO[bytes], fdst: IO[bytes]) -> None:
+        fdst.write(fsrc.read(prefix))
+        raise OSError(28, "No space left on device")
+
+    return _copy
 
 
 def _source(directory: Path) -> FileSource:
@@ -143,10 +166,6 @@ def test_claim_unique_copy_fallback_streams_the_bytes(
     which is unset by default.
 
     Mutation: drop the `copyfileobj` loop. Red: the copied file is empty or truncated."""
-
-    def _no_hard_links(*_a: object, **_k: object) -> None:
-        raise OSError("hard links unsupported on this filesystem")
-
     monkeypatch.setattr(os, "link", _no_hard_links)
     payload = bytes(range(256)) * 5000  # 1.28 MB, several read chunks, NUL bytes included
     source = tmp_path / "src.bin"
@@ -166,23 +185,8 @@ def test_claim_unique_copy_fallback_streams_the_bytes(
 # it: the claim already consumed the name, so the retry lands at `name-1.ext` and the fragment stays.
 #
 # Measured on the pre-fix code (Windows, 2026-09-14): a copy raising ENOSPC after 1024 of 400000 bytes
-# left `delivered.hl7` on disk at 1024 bytes, with no `.part` temp to mark it as incomplete.
-
-
-def _no_hard_links(*_a: object, **_k: object) -> None:
-    """Stand in for FAT/exFAT and the many SMB/NAS mounts where `os.link` raises a non-
-    `FileExistsError` `OSError`, which is what sends `_claim_unique` down the copy fallback."""
-    raise OSError("hard links unsupported on this filesystem")
-
-
-def _dying_copy(prefix: int) -> object:
-    """A `copyfileobj` that writes `prefix` bytes and then fails the way a full volume does."""
-
-    def _copy(fsrc: IO[bytes], fdst: IO[bytes], length: int = 0) -> None:
-        fdst.write(fsrc.read(prefix))
-        raise OSError(28, "No space left on device")
-
-    return _copy
+# left `delivered.hl7` on disk at 1024 bytes, with no `.part` temp to mark it as incomplete. The tests
+# below use a smaller payload — only the prefix is ever read, so the size only has to exceed it.
 
 
 def test_claim_unique_removes_the_partial_when_the_copy_dies_mid_stream(
@@ -190,12 +194,14 @@ def test_claim_unique_removes_the_partial_when_the_copy_dies_mid_stream(
 ) -> None:
     """A failed claim must leave NOTHING at the name it claimed.
 
-    Mutation: drop the `finally` cleanup. Red: `dst.bin` exists at 1024 of 400000 bytes."""
+    Mutation: drop the cleanup. Red: `dst.bin` exists at 1024 of 4096 bytes."""
     monkeypatch.setattr(os, "link", _no_hard_links)
     # `shutil.copyfileobj` has exactly one caller in the file transport (`_claim_unique`), so patching
     # it module-wide reaches only the stream under test on this path.
     monkeypatch.setattr(shutil, "copyfileobj", _dying_copy(1024))
-    payload = b"A" * 400_000
+    payload = (
+        b"A" * 4096
+    )  # only the prefix is ever read; it just has to exceed it, to be a truncation
     source = tmp_path / "src.bin"
     source.write_bytes(payload)
     target = tmp_path / "dst.bin"
@@ -206,7 +212,7 @@ def test_claim_unique_removes_the_partial_when_the_copy_dies_mid_stream(
     assert not target.exists(), "a truncated claim was left at the delivered name"
     # The source is untouched, so the caller's retry (or `FileSource._move`'s re-read) still has it.
     assert source.read_bytes() == payload
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["src.bin"]
+    assert _names(tmp_path) == ["src.bin"]
 
 
 def test_claim_unique_never_deletes_the_file_it_lost_the_name_race_to(
@@ -219,21 +225,27 @@ def test_claim_unique_never_deletes_the_file_it_lost_the_name_race_to(
     guard wrapped around the whole loop body deletes that file on EVERY collision, turning a
     no-clobber claim into a clobbering one.
 
-    Mutation: widen the `try` to enclose the `os.open`. Red: `out.hl7` is gone."""
+    TWO names are taken, not one, and that is deliberate. A widened guard destroys whichever name its
+    cleanup happens to be bound to, and the two plausible spellings differ by exactly one iteration:
+    binding the cleanup to the name the create ATTEMPTED destroys `out.hl7`, while letting it read the
+    already-reassigned loop variable destroys `out-1.hl7`. A single pre-existing file catches one
+    spelling and lets the other through.
+
+    Mutation: widen the `try` to enclose the `os.open`, either spelling. Red: one of the two taken
+    names is gone."""
     monkeypatch.setattr(os, "link", _no_hard_links)
     source = tmp_path / "src.part"
     source.write_bytes(b"PAYLOAD")
-    winner = tmp_path / "out.hl7"
-    winner.write_bytes(b"the winner's bytes")
+    (tmp_path / "out.hl7").write_bytes(b"first winner")
+    (tmp_path / "out-1.hl7").write_bytes(b"second winner")
 
-    claimed = _claim_unique(source, winner)
+    claimed = _claim_unique(source, tmp_path / "out.hl7")
 
-    assert claimed.name == "out-1.hl7"
+    assert claimed.name == "out-2.hl7"
     assert claimed.read_bytes() == b"PAYLOAD"
-    assert winner.read_bytes() == b"the winner's bytes"
-    # Assert the whole directory, not just the winner: a guard that deletes and then re-creates would
-    # satisfy a bytes-only check on a lucky ordering.
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["out-1.hl7", "out.hl7", "src.part"]
+    assert (tmp_path / "out.hl7").read_bytes() == b"first winner"
+    assert (tmp_path / "out-1.hl7").read_bytes() == b"second winner"
+    assert _names(tmp_path) == ["out-1.hl7", "out-2.hl7", "out.hl7", "src.part"]
 
 
 async def test_file_delivery_leaves_no_partial_when_the_claim_copy_dies(
@@ -259,4 +271,4 @@ async def test_file_delivery_leaves_no_partial_when_the_claim_copy_dies(
         await dest.send("MSH|^~\\&|A|B|C|D|20260914||ADT^A01|MSG00001|P|2.5\r")
 
     # Empty: no delivered file, and no `.part` temp either (the caller's own `finally` takes that one).
-    assert sorted(p.name for p in tmp_path.iterdir()) == []
+    assert _names(tmp_path) == []
