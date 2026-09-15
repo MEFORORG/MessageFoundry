@@ -2042,7 +2042,11 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     id           TEXT PRIMARY KEY,
     operation    TEXT NOT NULL,        -- registered op key, e.g. 'dead_letter_replay'
     params       TEXT NOT NULL,        -- JSON args captured at request time, replayed on approval
-    requester    TEXT NOT NULL,        -- who initiated; can never self-approve (dual-control, 2.3.5)
+    requester    TEXT NOT NULL,        -- who initiated, as a DISPLAY label only (see requester_user_id)
+    -- BACKLOG #1540: the requester's immutable users.id, and the ONLY key the self-approval refusal
+    -- compares. Nullable, and never backfilled -- the Store protocol's create_pending_approval says
+    -- why, and ApprovalGate.approve is what enforces it.
+    requester_user_id TEXT,
     requested_at REAL NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
                                        -- 'failed': the gate released it but the executor raised, so
@@ -3698,6 +3702,15 @@ class MessageStore:
         preset_cols = {row["name"] for row in await cur.fetchall()}
         if preset_cols and "last_used_at" not in preset_cols:
             await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
+        # BACKLOG #1540: a pre-existing pending_approvals table predates requester_user_id — ALTER it
+        # in, nullable (an ALTER cannot add NOT NULL without a default, and there is no name-to-id
+        # backfill that is CORRECT: after a rename the stored name may belong to somebody else, so
+        # resolving it would key the refusal on the wrong person). NULL on an existing row means "this
+        # request cannot be authorized" and approve() refuses it with a distinct 409.
+        cur = await db.execute("PRAGMA table_info(pending_approvals)")
+        approval_cols = {row["name"] for row in await cur.fetchall()}
+        if "requester_user_id" not in approval_cols:
+            await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -8021,6 +8034,7 @@ class MessageStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
@@ -8028,17 +8042,25 @@ class MessageStore:
         async with self._lock:
             await self._db.execute(
                 "INSERT INTO pending_approvals "
-                "(id, operation, params, requester, requested_at, status, expires_at) "
-                "VALUES (?,?,?,?,?,'pending',?)",
-                (approval_id, operation, params, requester, requested_at, expires_at),
+                "(id, operation, params, requester, requester_user_id, requested_at, status,"
+                " expires_at) VALUES (?,?,?,?,?,?,'pending',?)",
+                (
+                    approval_id,
+                    operation,
+                    params,
+                    requester,
+                    requester_user_id,
+                    requested_at,
+                    expires_at,
+                ),
             )
             await self._commit()
 
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals WHERE id = ?",
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
                 (approval_id,),
             )
             return await cur.fetchone()
@@ -8047,6 +8069,8 @@ class MessageStore:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         async with self._read() as db:
             cur = await db.execute(
+                # No requester_user_id here: the approver queue shows the DISPLAY label, and the
+                # authorization key is read through get_pending_approval on the approve path.
                 "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
                 " expires_at FROM pending_approvals"
                 " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
