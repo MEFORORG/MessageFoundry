@@ -6522,8 +6522,11 @@ def create_managed_app(
         # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
         # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
         # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
-        # the store is closed in the except below and no listener ever binds. A no-op off an editable
-        # install (no RECORD baseline), so dev is never bricked. Off only if [integrity].enabled=false.
+        # the store is closed in the except below and no listener ever binds. It raises for the same
+        # reason when attestation verified NOTHING — no baseline, a RECORD stripped of its package rows,
+        # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
+        # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
+        # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
         integ = integrity_settings or IntegritySettings()
         if integ.enabled:
             try:

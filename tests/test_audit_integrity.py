@@ -410,12 +410,15 @@ def test_audit_cli_refuses_a_file_that_is_not_a_database(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], subcommand: str
 ) -> None:
     # Adjacent to the zero-byte case and reached by the same probe: a path that is not SQLite at all
-    # is refused here, before the engine's store layer opens it. #1670 owns that story in general.
+    # is refused here, before the engine's store layer opens it. #1670 owns that story in general,
+    # so the probe hands this one to its reporter and the operator reads #1670's line either way --
+    # `test_audit_verify_exits_2_on_a_file_that_is_not_a_database` pins the same string from the
+    # other side, in a child interpreter, because that test's subject is that the process ENDS.
     text = tmp_path / "notes.txt"
     text.write_text("this is not a database\n", encoding="utf-8")
 
     assert main([subcommand, "--db", str(text)]) == 2
-    assert "cannot read an audit database" in capsys.readouterr().err
+    assert "cannot open the store" in capsys.readouterr().err
 
 
 def test_audit_verify_cli_exits_3_on_an_empty_log(

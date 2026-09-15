@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
 import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
 from pathlib import (
@@ -3928,10 +3929,28 @@ def _write_private_key(path: Path, pem: bytes) -> None:
 
     from messagefoundry.store.store import _secure_file
 
+    # The exclusive create sits OUTSIDE the cleanup guard on purpose: a pre-existing key raises
+    # FileExistsError HERE, and that file is the operator's real key — unlinking it is precisely the
+    # clobber the O_EXCL refusal exists to prevent.
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(pem)
-    _secure_file(path)
+    placed = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(pem)
+        # Inside the guard for breadth, not because it raises today: _secure_file is best-effort and
+        # non-fatal by contract (it logs a failed restriction rather than raising, so the engine can
+        # still start). Were that ever to change, the key it could not lock down must not be the one
+        # thing left behind.
+        _secure_file(path)
+        placed = True
+    finally:
+        # A write that dies partway (a full volume) would otherwise leave a TRUNCATED key that
+        # nothing removes, and the O_EXCL refusal above then fires on it forever: the caller cannot
+        # re-mint, and all it gets is a FileExistsError naming no cause. `finally`, not `except`, so
+        # nothing is caught or relabelled. It runs after the `with` closed the handle, which Windows
+        # requires before an unlink.
+        if not placed:
+            path.unlink(missing_ok=True)
 
 
 def _cert(args: argparse.Namespace) -> int:
@@ -4437,7 +4456,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    outcome, was = asyncio.run(run())
+    try:
+        outcome, was = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
     if args.json:
@@ -4546,6 +4568,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         outcome, store_path = asyncio.run(run())
     except FirstAdministratorRefused as exc:
         return _emit_error(str(exc), as_json=args.json)
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
     if args.json:
         _print_json(
@@ -4579,7 +4603,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
 
 def _refuse_a_store_that_is_not_an_audit_log(
-    *, is_sqlite: bool, path: str, refusal: str
+    *, is_sqlite: bool, path: str, refusal: str, as_json: bool = False
 ) -> int | None:
     """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
 
@@ -4595,11 +4619,17 @@ def _refuse_a_store_that_is_not_an_audit_log(
     is probed; a server backend's connection string is not a file and cannot be conjured by opening
     it. ``audit_log`` is the table the three callers actually read, so its absence is the exact
     question, not a proxy for it.
+
+    This probe runs BEFORE the ``sqlite3.DatabaseError`` catch each caller inherits from #1670, and
+    the two answer different questions -- "this is a database but not an audit log" here, "this is
+    not a database at all" there -- so both stay. Where they overlap, on a path SQLite cannot read,
+    the probe reaches it first and hands it to ``_emit_store_open_error`` so the operator sees one
+    line for one condition, whichever guard happened to catch it.
     """
     import contextlib
-    import sqlite3
-    from pathlib import Path
 
+    # `sqlite3` and `Path` are module-level (see the header imports) -- re-importing them here would
+    # shadow the same objects for no gain.
     if not is_sqlite:
         return None
 
@@ -4619,9 +4649,9 @@ def _refuse_a_store_that_is_not_an_audit_log(
     except sqlite3.DatabaseError as exc:
         # `OperationalError` subclasses this, so an unreadable path lands here too. #1670 owns the
         # general case of a non-database at `--db`; refusing it before the store opens is a side
-        # effect of probing first, not this item's fix.
-        print(f"error: cannot read an audit database at {path}: {exc} {tail}", file=sys.stderr)
-        return 2
+        # effect of probing first, not this item's fix -- so it reports in #1670's words and with
+        # #1670's exit code rather than minting a second message for one condition.
+        return _emit_store_open_error(exc, path, as_json=as_json)
 
     if found is None:
         print(
@@ -4680,7 +4710,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    ok, message, count = asyncio.run(run())
+    try:
+        ok, message, count = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
+        # ONLY SQLite; this catch is what a server backend and any error raised after the open
+        # still land in, so both guards stay live.
+        return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
@@ -4737,6 +4773,8 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
         refusal="refusing to create one and print an anchor of an empty log",
+        # Only this one of the three callers has --json, and #1670 routes its store-open error there.
+        as_json=args.json,
     )
     if refused is not None:
         return refused
@@ -4748,7 +4786,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    count, head = asyncio.run(run())
+    try:
+        count, head = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     anchor = f"{count}:{head}"
     if args.json:
         _print_json({"count": count, "head": head, "anchor": anchor}, compact=True)
@@ -4806,7 +4847,10 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    ok, message = asyncio.run(run())
+    try:
+        ok, message = asyncio.run(run())
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + message)
     return 0 if ok else 1
 
@@ -4927,6 +4971,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except NotImplementedError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path)
     print(
         f"OK: re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
@@ -5002,6 +5048,8 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
+    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if result is None:  # leader-gated no-op (never on the single-node CLI path) — defensive
         return _emit_error("backup did not run (not leader)", as_json=args.json)
     payload = {
@@ -5052,6 +5100,9 @@ def _restore_verify(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
+    # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
+    # call is inside `_full_open_check`, which already catches broadly and reports FAIL with a
+    # reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
     result = asyncio.run(
         run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
     )
@@ -5772,6 +5823,27 @@ def _safe_print(line: str) -> None:
 
 def _print_json(data: object, *, compact: bool) -> None:
     print(json.dumps(data) if compact else json.dumps(data, indent=2))
+
+
+def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool = False) -> int:
+    """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
+
+    EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --
+    ``audit-verify`` returns it for a BROKEN CHAIN -- so a compliance job keying on exit codes would
+    otherwise read "the path is not a database" as "tamper detected". 2 keeps "could not start"
+    separate from "ran and reported a problem", which is the split the rest of the file already uses
+    for a bad ``--db`` / unreadable ``--expected-anchor-file``.
+
+    ``sqlite3.OperationalError`` needs no separate clause: it subclasses ``DatabaseError``. That
+    catches the typo'd path too (a directory at ``--db`` raises "unable to open database file"),
+    which used to print a raw traceback.
+    """
+    message = f"cannot open the store at {path}: {exc}"
+    if as_json:
+        print(json.dumps({"error": message}))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return 2
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:

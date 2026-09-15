@@ -111,6 +111,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_licence_header_gate.py",
         "test_packaging.py",
         "test_release_pipeline.py",
+        # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing
+        # them. What it guards is the erased-body predicate going missing from a replay statement,
+        # which arrives as an ENGINE diff and does not trip the tooling path gate (BACKLOG #1560).
+        "test_replay_erased_body_scope.py",
         # NOT engine source either, so this entry widens the list's stated rule and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
