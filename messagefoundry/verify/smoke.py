@@ -3,7 +3,9 @@
 """End-to-end smoke + store connectivity — proves the deployment actually works on this box.
 
 * ``self``  — route a synthetic HL7 through the box's *real* config via :func:`dry_run` (no store, no
-  network, no side effects). Proves the config loads + routes + transforms cleanly on this host.
+  network, no side effects). Proves the config loads + routes + transforms cleanly on this host. It
+  PASSES only on a **delivering** outcome: a run that routes or transforms the message into nothing
+  fails, naming the disposition (BACKLOG #1707) — see :func:`_classify_self_smoke`.
 * ``live``  — MLLP-send a synthetic HL7 to the running engine's inbound and confirm an **AA ACK**.
   Proves the real listener accepts + acks. (Full disposition is then confirmed in the console — a
   MANUAL row — so the tool stays dependency-light and not brittle to API specifics.)
@@ -72,10 +74,70 @@ def synthetic_message() -> str:
     return SYNTHETIC_ADT_A01
 
 
+#: Why a no-delivery self smoke is a finding rather than a shrug, and what to do about it.
+#:
+#: Named separately because it is the half an operator acts on: the verdict says the run saw no
+#: delivery, this says the two reasons that happens and which one is theirs. The synthetic message
+#: is deliberately fixed (:data:`SYNTHETIC_ADT_A01`), so a site whose Router keys on its own sending
+#: facility declines it legitimately — that reader needs a pointer, not just a red row.
+_SELF_SMOKE_NO_DELIVERY_HINT: Final[str] = (
+    "this run proves the config LOADS, not that it routes. The synthetic message is an ADT^A01 from "
+    "MAINHOSP, so a Router keyed on a different feed declines it: point --inbound at a connection "
+    "that takes one, or fix the Router/Handler"
+)
+
+
+def _classify_self_smoke(disposition: str, summary: str) -> CheckResult:
+    """Map a **dry-run** disposition to the ``smoke.self`` result (pure — unit-tested).
+
+    The self smoke exists to answer *would a message reach a destination on this box*. Until BACKLOG
+    #1707 it answered *did* ``dry_run`` *return*: ``Status.PASS`` was unconditional on everything but
+    ``DryRunResult.error``, so a synthetic message the config routed nowhere (``UNROUTED``) or
+    transformed into nothing (``FILTERED``) printed its disposition into the summary and still
+    reported the deployment green. Zero deliveries is **blind** here, not clean — the opposite of a
+    scanner, where finding nothing is the good answer.
+
+    The verdict matches the one :func:`_classify_disposition` already reaches for the **live** smoke
+    on the **same** synthetic message (``runner._run_live_smoke`` sends :func:`synthetic_message`):
+    ``UNROUTED``/``FILTERED`` fail. Softening one side would leave two divergent answers to a single
+    question about a single config, which is worse than either answer alone.
+
+    It is deliberately **not** that function. The preview's vocabulary differs: ``disposition_for``
+    returns ``RECEIVED`` for "would route to at least one destination" because a simulation cannot
+    know the eventual delivery result, while the live path's ``RECEIVED`` means "committed at
+    ingress, awaiting routing" — which ``_classify_disposition`` correctly fails as non-terminal.
+    Sharing the code would mean teaching one classifier two meanings of one member.
+
+    Unknown members **fail closed**: a disposition this function does not recognise is a FAIL naming
+    it, never a fall-through to PASS. That is the whole defect, so the fix must not leave a door in.
+    """
+    from messagefoundry.store.store import MessageStatus
+
+    rid, title = "smoke.self", "Self smoke (dry-run routing)"
+    if disposition == MessageStatus.RECEIVED.value:
+        # The preview's delivering outcome: at least one DeliveryPreview was produced.
+        return CheckResult(rid, title, Status.PASS, summary)
+    reasons = {
+        MessageStatus.UNROUTED.value: "the Router selected no handler, so nothing would be delivered",
+        MessageStatus.FILTERED.value: (
+            "handlers ran but produced no delivery (a filter returned nothing, or every destination "
+            "is present-but-not-deployed)"
+        ),
+    }
+    reason = reasons.get(disposition, f"{disposition.upper()} is not a delivering outcome")
+    return CheckResult(
+        rid, title, Status.FAIL, f"{summary} — {reason}; {_SELF_SMOKE_NO_DELIVERY_HINT}"
+    )
+
+
 def smoke_self(
     config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
 ) -> CheckResult:
     """Route a synthetic message through the box's config with no side effects (``dry_run``).
+
+    PASSES only when the message would reach at least one destination. A parse/validation/script
+    failure is a FAIL carrying the error; a run that routes nowhere or delivers nothing is a FAIL
+    naming its disposition (:func:`_classify_self_smoke`).
 
     ``snapshot_on_send`` (ADR 0104) selects the copy-on-Send posture the preview reproduces, matching
     the live engine's ``[pipeline].snapshot_on_send``. It keeps the library default ``False`` here so a
@@ -121,7 +183,10 @@ def smoke_self(
         return CheckResult(
             "smoke.self", "Self smoke (dry-run routing)", Status.FAIL, f"{summary} — {result.error}"
         )
-    return CheckResult("smoke.self", "Self smoke (dry-run routing)", Status.PASS, summary)
+    # Gate on what the run PRODUCED, never on "the call returned" (BACKLOG #1707). A postcondition
+    # over the disposition the pipeline already computed cannot drift out of step with the pipeline;
+    # re-deriving "did it deliver" here from the counts would be a second classifier to keep in sync.
+    return _classify_self_smoke(result.disposition.value, summary)
 
 
 def _recv_mllp(sock: socket.socket, timeout: float) -> bytes:
