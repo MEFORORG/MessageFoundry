@@ -14,6 +14,7 @@ the actual defect in place."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -77,6 +78,12 @@ def _service_toml(
     toml = tmp_path / name
     toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(toml)
+
+
+def _no_hard_links(src, dst) -> None:
+    """Stand in for os.link on a volume that has none (FAT, some SMB shares), forcing the
+    exclusive-create copy fallback in _place_restored_store."""
+    raise OSError("hard links are unavailable on this volume")
 
 
 def _json_line(out: str) -> dict:
@@ -229,6 +236,12 @@ def test_restore_refuses_corrupt_archive(tmp_path, key_b64, capsys) -> None:
     out = capsys.readouterr().out
     assert "did not verify" in out
     assert not dest.exists()
+    # The refusal must keep BOTH halves of what the codec can tell: a failed tag means bad bytes OR the
+    # wrong key. These two substrings come from backup_codec, deliberately -- an operator told only
+    # "corrupt" goes hunting for bad media when the archive is intact and the DEK is not, so if a codec
+    # reword ever drops the distinction, this is the assertion that should notice.
+    assert "wrong key" in out
+    assert "corrupt" in out
 
 
 def test_restore_refuses_an_archive_whose_header_will_not_parse(tmp_path, key_b64, capsys) -> None:
@@ -244,29 +257,30 @@ def test_restore_refuses_an_archive_whose_header_will_not_parse(tmp_path, key_b6
 
     rc = main(["restore", str(bad), "--to", str(dest), "--service-config", toml])
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "did not verify" in out
-    assert "version 99" in out  # the codec's own cause survives into the refusal
+    assert "did not verify" in capsys.readouterr().out
     assert not dest.exists()
 
 
-def test_restore_refusal_names_the_wrong_key_as_a_possible_cause(tmp_path, key_b64, capsys) -> None:
-    # A failed GCM tag cannot tell corrupt bytes from the wrong key, and an operator who reads only
-    # "corrupt archive" goes hunting for bad media when the archive is fine and the DEK is not. The
-    # codec says both; the refusal must not summarize that away.
+def test_restore_key_mismatch_from_the_decrypt_is_not_reported_as_a_bad_archive(
+    tmp_path, key_b64, capsys, monkeypatch
+) -> None:
+    # BackupKeyMismatch is a SUBCLASS of BackupCodecError, so a single catch would report it as a
+    # generic bad archive and point the operator at the bytes when the key is the subject. It survives
+    # the fingerprint precheck through a real window: archive_key_id reads the header, decrypt_stream
+    # re-reads it, and an archive swapped between those two reads is approved by a precheck that ran
+    # against the old header. Standing in for that window by handing the decrypt a key the precheck
+    # approved and the header does not.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
-    blob = bytearray(Path(archive).read_bytes())
-    blob[-40] ^= 0x01
-    corrupt = Path(archive).with_suffix(".corrupt.mfbak")
-    corrupt.write_bytes(bytes(blob))
+    rival = generate_key()
+    monkeypatch.setattr(dr_backup, "_select_decrypt_key", lambda keys, kid: base64.b64decode(rival))
+    dest = tmp_path / "restored.db"
 
-    rc = main(
-        ["restore", str(corrupt), "--to", str(tmp_path / "restored.db"), "--service-config", toml]
-    )
+    rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     out = capsys.readouterr().out
-    assert "wrong key" in out
-    assert "corrupt" in out
+    assert "KEY_MISMATCH" in out
+    assert "did not verify" not in out  # NOT relabelled as a corrupt archive
+    assert not dest.exists()
 
 
 # --- (3b) a failed WRITE leaves nothing behind either -------------------------
@@ -281,14 +295,13 @@ def test_restore_leaves_no_partial_store_when_the_copy_dies(
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored.db"
 
-    def _no_links(src, dst) -> None:
-        raise OSError("hard links are unavailable on this volume")
-
     def _die_mid_copy(fsrc, fdst, length=0) -> None:
         fdst.write(b"SQLite format 3\x00")  # enough to look like a real store to a casual reader
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(os, "link", _no_links)
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    # Patching copyfileobj globally reaches only _place_restored_store on this path: _extract_member
+    # uses its own read loop, and the plaintext branch is skipped for an encrypted archive.
     monkeypatch.setattr(shutil, "copyfileobj", _die_mid_copy)
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
@@ -305,35 +318,22 @@ def test_restore_does_not_delete_the_winner_of_a_create_race(
     # it would turn the refusal into the unrecoverable overwrite the refusal exists to prevent.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored.db"
+    real_verify = dr_backup._verify_extracted_store
 
-    def _no_links(src, dst) -> None:
-        raise OSError("hard links are unavailable on this volume")
+    def _plant_a_rival(snap, manifest):
+        # The rival's file must appear AFTER the up-front destination check and before the create --
+        # the only window in which the create race can be lost.
+        counts = real_verify(snap, manifest)
+        dest.write_bytes(b"the winner's store")
+        return counts
 
-    monkeypatch.setattr(os, "link", _no_links)
-    # Appear only AFTER the up-front destination check, so the create itself is what collides.
-    monkeypatch.setattr(
-        dr_backup,
-        "_verify_extracted_store",
-        _after_verify_plant(dest, b"the winner's store"),
-    )
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_rival)
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     assert "refusing to overwrite" in capsys.readouterr().out
     assert dest.read_bytes() == b"the winner's store"  # untouched by the loser's cleanup
-
-
-def _after_verify_plant(dest: Path, payload: bytes):
-    """Wrap the real verify step so a rival's file appears between the up-front destination check and
-    the create -- the only window in which the create race can be lost."""
-    real = dr_backup._verify_extracted_store
-
-    def _wrapped(snap, manifest):
-        counts = real(snap, manifest)
-        dest.write_bytes(payload)
-        return counts
-
-    return _wrapped
 
 
 def test_restore_missing_archive(tmp_path, key_b64, capsys) -> None:
