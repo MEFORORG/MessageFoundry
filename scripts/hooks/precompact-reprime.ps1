@@ -72,35 +72,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Write-Context {
-    param([string]$Text)
-    # Plain text, not JSON. See the header: exit-0 stdout is what SessionStart adds to context.
-    [Console]::Out.Write($Text)
-}
-
-function ConvertTo-UtcInstant {
-    # WHY THIS IS NOT A [datetime]::TryParse CALL. ConvertFrom-Json already hands back a [datetime]
-    # with Kind=Utc for an ISO-8601 `Z` string, and the only thing that destroys that is casting it
-    # back to a string: [string] renders the UTC WALL CLOCK with no zone marker ("09/15/2026
-    # 15:52:28"), and re-parsing that yields Kind=Unspecified, which then subtracts as though it were
-    # LOCAL. That round-trip is what made a six-minute-old declaration report "-0.2 days old" -- wrong
-    # by exactly the UTC offset, and NEGATIVE anywhere west of Greenwich. Measured 2026-09-15. So take
-    # the [datetime] as it arrives, and parse only when the value is genuinely a string.
-    param($Value)
-    if ($null -eq $Value) { return $null }
-    $dt = [datetime]::MinValue
-    if ($Value -is [datetime]) {
-        $dt = [datetime]$Value
-    } elseif (-not [datetime]::TryParse([string]$Value, [ref]$dt)) {
-        return $null
-    }
-    if ($dt.Kind -eq [System.DateTimeKind]::Utc) { return $dt }
-    if ($dt.Kind -eq [System.DateTimeKind]::Local) { return $dt.ToUniversalTime() }
-    # seat.ps1 writes this field as UTC with a trailing Z, so an unzoned value came from that writer
-    # and is UTC. Assuming LOCAL here would reintroduce the very offset error described above.
-    return [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
-}
-
 function Format-Age {
     # A negative age is not a small age. It means this session's clock and the record's disagree, and
     # rounding it to "0.0 days" would hide the one fault in this line worth reporting.
@@ -133,16 +104,27 @@ try {
     }
 } catch {
     # An unreadable payload is the fail-open case: both discriminators stay empty and the hook speaks.
-    $hookSource = ''
-    $hookEvent = ''
 }
 
-# `startup`, `resume` and `clear` are cold starts. seat-declare-prompt.ps1 already owns those, and a
-# reprime there would contradict it by reporting a seat the session has not chosen yet. A payload
-# naming any event other than SessionStart is a leftover registration on some other event, and it
-# must stay quiet: its stdout does not reach context, so the work is wasted either way.
+# THE PROPERTY IS "NOT A COMPACTION", NOT A LIST OF THE STARTS THAT ARE NOT ONE. The harness ships at
+# least `startup`, `resume`, `clear`, `compact` and `fork`, and an equality test against `compact`
+# covers every one of them plus whatever is added next; enumerating the others would be a list that
+# is one short the day it grows. Those other starts are seat-declare-prompt.ps1's, and a reprime
+# during one would report a seat the session has not chosen yet.
+#
+# A payload naming any event other than SessionStart is a leftover registration somewhere else, and
+# it must stay quiet: its stdout does not reach context, so the work is wasted either way.
 if ($hookSource -and $hookSource -ne 'compact') { exit 0 }
 if ($hookEvent -and $hookEvent -ne 'SessionStart') { exit 0 }
+
+# Dot-sourced AFTER the guard, so a cold start never pays for it. config-roots.ps1 is a
+# definitions-only library with no load-time I/O, which is what makes that safe inside a hook.
+# DO NOT restate its rule here. The age line below was briefly a THIRD copy of ConvertTo-UtcDateTime,
+# and the copy was the weakest of the three -- it dropped the [datetimeoffset] arm and the
+# DateTimeOffset parse. That function's own docstring says why one place to change it is the
+# difference between a fix and a hunt, and fleet.ps1's Get-AgeHours records the same measurement.
+$rootsLib = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\config-roots.ps1'
+if (Test-Path -LiteralPath $rootsLib) { . $rootsLib }
 
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -193,7 +175,16 @@ try {
         $age = ''
         $declaredDisplay = ''
         if ($declared.PSObject.Properties['declaredAt'] -and $declared.declaredAt) {
-            $declaredUtc = ConvertTo-UtcInstant $declared.declaredAt
+            # SCOPED so the AGE degrades alone. If config-roots.ps1 is missing from a checkout, the
+            # call below is an unrecognised command, and without this catch the outer handler would
+            # swallow it and drop the WHOLE reprime -- seat, goal and held ledger numbers with it.
+            # That is the fail-silent direction this file exists to argue against, and it is not
+            # hypothetical: it happened here mid-change, and only driving the script revealed it.
+            try {
+                $declaredUtc = ConvertTo-UtcDateTime $declared.declaredAt
+            } catch {
+                $declaredUtc = $null
+            }
             if ($null -ne $declaredUtc) {
                 $age = ' (' + (Format-Age ((Get-Date).ToUniversalTime() - $declaredUtc)) + ')'
                 # Rendered in local time WITH its offset, so it cannot be read as the other zone. The
@@ -257,7 +248,12 @@ try {
         $lines += "Commit and push before the context gets any tighter. An unpushed branch is lost work."
     }
 
-    Write-Context ("[precompact] Restoring what this compaction is about to drop.`n" + ($lines -join "`n"))
+    # PLAIN TEXT ON STDOUT, which is what SessionStart adds to context. See the header for the
+    # envelope that used to be here and why the harness threw all of it away. [Console]::Out.Write
+    # rather than Write-Output, so nothing reformats or wraps the lines on the way out.
+    [Console]::Out.Write(
+        "[precompact] Restoring what this compaction is about to drop.`n" + ($lines -join "`n")
+    )
     exit 0
 } catch {
     # Deliberately swallowed. This hook never fails a turn.
