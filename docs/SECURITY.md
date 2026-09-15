@@ -1759,7 +1759,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
+| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; the count is applied by a single atomic store call, so failures submitted **in parallel** each land and a burst locks the account exactly as a serial run does; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, where lockout does **not** apply | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | **nothing** — `POST /me/reauth` and `POST /me/password` then have no anti-automation control at all |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
@@ -1770,7 +1770,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 
 **Control 1 bounds the lock, not the campaign.** Each lockout releases itself after
-`lockout_minutes`, but `_register_failure` restarts the counter on a lapsed window and re-locks on the
+`lockout_minutes`, but `increment_login_failure` restarts the counter on a lapsed window and re-locks on the
 next run to the threshold, and the account row persists a failure count and an expiry — never a count
 of locks — so nothing accumulates across cycles and the number of cycles has no ceiling. The account
 is reachable in the gap between one lock expiring and the next being set, and no longer. Sustaining
@@ -1792,21 +1792,27 @@ account is locked right now, and a locked account still lists as enabled. Diagno
 from the audit log, not the user list.
 
 **Recovery.** Absent a sustained attacker nothing is needed — the lock expires on its own. Against a
-sustained one: across all three store backends the writes that clear `locked_until` are
-`set_password`, the successful-login write and the failed-attempt write, and only `set_password` can
-run while a lock is live — control 1 refuses before any credential is verified, so neither the
-successful-login write nor the login-time rehash beside it is ever reached, and the failed-attempt
-write only clears an **already lapsed** lock. Two routes reach `set_password` while an account is
-locked, both local-account-only, and **both issue a new password rather than merely lifting the
-lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
+sustained one: across all three store backends **at least** four writes clear `locked_until` —
+`set_password`, the successful-login write, the atomic failed-attempt write
+(`increment_login_failure`) and the raw lockout-state write (`record_login_failure`), whose only
+remaining caller is the offline unlock below. Two of the four can run while a lock is live:
+`set_password` and that offline unlock. Control 1 refuses before any credential is verified, so
+neither the successful-login write nor the login-time rehash beside it is ever reached, and the
+failed-attempt write only clears an **already lapsed** lock. Two routes reach `set_password` while an
+account is locked, both local-account-only, and **both issue a new password rather than merely lifting
+the lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
 (session validation never consults `locked_until`, and that route is exempt from both the must-change
 and the MFA-pending gates), and the
-[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). No shipped command clears a lock
-without going through one of those two — the CLI manages no users.
+[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). The one shipped command that lifts a
+lock without issuing a password is `messagefoundry admin-unlock`
+([ADR 0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)),
+which is gated on **host access** rather than on a credential: reaching it needs the config, the store
+path and, on an encrypted store, the key material.
 
 **Arrange in advance.** Keep a **second administrator who can sign in**: the administrator reset
-refuses a self-reset, so a sole administrator holding no live session has no in-band route back for as
-long as an attacker sustains the lock.
+refuses a self-reset, so a sole administrator holding no live session has no *in-band* route back for
+as long as an attacker sustains the lock — only the host-gated `admin-unlock`, which needs access to
+the engine host itself.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
@@ -1872,8 +1878,12 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
 *those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
-**store-backed** (`record_login_failure` / `enforce_session_cap` / `set_user_disabled` against the one
-unified store), so they are **shared** by every API process and are **not** multiplied by N. The
+**store-backed** (`increment_login_failure` / `enforce_session_cap` / `set_user_disabled` against the
+one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
+the lockout, shared is not by itself enough and the second half is what makes the first half true: the
+count, the lapsed-window reset and the lock decision are **one atomic call** per attempt, so parallel
+attempts — from one process or from N shards — cannot each read the same pre-increment count and lose
+an increment between them. The
 per-uploader file/byte quota is also **not** multiplied by N: it is scoped to the `uploads_dir` (an
 uncached sidecar scan) with its check-then-write held as an atomic reservation on that same unified
 store, so shards sharing one dir enforce one budget between them. The request-body cap, the
@@ -1885,7 +1895,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 |---|---|---|---|---|---|---|---|---|
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (the two `/ui/reauth*` **ceremony** routes send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on `GET /ui/sso`, `GET /ui/oidc/start` and `GET /ui/oidc/callback`, because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 3 console ceremony routes | 429; `Retry-After: 30` on the two `/ui/reauth*` routes, none on the other four; logged |
-| Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — local password + TOTP/recovery legs | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs |
+| Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — local password + TOTP/recovery legs, counted by one atomic `increment_login_failure` per attempt (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`, logged |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | 429 + `Retry-After: 1`, logged |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
