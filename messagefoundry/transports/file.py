@@ -40,6 +40,7 @@ from messagefoundry.parsing.compression import CompressionError, gzip_compress, 
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
 from messagefoundry.parsing.split import split_batch
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -566,7 +567,7 @@ class FileSource(SourceConnector):
                 # store disposition to record; preserve the file in .error for the operator and log it.
                 logger.warning(
                     "file %s exceeds max_file_bytes (%s); routing to error dir",
-                    path.name,
+                    safe_name(path.name),
                     self.max_file_bytes,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
@@ -577,7 +578,11 @@ class FileSource(SourceConnector):
             except OSError as exc:
                 # Transient (file locked / vanished mid-scan): leave it in place to retry next scan
                 # rather than quarantining a healthy file. Logged, never silently swallowed.
-                logger.warning("could not read %s (will retry next scan): %s", path.name, exc)
+                logger.warning(
+                    "could not read %s (will retry next scan): %s",
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
+                )
                 continue
             if self.decompress == "gzip":
                 # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
@@ -593,7 +598,9 @@ class FileSource(SourceConnector):
                     )
                 except CompressionError as exc:
                     logger.warning(
-                        "file %s failed to gunzip (%s); routing to error dir", path.name, exc
+                        "file %s failed to gunzip (%s); routing to error dir",
+                        safe_name(path.name),
+                        safe_exc(exc, file_name=path.name),
                     )
                     await self._run_fs(self._move, path, self.error_dir)
                     disposed += 1
@@ -612,7 +619,7 @@ class FileSource(SourceConnector):
                 logger.warning(
                     "file %s does not match its declared content type %r (no matching magic bytes); "
                     "routing to error dir",
-                    path.name,
+                    safe_name(path.name),
                     (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._run_fs(self._move, path, self.error_dir)
@@ -629,8 +636,8 @@ class FileSource(SourceConnector):
                 # never became a "received message", so there's no store disposition; quarantine + log.
                 logger.warning(
                     "file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
-                    path.name,
-                    exc,
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
                 )
                 await self._run_fs(self._move, path, self.error_dir)
                 disposed += 1
@@ -644,8 +651,8 @@ class FileSource(SourceConnector):
                 # THIS file so a scanner hiccup can't abort the whole tick's remaining candidates.
                 logger.warning(
                     "file %s: pre-ingest scan hook errored (%s); leaving in place, will retry next scan",
-                    path.name,
-                    exc,
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
                 )
                 continue
             try:
@@ -663,7 +670,11 @@ class FileSource(SourceConnector):
                 # re-emits every message 1..N. That is at-least-once: messages 1..K-1 may be re-emitted
                 # (duplicates, acceptable — handlers are idempotent), but the file is NEVER moved with
                 # only some of its messages emitted (no accept-and-drop of the tail).
-                logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
+                logger.warning(
+                    "handler failed for %s (will retry next scan): %s",
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
+                )
                 continue
             await self._run_fs(self._after_processing, path)
             disposed += 1
@@ -895,7 +906,7 @@ class FileSource(SourceConnector):
             return True
         logger.warning(
             "file source: skipping %s — it resolves outside the watch root (symlink escape?)",
-            path.name,
+            safe_name(path.name),
         )
         return False
 
@@ -905,7 +916,11 @@ class FileSource(SourceConnector):
                 path.unlink()
             except OSError as exc:
                 # A processed file we can't delete will be re-read (duplicate); surface it (FILE-4).
-                logger.warning("could not delete processed file %s: %s", path.name, exc)
+                logger.warning(
+                    "could not delete processed file %s: %s",
+                    safe_name(path.name),
+                    safe_exc(exc, file_name=path.name),
+                )
         elif self.after_read == "leave":
             # #142 process-in-place: never move or delete the source file — the durable dedup ledger
             # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
@@ -934,16 +949,21 @@ class FileSource(SourceConnector):
             _claim_unique(path, dest_dir / path.name)
         except OSError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
-            logger.warning("could not move %s to %s: %s", path.name, dest_dir.name, exc)
+            logger.warning(
+                "could not move %s to %s: %s",
+                safe_name(path.name),
+                dest_dir.name,
+                safe_exc(exc, file_name=path.name),
+            )
             return
         try:
             path.unlink()
         except OSError as exc:
             logger.warning(
                 "archived %s to %s but could not remove the original (it will be re-read): %s",
-                path.name,
+                safe_name(path.name),
                 dest_dir.name,
-                exc,
+                safe_exc(exc, file_name=path.name),
             )
 
 
@@ -1035,12 +1055,51 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             n += 1
             candidate = target.with_name(f"{stem}-{n}{suffix}")
             continue
-        # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
-        # inbound file is only as small as the operator's max_file_bytes (unset by default), so
-        # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
-        # in memory on exactly the filesystems that already can't hard-link.
-        with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
-            shutil.copyfileobj(source, handle)
+        # The exclusive create above sits OUTSIDE the cleanup guard on purpose: a lost create race
+        # raises FileExistsError there and bumps the name, so the file then at `candidate` belongs to
+        # the winner — unlinking it would clobber exactly what O_EXCL exists to protect.
+        placed = False
+        try:
+            # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
+            # inbound file is only as small as the operator's max_file_bytes (unset by default), so
+            # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
+            # in memory on exactly the filesystems that already can't hard-link.
+            # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(tmp)` opened
+            # first and to raise, the fd would still be open and the unlink below would die on Windows
+            # with a sharing violation, replacing the real error with a bogus one.
+            with os.fdopen(fd, "wb") as handle, open(tmp, "rb") as source:
+                shutil.copyfileobj(source, handle)
+            placed = True
+        finally:
+            # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
+            # TRUNCATED, PHI-bearing file at `candidate` beside a reported failure — and it would
+            # consume that name permanently, since the bumping loop above skips a name that exists,
+            # so every later delivery would route around the debris instead of replacing it.
+            # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
+            # missed — `return` and `break` included, which an `except` arm never sees. It runs
+            # after the `with` has closed the handle, which Windows requires.
+            #
+            # Deliberately NOT the `except BaseException` that this package's persistent-connection
+            # connectors use (mllp.py, tcp.py, x12.py). Those are connection-discard arms inside
+            # `async def`, and they are broad because an await point can deliver CancelledError and
+            # the arm must stay distinguishable from the `except DeliveryError` above it. Neither
+            # applies here: `_claim_unique` is sync, so no CancelledError can arrive mid-execution,
+            # and there is only one cleanup path to begin with. Matching that shape would widen a
+            # catch past section 6 of CLAUDE.md for nothing. Settled twice; please leave it.
+            if not placed:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    # Cleanup must never DISPLACE the failure that caused it. Our own handle is
+                    # closed by now, but a drop directory is one other processes watch by design, so
+                    # a scanner or a reader holding the partial open is ordinary here, not exotic —
+                    # and an escaping unlink error would hide the full volume or dropped share behind
+                    # a cleanup message. Log it and let the real exception propagate.
+                    logger.warning(
+                        "could not remove the partial file %s after a failed claim: %s",
+                        candidate,
+                        unlink_exc,
+                    )
         return candidate
 
 
