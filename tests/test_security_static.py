@@ -553,6 +553,17 @@ _UNSCANNABLE_RE_PATTERNS = {
     # no nested quantifier, no overlapping alternation.
     "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
+    # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
+    # (_BLOB_SUFFIX, _META_SUFFIX, _TMP_TOKEN_BYTES), which is what stops a DELETING pattern from
+    # drifting wider than the writer's own spelling. Writing the escaped suffixes and the hex width
+    # out as literals would restore static scannability and lose exactly that coupling. The shape is
+    # bounded and non-catastrophic by inspection: every repetition is a FIXED count ({32}, and {8}
+    # from _TMP_TOKEN_BYTES * 2), the single alternation is two literal suffixes with no quantifier
+    # over it, and the whole pattern is anchored ^...\Z -- no nested quantifier, nothing to backtrack.
+    "messagefoundry/uploads.py": (
+        r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
