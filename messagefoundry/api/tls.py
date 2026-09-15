@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import ssl
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_anchor
 from messagefoundry.config.settings import ApiSettings
@@ -23,7 +25,15 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
 )
 
-__all__ = ["build_api_ssl_context", "ensure_api_tls_material"]
+__all__ = [
+    "ApiTlsPlan",
+    "ApiTlsSource",
+    "api_tls_source",
+    "build_api_ssl_context",
+    "ensure_api_tls_material",
+    "generated_state_dir",
+    "plan_api_tls_material",
+]
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +94,98 @@ _GENERATED_CERT_NAME = "api-generated-cert.pem"
 _GENERATED_KEY_NAME = "api-generated-key.pem"
 
 
+def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
+    """The ``(cert, key)`` paths of the first-run generated pair. The only place they are spelled."""
+    return state_dir / _GENERATED_CERT_NAME, state_dir / _GENERATED_KEY_NAME
+
+
+def generated_state_dir(store_path: str) -> Path:
+    """Where the engine keeps its own writable state: the directory holding the store database.
+
+    Named here rather than spelled at each call site, because it is the rule a CLIENT must not have
+    to know -- and it was already written twice (the serve path and the ``cert inventory`` reporter)
+    before it had a name.
+    """
+    return Path(store_path).resolve().parent
+
+
+#: Where the material the API bind serves with comes from. ``upstream`` is the one source that is not
+#: material at all -- a declared reverse proxy terminates TLS in front and the engine serves plaintext.
+ApiTlsSource = Literal["operator", "generated", "upstream"]
+
+
+def api_tls_source(*, cert_file: str | None, tls_terminated_upstream: bool) -> ApiTlsSource:
+    """The ORDER: an operator chain wins, a declared upstream terminator mints nothing, else generated.
+
+    Takes the two settings rather than an :class:`ApiSettings`, so a caller that cannot afford this
+    module's imports -- the tray reads an untrusted, possibly-malformed service TOML and must degrade
+    rather than raise (ADR 0113 layering) -- can share the ordering without sharing the machinery.
+    """
+    if cert_file:
+        return "operator"
+    return "upstream" if tls_terminated_upstream else "generated"
+
+
+@dataclass(frozen=True)
+class ApiTlsPlan:
+    """What the API bind **will** serve with, decided without reading or writing a single file.
+
+    This is the branch order of :func:`ensure_api_tls_material` lifted out so a caller that must not
+    mint can still answer the two questions a CLIENT has: *which scheme does this engine speak*, and
+    *which certificate will it present*. Both were previously derivable only by re-implementing the
+    predicate, and each re-implementation got it wrong in its own way -- keying the scheme on
+    ``[api].tls_cert_file`` alone reads the SHIPPED DEFAULT as cleartext (BACKLOG #1126), and a
+    client with no idea where the generated pair lands cannot trust it at all (BACKLOG #1695).
+
+    **THE ORDERING IS NOT DECLARED ONCE IN THIS REPOSITORY, and saying so would be the
+    false-premise documentation that let the first copy drift.** ``tray/config.py``'s
+    ``engine_serves_https`` spells it a second time, over a raw TOML dict, and that copy stays: the
+    tray is stdlib-only by ADR 0113, and importing this module would pull pydantic and the settings
+    package into a tray icon's startup for one boolean. :func:`api_tls_source` exists so the order
+    is at least *callable* without the machinery -- it takes the two settings, not an
+    :class:`ApiSettings` -- and converging the tray onto it is unfiled follow-up work.
+    """
+
+    source: ApiTlsSource
+    #: The certificate the bind will present, **whether or not it exists yet** -- for ``generated``
+    #: this is the path the engine mints to on its first run. ``None`` only for ``upstream``.
+    cert_file: str | None
+    key_file: str | None
+
+    @property
+    def scheme(self) -> Literal["http", "https"]:
+        """The scheme the engine's OWN bind serves.
+
+        ``http`` only for a DECLARED upstream terminator, which is not a weaker posture: the proxy
+        holds the protected hop and the engine speaks plaintext behind it. A client that hardcodes
+        https breaks exactly that topology, which is why this is reported rather than assumed.
+        """
+        return "http" if self.source == "upstream" else "https"
+
+    def material(self) -> tuple[str, str | None] | None:
+        """The pair in :func:`ensure_api_tls_material`'s shape, or ``None`` for an upstream proxy."""
+        return None if self.cert_file is None else (self.cert_file, self.key_file)
+
+
+def plan_api_tls_material(api: ApiSettings, *, state_dir: Path) -> ApiTlsPlan:
+    """Decide the API bind's TLS posture **without touching the disk** -- see :class:`ApiTlsPlan`.
+
+    Pure: it neither mints, reads, nor stats anything, so it is safe on a read-only path (the
+    ``cert inventory`` reporter) and safe to call before the engine has ever run.
+    :func:`ensure_api_tls_material` consumes it, so the engine's own material is decided once.
+    """
+    source = api_tls_source(
+        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
+    )
+    if source == "operator":
+        # Pass tls_key_file through UNCHANGED, None included -- see ensure_api_tls_material.
+        return ApiTlsPlan(source, api.tls_cert_file, api.tls_key_file)
+    if source == "upstream":
+        return ApiTlsPlan(source, None, None)
+    cert_path, key_path = _generated_pair(state_dir)
+    return ApiTlsPlan(source, str(cert_path), str(key_path))
+
+
 def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str | None] | None:
     """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
 
@@ -100,7 +202,9 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     fallback BENEATH it, never a replacement -- so a site that configures its own chain sees no
     behaviour change and this function is not even consulted.
 
-    **Returns ``None`` when a reverse proxy terminates TLS upstream** -- see the guard below.
+    **Returns ``None`` when a reverse proxy terminates TLS upstream.** Which of the three postures
+    applies is :func:`plan_api_tls_material`'s decision, not this function's -- this one adds only
+    the minting, so a read-only caller can ask the same question without writing a key.
 
     **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
     ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
@@ -116,20 +220,18 @@ def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, 
     would serve an expired certificate every client rejects. The rotation shape is an open decision
     on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
     """
-    if api.tls_cert_file:  # operator-supplied material always wins
-        # Pass tls_key_file through UNCHANGED, None included -- see the key_path note above.
-        return api.tls_cert_file, api.tls_key_file
+    # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
+    # path cannot disagree about which certificate the bind presents. Two of the three branches
+    # need no disk at all: an operator's material is passed through UNCHANGED (tls_key_file's None
+    # included -- see the key_path note above), and a DECLARED UPSTREAM TERMINATOR IS NOT AN
+    # UNPROTECTED HOP, so minting there would break the proxy's own plaintext hop rather than
+    # harden anything. "Always serves TLS" means the engine never leaves a hop unprotected, NOT
+    # that it terminates TLS in every topology.
+    plan = plan_api_tls_material(api, state_dir=state_dir)
+    if plan.source != "generated":
+        return plan.material()
 
-    # A DECLARED UPSTREAM TERMINATOR IS NOT AN UNPROTECTED HOP, AND MINTING HERE WOULD BREAK IT.
-    # `tls_terminated_upstream` (+ trusted_proxies) says a reverse proxy terminates TLS in FRONT of
-    # the engine and speaks plaintext to it. Serving HTTPS underneath that proxy does not harden the
-    # deployment -- it breaks the proxy's own hop. "Always serves TLS" means the engine never leaves
-    # a hop unprotected, NOT that it terminates TLS in every topology.
-    if api.tls_terminated_upstream:
-        return None
-
-    cert_path = state_dir / _GENERATED_CERT_NAME
-    key_path = state_dir / _GENERATED_KEY_NAME
+    cert_path, key_path = _generated_pair(state_dir)
     if cert_path.exists() and key_path.exists():
         return str(cert_path), str(key_path)
 
