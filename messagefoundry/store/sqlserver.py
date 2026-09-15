@@ -206,7 +206,13 @@ def _is_transient_write_conflict(exc: BaseException) -> bool:
     a client-side query timeout (SQLSTATE ``HYT00`` — the statement gave up WAITING for a lock, having
     committed nothing) or a deadlock-victim rollback (native error 1205). Both leave the transaction
     with no persisted effect, so re-issuing an increment cannot double-apply it. Matched on the stable
-    driver substrings (rather than importing pyodbc, the lazy extra), like :func:`_is_lock_timeout`."""
+    driver substrings (rather than importing pyodbc, the lazy extra), like :func:`_is_lock_timeout`.
+
+    NOT the same predicate as ``transports.database._is_transient``, and deliberately not shared with
+    it: that one keys on a parsed SQLSTATE instead of this module's driver-substring convention, and it
+    is broader by design -- it admits the ``08`` connection-exception class, which is precisely where
+    you CANNOT prove the transaction committed nothing. Retrying an increment on an ``08`` would risk
+    the double-count this method exists to prevent."""
     s = str(exc)
     return "HYT00" in s or f"({_DEADLOCK_NATIVE_ERROR})" in s
 
@@ -9252,6 +9258,7 @@ class SqlServerStore:
         now = time.time()
         for attempt in range(_CIPHER_MERGE_ATTEMPTS):
             merged = False
+            retry = False
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
                     await cur.execute(
@@ -9278,9 +9285,20 @@ class SqlServerStore:
                         and _is_transient_write_conflict(exc)
                         and attempt < _CIPHER_MERGE_ATTEMPTS - 1
                     ):
-                        await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
-                        continue
-                    raise
+                        retry = True
+                    else:
+                        raise
+            # The backoff sleeps with the pooled connection ALREADY RELEASED (the rollback above ran
+            # inside the block, so there is nothing left to hold). Two engine-specific reasons, neither
+            # of which applies to the vault's plain `pool.acquire()` twin this was ported from: this
+            # store's `_acquire` bounds every OTHER caller's pool wait at `[store].acquire_timeout` and
+            # then raises, so sleeping on a borrowed connection spends a resource its peers time out
+            # on -- under exactly the contention this retry exists for; and a cancellation landing in
+            # the sleep would reach `_acquire`'s `except BaseException` and quarantine the connection
+            # via `_release_dirty`, destroying it to protect a transaction that was already rolled
+            # back. Holding nothing across the sleep dissolves both.
+            if retry:
+                await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
         raise RuntimeError("unreachable: the add_cipher_invocations retry loop returns or raises")
 
     async def reserve_upload_quota(

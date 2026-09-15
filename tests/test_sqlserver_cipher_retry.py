@@ -13,6 +13,7 @@ cannot double-apply) is a SQL Server property exercised end-to-end by the gated
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
@@ -72,10 +73,19 @@ class _FakeStore:
         self.commits = 0
         self.rollbacks = 0
         self.merges_run = 0  # how many MERGEs actually executed (would-be double-count if > 1)
+        self.held = 0  # pooled connections currently borrowed
+        self.events: list[str] = []  # acquire / release / sleep, in order
+        self.held_at_sleep: list[int] = []  # self.held sampled inside each backoff sleep
 
     @contextlib.asynccontextmanager
     async def _acquire(self) -> AsyncIterator[_FakeConn]:
-        yield _FakeConn(self)
+        self.events.append("acquire")
+        self.held += 1
+        try:
+            yield _FakeConn(self)
+        finally:
+            self.held -= 1
+            self.events.append("release")
 
     @contextlib.asynccontextmanager
     async def _cursor(self, _conn: _FakeConn) -> AsyncIterator[_FakeCursor]:
@@ -132,3 +142,49 @@ async def test_exhausts_the_cap_then_raises_the_last_transient() -> None:
         await _add(store)
     assert store.attempt == _CIPHER_MERGE_ATTEMPTS  # bounded — never spins forever
     assert store.commits == 0  # never committed, so nothing was counted
+
+
+async def test_the_backoff_holds_no_pooled_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backoff must sleep with the connection RELEASED.
+
+    Engine-specific, and the reason this diverges from the vault twin it was ported from. This store's
+    ``_acquire`` bounds every other caller's pool wait at ``[store].acquire_timeout`` and then raises, so
+    sleeping on a borrowed connection spends a resource its peers time out on -- under exactly the
+    contention the retry exists for. A cancellation arriving in the sleep would also reach ``_acquire``'s
+    ``except BaseException`` and quarantine the connection, destroying it to protect a transaction the
+    rollback already discarded."""
+    store = _FakeStore([_HYT00, _HYT00, None])
+
+    real_sleep = asyncio.sleep
+
+    async def _watched_sleep(delay: float) -> None:
+        store.held_at_sleep.append(store.held)
+        store.events.append("sleep")
+        await real_sleep(0)  # keep the test fast; the delay itself is not under test
+
+    monkeypatch.setattr(asyncio, "sleep", _watched_sleep)
+    assert await _add(store) == 170
+
+    assert store.held_at_sleep == [0, 0]  # nothing borrowed across either backoff
+    assert store.held == 0  # and nothing leaked at the end
+    # Every sleep sits BETWEEN a release and the next acquire, never inside a borrow.
+    assert store.events == [
+        "acquire",
+        "release",
+        "sleep",
+        "acquire",
+        "release",
+        "sleep",
+        "acquire",
+        "release",
+    ]
+
+
+async def test_a_raising_attempt_never_reaches_the_backoff() -> None:
+    """A non-transient failure must not sleep at all -- the retry flag gates the backoff, so the
+    restructured loop cannot introduce a delay on the raise path."""
+    store = _FakeStore([Exception("conversion failed")])
+    with pytest.raises(Exception, match="conversion failed"):
+        await _add(store)
+    assert store.events == ["acquire", "release"]  # no sleep
+    assert store.held == 0
