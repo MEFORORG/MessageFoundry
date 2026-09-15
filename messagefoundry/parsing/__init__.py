@@ -59,6 +59,10 @@ from messagefoundry.parsing.xml import (
     XmlValidationError,
 )
 from messagefoundry.timezone import (
+    AmbiguousLocalTimeError,
+    DstEdgePolicy,
+    DstTransitionError,
+    NonExistentLocalTimeError,
     age_from_dob,
     convert_hl7_timestamp,
     hl7_now,
@@ -136,6 +140,12 @@ __all__ = [
     "hl7_now",
     "age_from_dob",
     "length_of_stay",
+    # Raised when a named source zone does not map an HL7 wall time to exactly one instant, plus the
+    # alias naming the resolution policies so a Handler can annotate its own wrapper.
+    "DstEdgePolicy",
+    "DstTransitionError",
+    "AmbiguousLocalTimeError",
+    "NonExistentLocalTimeError",
 ]
 
 # Defense-in-depth for review finding C-1: python-hl7 logs raw field values at ERROR on
