@@ -5242,6 +5242,49 @@ class PostgresStore:
         )
         return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter every non-terminal **channel-keyed** row (ingress/routed/response) whose
+        ``channel_id`` left the registry — no router, transform or re-ingress worker exists for an
+        unknown inbound and no dispatcher claims its lane. Outbound rows are excluded: they key on
+        ``destination_name`` and drain regardless of origin. ``valid_names`` is the WHOLE
+        deployment's inbound names, never one engine shard's slice. Returns the rows killed."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id, message_id, channel_id FROM queue"
+                " WHERE stage = ANY($1::text[]) AND status = ANY($2::text[])",
+                [Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value],
+                [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            )
+            orphans = [r for r in rows if r["channel_id"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "inbound removed from registry"
+            # Pre-lock all affected messages' finalize locks in canonical order before the loop
+            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
+            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            for row in orphans:
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                    now,
+                    row["id"],
+                )
+                await self._event(conn, row["message_id"], "dead", None, error, now)
+                await self._maybe_finalize_message(conn, row["message_id"], now)
+        log.warning(
+            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+            " inbound(s): %s",
+            len(orphans),
+            ", ".join(sorted({r["channel_id"] for r in orphans})),
+        )
+        return len(orphans)
+
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the

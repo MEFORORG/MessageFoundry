@@ -1317,6 +1317,19 @@ class Engine:
             set(self._registry_runner.registry.outbound)
         )
         await self.store.dead_letter_missing_handlers(set(self._registry_runner.registry.handlers))
+        # A3c — the third lane key. Ingress, routed and response rows key on `channel_id`, and the
+        # pooled lane provider for those stages is the live registry's inbound set, so a removed
+        # inbound's rows are never claimed, never swept by the two sweeps above (which key on the
+        # other two columns), and invisible to the buildup and stall alerts (they ask pending_depth
+        # about registry lanes only). Before this they sat pending forever with no disposition at all
+        # — an ACKed message stuck "in progress" for the life of the store, which count-and-log
+        # forbids. Keyed off `inbound_names()`, NOT `registry.inbound`: under engine sharding the
+        # latter is only THIS shard's slice, and the store is unified, so it would kill every sibling
+        # shard's live rows. As with the two sweeps above, clustered/sharded nodes must run identical
+        # config (a coordinated, not rolling, restart for config changes).
+        await self.store.dead_letter_missing_inbounds(
+            set(self._registry_runner.registry.inbound_names())
+        )
         # Reference sets (ADR 0006): materialize declared sets BEFORE listeners accept (a transform's
         # reference(...) resolves on the first message), then keep the periodic loop running (idempotent
         # — already started on every node in start() for clustered followers to converge). Leader-gated
