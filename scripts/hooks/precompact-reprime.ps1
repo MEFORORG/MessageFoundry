@@ -1,21 +1,60 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-# PreCompact hook: put back the facts a compaction destroys.
+# SessionStart hook, scoped to the `compact` source: put back the facts a compaction destroys.
 #
 # WHAT A COMPACTION TAKES. The seat, the goal, the brief, which ledger numbers this worktree holds,
 # and whether the work is pushed. All of that lives in the conversation, and a compaction summarises
-# the conversation. The SessionStart hook (seat-declare-prompt.ps1) asks for a declaration exactly
-# once, at session start, and never fires again -- so after a compaction the seat is undeclared IN
-# CONTEXT even though it declared perfectly well an hour ago, and it has no idea it is holding an
-# unfiled allocation that burns if the worktree is removed.
+# the conversation. seat-declare-prompt.ps1 asks for a declaration once, at a cold start, and never
+# fires again -- so after a compaction the seat is undeclared IN CONTEXT even though it declared
+# perfectly well an hour ago, and it has no idea it is holding an unfiled allocation that burns if
+# the worktree is removed.
 #
-# WHY IT READS RATHER THAN ASKS. At SessionStart the right move is to ask, because nothing is known
-# yet and a machine that invents a goal writes a record that looks declared and says nothing. At
-# PreCompact the declaration usually ALREADY EXISTS on disk; the compaction is about to drop it from
+# WHY IT READS RATHER THAN ASKS. At a cold start the right move is to ask, because nothing is known
+# yet and a machine that invents a goal writes a record that looks declared and says nothing. After
+# a compaction the declaration usually ALREADY EXISTS on disk; the compaction dropped it from
 # context, not from the record. So this hook reads the record back. That is a restatement of a
 # stated intent, not an invented one, and the distinction is the same one seat-declare-prompt.ps1
-# draws in its own header. Adopted from gastown, which registers its `prime --hook` primer on
-# SessionStart AND PreCompact for this reason (BACKLOG #1453).
+# draws in its own header. Adopted from gastown, which registers its `prime --hook` primer for this
+# reason (BACKLOG #1453).
+#
+# ---------------------------------------------------------------------------------------------
+# THIS HOOK RAN ON THE WRONG EVENT FOR ITS WHOLE LIFE AND PUT NOTHING BACK. Recorded here because
+# the failure was silent from both ends and the next author will reach for the same wiring.
+#
+# It was registered on PreCompact and emitted
+#     {"hookSpecificOutput":{"hookEventName":"PreCompact","additionalContext":"..."}}
+# The harness REJECTED that on every fire. Measured live 2026-09-15:
+#     Hook JSON output validation failed - hookSpecificOutput.hookEventName:
+#     expected one of "PreToolUse" | "UserPromptSubmit" | "UserPromptExpansion" |
+#     "SessionStart" | "Setup" | "PreModelSwitch" | ...
+# PreCompact is a real EVENT. It is not an accepted hookSpecificOutput.hookEventName. So the reprime
+# text never reached context once, and it surfaced only because the rejection notice happened to
+# echo the payload into a transcript somebody was reading.
+#
+# THE EVENT WAS THE DEEPER HALF, so repairing the payload alone would have shipped a second dud.
+# PreCompact fires BEFORE the summary is written, which makes anything it adds to context exactly
+# what the compaction then summarises away -- self-defeating by construction. The vendor
+# documentation agrees from the other side: exit-0 stdout is added to context for UserPromptSubmit,
+# UserPromptExpansion, SessionStart and PostModelSwitch, PreCompact is in none of those lists, and
+# no context-injection schema is documented for it at all. That documentation names this very
+# repair: use a SessionStart hook on the `compact` source to re-inject context after a compaction.
+#
+# SO THE OUTPUT IS NOW PLAIN TEXT ON STDOUT, exit 0 -- the form seat-declare-prompt.ps1 has always
+# used at SessionStart, and the form measured landing in context on the same day.
+#
+# WHY THE SOURCE GUARD IS IN THIS SCRIPT RATHER THAN IN A MATCHER. The documented alternative is a
+# `"matcher": "compact"` on the settings row. No SessionStart matcher has ever been used in this
+# repository and whether this harness honours one is UNMEASURED, while the no-matcher row is
+# measured to fire on a compaction. Picking the unmeasured spelling would risk re-shipping the very
+# defect above: a hook that reads as wired and never runs. So the row stays match-all and the
+# scoping lives here, where a test can drive it. Adding the matcher later stays safe -- this guard
+# holds either way, and the two agreeing is the belt-and-braces shape usage-headroom-inject.ps1
+# already uses with its own $SPAWN_TOOLS guard.
+#
+# THE GUARD FAILS OPEN, ON PURPOSE. It goes quiet only when it can POSITIVELY read a payload saying
+# this is not a compaction restart. An absent or unparseable payload speaks anyway, because a hook
+# that says something unnecessary is a nuisance somebody notices, and a hook that silently says
+# nothing is the defect this file exists to record.
 #
 # LEGIBLE SILENCE. If no declaration is found, this hook says so rather than saying nothing, and
 # repeats the declare command. "Never declared" and "declared, then compacted away" have opposite
@@ -23,8 +62,11 @@
 #
 # THIS HOOK MUST NEVER FAIL THE TURN. It exits 0 on every path.
 #
-# WIRING IS NOT ASSERTED HERE ON PURPOSE. Whether this script is referenced by a PreCompact matcher
-# is a property of settings.json, not of this file.
+# WIRING IS ASSERTED, in tests/test_precompact_reprime_hook.py, against .claude/settings.json. This
+# header used to say wiring was left unasserted on purpose, because the matcher is settings.json's
+# property and not this file's. That much is true, and it is why the check lives in a test rather
+# than in this script -- but "not asserted here" got read as "not asserted", and nothing anywhere
+# checked the event or the payload. That is how a hook ships dead.
 # See docs/WORKTREES.md.
 
 Set-StrictMode -Version Latest
@@ -32,14 +74,75 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Context {
     param([string]$Text)
-    $payload = [pscustomobject]@{
-        hookSpecificOutput = [pscustomobject]@{
-            hookEventName     = 'PreCompact'
-            additionalContext = $Text
+    # Plain text, not JSON. See the header: exit-0 stdout is what SessionStart adds to context.
+    [Console]::Out.Write($Text)
+}
+
+function ConvertTo-UtcInstant {
+    # WHY THIS IS NOT A [datetime]::TryParse CALL. ConvertFrom-Json already hands back a [datetime]
+    # with Kind=Utc for an ISO-8601 `Z` string, and the only thing that destroys that is casting it
+    # back to a string: [string] renders the UTC WALL CLOCK with no zone marker ("09/15/2026
+    # 15:52:28"), and re-parsing that yields Kind=Unspecified, which then subtracts as though it were
+    # LOCAL. That round-trip is what made a six-minute-old declaration report "-0.2 days old" -- wrong
+    # by exactly the UTC offset, and NEGATIVE anywhere west of Greenwich. Measured 2026-09-15. So take
+    # the [datetime] as it arrives, and parse only when the value is genuinely a string.
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $dt = [datetime]::MinValue
+    if ($Value -is [datetime]) {
+        $dt = [datetime]$Value
+    } elseif (-not [datetime]::TryParse([string]$Value, [ref]$dt)) {
+        return $null
+    }
+    if ($dt.Kind -eq [System.DateTimeKind]::Utc) { return $dt }
+    if ($dt.Kind -eq [System.DateTimeKind]::Local) { return $dt.ToUniversalTime() }
+    # seat.ps1 writes this field as UTC with a trailing Z, so an unzoned value came from that writer
+    # and is UTC. Assuming LOCAL here would reintroduce the very offset error described above.
+    return [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+}
+
+function Format-Age {
+    # A negative age is not a small age. It means this session's clock and the record's disagree, and
+    # rounding it to "0.0 days" would hide the one fault in this line worth reporting.
+    param([timespan]$Span)
+    if ($Span.TotalSeconds -lt 0) {
+        return 'declared in the FUTURE -- this session and the record disagree on the clock'
+    }
+    if ($Span.TotalHours -lt 1) { return "$([math]::Round($Span.TotalMinutes)) minutes old" }
+    if ($Span.TotalDays -lt 1) { return "$([math]::Round($Span.TotalHours, 1)) hours old" }
+    return "$([math]::Round($Span.TotalDays, 1)) days old"
+}
+
+# ---- scope: a compaction restart, and nothing else --------------------------------------------
+# Read before any other work, so the common case (a cold start) costs one JSON parse and exits.
+$hookSource = ''
+$hookEvent = ''
+try {
+    if ([Console]::IsInputRedirected) {
+        $raw = [Console]::In.ReadToEnd()
+        if ($raw) {
+            $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+            $names = $payload.PSObject.Properties.Name
+            if ($names -contains 'source' -and $payload.source) {
+                $hookSource = [string]$payload.source
+            }
+            if ($names -contains 'hook_event_name' -and $payload.hook_event_name) {
+                $hookEvent = [string]$payload.hook_event_name
+            }
         }
     }
-    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+} catch {
+    # An unreadable payload is the fail-open case: both discriminators stay empty and the hook speaks.
+    $hookSource = ''
+    $hookEvent = ''
 }
+
+# `startup`, `resume` and `clear` are cold starts. seat-declare-prompt.ps1 already owns those, and a
+# reprime there would contradict it by reporting a seat the session has not chosen yet. A payload
+# naming any event other than SessionStart is a leftover registration on some other event, and it
+# must stay quiet: its stdout does not reach context, so the work is wasted either way.
+if ($hookSource -and $hookSource -ne 'compact') { exit 0 }
+if ($hookEvent -and $hookEvent -ne 'SessionStart') { exit 0 }
 
 try {
     $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -88,11 +191,15 @@ try {
         $stale = $declBranch -and $branchNow -and ($declBranch -ne $branchNow)
 
         $age = ''
+        $declaredDisplay = ''
         if ($declared.PSObject.Properties['declaredAt'] -and $declared.declaredAt) {
-            $parsed = [datetime]::MinValue
-            if ([datetime]::TryParse([string]$declared.declaredAt, [ref]$parsed)) {
-                $days = [math]::Round(((Get-Date) - $parsed).TotalDays, 1)
-                $age = " ($days days old)"
+            $declaredUtc = ConvertTo-UtcInstant $declared.declaredAt
+            if ($null -ne $declaredUtc) {
+                $age = ' (' + (Format-Age ((Get-Date).ToUniversalTime() - $declaredUtc)) + ')'
+                # Rendered in local time WITH its offset, so it cannot be read as the other zone. The
+                # stored field is a UTC instant, and printing its bare wall clock is what made an
+                # already-confusing line look local.
+                $declaredDisplay = $declaredUtc.ToLocalTime().ToString('yyyy-MM-ddTHH:mm:ssK')
             }
         }
 
@@ -109,7 +216,7 @@ try {
             $lines += "GOAL: $($declared.goal)"
             if ($declared.PSObject.Properties['done'] -and $declared.done) { $lines += "DONE WHEN: $($declared.done)" }
             if ($declared.PSObject.Properties['outOfScope'] -and $declared.outOfScope) { $lines += "OUT OF SCOPE: $($declared.outOfScope)" }
-            if ($age) { $lines += "declared at $($declared.declaredAt)$age" }
+            if ($declaredDisplay) { $lines += "declared at $declaredDisplay$age" }
         }
     } else {
         $lines += "SEAT: not declared. Nothing on disk carries a goal for this worktree, so this is the"
