@@ -349,8 +349,19 @@ INVENTORY: dict[str, frozenset[str]] = {
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself is delegated to store/backup_codec.py — a
     # CRYPTO_SEAM_MODULES import, so that delegation is now a first-class inventory token.
+    #
+    # BACKLOG #1561 adds the SECOND seam, and the two are different operations under different key
+    # material — which is the whole reason both are listed rather than one standing in for the other:
+    #   * backup_codec  — SEALING the .mfbak, chunked AES-256-GCM over raw DEK bytes from
+    #                     resolve_active_key. cipher_provider never reaches it.
+    #   * store.crypto  — READING the extracted snapshot's own cells on a FULL restore-verify, through
+    #                     the store cipher (build_store_cipher, so vault_transit DOES reach it) with the
+    #                     store's own per-cell AAD. Decrypt-and-authenticate only; it reports a COUNT of
+    #                     cells opened and writes no plaintext anywhere.
+    # Registered rather than suppressed: this file now performs at-rest crypto through the store seam,
+    # and the bidirectional gate should red if that stops being true.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
-        {"hashlib", "messagefoundry.store.backup_codec"}
+        {"hashlib", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
     ),
     # ADR 0073: rendezvous (HRW) outbound-lane ownership for engine shards — sha256 as a STABLE,
     # process-independent hash (the salted builtin hash() differs per process, which would let two

@@ -409,10 +409,20 @@ application log files (`[logging].log_dir`).
     ([store/backup_codec.py](../messagefoundry/store/backup_codec.py), whose own docstring says the
     cipher *mechanism* is net-new): chunked AES-256-GCM under the store DEK resolved directly by
     `resolve_active_key`, with a per-chunk AAD of
-    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. Because the
+    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. Because that
     key is resolved by `resolve_active_key` and not `build_store_cipher`, `cipher_provider =
-    vault_transit` **never applies to a backup**. And `[backup].allow_unencrypted = true` writes a
-    **CLEARTEXT `.mfbak.plain`** — a plaintext PHI-body archive on disk.
+    vault_transit` **never applies to sealing or unsealing an archive**. And
+    `[backup].allow_unencrypted = true` writes a **CLEARTEXT `.mfbak.plain`** — a plaintext PHI-body
+    archive on disk.
+    - *Scope of that sentence.* It is about the **archive**, not about every step of a backup run.
+      `[backup].full_restore_verify` opens the *extracted* snapshot and decrypts its cells to prove the
+      PHI is still readable, and reading a store cell is what the store cipher is for — so that step
+      **does** go through `build_store_cipher`, and therefore through Transit under `vault_transit`.
+      Two paths, two key uses, one key source; the split is recorded once in
+      [ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md) §"Encryption boundary" and pinned by
+      `tests/test_phi_at_rest_inventory.py::test_the_mfbak_seal_never_reaches_for_the_store_cipher`.
+      That pass decrypts into memory and reports a **count** of cells opened; it writes no plaintext,
+      so it adds no at-rest tier to this inventory.
   - *File-connector spill dirs* — **plaintext on disk**; there is no cipher on that path, only
     volume/share encryption and the directory ACL.
 - **Integrity.** The per-value GCM tag is the tamper-evidence. For `attachment_chunk.ciphertext` each
