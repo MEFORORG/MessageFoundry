@@ -9,7 +9,8 @@ temp name, then ``rename``) so a reader watching the directory never sees a part
 
 **Source** polls a directory for files, hands each to the pipeline handler, then moves the
 file into a ``.processed`` subdirectory (or ``.error`` if the handler raised). Files have
-no reply channel, so the handler's return value is ignored.
+no reply channel, so the *pipeline* handler's return value is ignored here. That is not a statement
+about a config **Handler**: its return is routed like any other (and an inadmissible one raises).
 """
 
 from __future__ import annotations

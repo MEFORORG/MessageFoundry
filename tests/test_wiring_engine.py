@@ -180,6 +180,49 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
     ).exists()  # nothing delivered — failed closed, not accept-and-drop
 
 
+async def _last_errors(store: MessageStore, message_id: str) -> str:
+    """Every stage row's decrypted ``last_error`` for one message, joined. The DLQ readers
+    (``list_dead``/``outbox_for``) are scoped to the OUTBOUND stage, so a routed-stage failure is
+    invisible to them and this probes the queue table directly."""
+    cur = await store._db.execute("SELECT last_error FROM queue WHERE message_id=?", (message_id,))
+    return " ".join(store._cipher.decrypt(r["last_error"] or "") for r in await cur.fetchall())
+
+
+async def test_unrecognised_handler_return_dead_letters_in_the_live_runner(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # BACKLOG #1687, the live-runner half of the shape table in test_dryrun.py / test_sandbox_codec.py.
+    # A Handler returning its own Message used to partition to nothing: the message finalized FILTERED
+    # with events received/routed/transformed, nothing delivered, and no WARNING-or-above record
+    # anywhere — the author's slip wearing the disposition of a deliberate decline. What this test adds
+    # to the unit-level ones is the SEAM: the transform stage really does route the ValueError to the
+    # internal-error policy, so it is an ERROR an operator can see and replay. The other three measured
+    # shapes are pinned where they differ (the message text), not by re-running a whole engine.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+
+    reg = _registry(inbox, outdir, lambda m: ["h"], {"h": lambda m: m})
+    runner = await _run(reg, store)
+    try:
+        await _until_message(store, MessageStatus.ERROR.value)
+    finally:
+        await runner.stop()
+    assert not (outdir / "MSG1.hl7").exists()  # nothing delivered
+
+    rows = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    mid = rows[0]["id"]
+    errors = await _last_errors(store, mid)
+    # The stored signal has to name BOTH the handler and the type, or an operator holding a dead
+    # message cannot get from it back to the line of Python that produced it.
+    assert "unsupported Message" in errors and "'h'" in errors
+    assert "DOE" not in errors and "JANE" not in errors  # the message carries no PHI to redact
+    # Replayable: the dead row is a routed-stage row, so a fixed Handler re-runs this message rather
+    # than the operator re-sending it from the partner.
+    assert await store.replay(mid) == 1
+    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+
+
 class _BoomSource(SourceConnector):
     """A source whose start() always fails (simulates a port-in-use bind error). Inherits
     SourceConnector so it carries the full interface (e.g. the #114 validate_startup no-op the runner
@@ -340,8 +383,7 @@ async def test_handler_exception_redacts_phi_from_stored_error(
     mid = (await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value))[0][
         "id"
     ]
-    cur = await store._db.execute("SELECT last_error FROM queue WHERE message_id=?", (mid,))
-    errors = " ".join(store._cipher.decrypt(r["last_error"] or "") for r in await cur.fetchall())
+    errors = await _last_errors(store, mid)
     assert "ValueError" in errors and "handler error" in errors  # type + context kept
     assert "DOE" not in errors and "JANE" not in errors  # PHI redacted out of last_error
     # the 'dead' event detail (built from the same exception) is redacted too

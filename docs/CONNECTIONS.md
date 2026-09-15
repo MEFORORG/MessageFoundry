@@ -206,6 +206,12 @@ handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Se
 a list is the idiom shown throughout these docs, but **any non-`str` iterable** delivers the same
 `Send`s (a tuple, a set, or a generator that `yield`s them). An **empty** one (`return []` /
 `return ()`) is the filter: nothing is delivered and the message is logged `FILTERED`.
+
+A Handler returns a `Send`, a `SetState`, a `SetMeta`, an iterable of those, or `None` — **and
+nothing else**. Returning the message itself, `msg.encode()`, a `dict`, or a `(name, message)` tuple
+is an authoring error: the engine raises, naming the handler and the type, and the message is
+`ERROR`/dead-lettered and replayable. It is never silently `FILTERED`, which would be
+indistinguishable from a Handler that deliberately declined it.
 Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
 duplicate name (across **any** of these files) and an inbound that binds a router that doesn't exist.
 
@@ -441,9 +447,11 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
         router="x12_router", content_type="x12")
 ```
 
-- **No HL7 ACK.** A `Tcp(...)` source does **not** generate an HL7 acknowledgement. If a Handler
-  returns a payload it is framed back to the sender on the same connection (so a framed
-  application-level reply is possible); returning `None` sends nothing.
+- **No HL7 ACK, and no reply at all.** A `Tcp(...)` source does **not** generate an HL7
+  acknowledgement, and the engine writes nothing back on the inbound socket — routing runs after the
+  ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
+  returning `Send("<outbound>", payload)`; returning the payload bare is an authoring error and
+  raises (ERROR / dead-letter, replayable) rather than delivering.
 - **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
   validation, or content sniffing in the connector.
 - **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
@@ -519,9 +527,12 @@ inbound("X12-IN_PARTNER_270", X12(port=2710, max_messages_per_second=10, message
 See `samples/config/IB_PARTNER_X12.py` + `samples/messages/x12_270_eligibility.edi` for a runnable
 example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 
-- **No X12 ACK on the *inbound*.** An `X12(...)` source does **not** generate a TA1/997/999. If a
-  Handler returns a payload it is written back **verbatim** on the same connection; returning `None`
-  sends nothing.
+- **No X12 ACK on the *inbound*, and no reply at all.** An `X12(...)` source does **not** generate a
+  TA1/997/999, and the engine writes nothing back on the inbound socket — routing runs after the
+  ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
+  returning `Send("X12-OUT_...", payload)` to an **outbound**; returning the payload bare is an
+  authoring error and raises (ERROR / dead-letter, replayable) rather than delivering. For a
+  synchronous 270/271 use the capturing outbound below.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
@@ -2651,10 +2662,10 @@ quarantined to the error directory — charges.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; an ACK over its write bound drops the connection as a `peer_reset` | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
-| Raw TCP listener (inbound) | `receive_timeout` 60 s | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path | n/a |
-| X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal is **log-only** (no connection_event) and a **capacity refusal is silent — no event and no log** | n/a |
+| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
+| X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal is **log-only** (no connection_event) and a **capacity refusal is silent — no event and no log**; a reply over its write bound likewise drops the connection on a **logged warning only** — this listener emits no connection_event of any kind | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |

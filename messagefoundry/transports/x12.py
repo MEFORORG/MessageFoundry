@@ -14,9 +14,16 @@ stop). For partners who *do* wrap each interchange in a fixed sentinel (STX/ETX,
 The payload is relayed **opaquely**: each received interchange's raw bytes are handed to the pipeline
 handler and routed as a :class:`~messagefoundry.parsing.message.RawMessage` (pair it with
 ``content_type="x12"`` on the inbound, ADR 0004); a Router/Handler parses it on demand via the pure
-:mod:`messagefoundry.parsing.x12` codec. There is **no X12 acknowledgment** (TA1/997/999 are deferred)
-— if a Handler returns a reply it is written back verbatim, otherwise nothing is sent. Delivery is
-at-least-once, so the receiving system must be **idempotent**.
+:mod:`messagefoundry.parsing.x12` codec. There is **no X12 acknowledgment** (TA1/997/999 are deferred).
+Delivery is at-least-once, so the receiving system must be **idempotent**.
+
+**A Handler does not reply down the inbound socket, and must not try.** The reply this connector
+writes back is whatever the *pipeline* handler it was given returns (:data:`InboundHandler`,
+``bytes -> str | None``), and the engine's is ``None`` for every non-HL7 content type — routing runs
+after the ingress commit, not inside this call. A Handler reaches a partner by returning
+``Send("X12-OUT_...", payload)`` to an **outbound** connection; returning the payload BARE is an
+authoring error and raises rather than delivering (BACKLOG #1687). For a synchronous 270/271 use the
+capturing *outbound* (``capture_response``/``reingress_to``, ADR 0016) documented below.
 """
 
 from __future__ import annotations
@@ -60,6 +67,12 @@ logger = logging.getLogger(__name__)
 # Established clients get this long to finish an in-flight commit on stop()/reload before cancellation
 # (mirrors MLLPSource/TcpSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
+
+# Seconds one reply gets to drain to the sender before the connection is dropped. Same value, and the
+# same reasoning, as TcpSource's `_REPLY_DRAIN_GRACE` — see transports/tcp.py for why this is the
+# shutdown grace rather than a new per-connection knob, and why reusing `receive_timeout` would
+# reopen the hole through a supported setting.
+_REPLY_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 
 
 # --- destination -------------------------------------------------------------
@@ -462,8 +475,11 @@ class X12Destination(DestinationConnector):
 
 class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
-    **raw bytes** to the pipeline handler. No HL7/X12 ACK: if the handler returns a non-``None`` reply,
-    it is written back verbatim on the same connection; otherwise nothing is sent (fire-and-forget)."""
+    **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
+    (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
+    back verbatim on the same connection; the engine's returns ``None`` for every non-HL7 content type,
+    so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
+    see this module's docstring."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -539,6 +555,24 @@ class X12Source(SourceConnector):
                 logger.warning("X12 server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
+    async def _drain_reply(self, writer: asyncio.StreamWriter) -> None:
+        """Flush one already-written reply to the sender under :data:`_REPLY_DRAIN_GRACE`.
+
+        Re-raises rather than handling the timeout, for the reason spelled out on
+        :meth:`TcpSource._drain_reply`. The delta here is the logging: unlike the MLLP and raw-TCP
+        listeners, ``X12Source`` emits no ADR 0021 ``connection_event`` at all, so this warning is
+        the whole of the engine-side evidence — without it the drop would leave no record anywhere.
+        """
+        try:
+            await asyncio.wait_for(writer.drain(), _REPLY_DRAIN_GRACE)
+        except TimeoutError:
+            logger.warning(
+                "X12 reply to %s not drained within %.1fs; dropping the connection",
+                writer.get_extra_info("peername"),
+                _REPLY_DRAIN_GRACE,
+            )
+            raise
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         task = asyncio.current_task()
@@ -579,7 +613,7 @@ class X12Source(SourceConnector):
                             reply = await self._handler(interchange)
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
-                                await writer.drain()
+                                await self._drain_reply(writer)
                         # Charge AFTER the interchanges in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)

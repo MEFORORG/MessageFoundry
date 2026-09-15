@@ -13,10 +13,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.transports import mllp as mllp_mod
 from messagefoundry.transports.mllp import SB, MLLPSource, build_ack, frame
 from messagefoundry.transports.tcp import TcpSource
 
@@ -166,6 +169,96 @@ async def test_idle_timeout_close_reason() -> None:
     assert await _wait_for(lambda: "closed" in cap.kinds())
     closed_reason = next(r for k, _, r in cap.events if k == "closed")
     assert closed_reason == "idle_timeout"
+
+
+class _StalledPeer:
+    """A sender that takes the ACK bytes and then never drains them.
+
+    A fake rather than a real socket: wedging a real loopback peer means filling its receive window,
+    which takes hundreds of KiB of a size the OS picks, so the wedge would be slow and
+    platform-dependent. The bound under test is on ``drain()``, and this reproduces exactly that.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        # TEST-NET-2 (RFC 5737) — a documentation address, never a routable one.
+        return ("198.51.100.7", 2575) if name == "peername" else default
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        await asyncio.sleep(3600)  # the peer is not reading; nothing here ever completes
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+class _OneFrameThenSilent:
+    """Hands over one framed message, then holds the connection open without reaching EOF."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, _n: int) -> bytes:
+        if self._data:
+            chunk, self._data = self._data, b""
+            return chunk
+        await asyncio.sleep(3600)
+        return b""
+
+
+async def test_ack_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sender that stops reading must not pin the connection or the slot it holds (BACKLOG #1617).
+
+    ``receive_timeout`` bounds the READ. The ACK write's ``drain()`` was unbounded, so a peer whose
+    receive window filled while it kept the connection open would hold its ``max_connections`` slot
+    for as long as it liked, with nothing to time it out.
+    """
+    # The release the fix rides on, asserted rather than assumed: were TimeoutError to stop being an
+    # OSError, _on_client's existing arm would miss it and the slot would leak, while the outcome
+    # assertions below could still pass on a cancelled task.
+    assert issubclass(TimeoutError, OSError)
+
+    cap = _Capture()
+    source = _mllp(max_connections=1)
+    source.on_connection_event = cap
+    await source.start(_ack_handler)
+    # Bound the ACK write ONLY. Shrinking _CLIENT_SHUTDOWN_GRACE instead would also shrink the
+    # teardown measured at the end, and a stop() that returned fast because its own grace was 0.05 s
+    # would say nothing about the connection.
+    monkeypatch.setattr(mllp_mod, "_ACK_DRAIN_GRACE", 0.05)
+    peer = _StalledPeer()
+    try:
+        client = asyncio.create_task(
+            source._on_client(_OneFrameThenSilent(frame(ADT)), peer)  # type: ignore[arg-type]
+        )
+        # Unbounded, this never returns. The 2 s is how the regression FAILS, not the assertion.
+        await asyncio.wait_for(client, timeout=2.0)
+        assert peer.closed  # dropped, not left open on a peer that had stopped reading
+        assert source._active == 0  # ... and the max_connections slot went back
+        assert "peer_reset" in cap.kinds()
+        assert "closed" not in cap.kinds()  # a failure kind is not also reported as a clean close
+    finally:
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+        elapsed = asyncio.get_running_loop().time() - started
+    # Nothing was left in flight, so stop() must not have spent its shutdown grace waiting.
+    #
+    # A LITERAL ceiling, deliberately NOT _CLIENT_SHUTDOWN_GRACE -- do not "tidy" it back to the
+    # constant. Deriving it from the shutdown grace is what made the previous version inert: the
+    # grace is 5.0 and so is the wait_for above, so a stop() slow enough to matter raised
+    # TimeoutError there before the assert was ever reached. It could only ever be evaluated in
+    # worlds where it already held. Measured: with a 2.5 s stop() injected, `elapsed < 5.0` passed.
+    # 2.0 sits far below that 5.0, so the assert is REACHED and can fail, and far above the 0.05 s
+    # _ACK_DRAIN_GRACE plus scheduling slack on a loaded runner, so it is not flaky. PR 1122 uses
+    # the same 2.0 for the same reason in the TCP/X12 twins of this test; keep the three in step.
+    assert elapsed < 2.0
 
 
 async def test_tcp_emits_established_then_closed() -> None:

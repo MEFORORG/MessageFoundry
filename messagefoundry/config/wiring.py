@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -213,13 +213,70 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
+#: The spellings a ``cast = "bool"`` environment value may carry, case-folded. An operator writes a
+#: boolean into ``environments/<env>.toml`` or a ``MEFOR_VALUE_*`` variable as TEXT, and each of these
+#: reads unambiguously as one side or the other in a config file.
+_BOOL_SPELLINGS: dict[str, bool] = {
+    "true": True,
+    "1": True,
+    "yes": True,
+    "on": True,
+    "false": False,
+    "0": False,
+    "no": False,
+    "off": False,
+}
+
+
+def _cast_bool(raw: Any) -> bool:
+    """Parse an environment value's boolean spelling — the ``cast = "bool"`` named cast (ADR 0007).
+
+    The builtin ``bool`` cannot do this job. An environment value arrives as a **string**, and
+    ``bool(str)`` is true for every non-empty one, so ``MEFOR_VALUE_X=false`` (and ``0``/``no``/``off``)
+    would resolve to ``True`` — the inverse of what the operator wrote, silently, with only an unset or
+    empty value ever reading as ``False``. Recognize the spellings instead, and refuse an unrecognized
+    one rather than guessing a side.
+
+    A value that is already a ``bool`` passes through: ``environments/<env>.toml`` is TOML, so a native
+    ``flag = true`` reaches here typed, and re-parsing it would be the same mistake in reverse. The
+    integers ``0``/``1`` are taken for the same reason — TOML types ``flag = 1`` as an ``int`` and the
+    strings ``"0"``/``"1"`` are already accepted, so refusing only the typed form would be an arbitrary
+    seam. Any other int (``2``, ``-1``) has no unambiguous reading and raises.
+
+    Raises ``ValueError`` — what both cast call sites already catch, so the failure is batched and
+    redacted by :func:`resolve_env_settings` rather than propagating raw. See the raise below for why
+    the message must not name the value."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        spelled = _BOOL_SPELLINGS.get(raw.strip().lower())
+        if spelled is not None:
+            return spelled
+    if isinstance(raw, int) and raw in (0, 1):
+        return raw == 1
+    # NEVER put ``raw`` in this message, and do not rely on the caller to strip it. The value can be a
+    # store password or a connector key, and ``resolve_env_settings`` renders only ``type(exc).__name__``
+    # -- so a value included here would be dropped TODAY, but by that handler's choice rather than by
+    # anything here. That is one edit away from being false: the same value used to leak twice from that
+    # block, once from its own f-string and once from inside ``int``'s "invalid literal for int() with
+    # base 10: '<value>'", and BACKLOG #1183 had to remove both halves. Keeping the value out at the
+    # source makes the invariant hold whatever the handler renders later.
+    raise ValueError(f"not one of {', '.join(sorted(_BOOL_SPELLINGS))} (value withheld)")
+
+
+# ``resolve_env_settings`` builds its operator diagnostic from the cast's ``__name__`` ("value is not a
+# valid <name>"), so this has to read as the cast the operator actually wrote in ``connections.toml`` —
+# "not a valid bool" — rather than naming this private helper.
+_cast_bool.__name__ = "bool"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
     "int": int,
     "float": float,
-    "bool": bool,
+    "bool": _cast_bool,
     "str": str,
 }
 
@@ -1241,8 +1298,10 @@ def Tcp(
 
     Inbound takes no ``host`` (the bind interface is ``[inbound].bind_host``); pair it with
     ``content_type="x12"`` on ``inbound(...)`` so the body routes as a ``RawMessage`` (ADR 0004).
-    There is **no HL7 ACK** — a Handler may still return a payload, which is framed back to the
-    sender. Outbound dials ``host``/``port``, frames + sends; with ``expect_reply`` it waits for one
+    There is **no HL7 ACK**, and no reply of any kind: the engine writes nothing back on the inbound
+    socket, because routing runs after the ingress commit rather than inside the accept. Reply to a
+    partner by returning ``Send("<outbound>", payload)``; returning the payload BARE is an authoring
+    error and raises (BACKLOG #1687). Outbound dials ``host``/``port``, frames + sends; with ``expect_reply`` it waits for one
     framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
     acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**.
 
@@ -3073,14 +3132,58 @@ def handler_result_items(result: object) -> list[object] | None:
     * The gate is ``isinstance(result, Iterable)`` — an explicit ``__iter__`` — **not** a duck-typed
       ``try: list(result)``. A :class:`~messagefoundry.parsing.message.Message` defines
       ``__getitem__(path: str)`` and no ``__iter__``, so ``list()`` would drive the legacy sequence
-      protocol with an *int* index and raise out of a Handler that merely returned its message by
-      mistake. That slip drops silently today, and this fix must not convert it into a new raise.
+      protocol with an *int* index and raise ``TypeError`` from inside the Handler's own frame — a
+      diagnosis that names neither the Handler nor what it should have returned. That slip is a
+      :func:`handler_item_fault` for the partitioner to report by name instead (BACKLOG #1687).
     """
-    if isinstance(result, str | bytes | bytearray):
+    # Tuple, not a `str | bytes | bytearray` union, for the reason recorded on HANDLER_ITEM_TYPES
+    # below: a PEP-604 union is rebuilt on every call, and this runs once per handler per message.
+    if isinstance(result, (str, bytes, bytearray)):
         return None
     if isinstance(result, Iterable):
         return list(result)
     return None
+
+
+#: The three things a Handler may return as a SINGLE item — the admissible set
+#: :func:`handler_item_fault` tests against, named so a consumer that BUCKETS these items can be held
+#: to the same set rather than restating it (``tests/test_dryrun.py`` pins that agreement). A tuple,
+#: not a ``Send | SetState | SetMeta`` union: a PEP-604 union is not constant-folded, so the union form
+#: allocates a fresh ``types.UnionType`` on every call — measured 221 ns against 24 ns for the tuple,
+#: on a path that runs once per item per handler per message.
+HANDLER_ITEM_TYPES: Final[tuple[type, ...]] = (Send, SetState, SetMeta)
+
+
+def handler_item_fault(item: object) -> str | None:
+    """``None`` when ``item`` is one of the three things a Handler may return; otherwise the one-line
+    reason it is not, for the caller to raise inside its own exception type (BACKLOG #1687).
+
+    The companion to :func:`handler_result_items`, and here for the same reason: its two consumers —
+    the in-process partitioner (:func:`messagefoundry.pipeline.dryrun._partition`) and the sandbox
+    child's encoder (:func:`messagefoundry.pipeline._sandbox_codec._enc_item`) — already import this
+    module, and ``[sandbox].mode`` must never decide whether a return value is accepted (ADR 0087).
+    Materialization says *what the items are*; this says *whether each one is admissible*.
+
+    **Both sites used to drop an inadmissible item.** The partitioner ran three ``isinstance``
+    filters and an item matching none of them fell out of all three lists; the encoder described it
+    as an ignored slot the parent rebuilt as inert. So a Handler that returned its
+    :class:`~messagefoundry.parsing.message.Message` instead of ``Send(out, msg)``, or a ``dict``, or
+    ``msg.encode()``, or a ``(name, message)`` tuple, delivered nothing and errored nothing — the
+    message finalized ``FILTERED``, which is what a Handler that *deliberately* declines looks like.
+    That is the accept-and-drop CLAUDE.md §12 forbids: the author's mistake would be indistinguishable
+    from their intent, on a first deployment, with no ERROR, no dead-letter and no replay.
+
+    An EMPTY container is untouched — it yields no items at all, so ``return []`` / ``return ()``
+    keeps filtering (this function never sees one). A non-empty ``dict`` DOES fault: it is iterable,
+    so materialization yields its **keys**, and a key is not a ``Send``."""
+    if isinstance(item, HANDLER_ITEM_TYPES):
+        return None
+    # Deliberately ASCII: this text reaches an operator's log and a stock Windows cp1252 console
+    # raises UnicodeEncodeError on the em dash the prose around it uses freely (CLAUDE.md section 11).
+    return (
+        f"returned an unsupported {type(item).__name__}; a Handler returns a Send, a SetState, a "
+        "SetMeta, any non-str iterable of those, or None"
+    )
 
 
 #: An optional **router-stage** applicability predicate a Handler may declare (``@handler(name,
@@ -3569,6 +3672,30 @@ def inbound_binding_conflicts(
     return messages
 
 
+# --- declared text-encoding validation (BACKLOG #1613) -----------------------
+# A connection's `encoding` names a Python text codec. It is read once when the connector is built
+# and then used PER MESSAGE, so a name Python cannot resolve is invisible at load and at connection
+# start and would first fail on the first real message — where the ingress decode catches only
+# UnicodeDecodeError, so the LookupError escapes uncaught instead of dead-lettering that one message.
+# Registry.encoding_problems catches it statically; the probe below is how.
+
+
+def _is_text_codec(value: str) -> bool:
+    """True if ``value`` names a codec ``str.encode`` / ``bytes.decode`` will accept.
+
+    ``"".encode(value)`` is the probe, deliberately rather than ``codecs.lookup(value)``: it is the
+    same call the connectors make, so it also rejects a registered **non-text** codec (``base64``,
+    ``hex``, ``rot13``, ``zlib``), which ``codecs.lookup`` accepts and the transports do not. The
+    mirror-image probe ``b"".decode(value)`` is no probe at all — CPython short-circuits an empty
+    decode without consulting the codec, so it returns cleanly for *every* string including
+    ``"not-a-real-codec"``."""
+    try:
+        "".encode(value)
+    except LookupError:
+        return False
+    return True
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -3672,6 +3799,9 @@ class Registry:
             if hname not in self.handlers:
                 raise WiringError(f"accepts= predicate declared for unknown handler {hname!r}")
             _check_accepts_predicate(hname, pred)
+        problems = self.encoding_problems()
+        if problems:
+            raise WiringError(problems[0])
         collisions = self.port_collisions()
         if collisions:
             port, first, second = collisions[0]
@@ -3699,6 +3829,73 @@ class Registry:
             and not isinstance(port, bool)
         ]
         return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
+
+    def encoding_problems(self) -> list[str]:
+        """Human-readable messages for declared ``encoding`` values naming no usable text codec.
+
+        Caught statically, naming the connection and the offending string, the way
+        :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
+        (see the section comment above for the runtime failure this pre-empts).
+
+        **Literal names only**, exactly like :meth:`port_collisions`. An :func:`env` reference is
+        skipped **deliberately, not by oversight**: it carries no value here (``resolve_env_settings``
+        needs the instance's environment values and :func:`validate_config` is handed only a
+        directory). Nothing checks it later either — the resolved counterpart is unbuilt, and would
+        belong in ``build_check_registry`` alongside :func:`inbound_binding_conflicts`, which is where
+        the same second pass already happens for ``env()`` ports. So the skip is *unchecked*, not
+        deferred, and :meth:`encoding_census` is what keeps it from being silent.
+
+        A ``deployed=False`` connection IS checked: parking a feed does not make a typo'd codec name
+        correct, and the ``inbound -> router`` check above treats a parked connection the same way.
+        (``port_collisions`` excludes it for a reason that does not apply here — it never binds, so it
+        genuinely cannot collide.)"""
+        problems: list[str] = []
+        for kind, name, value in self._declared_encodings():
+            if isinstance(value, EnvRef):
+                # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
+                # try/except wide enough to catch that could not tell it from a real failure.
+                continue
+            if not isinstance(value, str):
+                continue  # not a literal codec name — nothing this pass can probe
+            if not _is_text_codec(value):
+                problems.append(
+                    f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
+                    f"message would fail at decode/encode; use a codec name such as 'utf-8', "
+                    f"'latin-1' or 'cp1252'"
+                )
+        return problems
+
+    def encoding_census(self) -> tuple[int, int]:
+        """Declared ``encoding`` values, as ``(checked, unchecked)``.
+
+        A pass that examined **nothing** and one that examined everything and found it good both
+        return no problems, so this count is what tells them apart. ``unchecked`` is the ``env()``
+        refs :meth:`encoding_problems` skips; it is derived from the total, so no entry can fall into
+        a silent third bucket. Only a connector type with no ``encoding`` argument at all is in
+        neither number — every other factory writes its ``utf-8`` default into ``settings``, so
+        leaving the argument off still counts as checked."""
+        declared = list(self._declared_encodings())
+        checked = sum(1 for *_, value in declared if isinstance(value, str))
+        return checked, len(declared) - checked
+
+    def _declared_encodings(self) -> Iterator[tuple[str, str, Any]]:
+        """``(kind, name, value)`` for every registry entry whose settings carry an ``encoding``.
+
+        Every settings-bearing table, because an unusable codec name is a property of the setting and
+        not of the direction it is read in. The table list is the same one
+        ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
+        together, since a sixth settings-bearing table added to one and missed here reads as clean."""
+        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any]]]]] = [
+            ("inbound connection", ((n, c.spec.settings) for n, c in self.inbound.items())),
+            ("outbound connection", ((n, c.spec.settings) for n, c in self.outbound.items())),
+            ("database lookup", ((n, s.settings) for n, s in self.lookups.items())),
+            ("fhir lookup", ((n, s.settings) for n, s in self.fhir_lookups.items())),
+            ("reference set", ((n, r.source.settings) for n, r in self.references.items())),
+        ]
+        for kind, entries in tables:
+            for name, settings in entries:
+                if "encoding" in settings:
+                    yield kind, name, settings["encoding"]
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -5380,6 +5577,8 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
             _check_accepts_predicate(hname, pred)
         except WiringError as exc:
             diagnostics.append(Diagnostic(message=str(exc)))
+    # Mirror Registry.encoding_problems as editor diagnostics (BACKLOG #1613).
+    diagnostics.extend(Diagnostic(message=m) for m in registry.encoding_problems())
     for port, first, second in registry.port_collisions():  # low-13
         diagnostics.append(
             Diagnostic(

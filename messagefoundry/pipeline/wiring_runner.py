@@ -1857,16 +1857,26 @@ class RegistryRunner:
         the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
         so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073).
 
-        **REFUSES while a #122 log-failure halt is in force and the log is still unwritable** (ADR
-        0162). Delivery is processing: a paused outbound holds rows the halt retained, and un-pausing
-        it would ship them with no application log behind them — the same violation as re-arming an
-        inbound, reached by the other door. Gated HERE rather than in ``_start_outbound_unsafe`` so a
-        reload's outbound reconciliation is untouched; a reload never un-pauses an operator-paused
-        lane (#115/#233), so this public entry point is the only way delivery resumes."""
+        **REFUSES while a #122 log-failure halt is in force and the log is still unwritable** —
+        :meth:`_outbound_start_permitted` is the gate and carries the reason.
+
+        What is true only here is the PLACEMENT: at the door, not inside ``_start_outbound_unsafe``.
+        Two properties of the primitive make that the right depth, and neither is about how many
+        callers it has today. The gate is not a predicate — :meth:`_log_recovery_ok` performs a
+        synchronous re-validation WRITE and clears the halt latch, and a refusal PAGES — so one
+        operator ask must mean one probe and one page, which a primitive a future loop caller could
+        drive per-lane cannot promise. And the two refusals have incompatible contracts:
+        ``_start_outbound_unsafe`` RAISES (``NotDeployedError``) while this one returns QUIETLY, so
+        fusing them would make "it returned normally" stop meaning "it started".
+
+        A reload is untouched either way, and not because of this placement: its outbound
+        reconciliation resumes a lane through :meth:`_unpark_outbound_lane`, never through
+        ``_start_outbound_unsafe``. What makes THAT safe is ``_stop_outbound_unsafe`` dropping the
+        ``_gate_parked`` marker, so a halt-paused lane reads as operator-paused and no reload
+        resumes it (#115/#233)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
-            if not self._log_recovery_ok():
-                self._log_write_refused_restart(name)
+            if not self._outbound_start_permitted(name):
                 return
             await self._start_outbound_unsafe(name)
 
@@ -1885,10 +1895,19 @@ class RegistryRunner:
         """Stop + start delivery for one outbound in a single lock span (atomic w.r.t. a concurrent
         reload). The connector is kept WARM throughout (``_destinations[name]`` is never torn down) — a
         restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm, exactly like a reload.
-        Sharded: owner-only (ADR 0073)."""
+        Sharded: owner-only (ADR 0073).
+
+        **REFUSES the START half on :meth:`_outbound_start_permitted`** — the same gate
+        :meth:`start_outbound` asks, which owns the rule and the reason. Two things are true only
+        here. The refusal happens AFTER the stop, deliberately: the fail-closed outcome is a lane
+        left PAUSED, so the pause is taken first and then stands. And this door is reachable with no
+        operator at all — an alert rule's ``control_action`` can auto-fire ``restart_outbound``
+        (#144) on ``connection_stopped``, the very signal a log-failure halt raises."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._stop_outbound_unsafe(name)
+            if not self._outbound_start_permitted(name):
+                return
             await self._start_outbound_unsafe(name)
 
     def _stop_outbound_unsafe(self, name: str) -> None:
@@ -2606,6 +2625,30 @@ class RegistryRunner:
             )
         except Exception:
             log.exception("alert sink raised on a refused log-failure restart for %r", name)
+
+    def _outbound_start_permitted(self, name: str) -> bool:
+        """The #122 (ADR 0162) log-recovery gate on the two per-connection doors into resuming
+        delivery — :meth:`start_outbound` and :meth:`restart_outbound`.
+
+        **Scoped to those two deliberately, and NOT a claim that nothing else can resume delivery.**
+        At least :meth:`start`'s own outbound spawn does not pass through here, which is a separate
+        open gap rather than an exemption this helper grants; an absolute here would be a
+        compensating control resting on a false premise.
+
+        One shared helper rather than the check spelled out in each door, because the defect this
+        closes was precisely two doors and one gate: ``start_outbound`` asked, ``restart_outbound``
+        called ``_start_outbound_unsafe`` straight through, and a restart would therefore resume a
+        log-halted lane and deliver rows with no application log behind them — silently defeating the
+        count-and-log invariant on a first deployment. Two copies of a check can drift apart with
+        nothing reporting it; one cannot.
+
+        Returns True when delivery may resume. A refusal PAGES through the notifier
+        (:meth:`_log_write_refused_restart`) and the caller then returns quietly — a raise here would
+        roll a whole reload back, and the log is the one thing that cannot carry this news."""
+        if self._log_recovery_ok():
+            return True
+        self._log_write_refused_restart(name)
+        return False
 
     async def _unbind_for_log_failure(self) -> None:
         """Take intake back down when :meth:`start` came up into an unwritable application log (#122).

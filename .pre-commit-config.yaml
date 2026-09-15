@@ -85,14 +85,15 @@ repos:
       - id: ruff-check
         args: [--fix]
 
-  # These four stay `language: system`, and they are safe there for the reason ruff was not: they
+  # The local hooks below stay `language: system`, and they are safe there for the reason ruff was
+  # not: they
   # resolve `python`, which DOES exist on the ambient PATH (the Windows Python Manager 3.14.6 shim),
   # and every entry point is stdlib-only -- so they run with no venv, from any shell, in a worktree
   # that has never been provisioned. Measured 2026-08-18 in a worktree with no .venv at all: these
-  # four Passed and the two ruff hooks Failed. That measurement is WINDOWS-ONLY and the allowlist
-  # named below states its own bound rather than implying universal resolvability -- `python` (as
-  # distinct from `python3`) is not on a stock Ubuntu PATH, and nothing here measures these four on
-  # Linux. `language: system` is not the defect; a `language: system` entry naming a program that
+  # local hooks Passed and the two ruff hooks Failed. That measurement is WINDOWS-ONLY and the
+  # allowlist named below states its own bound rather than implying universal resolvability --
+  # `python` (as distinct from `python3`) is not on a stock Ubuntu PATH, and nothing here measures
+  # them on Linux. `language: system` is not the defect; a `language: system` entry naming a program that
   # only a venv provides is. That distinction is held by
   # tests/test_lint_scope_parity.py::test_language_system_hook_entries_resolve_without_an_activated_venv.
   #
@@ -126,10 +127,15 @@ repos:
   # third-party hook is the near case and IS caught -- it leaves a hook with no entry this file can
   # see, and the guard reds on that rather than vouching for it.) And it is a check on names, not an
   # execution -- it cannot tell that a script it accepts imports a third-party package, so
-  # "stdlib-only" above remains a property of these four scripts rather than something a gate holds.
+  # "stdlib-only" above remains a property of those scripts rather than something a gate holds.
   # It is also deliberately blunt in the safe direction: `pwsh` resolves on the ambient PATH here and
   # a hook naming it would still red, because nothing has measured it. Adding a program or a module to
   # either allowlist means measuring it first and writing the measurement down beside it.
+  #
+  # THE COUNT USED TO BE WRITTEN HERE -- "these four" -- and it was wrong before this change touched
+  # it: the block already held six. A count in prose beside a list that grows is a fact with nobody
+  # maintaining it, and a reader who trusts it looks at the wrong set. The characterisation replaces
+  # it, so the sentence stays true whatever the block holds.
   - repo: local
     hooks:
       # The LEDGER GATE runs here rather than as a standalone .git/hooks/pre-commit, and that is a
@@ -235,6 +241,30 @@ repos:
       - id: stale-repo-slug
         name: stale repo slug (pre-rename vault path)
         entry: python scripts/quality/stale_repo_slug_check.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # CRYPTO INVENTORY (ASVS 11.1.3). The AST walk that diffs every cryptographic call site against
+      # the maintained inventory in scripts/security/crypto_inventory_check.py. Stdlib-only, no
+      # network, measured at 1.69s over the whole tracked tree -- and until this stanza it was the
+      # ONLY required status context with no local copy at all, so the first report of an
+      # undocumented `import ssl` was a red hosted leg minutes after the author's process had exited.
+      #
+      # ***THE HOSTED JOB IN security.yml STAYS, AND THIS HOOK DOES NOT INHERIT ITS GATE.*** A commit
+      # created by the git sequencer -- a rebase, a cherry-pick -- runs ZERO hooks, recorded with a
+      # positive control under BACKLOG #1395 and mirrored by precommit-replay.yml. So a local hook
+      # can only deliver the answer EARLIER; it can never hold the line on a replayed commit. That is
+      # the same argument every other hook in this block won, and it is why adding one here is never
+      # a reason to retire the leg it duplicates.
+      #
+      # always_run with pass_filenames FALSE, matching the two screens directly above for the same
+      # reason: the scanner walks its own WALK_ROOTS, and a changed-file list would narrow what it
+      # looked at while still printing a confident count -- the shape this gate exists to catch,
+      # reproduced in its own wiring.
+      - id: crypto-inventory
+        name: crypto inventory (ASVS 11.1.3 discovery gate)
+        entry: python scripts/security/crypto_inventory_check.py
         language: system
         pass_filenames: false
         always_run: true
