@@ -113,6 +113,11 @@ holds. See *Consequences* for exactly what an operator sees change.
 - **AC-4** -- THE SYSTEM SHALL hold AC-1 through AC-3 in BOTH claim modes, which reach the claim by
   different mechanisms.
   → the same test, parametrized over `CLAIM_MODES = ["pooled", "per_lane"]`
+- **AC-5** -- WHILE the halt is latched, IF a reload ADDS an outbound connection that is deployed and
+  auto-start (door six), THEN THE SYSTEM SHALL leave that lane PAUSED with no engine park marker and
+  SHALL deliver none of its queued rows; and WHEN the sinks are repaired and a gated door starts it,
+  THE SYSTEM SHALL deliver the same retained row.
+  → `tests/test_log_write_guard.py::test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused`
 
 ## Options considered
 
@@ -129,7 +134,13 @@ holds. See *Consequences* for exactly what an operator sees change.
    Rejected, and the reason is measured rather than aesthetic. `_stop_all_for_log_failure` builds its
    pause list as the owned lanes NOT already paused, so a set populated from it would omit exactly
    the engine-parked lane that door 4 is about -- the narrowing bug, reintroduced. A set also cannot
-   cover a lane BUILT AFTER the halt (a reload adding an outbound), which is door six. Per-lane
+   cover a lane BUILT AFTER the halt (a reload adding an outbound), which is **door six**. That door
+   is now gated -- `_reconcile_outbounds` routes an outbound it would bring up while the latch holds
+   through `_stop_outbound_unsafe`, so the lane lands in the same paused state as every other one and
+   no lane reaches the claim gate on the ordinary halt (see *Negative / risks*). It is gated with a
+   STOP and not a park on purpose: `_park_outbound_lane` writes `_gate_parked`, which the door-4 gate
+   a few lines above lifts the moment a probe succeeds, so a park would re-open the door one reload
+   later off a marker the method wrote itself. Per-lane
    recovery is meaningless here anyway: the broken sink is process-global, so the moment one lane's
    door re-validates it, no lane's halt reason survives -- leaving the others latched on a premise
    just measured false would be the SDS-3.7 shape.
@@ -174,10 +185,32 @@ halted-and-quiesced lane stays purgeable.
 
 **Negative / risks** -- the pooled half is post-claim, so a halted pooled lane that some path readies
 will claim a head, reschedule it, and park, once per `_WORKER_ERROR_BACKOFF_SECONDS`, for as long as
-the disk stays broken. That is a bounded store round-trip per lane per second on a process that is
-already refusing to work, and it is the price of the dispatcher staying runner-agnostic. The claim's
-`attempts` increment is undone by the reschedule, so the retry ledger and the poison ceiling are
-untouched.
+the disk stays broken. The claim's `attempts` increment is undone by the reschedule, so the retry
+ledger and the poison ceiling are untouched.
+
+**What one of those cycles costs, measured against the SQLite store rather than estimated.** It is
+**two write transactions and a payload decrypt per lane per second**, not one round-trip.
+`claim_fifo_heads` takes the process-wide `self._lock` and runs a `SELECT`, an `UPDATE` to
+`inflight` with `attempts+1`, a re-`SELECT` for the post-increment `attempts`, and a
+`delivered_keys` probe, then commits **once for the whole lane chunk** -- so that half is amortized
+across up to `_FIFO_HEADS_LANE_CHUNK` lanes. Off the lock, `_outbox_item_from_row` **decrypts** the
+row's payload wherever at-rest encryption is on (and dereferences `shared_body` first if the row
+carries a `body_ref`). Then `reschedule_claimed` takes `self._lock` again for its own `UPDATE` and
+its **own commit, amortized across nothing** -- the gate calls it with one id, for one lane.
+
+That lock is the same one `enqueue_ingress` and every stage handoff serialize behind (both reach it
+through `_writer_txn`, whether or not the ADR 0055 group-committer is enabled), so the cost is not
+confined to a tier that is already refusing to work: a halted lane's cycle contends with intake and
+with routing/transform handoffs on the one writer. It is still bounded and it is still the price of
+the dispatcher staying runner-agnostic -- but *"a bounded store round-trip per lane per second"*,
+which this paragraph replaces, understated it, and it is the kind of sentence a later reader cites
+as a measurement.
+
+**The lane population that pays it should now be zero**, which is what makes the cost tolerable
+rather than merely bounded: the halt pauses every owned outbound through `_stop_outbound_unsafe`, a
+PAUSED lane is never claimed, and the one path that could still bring an unpaused lane up while the
+latch held -- a reload ADDING an outbound, option 4's door six -- is gated in
+`_reconcile_outbounds`. A non-zero count here means a door is missing.
 
 `log_halted` is a NEW status string on a free-form `str` field. Any consumer that switch-matched the
 old vocabulary sees an unknown value. There are no deployments to migrate (section 0), and the

@@ -4012,10 +4012,12 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
-        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
-        # carries that mechanism, and its "says nothing about the lane the halt never touched"
-        # paragraph is what this gate closes.
+        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO.
+        # `_unpark_outbound_lane` below, on a lane the ENGINE parked that the halt therefore skipped —
+        # :meth:`start_outbound` carries that mechanism, and its "says nothing about the lane the halt
+        # never touched" paragraph is what the first gate closes. And the lane this reload ADDS, which
+        # no door ever gated because it did not exist when the halt ran: ADR 0189 door six, gated a few
+        # lines further down where the comment reasons about the marker it must not write.
         #
         # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
         # action and that helper's docstring says why. None = not asked yet; a reload with no parked
@@ -4085,6 +4087,36 @@ class RegistryRunner:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
                     continue
+            # #122 (ADR 0189) DOOR SIX: the lane this reload brings up that no door ever gated. An
+            # outbound the new graph ADDS is in neither `_gate_parked` nor `_outbound_paused`, so the
+            # gate above never asks about it and the branches below build its connector and arm its
+            # lane — which the reload's own `notify_work` then seeds READY. No bytes ship (the claim
+            # gate refuses every row, which is the whole point of the latch); what the lane does
+            # instead is reach that gate once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole
+            # duration, at the cost the ADR's *Negative / risks* now states. ADR 0189 option 4's
+            # rejection named this case ("a lane BUILT AFTER the halt ... which is door six") and did
+            # not close it.
+            #
+            # `_stop_outbound_unsafe`, NOT `_park_outbound_lane`, and the difference is the fix. A park
+            # writes `_gate_parked`, which the gate directly above LIFTS the moment a probe succeeds —
+            # so a parked lane would re-open this hole one reload later, off a marker this method wrote
+            # itself. Stopping leaves the lane in exactly the state the halt left every other lane in
+            # (`_outbound_paused`, no engine marker), so the only reachable spin path collapses into the
+            # ordinary paused one and recovery is the same operator start through a gated door.
+            #
+            # A lane ALREADY paused is left untouched rather than re-stopped: `_stop_outbound_unsafe`
+            # CLEARS the quiescence Event, which would flip a drained lane's status back from 'stopped'
+            # to 'stopping' and withdraw its purge-eligibility for a reload that changed nothing. The
+            # `continue` still fails closed the way the gate above does — no connector is warmed for a
+            # lane that may not deliver, and queued rows stay PENDING.
+            #
+            # Read LIVE, not memoised: `_outbound_start_permitted` above is a PROBE, so a gate-parked
+            # lane earlier in this loop may have just repaired the sinks and cleared the latch, and
+            # every later lane should then come up normally.
+            if self._delivery_halted:
+                if name not in self._outbound_paused:
+                    self._stop_outbound_unsafe(name)
+                continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
