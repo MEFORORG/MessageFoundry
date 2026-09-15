@@ -468,6 +468,23 @@ def _is_toml_managed(source_file: str | None) -> bool:
     return source_file is not None and source_file.endswith(CONNECTIONS_FILE_NAME)
 
 
+def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for a resend into an outbound that is not delivering — one place, because both
+    resend routes ask the identical question and a second copy would drift.
+
+    It NAMES THE CAUSE for a #122 log halt (ADR 0189), and that is the point of the helper rather than
+    a nicety. "start it before resending" is the right instruction for an operator-paused lane and the
+    WRONG one for a halted engine, where the same door the message points at is refused until the
+    application log is writable again — a 409 that sends an operator to a control that cannot help is
+    the compensating-control-on-a-false-premise shape (SDS-3.7)."""
+    if rr.outbound_status(name) == "log_halted":
+        return (
+            f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
+            "is being delivered anywhere — fix the log, then start the connection, then resend"
+        )
+    return f"outbound {name!r} is not running — start it before resending"
+
+
 def _backlog(depth: int, recent: int) -> float | None:
     """Estimated seconds to clear the queue: 0 if empty, None if queued but nothing draining."""
     if depth == 0:
@@ -2018,9 +2035,14 @@ def create_app(
                     dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
                     # The collapsed display status: not-deployed (#233) WINS (never wired — not failed,
                     # not merely paused/"stopped"), then failed/filtered, else the live per-outbound
-                    # tri-state (running/stopping/stopped) — no longer the whole-engine state. A
+                    # state (running/stopping/stopped, or "log_halted" #122 ADR 0189 when the engine
+                    # cannot write its application log) — no longer the whole-engine state. A
                     # not-deployed lane is parked (paused+quiesced) exactly like a start-disabled one, so
                     # outbound_status alone would report "stopped"; the flag disambiguates the two.
+                    # failed/filtered still outrank a log halt: those are per-connection facts an
+                    # operator has to fix on THIS row, while the halt is process-wide and has its own
+                    # page (the AlertSink's log_write_failed), so collapsing them away would lose the
+                    # only per-lane explanation the row carries.
                     dstatus = (
                         "not_deployed"
                         if not oc.deployed
@@ -2082,14 +2104,14 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
-            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
-            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
-            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
-            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
+            # Also surface any DOWN outbound with no failed/filtered/edge row yet, so a down idle/no-edge
+            # lane stays visible + selectable (its purge-eligibility is the `paused` field below; the
+            # status is the live stopping/stopped, or "log_halted", reason None — no failure). A
+            # not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a start-disabled
+            # one, so outbound_status reports "stopped" for it too — but it must surface as
             # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
             # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
-            # deployed=False wins over the tri-state.
+            # deployed=False wins over the live state.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
@@ -2097,7 +2119,12 @@ def create_app(
                     standalone[oname] = ("not_deployed", None)
                     continue
                 ostatus = rr.outbound_status(oname)
-                if ostatus in ("stopping", "stopped"):
+                # "log_halted" (#122, ADR 0189) joins the two pause states here for the same reason
+                # they are here: a lane that is DOWN with no metrics edge yet must stay visible and
+                # selectable. It is also the state most in need of a row — the halt takes down every
+                # lane at once, so a console that only listed the trafficked ones would show a handful
+                # of halted lanes and silently omit the rest.
+                if ostatus in ("stopping", "stopped", "log_halted"):
                     standalone[oname] = (ostatus, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
@@ -3964,9 +3991,7 @@ def create_app(
             )
         try:
             if not rr.outbound_running(body.to):
-                raise HTTPException(
-                    409, f"outbound {body.to!r} is not running — start it before resending"
-                )
+                raise HTTPException(409, _outbound_down_detail(rr, body.to))
         except KeyError:  # neither declared nor draining (mirrors the control handlers)
             raise HTTPException(404, f"no such outbound connection: {body.to}") from None
         try:
@@ -4049,9 +4074,7 @@ def create_app(
                 )
             try:
                 if not rr.outbound_running(body.to):
-                    raise HTTPException(
-                        409, f"outbound {body.to!r} is not running — start it before resending"
-                    )
+                    raise HTTPException(409, _outbound_down_detail(rr, body.to))
             except KeyError:
                 raise HTTPException(404, f"no such outbound connection: {body.to}") from None
             try:
@@ -4875,6 +4898,13 @@ def create_app(
             committed_txns=getattr(engine.store, "committed_txns", 0),
             body_copies=getattr(engine.store, "body_copies", 0),
             fenced_writes=getattr(engine.store, "fenced_writes", 0),
+            # #122 (ADR 0189). 0 with no runner attached, the same default the B11 counters take: a
+            # graph-less engine has no claim gate to refuse anything at. getattr-with-default for the
+            # same reason the counters above use it — an alternative or older runner object reports 0
+            # rather than 500ing the whole stats read on one missing attribute.
+            halted_claim_gate_hits=getattr(rr, "halted_claim_gate_hits", 0)
+            if rr is not None
+            else 0,
         )
 
     @app.get("/metrics")

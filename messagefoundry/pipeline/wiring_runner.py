@@ -1141,12 +1141,19 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
+        # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
+        # than a field here — see that property for why the tier links to the process latch instead
+        # of restating it.
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
         self._empty_claims = EmptyClaimCounters()
+        # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused because the delivery tier was
+        # halted. See :attr:`halted_claim_gate_hits` for what a non-zero reading does and does not
+        # establish; it is the one signal this latch structurally cannot get from an enumeration.
+        self._halted_claim_gate_hits = 0
         # Bench-gated per-delivery phase timing (default OFF). Resolved ONCE here (not per delivery) so
         # the per-item body is a single bool check when off — no perf_counter, no allocation. BOTH the
         # pooled OUTBOUND StageDispatcher (_dispatch_delivery) and the per_lane _delivery_worker flow
@@ -1190,6 +1197,32 @@ class RegistryRunner:
         reads these to surface the connection-scale wall signals; nothing in the engine mutates routing
         from them."""
         return self._empty_claims
+
+    @property
+    def halted_claim_gate_hits(self) -> int:
+        """OUTBOUND rows the POOLED claim gate refused because :attr:`_delivery_halted` held (#122,
+        ADR 0189). Read-only; the ``/stats`` route surfaces it and nothing in the engine reads it back.
+
+        **What it is FOR: the one thing a latch cannot enumerate.** The latch's whole argument is that
+        counting doors is a completeness claim nobody can verify. That argument cuts both ways — it
+        also means nobody can verify that every door is now gated. A lane can only reach this gate if
+        some path brought it up UNPAUSED while the halt held, which is exactly what a missing door
+        looks like from the outside. This is the only signal that reports one.
+
+        **A non-zero reading is not automatically a defect, and the qualifier is load-bearing.** The
+        latch is set before :meth:`_stop_all_for_log_failure` takes the reload lock and pauses the
+        lanes, so a claim already in flight across that window lands here legitimately — a small,
+        BOUNDED count at the moment of the halt is the documented pause lag, not a door. What names a
+        door is a count that KEEPS CLIMBING while the halt holds: a paused lane is never claimed, so
+        every later hit is a lane that is not paused.
+
+        **POOLED ONLY, and zero is therefore NOT a clean bill** (the same shape as
+        ``claim_lock_timeouts``). The per_lane worker's gate is at its loop TOP, above the claim, so
+        nothing to count reaches a claim there — and it deliberately stays uncounted rather than being
+        made to tick at the loop top, because every running per_lane worker passes that gate once at
+        halt time and the resulting floor would bury the signal. A per_lane engine reports zero
+        forever; do not render that as "no door is missing"."""
+        return self._halted_claim_gate_hits
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -1628,13 +1661,49 @@ class RegistryRunner:
         signals."""
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
 
+    @property
+    def _delivery_halted(self) -> bool:
+        """THE DELIVERY TIER'S ONE QUESTION: may this process deliver at all? (#122, ADR 0189.)
+
+        The counterpart of :attr:`_log_halted` for the delivery tier, read at the CLAIM GATE in both
+        claim modes — :meth:`_delivery_worker`'s loop top (per_lane) and :meth:`_dispatch_delivery`
+        (pooled) — because that is the point every delivery passes through whichever door started the
+        lane. Before it, the rule could only be re-asserted at each DOOR into resuming delivery, and
+        four of those were found one at a time, each only after the previous fix shipped:
+        ``start_outbound``, ``restart_outbound``, a ``stop()``+``start()`` teardown, and the reload's
+        :meth:`_unpark_outbound_lane`. An enumeration of doors is a completeness claim nobody can
+        verify; a claim gate is not. The four door gates are KEPT as defence in depth — they fail fast
+        with an operator-legible page — and this is the backstop behind them.
+
+        **DERIVED, not a second flag, and that is deliberate (SDS-3.5).** "This process cannot log and
+        has fail-closed" is one load-bearing fact and :attr:`_log_write_stopped` already states it:
+        both halt sites set it (:meth:`_stop_all_for_log_failure`, :meth:`start`) and the only path
+        that clears it is :meth:`_log_recovery_ok`, which re-tests the sinks by WRITING to them. A
+        parallel bool set and cleared at the same four moments would be state that must agree with
+        this one, with nothing checking that it does.
+
+        **It survives a teardown, which is the whole point.** :meth:`_teardown_body` clears
+        ``_outbound_paused`` on purpose (an operator pause is in-memory and must not outlive the
+        process's graph), and the halt's own pause went with it — which is exactly how the third and
+        fourth doors resumed delivery into a dead log. ``_log_write_stopped`` is not cleared there, so
+        neither is this.
+
+        Delivery is halted iff a halt has fired and no recovery has re-validated the sinks since, so
+        the ``continue`` log-write policy (which fail-closes nothing) reads False here throughout."""
+        return self._log_write_stopped
+
     def outbound_running(self, name: str) -> bool:
         """Whether the named outbound is actively delivering (operator intent): the engine is running
         AND the outbound is not operator-paused. Raises :class:`KeyError` for a name that is neither a
         declared nor a draining outbound, so the API 404s an unknown connection (mirrors
-        :meth:`inbound_running`'s membership semantics + the outbound control handlers)."""
+        :meth:`inbound_running`'s membership semantics + the outbound control handlers).
+
+        **False for every lane while :attr:`_delivery_halted`**, whatever the pause set says. A lane a
+        door never gated (or one an unguarded path brought up) is not in ``_outbound_paused`` and was
+        reporting as actively delivering while the claim gate refused every row — the console's own
+        running/stopped split reading the opposite of what the engine does."""
         self._validate_outbound(name)
-        return self._running and name not in self._outbound_paused
+        return self._running and not self._delivery_halted and name not in self._outbound_paused
 
     def outbound_quiesced(self, name: str) -> bool:
         """Whether a PAUSED outbound has fully DRAINED to zero in-flight — the PURGE precondition. True
@@ -1648,10 +1717,26 @@ class RegistryRunner:
         return ev is not None and ev.is_set()
 
     def outbound_status(self, name: str) -> str:
-        """Tri-state delivery status for one outbound: 'running' (not paused), 'stopping' (paused, an
+        """Delivery status for one outbound: 'log_halted' (#122 — this process cannot write its
+        application log, so NO lane delivers), 'running' (not paused), 'stopping' (paused, an
         in-flight head still resolving — the quiescence Event not yet set), or 'stopped' (paused AND
         quiesced — zero in-flight, safe to purge). A name not in ``_outbound_paused`` → 'running' (the
-        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control)."""
+        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control).
+
+        **'log_halted' is FIRST and process-wide, because the halt is (ADR 0189).** The cause is a
+        root-logger handler set with no per-connection attribution to narrow it with, so while
+        :attr:`_delivery_halted` holds, every lane this process owns is down for that one reason. It
+        used to read as 'stopped' — the halt takes a lane down by pausing it, and a pause is what an
+        OPERATOR does — which told an operator the lane was waiting for them to press start, when what
+        it was waiting for was a writable disk. Reporting the cause is also the only way the fifth-door
+        case is visible at all: a lane an unguarded path brought up is not in ``_outbound_paused``, so
+        it would have read 'running' while the claim gate refused every one of its rows.
+
+        Purge-eligibility is unaffected and deliberately separate: :meth:`outbound_quiesced` still
+        answers off the pause set, so a halted-and-quiesced lane stays purgeable (the API surfaces
+        that as its own ``paused`` field, never collapsed into this string)."""
+        if self._delivery_halted:
+            return "log_halted"
         if name not in self._outbound_paused:
             return "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
@@ -3957,10 +4042,10 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
-        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
-        # carries that mechanism, and its "says nothing about the lane the halt never touched"
-        # paragraph is what this gate closes.
+        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
+        # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
+        # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
+        # mechanism behind the first.
         #
         # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
         # action and that helper's docstring says why. None = not asked yet; a reload with no parked
@@ -4021,14 +4106,53 @@ class RegistryRunner:
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
             #
             # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
-            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
-            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
-            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
-            # so the next reload on a repaired log lifts it.
-            if name in self._gate_parked:
+            # the top of this method), and the SAME refusal covers both of this method's doors.
+            #
+            # DOOR SIX (ADR 0189) is the `_delivery_halted` half of the condition: the lane this
+            # reload BRINGS UP that no door ever gated. An outbound the new graph ADDS is in neither
+            # `_gate_parked` nor `_outbound_paused`, so the un-park question was never asked about it
+            # and the branches below would build its connector and arm its lane — which the reload's
+            # own `notify_work` then seeds READY. No bytes ship (the claim gate refuses every row,
+            # which is the whole point of the latch); what the lane does instead is reach that gate
+            # once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole duration, at the cost the
+            # ADR's *Negative / risks* states. Option 4's rejection named this case ("a lane BUILT
+            # AFTER the halt ... which is door six") and did not close it.
+            #
+            # ONE GATE FOR BOTH, rather than a raw `_delivery_halted` read beside this one, because
+            # `_outbound_start_permitted` is a PROBE and not a predicate: it re-validates the sinks by
+            # WRITING to them, it can CLEAR the latch, and a refusal PAGES. Reading the latch raw here
+            # would mean a repaired disk lifts the halt on a reload that happens to touch a
+            # gate-parked lane and not on one that only adds an outbound — the same repair, the same
+            # reload, two outcomes, decided by an unrelated lane's park state. It would also refuse
+            # door six SILENTLY, when the reason the ADR keeps door gates at all is that a refusal
+            # here pages with a cause. The memo keeps it at one probe and one page per reload, and
+            # the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            #
+            # The two doors then differ only in what they leave behind, which is the fail-closed shape
+            # each needs. A lane the ENGINE parked keeps its `_gate_parked` marker — untouched,
+            # connector-less, rows retained PENDING — so a later reload on a repaired log lifts it. A
+            # lane this reload would have brought up goes DOWN through :meth:`_pause_delivery_lanes`,
+            # which owns HOW the halt takes a delivery lane down and says a third copy of that loop is
+            # how the two halts drift. It routes through `_stop_outbound_unsafe`, NOT
+            # `_park_outbound_lane`, and that difference is the fix: a park writes `_gate_parked`,
+            # which this very gate LIFTS the moment a probe succeeds, so a parked lane would re-open
+            # the hole one reload later off a marker this method wrote itself. Stopping leaves it in
+            # exactly the state the halt left every other lane in, so the only reachable spin path
+            # collapses into the ordinary paused one. Reusing the helper also inherits its per-lane
+            # `except`, so a lane that refuses to pause is logged and the rest of this reload's
+            # outbounds still reconcile instead of the raise aborting the loop partway down the list.
+            #
+            # The membership test is what separates them, and it is the caller's filter exactly as in
+            # :meth:`_stop_all_for_log_failure`: every `_gate_parked` lane is already in
+            # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
+            # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
+            # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
+            if self._delivery_halted or name in self._gate_parked:
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
+                    if name not in self._outbound_paused:
+                        self._pause_delivery_lanes([name])
                     continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
@@ -4911,6 +5035,15 @@ class RegistryRunner:
         # stable for the worker's life (never replaced), so a sticky set survives a respawn.
         wait_ev = self._lane_event(Stage.OUTBOUND, name) if self._per_lane_wake else self._work
         while not self._stop.is_set():
+            # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
+            # process has fail-closed, so this lane must not deliver no matter which door started it.
+            # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state
+            # :meth:`_router_worker`'s gate leaves, and re-armed the same way (a door that finds the
+            # log working clears the latch and respawns this worker). Placed ABOVE the operator-pause
+            # gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
+            # resume would release it straight into a claim.
+            if self._delivery_halted:
+                return
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
                 # quiescence (the <=1 in-flight _process_delivery_item below already finished on the prior
@@ -6713,6 +6846,28 @@ class RegistryRunner:
         return result
 
     async def _dispatch_delivery(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        # #122 (ADR 0189) THE CLAIM GATE, pooled half: the same one question the per_lane delivery
+        # worker asks at its loop top, asked here because the runner does not own the pooled claim —
+        # this adapter is the first runner-owned code a claimed OUTBOUND row reaches, and it is
+        # upstream of BOTH the plain and the batch send seams below.
+        #
+        # RESCHEDULE rather than mark_failed, and PARK rather than STOP. A log-write halt is a
+        # machinery fault, not the message's (ADR 0070 fix A's reasoning verbatim): mark_failed would
+        # spend a retry and, under a finite max_attempts, eventually write terminal DEAD on a row that
+        # was never sent. A plain release_claimed leaves the head past-due, so the ~0.25 s sweep
+        # re-readies it and the gate re-fires ~4x/s for as long as the disk stays broken; dating it
+        # into the future collapses that to the backoff cadence. STOP would be worse than a park in
+        # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
+        # not lift a STOPPED one, while a PARKED lane's own timer unparks it.
+        if self._delivery_halted:
+            # Counted, because reaching this line means SOME path armed an unpaused lane while the
+            # halt held — the missing-door signal the latch cannot get by enumeration. See
+            # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
+            # climbing one is not.
+            self._halted_claim_gate_hits += 1
+            park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            await self.store.reschedule_claimed([item.id], park_until)
+            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
         await self._pace_outbound(lane)
