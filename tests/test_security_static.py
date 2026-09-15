@@ -519,10 +519,29 @@ _UNSCANNABLE_RE_PATTERNS = {
     # non-catastrophic by inspection: one BOUNDED prefix repetition ``{0,6}`` (deliberately bounded --
     # unbounded it is quadratic on attacker-influenceable log text), then a literal alternation, then
     # a negated character class. No nested quantifier and no overlapping alternation.
+    #
+    # ``_CREDENTIAL_KV`` gained three spliced value fragments under BACKLOG #1685, and the clause above
+    # covers them all. Every repetition they add is DETERMINISTIC -- there is exactly one parse of any
+    # prefix, so there is nothing to re-walk:
+    #
+    # * ``_ODBC_BRACED`` is ``\{(?:[^}]|\}\})*+\}(?!\})``. Its two branches cannot both match at one
+    #   position, because ``[^}]`` excludes the single character ``\}\}`` needs. The quantifier is
+    #   POSSESSIVE, which this scanner reads as the mitigation rather than the shape, and correctly:
+    #   it is what stops the walk retrying on a brace that never closes.
+    # * ``_QUOTED_VALUE`` is ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
+    #   closer, possessive for the same reason.
+    # * ``_ODBC_BRACED_OVERRUN`` is ``\{[^\r\n]*`` -- one unbounded repetition of a negated class,
+    #   quantified nowhere and inside no quantified group.
+    #
+    # Measured 2026-09-14, minimum over 25 interleaved rounds of 20 ``sub`` passes, against a
+    # reconstruction of the pre-#1685 pattern. Every shape occurring in real log text is level or
+    # faster (plain line 2.18 against 2.27 us; the 6 KB adversarial run naming every family 359
+    # against 357 us). The one regression is a 6 KB line whose value opens "{" and never closes, at 83
+    # against 25 us -- two linear walks rather than one, recorded in full in the module's docstring.
     "messagefoundry/secretscrub.py": (
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+'",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+[\\'\\\\\"]?'",
-        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+)'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";&]+'",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3

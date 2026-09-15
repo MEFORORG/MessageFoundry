@@ -100,6 +100,10 @@ from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.split import split_by_obr
 from messagefoundry.timezone import (
+    AmbiguousLocalTimeError,
+    DstEdgePolicy,
+    DstTransitionError,
+    NonExistentLocalTimeError,
     age_from_dob,
     convert_hl7_timestamp,
     hl7_now,
@@ -195,6 +199,12 @@ __all__ = [
     "hl7_now",
     "age_from_dob",
     "length_of_stay",
+    # Raised when a named source zone does not map an HL7 wall time to exactly one instant, plus the
+    # alias naming the resolution policies so a Handler can annotate its own wrapper.
+    "DstEdgePolicy",
+    "DstTransitionError",
+    "AmbiguousLocalTimeError",
+    "NonExistentLocalTimeError",
     # Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip for on-demand Handler use.
     "CompressionError",
     "gzip_compress",
