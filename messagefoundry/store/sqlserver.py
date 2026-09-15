@@ -237,6 +237,12 @@ _CIPHER_MERGE_BACKOFF = 0.05
 # the prefix-match hazard the skip exists to kill.
 _CLAIM_PROC_LANE_MAX = 256
 
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The SQL
+#: Server twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced
+#: into :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither re-queues a
+#: delivery whose content retention has erased.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
 
 def _utf16_units(text: str) -> int:
     """The NVARCHAR length of ``text``: UTF-16 code units (astral chars count 2)."""
@@ -8354,7 +8360,12 @@ class SqlServerStore:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
         sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress/routed
-        row remains (needs re-routing), else ROUTED."""
+        row remains (needs re-routing), else ROUTED.
+
+        A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
+        idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -8375,13 +8386,15 @@ class SqlServerStore:
                     # a crash-re-run duplicate. Scoped to this message only.
                     await cur.execute(
                         "DELETE FROM delivered_keys WHERE outbox_id IN"
-                        " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                        f" (SELECT id FROM queue WHERE message_id=? AND status=?"
+                        f" AND ({_REPLAYABLE_BODY}))",
                         (message_id, OutboxStatus.DONE.value),
                     )
                 placeholders = ",".join("?" * len(replay_from))
                 await cur.execute(
                     f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                    f" updated_at=? WHERE message_id=? AND status IN ({placeholders})",
+                    f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                    f" AND ({_REPLAYABLE_BODY})",
                     (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                 )
                 count = cur.rowcount
@@ -8797,8 +8810,16 @@ class SqlServerStore:
         destination_name: str | None = None,
         now: float | None = None,
     ) -> int:
+        """Re-queue dead-lettered outbound deliveries (optionally scoped), reverting each affected
+        message from ``error`` to ``routed``. Mirrors :meth:`MessageStore.replay_dead`.
+
+        Rows whose body retention has ERASED are excluded (:data:`_REPLAYABLE_BODY`, BACKLOG #1560).
+        The predicate lives in the shared ``clause`` so it reaches BOTH the ``SELECT DISTINCT`` that
+        computes the affected message set and the UPDATE: guarding only the write would revert a purged
+        message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
+        not disturb the positional ``?`` order ``params`` depends on."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")
