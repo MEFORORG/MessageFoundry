@@ -1056,7 +1056,16 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             # consume that name permanently, since the bumping loop above skips a name that exists,
             # so every later delivery would route around the debris instead of replacing it.
             # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
-            # missed. It runs after the `with` has closed the handle, which Windows requires.
+            # missed — `return` and `break` included, which an `except` arm never sees. It runs
+            # after the `with` has closed the handle, which Windows requires.
+            #
+            # Deliberately NOT the `except BaseException` that this package's persistent-connection
+            # connectors use (mllp.py, tcp.py, x12.py). Those are connection-discard arms inside
+            # `async def`, and they are broad because an await point can deliver CancelledError and
+            # the arm must stay distinguishable from the `except DeliveryError` above it. Neither
+            # applies here: `_claim_unique` is sync, so no CancelledError can arrive mid-execution,
+            # and there is only one cleanup path to begin with. Matching that shape would widen a
+            # catch past section 6 of CLAUDE.md for nothing. Settled twice; please leave it.
             if not placed:
                 try:
                     candidate.unlink(missing_ok=True)
