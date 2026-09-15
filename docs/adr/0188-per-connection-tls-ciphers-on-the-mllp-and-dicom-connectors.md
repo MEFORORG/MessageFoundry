@@ -48,15 +48,37 @@ not a second copy — so an operator cannot put a NULL, anonymous, non-forward-s
 suite on a hop carrying PHI. Opting in therefore **narrows** that one hop to AEAD. It is the operator
 asking for the stricter list; it is not the engine imposing it on anyone who says nothing.
 
-**One helper, not four threaded copies.** `tls_policy.harden_connection_cipher_suites(ctx, settings, *,
-connector)` replaces the `harden_cipher_suites(ctx, connector=...)` call at each of the four seams. It
-reads the setting, validates and applies it when present, and then runs the existing assertion. The
-four seams were already identical in shape, so this is the whole change at each of them.
+**One helper for the narrowing, and the assertion stays at the seam.** `tls_policy.apply_connection_tls_ciphers(ctx,
+settings, *, connector)` reads the setting, validates it and applies it when present, and returns what
+it applied. It is added *above* the existing `harden_cipher_suites(ctx, connector=...)` call at each of
+the four seams, which stays exactly where it was. The four seams were already identical in shape, so
+this is the whole change at each of them:
 
-The **order** is why it is one helper. The assertion has to run on the context the connector will
-actually use, which is the post-`set_ciphers` one; threading an option into four builders would let
-that order drift on one of them, and a suite list asserted before it is replaced is an assertion of
-nothing. Here the order cannot drift.
+```python
+harden_kex_groups(ctx)                                      # pin ECDHE groups (ASVS 11.6.2)
+apply_connection_tls_ciphers(ctx, s, connector="<seam>")    # opt-in per-hop suite list (this ADR)
+harden_cipher_suites(ctx, connector="<seam>")               # assert forward secrecy (ASVS 12.1.2)
+```
+
+**The assertion may not be folded into the helper, and that is a correctness constraint rather than a
+style choice.** The ASVS 12.1.2 call-site guard
+(`tests/test_tls_policy.py::test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy`)
+reads every context builder for `harden_cipher_suites` **by name**, so that a new seam cannot ship a
+context nothing checked. A first draft of this ADR folded the two together behind one wrapper; the
+guard went red on all four seams, which is the guard working. Its call-site half is the only
+instrument that can see a seam with no assertion at all — the function-level tests exercise the
+function, not its wiring.
+
+**On order.** The seams narrow first and assert last, on the post-`set_ciphers` context the connector
+will actually use. An earlier draft claimed the single helper was needed because a drifted order would
+be unsafe. **That claim was wrong and is withdrawn here rather than quietly dropped**:
+`validate_tls_ciphers` runs on the *string*, independently of `ctx`, and it is strictly stronger than
+the assertion (allow-list included), so a seam that asserted before applying would still refuse every
+string the policy refuses. What the trailing assertion genuinely adds is a check on the **real context
+shape** — the validator probes a `PROTOCOL_TLS_SERVER` context, and a client context could in
+principle resolve the same string differently. The order is therefore checked rather than structurally
+guaranteed: `test_the_assertion_runs_on_the_post_set_ciphers_context` runs per seam, and swapping the
+two calls on one seam reds that seam alone.
 
 The setting name lives once, in `CONNECTION_TLS_CIPHERS_SETTING`, so four seams cannot spell it
 differently — a misspelled key would read as "the operator set nothing" and would never fail.
@@ -66,7 +88,11 @@ exactly: a recognised key of the connector's free-form `settings` mapping, read 
 via `settings.get(...)`, surfaced by the code-first factory — **not** a typed model field. Because
 `connections.toml` desugars `[settings]` straight through the same factory ("the factory IS the
 schema", `config/connections_file.py`), adding the factory parameter reaches the data surface too,
-with no second schema to keep in step.
+with no second schema to keep in step. Both surfaces are checked, not reasoned about:
+`test_the_code_first_factories_carry_the_setting` and
+`test_tls_ciphers_reaches_the_mllp_connector_from_connections_toml`. The DICOM half is factory-only
+(see Consequences 3), and `test_dicom_is_still_absent_from_the_toml_transport_table` pins that so the
+sentence above cannot quietly become half-false.
 
 ## Acceptance Criteria
 
@@ -89,6 +115,15 @@ with no second schema to keep in step.
 - **AC-6** — WHERE `tls_ciphers` is unset, THE SYSTEM SHALL still offer the CBC-SHA2 suites the
   approved list excludes, wherever the local OpenSSL enables any.
   → `tests/test_connection_tls_ciphers.py::test_unset_still_offers_the_suites_the_allow_list_excludes`
+
+**AC-4, AC-5 and AC-6 are three independent instruments on one boundary, and they are
+mutation-proven.** Making the unset path apply `ECDHE+AESGCM:ECDHE+CHACHA20` turns all twelve cases
+red — four seams by three instruments — so none of them is a guard that cannot fail. They are kept
+separate because they make different claims: AC-4 compares the resulting suite *set*, AC-5 forbids the
+`set_ciphers` *call* (a call resolving back to today's default would satisfy AC-4 and still freeze the
+list against a future interpreter), and AC-6 names the six suites the boundary exists to keep. AC-5
+carries its own positive control — a class-level patch on a stdlib method is the kind that silently
+misses its target, so the opt-in arm must record a call or the zero means nothing.
 
 ## Options considered
 
@@ -133,3 +168,5 @@ the peer census.
 
 - [x] Confirm the unset path performs no `set_ciphers` and resolves the reference suite list (AC-4, AC-5).
 - [x] Confirm the opt-in path runs the same validator as `[api].tls_ciphers`, allow-list included (AC-3).
+- [x] Confirm the ASVS 12.1.2 call-site guard still sees the assertion at all four seams.
+      It did not, on the first draft, and that is why the assertion is not folded into the helper.
