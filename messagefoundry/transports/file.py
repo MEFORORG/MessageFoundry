@@ -1011,7 +1011,11 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
     name is taken, so claiming a free name is a single atomic step — no check-then-act window where
     a concurrent writer could clobber us. Where hard links aren't supported (FAT/exFAT, many SMB/NAS
     mounts) ``os.link`` raises a different ``OSError``; fall back to an exclusive-create copy
-    (``O_CREAT | O_EXCL``), which is also atomic no-clobber but works cross-filesystem (review low-5)."""
+    (``O_CREAT | O_EXCL``), which is also atomic no-clobber but works cross-filesystem (review low-5).
+
+    The fallback is **fail-closed**: a copy that dies part-way removes the name it claimed, so a raise
+    from here never leaves a truncated file behind. Only the copy needs it — ``os.link`` publishes the
+    whole file or nothing."""
     stem, suffix = target.stem, target.suffix
     candidate, n = target, 0
     linkable = True
@@ -1039,8 +1043,33 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
         # inbound file is only as small as the operator's max_file_bytes (unset by default), so
         # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
         # in memory on exactly the filesystems that already can't hard-link.
-        with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
-            shutil.copyfileobj(source, handle)
+        #
+        # The exclusive create above sits OUTSIDE this guard on purpose. FileExistsError there is the
+        # loop's NORMAL control flow — it is how a taken name advances to name-1.ext — and the file
+        # sitting at that name belongs to whoever won it. Widening the guard to cover the create would
+        # delete a concurrent writer's delivery, or a previously archived message, on every collision.
+        placed = False
+        try:
+            with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
+                shutil.copyfileobj(source, handle)
+            placed = True
+        finally:
+            # A copy that dies mid-stream (a full volume, a dropped SMB share) would otherwise leave a
+            # TRUNCATED file at the DELIVERED name: a partial message handed to a downstream system,
+            # which the retry cannot correct because the retry claims name-1.ext and the fragment keeps
+            # the name. `finally`, not `except`, so nothing is caught and no failure mode is missed; it
+            # runs after `with` has closed the handle, which Windows requires before an unlink.
+            if not placed:
+                try:
+                    candidate.unlink()
+                except OSError as exc:
+                    # Never replace the in-flight copy error with a cleanup error — that one names the
+                    # cause. Log the fragment instead so an operator knows it is there.
+                    logger.warning(
+                        "could not remove the partial file %s left by a failed claim copy: %s",
+                        candidate,
+                        exc,
+                    )
         return candidate
 
 

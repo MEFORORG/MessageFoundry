@@ -11,17 +11,24 @@ The default config cannot race it (one poller per source over an engine-owned `p
 the canonical raw message is durable in the store before the ACK regardless), so this is a
 concurrency defect with no integrity consequence on the shipping configuration. It bites the
 non-default config the item names: two FILE sources sharing one `processed_dir`.
+
+`_claim_unique` is therefore the one claim both callers share, so its semantics are covered here from
+both sides: the inbound archive move above, and — in the fail-closed section at the foot of the file —
+the outbound delivery path that reaches the same helper under the default `overwrite=false`.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from pathlib import Path
+from typing import IO
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.transports.base import DeliveryError, build_destination
 from messagefoundry.transports.file import FileSource, _claim_unique
 
 #: Enough rounds to make the interleaving reliable rather than lucky. Measured on the pre-fix code
@@ -148,3 +155,108 @@ def test_claim_unique_copy_fallback_streams_the_bytes(
     claimed = _claim_unique(source, tmp_path / "dst.bin")
 
     assert claimed.read_bytes() == payload
+
+
+# --- the copy fallback is fail-closed ----------------------------------------
+#
+# `_claim_unique`'s `os.link` branch publishes the whole file or nothing. The copy fallback does not:
+# it exclusive-creates the destination and THEN streams into it, so a stream that dies part-way (a
+# full volume, a dropped SMB share) would leave a truncated file at the DELIVERED name. On the
+# outbound path that is a partial message handed to a downstream system, and the retry cannot correct
+# it: the claim already consumed the name, so the retry lands at `name-1.ext` and the fragment stays.
+#
+# Measured on the pre-fix code (Windows, 2026-09-14): a copy raising ENOSPC after 1024 of 400000 bytes
+# left `delivered.hl7` on disk at 1024 bytes, with no `.part` temp to mark it as incomplete.
+
+
+def _no_hard_links(*_a: object, **_k: object) -> None:
+    """Stand in for FAT/exFAT and the many SMB/NAS mounts where `os.link` raises a non-
+    `FileExistsError` `OSError`, which is what sends `_claim_unique` down the copy fallback."""
+    raise OSError("hard links unsupported on this filesystem")
+
+
+def _dying_copy(prefix: int) -> object:
+    """A `copyfileobj` that writes `prefix` bytes and then fails the way a full volume does."""
+
+    def _copy(fsrc: IO[bytes], fdst: IO[bytes], length: int = 0) -> None:
+        fdst.write(fsrc.read(prefix))
+        raise OSError(28, "No space left on device")
+
+    return _copy
+
+
+def test_claim_unique_removes_the_partial_when_the_copy_dies_mid_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed claim must leave NOTHING at the name it claimed.
+
+    Mutation: drop the `finally` cleanup. Red: `dst.bin` exists at 1024 of 400000 bytes."""
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    # `shutil.copyfileobj` has exactly one caller in the file transport (`_claim_unique`), so patching
+    # it module-wide reaches only the stream under test on this path.
+    monkeypatch.setattr(shutil, "copyfileobj", _dying_copy(1024))
+    payload = b"A" * 400_000
+    source = tmp_path / "src.bin"
+    source.write_bytes(payload)
+    target = tmp_path / "dst.bin"
+
+    with pytest.raises(OSError):
+        _claim_unique(source, target)
+
+    assert not target.exists(), "a truncated claim was left at the delivered name"
+    # The source is untouched, so the caller's retry (or `FileSource._move`'s re-read) still has it.
+    assert source.read_bytes() == payload
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["src.bin"]
+
+
+def test_claim_unique_never_deletes_the_file_it_lost_the_name_race_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup above must NOT cover the exclusive create.
+
+    `FileExistsError` from `os.open` is the loop's normal control flow — it is how a taken name
+    advances to `name-1.ext` — and the file sitting at that name belongs to whoever won it. A naive
+    guard wrapped around the whole loop body deletes that file on EVERY collision, turning a
+    no-clobber claim into a clobbering one.
+
+    Mutation: widen the `try` to enclose the `os.open`. Red: `out.hl7` is gone."""
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    source = tmp_path / "src.part"
+    source.write_bytes(b"PAYLOAD")
+    winner = tmp_path / "out.hl7"
+    winner.write_bytes(b"the winner's bytes")
+
+    claimed = _claim_unique(source, winner)
+
+    assert claimed.name == "out-1.hl7"
+    assert claimed.read_bytes() == b"PAYLOAD"
+    assert winner.read_bytes() == b"the winner's bytes"
+    # Assert the whole directory, not just the winner: a guard that deletes and then re-creates would
+    # satisfy a bytes-only check on a lucky ordering.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out-1.hl7", "out.hl7", "src.part"]
+
+
+async def test_file_delivery_leaves_no_partial_when_the_claim_copy_dies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap is reachable from the OUTBOUND path under the DEFAULT config, not just from the helper.
+
+    `overwrite` defaults to false, so `FileDestination._write` publishes through `_claim_unique`; on a
+    filesystem without hard links that is the copy fallback. Delivery is at-least-once and outbound
+    connections must be idempotent, so a failed send must leave the destination directory exactly as it
+    found it — no truncated message for a downstream reader to pick up before the retry."""
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(shutil, "copyfileobj", _dying_copy(8))
+    dest = build_destination(
+        Destination(
+            name="OB_TEST_ADT",
+            type=ConnectorType.FILE,
+            settings={"directory": str(tmp_path), "filename": "delivered.hl7"},
+        )
+    )
+
+    with pytest.raises(DeliveryError):
+        await dest.send("MSH|^~\\&|A|B|C|D|20260914||ADT^A01|MSG00001|P|2.5\r")
+
+    # Empty: no delivered file, and no `.part` temp either (the caller's own `finally` takes that one).
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
