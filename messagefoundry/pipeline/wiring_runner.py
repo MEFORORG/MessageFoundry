@@ -1169,6 +1169,10 @@ class RegistryRunner:
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
         self._empty_claims = EmptyClaimCounters()
+        # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused because the delivery tier was
+        # halted. See :attr:`halted_claim_gate_hits` for what a non-zero reading does and does not
+        # establish; it is the one signal this latch structurally cannot get from an enumeration.
+        self._halted_claim_gate_hits = 0
         # Bench-gated per-delivery phase timing (default OFF). Resolved ONCE here (not per delivery) so
         # the per-item body is a single bool check when off — no perf_counter, no allocation. BOTH the
         # pooled OUTBOUND StageDispatcher (_dispatch_delivery) and the per_lane _delivery_worker flow
@@ -1212,6 +1216,32 @@ class RegistryRunner:
         reads these to surface the connection-scale wall signals; nothing in the engine mutates routing
         from them."""
         return self._empty_claims
+
+    @property
+    def halted_claim_gate_hits(self) -> int:
+        """OUTBOUND rows the POOLED claim gate refused because :attr:`_delivery_halted` held (#122,
+        ADR 0189). Read-only; the ``/stats`` route surfaces it and nothing in the engine reads it back.
+
+        **What it is FOR: the one thing a latch cannot enumerate.** The latch's whole argument is that
+        counting doors is a completeness claim nobody can verify. That argument cuts both ways — it
+        also means nobody can verify that every door is now gated. A lane can only reach this gate if
+        some path brought it up UNPAUSED while the halt held, which is exactly what a missing door
+        looks like from the outside. This is the only signal that reports one.
+
+        **A non-zero reading is not automatically a defect, and the qualifier is load-bearing.** The
+        latch is set before :meth:`_stop_all_for_log_failure` takes the reload lock and pauses the
+        lanes, so a claim already in flight across that window lands here legitimately — a small,
+        BOUNDED count at the moment of the halt is the documented pause lag, not a door. What names a
+        door is a count that KEEPS CLIMBING while the halt holds: a paused lane is never claimed, so
+        every later hit is a lane that is not paused.
+
+        **POOLED ONLY, and zero is therefore NOT a clean bill** (the same shape as
+        ``claim_lock_timeouts``). The per_lane worker's gate is at its loop TOP, above the claim, so
+        nothing to count reaches a claim there — and it deliberately stays uncounted rather than being
+        made to tick at the loop top, because every running per_lane worker passes that gate once at
+        halt time and the resulting floor would bury the signal. A per_lane engine reports zero
+        forever; do not render that as "no door is missing"."""
+        return self._halted_claim_gate_hits
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -4082,12 +4112,10 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO.
-        # `_unpark_outbound_lane` below, on a lane the ENGINE parked that the halt therefore skipped —
-        # :meth:`start_outbound` carries that mechanism, and its "says nothing about the lane the halt
-        # never touched" paragraph is what the first gate closes. And the lane this reload ADDS, which
-        # no door ever gated because it did not exist when the halt ran: ADR 0189 door six, gated a few
-        # lines further down where the comment reasons about the marker it must not write.
+        # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
+        # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
+        # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
+        # mechanism behind the first.
         #
         # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
         # action and that helper's docstring says why. None = not asked yet; a reload with no parked
@@ -4149,45 +4177,54 @@ class RegistryRunner:
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
             #
             # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
-            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
-            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
-            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
-            # so the next reload on a repaired log lifts it.
-            if name in self._gate_parked:
+            # the top of this method), and the SAME refusal covers both of this method's doors.
+            #
+            # DOOR SIX (ADR 0189) is the `_delivery_halted` half of the condition: the lane this
+            # reload BRINGS UP that no door ever gated. An outbound the new graph ADDS is in neither
+            # `_gate_parked` nor `_outbound_paused`, so the un-park question was never asked about it
+            # and the branches below would build its connector and arm its lane — which the reload's
+            # own `notify_work` then seeds READY. No bytes ship (the claim gate refuses every row,
+            # which is the whole point of the latch); what the lane does instead is reach that gate
+            # once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole duration, at the cost the
+            # ADR's *Negative / risks* states. Option 4's rejection named this case ("a lane BUILT
+            # AFTER the halt ... which is door six") and did not close it.
+            #
+            # ONE GATE FOR BOTH, rather than a raw `_delivery_halted` read beside this one, because
+            # `_outbound_start_permitted` is a PROBE and not a predicate: it re-validates the sinks by
+            # WRITING to them, it can CLEAR the latch, and a refusal PAGES. Reading the latch raw here
+            # would mean a repaired disk lifts the halt on a reload that happens to touch a
+            # gate-parked lane and not on one that only adds an outbound — the same repair, the same
+            # reload, two outcomes, decided by an unrelated lane's park state. It would also refuse
+            # door six SILENTLY, when the reason the ADR keeps door gates at all is that a refusal
+            # here pages with a cause. The memo keeps it at one probe and one page per reload, and
+            # the `_delivery_halted` guard keeps a HEALTHY reload from probing at all.
+            #
+            # The two doors then differ only in what they leave behind, which is the fail-closed shape
+            # each needs. A lane the ENGINE parked keeps its `_gate_parked` marker — untouched,
+            # connector-less, rows retained PENDING — so a later reload on a repaired log lifts it. A
+            # lane this reload would have brought up goes DOWN through :meth:`_pause_delivery_lanes`,
+            # which owns HOW the halt takes a delivery lane down and says a third copy of that loop is
+            # how the two halts drift. It routes through `_stop_outbound_unsafe`, NOT
+            # `_park_outbound_lane`, and that difference is the fix: a park writes `_gate_parked`,
+            # which this very gate LIFTS the moment a probe succeeds, so a parked lane would re-open
+            # the hole one reload later off a marker this method wrote itself. Stopping leaves it in
+            # exactly the state the halt left every other lane in, so the only reachable spin path
+            # collapses into the ordinary paused one. Reusing the helper also inherits its per-lane
+            # `except`, so a lane that refuses to pause is logged and the rest of this reload's
+            # outbounds still reconcile instead of the raise aborting the loop partway down the list.
+            #
+            # The membership test is what separates them, and it is the caller's filter exactly as in
+            # :meth:`_stop_all_for_log_failure`: every `_gate_parked` lane is already in
+            # `_outbound_paused`, so it takes the no-write path. Re-stopping an already-paused lane
+            # would CLEAR its quiescence Event, flipping a drained lane's status back from 'stopped'
+            # to 'stopping' and withdrawing its purge-eligibility for a reload that changed nothing.
+            if self._delivery_halted or name in self._gate_parked:
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
+                    if name not in self._outbound_paused:
+                        self._pause_delivery_lanes([name])
                     continue
-            # #122 (ADR 0189) DOOR SIX: the lane this reload brings up that no door ever gated. An
-            # outbound the new graph ADDS is in neither `_gate_parked` nor `_outbound_paused`, so the
-            # gate above never asks about it and the branches below build its connector and arm its
-            # lane — which the reload's own `notify_work` then seeds READY. No bytes ship (the claim
-            # gate refuses every row, which is the whole point of the latch); what the lane does
-            # instead is reach that gate once per `_WORKER_ERROR_BACKOFF_SECONDS` for the halt's whole
-            # duration, at the cost the ADR's *Negative / risks* now states. ADR 0189 option 4's
-            # rejection named this case ("a lane BUILT AFTER the halt ... which is door six") and did
-            # not close it.
-            #
-            # `_stop_outbound_unsafe`, NOT `_park_outbound_lane`, and the difference is the fix. A park
-            # writes `_gate_parked`, which the gate directly above LIFTS the moment a probe succeeds —
-            # so a parked lane would re-open this hole one reload later, off a marker this method wrote
-            # itself. Stopping leaves the lane in exactly the state the halt left every other lane in
-            # (`_outbound_paused`, no engine marker), so the only reachable spin path collapses into the
-            # ordinary paused one and recovery is the same operator start through a gated door.
-            #
-            # A lane ALREADY paused is left untouched rather than re-stopped: `_stop_outbound_unsafe`
-            # CLEARS the quiescence Event, which would flip a drained lane's status back from 'stopped'
-            # to 'stopping' and withdraw its purge-eligibility for a reload that changed nothing. The
-            # `continue` still fails closed the way the gate above does — no connector is warmed for a
-            # lane that may not deliver, and queued rows stay PENDING.
-            #
-            # Read LIVE, not memoised: `_outbound_start_permitted` above is a PROBE, so a gate-parked
-            # lane earlier in this loop may have just repaired the sinks and cleared the latch, and
-            # every later lane should then come up normally.
-            if self._delivery_halted:
-                if name not in self._outbound_paused:
-                    self._stop_outbound_unsafe(name)
-                continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
@@ -6990,6 +7027,11 @@ class RegistryRunner:
         # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
         # not lift a STOPPED one, while a PARKED lane's own timer unparks it.
         if self._delivery_halted:
+            # Counted, because reaching this line means SOME path armed an unpaused lane while the
+            # halt held — the missing-door signal the latch cannot get by enumeration. See
+            # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
+            # climbing one is not.
+            self._halted_claim_gate_hits += 1
             park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
             await self.store.reschedule_claimed([item.id], park_until)
             return LaneItemResult(LaneResultKind.RETRY, park_until)

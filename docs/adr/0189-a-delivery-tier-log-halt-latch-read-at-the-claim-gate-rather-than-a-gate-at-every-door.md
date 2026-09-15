@@ -134,13 +134,21 @@ holds. See *Consequences* for exactly what an operator sees change.
    Rejected, and the reason is measured rather than aesthetic. `_stop_all_for_log_failure` builds its
    pause list as the owned lanes NOT already paused, so a set populated from it would omit exactly
    the engine-parked lane that door 4 is about -- the narrowing bug, reintroduced. A set also cannot
-   cover a lane BUILT AFTER the halt (a reload adding an outbound), which is **door six**. That door
-   is now gated -- `_reconcile_outbounds` routes an outbound it would bring up while the latch holds
-   through `_stop_outbound_unsafe`, so the lane lands in the same paused state as every other one and
-   no lane reaches the claim gate on the ordinary halt (see *Negative / risks*). It is gated with a
-   STOP and not a park on purpose: `_park_outbound_lane` writes `_gate_parked`, which the door-4 gate
-   a few lines above lifts the moment a probe succeeds, so a park would re-open the door one reload
-   later off a marker the method wrote itself. Per-lane
+   cover a lane BUILT AFTER the halt (a reload adding an outbound), which is **door six**.
+
+   **Door six is now gated, by widening door 4's gate rather than adding a seventh.**
+   `_reconcile_outbounds` asks `_outbound_start_permitted` once per reload while the latch holds, and
+   on a refusal routes an outbound it would have brought up through `_stop_outbound_unsafe` -- so the
+   lane lands in the same paused state as every other one. One gate for both doors, because that
+   helper is a PROBE and not a predicate: it re-validates the sinks by writing to them, it can clear
+   the latch, and a refusal pages. A raw latch read beside it would have made "fix the disk and
+   reload" work only on a reload that happens to touch a gate-parked lane, and would have refused
+   door six silently -- when a refusal that pages with a cause is the whole reason this ADR keeps the
+   door gates. The two doors differ only in what they leave behind: an engine-parked lane keeps its
+   `_gate_parked` marker for a later reload to lift, while an added lane is STOPPED, not parked,
+   because a park would write the very marker that gate lifts the moment a probe succeeds.
+
+   Per-lane
    recovery is meaningless here anyway: the broken sink is process-global, so the moment one lane's
    door re-validates it, no lane's halt reason survives -- leaving the others latched on a premise
    just measured false would be the SDS-3.7 shape.
@@ -202,15 +210,20 @@ That lock is the same one `enqueue_ingress` and every stage handoff serialize be
 through `_writer_txn`, whether or not the ADR 0055 group-committer is enabled), so the cost is not
 confined to a tier that is already refusing to work: a halted lane's cycle contends with intake and
 with routing/transform handoffs on the one writer. It is still bounded and it is still the price of
-the dispatcher staying runner-agnostic -- but *"a bounded store round-trip per lane per second"*,
-which this paragraph replaces, understated it, and it is the kind of sentence a later reader cites
-as a measurement.
+the dispatcher staying runner-agnostic.
 
-**The lane population that pays it should now be zero**, which is what makes the cost tolerable
-rather than merely bounded: the halt pauses every owned outbound through `_stop_outbound_unsafe`, a
-PAUSED lane is never claimed, and the one path that could still bring an unpaused lane up while the
-latch held -- a reload ADDING an outbound, option 4's door six -- is gated in
-`_reconcile_outbounds`. A non-zero count here means a door is missing.
+**The lane population that pays it should be zero**, which is what makes the cost tolerable rather
+than merely bounded: the halt pauses every owned outbound through `_stop_outbound_unsafe`, and a
+PAUSED lane is never claimed. Door six (see option 4) was the one path that could still bring an
+unpaused lane up while the latch held.
+
+**A non-zero count is therefore the signal that a door is missing**, and `/stats`
+`halted_claim_gate_hits` reports it. That is the one thing this latch structurally cannot get from
+an enumeration: its own argument -- that counting doors is a claim nobody can verify -- also means
+nobody can verify that every door is gated. Two qualifiers travel with the number, and the runner
+property of the same name owns them: a small count at the moment of the halt is the documented
+window between setting the latch and pausing the lanes, and zero is not a clean bill because the
+counter is POOLED-only.
 
 `log_halted` is a NEW status string on a free-form `str` field. Any consumer that switch-matched the
 old vocabulary sees an unknown value. There are no deployments to migrate (section 0), and the

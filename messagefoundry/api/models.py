@@ -632,6 +632,12 @@ class StatsResponse(BaseModel):
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
+    # #122 (ADR 0189): OUTBOUND rows the pooled claim gate refused while the delivery tier was halted.
+    # The runner property of the same name owns the reading rule; the two things an operator must not
+    # infer from this number are that a small count is a defect (the latch is set before the lanes are
+    # paused, so a claim in flight across that window lands here legitimately) and that zero is a clean
+    # bill (POOLED ONLY — a per_lane engine reports zero forever).
+    halted_claim_gate_hits: int = 0
 
 
 class MetricsHistorySample(BaseModel):
