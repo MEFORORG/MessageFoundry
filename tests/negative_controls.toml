@@ -491,6 +491,109 @@ CLOSED in CI on a per-section detector floor, because a partially-mangled token 
 as 1 of 21 detectors and passed with a green tick.
 """
 
+# --- security.yml, the two COMPOSITE roll-ups ------------------------------------------------------
+#
+# REQUIRED SINCE 2026-09-15, and they are a different kind of gate from the seven above, so the
+# controls are a different kind too. A composite runs COPIES of the scan bodies its constituents run --
+# `tests/test_security_composite_parity.py` asserts each copy is byte-identical to its original -- so a
+# control that re-planted a bandit finding here would only re-measure bandit. The property that is
+# genuinely NEW, and the only one a composite can lose on its own, is FAITHFULNESS: the copy must stay
+# the string every existing control was written about, and the job around it must still run every copied
+# scan to completion under the checkout each original asked for.
+#
+# THAT IS WHY BYTE-IDENTICAL PARITY IS THE LOAD-BEARING CONTROL AND NOT AN AESTHETIC ONE. Every
+# assertion this repository makes about an original step -- scan corpus, severity floor, history depth,
+# fail-closed behaviour -- is an assertion about a string. Once protection reads the copy, a copy that
+# has drifted is a required gate no control covers, and nothing else in the tree would say so.
+
+[[control]]
+context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
+plants = """
+Two shapes, both silent. FIRST, a copied scan body drifts from its original: an extra shell line added
+to one copy, which leaves the job running, exiting on the same code, and reporting the same success
+while the string every control was written about no longer matches. SECOND, the `if: ${{ !cancelled() }}`
+guard is removed from one copied scan, which turns a four-scan composite into a stop-at-the-first-finding
+gate -- the later scans never run, the job still goes red on the first, and the missing coverage is
+invisible in the conclusion branch protection reads.
+"""
+red = [
+  "tests/test_security_composite_parity.py::test_every_copied_scan_body_is_byte_identical_to_its_original",
+  "tests/test_security_composite_parity.py::test_no_scan_in_a_composite_is_skipped_by_an_earlier_failure",
+]
+holds = """
+Neither plant may disturb the layer that catches a job being switched OFF rather than made unfaithful.
+`continue-on-error`, a `|| true` / `--exit-zero` idiom, and a skippable job-level `if:` are caught by
+`tests/test_security_posture.py`, which grades these two jobs for the first time now that their contexts
+are recorded -- and those tests must stay GREEN under a body drift, because a drifted copy is not a
+neutered one. If a single plant reddened both layers the registry could not tell you which layer does
+the work, which is this file's own asymmetry rule.
+"""
+green = [
+  "tests/test_security_composite_parity.py::test_the_mapping_names_real_jobs",
+  "tests/test_security_posture.py::test_required_jobs_carry_no_continue_on_error",
+  "tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps",
+  "tests/test_security_posture.py::test_required_jobs_declare_no_skippable_job_level_if",
+]
+observed = """
+RUN AGAINST A NEUTERED GATE, 2026-09-15, both plants applied to the real security.yml one at a time and
+the file restored from git after each:
+
+  * extra `echo` line inside one copied scan body -- EXACTLY ONE test red
+    (`test_every_copied_scan_body_is_byte_identical_to_its_original`, naming the step and both job
+    names), 20 green across both suites, every posture test among them.
+  * `if: ${{ !cancelled() }}` removed from one copied scan -- EXACTLY ONE test red
+    (`test_no_scan_in_a_composite_is_skipped_by_an_earlier_failure`), 20 green.
+
+A third plant was attempted and DISCARDED rather than registered: deleting a whole copied step reddened
+20 of 21 tests, which is a broken YAML parse and not a discriminating control. Recorded because a
+uniform red reads as a stronger result than a single red and teaches nothing.
+"""
+
+[[control]]
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
+plants = """
+Two shapes the CHECKOUT and the WORKING DIRECTORY lose silently, both specific to consolidation: a
+composite has one checkout and one default working directory where its constituents had three of each,
+so the deepest and most specific requirement among them governs the whole job.
+
+FIRST, `fetch-depth: 0` becomes `fetch-depth: 1`. gitleaks walks every ancestor of HEAD, so a shallow
+clone reduces a secret gate to one commit while it scans, exits 0 and reports success. SECOND, the
+`working-directory: ide` on the copied npm-audit step is removed, which leaves `--package-lock-only`
+auditing a tree with no lockfile.
+"""
+red = [
+  "tests/test_security_composite_parity.py::test_a_copied_checkout_is_at_least_as_deep_as_every_original_asked_for",
+  "tests/test_security_composite_parity.py::test_a_copied_step_keeps_the_working_directory_its_original_job_supplied",
+]
+holds = """
+Neither plant touches a scan BODY, so byte-identical parity must stay green under both -- the copies are
+still verbatim; it is the environment around them that moved. That is the asymmetry worth having here,
+because it separates "the copy is wrong" from "the copy is right and the job feeds it the wrong tree",
+which need different fixes. The posture layer must also stay green: a shallow clone is not a neutered
+step, and a detector that flagged it as one would be satisfied by re-adding a flag that changes nothing.
+"""
+green = [
+  "tests/test_security_composite_parity.py::test_every_copied_scan_body_is_byte_identical_to_its_original",
+  "tests/test_security_composite_parity.py::test_the_mapping_names_real_jobs",
+  "tests/test_security_posture.py::test_required_jobs_carry_no_continue_on_error",
+  "tests/test_security_posture.py::test_required_jobs_have_no_neutered_steps",
+]
+observed = """
+RUN AGAINST A NEUTERED GATE, 2026-09-15, both plants applied to the real security.yml one at a time and
+the file restored from git after each:
+
+  * `fetch-depth: 0` -> `1` on the composite's checkout -- EXACTLY ONE test red
+    (`test_a_copied_checkout_is_at_least_as_deep_as_every_original_asked_for`), 20 green.
+  * `working-directory: ide` deleted from the copied npm-audit step -- EXACTLY ONE test red
+    (`test_a_copied_step_keeps_the_working_directory_its_original_job_supplied`), 20 green.
+
+AN INSTRUMENT ERROR ON THE WAY TO THE FIRST ONE, recorded because it is the failure this file's own
+header warns about. The first attempt replaced the string `fetch-depth: 0` and hit the COMMENT above the
+key, not the key: the suite stayed 21 green and read as a guard that cannot fire. The guard is fine; the
+plant never reached it. A plant must be confirmed to have changed the thing it names before its green is
+reported as a finding.
+"""
+
 # --- cla.yml ---------------------------------------------------------------------------------------
 
 [[control]]

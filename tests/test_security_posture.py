@@ -58,6 +58,14 @@ _BLOCKING_SECURITY_JOBS = frozenset(
         "semgrep",
         "crypto-inventory",
         "forbidden-content",
+        # The two composite roll-ups, PROMOTED 2026-09-15 out of _PENDING_PROMOTION_SECURITY_JOBS
+        # after the owner added both contexts to branch protection. Recording a context is what drags
+        # its job under every rule in this module for the first time, so this line is the point at
+        # which the composites are graded like the seven scans they duplicate rather than like staged
+        # work nobody grades. They stay here THROUGH the overlap: both sets are required at once, and
+        # the seven above come out at consolidation step 3 (docs/CI.md).
+        "repo-scan",
+        "dependency-and-secret-scan",
     }
 )
 
@@ -93,12 +101,28 @@ _ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 # first, to names nothing yet reports, wedges it identically. The workflow header carries the four
 # steps in order.
 #
-# EMPTYING THIS LIST IS STEP 3. When the owner adds a composite context to branch protection and a
-# pull request records it in .github/required-contexts.txt, that same pull request moves the name
-# into _BLOCKING_SECURITY_JOBS -- which drags it under every rule in this module for the first time.
-# `test_pending_promotion_jobs_are_not_recorded_as_required` below is the forcing function for that
-# move, so the two halves cannot be done separately.
-_PENDING_PROMOTION_SECURITY_JOBS = frozenset({"repo-scan", "dependency-and-secret-scan"})
+# THE BUCKET IS EMPTY AS OF 2026-09-15 and the mechanism is kept for the next staged job. The owner
+# added both composite contexts to branch protection, a pull request recorded them in
+# .github/required-contexts.txt, and the same pull request moved both names into
+# _BLOCKING_SECURITY_JOBS above -- which drags them under every rule in this module for the first
+# time. `test_pending_promotion_jobs_are_not_recorded_as_required` below is the forcing function that
+# made those two halves one change, and it is what reddened when only the file was edited.
+#
+# WHAT IT DID NOT FORCE, AND MUST NOT: deleting the seven original jobs. Its failure message used to
+# name that as part of the same change, which is wrong and would wedge the repository -- protection
+# still requires all seven ORIGINAL contexts alongside the composites, so deleting their jobs leaves
+# seven required contexts nothing can report. That is consolidation steps 3 and 4, it needs a branch
+# protection edit in the same window, and docs/CI.md carries the ordering hazard.
+#
+# WHILE THIS LIST IS EMPTY THE THREE `pending_promotion` TESTS BELOW ARE DORMANT, and that is said
+# plainly rather than left to be discovered: a loop over an empty set cannot fail. They are kept
+# because the staging window recurs, and nothing is licensed by their dormancy -- the composites are
+# now graded by `test_blocking_security_jobs_are_in_the_required_set`,
+# `test_required_jobs_carry_no_continue_on_error`, `test_required_jobs_have_no_neutered_steps` and
+# `test_required_jobs_declare_no_skippable_job_level_if`, all of which are live on them. The guard
+# that cannot go vacuous is `test_every_security_job_is_classified`: it asserts SET EQUALITY over
+# every job in the workflow, so emptying this bucket is only legal if each name landed in another.
+_PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset()
 
 # Job-level `if:` expressions that CANNOT skip the job on a pull_request, with the reason each is safe.
 # Anything else on a required job is a way for the context to silently not report.
@@ -323,10 +347,13 @@ def test_pending_promotion_jobs_are_not_recorded_as_required() -> None:
         if context_of(k, jobs[k]) in required
     )
     assert not promoted, (
-        f"{promoted} is recorded as required but is still classified as pending promotion. That is "
-        "step 3 of the consolidation, half done: move the job key into _BLOCKING_SECURITY_JOBS in "
-        "the same change, delete the original jobs it consolidates, and update the distinct-job "
-        "count pinned in test_required_jobs_carry_no_continue_on_error below."
+        f"{promoted} is recorded as required but is still classified as pending promotion. Move the "
+        "job key into _BLOCKING_SECURITY_JOBS in the same change, and update the distinct-job count "
+        "pinned in test_required_jobs_carry_no_continue_on_error below. Do NOT also delete the "
+        "original jobs it consolidates: branch protection still requires those contexts, so deleting "
+        "their jobs leaves required contexts nothing can report and wedges every pull request. That "
+        "deletion is consolidation step 3 and needs the owner's protection edit in the same window "
+        "(docs/CI.md)."
     )
 
 
@@ -347,10 +374,15 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
     # change in the collapse — a matrix split, or a context that quietly stops resolving — forces a
     # look here instead of passing on a self-consistent count.
     #
-    # 13/11 since 2026-09-04, when the owner retired the review requirement and
-    # `a reviewer has read this` came off branch protection. It was 14/12 from 2026-08-31 (BACKLOG
-    # #1404), when that context was armed, and 13/11 before that. One collapse throughout: ci.yml's
-    # `test` matrix reports 3 contexts from 1 job, so 13 - 2 = 11.
+    # 15/13 since 2026-09-15, when the owner added `security.yml`'s two composite roll-ups to branch
+    # protection (consolidation step 2, docs/CI.md) -- two new contexts backed by two new distinct
+    # jobs. It was 13/11 from 2026-09-04, when the owner retired the review requirement and
+    # `a reviewer has read this` came off branch protection; 14/12 from 2026-08-31 (BACKLOG #1404),
+    # when that context was armed; and 13/11 before that. One collapse throughout: ci.yml's `test`
+    # matrix reports 3 contexts from 1 job, so 15 - 2 = 13.
+    #
+    # THE COUNT WILL DROP TO 8/6 AT CONSOLIDATION STEP 3, when the seven original scan jobs are
+    # deleted and their contexts come off protection. Expect to edit this line then; it is not drift.
     #
     # THIS MODULE READS THE CANONICAL FILE, NOT THE SERVER, so a context that reaches protection and
     # not the file is not examined here. That file's own header states the ordering rule -- protection
@@ -370,8 +402,8 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 11, (
-        f"expected the {len(required_contexts())} required contexts to resolve to 11 distinct jobs "
+    assert examined == 13, (
+        f"expected the {len(required_contexts())} required contexts to resolve to 13 distinct jobs "
         f"(the 3 `test` legs share one matrix job); got {examined}. If the workflow layout genuinely "
         "changed, update this count."
     )
