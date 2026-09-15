@@ -1055,12 +1055,51 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             n += 1
             candidate = target.with_name(f"{stem}-{n}{suffix}")
             continue
-        # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
-        # inbound file is only as small as the operator's max_file_bytes (unset by default), so
-        # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
-        # in memory on exactly the filesystems that already can't hard-link.
-        with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
-            shutil.copyfileobj(source, handle)
+        # The exclusive create above sits OUTSIDE the cleanup guard on purpose: a lost create race
+        # raises FileExistsError there and bumps the name, so the file then at `candidate` belongs to
+        # the winner — unlinking it would clobber exactly what O_EXCL exists to protect.
+        placed = False
+        try:
+            # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
+            # inbound file is only as small as the operator's max_file_bytes (unset by default), so
+            # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
+            # in memory on exactly the filesystems that already can't hard-link.
+            # `fd` is wrapped FIRST so a handle that closes it always exists: were `open(tmp)` opened
+            # first and to raise, the fd would still be open and the unlink below would die on Windows
+            # with a sharing violation, replacing the real error with a bogus one.
+            with os.fdopen(fd, "wb") as handle, open(tmp, "rb") as source:
+                shutil.copyfileobj(source, handle)
+            placed = True
+        finally:
+            # A copy that dies mid-stream (a full volume, a dropped share) would otherwise leave a
+            # TRUNCATED, PHI-bearing file at `candidate` beside a reported failure — and it would
+            # consume that name permanently, since the bumping loop above skips a name that exists,
+            # so every later delivery would route around the debris instead of replacing it.
+            # `finally`, not `except`, so nothing is caught or relabelled and no failure mode is
+            # missed — `return` and `break` included, which an `except` arm never sees. It runs
+            # after the `with` has closed the handle, which Windows requires.
+            #
+            # Deliberately NOT the `except BaseException` that this package's persistent-connection
+            # connectors use (mllp.py, tcp.py, x12.py). Those are connection-discard arms inside
+            # `async def`, and they are broad because an await point can deliver CancelledError and
+            # the arm must stay distinguishable from the `except DeliveryError` above it. Neither
+            # applies here: `_claim_unique` is sync, so no CancelledError can arrive mid-execution,
+            # and there is only one cleanup path to begin with. Matching that shape would widen a
+            # catch past section 6 of CLAUDE.md for nothing. Settled twice; please leave it.
+            if not placed:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    # Cleanup must never DISPLACE the failure that caused it. Our own handle is
+                    # closed by now, but a drop directory is one other processes watch by design, so
+                    # a scanner or a reader holding the partial open is ordinary here, not exotic —
+                    # and an escaping unlink error would hide the full volume or dropped share behind
+                    # a cleanup message. Log it and let the real exception propagate.
+                    logger.warning(
+                        "could not remove the partial file %s after a failed claim: %s",
+                        candidate,
+                        unlink_exc,
+                    )
         return candidate
 
 
