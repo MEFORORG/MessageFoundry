@@ -66,7 +66,11 @@ which is why it is yours to remove.
 ## self vs live smoke
 - **`--smoke self`** — safe anywhere (CI, a fresh box, before the engine is even running). Proves your
   routers/handlers load and route a message cleanly. Needs `--config <your config>` (and `--inbound
-  NAME` if the config has several inbounds).
+  NAME` if the config has several inbounds). It **PASSES only on a delivering outcome**: a run whose
+  Router selects no handler (`UNROUTED`) or whose Handlers send nothing (`FILTERED`) **FAILs** and
+  names the disposition, because a routed-nowhere preview proves the config *loads*, not that it
+  routes. The synthetic message is a fixed `ADT^A01` from `MAINHOSP`, so a Router keyed on your own
+  sending facility declines it legitimately — point `--inbound` at a connection that takes one.
 - **`--smoke live`** — proves the real listener accepts + ACKs on the running engine. It persists **one**
   synthetic message (recognizable synthetic patient); confirm its `RECEIVED→ROUTED→PROCESSED`
   disposition and outbound delivery in the **console** (the `manual.disposition` row), or automate that

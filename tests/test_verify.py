@@ -125,9 +125,117 @@ def test_self_smoke_ambiguous_inbound_skips() -> None:
 
 
 def test_self_smoke_routes_synthetic_adt() -> None:
+    # The happy path, and it has to PROVE delivery rather than merely find the word. `deliveries=`
+    # also matches `deliveries=0`, so the original substring passed on the exact outcome BACKLOG
+    # #1707 exists to fail -- an assertion that cannot go red is the same defect as the gate it
+    # covers.
     r = smoke.smoke_self("samples/config", inbound="IB_ACME_ADT")
     assert r.status is Status.PASS, r.detail
-    assert "deliveries=" in r.detail
+    assert f"disposition={MessageStatus.RECEIVED.value}" in r.detail
+    assert "deliveries=1" in r.detail
+
+
+# ---- self smoke: PASS requires a DELIVERING outcome (BACKLOG #1707) ----------------------------
+#
+# `dry_run` sets `DryRunResult.error` for a parse failure, a strict-validation failure or a
+# Router/Handler raise -- and for NOTHING else. UNROUTED and FILTERED carry `error=None`, so gating
+# on the error alone answered "did dry_run return?" when the question is "would a message land?".
+
+
+def _write_smoke_config(tmp_path: Path, *, route: str, handle: str) -> str:
+    """A one-module config dir whose Router returns ``route`` and whose Handler returns ``handle``."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_SMOKE.py").write_text(
+        f"""\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import MLLP, Send, handler, inbound, outbound, router
+
+inbound("IB_SMOKE", MLLP(port=2601), router="r")
+outbound("OB_SMOKE", MLLP(host="127.0.0.1", port=2602))
+
+
+@router("r")
+def route(msg):
+    return {route}
+
+
+@handler("h")
+def handle(msg):
+    return {handle}
+""",
+        encoding="utf-8",
+    )
+    return str(cfg)
+
+
+# The two shapes a deploying site actually hits, and they go wrong at DIFFERENT stages. Unrouted:
+# the Router matched nothing, so no Handler ever ran. Filtered: the Router DID select a handler and
+# the transform DID run, so every stage reports having worked -- it is the delivery count that is
+# zero, which is the whole question the check exists to answer.
+@pytest.mark.parametrize(
+    ("route", "handle", "disposition", "handlers", "reason"),
+    [
+        ("[]", 'Send("OB_SMOKE", msg)', MessageStatus.UNROUTED, 0, "no handler"),
+        ('["h"]', "None", MessageStatus.FILTERED, 1, "no delivery"),
+    ],
+    ids=["unrouted", "filtered"],
+)
+def test_self_smoke_fails_without_a_delivery(
+    tmp_path: Path,
+    route: str,
+    handle: str,
+    disposition: MessageStatus,
+    handlers: int,
+    reason: str,
+) -> None:
+    """A run that delivers nowhere must not read green.
+
+    It proves the config LOADS and proves nothing about routing, because nothing reached a
+    destination. A deploying site would otherwise read a green acceptance report off a message the
+    engine would have dropped.
+    """
+    cfg = _write_smoke_config(tmp_path, route=route, handle=handle)
+    r = smoke.smoke_self(cfg, inbound="IB_SMOKE")
+    assert r.status is Status.FAIL, r.detail
+    assert f"disposition={disposition.value}" in r.detail
+    assert f"handlers={handlers}" in r.detail
+    # Kept even though the disposition implies it: this pins that the row REPORTS the count, which
+    # is a property of the summary string rather than of `disposition_for`.
+    assert "deliveries=0" in r.detail
+    assert reason in r.detail  # the FAIL text names why, not just the verdict
+
+
+def test_classify_self_smoke() -> None:
+    """The classifier itself, including the arm that must not exist: a silent PASS.
+
+    Mirrors ``test_classify_disposition`` for the live smoke -- the same vocabulary reaching the same
+    verdict on the same synthetic message, so the two halves of ``verify`` cannot answer one question
+    two ways.
+    """
+    ok = smoke._classify_self_smoke(MessageStatus.RECEIVED, "SUMMARY")
+    assert ok.id == "smoke.self"
+    assert ok.status is Status.PASS
+    assert ok.detail == "SUMMARY"  # a delivering run adds nothing to the summary
+
+    for bad in (MessageStatus.UNROUTED, MessageStatus.FILTERED):
+        r = smoke._classify_self_smoke(bad, "SUMMARY")
+        assert r.status is Status.FAIL, bad
+        assert r.detail.startswith("SUMMARY ")
+        # An operator gets a next step, not just a red row: the synthetic message is a fixed ADT^A01
+        # from MAINHOSP, so a Router keyed on another feed declines it legitimately.
+        assert "--inbound" in r.detail, bad
+
+    # FAIL CLOSED. `disposition_for` returns only the three members above, so these are the members
+    # somebody adds to the pipeline later. Each must fail NAMING itself rather than fall through to
+    # the PASS arm -- that fall-through is the defect, so the fix must not leave a door in.
+    for unknown in (MessageStatus.ERROR, MessageStatus.NOT_DEPLOYED, MessageStatus.ROUTED):
+        r = smoke._classify_self_smoke(unknown, "SUMMARY")
+        assert r.status is Status.FAIL, unknown
+        assert unknown.value.upper() in r.detail, unknown
+        # ...and WITHOUT the unrouted/filtered remedy. "Re-point --inbound" is advice that flag
+        # cannot act on for these, and a confident wrong next step costs more than none.
+        assert "--inbound" not in r.detail, unknown
 
 
 def test_synthetic_message_is_hl7() -> None:

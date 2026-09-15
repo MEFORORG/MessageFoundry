@@ -160,8 +160,10 @@ class _FakeRequest:
 
 class _FakeStoreEvent:
     """A minimal EVT_C_STORE stand-in exposing only what ``_on_c_store`` reads before decode. Touching
-    ``dataset`` / ``file_meta`` fails the test — the ASVS 5.2.3 guard MUST short-circuit a deflate bomb
-    BEFORE pynetdicom inflates ``event.dataset``."""
+    ``dataset`` / ``file_meta`` raises — the pre-decode guards (the ASVS 5.2.3 deflate ceiling and the
+    BACKLOG #1727 raw-length charge) MUST refuse an over-cap object BEFORE pynetdicom decodes it. The
+    raise surfaces through ``_on_c_store``'s last-resort handler as ``0xC000``, so a ``0xA700`` from a
+    test using this event IS the evidence that the decode never ran."""
 
     def __init__(self, *, transfer_syntax: str, data_set: bytes) -> None:
         self.assoc = _FakeAssoc()
@@ -170,13 +172,11 @@ class _FakeStoreEvent:
 
     @property
     def dataset(self) -> object:
-        raise AssertionError(
-            "event.dataset must not be touched for a deflate bomb (unbounded inflate)"
-        )
+        raise AssertionError("event.dataset must not be touched before the pre-decode guards run")
 
     @property
     def file_meta(self) -> object:
-        raise AssertionError("event.file_meta must not be touched for a deflate bomb")
+        raise AssertionError("event.file_meta must not be touched before the pre-decode guards run")
 
 
 def test_scp_rejects_deflated_decompression_bomb_before_decode() -> None:
@@ -194,6 +194,29 @@ def test_scp_rejects_deflated_decompression_bomb_before_decode() -> None:
         status == 0xA700
     )  # Refused: Out of Resources — over the inflate cap, before any decode/commit
     assert captured == []  # never committed
+
+
+def test_scp_rejects_oversized_raw_data_set_before_decode() -> None:
+    # BACKLOG #1727: max_object_bytes used to be charged only AFTER event.dataset had copied and decoded
+    # the received object and save_as had re-encoded it, so an over-cap object was held several times over
+    # before the cap refused it. It is now charged against the RAW event.request.DataSet length first, on
+    # EVERY transfer syntax — not just the deflated one. _FakeStoreEvent raises when the decode is
+    # touched, and that raise returns 0xC000, so 0xA700 here is the proof the decode never ran.
+    captured: list[bytes] = []
+    scp = _build_scp(captured, max_object_bytes=64)
+    uncompressed = (
+        "1.2.840.10008.1.2.1"  # Explicit VR Little Endian — no inflate, so no deflate guard
+    )
+    over_cap = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * 128)
+    assert (
+        scp._on_c_store(over_cap) == 0xA700
+    )  # Out of Resources — refused before any decode/commit
+    assert captured == []  # never committed
+    # Positive control: the SAME event under the cap DOES reach event.dataset, whose raise surfaces as
+    # 0xC000. Without this, an inert decode trap would produce the assertion above for the wrong reason.
+    under_cap = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * 32)
+    assert scp._on_c_store(under_cap) == 0xC000, "the decode trap must still fire under the cap"
+    assert captured == []
 
 
 async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
