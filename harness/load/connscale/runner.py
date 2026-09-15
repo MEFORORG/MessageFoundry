@@ -99,9 +99,13 @@ _AUDIT_DISABLED = "intake audit disabled for this profile"
 #: SQLite's PRIMARY result code for an I/O error. Extended codes are `primary | (N << 8)`, so the
 #: low byte of `sqlite_errorcode` is what identifies the family (1546 = SQLITE_IOERR_TRUNCATE).
 _SQLITE_IOERR = 10
-#: Pauses before each post-mortem store-open retry, in seconds -- ~1.5s in total. Sized from the
-#: measurement in `_store_reader`: a 0.75s pause cleared the race on every one of 10 trials, so the
-#: schedule clears it with margin while staying far below the step's own timeout.
+#: Pauses before each post-mortem store-open retry, in seconds -- ~1.5s in total, which stays far
+#: below the step's own timeout. NOT SIZED FROM A CONTROLLED MEASUREMENT: the 0.75s reading in
+#: `_store_reader` came from sequential arms on a box with varying load, and the trigger looks to be
+#: contention rather than elapsed time, so treat these values as a working schedule rather than a
+#: derived bound. What IS verified is that the schedule absorbs the failure in practice -- see the
+#: positive control in that function's comment, where the race fired 1, 3 and 2 times across three
+#: runs and every one passed. Widen it if a saturated box ever exhausts all five attempts.
 _AUDIT_OPEN_BACKOFF = (0.1, 0.2, 0.4, 0.8)
 _PORTS_READY_TIMEOUT = 60.0  # waiting for the engine to report all N inbound rows (N can be large)
 # A single trivial ADT type — the connscale graph routes every message identically, so the mix only
@@ -725,12 +729,30 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
         # file whose section the just-reaped process still has mapped. SQLite reports that as
         # SQLITE_IOERR_TRUNCATE (extended code 1546), which surfaces as the generic "disk I/O error".
         #
-        # Measured 2026-09-15 on Windows 11, isolated from this rig, paired arms with one variable:
-        # when the killed holder was a real `MessageStore` (writer + the 4-connection read pool),
-        # opening immediately failed 7/10 and 13/15, while the SAME open after a 0.75s pause failed
-        # 0/10. Plain `sqlite3` connections in the killed holder never reproduced it (0/30), so it
-        # takes the store's own connection set. `_secure_file`/icacls was ruled out by an interleaved
-        # control (13/15 both with it and without). End to end the test failed about 3 runs in 10.
+        # Measured 2026-09-15 on Windows 11, isolated from this rig: with the killed holder a real
+        # `MessageStore` (writer + the 4-connection read pool), opening immediately failed 7/10 and
+        # 13/15, while the same open after a 0.75s pause failed 0/10. End to end the test failed
+        # about 3 runs in 10. `_secure_file`/icacls was ruled out by an INTERLEAVED control, 13/15
+        # both with it and without -- that one is trustworthy because the arms alternated.
+        #
+        # READ THE ARMS ABOVE AS SUGGESTIVE, NOT AS A CONTROLLED COMPARISON, and size nothing else
+        # from them. They ran SEQUENTIALLY on a box whose load varied by 3x within the hour (the same
+        # single test took 22s and 75s), so elapsed time and contention are confounded in every arm
+        # that is not marked interleaved. Two further readings were taken the same day and are NOT
+        # recorded here as fact, because both came out of that same uncontrolled setup: that plain
+        # `sqlite3` connections in the killed holder never reproduce it (0/30, which would mean the
+        # store's own connection set is required), and that a cold process is protective. The second
+        # was withdrawn outright -- the "cold" arm also spawned an entire process between the kill
+        # and the open, so it varied spawn delay, load and warmth at once and isolated nothing.
+        #
+        # WHAT THE TRIGGER ACTUALLY IS, on a neighbouring race in the same first-PRAGMA position
+        # (measured by another session, 500 runs per arm): CPU CONTENTION AT THE MOMENT OF THE
+        # HANDOFF, not elapsed time since the holder died. Cold children reproduced at ~3% under
+        # 32-way load and 0/40 on a quiet box, and an injected `OperationalError` at the same
+        # statement reproduced at the same rate as the genuine error -- so failure POSITION matters
+        # and the error CLASS does not. That is a different race from this one (a lagging aiosqlite
+        # worker, not a refused truncate) and is cited as the reason NOT to trust a quiet-box null
+        # here, not as a measurement of this failure. Nobody has run this one under saturation.
         #
         # THIS IS NOT A LOOSENING OF THE AUDIT, and the difference matters because the assertion this
         # feeds exists precisely to refuse an instrument that cannot answer. The retry covers ONLY a
