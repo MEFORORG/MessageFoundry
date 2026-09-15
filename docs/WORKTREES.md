@@ -910,10 +910,49 @@ message shape, nowhere else.
 per session. It stays silent, and keeps its powder dry, when there's nobody to tell. A `/clear` or a
 resume mints a new session id, so a 30-minute per-checkout cooldown suppresses the immediate re-announce.
 
-**Expect about half the roster to be unreachable.** `presence.ps1` is authoritative for who **exists**;
-`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. The cap is
-therefore a budget of *delivered* messages the model tops up past unreachable peers, rather than a
-candidate list the hook trims.
+**Expect most of the roster to be unmessageable, and no longer unreached.** `presence.ps1` is
+authoritative for who **exists**; `list_sessions` is authoritative only for who the model can
+**message**, and the two disagree badly. Measured on this repo 2026-09-14: 10 live peers, 3 reachable,
+`list_sessions` returning exactly the 3 on this login. The MCP cap is therefore a budget of *delivered*
+messages the model tops up past unmessageable peers, rather than a candidate list the hook trims.
+
+**The other 7 are announced to by the hook itself, over the mail lane.** A peer on another login, or on a
+surface the Desktop app never spawned, is unaddressable by the model's tools no matter how well the model
+is instructed: no instruction can conjure a session id that does not exist in the caller's namespace. So
+the hook mails those peers directly through
+[`scripts/coord/mail.ps1`](../scripts/coord/mail.ps1), which is a file write in
+`<git-common-dir>/mefor-coord/` and is blind to both login and surface. Those peers render as **MAILED**
+in the roster, meaning *already announced to, do nothing*. `mail.ps1` was built for exactly these two
+cases and names them both in its own header; the two components shipped separately and the hook contained
+**zero** references to mail until 2026-09-14.
+
+Four properties of that lane, each of which cost a measurement:
+
+- **It runs before the `NO_PEERS` exit, and that order is the feature.** The new-peer set is computed from
+  *messageable* peers alone, so a fleet in which every peer is cross-login would otherwise take that exit
+  having announced nothing at all.
+- **It shells out to `mail.ps1` rather than writing the inbox file.** `mail.ps1` refuses an oversized body
+  or an overlong line **loudly**; the enforcing copy in
+  [`mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) **truncates silently** at the far end. Bypassing the
+  sender trades a refusal you can see for a mid-sentence cut you cannot.
+- **The body wraps to 90 columns and hard-cuts unbreakable tokens.** The receiver refuses any line over
+  240 characters. An ordinary one-line intent of ~370 characters refused all 7 of a peer's sends on
+  2026-09-14, and the envelope this hook dictates says `intent: <one line>`, so the hook cannot pass its
+  own prescribed text through the lane unmodified.
+- **The intent comes from the claim note, never from the user's prompt.** The hook *has* the prompt in its
+  payload. Mailing it would copy arbitrary user text into a peer's transcript that nothing here can
+  delete, which `mail.ps1`'s body rule forbids outright. No claim note is reported as *not declared*
+  rather than filled in from the worktree name.
+
+**Three bounds, and the clock is the one that matters.** This is `UserPromptSubmit`, whose timeout is 15 s
+and whose failure mode is a **blocked user prompt** rather than degraded coordination. One send costs
+0.76-1.32 s wall clock (mean 0.98 over three spawns, warm idle host, 2026-09-14) and the peer lookup has
+already spent ~1.0 s, so an uncapped fan-out to 7 peers is 8-10 s of that 15 s. `-MaxMailPerPrompt`
+bounds the fan-out (3), `-MaxMailTotal` bounds the session (12), and `-MailBudgetMs` bounds the **wall
+clock** (6000). Only the last survives ten sessions draining the same directory at once: a count cap
+cannot bound time. Announces also carry a 120-minute TTL rather than `mail.ps1`'s 72-hour default,
+because an announce is worth nothing stale and would otherwise hold a drain slot for three days against a
+5-per-injection cap.
 
 **Reachability is an exact `cwd` match and nothing else — never `isRunning`.** That flag means *"executing
 a turn right now"*, so as a reachability test it reads **backwards**: `false` is an idle peer that answers,
@@ -926,7 +965,12 @@ rate, when it was a count of who happened to be mid-turn.
 **State, receipts and the kill switch.** `<git-common-dir>/mefor-coord/announce/` holds one
 `<session-id>.json` marker per session (delete it to force a re-announce), `receipts/<key>.tsv` — one
 line per **decision**, carrying its outcome code — and `sent/<key>.tsv`, which the *model* writes with
-what it actually delivered. All reaped after 7 days. **To turn announce off for this repo immediately, in
+what it actually delivered. All reaped after 7 days. The marker's `known`/`sent` track the MCP lane and
+`mailed`/`mailSent` track the mail lane, separately, because the two have different bounds and different
+senders. A receipt's `mail=` field is what **this process** sent and `msg=` is what the **model** was asked
+to send; the outcome code `ANNOUNCED_MAIL` means the cross-account half went out with no messageable peer
+in the fleet, which a bare `NO_PEERS` would have reported as nothing happening. Receipts are `v=2` from
+2026-09-14, so a reader can tell a v1 receipt's *absent* mail count from a v2 receipt's zero. **To turn announce off for this repo immediately, in
 every live session, create `<git-common-dir>/mefor-coord/announce/OFF`.** Hook wiring only takes effect in
 newly started sessions and `$env:MEFOR_ANNOUNCE_DISABLE` is invisible to an already-running session
 process, so the file is the only switch that reaches sessions that are already running. Remove it to
@@ -943,6 +987,17 @@ pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Only UserPromptSub
 `-SelfTest` shows what it would do right now without doing it, and without writing anything. `-Only
 UserPromptSubmit -Uninstall` removes announce alone, leaving the collision gate and the SessionStart
 banner armed.
+
+**Pass `-AsLogin` to any hand-run, or the diagnostic reports an upper bound as a measurement.** A hand-run
+carries no session id, so it cannot resolve its own login, so the login filter goes **off** and every
+cross-login peer renders reachable. Measured on the live fleet 2026-09-14: the same roster read
+`reachable=9` without it and `reachable=3` with it, and only the second matches what `list_sessions`
+returned. With a stated login it also prints the mail split, which is the only way to see the
+cross-account half without sending anything.
+
+```powershell
+pwsh -NoProfile -File scripts\hooks\announce-session.ps1 -SelfTest -AsLogin acct-1
+```
 
 **Cost, stated rather than discovered.** Measured on this host: the shim costs ~0.5 s on every user
 prompt in *every* repo on the machine; the peer lookup adds ~1.0 s on the prompts where it actually runs,
