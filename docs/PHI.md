@@ -409,10 +409,14 @@ application log files (`[logging].log_dir`).
     ([store/backup_codec.py](../messagefoundry/store/backup_codec.py), whose own docstring says the
     cipher *mechanism* is net-new): chunked AES-256-GCM under the store DEK resolved directly by
     `resolve_active_key`, with a per-chunk AAD of
-    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. Because the
-    key is resolved by `resolve_active_key` and not `build_store_cipher`, `cipher_provider =
-    vault_transit` **never applies to a backup**. And `[backup].allow_unencrypted = true` writes a
-    **CLEARTEXT `.mfbak.plain`** — a plaintext PHI-body archive on disk.
+    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. The archive's
+    own seal is keyed by `resolve_active_key` and not `build_store_cipher`, so `cipher_provider =
+    vault_transit` **never applies to sealing or unsealing a `.mfbak`**. It DOES apply one frame
+    further in, and the distinction is the archive versus the cells inside it: `full_restore_verify`
+    opens the extracted snapshot's cipher-covered cells through the **store** cipher
+    (`build_store_cipher`, ADR 0049 AC-13) — the same cipher that wrote them — so under `vault_transit`
+    that read runs in Transit exactly as a live cell read would. And `[backup].allow_unencrypted = true`
+    writes a **CLEARTEXT `.mfbak.plain`** — a plaintext PHI-body archive on disk.
   - *File-connector spill dirs* — **plaintext on disk**; there is no cipher on that path, only
     volume/share encryption and the directory ACL.
 - **Integrity.** The per-value GCM tag is the tamper-evidence. For `attachment_chunk.ciphertext` each
