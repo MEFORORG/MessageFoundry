@@ -25,6 +25,7 @@ import { newConnectionWizard } from "./connectionQuickInput";
 import { registerEditorToolbar } from "./editorToolbar";
 import { disposeEngineLog } from "./engineLog";
 import { EngineSetupPanel } from "./engineSetup";
+import { registerEngineTrust } from "./engineTrust";
 import { registerEngineStatusBar } from "./statusBar";
 import { registerInsertElement } from "./insertElement";
 import { generateSamples } from "./generate";
@@ -115,6 +116,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // from a 200), and the repairs. Distinct from the left-side live-debug toggles above — this reflects the
   // real engine, not the offline dry-run loop. Owns the "MessageFoundry Engine" log channel.
   context.subscriptions.push({ dispose: disposeEngineLog });
+  // Learn (from the engine itself) which certificate its API bind presents, so the https requests
+  // below can verify the self-signed pair it mints on first run — BACKLOG #1695. Fail-soft: with no
+  // engine, no service TOML, or an untrusted workspace it registers nothing and changes nothing.
+  registerEngineTrust(context);
   registerEngineStatusBar(context);
   // Custom editors (#221b): connections.toml + codesets/*.csv open in the form/grid by default, with
   // "Reopen With → Text Editor" always available. Reuses the existing form rendering; the router names
