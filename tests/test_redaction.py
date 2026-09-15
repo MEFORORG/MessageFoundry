@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PHI redaction on the exception/logging path (WP-6c, ASVS 16.2.5 / PHI.md P1-3): redact() scrubs
-HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message."""
+HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message;
+safe_name() derives a safe label for a partner-chosen file name, which redact() is measured blind to
+(BACKLOG #1748)."""
 
 from __future__ import annotations
 
@@ -9,9 +11,10 @@ import re
 import time
 
 import pytest
+from _phi_log_capture import IDENTIFIER_SHAPED_NAMES
 
 from messagefoundry import redaction
-from messagefoundry.redaction import redact, safe_exc, safe_text
+from messagefoundry.redaction import redact, safe_exc, safe_name, safe_text
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -288,3 +291,110 @@ def test_the_linear_scan_guard_does_not_change_what_is_redacted(line: str) -> No
     assert redaction._HL7_FIELD_RUN.sub("[redacted]", line) == _PRE_GUARD_FIELD_RUN.sub(
         "[redacted]", line
     )
+
+
+# --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_redact_is_blind_to_an_identifier_shaped_file_name(name: str) -> None:
+    """The measurement this fix rests on, pinned so it cannot quietly change meaning.
+
+    ``_NAME_RUN`` needs ``\\s+`` between its tokens and ``_DATE_RUN`` needs a word boundary before the
+    digits; a file name supplies neither, so all three of these pass through untouched. The control
+    below proves the same chain is not simply inert."""
+    line = f"file {name} exceeds max_file_bytes (10); routing to error dir"
+    assert redact(line) == line
+
+
+def test_redact_control_a_whitespace_name_with_a_delimited_date_is_caught() -> None:
+    """The positive control for the test above. Without it, ``redact(line) == line`` would be equally
+    consistent with a redactor that had stopped working altogether."""
+    line = "file DOE JANE 1980-05-05.hl7 exceeds max_file_bytes (10); routing to error dir"
+    out = redact(line)
+    assert "DOE JANE" not in out and "1980-05-05" not in out
+    assert out.count("[redacted]") == 2
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_name_drops_every_identifier_shape(name: str) -> None:
+    label = safe_name(name)
+    assert name not in label
+    for token in ("MRN123456789", "DOE", "JANE", "19800505", "100001"):
+        assert token not in label
+    assert re.fullmatch(r"\[name:[0-9a-f]{12}\.hl7\]", label)
+
+
+def test_safe_name_is_stable_and_distinguishing() -> None:
+    """Both halves are the point: stable, so an operator recognises the same stuck file across polls;
+    distinguishing, so two files in one directory are not one line."""
+    assert safe_name("a.hl7") == safe_name("a.hl7")
+    assert safe_name("a.hl7") != safe_name("b.hl7")
+
+
+def test_safe_name_keeps_a_double_extension_so_the_gzip_mode_stays_legible() -> None:
+    assert safe_name("msg1.hl7.gz").endswith(".hl7.gz]")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_suffix"),
+    [
+        ("patient.MRN123456789", "]"),  # 13 chars: over the bound, so nothing is carried through
+        ("drop.2026_MRN00042", "]"),  # underscores are not alphanumeric: refused whole
+        ("plainname", "]"),  # no extension at all
+        ("msg.HL7", ".HL7]"),  # case survives; the bound is what does the work
+        ("msg.hl7", ".hl7]"),
+    ],
+)
+def test_safe_name_only_carries_a_bounded_alphanumeric_extension(
+    name: str, expected_suffix: str
+) -> None:
+    """The extension is the one part of a partner's name that passes through, so it is bounded."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+def test_safe_name_takes_the_basename_so_a_path_never_leaks() -> None:
+    """Callers pass a basename today, but a directory component can itself embed an identifier, so the
+    helper is total rather than trusting its callers."""
+    label = safe_name("/drops/MRN123456789/ADT_DOE_JANE.hl7")
+    assert "MRN123456789" not in label and "DOE" not in label
+    assert safe_name("C:\\drops\\ADT_DOE_JANE.hl7") == safe_name("ADT_DOE_JANE.hl7")
+
+
+@pytest.mark.parametrize("name", [*IDENTIFIER_SHAPED_NAMES, "msg1.hl7.gz", "plainname"])
+def test_safe_name_output_survives_the_redactor_unchanged(name: str) -> None:
+    """The label is emitted INTO a log line the RedactionFilter then redacts. If ``redact`` ate part of
+    it, the operator would lose the correlation the label exists to give."""
+    label = safe_name(name)
+    assert redact(label) == label
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_exc_file_name_swaps_the_name_out_of_the_exception_message(name: str) -> None:
+    """An OSError renders its path INTO its message, so routing a file source's error arm through
+    ``safe_exc`` alone would keep the name. This is the half of #1748 that the call-site swap to
+    ``safe_name`` does not reach on its own."""
+    exc = OSError(f"[WinError 32] file in use: 'C:\\\\drops\\\\{name}'")
+    out = safe_exc(exc, file_name=name)
+    assert name not in out
+    assert out.startswith("OSError:")  # the type survives
+    assert "WinError 32" in out  # and so does the OS diagnostic, which is the point of keeping it
+    assert safe_name(name) in out
+
+
+def test_safe_exc_without_file_name_is_unchanged() -> None:
+    """The parameter is opt-in: every existing caller keeps its exact rendering."""
+    exc = ValueError("patient DOE JANE dob 1980-05-05 not found")
+    assert safe_exc(exc, file_name=None) == safe_exc(exc)
+
+
+def test_safe_exc_file_name_covers_a_bare_basename_too() -> None:
+    """A remote client quotes the name without a directory; the swap must still fire."""
+    out = safe_exc(
+        OSError("550 no such file: MRN123456789_ADT.hl7"), file_name="MRN123456789_ADT.hl7"
+    )
+    assert "MRN123456789" not in out and "550" in out
+
+
+def test_safe_name_is_exported() -> None:
+    assert "safe_name" in redaction.__all__
