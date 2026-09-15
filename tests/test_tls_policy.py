@@ -679,7 +679,11 @@ def test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy() -> No
     assert not problems, (
         f"TLS context site(s) that pin key-exchange groups but do NOT assert forward secrecy: "
         f"{problems}. Every built context must be checked (ASVS 12.1.2) — the suite list is inherited "
-        f"from the interpreter unless something asserts it."
+        f"from the interpreter unless something asserts it. IF YOU JUST MOVED THE ASSERTION BEHIND A "
+        f"WRAPPER, that is this failure and the fix is to call harden_cipher_suites at the seam, not "
+        f"to teach this scan the wrapper's name: co-location is the requirement, because a scan that "
+        f"accepts N helper names has to trust that no future edit puts an early return above the "
+        f"assertion in any of them (ADR 0188 hit exactly this and split its helper)."
     )
 
 

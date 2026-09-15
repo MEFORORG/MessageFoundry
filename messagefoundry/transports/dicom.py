@@ -64,6 +64,7 @@ from typing import Any, cast
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
+    apply_connection_tls_ciphers,
     build_verifying_client_context,
     harden_cipher_suites,
     harden_crl_check,
@@ -166,6 +167,10 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
         if crl := s.get("tls_crl_file"):
             harden_crl_check(ctx, str(crl))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
+    # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below the
+    # assertion this seam has always made on the inherited suite list.
+    apply_connection_tls_ciphers(ctx, s, connector="DICOM listener")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
     return ctx
@@ -571,6 +576,8 @@ def _client_ssl_context(
         )
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # See the SCP listener above: narrow first (ADR 0188), assert second, both visible here.
+    apply_connection_tls_ciphers(ctx, s, connector="DICOM destination")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="DICOM destination")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert

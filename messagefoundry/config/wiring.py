@@ -1135,6 +1135,8 @@ def MLLP(
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_ciphers: str
+    | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
     """An MLLP endpoint. Inbound uses port/max_connections/receive_timeout/max_frame_bytes (the
     bind interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
@@ -1218,7 +1220,16 @@ def MLLP(
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
     certificate has lapsed: it honours an **expired** cert while STILL verifying the chain and hostname
     (a wrong-host / untrusted-chain cert is still rejected), logs a WARN, and — because verification stays
-    ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical."""
+    ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical.
+
+    ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
+    hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
+    the destination build exactly the context they build today — the interpreter's inherited suite
+    list, six CBC-SHA2 suites included, which is what keeps a legacy hospital peer negotiable. Set, the
+    string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
+    forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
+    NARROWS this one hop. A rejected string fails loud at construction, surfaced by
+    ``messagefoundry check`` / dry-run."""
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -1251,6 +1262,7 @@ def MLLP(
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ciphers": tls_ciphers,
         },
     )
 
@@ -2338,6 +2350,9 @@ def DICOM(
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
+    tls_ciphers: str
+    | EnvRef
+    | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
@@ -2382,7 +2397,16 @@ def DICOM(
     account for. So an established association is NOT bounded in the objects it may push — those are
     bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
     guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
-    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace."""
+    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace.
+
+    **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
+    cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
+    default) the SCP and the SCU build exactly the context they build today — the interpreter's
+    inherited suite list, six CBC-SHA2 suites included, which is what keeps an older modality or PACS
+    negotiable. Set, the string is validated by the **same** strict allow-list that guards
+    ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
+    and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
+    surfaced by ``messagefoundry check`` / dry-run."""
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -2400,6 +2424,7 @@ def DICOM(
             "tls_ca_file": tls_ca_file,
             "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
+            "tls_ciphers": tls_ciphers,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,
             "max_associations_per_second": max_associations_per_second,
