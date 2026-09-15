@@ -1,0 +1,378 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The SQLite writer transaction unwinds on CANCELLATION, not just on ordinary exceptions.
+
+``asyncio.CancelledError`` derives from ``BaseException``, so the store's ``except Exception``
+rollbacks never fired on a cancellation: the writer left its transaction open, and because SQLite has
+exactly ONE write connection behind one ``asyncio.Lock``, the next writer to take that lock would
+inherit it. The next writer that issues no ``BEGIN`` of its own -- most of the store's short writers
+-- would then have its ``COMMIT`` make the abandoned statements durable too. On a stage handoff that
+is how a cancelled route would lose work on first deployment: the ingress row's guarded ``DELETE``
+becomes durable while the routed rows it should have produced never existed.
+
+These drive :func:`messagefoundry.store.store._writer_txn` through the store's public API at three
+distinct cancel points, and each arm proves the same things:
+
+1. the failure propagates;
+2. NO transaction is left open;
+3. an UNRELATED writer can still use the connection afterwards -- that writer deliberately issues no
+   ``BEGIN``, so it is the probe that would carry the abandoned work if one were still open;
+4. it did NOT carry that work: the ingress row is still there, still ``inflight``, and nothing the
+   failed handoff would have produced leaked;
+5. the handoff RE-RUNS to success, which is the at-least-once contract the unwind exists to keep.
+
+The ordinary-exception CONTROL arm is not padding. A cancel test alone cannot tell "cancellation now
+unwinds correctly" from "cancellation is now silently swallowed" -- both leave a clean database. The
+control arm injects a plain exception at the SAME await and runs the SAME assertions, so the two
+paths are shown to behave identically. Every case also runs with GROUP COMMIT enabled, where the
+writer transaction lives in the committer task and the cancellation must additionally resolve every
+enrolled member's future or its caller parks on it forever.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.store.store import (
+    MessageStatus,
+    MessageStore,
+    OutboxStatus,
+    Stage,
+)
+
+RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
+CH = "IB_TEST_ADT"
+# A non-zero window is what flips the store from inline-commit to the committer coroutine.
+GC_WINDOW_MS = 5.0
+# Bound on every handshake with the trapped writer. Generous (these are sub-millisecond in practice)
+# but finite, so a wedged case fails as a timeout instead of hanging the suite.
+WAIT = 5.0
+
+# The three cancel points, named by the await the failure lands on.
+BEGIN, BODY, COMMIT = "begin", "body", "commit"
+CANCEL_POINTS = [BEGIN, BODY, COMMIT]
+ARMS = ["cancel", "control"]
+
+
+class _Boom(Exception):
+    """The control arm's ordinary exception. Deliberately NOT a RuntimeError, so it can never be
+    confused with the coordinated-rollback error the group committer rejects members with."""
+
+
+class _Trap:
+    """Stall (or fail) the store's single writer at ONE chosen await inside its transaction.
+
+    ``arm(point)`` selects the await:
+
+    * ``begin``  -- just after ``BEGIN`` landed: the transaction is open, nothing written;
+    * ``body``   -- just after the handoff's guarded ``DELETE``: one uncommitted mutation open;
+    * ``commit`` -- just before ``COMMIT``: the whole handoff written and not yet durable.
+
+    In the CANCEL arm the writer parks there until the test cancels its task. In the CONTROL arm it
+    raises :class:`_Boom` at that same await instead. Nothing else differs between the arms.
+
+    ``stall_rollback`` additionally holds the unwind's ``ROLLBACK`` open for a beat, which is the
+    window the cancel-twice cases need to land a SECOND cancellation inside the shielded rollback."""
+
+    def __init__(self, db: Any) -> None:
+        self._real_execute = db.execute
+        self._real_commit = db.commit
+        self._real_rollback = db.rollback
+        self.point: str | None = None
+        self.raise_instead = False
+        self.stall_rollback = 0.0
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+        self.rollback_started = asyncio.Event()
+        self.rollback_finished = asyncio.Event()
+        db.execute = self._execute
+        db.commit = self._commit
+        db.rollback = self._rollback
+
+    def arm(self, point: str, *, raise_instead: bool = False) -> None:
+        self.point = point
+        self.raise_instead = raise_instead
+        self.reached.clear()
+
+    async def _execute(self, sql: Any, *args: Any, **kwargs: Any) -> Any:
+        cur = await self._real_execute(sql, *args, **kwargs)
+        # Trip AFTER the statement really ran: a cancellation delivered at this await leaves the
+        # worker thread's work applied, which is the state the unwind has to clean up.
+        text = str(sql)
+        if (self.point == BEGIN and text.startswith("BEGIN")) or (
+            self.point == BODY and text.startswith("DELETE FROM queue")
+        ):
+            await self._trip()
+        return cur
+
+    async def _commit(self) -> Any:
+        if self.point == COMMIT:
+            await self._trip()  # before the real COMMIT: everything written, nothing durable
+        return await self._real_commit()
+
+    async def _rollback(self) -> Any:
+        self.rollback_started.set()
+        if self.stall_rollback:
+            await asyncio.sleep(self.stall_rollback)
+        try:
+            return await self._real_rollback()
+        finally:
+            self.rollback_finished.set()
+
+    async def _trip(self) -> None:
+        self.point = None  # one shot: the recovery re-run must not trip it again
+        self.reached.set()
+        if self.raise_instead:
+            raise _Boom("injected at the cancel point")
+        await self.release.wait()
+
+
+async def _prepare(store: MessageStore) -> tuple[str, str]:
+    """One received message, claimed at the ingress stage and ready to hand off."""
+    mid = await store.enqueue_ingress(channel_id=CH, raw=RAW)
+    item = await store.claim_next_fifo(CH, stage=Stage.INGRESS.value)
+    assert item is not None
+    return mid, item.id
+
+
+async def _route(store: MessageStore, mid: str, ingress_id: str) -> bool:
+    return bool(
+        await store.route_handoff(
+            ingress_id=ingress_id,
+            message_id=mid,
+            channel_id=CH,
+            handlers=[("h", RAW)],
+            disposition=MessageStatus.ROUTED,
+        )
+    )
+
+
+async def _assert_unwound_and_recovered(
+    store: MessageStore, mid: str, ingress_id: str, *, probe: str
+) -> None:
+    """The post-conditions EVERY failing writer must meet -- cancel arm and control arm alike.
+
+    Shared verbatim by both arms on purpose: a cancellation that was swallowed rather than unwound
+    would still satisfy a cancel-only test, and only a side-by-side comparison against the ordinary
+    failure shows the two paths now agree."""
+    # 1. The invariant itself, stated directly: the writer left NO transaction open. Asserted first,
+    #    because the probe below closes whatever is open and would mask this at the `begin` point.
+    assert not store._db.in_transaction, "the failed writer left its transaction open"
+
+    # 2. The connection is usable by the NEXT writer. record_connection_event takes the write lock and
+    #    issues its INSERT with no BEGIN of its own, so if the failed transaction were still open this
+    #    INSERT would join it and the commit below would make the abandoned DELETE durable.
+    await store.record_connection_event(
+        connection=probe, transport="mllp", direction="inbound", kind="probe"
+    )
+    assert len(await store.list_connection_events(connection=probe)) == 1
+
+    # 3. ...and it did NOT carry the abandoned work with it.
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
+    row = await cur.fetchone()
+    assert row is not None, "the failed handoff's guarded DELETE became durable -- work lost"
+    assert row["status"] == OutboxStatus.INFLIGHT.value
+
+    # 4. Nothing the failed handoff would have produced leaked.
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS n FROM queue WHERE stage=? AND message_id=?",
+        (Stage.ROUTED.value, mid),
+    )
+    assert (await cur.fetchone())["n"] == 0
+    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+
+    # 5. Recovery: the in-flight row re-pends and the SAME handoff re-runs to success. This is the
+    #    at-least-once contract -- a rolled-back handoff must be re-runnable, not merely harmless.
+    assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) >= 1
+    item = await store.claim_next_fifo(CH, stage=Stage.INGRESS.value)
+    assert item is not None and item.message_id == mid
+    assert await _route(store, mid, item.id)
+    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+
+
+# --- inline writer transaction (group-commit DISABLED, the default) -----------------------------
+
+
+@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_inline_writer_unwinds(tmp_path: Path, point: str, arm: str) -> None:
+    """A cancellation at any of the three cancel points unwinds the inline writer transaction, and an
+    ordinary exception at the same await does exactly the same thing."""
+    store = await MessageStore.open(tmp_path / f"inline-{point}-{arm}.db")
+    try:
+        trap = _Trap(store._db)
+        mid, ingress_id = await _prepare(store)
+        trap.arm(point, raise_instead=arm == "control")
+
+        if arm == "cancel":
+            task = asyncio.create_task(_route(store, mid, ingress_id))
+            await asyncio.wait_for(trap.reached.wait(), WAIT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(_Boom):
+                await _route(store, mid, ingress_id)
+
+        await _assert_unwound_and_recovered(store, mid, ingress_id, probe=f"{point}-{arm}")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_inline_writer_survives_a_second_cancellation(tmp_path: Path, point: str) -> None:
+    """A SECOND cancellation landing inside the shielded rollback corrupts nothing: the rollback still
+    runs to completion, the original cancellation still propagates, and the connection is clean.
+
+    Without the shield the second cancel would kill the rollback and leave the very half-open
+    transaction the first cancel's unwind was closing."""
+    store = await MessageStore.open(tmp_path / f"twice-{point}.db")
+    try:
+        trap = _Trap(store._db)
+        trap.stall_rollback = 0.05  # hold the ROLLBACK open long enough to cancel into it
+        mid, ingress_id = await _prepare(store)
+        trap.arm(point)
+
+        task = asyncio.create_task(_route(store, mid, ingress_id))
+        await asyncio.wait_for(trap.reached.wait(), WAIT)
+        task.cancel()
+        await asyncio.wait_for(trap.rollback_started.wait(), WAIT)
+        task.cancel()  # lands while the unwind is parked on the shielded rollback
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert trap.rollback_finished.is_set(), "the second cancellation killed the rollback"
+        await _assert_unwound_and_recovered(store, mid, ingress_id, probe=f"twice-{point}")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("arm", ARMS)
+async def test_standalone_dead_letter_writer_unwinds(tmp_path: Path, arm: str) -> None:
+    """``dead_letter_now(_standalone=True)`` is the ONE grouped writer that also owns a second, inline
+    transaction -- the undecryptable-payload path a standalone claim takes, which must never join a
+    batch. It is covered here because routing only ``_run_grouped`` would have left it behind with the
+    ``except Exception`` shape it was copied from."""
+    store = await MessageStore.open(
+        tmp_path / f"standalone-{arm}.db", group_commit_window_ms=GC_WINDOW_MS
+    )
+    try:
+        mid = await store.enqueue_ingress(channel_id=CH, raw=RAW)
+        item = await store.claim_next_fifo(CH, stage=Stage.INGRESS.value)
+        assert item is not None
+        trap = _Trap(store._db)
+        trap.arm(COMMIT, raise_instead=arm == "control")
+
+        async def _dead() -> None:
+            await store.dead_letter_now(item.id, "undecryptable payload: test", _standalone=True)
+
+        if arm == "cancel":
+            task = asyncio.create_task(_dead())
+            await asyncio.wait_for(trap.reached.wait(), WAIT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(_Boom):
+                await _dead()
+
+        assert not store._db.in_transaction, "the failed writer left its transaction open"
+        await store.record_connection_event(
+            connection=f"standalone-{arm}", transport="mllp", direction="inbound", kind="probe"
+        )
+        cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
+        row = await cur.fetchone()
+        assert row is not None and row["status"] == OutboxStatus.INFLIGHT.value
+        assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+
+        # And it re-runs: the row really does go DEAD on the second attempt.
+        await _dead()
+        cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
+        assert (await cur.fetchone())["status"] == OutboxStatus.DEAD.value
+    finally:
+        await store.close()
+
+
+# --- group-commit writer transaction (ADR 0055, the committer's shared BEGIN ... COMMIT) ---------
+
+
+@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_group_commit_writer_unwinds(tmp_path: Path, point: str, arm: str) -> None:
+    """Same three cancel points with group commit ON, where the writer transaction lives in the
+    COMMITTER task. Cancelling it must roll the batch back AND reject every enrolled member's future:
+    a member's caller parks on that future (the inbound ACK gate among them), so a batch abandoned
+    without rejection would park it forever."""
+    store = await MessageStore.open(
+        tmp_path / f"gc-{point}-{arm}.db", group_commit_window_ms=GC_WINDOW_MS
+    )
+    try:
+        gc = store._group_commit
+        assert gc is not None
+        trap = _Trap(store._db)
+        mid, ingress_id = await _prepare(store)
+        trap.arm(point, raise_instead=arm == "control")
+
+        member = asyncio.create_task(_route(store, mid, ingress_id))
+        await asyncio.wait_for(trap.reached.wait(), WAIT)
+
+        if arm == "cancel":
+            committer = gc._task
+            assert committer is not None
+            committer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await committer
+            # The member was rejected before the committer died -- not stranded on its future.
+            with pytest.raises(RuntimeError, match="committer cancelled"):
+                await member
+            # Revive the committer for the recovery re-run below. What is under test is the state of
+            # the CONNECTION after the unwind, not the committer's own lifecycle.
+            gc._task = None
+            gc.start()
+        else:
+            with pytest.raises(_Boom):
+                await member
+
+        await _assert_unwound_and_recovered(store, mid, ingress_id, probe=f"gc-{point}-{arm}")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("point", CANCEL_POINTS)
+async def test_group_commit_survives_a_second_cancellation(tmp_path: Path, point: str) -> None:
+    """The cancel-twice case with group commit ON: a second cancellation of the committer, landing
+    inside the shielded rollback, still leaves the batch rolled back and the connection clean."""
+    store = await MessageStore.open(
+        tmp_path / f"gc-twice-{point}.db", group_commit_window_ms=GC_WINDOW_MS
+    )
+    try:
+        gc = store._group_commit
+        assert gc is not None
+        trap = _Trap(store._db)
+        trap.stall_rollback = 0.05
+        mid, ingress_id = await _prepare(store)
+        trap.arm(point)
+
+        member = asyncio.create_task(_route(store, mid, ingress_id))
+        await asyncio.wait_for(trap.reached.wait(), WAIT)
+        committer = gc._task
+        assert committer is not None
+        committer.cancel()
+        await asyncio.wait_for(trap.rollback_started.wait(), WAIT)
+        committer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await committer
+
+        assert trap.rollback_finished.is_set(), "the second cancellation killed the rollback"
+        with pytest.raises(RuntimeError, match="committer cancelled"):
+            await member
+
+        gc._task = None
+        gc.start()
+        await _assert_unwound_and_recovered(store, mid, ingress_id, probe=f"gc-twice-{point}")
+    finally:
+        await store.close()
