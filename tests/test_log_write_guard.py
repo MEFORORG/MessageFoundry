@@ -801,6 +801,25 @@ async def _until_outbound_row(
     return True
 
 
+async def _until_delivery_status(
+    store: MessageStore, message_id: str, destination: str, status: str, timeout: float = 5.0
+) -> bool:
+    """Wait for ONE destination's outbound row to reach ``status`` in the STORE.
+
+    The store is the authority on a delivery, and a written file is not: the connector writes, and the
+    row's terminal write commits after it. Anything that must know a delivery has RESOLVED — as
+    opposed to merely having produced bytes — has to ask here."""
+    elapsed = 0.0
+    while True:
+        rows = await store.outbox_for(message_id)
+        if any(r["destination_name"] == destination and r["status"] == status for r in rows):
+            return True
+        if elapsed > timeout:
+            return False
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+
+
 async def _added_row(store: MessageStore, message_id: str) -> dict[str, object]:
     """The ``OUTBOUND_ADDED`` delivery row, for comparing a WHOLE row across a time window.
 
@@ -1537,10 +1556,23 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
         assert await _until_outbound_row(store, message_id, count=2), (
             "never fanned out to both lanes"
         )
-        assert await _until(lambda: any(outdir.iterdir())), "the first lane never delivered"
+        # Wait for the first lane's row to be DONE IN THE STORE, not merely for its file to exist.
+        # Those are different instants and the gap is a real race this test hit: the connector writes
+        # the file, and the store write marking the row done commits after it. Stopping the runner in
+        # that gap leaves the row INFLIGHT, phase 2's `reset_stale_inflight` reverts it to PENDING, and
+        # the message can then never reach PROCESSED — because that lane is paused by the halt for the
+        # rest of the test and nothing will ever deliver it again. It surfaced once in six runs, at the
+        # control arm's "delivered but never finalized", a good three assertions away from its cause.
+        assert await _until_delivery_status(store, message_id, OUTBOUND, "done"), (
+            "the first lane never recorded its delivery"
+        )
     finally:
         await seeding.stop()
     assert list(added.iterdir()) == [], "the engine-parked lane delivered at boot"
+    # The premise of everything below: exactly one row is left for the lane phase 2 has never heard of.
+    assert await _until_delivery_status(
+        store, message_id, OUTBOUND_ADDED, "pending", timeout=0.0
+    ), "the engine-parked lane's row is not waiting PENDING"
 
     # PHASE 2 — a second engine comes up on the SAME store WITHOUT that connection. The row sits: the
     # pooled lane provider is `registry.outbound | _destinations`, and this graph has it in neither.
