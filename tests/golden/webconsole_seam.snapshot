@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-c609055939e9a577
+28703f16c0f3db71
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -121,6 +121,7 @@ begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
+factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'

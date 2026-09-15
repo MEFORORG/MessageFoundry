@@ -711,12 +711,16 @@ def _break_sink_and_replacement(handler: GuardedFileHandler, directory: Path) ->
     directory.write_text("not a directory", encoding="utf-8")
 
 
-def _e2e_registry(outdir: Path) -> Registry:
+def _e2e_registry(outdir: Path, *, outbound_auto_start: bool = True) -> Registry:
     """A real graph: MLLP inbound -> router -> handler -> FILE outbound writing into ``outdir``.
 
     The inbound binds an ephemeral port and is never connected to; every message in these tests is
     put on the ingress stage directly, because the question is what the ROUTER and TRANSFORM workers
-    do with a message that is already durably in the store — the listener stopping is the easy half."""
+    do with a message that is already durably in the store — the listener stopping is the easy half.
+
+    ``outbound_auto_start=False`` engine-PARKS the delivery lane at boot (#115), which is the one
+    down state a log-failure halt skips — the lane is already paused, so the halt never reaches it
+    and its ``_gate_parked`` marker survives. The default leaves every other caller unchanged."""
     reg = Registry()
     reg.add_outbound(
         OutboundConnection(
@@ -724,6 +728,7 @@ def _e2e_registry(outdir: Path) -> Registry:
             ConnectionSpec(
                 ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
             ),
+            auto_start=outbound_auto_start,
         )
     )
     reg.add_inbound(
@@ -1232,6 +1237,127 @@ async def test_a_runner_started_into_a_dead_log_comes_up_halted(
         await runner.start_outbound(OUTBOUND)
         assert await _until(lambda: any(outdir.iterdir())), "the repaired engine never drained"
         assert await _until_processed(store, message_id), "drained but never finalized"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_stop_then_start_does_not_resume_delivery_into_a_dead_log(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE DELIVERY TIER OF THE START-TIME HALT, and the test above does not reach it. That one leaves
+    # its message stranded at the INGRESS stage, so its `outdir` assertion is satisfied by the
+    # internal-stage halt alone and would stay green against a runner whose outbound lanes came up
+    # wide open. Here a real delivery row is ALREADY on the outbound stage when the restart arrives,
+    # which is the only arrangement that can tell those two engines apart.
+    #
+    # MEASURED RED before `start` parked the delivery lanes, in BOTH claim modes: the queued row was
+    # written into `outdir` while `guard.can_log()` read False throughout. The route in is ordinary —
+    # `_teardown_body` clears `_outbound_paused` (an operator pause is in-memory and deliberately does
+    # not survive a teardown), and `start`'s own outbound spawn asked nothing about the log — so a
+    # service restart, an HA demote-then-promote, or `stop()`+`start()` from the API would each have
+    # resumed delivery with no application log behind it on a first deployment.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        # Park the lane while the log still works, so a GENUINE delivery is queued and waiting. On an
+        # empty outbound stage "no file was written" cannot tell a working gate from an empty lane.
+        await runner.stop_outbound(OUTBOUND)
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id), "never reached the outbound stage"
+        assert list(outdir.iterdir()) == []  # paused: routed and transformed, but not shipped
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+
+        # The restart arrives with NOTHING repaired. Deliberately no _revive_every_sink.
+        await runner.stop()
+        await runner.start()
+        await asyncio.sleep(1.0)  # generous: the repaired restart below ships far inside this
+
+        assert runner._log_write_stopped, "start disarmed the halt against an unwritable log"
+        assert list(outdir.iterdir()) == [], (
+            "a queued row shipped with no application log behind it"
+        )
+        assert OUTBOUND in runner._outbound_paused  # the lane came back DOWN, not merely slow
+        # …and its delivery row is retained PENDING, not dead-lettered by the refusal.
+        assert len(await store.outbox_for(message_id)) == 1
+
+        # THE CONTROL, and it carries the attribution: the ONLY difference between these two arms is
+        # whether the log works. The same stop()+start(), on the same rig, with the same queued row,
+        # must deliver once the disk is fixed — otherwise this test would also pass against an engine
+        # that never resumes delivery after any restart, which is the wrong engine for the right
+        # reason. It also proves the assertion above is capable of failing.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.stop()
+        await runner.start()
+
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired restart never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+        assert OUTBOUND not in runner._outbound_paused
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_reload_that_re_deploys_a_parked_lane_is_refused_into_a_dead_log(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE THIRD DOOR, and it is the one the halt walks straight past. `_stop_all_for_log_failure`
+    # pauses the outbound lanes that are RUNNING; a lane the ENGINE parked (auto_start=False #115 /
+    # deployed=False #233) is already in `_outbound_paused`, so the halt skips it and its
+    # `_gate_parked` marker survives untouched. A reload that flips the flag back then calls
+    # `_unpark_outbound_lane`, which is the one resume path that never asked about the log.
+    #
+    # MEASURED RED before that helper was gated, in BOTH claim modes: the reload resumed the lane and
+    # its queued row was delivered with both sinks dead. `start_outbound`'s docstring reasons that a
+    # reload is safe because `_stop_outbound_unsafe` drops the `_gate_parked` marker — true of a lane
+    # the HALT paused, and silent about the lane the halt never touched.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    parked = _e2e_registry(outdir, outbound_auto_start=False)  # engine-parked at boot
+    configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
+    runner = RegistryRunner(parked, store, poll_interval=0.02, claim_mode=claim_mode)
+    await runner.start()
+    try:
+        assert OUTBOUND in runner._gate_parked, "the rig never engine-parked the lane"
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id), "never reached the outbound stage"
+        assert list(outdir.iterdir()) == []
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert OUTBOUND in runner._gate_parked  # the halt left the engine-park marker in place
+
+        # The operator re-deploys the lane with NOTHING repaired. `_e2e_registry` defaults
+        # auto_start=True, so this reload is exactly the "flip the flag back" case (AC-4).
+        await runner.reload(_e2e_registry(outdir))
+        await asyncio.sleep(1.0)  # generous: the repaired reload below ships far inside this
+
+        assert list(outdir.iterdir()) == [], (
+            "a queued row shipped with no application log behind it"
+        )
+        assert OUTBOUND in runner._outbound_paused  # the lane stayed down
+        assert (
+            OUTBOUND in runner._gate_parked
+        )  # …and recoverably so: a later reload can still lift it
+        assert len(await store.outbox_for(message_id)) == 1
+
+        # THE CONTROL: the same reload, once the disk is fixed, must un-park the lane and ship the
+        # same row. Without it a refusal-only assertion would also pass against an engine that can
+        # never re-deploy a parked lane at all.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.reload(_e2e_registry(outdir))
+
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired reload never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+        assert OUTBOUND not in runner._gate_parked
     finally:
         await runner.stop()
 
