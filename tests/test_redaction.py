@@ -11,7 +11,7 @@ import re
 import time
 
 import pytest
-from _phi_log_capture import IDENTIFIER_SHAPED_NAMES
+from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
 from messagefoundry import redaction
 from messagefoundry.redaction import redact, safe_exc, safe_name, safe_text
@@ -339,18 +339,99 @@ def test_safe_name_keeps_a_double_extension_so_the_gzip_mode_stays_legible() -> 
 @pytest.mark.parametrize(
     ("name", "expected_suffix"),
     [
-        ("patient.MRN123456789", "]"),  # 13 chars: over the bound, so nothing is carried through
-        ("drop.2026_MRN00042", "]"),  # underscores are not alphanumeric: refused whole
+        ("patient.MRN123456789", "]"),  # not a format marker, so nothing is carried through
+        ("drop.2026_MRN00042", "]"),  # nor this
         ("plainname", "]"),  # no extension at all
-        ("msg.HL7", ".HL7]"),  # case survives; the bound is what does the work
+        ("msg.HL7", ".hl7]"),  # recognised case-insensitively, emitted lower-cased
         ("msg.hl7", ".hl7]"),
     ],
 )
-def test_safe_name_only_carries_a_bounded_alphanumeric_extension(
+def test_safe_name_only_carries_a_known_format_marker(name: str, expected_suffix: str) -> None:
+    """The extension is the one part of a partner's name that passes through, so it is an allowlist."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+# --- the suffix allowlist: a length bound let a dotted identifier through (BACKLOG #1748) ------
+#
+# Measured on the pre-fix `_SAFE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,8}\Z")`: any segment of eight
+# or fewer alphanumerics qualified as an "extension", and a dotted identifier is exactly that. Nine
+# characters failed the bound and eight passed it, so it separated a long identifier from a short one
+# rather than an identifier from an extension. Each value below is SYNTHETIC.
+
+#: A partner-chosen name whose trailing dotted segment is an identifier, paired with the fragment the
+#: pre-fix code carried into the log line. Reverting the allowlist turns every one of these red.
+LEAKED_DOTTED_IDENTIFIERS = [
+    ("ACC.12345678.hl7", "12345678"),  # an 8-digit accession
+    ("patient.MRN12345.hl7", "MRN12345"),  # an MRN token
+    ("DOE.19800505.hl7", "19800505"),  # a birthdate `_DATE_RUN` exists to catch
+    ("A.87654321.txt", "87654321"),
+]
+
+#: Names the product itself builds or ingests, whose marker MUST still reach the log line. These are
+#: the control arm: they pass before and after the fix, so a red one means the fix over-reached.
+KEPT_FORMAT_MARKERS = [
+    ("report.hl7.gz", ".hl7.gz]"),  # the FILE destination's own gzip-mode name
+    ("x.dcm", ".dcm]"),
+    ("scan.xml", ".xml]"),
+    ("note.txt", ".txt]"),
+    ("msg1.hl7", ".hl7]"),
+]
+
+
+@pytest.mark.parametrize(("name", "leaked"), LEAKED_DOTTED_IDENTIFIERS)
+def test_safe_name_drops_a_dotted_identifier_that_a_length_bound_admitted(
+    name: str, leaked: str
+) -> None:
+    """A dotted segment is kept only when it IS a format marker, so an identifier that happens to be
+    short contributes nothing. On a first deployment the pre-fix code would have written the fragment
+    asserted absent here into the general application log."""
+    label = safe_name(name)
+    assert leaked not in label
+    # And what IS kept is the real marker, not simply everything dropped.
+    assert label.endswith(f".{name.rsplit('.', 1)[-1]}]")
+
+
+@pytest.mark.parametrize(("name", "expected_suffix"), KEPT_FORMAT_MARKERS)
+def test_safe_name_keeps_the_format_markers_the_product_reads_and_writes(
     name: str, expected_suffix: str
 ) -> None:
-    """The extension is the one part of a partner's name that passes through, so it is bounded."""
+    """The compatibility arm of the control above. ``.hl7.gz`` is the load-bearing one: the FILE
+    destination appends ``.gz`` to the rendered name in gzip mode, so collapsing it to ``.gz`` would
+    lose which format the operator is looking at."""
     assert safe_name(name).endswith(expected_suffix)
+
+
+def test_safe_name_suffix_is_a_literal_from_the_allowlist_never_partner_bytes() -> None:
+    """The property the length bound could not state: the label's suffix is a concatenation of at most
+    two literals from a fixed set, so nothing a partner chose survives the digest — not even a segment
+    that looks like an extension."""
+    for name, _ in [*LEAKED_DOTTED_IDENTIFIERS, ("weird.MRN1.Z9", "")]:
+        suffix = safe_name(name).removeprefix("[name:")[12:].removesuffix("]")
+        parts = [f".{p}" for p in suffix.split(".") if p]
+        assert len(parts) <= redaction._SAFE_SUFFIX_MAX
+        assert all(p in redaction._SAFE_SUFFIXES for p in parts)
+
+
+def test_safe_name_allowlist_covers_every_format_the_engine_discriminates() -> None:
+    """The drift gate the allowlist's own comment promises. ``redaction`` is pure stdlib by design and
+    cannot import ``parsing``, so the entries are duplicated literals; this asserts the duplication
+    stays a superset of the source maps rather than silently falling behind one."""
+    from messagefoundry.parsing import sniff
+    from messagefoundry.uploads import _ALLOWED_UPLOAD_EXTENSIONS
+
+    for source in (
+        sniff._EXTENSION_CONTENT_TYPE,
+        sniff._EXTENSION_MAGIC,
+        _ALLOWED_UPLOAD_EXTENSIONS,
+    ):
+        assert set(source) <= redaction._SAFE_SUFFIXES
+
+
+def test_log_capture_helper_marker_list_matches_the_allowlist() -> None:
+    """``_phi_log_capture`` keeps its own copy of the markers on purpose — it decides what is stripped
+    out of a log line before that line is scanned for an identifier, so deriving it from the module it
+    is grading would let a widened allowlist widen the strip. Independent, but not free to rot."""
+    assert {f".{s}" for s in SAFE_NAME_SUFFIXES} == redaction._SAFE_SUFFIXES
 
 
 def test_safe_name_takes_the_basename_so_a_path_never_leaks() -> None:

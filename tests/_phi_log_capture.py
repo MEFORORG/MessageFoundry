@@ -40,9 +40,44 @@ IDENTIFIER_SHAPED_NAMES = (
 #: pair). Deliberately NOT the redaction module's own patterns — those are what the item measured as
 #: blind to a file name, so reusing them would ask the suspect to grade itself.
 IDENTIFIER_SHAPE = re.compile(r"\d{5,}|[A-Z]{2,}[_-][A-Z]{2,}")
+#: The format markers a well-formed label may carry, spelled out here rather than imported from
+#: :data:`messagefoundry.redaction._SAFE_SUFFIXES`. An independent copy is the whole point: this list
+#: decides what :func:`strip_safe_labels` removes from a line BEFORE it is scanned, so deriving it from
+#: the module under test would let a widened allowlist silently widen the strip — the suspect grading
+#: itself, the same reason :data:`IDENTIFIER_SHAPE` is not the module's own pattern.
+#: ``test_redaction.py`` asserts the two stay equal, so the copy cannot rot unnoticed.
+#: Longest-first, so `.hl7v2` is never matched as `.hl7` followed by stray text.
+SAFE_NAME_SUFFIXES = [
+    "hl7v2",
+    "hl7",
+    "json",
+    "fhir",
+    "xml",
+    "dcm",
+    "edi",
+    "x12",
+    "txt",
+    "pdf",
+    "png",
+    "jpeg",
+    "jpg",
+    "gif",
+    "tiff",
+    "tif",
+    "zip",
+    "gz",
+]
 #: A well-formed :func:`~messagefoundry.redaction.safe_name` label: a 12-hex digest plus up to two
-#: short alphanumeric extensions.
-SAFE_NAME_LABEL = re.compile(r"\[name:[0-9a-f]{12}(?:\.[A-Za-z0-9]{1,8}){0,2}\]")
+#: trailing format markers.
+#:
+#: **An "extension-shaped" segment was the wrong admission test here too (BACKLOG #1748).** This read
+#: ``(?:\.[A-Za-z0-9]{1,8}){0,2}``, which is exactly the length bound that let a dotted identifier
+#: through the helper it was grading — so a label carrying a leaked ``.MRN12345`` would have been
+#: stripped as well-formed and never scanned. Matching the markers themselves means a label is
+#: stripped only when it really is one.
+SAFE_NAME_LABEL = re.compile(
+    r"\[name:[0-9a-f]{12}(?:\.(?:" + "|".join(SAFE_NAME_SUFFIXES) + r")){0,2}\]"
+)
 
 
 def strip_safe_labels(line: str) -> str:

@@ -88,11 +88,68 @@ _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s
 #: Hex characters of the :func:`safe_name` digest kept. Long enough that two names in one directory do
 #: not collide in practice, short enough to read in a log line.
 _NAME_DIGEST_CHARS = 12
-#: A **trailing extension** :func:`safe_name` may keep: a dot then at most eight alphanumerics. The
-#: bound is what makes the extension safe to pass through — a partner-chosen ``patient.MRN123456789``
-#: fails it and contributes nothing, while every real format marker (``.hl7``, ``.gz``, ``.xml``,
-#: ``.dcm``, ``.txt``) passes.
-_SAFE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,8}\Z")
+#: The **complete** set of trailing extensions :func:`safe_name` may keep — matched case-insensitively
+#: and emitted lower-cased, so the label's suffix is drawn from this fixed list of literals and nothing
+#: partner-chosen passes through at all.
+#:
+#: **A LENGTH BOUND WAS THE WRONG SHAPE, AND THE PROSE BESIDE IT CLAIMED A DEFENCE IT DID NOT GIVE
+#: (BACKLOG #1748).** This was ``re.compile(r"\.[A-Za-z0-9]{1,8}\Z")``, described as *"the bound is
+#: what makes the extension safe to pass through — a partner-chosen ``patient.MRN123456789`` fails it
+#: and contributes nothing"*. That is true of the one example and false of the shapes a partner
+#: actually names a drop, because any segment of eight-or-fewer alphanumerics qualified and a dotted
+#: identifier is exactly that. Measured on the pre-fix code, with the kept segment in **bold**:
+#: ``ACC.12345678.hl7`` kept **.12345678** (an accession), ``patient.MRN12345.hl7`` kept **.MRN12345**
+#: (an MRN token), ``DOE.19800505.hl7`` kept **.19800505** and ``A.87654321.txt`` kept **.87654321**.
+#: Nine characters failed the bound and eight passed it, so the bound never separated an extension
+#: from an identifier — it separated a long identifier from a short one. The birthdate case is the
+#: sharpest: :data:`_DATE_RUN` exists to catch a bare ``YYYYMMDD`` and the extension arm routed one
+#: straight past it. A control whose stated reason does not hold is a defect in the prose as much as
+#: in the code (CLAUDE.md §11, SDS-3.7), so both are replaced here.
+#:
+#: An allowlist says what the bound was reaching for and closes the hole instead of moving it: a
+#: segment is kept only when it **is** a format marker this product reads or writes. Every entry is
+#: derived from engine code rather than from a list of plausible extensions:
+#:
+#: * ``parsing/sniff.py`` ``_EXTENSION_CONTENT_TYPE`` — the engine's own extension-to-``ContentType``
+#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .json .fhir .xml .dcm .edi .x12``.
+#: * ``parsing/sniff.py`` ``_EXTENSION_MAGIC`` — the container/attachment formats it admits by leading
+#:   magic bytes: ``.pdf .png .jpg .jpeg .gif .tif .tiff .zip .gz``.
+#: * ``uploads.py`` ``_ALLOWED_UPLOAD_EXTENSIONS`` / ``content_type_for`` — ``.hl7v2`` and ``.txt``.
+#:
+#: ``.gz`` earns its place twice over: the FILE destination's gzip mode appends it to the rendered
+#: name itself (``transports/file.py``), which is where ``.hl7.gz`` comes from.
+#:
+#: Deliberately **not** imported from those modules. This module is pure stdlib on purpose (see the
+#: module docstring) so any engine package can use it, and importing ``parsing`` here would put the
+#: parser underneath the logging chokepoint. What is duplicated is a list of literals, not logic, and
+#: ``tests/test_redaction.py`` asserts each source map is a subset of this set, so the two cannot
+#: drift apart silently.
+#:
+#: A marker this list does not carry is simply dropped, which costs a log line some legibility and
+#: nothing else — :func:`safe_name` feeds log text and :func:`safe_exc`, never a filesystem or
+#: routing decision — and the label stays stable and distinguishing either way.
+_SAFE_SUFFIXES = frozenset(
+    {
+        ".hl7",
+        ".hl7v2",
+        ".json",
+        ".fhir",
+        ".xml",
+        ".dcm",
+        ".edi",
+        ".x12",
+        ".txt",
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".tif",
+        ".tiff",
+        ".zip",
+        ".gz",
+    }
+)
 #: How many trailing extensions :func:`safe_name` keeps. Two, so the gzip mode's ``.hl7.gz`` — a name
 #: the File destination itself builds — stays legible instead of collapsing to ``.gz``.
 _SAFE_SUFFIX_MAX = 2
@@ -105,16 +162,24 @@ def _basename(name: str) -> str:
 
 
 def _safe_suffixes(base: str) -> str:
-    """The trailing extension(s) of ``base``, kept while each passes :data:`_SAFE_SUFFIX`. Stops at
-    the first one that does not, so nothing unbounded is ever carried through from a partner's name."""
+    """The trailing extension(s) of ``base``, taken right to left and kept while each is a known format
+    marker (:data:`_SAFE_SUFFIXES`, case-insensitive). Stops at the first segment that is not one, so
+    the result is always a concatenation of at most :data:`_SAFE_SUFFIX_MAX` literals from that set —
+    no part of a partner's name is ever carried through.
+
+    A dot at position 0 is not an extension (``.hl7`` names a dotfile, it does not extend one), which
+    is the same convention ``parsing/sniff.py`` ``_member_extension`` applies to an archive member."""
     kept: list[str] = []
     stem = base
     while len(kept) < _SAFE_SUFFIX_MAX:
-        match = _SAFE_SUFFIX.search(stem)
-        if match is None:
+        dot = stem.rfind(".")
+        if dot <= 0:
             break
-        kept.append(match.group())
-        stem = stem[: match.start()]
+        suffix = stem[dot:].lower()
+        if suffix not in _SAFE_SUFFIXES:
+            break
+        kept.append(suffix)
+        stem = stem[:dot]
     return "".join(reversed(kept))
 
 
@@ -173,8 +238,11 @@ def safe_name(name: str) -> str:
     very error arm that is reporting the file went missing. A byte length, where the caller has one
     already, belongs beside this label as its own log argument rather than folded in here.
 
-    The extension is kept only while it is short and alphanumeric (at most two of them, so ``.hl7.gz``
-    survives the gzip mode intact), so a pathological ``patient.MRN123456789`` contributes nothing."""
+    The only thing kept beside the digest is up to two trailing **known format markers** — an
+    allowlist, not a shape (:data:`_SAFE_SUFFIXES`, which records why a length bound was not enough and
+    what each entry is derived from). Two of them, so ``.hl7.gz`` survives the gzip mode intact. A
+    ``patient.MRN12345`` therefore contributes nothing: its trailing segment is not a format marker,
+    whatever its length."""
     base = _basename(name)
     digest = hashlib.sha256(base.encode("utf-8", "surrogatepass")).hexdigest()
     return f"[name:{digest[:_NAME_DIGEST_CHARS]}{_safe_suffixes(base)}]"
