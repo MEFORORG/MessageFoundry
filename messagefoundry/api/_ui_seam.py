@@ -122,6 +122,12 @@ from typing import Any
 #: ``.browse_uploaded_file`` also changed shape (each is now the shared implementation the route pair
 #: calls, not the GET route object) — the keyword arguments the console passes are unchanged, but the
 #: contract did move, and a bump is the honest signal for that.
+#: 2026-09-14 (ASVS 6.3.3, BACKLOG #1549): ``AuthService`` gained the public
+#: ``factor_binding_is_blocked``, which the console's ``_ui_action_step_up_ok`` calls so the /ui lane
+#: applies the factor-binding refusal without reaching a private engine symbol. A METHOD the console
+#: calls forces a bump for the reason the federated-SSO entry above gives: a missing method is a hard
+#: AttributeError at request time, not a degraded render. The change that added it shipped without
+#: this bump, and the golden gate is what caught it.
 #:
 #: **v19 WAS DELIBERATELY SKIPPED, and the reason was a defect rather than an accident.** Two unlanded
 #: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
@@ -143,7 +149,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "f23c63c56b5461eb"
+ENGINE_UI_SEAM: str = "8dd30734cd1e27f3"
 
 
 @dataclass(frozen=True, slots=True)
