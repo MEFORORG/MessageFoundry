@@ -3925,9 +3925,10 @@ class IntegritySettings(_Section):
     At startup (and on demand) the engine hashes its loaded ``messagefoundry`` module files against the
     installed wheel's ``*.dist-info/RECORD`` baseline; on drift it writes a hash-chained
     ``startup_integrity`` audit row + fires the AlertSink. Both keys default safe: attestation is **on**
-    but **alert-only** (it never blocks startup), so an existing deployment is unchanged. An EDITABLE
-    install (``pip install -e .`` — no RECORD baseline) is a NO-OP regardless, so dev is never bricked
-    (see messagefoundry/integrity.py)."""
+    but **alert-only** (it never blocks startup). An install that **declares** itself editable
+    (``pip install -e .``) is a NO-OP regardless, so dev is never bricked. An install that merely *has no
+    usable baseline* is not that no-op (BACKLOG #1679): it verified nothing, so it warns, audits and
+    alerts, and under ``fail_closed_on_drift`` it refuses to start (see messagefoundry/integrity.py)."""
 
     # Run startup attestation at all. On by default (alert-only is harmless); a no-op off an editable
     # install. Set false only to suppress the check entirely (e.g. an unusual packaging where RECORD is
@@ -3938,6 +3939,10 @@ class IntegritySettings(_Section):
     # in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a
     # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
     # enforcement on a locked-down instance.
+    # It ALSO refuses when attestation verified NOTHING — no baseline, a RECORD stripped of its package
+    # rows, or the package loaded from outside the install root (BACKLOG #1679). A pass that compared
+    # zero files cannot say the bytes are clean, and stripping the baseline is easier for the stated
+    # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
     # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
     # ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes startup (a
