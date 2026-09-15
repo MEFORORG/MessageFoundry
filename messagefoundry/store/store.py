@@ -182,7 +182,14 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
 async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
 
-    This is the store's single writer-transaction shape. The handler is ``BaseException`` and not
+    **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
+    appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
+    that way. It is NOT yet the store's only writer shape: most short writers take the lock, issue
+    one statement and ``_commit()``, and sqlite3's ``isolation_level=''`` auto-begins for them, so
+    they hold an implicit transaction with the same exposure. Converting those is deferred work
+    (ADR 0159) — do not read this helper's existence as covering them.
+
+    The handler is ``BaseException`` and not
     ``Exception`` on purpose: :class:`asyncio.CancelledError` derives from ``BaseException``, so an
     ``except Exception`` rollback never fires on a cancellation and the block would unwind with its
     transaction still open. SQLite has ONE writer connection behind ``lock``, so the next writer to
@@ -196,7 +203,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     ``ROLLBACK`` with no transaction open is a no-op, so covering it costs nothing.
 
     The block owns its own ``COMMIT`` (nothing here commits for it), so an early ``return`` after an
-    explicit ``rollback()`` — the idempotent no-op exits — still runs that rollback under the lock."""
+    explicit ``rollback()`` — the idempotent no-op exits — still runs that rollback under the lock.
+    **That cuts both ways, and it is the rule a new caller must not miss:** a clean exit unwinds
+    NOTHING, so any path leaving the block between the ``BEGIN`` and the ``COMMIT`` has to
+    ``rollback()`` itself first or it leaves the transaction open for the next writer."""
     async with lock:
         try:
             await db.execute("BEGIN")

@@ -183,17 +183,61 @@ the next reader does not re-derive the wrong precedent from the same comment.
   waiting out its bound instead — returning early would release the lock over a half-open
   transaction, which is the whole hazard.
 
-  **That remedy is PARTIAL, recorded here because the paragraphs above read as though it were total.**
-  `_writer_txn` is routed through the writers that carry a **stage handoff**: `_run_grouped`'s inline
-  arm, the group committer's shared batch transaction, the fused `route_handoff`, and
-  `dead_letter_now`'s standalone arm. The defining property of what is left is that the writer opens
-  its own `BEGIN` directly under `self._lock` and unwinds on `except Exception`, so a cancellation
-  there still leaves the transaction open and the next writer still inherits it. Seventeen writers
-  matched that property when this was written — auth, retention and purge writers, plus
-  `ingress_handoff`, which its own docstring calls a clone of `route_handoff` and which sits on the
-  staged-pipeline path. **So do not cite this ADR as evidence that a given SQLite writer unwinds on
-  cancellation; check whether that writer goes through `_writer_txn`.** Converting the remainder is
-  unfiled work — named by subject here rather than by a number, because none is allocated for it.
+  **That remedy was PARTIAL, recorded here because the paragraphs above read as though it were
+  total.** `_writer_txn` first reached only the writers carrying a **stage handoff**: `_run_grouped`'s
+  inline arm, the group committer's shared batch transaction, the fused `route_handoff`, and
+  `dead_letter_now`'s standalone arm. The property it named for what was left is a writer that opens
+  its own `BEGIN` directly under `self._lock` and unwinds on `except Exception`.
+
+  **AMENDED 2026-09-15. Every writer matching that property is now converted, and a DIFFERENT residual
+  remains, so the caveat below stays.** The population was re-derived from the property rather than
+  carried from the count, and seventeen matched, which is the figure this paragraph already held:
+  `enqueue_message`, `release_message_attachments`, `write_reference_snapshot`, `record_received`,
+  `ingress_handoff`, `record_ack_sent`, `resend_to`, `reingress`, `delete_user`, `delete_custom_role`,
+  `upsert_search_preset`, `set_user_roles`, `set_ad_group_role_map`, `set_ad_group_scope_map`,
+  `purge_message_bodies`, `_apply_document_strips` and `purge_dead_letters`. All seventeen shared one
+  shape exactly — a single `except Exception:` doing `rollback(); raise`, no `else`, no `finally` — so
+  all seventeen took the existing helper and none needed a variant. Take that roster as the state at
+  this commit rather than as a live index; what is kept live instead is the invariant, and it is now
+  enforced rather than asserted. `tests/test_writer_txn_is_the_only_begin.py` AST-scans `store.py`
+  and reds on any `execute("BEGIN")` outside two pinned carve-outs: `_writer_txn` itself, and
+  `_read`'s pooled read snapshot, which runs on a borrowed connection and already unwinds in its own
+  `except BaseException: ROLLBACK`. So **no writer opens a transaction on `self._db` outside
+  `_writer_txn`**, and an eighteenth that tried would fail the build rather than quietly reopen the
+  hole.
+
+  **What remains is the SHORT writers: a different property, the same mechanism.** A short writer
+  takes `self._lock`, issues its DML with no `BEGIN` of its own, and calls `_commit()`. The paragraph
+  above casts those as the victims — the next borrower whose `COMMIT` makes an abandoned statement
+  durable — and they are, but they are also exposed in their own right. The store opens SQLite with
+  `isolation_level=''`, so sqlite3 auto-begins before DML: measured 2026-09-14, after a bare `INSERT`
+  under the lock and before the commit, `in_transaction` is `True`. A cancellation in that window
+  leaves an implicit transaction open, exactly as an abandoned explicit one would. **Seventy** blocks
+  match `self._lock` + DML + `_commit()` with no `BEGIN`, counted by that syntactic shape over
+  `store.py`; they include `claim_ready` and `claim_next_fifo`, so this is not confined to auxiliary
+  writers.
+
+  **Those seventy split into two tiers, and the split is what makes the deferred work schedulable.**
+  Eight already carry the same `except Exception: rollback(); raise` handler the seventeen had —
+  `put_attachment`, `attachment_incref`, `sweep_orphan_attachments`, `claim_fifo_heads`,
+  `release_claimed`, `reschedule_claimed`, `reset_stale_inflight`, `replay_dead`. Those are not
+  merely inheriting victims: they are the same cancellation-blind handler this work exists to
+  delete, reached through the implicit begin instead of an explicit one. The other sixty-two have no
+  handler at all.
+
+  The second reason for deferring is the helper's own contract. `_writer_txn` neither commits nor
+  rolls back on a clean exit — the block owns its `COMMIT` — so a path that leaves between the
+  `BEGIN` and the commit must `rollback()` itself first. Fifteen of the seventy return or raise
+  inside the lock (five in the eight, ten in the sixty-two), and wrapping one of those without
+  adding that rollback would leave an open, empty transaction. Some already have it: `attachment_incref`
+  rolls back before its `raise KeyError`. So this is per-writer reading, not a scripted edit. The
+  change that would make it scripted is giving `_writer_txn` the `COMMIT` and an explicit abort
+  sentinel for the no-op exits — that is the enabling step, and it has its own semantics to settle
+  (`_note_commit` accounting and the `_GroupCommitter` path). **So do not cite this ADR as evidence
+  that a given SQLite writer unwinds on cancellation; check whether that writer goes through
+  `_writer_txn`.** Converting the short
+  writers is unfiled work — named by subject here rather than by a number, because none is allocated
+  for it.
 - **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
   instance 2, found independently and concurrently). That work traced the other end of this same chain:
   a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),

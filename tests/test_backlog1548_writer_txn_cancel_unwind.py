@@ -26,9 +26,11 @@ same things:
 The ordinary-exception CONTROL arm is not padding. A cancel test alone cannot tell "cancellation now
 unwinds correctly" from "cancellation is now silently swallowed" -- both leave a clean database. The
 control arm injects a plain exception at the SAME await and runs the SAME assertions, so the two
-paths are shown to behave identically. Every case also runs with GROUP COMMIT enabled, where the
-writer transaction lives in the committer task and the cancellation must additionally resolve every
-enrolled member's future or its caller parks on it forever.
+paths are shown to behave identically. The GROUPED cases run again with GROUP COMMIT enabled, where
+the writer transaction lives in the committer task and the cancellation must additionally resolve
+every enrolled member's future or its caller parks on it forever. ``ingress_handoff`` has no such
+arm: it takes ``_writer_txn`` directly rather than going through ``_run_grouped``, so there is no
+committer to cancel.
 """
 
 from __future__ import annotations
@@ -157,6 +159,26 @@ async def _route(store: MessageStore, mid: str, ingress_id: str) -> bool:
     )
 
 
+async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
+    """The invariant itself, and the probe that detects its absence. Shared by every assert helper
+    here -- it is the one mechanism the whole file exists to exercise, so it gets ONE definition.
+
+    Order matters. `in_transaction` is asserted FIRST because the probe below closes whatever is
+    open, which would mask the failure at the `begin` cancel point.
+
+    The probe is load-bearing for a specific reason: `record_connection_event` takes the write lock
+    and issues its INSERT with NO `BEGIN` of its own. If the failed writer's transaction were still
+    open, this INSERT would join it and its commit would make the abandoned work durable -- which is
+    exactly the inheritance this unwind exists to prevent. Should that method ever grow a
+    transaction of its own, this stops proving anything and needs replacing with another short
+    writer."""
+    assert not store._db.in_transaction, "the failed writer left its transaction open"
+    await store.record_connection_event(
+        connection=probe, transport="mllp", direction="inbound", kind="probe"
+    )
+    assert len(await store.list_connection_events(connection=probe)) == 1
+
+
 async def _assert_unwound_and_recovered(
     store: MessageStore, mid: str, ingress_id: str, *, probe: str
 ) -> None:
@@ -165,17 +187,8 @@ async def _assert_unwound_and_recovered(
     Shared verbatim by both arms on purpose: a cancellation that was swallowed rather than unwound
     would still satisfy a cancel-only test, and only a side-by-side comparison against the ordinary
     failure shows the two paths now agree."""
-    # 1. The invariant itself, stated directly: the writer left NO transaction open. Asserted first,
-    #    because the probe below closes whatever is open and would mask this at the `begin` point.
-    assert not store._db.in_transaction, "the failed writer left its transaction open"
-
-    # 2. The connection is usable by the NEXT writer. record_connection_event takes the write lock and
-    #    issues its INSERT with no BEGIN of its own, so if the failed transaction were still open this
-    #    INSERT would join it and the commit below would make the abandoned DELETE durable.
-    await store.record_connection_event(
-        connection=probe, transport="mllp", direction="inbound", kind="probe"
-    )
-    assert len(await store.list_connection_events(connection=probe)) == 1
+    # 1-2. No transaction left open, and the next writer can use the connection.
+    await _assert_connection_clean(store, probe=probe)
 
     # 3. ...and it did NOT carry the abandoned work with it.
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
@@ -286,10 +299,7 @@ async def test_standalone_dead_letter_writer_unwinds(tmp_path: Path, arm: str) -
             with pytest.raises(_Boom):
                 await _dead()
 
-        assert not store._db.in_transaction, "the failed writer left its transaction open"
-        await store.record_connection_event(
-            connection=f"standalone-{arm}", transport="mllp", direction="inbound", kind="probe"
-        )
+        await _assert_connection_clean(store, probe=f"standalone-{arm}")
         cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
         row = await cur.fetchone()
         assert row is not None and row["status"] == OutboxStatus.INFLIGHT.value
@@ -350,17 +360,8 @@ async def _assert_reingress_unwound_and_recovered(
     The work-row's existence IS the exactly-once token, so the load-bearing assertion is that the
     guarded ``DELETE`` did not become durable. Had it, the reply would be consumed with no child
     produced: the re-ingress is gone, and nothing re-derives it."""
-    # 1. The invariant itself. Asserted first, because the probe below closes whatever is open and
-    #    would mask this at the `begin` point.
-    assert not store._db.in_transaction, "the failed writer left its transaction open"
-
-    # 2. The connection is usable by the NEXT writer. record_connection_event takes the write lock
-    #    and issues its INSERT with no BEGIN of its own, so if the failed transaction were still open
-    #    this INSERT would join it and the commit below would make the abandoned DELETE durable.
-    await store.record_connection_event(
-        connection=probe, transport="mllp", direction="inbound", kind="probe"
-    )
-    assert len(await store.list_connection_events(connection=probe)) == 1
+    # 1-2. No transaction left open, and the next writer can use the connection.
+    await _assert_connection_clean(store, probe=probe)
 
     # 3. ...and it did NOT carry the abandoned work with it: the token survived.
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (work_id,))
