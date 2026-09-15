@@ -2339,7 +2339,8 @@ def DICOM(
     | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
-    # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
+    # failure BEFORE the object is decoded, and so before the durable commit (the X12
+    # max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
