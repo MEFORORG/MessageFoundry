@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _ast_sites import call_sites
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import (
@@ -297,21 +298,13 @@ def test_a_keyless_store_has_no_dek_to_expire() -> None:
 # --- ARM 5: the SITING, which is what makes this a control ------------------------------------
 
 
-def _calls_named(node: ast.AST, name: str) -> list[ast.Call]:
-    return [
-        n
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
-    ]
-
-
 def _guarded_reconcile_try(tree: ast.Module) -> ast.Try:
     """The ``try`` in engine.py whose body awaits ``reconcile_rotation_meta`` — the blanket handler
     whose entire body is a log call. Located by CONTENT, so it survives any line-number churn."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try):
             continue
-        if _calls_named(node, "reconcile_rotation_meta"):
+        if call_sites(node, "reconcile_rotation_meta", bare_only=True):
             return node
     raise AssertionError(
         "no try/except around reconcile_rotation_meta in engine.py — this test's premise is gone; "
@@ -339,13 +332,13 @@ def test_the_refusal_is_sited_OUTSIDE_the_blanket_reconcile_handler() -> None:
     goes red. A refusal beneath that handler is logged and stepped over: a traceback, not a control."""
     tree = ast.parse(_ENGINE_PY.read_text(encoding="utf-8"))
     guarded = _guarded_reconcile_try(tree)
-    assert _calls_named(guarded, "enforce_store_key_expiry") == [], (
+    assert call_sites(guarded, "enforce_store_key_expiry", bare_only=True) == [], (
         "the store-key expiry refusal is sited INSIDE the blanket `except Exception` guarding the "
         "rotation-meta reconcile, whose entire body is a log call. It would be swallowed and the "
         "engine would start on an expired key. Site it after the handler (BACKLOG #1004, trap 1)."
     )
     # ...and it must exist somewhere, or the assertion above passes by absence.
-    assert _calls_named(tree, "enforce_store_key_expiry"), (
+    assert call_sites(tree, "enforce_store_key_expiry", bare_only=True), (
         "engine.py never calls enforce_store_key_expiry — the gate is gone, not merely re-sited"
     )
 
