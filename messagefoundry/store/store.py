@@ -470,6 +470,29 @@ REINGRESS_TARGET_PREFIX = "@reingress:"
 #: ``base`` re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
 
+#: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). Its
+#: negation — ``payload = '' AND body_ref IS NULL`` — is exactly what retention leaves behind, and
+#: three facts make that an exact discriminator rather than a heuristic:
+#:
+#: 1. every purge path writes a *literal* ``payload=''`` (:meth:`QueueStore.purge_message_bodies`,
+#:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
+#: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
+#:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
+#: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
+#:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
+#:
+#: Spliced into :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can re-queue
+#: a delivery whose content no longer exists: the connector would be handed a zero-byte frame and the
+#: finalizer would record it as a successful send.
+_REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
+#: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
+#: the attachment GC already treated a purged row as unreplayable while ``replay`` replayed it anyway.
+_REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
+    "body_ref", "q.body_ref"
+)
+
 
 @dataclass(frozen=True)
 class ReingressOutcome:
@@ -3975,11 +3998,15 @@ class MessageStore:
         row is blanked — whichever of :meth:`purge_message_bodies` (``done``/``cancelled`` case) or
         :meth:`purge_dead_letters` (``dead`` case) does so. Gating on replayability (not merely status,
         and not merely a non-blank inline ``payload``) is what makes it correct under either purge order
-        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live."""
+        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live.
+
+        The replayability half is :data:`_REPLAYABLE_BODY`, shared with :meth:`replay` /
+        :meth:`replay_dead` (BACKLOG #1560) so the attachment GC and the replay guard can never
+        disagree about which rows are still deliverable."""
         return (
             "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
             f"{msg_col} AND (q.status IN (?, ?) OR "
-            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}))))"
         )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -4069,6 +4096,13 @@ class MessageStore:
         row_id = uuid4().hex
         # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
         # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        #
+        # DO NOT "simplify" the else-arm to `self._enc(...)`. `_enc` short-circuits a falsy value to
+        # itself, so a legitimately EMPTY body would land as '' — indistinguishable at rest from a
+        # retention erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The
+        # direct `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two
+        # apart on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
+        # guard is replay-only, so a first delivery is unaffected either way.)
         stored_payload = (
             ""
             if body_ref is not None
@@ -6475,7 +6509,21 @@ class MessageStore:
 
         ``cancelled`` rows are never touched (an operator purged them). A message with no re-queueable
         rows (parse/validation ERROR, FILTERED, or UNROUTED with no queue rows) returns 0, status
-        untouched. Returns rows requeued."""
+        untouched. Returns rows requeued.
+
+        **A row whose body retention has ERASED is never re-queued** (:data:`_REPLAYABLE_BODY`,
+        BACKLOG #1560). Re-pending one handed the connector a zero-byte frame and had the finalizer
+        record it as a successful delivery. The predicate rides the existing ``WHERE``, so a MIXED
+        batch simply SKIPS the erased rows and recovers the rest — it never aborts the whole call, and
+        an operator recovering a partly-purged message still gets back what is left. When *every*
+        candidate row is erased the UPDATE matches nothing, so this returns 0 and — because the status
+        write and the audit event both hang off ``rowcount`` — the message keeps its disposition and no
+        ``replayed`` event is written for a replay that did not happen.
+
+        The ``stuck`` count deliberately does NOT carry the predicate. An unreplayable ``dead`` row
+        still means something is stuck, so the message stays in RECOVER mode and this returns 0.
+        Excluding it would fall through to RE-SEND and re-transmit the message's *delivered* siblings,
+        which the operator did not ask for — a worse outcome than doing nothing."""
         now = time.time() if now is None else now
         async with self._lock:
             cur = await self._db.execute(
@@ -6496,14 +6544,18 @@ class MessageStore:
                 # their idempotency-ledger entries FIRST so the re-claimed rows are NOT skip-and-completed
                 # as crash-re-run duplicates — a replay must actually re-deliver. Scoped to THIS message's
                 # DONE rows (the exact set the UPDATE below re-pends), so no other message is affected.
+                # It carries the erased-body predicate for exactly that reason: the UPDATE skips a purged
+                # row, so dropping its ledger entry would disarm the duplicate guard for a delivery that
+                # is never going to run again (#1560).
                 await self._db.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                    f" (SELECT id FROM queue WHERE message_id=? AND status=? AND ({_REPLAYABLE_BODY}))",
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
-                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})",
+                f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                f" AND ({_REPLAYABLE_BODY})",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
@@ -6946,9 +6998,17 @@ class MessageStore:
         match the dead-letter view (:meth:`list_dead` is outbound-only): this is the bulk DLQ replay,
         so it must only touch rows the operator can actually see. Dead **ingress** rows (processing
         failures) are recovered via the per-message :meth:`replay`, not here. Unlike :meth:`replay`
-        this never touches rows that already delivered. Returns the number of dead rows requeued."""
+        this never touches rows that already delivered. Returns the number of dead rows requeued.
+
+        **Rows whose body retention has ERASED are excluded** (:data:`_REPLAYABLE_BODY`, BACKLOG
+        #1560), and the predicate lives in the shared ``clause`` so it reaches BOTH statements. That is
+        the point: the affected message set is computed by a separate ``SELECT DISTINCT message_id``
+        before the UPDATE, so guarding only the write would revert a purged message from ``ERROR`` to
+        ``ROUTED`` with nothing actually re-queued — a NEW false disposition, worse than the zero-byte
+        send it replaced, and invisible to a ``rowcount`` check. A mixed batch replays the rows that
+        still have a body and leaves the rest dead."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")
