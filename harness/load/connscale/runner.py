@@ -96,6 +96,13 @@ _HEALTH_TIMEOUT = 30.0
 # why nothing ran -- a reader comparing the two moments of a disabled step reads the difference as
 # meaningful.
 _AUDIT_DISABLED = "intake audit disabled for this profile"
+#: SQLite's PRIMARY result code for an I/O error. Extended codes are `primary | (N << 8)`, so the
+#: low byte of `sqlite_errorcode` is what identifies the family (1546 = SQLITE_IOERR_TRUNCATE).
+_SQLITE_IOERR = 10
+#: Pauses before each post-mortem store-open retry, in seconds -- ~1.5s in total. Sized from the
+#: measurement in `_store_reader`: a 0.75s pause cleared the race on every one of 10 trials, so the
+#: schedule clears it with margin while staying far below the step's own timeout.
+_AUDIT_OPEN_BACKOFF = (0.1, 0.2, 0.4, 0.8)
 _PORTS_READY_TIMEOUT = 60.0  # waiting for the engine to report all N inbound rows (N can be large)
 # A single trivial ADT type — the connscale graph routes every message identically, so the mix only
 # needs to drive ONE generated type (the wall is per-connection machinery, not message-type spread).
@@ -709,7 +716,53 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
         from messagefoundry.config.settings import load_settings
         from messagefoundry.store.base import open_store
 
-        store = await open_store(load_settings(environ=node_env).store)
+        settings = load_settings(environ=node_env).store
+        # THE POST-MORTEM OPEN RACES THE ENGINE'S OWN TEARDOWN ON WINDOWS, so a SQLite I/O error here
+        # is retried rather than reported. `EngineNode.stop` calls `proc.terminate()`, which on
+        # Windows is `TerminateProcess` -- a hard kill, not a graceful shutdown -- so the engine never
+        # closes its connections and leaves a hot multi-megabyte `-wal` beside a still-mapped `-shm`.
+        # Opening that store runs WAL recovery, recovery truncates, and Windows refuses to truncate a
+        # file whose section the just-reaped process still has mapped. SQLite reports that as
+        # SQLITE_IOERR_TRUNCATE (extended code 1546), which surfaces as the generic "disk I/O error".
+        #
+        # Measured 2026-09-15 on Windows 11, isolated from this rig, paired arms with one variable:
+        # when the killed holder was a real `MessageStore` (writer + the 4-connection read pool),
+        # opening immediately failed 7/10 and 13/15, while the SAME open after a 0.75s pause failed
+        # 0/10. Plain `sqlite3` connections in the killed holder never reproduced it (0/30), so it
+        # takes the store's own connection set. `_secure_file`/icacls was ruled out by an interleaved
+        # control (13/15 both with it and without). End to end the test failed about 3 runs in 10.
+        #
+        # THIS IS NOT A LOOSENING OF THE AUDIT, and the difference matters because the assertion this
+        # feeds exists precisely to refuse an instrument that cannot answer. The retry covers ONLY a
+        # SQLite I/O error, is bounded at ~1.5s, and re-raises the original once exhausted -- a store
+        # that genuinely cannot be read still lands as PROBE_UNUSABLE and still fails
+        # `_assert_intake_audit`. What it removes is the opposite failure: an unattributable red whose
+        # whole cause was the rig reading a fraction of a second too early. The data was never in
+        # doubt -- on every observed failure a retried read returned exactly `sent` rows with
+        # `missing_accepted=0`, so the no-loss property held while the probe was reporting that it
+        # could not tell.
+        #
+        # The ENGINE's own `MessageStore.open` has no equivalent retry, so an engine restarting on
+        # Windows straight after a hard stop would hit this same race and fail to start. That is a
+        # product question, deliberately not answered here; this function only fixes the rig.
+        store: Any = None
+        last_ioerr: BaseException | None = None
+        for pause in (0.0, *_AUDIT_OPEN_BACKOFF):
+            if pause:
+                await asyncio.sleep(pause)
+            try:
+                store = await open_store(settings)
+                break
+            except Exception as exc:  # noqa: BLE001 - re-raised below unless it is a SQLite I/O error
+                # Extended codes are `primary | (N << 8)`, so the low byte identifies the family.
+                # Absent on the server backends, which therefore never retry.
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xFF != _SQLITE_IOERR:
+                    raise
+                last_ioerr = exc
+        if store is None:  # every attempt hit a SQLite I/O error -> report the last one
+            assert last_ioerr is not None
+            raise last_ioerr
         try:
             return await intake_audit.sweep_store(store, row_cap=row_cap)
         finally:
