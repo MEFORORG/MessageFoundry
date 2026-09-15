@@ -849,6 +849,7 @@ def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path)
         import sqlite3
         import sys
         import threading
+        import time
 
         from messagefoundry.store import MessageStore
 
@@ -860,12 +861,30 @@ def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path)
             raise SystemExit("open succeeded on a file that is not a database")
 
         asyncio.run(main())
+
         # Only a non-daemon thread can block interpreter exit, so that is what is reported.
-        left = [
-            t.name
-            for t in threading.enumerate()
-            if t is not threading.main_thread() and not t.daemon
-        ]
+        def _live() -> list[str]:
+            return [
+                t.name
+                for t in threading.enumerate()
+                if t is not threading.main_thread() and not t.daemon
+            ]
+
+        # POLLED TO A DEADLINE, NOT SAMPLED ONCE. Closing the connection SIGNALS the aiosqlite
+        # worker and returns; the thread exits a moment later. A single enumerate() here races
+        # that shutdown and names a thread already on its way out, which is a failure on a build
+        # where the fix works -- it reported a leak on 2 of 3 CI runs, across two platforms, and
+        # evicted two unrelated pull requests from the merge queue.
+        #
+        # A GENUINELY leaked worker never drains, so it is still reported after the deadline and
+        # this keeps its teeth. Measured both ways before landing: 0/20 on a correct build, and
+        # 3/3 still detected against a store opened and deliberately never closed.
+        deadline = time.monotonic() + 5.0
+        while True:
+            left = _live()
+            if not left or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         print(",".join(left))
         """
     )
