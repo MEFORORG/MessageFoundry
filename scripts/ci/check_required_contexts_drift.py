@@ -10,9 +10,25 @@ server, on a question whose whole point is to be answerable from a clone.
 
 WHY NOTHING CAUGHT IT. ``tests/test_required_contexts.py`` compares in-repo text to in-repo text: the
 file against ``docs/CI.md``, against workflow job names, against a pinned count. Every one of those
-still agreed with every other while the SERVER moved underneath them, and the count pin
-(``assert len(contexts) == 13``) is a literal written once by hand, not a measurement. A suite that
-only ever asks "do our documents agree" cannot see a document that agrees with itself and not reality.
+still agreed with every other while the SERVER moved underneath them, and that count pin is a literal
+written once by hand, not a measurement. Its value is deliberately not quoted here -- it moves with the
+server, and a quotation of it would rot the way the file it guards did. A suite that only ever asks "do
+our documents agree" cannot see a document that agrees with itself and not reality.
+
+IT RECURRED ON 2026-09-14, WITH A WORSE OUTCOME, AND THE SECOND HALF IS THIS SCRIPT'S OWN LIMIT.
+Branch protection took on ``security.yml``'s two composite roll-ups some time between 2026-09-13
+22:41Z and 2026-09-14 06:59Z, and the checked-in file named thirteen over a server holding fifteen for
+about a day. This script caught it on the first cron after the change and said so in as many words:
+"compared 13 declared in .github/required-contexts.txt against 15 required on
+MEFORORG/MessageFoundry@main". ``required-workflow-state.yml`` then failed every run in that window --
+and it is NOT a required context, so nothing surfaced the failure to any pull request or session. Two
+sessions counted passing checks against the file and read a pull request as fully green with two
+required contexts unreported.
+
+SO A DETECTOR THAT REPORTS TO NOBODY IS HALF A CONTROL, and that is recorded rather than fixed here:
+giving this one a consumer is an alerting design over shared CI, not a line in this file. What the
+2026-09-15 sync changed was the file, the pin, ``docs/CI.md`` and the job classification in
+``tests/test_security_posture.py`` -- the drift, not the reporting path.
 
 WHY THIS IS A SEPARATE SCRIPT, not a branch inside ``check_required_workflow_state.py``. That sibling
 asks REACHABILITY -- *can this context ever report?* This one asks ACCURACY -- *does our checked-in claim

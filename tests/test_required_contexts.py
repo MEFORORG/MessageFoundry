@@ -107,11 +107,14 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
     # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection
-    # --jq '.required_status_checks.contexts[]'` at 2026-09-04 19:05 CDT: 13 contexts, SET-EQUAL to the
-    # file with nothing extra on either side, checked by diffing the sorted API read against the sorted
-    # parse of the file. The previous reading was 14 at 2026-08-31 20:57 CDT, before the owner retired
-    # `a reviewer has read this`. Set-equal is the reading worth recording -- a count alone cannot tell
-    # a matching set from two errors that cancel.
+    # --jq '.required_status_checks.contexts[]'` at 2026-09-15: 15 contexts, SET-EQUAL to the file with
+    # nothing extra on either side, checked by diffing the sorted API read against the sorted parse of
+    # the file. The two added since the previous reading are `security.yml`'s composite roll-ups,
+    # `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)` and
+    # `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)` -- step 2 of the consolidation
+    # staged in docs/CI.md. Earlier readings: 13 at 2026-09-04 19:05 CDT, and 14 at 2026-08-31 20:57
+    # CDT before the owner retired `a reviewer has read this`. Set-equal is the reading worth recording
+    # -- a count alone cannot tell a matching set from two errors that cancel.
     #
     # THE PIN GOES STALE IN THE DIRECTION THAT LOOKS FINE. It read 13 while the server held more, and
     # a context this file omits reads as NOT BLOCKING -- the reassuring answer rather than the true
@@ -126,7 +129,17 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # server holding 13. It reddened only when a human came to edit the file. A guard whose trigger is
     # the edit it is guarding cannot see the drift it exists to catch; what catches that is
     # scripts/ci/check_required_contexts_drift.py, which reads the API.
-    assert len(contexts) == 13, (
+    #
+    # 2026-09-15 IS THE SECOND LIVE PROOF, AND IT IS THE SAME DEFECT WITH A WORSE OUTCOME. The owner
+    # added the two composite roll-ups to protection some time between 2026-09-13 22:41Z and
+    # 2026-09-14 06:59Z. This assertion stayed green at 13 over a server holding 15, for about a day,
+    # and so did every other test in this module -- they all compare in-repo text to in-repo text.
+    # The drift script caught it on the first cron after the change and its workflow has failed every
+    # run since; that workflow is NOT a required context, so nothing surfaced the failure and two
+    # sessions counted checks against this file and read a pull request as fully green with two
+    # required contexts unreported. The caution above was written before that happened and is left
+    # exactly as it was, because it predicted it.
+    assert len(contexts) == 15, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )
