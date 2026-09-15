@@ -1014,6 +1014,18 @@ _OVERWRITE_REFUSAL = (
     "choose an empty --to path (or move the existing store aside first)"
 )
 
+#: The one place a codec-level archive failure is worded, for the same reason ``_OVERWRITE_REFUSAL`` is:
+#: the operator whose header will not parse reads the same sentence as the one whose GCM tag failed.
+#: ``{reason}`` is the codec's own scrubbed message, which is kept rather than summarized because it
+#: carries the distinction the operator has to act on — a failed AEAD tag means corrupt, tampered or
+#: truncated bytes **or** the wrong key, and the codec cannot tell which. Saying only "corrupt archive"
+#: would send an operator hunting for bad media when the archive is fine and the DEK is not.
+_DECRYPT_REFUSAL = (
+    "the archive did not verify: {reason}. Nothing was written to the destination. Confirm the .mfbak "
+    "is intact (size and checksum against the source) and that the configured store key is the DEK the "
+    "archive was sealed under"
+)
+
 
 async def run_restore(
     archive_path: str,
@@ -1082,7 +1094,13 @@ def _restore_blocking(
     key_id: str | None = None
     match_key: bytes | None = None
     if encrypted:
-        key_id = archive_key_id(archive_path)
+        # The header read is already a codec operation: a .mfbak whose magic survived but whose version
+        # or JSON header did not raises here, one step before the decrypt below, and must refuse the
+        # same way rather than escaping as a raw BackupCodecError.
+        try:
+            key_id = archive_key_id(archive_path)
+        except BackupCodecError as exc:
+            raise BackupError("verify", _DECRYPT_REFUSAL.format(reason=safe_exc(exc))) from exc
         if not keys:
             raise BackupError(
                 "verify", "archive is encrypted but no store key is configured to decrypt it"
@@ -1108,7 +1126,16 @@ def _restore_blocking(
         tar_path = Path(tmp) / "archive.tar"
         with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
             if match_key is not None:
-                decrypt_stream(src, dst, match_key)
+                # A failed GCM tag is the whole point of the AEAD framing, so it is an ORDINARY outcome
+                # here, not a bug: turn it into the same BackupError refusal the destination check
+                # produces. The catch is narrowed to the codec's own exception so a genuine defect
+                # (an OSError, a bad key length) is never relabelled "the archive did not verify".
+                try:
+                    decrypt_stream(src, dst, match_key)
+                except BackupCodecError as exc:
+                    raise BackupError(
+                        "verify", _DECRYPT_REFUSAL.format(reason=safe_exc(exc))
+                    ) from exc
             else:
                 shutil.copyfileobj(src, dst, 1024 * 1024)
 
@@ -1214,10 +1241,27 @@ def _place_restored_store(src: Path, dest: Path) -> int:
     except FileExistsError:
         raise
     except OSError:
-        with open(src, "rb") as fh, open(dest, "xb") as out:
-            shutil.copyfileobj(fh, out, 1024 * 1024)
-            out.flush()
-            os.fsync(out.fileno())
+        # The exclusive create sits OUTSIDE the cleanup guard on purpose: a lost create race raises
+        # FileExistsError here, and the file then at ``dest`` belongs to the winner — deleting it would
+        # turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
+        out = open(dest, "xb")  # noqa: SIM115 — held open across the guard below
+        placed = False
+        try:
+            with out, open(src, "rb") as fh:
+                shutil.copyfileobj(fh, out, 1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+            placed = True
+        finally:
+            # From the create onward the file is ours, and a copy that dies mid-stream (a full volume,
+            # a dropped SMB share) would otherwise leave a TRUNCATED store beside a reported failure:
+            # a valid-looking SQLite file an operator could activate, and debris that fails the retry's
+            # never-overwrite check. ``finally`` rather than ``except`` so nothing is caught or
+            # relabelled — the original error propagates untouched, and no failure mode is missed.
+            if not placed:
+                dest.unlink(missing_ok=True)
+    # Best-effort and non-fatal by contract (it logs rather than raising), so it cannot leave the
+    # placed store behind on a failure of its own.
     _secure_file(dest)
     return size
 
