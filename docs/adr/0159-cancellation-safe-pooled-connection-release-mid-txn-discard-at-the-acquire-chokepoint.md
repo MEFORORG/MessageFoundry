@@ -182,6 +182,18 @@ the next reader does not re-derive the wrong precedent from the same comment.
   once, which is safe only because the connection is already out of the pool. SQLite's unwind keeps
   waiting out its bound instead — returning early would release the lock over a half-open
   transaction, which is the whole hazard.
+
+  **That remedy is PARTIAL, recorded here because the paragraphs above read as though it were total.**
+  `_writer_txn` is routed through the writers that carry a **stage handoff**: `_run_grouped`'s inline
+  arm, the group committer's shared batch transaction, the fused `route_handoff`, and
+  `dead_letter_now`'s standalone arm. The defining property of what is left is that the writer opens
+  its own `BEGIN` directly under `self._lock` and unwinds on `except Exception`, so a cancellation
+  there still leaves the transaction open and the next writer still inherits it. Seventeen writers
+  matched that property when this was written — auth, retention and purge writers, plus
+  `ingress_handoff`, which its own docstring calls a clone of `route_handoff` and which sits on the
+  staged-pipeline path. **So do not cite this ADR as evidence that a given SQLite writer unwinds on
+  cancellation; check whether that writer goes through `_writer_txn`.** Converting the remainder is
+  unfiled work — named by subject here rather than by a number, because none is allocated for it.
 - **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
   instance 2, found independently and concurrently). That work traced the other end of this same chain:
   a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),
