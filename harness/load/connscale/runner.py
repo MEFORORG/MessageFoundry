@@ -99,13 +99,14 @@ _AUDIT_DISABLED = "intake audit disabled for this profile"
 #: SQLite's PRIMARY result code for an I/O error. Extended codes are `primary | (N << 8)`, so the
 #: low byte of `sqlite_errorcode` is what identifies the family (1546 = SQLITE_IOERR_TRUNCATE).
 _SQLITE_IOERR = 10
-#: Pauses before each post-mortem store-open retry, in seconds -- ~1.5s in total, which stays far
-#: below the step's own timeout. NOT SIZED FROM A CONTROLLED MEASUREMENT: the 0.75s reading in
-#: `_store_reader` came from sequential arms on a box with varying load, and the trigger looks to be
-#: contention rather than elapsed time, so treat these values as a working schedule rather than a
-#: derived bound. What IS verified is that the schedule absorbs the failure in practice -- see the
-#: positive control in that function's comment, where the race fired 1, 3 and 2 times across three
-#: runs and every one passed. Widen it if a saturated box ever exhausts all five attempts.
+#: Pauses before each post-mortem store-open retry, in seconds. Cumulative elapsed at each attempt is
+#: 0.1, 0.3, 0.7, 1.5s, and the interleaved arms in `_store_reader` put the protective delay at about
+#: 370 ms -- so the THIRD attempt is already past it and the fourth carries margin, while 1.5s total
+#: stays far below the step's own timeout. That margin is deliberate: 370 ms is a median on one box
+#: at one load, not a bound, and the arms that produced it cannot see a small residual rate.
+#: Independently, the schedule is verified to absorb the failure in practice -- see the positive
+#: control in that function's comment, where the race fired 1, 3 and 2 times across three runs and
+#: every one passed. Widen it if a saturated box ever exhausts all five attempts.
 _AUDIT_OPEN_BACKOFF = (0.1, 0.2, 0.4, 0.8)
 _PORTS_READY_TIMEOUT = 60.0  # waiting for the engine to report all N inbound rows (N can be large)
 # A single trivial ADT type — the connscale graph routes every message identically, so the mix only
@@ -729,30 +730,40 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
         # file whose section the just-reaped process still has mapped. SQLite reports that as
         # SQLITE_IOERR_TRUNCATE (extended code 1546), which surfaces as the generic "disk I/O error".
         #
-        # Measured 2026-09-15 on Windows 11, isolated from this rig: with the killed holder a real
-        # `MessageStore` (writer + the 4-connection read pool), opening immediately failed 7/10 and
-        # 13/15, while the same open after a 0.75s pause failed 0/10. End to end the test failed
-        # about 3 runs in 10. `_secure_file`/icacls was ruled out by an INTERLEAVED control, 13/15
-        # both with it and without -- that one is trustworthy because the arms alternated.
+        # WHAT PROTECTS IS ELAPSED TIME SINCE THE HOLDER DIED, measured 2026-09-15 on Windows 11 with
+        # three arms INTERLEAVED trial by trial, so machine load cannot drift between them (it varied
+        # 3x within the hour here -- the same single test took 22s and 75s, which is why sequential
+        # arms on this box are worthless):
         #
-        # READ THE ARMS ABOVE AS SUGGESTIVE, NOT AS A CONTROLLED COMPARISON, and size nothing else
-        # from them. They ran SEQUENTIALLY on a box whose load varied by 3x within the hour (the same
-        # single test took 22s and 75s), so elapsed time and contention are confounded in every arm
-        # that is not marked interleaved. Two further readings were taken the same day and are NOT
-        # recorded here as fact, because both came out of that same uncontrolled setup: that plain
-        # `sqlite3` connections in the killed holder never reproduce it (0/30, which would mean the
-        # store's own connection set is required), and that a cold process is protective. The second
-        # was withdrawn outright -- the "cold" arm also spawned an entire process between the kill
-        # and the open, so it varied spawn delay, load and warmth at once and isolated nothing.
+        #   warm          median kill->open     0.0 ms    fired 15/20
+        #   cold child    median kill->open   376.0 ms    fired  0/20
+        #   warm+sleep    median kill->open   373.2 ms    fired  0/20
         #
-        # WHAT THE TRIGGER ACTUALLY IS, on a neighbouring race in the same first-PRAGMA position
-        # (measured by another session, 500 runs per arm): CPU CONTENTION AT THE MOMENT OF THE
-        # HANDOFF, not elapsed time since the holder died. Cold children reproduced at ~3% under
-        # 32-way load and 0/40 on a quiet box, and an injected `OperationalError` at the same
-        # statement reproduced at the same rate as the genuine error -- so failure POSITION matters
-        # and the error CLASS does not. That is a different race from this one (a lagging aiosqlite
-        # worker, not a refused truncate) and is cited as the reason NOT to trust a quiet-box null
-        # here, not as a measurement of this failure. Nobody has run this one under saturation.
+        # warm vs warm+sleep isolates DELAY: 15/20 to 0/20. cold vs warm+sleep holds delay equal and
+        # isolates COLDNESS: identical, so coldness contributes nothing and was only ever a way of
+        # spending time. About 370 ms of any kind clears it.
+        #
+        # THE ZERO ARMS BOUND THE BIG FAILURE MODE, NOT ZERO. At the warm arm's 75% rate a 20-trial
+        # zero is ~9e-13, so delay demonstrably removes THAT. It does not exclude a small residual:
+        # at a 3% rate, 20 trials come up empty about half the time. Nobody has run this race under
+        # deliberate CPU saturation, which is the condition that matters for the residual.
+        #
+        # AN EARLIER VERSION OF THIS COMMENT CREDITED THE PROTECTION TO IMPORT WARMTH and called its
+        # arms "paired arms with one variable". They were three: the cold arm also spawned a whole
+        # process between the kill and the open, and the arms ran sequentially under drifting load.
+        # Two readings from that same setup are withdrawn and must not be reinstated from memory:
+        # that a cold process is protective (superseded by the table above -- it is the delay), and
+        # that plain `sqlite3` connections in the killed holder never reproduce it (0/30, which would
+        # have meant the store's own connection set is required). The second was never challenged
+        # because it read as mechanism rather than as an inference, which is exactly why it is named.
+        #
+        # A NEIGHBOURING RACE IN THE SAME FIRST-PRAGMA POSITION behaves differently and the two must
+        # not be merged: a lagging aiosqlite worker (BACKLOG #1670's subject) is driven by CPU
+        # contention rather than by this delay, reproducing at ~3% under 32-way load and 0/40 on a
+        # quiet box, and an injected `OperationalError` there reproduces at the same rate as the
+        # genuine error -- so for THAT one, failure POSITION matters and error CLASS does not.
+        # Measured by another session, 500 runs per arm. Cited to keep the two apart, not as
+        # evidence about this failure.
         #
         # THIS IS NOT A LOOSENING OF THE AUDIT, and the difference matters because the assertion this
         # feeds exists precisely to refuse an instrument that cannot answer. The retry covers ONLY a
@@ -764,9 +775,13 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
         # `missing_accepted=0`, so the no-loss property held while the probe was reporting that it
         # could not tell.
         #
-        # The ENGINE's own `MessageStore.open` has no equivalent retry, so an engine restarting on
-        # Windows straight after a hard stop would hit this same race and fail to start. That is a
-        # product question, deliberately not answered here; this function only fixes the rig.
+        # THE ENGINE'S OWN `MessageStore.open` HAS NO EQUIVALENT RETRY, and the table above is the
+        # reason that is probably survivable rather than the reason to worry. A restarting engine
+        # spends its whole process spawn plus imports plus config load and wiring before it opens its
+        # store -- the cold arm measured 376 ms for spawn and imports ALONE, and a real engine does
+        # strictly more -- so it lands in the region where this fired 0/20. What is NOT excluded is
+        # the small residual those 20 trials cannot see, or behaviour under saturation. Left as a
+        # product question on purpose; this function only fixes the rig.
         store: Any = None
         last_ioerr: BaseException | None = None
         for pause in (0.0, *_AUDIT_OPEN_BACKOFF):
