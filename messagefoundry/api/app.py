@@ -2018,9 +2018,14 @@ def create_app(
                     dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
                     # The collapsed display status: not-deployed (#233) WINS (never wired — not failed,
                     # not merely paused/"stopped"), then failed/filtered, else the live per-outbound
-                    # tri-state (running/stopping/stopped) — no longer the whole-engine state. A
+                    # state (running/stopping/stopped, or "log_halted" #122 ADR 0189 when the engine
+                    # cannot write its application log) — no longer the whole-engine state. A
                     # not-deployed lane is parked (paused+quiesced) exactly like a start-disabled one, so
                     # outbound_status alone would report "stopped"; the flag disambiguates the two.
+                    # failed/filtered still outrank a log halt: those are per-connection facts an
+                    # operator has to fix on THIS row, while the halt is process-wide and has its own
+                    # page (the AlertSink's log_write_failed), so collapsing them away would lose the
+                    # only per-lane explanation the row carries.
                     dstatus = (
                         "not_deployed"
                         if not oc.deployed
@@ -2097,7 +2102,12 @@ def create_app(
                     standalone[oname] = ("not_deployed", None)
                     continue
                 ostatus = rr.outbound_status(oname)
-                if ostatus in ("stopping", "stopped"):
+                # "log_halted" (#122, ADR 0189) joins the two pause states here for the same reason
+                # they are here: a lane that is DOWN with no metrics edge yet must stay visible and
+                # selectable. It is also the state most in need of a row — the halt takes down every
+                # lane at once, so a console that only listed the trafficked ones would show a handful
+                # of halted lanes and silently omit the rest.
+                if ostatus in ("stopping", "stopped", "log_halted"):
                     standalone[oname] = (ostatus, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:

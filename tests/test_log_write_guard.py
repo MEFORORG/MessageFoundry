@@ -1362,6 +1362,80 @@ async def test_a_reload_that_re_deploys_a_parked_lane_is_refused_into_a_dead_log
         await runner.stop()
 
 
+# --- the door nobody has enumerated (ADR 0189) -------------------------------
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_an_unguarded_start_cannot_deliver_while_the_halt_is_latched(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE TEST THAT JUSTIFIES THE LATCH, and the only one here that is not about a door somebody
+    # already found. The four tests above each pin ONE entry into resuming delivery — start_outbound,
+    # restart_outbound, stop-then-start, and the reload's un-park — and each of those four was
+    # discovered the same way: in behaviour, after the previous fix shipped. Four gates are a
+    # completeness claim nobody can verify (CLAUDE.md section 11, SDS-3.6), so this test deliberately
+    # declines to use any of them.
+    #
+    # `_start_outbound_unsafe` is the unguarded primitive every one of the four doors eventually
+    # calls. Driving it DIRECTLY is a stand-in for the fifth door — whatever it turns out to be — and
+    # what it asserts is structural: with the delivery tier's halt latched and both sinks genuinely
+    # dead, a lane brought up by a path that asked NOTHING still ships no bytes. That is a claim about
+    # the claim gate, which every delivery passes through whichever door started the lane, and it
+    # cannot be satisfied by adding a fifth gate at a fifth door.
+    #
+    # MEASURED RED on main before `_delivery_halted` existed, in BOTH claim modes: the queued row was
+    # written into `outdir` while `guard.can_log()` read False throughout.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        # Park the lane while the log still works, so a GENUINE delivery is queued and waiting — on an
+        # empty outbound stage "no file was written" cannot tell a working gate from an empty lane.
+        await runner.stop_outbound(OUTBOUND)
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id), "never reached the outbound stage"
+        assert list(outdir.iterdir()) == []
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert runner._delivery_halted, "the delivery tier's latch never closed"
+
+        # THE FIFTH DOOR: straight past start_outbound, restart_outbound, the teardown park and the
+        # reload's un-park, into the primitive all four of them share. Nothing is repaired first.
+        await runner._start_outbound_unsafe(OUTBOUND)
+        await asyncio.sleep(1.0)  # generous: the repaired restart below ships far inside this
+
+        # THE LOAD-BEARING ASSERTION, and it is bytes on disk written by a real File connector out of
+        # a real store — not a read-back of the flag this change adds.
+        assert list(outdir.iterdir()) == [], (
+            "a queued row shipped with no application log behind it"
+        )
+        # …and the row is RETAINED PENDING, not dead-lettered and not stranded INFLIGHT by the refusal.
+        assert len(await store.outbox_for(message_id)) == 1
+        assert runner._delivery_halted, "the unguarded start cleared the latch"
+        # The lane also reports the CAUSE rather than an operator pause it never had.
+        assert runner.outbound_status(OUTBOUND) == "log_halted"
+        assert not runner.outbound_running(OUTBOUND)
+
+        # THE CONTROL, and it carries the attribution: the ONLY difference between these two arms is
+        # whether the log works. The same rig, the same queued row, delivered once the disk is fixed —
+        # so the refusal above cannot be an engine that never delivers, and the assertion is shown able
+        # to fail. Recovery goes through a GATED door on purpose: lifting the latch is the doors' job,
+        # and the claim gate is defence in depth behind them, never the recovery path.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_outbound(OUTBOUND)
+        assert not runner._delivery_halted, "a repaired restart left the latch closed"
+
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired restart never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+        assert runner.outbound_status(OUTBOUND) == "running"
+    finally:
+        await runner.stop()
+
+
 # --- the hair trigger on the DEFAULT sink, found by running the suite ---------
 
 

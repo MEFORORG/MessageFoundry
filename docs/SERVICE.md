@@ -422,6 +422,16 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
+**Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
+`stopped`. The difference is the one that decides what you do next: `stopped` means the lane is
+waiting for you to press start, and `log_halted` means it is waiting for a writable disk — pressing
+start is refused until the disk is fixed. The state is process-wide because the broken thing is, so
+every lane this engine owns shows it at once, and `outbound_running` reports false for all of them
+(so `/stats`' running/stopped split counts them as not running). A lane that failed to build, was
+parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / `filtered` /
+`not_deployed` instead: those are facts about that one connection, and the halt already has its own
+alert.
+
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
