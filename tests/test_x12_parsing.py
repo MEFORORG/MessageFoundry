@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from messagefoundry.parsing.x12 import (
+    X12FrameError,
     X12FrameReader,
     X12Message,
     X12Peek,
@@ -253,12 +254,53 @@ def test_frame_reader_iea_in_data_does_not_truncate() -> None:
     assert list(X12FrameReader().feed(data)) == [data]
 
 
-def test_frame_reader_oversize_raises() -> None:
-    from messagefoundry.parsing.x12 import X12FrameError
+# --- streaming byte frame reader: the two oversize caps ----------------------
+# ``max_interchange_bytes`` is enforced by two independent guards, so each needs its own test. Every
+# test here matches on the message text, because a bare ``pytest.raises(X12FrameError)`` passes just
+# as happily via the other guard.
 
+
+def test_frame_reader_oversize_raises() -> None:
+    # Guard one: an interchange that arrived whole and is still too big.
     reader = X12FrameReader(max_interchange_bytes=64)
-    with pytest.raises(X12FrameError):
+    with pytest.raises(X12FrameError, match="exceeds the 64-byte cap"):
         list(reader.feed(interchange().encode("utf-8")))
+
+
+def test_frame_reader_cap_holds_when_no_iea_ever_arrives() -> None:
+    # Guard two: a peer that opened an ISA and streamed on without ever closing it would grow the
+    # buffer without bound. Guard one cannot reach this case, because no IEA arrives to complete a
+    # frame. Plain body bytes keep the reader on its cheap "could an IEA be here at all" pre-check.
+    _assert_open_interchange_refused_at_cap(b"REF*XX*PADDING~")
+
+
+def test_frame_reader_cap_holds_when_iea_appears_in_element_data() -> None:
+    # Guard two on its other path. "IEA" inside element data satisfies that pre-check, so the reader
+    # walks segment by segment for a boundary it will never find. The cap has to hold on the walk
+    # too, not only on the pre-check that skips it.
+    _assert_open_interchange_refused_at_cap(b"REF*XX*IEADATA~")
+
+
+def _assert_open_interchange_refused_at_cap(chunk: bytes) -> None:
+    """Stream ``chunk`` after an ISA, never sending an IEA, and require the refusal on the read that
+    carries the buffer past the cap.
+
+    Asserting the byte count is the point. A guard that refused only after buffering far past the cap
+    would satisfy a bare ``pytest.raises`` and still be the unbounded-growth defect; so would one that
+    tripped on the ISA alone, never reaching the across-feeds behaviour under test. The surplus chunks
+    are the room a late guard would have used.
+    """
+    cap = 256
+    header = isa().encode("utf-8")
+    reader = X12FrameReader(max_interchange_bytes=cap)
+    list(reader.feed(header))  # 106 bytes: opening the interchange must not trip the cap by itself
+    fed = len(header)
+    with pytest.raises(X12FrameError, match="before the IEA segment"):
+        for _ in range(40):
+            fed += len(chunk)
+            list(reader.feed(chunk))
+    crossing = -(-(cap + 1 - len(header)) // len(chunk))  # first chunk to carry the buffer past cap
+    assert fed == len(header) + crossing * len(chunk) == 271
 
 
 # --- integrity ---------------------------------------------------------------

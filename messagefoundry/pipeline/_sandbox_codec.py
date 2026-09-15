@@ -65,6 +65,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     WiringError,
+    handler_item_fault,
     handler_result_items,
 )
 from messagefoundry.parsing.message import Message, RawMessage
@@ -73,7 +74,6 @@ __all__ = [
     "MAX_FRAME",
     "SandboxError",
     "SandboxCodecError",
-    "Ignored",
     "Request",
     "Response",
     "build_payload",
@@ -728,21 +728,6 @@ def _dec_response_view(node: Any, reader: _Reader) -> dict[str, CapturedResponse
 # --- the result (child -> parent) ---------------------------------------------
 
 
-class Ignored:
-    """A child result item :func:`dryrun._partition` would ignore, described rather than omitted.
-
-    The encoder never silently drops an item it does not recognise — a silent omission would be an
-    accept-and-drop (CLAUDE.md §12). Rebuilding the ignored slot keeps ``_partition`` the SOLE filter,
-    so an unrecognised Handler return (a bare ``int``, a ``__reduce__`` gadget) still resolves to
-    ``([], [], [])`` byte-identically to ``mode=off`` — as does an unrecognised ELEMENT inside a
-    container the child materialised."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return "Ignored()"
-
-
 def enc_result(phase: str, result: object, blobs: _Blobs) -> dict[str, Any]:
     """Describe a Router/Handler/predicate return value, phase-typed."""
     if phase == "accepts":
@@ -776,8 +761,9 @@ def enc_result(phase: str, result: object, blobs: _Blobs) -> dict[str, Any]:
         # single shared rule, so a tuple/set/generator fan-out delivers under mode=subprocess exactly
         # as it does under mode=off (BACKLOG #341); fixing only the parent's _partition would make the
         # disposition MODE-DEPENDENT, which is worse than the original accept-and-drop. A value the
-        # rule does not recognise as a container stays a "one" item — the parent's unmodified
-        # _partition still filters it out (and `dec_result` still returns the ITEM, not a 1-list).
+        # rule does not recognise as a container stays a "one" item, and `_enc_item` then applies the
+        # shared ADMISSIBILITY rule to it — so an inadmissible single value is rejected HERE, in the
+        # child, exactly as the parent's _partition rejects it under mode=off (BACKLOG #1687).
         if result is None:
             return {"r": "items", "shape": "none"}
         items = handler_result_items(result)
@@ -814,6 +800,12 @@ def dec_result(phase: str, node: Any, reader: _Reader) -> object:
 
 
 def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
+    # The SAME admissibility rule _partition applies in the parent (config.wiring), for the parity
+    # reason enc_result's transform branch states above (BACKLOG #1687). The verdict travels back as a
+    # `kind="error"` frame, so the worker survives for the next message and only THIS one dead-letters.
+    fault = handler_item_fault(item)
+    if fault is not None:
+        raise SandboxCodecError(f"handler {fault}")
     # isinstance, in _partition's order — NOT type identity, so a user SUBCLASS of Send still
     # delivers exactly as it does in-process.
     if isinstance(item, Send):
@@ -843,14 +835,20 @@ def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
             "key": _req_str(item.key, "SetMeta key"),
             "v": blobs.ref(item.value),
         }
-    return {"o": "other"}
+    # Unreachable while HANDLER_ITEM_TYPES matches the three branches above; a raise rather than a
+    # silent slot so widening that tuple without a branch here fails loudly instead of re-dropping.
+    raise SandboxCodecError(f"handler result item {type(item).__name__} has no encoder branch")
 
 
 def _dec_item(node: Any, reader: _Reader) -> object:
     obj = _req_obj(node, "transform item")
     tag = obj.get("o")
-    # The NORMAL constructors over a CLOSED four-tag literal match — no getattr, no import, no
-    # registry keyed by a wire string.
+    # The NORMAL constructors over a CLOSED three-tag literal match — no getattr, no import, no
+    # registry keyed by a wire string. The grammar lost its fourth tag with BACKLOG #1687: `"other"`
+    # described an item the parent would ignore, and nothing admissible encodes to it any more. A
+    # forged frame carrying it now falls to the unknown-tag rejection below, which is the honest
+    # diagnosis — rebuilding it would hand `_partition` a value it must reject, blaming the config
+    # AUTHOR for a frame their Handler never produced.
     try:
         if tag == "send":
             return Send(_req_str(obj.get("to"), "Send destination"), reader.text(obj.get("m")))
@@ -867,8 +865,6 @@ def _dec_item(node: Any, reader: _Reader) -> object:
         # return it), so a raise here cannot be an authoring fault — it is a codec bug or a forged
         # frame. Reporting it as a WiringError would put a FALSE diagnosis in the operator's last_error.
         raise SandboxCodecError(f"sandbox result item could not be rebuilt: {exc}") from exc
-    if tag == "other":
-        return Ignored()
     raise SandboxCodecError(f"unknown sandbox result item tag {tag!r}")
 
 

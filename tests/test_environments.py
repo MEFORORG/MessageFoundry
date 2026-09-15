@@ -22,6 +22,7 @@ from messagefoundry.config.wiring import (
     display_settings,
     env,
     load_config,
+    parse_env_setting,
     referenced_env_keys,
     resolve_env_settings,
 )
@@ -95,6 +96,83 @@ def test_resolve_env_settings_reports_missing_and_uncastable_together() -> None:
         resolve_env_settings(settings, {"b_port": "notnum"})  # a_host missing + b_port uncastable
     msg = str(ei.value)
     assert "missing: a_host" in msg and "b_port" in msg
+
+
+def _bool_ref(key: str = "flag") -> EnvRef:
+    """An env ref carrying the NAMED ``cast = "bool"``, decoded exactly as ``connections.toml`` is.
+
+    Going through :func:`parse_env_setting` rather than ``env(cast=...)`` is the point: the defect
+    below lived in the name→callable table, so a test that hands ``resolve_env_settings`` its own
+    callable would pass over the broken mapping without touching it."""
+    ref = parse_env_setting({"env": key, "cast": "bool"})
+    assert isinstance(ref, EnvRef)
+    return ref
+
+
+@pytest.mark.parametrize(
+    "spelling", ["true", "True", "TRUE", "1", "yes", "YES", "on", "On", " true "]
+)
+def test_named_bool_cast_reads_every_true_spelling(spelling: str) -> None:
+    out = resolve_env_settings({"flag": _bool_ref()}, {"flag": spelling})
+    assert out["flag"] is True  # `is`, not `==`: `1 == True`, so equality would not pin the type
+
+
+@pytest.mark.parametrize(
+    "spelling", ["false", "False", "FALSE", "0", "no", "NO", "off", "Off", " false "]
+)
+def test_named_bool_cast_reads_every_false_spelling(spelling: str) -> None:
+    # The whole defect (BACKLOG #1651). The named cast was the builtin ``bool``, and ``bool(str)`` is
+    # True for EVERY non-empty string, so each of these resolved to True -- the inverse of what the
+    # operator wrote, with only an unset/empty value ever reading False. These assertions fail on the
+    # pre-fix code and the True ones above pass on it, so this half is the one carrying the guard.
+    out = resolve_env_settings({"flag": _bool_ref()}, {"flag": spelling})
+    assert out["flag"] is False
+
+
+@pytest.mark.parametrize(("raw", "want"), [(True, True), (False, False), (1, True), (0, False)])
+def test_named_bool_cast_passes_typed_toml_values_through(raw: object, want: bool) -> None:
+    # environments/<env>.toml is TOML, so a native ``flag = true`` (or ``flag = 1``) reaches the cast
+    # already typed rather than as text. Re-parsing a real bool would be this same defect in reverse.
+    assert resolve_env_settings({"flag": _bool_ref()}, {"flag": raw})["flag"] is want
+
+
+@pytest.mark.parametrize("raw", ["maybe", "", "   ", "2", "truthy", "y", 2, -1, None, 1.5])
+def test_named_bool_cast_refuses_an_unreadable_value(raw: object) -> None:
+    # An unrecognized spelling has no honest reading, so it fails loud the way a bad ``int`` does
+    # rather than guessing a side. The empty string is deliberately in here: pre-fix it was the ONLY
+    # value that read False, and "the operator left it unset" is not evidence they meant False.
+    with pytest.raises(WiringError, match="not a valid bool"):
+        resolve_env_settings({"debug": _bool_ref("debug_flag")}, {"debug_flag": raw})
+
+
+def test_named_bool_cast_failure_renders_the_operator_diagnostic() -> None:
+    # Pins the rendered sentence, because two separate things feed it and neither is obvious at the
+    # cast. ``resolve_env_settings`` names the expected TYPE from the cast callable's ``__name__``, so
+    # a helper named ``_parse_bool`` (or a lambda) would render "not a valid _parse_bool" / "not a
+    # valid <lambda>" -- a silent regression in operator-facing text that no other assertion catches.
+    # And the value must never appear: a MEFOR_VALUE_* setting carries store passwords and connector
+    # keys, and this string reaches the operator log, the support bundle and GET /logs/tail
+    # (BACKLOG #1183, the same rule the int cast above is held to).
+    secret = "pw-B00l_Val-77"
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"debug": _bool_ref("debug_flag")}, {"debug_flag": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the raw env value survived into the error text: {msg!r}"
+    assert "debug" in msg and "debug_flag" in msg, f"the setting and key are the fix-it: {msg!r}"
+    assert "not a valid bool" in msg, f"the expected type is the operator's diagnostic: {msg!r}"
+    assert "value withheld" in msg, f"a silent redaction reads as a truncated error: {msg!r}"
+
+
+def test_named_bool_cast_batches_with_other_failures() -> None:
+    # The bool parser must raise what the existing handler catches (ValueError/TypeError), not a
+    # WiringError of its own -- one raised from inside the cast would propagate past that handler,
+    # skipping BOTH the batching and the redaction. A WiringError still arrives here either way, so
+    # only a report naming every problem at once distinguishes the two.
+    settings = {"host": env("a_host"), "port": env("b_port", cast=int), "debug": _bool_ref()}
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings(settings, {"b_port": "notnum", "flag": "perhaps"})
+    msg = str(ei.value)
+    assert "missing: a_host" in msg and "b_port" in msg and "debug" in msg
 
 
 def test_referenced_env_keys_and_display() -> None:

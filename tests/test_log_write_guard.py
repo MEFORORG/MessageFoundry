@@ -810,9 +810,23 @@ def _revive_every_sink(logdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.stdout", io.StringIO())
 
 
-def _e2e_runner(store: MessageStore, outdir: Path, logdir: Path, claim_mode: str) -> RegistryRunner:
+def _e2e_runner(
+    store: MessageStore,
+    outdir: Path,
+    logdir: Path,
+    claim_mode: str,
+    alert_sink: LoggingAlertSink | None = None,
+) -> RegistryRunner:
+    # alert_sink is optional because only the refusal tests read the page back; None leaves the
+    # runner to build its own, which is what every other caller here wants.
     configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
-    return RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+    return RegistryRunner(
+        _e2e_registry(outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        alert_sink=alert_sink,
+    )
 
 
 # BOTH CLAIM MODES, because the halt reaches the internal stages by two DIFFERENT mechanisms and a
@@ -964,6 +978,64 @@ async def test_a_restart_is_refused_while_the_log_is_still_unwritable(
         await runner.start_outbound(OUTBOUND)
         assert await _until(lambda: any(outdir.iterdir())), "the repaired engine never drained"
         assert await _until_processed(store, message_id), "drained but never finalized"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_restart_outbound_is_refused_while_the_log_is_still_unwritable(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE SECOND DOOR INTO DELIVERY, and the one that had no gate. The test above drives
+    # `restart_inbound` + `start_outbound`; nothing covered `restart_outbound`, which reached
+    # `_start_outbound_unsafe` straight through. `RegistryRunner._outbound_start_permitted` carries
+    # what that would have cost and why this door is reachable with no operator at all.
+    #
+    # QUEUED WORK IS THE SUBJECT, not scenery. The lane is paused while the log is still healthy and
+    # a message is driven onto the outbound stage BEFORE the halt, so a real delivery is sitting
+    # there when the restart arrives. On an empty lane "no file was written" cannot tell a working
+    # gate from a lane that had nothing to deliver.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    sink = _RecordingSink()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode, alert_sink=sink)
+    await runner.start()
+    try:
+        await runner.stop_outbound(OUTBOUND)
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until_outbound_row(store, message_id), "never reached the outbound stage"
+        assert list(outdir.iterdir()) == []  # paused: routed and transformed, but not shipped
+
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+
+        # The restart arrives with NOTHING repaired. Deliberately no _revive_every_sink.
+        await runner.restart_outbound(OUTBOUND)
+        await asyncio.sleep(1.0)  # generous: the repaired lane below ships far inside this
+
+        assert list(outdir.iterdir()) == []  # the queued row was NOT delivered
+        assert OUTBOUND in runner._outbound_paused  # …and the lane was left PAUSED, not resumed
+        assert runner._log_write_stopped  # the halt is still latched — a restart must not disarm it
+        # …and its delivery row is retained PENDING, not dead-lettered by the refusal.
+        assert len(await store.outbox_for(message_id)) == 1
+        # The refusal PAGED rather than passing silently. `stopped=0` is the refusal's own signature:
+        # the halt itself reports how many connections it stopped, which is non-zero here.
+        assert [f for f in sink.log_failures if f[3] == 0 and OUTBOUND in f[2]], (
+            f"the refusal never paged: {sink.log_failures}"
+        )
+
+        # THE OTHER HALF, and it is required: a refusal-only test also passes against a lane that is
+        # permanently broken, which is the wrong engine for the right reason. The REPAIR is what earns
+        # the restart, so the same call must now deliver the same row.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_outbound(OUTBOUND)
+        # The delivered file IS the un-pause, so no separate _outbound_paused assertion here — unlike
+        # the refusal half above, where "nothing delivered" and "left paused" are different outcomes
+        # (an un-paused lane could merely be slow).
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired lane never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
     finally:
         await runner.stop()
 

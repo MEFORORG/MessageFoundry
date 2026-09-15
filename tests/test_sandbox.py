@@ -467,25 +467,26 @@ def test_a_handler_returning_a_reduce_gadget_does_not_execute_in_the_engine(
     ``h_gadget`` returns an object whose ``__reduce__`` creates a directory. Under the old pickle pipe
     the ENGINE PARENT ran it while unpickling the response frame — a full address-space-boundary
     bypass by admin-authored Handler code, which is the exact thing the sandbox exists to prevent.
-    Under MFW2 the gadget is an item ``_partition`` would ignore: it is described as ``{"o": "other"}``
-    and rebuilt as an inert placeholder, so nothing runs and the message simply delivers nothing."""
+    Under MFW2 the gadget is not an admissible Handler item, so the CHILD's encoder refuses it without
+    reading an attribute off it (BACKLOG #1687) and reports a plain error frame; nothing about the
+    object is ever executed, described, or rebuilt on either side of the pipe.
+
+    The sentinel is the load-bearing assertion and is unchanged. What moved is the verdict beside it:
+    the gadget used to be described as an ignorable slot and the message finalized ``FILTERED``, which
+    was equally non-executing and silently indistinguishable from a deliberate decline."""
     registry, config_dir = graph
     sentinel = _sentinel_path(config_dir)
     assert not sentinel.exists()
     session = _session(config_dir)
     try:
-        deliveries, state_ops, meta_ops, declined = transform_one(
-            registry, "h_gadget", RAW, sandbox=session, run_context=RunContext()
-        )
-        # Parity with mode=off, which drops an unrecognised return value the same way.
-        assert (deliveries, state_ops, meta_ops, declined) == ([], [], [], [])
-        assert transform_one(registry, "h_gadget", RAW) == (
-            deliveries,
-            state_ops,
-            meta_ops,
-            declined,
-        )
-        # And the worker survived — a described-but-ignored result is not a fault.
+        with pytest.raises(SandboxError, match="unsupported _Gadget"):
+            transform_one(registry, "h_gadget", RAW, sandbox=session, run_context=RunContext())
+        # Parity with mode=off, which rejects the same return value by the same shared rule. The
+        # exception TYPE differs by design (the child's rejection reaches the parent as a
+        # SandboxError); both land on the transform stage's internal-error policy.
+        with pytest.raises(ValueError, match="unsupported _Gadget"):
+            transform_one(registry, "h_gadget", RAW)
+        # And the worker survived — a rejected result is reported, not a lost child.
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
     finally:
         session.close()

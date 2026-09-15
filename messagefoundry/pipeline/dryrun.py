@@ -34,6 +34,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     StateValue,
+    handler_item_fault,
     handler_result_items,
 )
 from messagefoundry.parsing import (
@@ -102,7 +103,7 @@ def _handler_names(result: list[str] | str | None) -> list[str]:
 
 
 def _partition(
-    result: HandlerResult,
+    result: HandlerResult, hname: str
 ) -> tuple[list[Send], list[SetState], list[SetMeta]]:
     """Split a Handler's return into (deliveries, state writes, metadata writes) — ADR 0005 + ADR 0081.
 
@@ -116,12 +117,23 @@ def _partition(
     the sandbox child applies the SAME one, so ``[sandbox].mode`` never changes **which** ``Send``\\ s a
     Handler delivers. Order is the container's: an ordered one delivers in its order under either mode,
     while a ``set`` has no defined iteration order at all — see that function for why, and why the docs
-    steer authors away from it. A value the rule does not recognise as a container is a single item,
-    matches none of the three ``isinstance`` filters below, and still drops."""
+    steer authors away from it.
+
+    Anything else **raises** ``ValueError`` naming the handler and the offending type (BACKLOG #1687)
+    rather than falling out of all three filters and vanishing — see
+    :func:`~messagefoundry.config.wiring.handler_item_fault` for what that used to cost. The raise is
+    deliberately the SAME shape as this function's caller already uses for an over-cap ``SetMeta`` bag
+    and for a ``Send`` to an unknown outbound: a transform-time authoring error, post-ACK, so the
+    transform stage routes it to the internal-error policy (ERROR / dead-letter, replayable, no NAK).
+    The sandbox child applies that same shared rule, so it rejects exactly these values (ADR 0087)."""
     if result is None:
         return [], [], []
     materialized = handler_result_items(result)
     items: list[object] = [result] if materialized is None else materialized
+    for item in items:
+        fault = handler_item_fault(item)
+        if fault is not None:
+            raise ValueError(f"handler {hname!r} {fault}")
     sends = [it for it in items if isinstance(it, Send)]
     state_ops = [it for it in items if isinstance(it, SetState)]
     meta_ops = [it for it in items if isinstance(it, SetMeta)]
@@ -410,7 +422,8 @@ def transform_one(
     payload (a :class:`Message`, or a :class:`RawMessage` when ``content_type`` is non-HL7 — so one
     handler's transforms can't leak into another's), with every ``Send`` target validated against the
     outbound registry. An unknown outbound fails closed **here** (``ValueError``): an undeliverable
-    target would otherwise enqueue an outbound row no worker drains (silent accept-and-strand).
+    target would otherwise enqueue an outbound row no worker drains (silent accept-and-strand). An
+    inadmissible return value fails closed the same way — see :func:`_partition`.
 
     A ``Send`` naming a **present-but-not-deployed** connection (#233, ADR 0111) is **declined** here
     rather than delivered: it never becomes a :class:`DeliveryPreview`, so no caller can commit an
@@ -460,7 +473,7 @@ def transform_one(
         raw_result = (
             handle(payload) if tracer is None else tracer.trace_handler(handle, hname, payload)
         )
-    sends, ops, meta = _partition(raw_result)
+    sends, ops, meta = _partition(raw_result, hname)
     # Cap the handler's metadata contribution (ADR 0081): a runaway bag would bloat the encrypted
     # column. Over-cap is a transform-time code error → the transform worker dead-letters the row.
     if len(meta) > META_MAX_KEYS:

@@ -332,6 +332,131 @@ def test_build_check_registry_raises_port_conflict_error_on_api_port() -> None:
         )
 
 
+# --- declared text-encoding validation (BACKLOG #1613) -----------------------
+# See Registry.encoding_problems in messagefoundry/config/wiring.py for the failure these pin.
+
+
+def _encoding_cfg(directory: Path, body: str) -> Path:
+    return _write(
+        directory,
+        "from messagefoundry import inbound, outbound, router, MLLP, File, env\n"
+        + body
+        + "\n@router('r')\ndef route(msg):\n    return []\n",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        (
+            "inbound('i', MLLP(port=2575, encoding='not-a-real-codec'), router='r')",
+            "inbound connection 'i'",
+        ),
+        # Same setting, same class of failure: an outbound encodes every payload with it.
+        (
+            "outbound('o', File(directory='.', encoding='not-a-real-codec'))",
+            "outbound connection 'o'",
+        ),
+        # `base64` IS a registered codec, so codecs.lookup() accepts it — but str.encode/bytes.decode
+        # refuse it ("not a text encoding"), and those are what the transports actually call.
+        ("inbound('i', MLLP(port=2575, encoding='base64'), router='r')", "'base64' is not"),
+    ],
+)
+def test_unusable_encoding_refuses_to_load(tmp_path: Path, body: str, match: str) -> None:
+    _encoding_cfg(tmp_path, body)
+    with pytest.raises(WiringError, match=match):
+        load_config(tmp_path)
+
+
+def test_validate_config_reports_invalid_inbound_encoding(tmp_path: Path) -> None:
+    _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding='utf8-8'), router='r')")
+    diags = [d for d in validate_config(tmp_path) if d.severity == "error"]
+    assert any("'i'" in d.message and "'utf8-8'" in d.message for d in diags)
+
+
+def test_check_validate_fails_on_invalid_encoding(tmp_path: Path) -> None:
+    # The `messagefoundry check` gate must go red BEFORE the connection is ever started.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding='utf8-8'), router='r')")
+    result = _check_validate(tmp_path)
+    assert result.ok is False and result.required is True
+    assert "not a Python text codec" in result.detail
+
+
+# "UTF_8" is the load-bearing row: Python normalizes case and underscores, so a probe stricter than
+# str.encode would false-positive on it. The other two are the ordinary spellings.
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "UTF_8"])
+def test_real_encodings_validate_cleanly(tmp_path: Path, encoding: str) -> None:
+    _encoding_cfg(
+        tmp_path,
+        f"inbound('i', MLLP(port=2575, encoding={encoding!r}), router='r')\n"
+        f"outbound('o', File(directory='.', encoding={encoding!r}))",
+    )
+    reg = load_config(tmp_path)  # no WiringError
+    assert reg.encoding_problems() == []
+    assert validate_config(tmp_path) == []
+
+
+def test_env_supplied_encoding_is_left_unchecked_without_masking_a_literal_typo(
+    tmp_path: Path,
+) -> None:
+    # An env() ref carries no value at load time (resolve_env_settings needs the instance's
+    # environment values), so it is skipped deliberately — and probing the EnvRef object itself would
+    # raise TypeError, not LookupError, so this also pins that the skip happens before any probe.
+    # The bad literal beside it is the positive control: without it this test would pass just as well
+    # if the check never ran at all.
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
+        "outbound('o', File(directory='.', encoding='not-a-real-codec'))",
+    )
+    flagged = [d.message for d in validate_config(tmp_path) if "text codec" in d.message]
+    assert len(flagged) == 1  # the env()-supplied inbound encoding produced nothing
+    assert "outbound connection 'o'" in flagged[0]  # the literal typo still did
+
+
+def test_encoding_census_counts_what_was_probed(tmp_path: Path) -> None:
+    # Three literals probed — the fourth connection never set one, so its factory wrote the "utf-8"
+    # default into settings — and one env ref left unchecked.
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575, encoding='utf-8'), router='r')\n"
+        "outbound('a', File(directory='.', encoding='latin-1'))\n"
+        "outbound('b', File(directory='.', encoding=env('charset')))\n"
+        "outbound('c', MLLP(host='h', port=1234))",
+    )
+    assert load_config(tmp_path).encoding_census() == (3, 1)
+
+
+def test_an_all_env_config_is_counted_as_unchecked_not_reported_as_clean(tmp_path: Path) -> None:
+    # The failure this guards: every encoding deferred, nothing probed, and the pass reporting no
+    # problems — indistinguishable from a pass that checked everything. The census is what separates
+    # them, so pin the zero.
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
+        "outbound('o', File(directory='.', encoding=env('charset', default='utf-8')))",
+    )
+    reg = load_config(tmp_path)  # no WiringError, no TypeError
+    assert validate_config(tmp_path) == []
+    assert reg.encoding_census() == (0, 2)
+
+
+def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> None:
+    # The count reaches an operator: `messagefoundry check`'s validate line says how many were probed.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
+        "outbound('o', File(directory='.', encoding='utf-8'))",
+    )
+    result = _check_validate(tmp_path)
+    assert result.ok is True
+    assert "encodings checked: 1, unchecked env() refs: 1" in result.detail
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (CONFIG-2 / review M-21)")
 def test_validate_config_refuses_unsafe_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

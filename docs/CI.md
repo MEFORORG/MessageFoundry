@@ -65,7 +65,7 @@ which fork-PR tokens do not have, so requiring it would block PRs from forks. Bo
 were seen on branch protection earlier on 2026-08-31 and were off again by 20:57 CDT that day; the
 rationale is unchanged, and `.github/required-contexts.txt` records it. Scorecard is advisory for
 the same reason and additionally **does not run on PRs at all** (`scorecard.yml` has no `pull_request`
-trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
+trigger — it runs on a weekly schedule, on branch-protection changes, and on demand). Nightly / path-gated
 legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
 `a reviewer has read this` (`review-gate.yml`) was **retired by the owner on 2026-09-04**. The context
@@ -187,7 +187,7 @@ for diff-coverage and usually *not* true for complexity, so the two land in diff
 | Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex. Findings anchor on the `def` line, which a body-only edit does not touch, so **most complexity annotations appear in the Checks tab and the step summary rather than inline**. The summary table is this signal's primary surface. Pre-existing findings are never reported; the full list stays in the job log. |
 | Duplication (`jscpd`) | Step summary only. jscpd emits one location per clone pair chosen by scan order, so annotating it would anchor on the untouched twin about half the time. |
 | **Gate liveness** | A pass/fail table proving each gate above actually *measured* something. See below — this is the only job in that workflow that can go red. |
-| Mutation (`mutmut`) | A **killed / survived / not-covered** table in the step summary, with the surviving mutants listed — those are injected bugs the tests did not catch. Runs on PRs too: measured at **461 mutants in 3 seconds** (87 killed, 19 survived) over the bounded scope, because mutmut 3 only runs the tests that cover each mutant. Repaired 2026-07-27 — `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 before generating a single mutant and, thanks to `\|\| true`, had been reporting success in 37s while measuring nothing. |
+| Mutation (`mutmut`) | A **killed / survived / not-covered** table in the step summary, with the surviving mutants listed — those are injected bugs the tests did not catch. **Off pull requests** — it runs on the nightly cron and on dispatch, alongside `jscpd`, because an advisory job holds a runner slot the merge queue wants whatever its runtime. Measured at **461 mutants in 3 seconds** (87 killed, 19 survived) over the bounded scope, because mutmut 3 only runs the tests that cover each mutant. Repaired 2026-07-27 — `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 before generating a single mutant and, thanks to `\|\| true`, had been reporting success in 37s while measuring nothing. |
 
 ### Gate liveness — the check that watches the checks
 

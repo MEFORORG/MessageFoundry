@@ -11,6 +11,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.wiring import (
+    HANDLER_ITEM_TYPES,
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
@@ -18,10 +19,12 @@ from messagefoundry.config.wiring import (
     Send,
     SetMeta,
     SetState,
+    handler_item_fault,
 )
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.dryrun import (
     DeliveryPreview,
+    _partition,
     disposition_for,
     dry_run,
     route_message,
@@ -428,13 +431,85 @@ def test_a_mixed_tuple_partitions_exactly_like_the_equivalent_list() -> None:
     assert (len(tup.deliveries), len(tup.state_ops), len(tup.meta_ops)) == (1, 1, 1)
 
 
-def test_a_bare_message_return_still_drops_and_never_raises() -> None:
-    """A Handler that returns its ``Message`` by mistake still drops silently — the widen must not turn
-    that slip into a raise. This pins the ``isinstance(..., Iterable)`` GATE, not merely the outcome: a
-    duck-typed ``list(result)`` would drive ``Message.__getitem__`` (declared ``(path: str)``) through
-    the legacy sequence protocol with an *int* index and raise ``TypeError`` out of the handler."""
+@pytest.mark.parametrize(
+    ("build", "offender"),
+    [
+        (lambda msg: msg, "Message"),
+        (lambda msg: [Send("OB_A", msg), object()], "object"),
+    ],
+    ids=["bare_return", "stray_element"],
+)
+def test_an_unrecognised_return_raises_and_names_the_handler(build: Any, offender: str) -> None:
+    """BACKLOG #1687, through the ``transform_one`` seam. The slip used to partition to nothing and
+    finalize ``FILTERED`` — see
+    :func:`~messagefoundry.config.wiring.handler_item_fault` for what that cost.
+
+    Two rows, because the two positions are different code paths: a bare return is the value the
+    materialization rule declined to treat as a container, a stray element is one it DID materialize.
+    The remaining measured shapes (``msg.encode()``, a ``dict``, a ``(name, message)`` tuple) are
+    pinned in ``tests/test_sandbox_codec.py::test_partition_parity_table_rejects``, which asserts them
+    against both ``[sandbox]`` modes rather than only this one.
+
+    The handler NAME is asserted, not just the raise: a message that says only "unsupported dict"
+    leaves an operator with a dead-lettered message and no way to find the Handler that produced it."""
 
     def handle(msg: Message) -> Any:
-        return msg
+        return build(msg)
 
-    assert transform_one(_fanout_registry(handle), "h", ADT_A01) == ([], [], [], [])
+    with pytest.raises(ValueError, match=f"handler 'h' returned an unsupported {offender}"):
+        transform_one(_fanout_registry(handle), "h", ADT_A01)
+
+
+def test_an_unrecognised_return_is_an_error_disposition_not_filtered() -> None:
+    """The disposition the finding actually measured, at the surface an author sees. ``dry_run``
+    reported ``FILTERED`` with ``error`` unset — the shape of a deliberate decline — so ``messagefoundry
+    check`` passed a broken feed. Asserting the raise alone would not have caught that: the raise could
+    be swallowed anywhere between here and the report and every other test would stay green."""
+    result = dry_run(_registry(lambda m: ["h"], {"h": lambda m: m}), ADT_A01)
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error and "'h'" in result.error and "unsupported" in result.error
+
+
+def test_every_admissible_item_type_has_a_partition_bucket() -> None:
+    """The two halves of the rule cannot drift apart. ``handler_item_fault`` decides what is
+    ADMISSIBLE and ``_partition``'s three filters decide where each one GOES, and a type added to the
+    first without a filter in the second would be accepted and then dropped from all three lists —
+    re-opening the accept-and-drop #1687 closes, silently.
+
+    The table is keyed on ``HANDLER_ITEM_TYPES`` itself rather than listing the types, so widening
+    that tuple fails HERE, on the set comparison, with the reason in the assertion."""
+    samples: dict[type, object] = {
+        Send: Send("OB_A", "x"),
+        SetState: SetState("ns", "k", 1),
+        SetMeta: SetMeta("mk", "mv"),
+    }
+    assert set(samples) == set(HANDLER_ITEM_TYPES), (
+        "a new admissible item type needs a bucket below"
+    )
+    for kind, sample in samples.items():
+        assert handler_item_fault(sample) is None
+        buckets = _partition([sample], "h")  # type: ignore[arg-type]
+        assert [len(b) for b in buckets].count(1) == 1, f"{kind.__name__} landed in no bucket"
+
+
+def test_a_bare_message_return_is_not_iterated_to_reach_that_raise() -> None:
+    """The ``isinstance(..., Iterable)`` GATE, pinned apart from the outcome above.
+
+    A :class:`Message` declares ``__getitem__(path: str)`` and no ``__iter__``, so a duck-typed
+    ``list(result)`` would drive the legacy sequence protocol with an *int* index and raise
+    ``TypeError`` from inside the handler's own frame — naming neither the handler nor what it should
+    have returned. The row above would still be "it raises" and would not notice the difference, so
+    the exception TYPE and the absence of any ``__getitem__`` traffic are what make the gate
+    falsifiable."""
+    seen: list[object] = []
+
+    class _Watched(Message):
+        def __getitem__(self, path: Any) -> Any:
+            seen.append(path)
+            return super().__getitem__(path)
+
+    watched = _Watched.parse(ADT_A01)
+    reg = _fanout_registry(lambda msg: watched)
+    with pytest.raises(ValueError, match="unsupported _Watched"):
+        transform_one(reg, "h", ADT_A01)
+    assert seen == [], f"the return value was iterated, not classified: {seen}"
