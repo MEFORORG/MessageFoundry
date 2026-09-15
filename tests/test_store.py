@@ -92,7 +92,10 @@ def test_secure_file_grants_extra_read_principals(monkeypatch: pytest.MonkeyPatc
         Path("key.dpapi"), extra_read_grants=["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
     )
     argv = captured[0]
-    assert argv[0] == "icacls" and "/inheritance:r" in argv and "/grant:r" in argv
+    # argv[0] is the pinned absolute path; test_secure_file_pins_icacls_to_the_system_directory
+    # owns that assertion, so check only that it is still icacls here.
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"
+    assert "/inheritance:r" in argv and "/grant:r" in argv
     assert "minter:F" in argv  # owner keeps full control
     assert "*S-1-5-18:R" in argv  # SYSTEM read
     assert "NT SERVICE\\MessageFoundry:R" in argv  # service account read
@@ -107,7 +110,35 @@ def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> N
 
     captured = _capture_icacls(monkeypatch)
     store_mod._secure_file(Path("store.db"))
-    assert captured[0] == ["icacls", "store.db", "/inheritance:r", "/grant:r", "minter:F"]
+    argv = captured[0]
+    assert os.path.basename(argv[0]).lower() == "icacls.exe"  # the pin has its own test
+    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", "minter:F"]
+
+
+@_windows_only
+def test_secure_file_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This call WRITES the ACL restricting the store DB and the DPAPI key file, so it must name
+    # icacls by absolute path: CreateProcess resolves an unqualified name through a search path that
+    # reaches the caller's working directory. _secure_file logs only on a non-zero exit, so a planted
+    # icacls.exe that exits 0 would leave the file its inherited (possibly broad) ACL and report
+    # nothing — the hardening becomes a silent no-op (BACKLOG #1769).
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+    from messagefoundry import service_status
+
+    captured = _capture_icacls(monkeypatch)
+    store_mod._secure_file(Path("store.db"))
+    # Guard the guard: with no call recorded, every assertion below passes over nothing.
+    assert captured, "icacls was never invoked; the pin assertions would pass vacuously"
+    program = captured[0][0]
+    assert os.path.isabs(program), f"icacls must be pinned to an absolute path, got {program!r}"
+    assert os.path.basename(program).lower() == "icacls.exe"
+    # It must be the OS-reported system directory, not merely some absolute path. Compared against
+    # _system_dir rather than a literal "System32" because GetSystemDirectoryW answers "SysWOW64" to
+    # a 32-bit process, and that is the correct system directory there; _system_dir's own behaviour
+    # is tested beside it in tests/test_service_control.py.
+    assert os.path.dirname(program) == service_status._system_dir()
 
 
 async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> None:
