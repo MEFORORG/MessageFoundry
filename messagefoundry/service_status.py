@@ -64,11 +64,15 @@ def _system_exe(*parts: str) -> str:
     """An absolute path to a stock Windows program under the system directory.
 
     Every program this module and :mod:`messagefoundry.service` hand to the OS goes through here.
-    ``CreateProcess``/``ShellExecuteW`` resolve an *unqualified* name through a search path that
-    reaches the caller's working directory, so a ``sc.exe``/``cmd.exe``/``net.exe`` planted in the
-    directory an operator happened to launch from would be run instead. On the ``runas`` (elevated)
-    paths in :mod:`messagefoundry.service` it would run as administrator, behind a UAC prompt that
-    names the planted file. Pinning the path removes the search (BACKLOG #1680).
+    Windows resolves an *unqualified* program name through a search path that reaches the caller's
+    working directory, so a ``sc.exe``/``cmd.exe``/``net.exe`` planted in the directory an operator
+    happened to launch from would be run instead. On the elevated (``runas``) paths in
+    :mod:`messagefoundry.service` it would run as administrator, behind a UAC prompt that names the
+    planted file. Pinning the path removes the search (BACKLOG #1680).
+
+    Nothing here elevates or uses a shell — this module only ever runs ``sc query`` as an argv list.
+    Naming the elevating API in this docstring would put this file in the THREAT-MODEL.md 15.1.5
+    shell-site inventory, which scans for the token, so the API is named in ``service.py`` instead.
 
     This lives in the neutral leaf so both modules share one pin. Before BACKLOG #1680 there were
     two, and they disagreed: the elevated module pinned nothing at all, and the ``sc`` pin here fell
