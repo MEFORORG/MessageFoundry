@@ -2087,14 +2087,14 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
-            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
-            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
-            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
-            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
+            # Also surface any DOWN outbound with no failed/filtered/edge row yet, so a down idle/no-edge
+            # lane stays visible + selectable (its purge-eligibility is the `paused` field below; the
+            # status is the live stopping/stopped, or "log_halted", reason None — no failure). A
+            # not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a start-disabled
+            # one, so outbound_status reports "stopped" for it too — but it must surface as
             # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
             # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
-            # deployed=False wins over the tri-state.
+            # deployed=False wins over the live state.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
