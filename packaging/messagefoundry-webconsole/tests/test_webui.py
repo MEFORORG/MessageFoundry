@@ -2528,6 +2528,10 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u1")
+        # BACKLOG #1737: the update lane is action-bound, and the grant is SINGLE-USE, so each of the
+        # two submits below needs its own. The continuation is the detail PAGE, not the POST path (a
+        # body-carrying action is in neither continuation allow-list) — that is where the grant mints.
+        await _mint_action(c, f"/ui/users/{uid}")
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "User One", "email": "u1@example.test", "disabled": "on"},
@@ -2538,6 +2542,7 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert user is not None
         assert user.display_name == "User One" and user.disabled
         # Re-enable (checkbox absent) + clear the email ("" clears to None — full-form semantics).
+        await _mint_action(c, f"/ui/users/{uid}")
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "User One", "email": ""},
@@ -2549,10 +2554,64 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert not user.disabled and user.email is None
 
 
+async def test_update_user_requires_a_grant_bound_to_this_action(engine: Engine) -> None:
+    """BACKLOG #1737 (ASVS 7.5.1): the console update lane must require the same action-bound,
+    single-use step-up its JSON twin (``PATCH /users/{id}``) requires — not the shared window.
+
+    THE CONTROL IS THE BOUNCE, AND IT IS ASSERTED BEFORE ANY GRANT EXISTS. Minting and then
+    succeeding shows the flow works, not that the gate stands: this session is freshly signed in, so
+    it already satisfies ``has_recent_step_up``, and a route back on ``require_ui_step_up`` would
+    serve step 1 with a 303 to the user page and the write applied. The wrong-action leg is the
+    second half of the same control — it fails a route that reads any fresh grant rather than this
+    action's, which a bare "does a grant work" test cannot tell apart.
+    """
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        form = {"display_name": "Renamed", "email": "u1@example.test", "disabled": "on"}
+
+        async def _update() -> httpx.Response:
+            return await c.post(
+                f"/ui/users/{uid}/update", data=form, headers={"Sec-Fetch-Site": "same-origin"}
+            )
+
+        async def _unchanged() -> None:
+            user = await service.store.get_user(uid)
+            assert user is not None
+            assert user.display_name != "Renamed" and not user.disabled
+
+        # 1. The login-seeded window alone does not reach it.
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+        await _unchanged()
+
+        # 2. Nor does a fresh grant minted for a DIFFERENT action on the same session.
+        await _mint_action(c, f"/ui/users/{uid}/reset-password")  # mints admin_reset_password
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+        await _unchanged()
+
+        # 3. The grant bound to THIS action does, so the gate did not just break the lane.
+        await _mint_action(c, f"/ui/users/{uid}")
+        r = await _update()
+        assert r.status_code == 303 and r.headers["location"] == f"/ui/users/{uid}"
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Renamed" and user.disabled
+
+        # 4. And it is spent: the next submit bounces again rather than riding the refreshed window.
+        bounced = await _update()
+        assert bounced.status_code == 303
+        assert "/ui/reauth" in bounced.headers["location"]
+
+
 async def test_cannot_disable_self_rerenders_error(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "boss")
+        await _mint_action(c, f"/ui/users/{uid}")  # BACKLOG #1737: action-bound lane
         r = await c.post(
             f"/ui/users/{uid}/update",
             data={"display_name": "", "email": "", "disabled": "on"},
@@ -2966,9 +3025,11 @@ async def test_all_admin_posts_reject_cross_site(engine: Engine) -> None:
         # missing assert_same_origin on those routes must fail loudly, not hide behind a no-grant 303).
         await _mint_action(c, "/ui/account/webauthn/enroll")
         await _mint_action(c, "/ui/account/webauthn/abc123/delete")
-        # BACKLOG #1148 puts the two admin reset lanes into that same shape.
+        # BACKLOG #1148 puts the two admin reset lanes into that same shape, #1737 the update lane
+        # (whose grant mints against the detail PAGE — the POST path is not a continuation).
         await _mint_action(c, f"/ui/users/{boss_id}/reset-password")
         await _mint_action(c, f"/ui/users/{boss_id}/reset-mfa")
+        await _mint_action(c, f"/ui/users/{boss_id}")
         posts = [
             "/ui/users",
             f"/ui/users/{boss_id}/update",

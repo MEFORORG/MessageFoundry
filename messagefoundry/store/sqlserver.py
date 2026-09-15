@@ -138,11 +138,13 @@ from messagefoundry.store.store import (
     UserRecord,
     WebAuthnCredential,
     _append_channel_scope,
+    _opt_float,
     _qmark_cutoff_case,
     audit_mac_bytes,
     audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
+    next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
     password_claim_set,
@@ -9956,6 +9958,52 @@ class SqlServerStore:
             "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
             (failed_attempts, locked_until, now, user_id),
         )
+
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The ``UPDLOCK`` SELECT + UPDATE run in one transaction, so concurrent attempts serialize on
+        the row rather than each reading the same pre-increment count.
+        :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
+        than three. Returns ``(0, False)`` for an unknown user."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT failed_attempts, locked_until FROM users WITH (UPDLOCK, ROWLOCK)"
+                    " WHERE id=?",
+                    (user_id,),
+                )
+                # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
+                # clean; `_cursor` closes the cursor before the pooled connection is reused (EF-6).
+                rows = await cur.fetchall()
+                if not rows:
+                    await self._commit(conn)
+                    return 0, False
+                state = next_lockout_state(
+                    failed_attempts=int(rows[0][0]),
+                    locked_until=_opt_float(rows[0][1]),
+                    now=now,
+                    threshold=threshold,
+                    lockout_seconds=lockout_seconds,
+                )
+                await cur.execute(
+                    "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
+                    (state.attempts, state.locked_until, now, user_id),
+                )
+                await self._commit(conn)
+                return state.attempts, state.just_locked
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def upsert_role(
         self,

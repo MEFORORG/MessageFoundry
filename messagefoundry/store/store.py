@@ -1476,6 +1476,59 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
 
 
+@dataclass(frozen=True)
+class LockoutState:
+    """What one failed credential attempt writes to the account-lockout columns, plus whether that
+    attempt is the one that locked the account. Computed by :func:`next_lockout_state`."""
+
+    attempts: int
+    locked_until: float | None
+    just_locked: bool
+
+
+def next_lockout_state(
+    *,
+    failed_attempts: int,
+    locked_until: float | None,
+    now: float,
+    threshold: int,
+    lockout_seconds: float,
+) -> LockoutState:
+    """The per-account lockout policy for ONE failed credential attempt -- shared by all three
+    backends so the rule is stated once.
+
+    **It runs inside each backend's atomic increment, and the siting is the fix rather than the
+    arithmetic.** The same arithmetic used to run in ``AuthService._register_failure`` against a user
+    row read before the argon2 verify. Every await between that read and the write back is a window in
+    which another attempt reads the SAME pre-increment count, so N wrong passwords submitted in
+    parallel would all compute 1, the account would never reach ``threshold``, and an attacker who
+    parallelizes would evade the lockout entirely on a first deployment. Callers must pass the values
+    they re-read under the lock that also carries the write.
+
+    A LAPSED lock restarts the counter, so one post-lockout failure cannot re-lock immediately, and
+    the stale ``locked_until`` is cleared whenever the restarted count is back below ``threshold``.
+
+    ``just_locked`` is True only for the attempt that takes the account from unlocked to locked. An
+    attempt landing while a LIVE lock is already set extends the lock but reports False, so exactly
+    one ACCOUNT_LOCKED notice fires per lockout however many attempts arrive at once -- which is what
+    the caller's one-notification-per-lockout contract rests on now that a burst can reach here past
+    the caller's own locked-account pre-check.
+
+    Nothing here accumulates across lock CYCLES: the row persists a failure count and an expiry, never
+    a count of locks, so re-locking is unbounded by construction (docs/SECURITY.md, control 1). Adding
+    a cross-cycle ceiling means re-deriving that note in the same change.
+    """
+    already_locked = locked_until is not None and now < locked_until
+    lapsed = locked_until is not None and now >= locked_until
+    attempts = (0 if lapsed else failed_attempts) + 1
+    locked = now + lockout_seconds if attempts >= threshold else None
+    return LockoutState(
+        attempts=attempts,
+        locked_until=locked,
+        just_locked=locked is not None and not already_locked,
+    )
+
+
 def _append_channel_scope(
     clauses: list[str],
     params: list[object],
@@ -8540,6 +8593,46 @@ class MessageStore:
                 (failed_attempts, locked_until, now, user_id),
             )
             await self._commit()
+
+    async def increment_login_failure(
+        self,
+        user_id: str,
+        *,
+        threshold: int,
+        lockout_seconds: float,
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
+        return ``(failed_attempts, just_locked)``.
+
+        The re-read + compute + write run under one ``self._lock``, the way ``consume_totp_step``
+        does, so two concurrent wrong credentials cannot both read the same pre-increment count and
+        lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
+        this has to be one call rather than three.
+
+        Returns ``(0, False)`` for an unknown user -- there is no row to count against, and a caller
+        that reached here on a missing account has already refused it."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT failed_attempts, locked_until FROM users WHERE id=?", (user_id,)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return 0, False
+            state = next_lockout_state(
+                failed_attempts=int(row["failed_attempts"]),
+                locked_until=_opt_float(row["locked_until"]),
+                now=now,
+                threshold=threshold,
+                lockout_seconds=lockout_seconds,
+            )
+            await self._db.execute(
+                "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
+                (state.attempts, state.locked_until, now, user_id),
+            )
+            await self._commit()
+            return state.attempts, state.just_locked
 
     async def upsert_role(
         self,

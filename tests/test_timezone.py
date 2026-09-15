@@ -3,6 +3,9 @@
 """DST-aware named-zone HL7 timestamp conversion (Tier 2.4): convert_hl7_timestamp() and to_zone()
 shift HL7 v2 timestamps between IANA zones using zoneinfo's DST rules, preserving precision.
 
+Includes the daylight-saving edges (BACKLOG #1686): a wall time that occurs twice or never is refused
+rather than silently resolved, and the opt-in resolutions are pinned either way.
+
 All data here is synthetic (fabricated timestamps), never PHI.
 """
 
@@ -13,6 +16,9 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from messagefoundry.timezone import (
+    AmbiguousLocalTimeError,
+    DstTransitionError,
+    NonExistentLocalTimeError,
     age_from_dob,
     convert_hl7_timestamp,
     hl7_now,
@@ -52,6 +58,142 @@ def test_dst_aware_conversion_from_utc_offset() -> None:
     assert convert_hl7_timestamp("20260115140000+0000", EASTERN) == "20260115090000-0500"
     # 2026-07-15 14:00 UTC in summer → 10:00 EDT (-0400) — same UTC wall-clock, different offset/hour.
     assert convert_hl7_timestamp("20260715140000+0000", EASTERN) == "20260715100000-0400"
+
+
+# --- DST edges: a wall time that happens twice, or never (BACKLOG #1686) -----
+#
+# A named source zone only pins an instant for wall-clock times that happen exactly once. On the two
+# transition days it does not, and the old code resolved both silently via datetime.replace()'s
+# implicit fold=0 — emitting a well-formed timestamp that could be an hour wrong. These pin the
+# refusal and the opt-in resolutions. America/Chicago 2026: the spring-forward gap is 02:00-03:00 on
+# March 8, the fall-back overlap is 01:00-02:00 on November 1.
+
+AMBIGUOUS_CENTRAL = "20261101013000"  # 01:30 on fall-back day — occurs twice
+NONEXISTENT_CENTRAL = "20260308023000"  # 02:30 on spring-forward day — never occurs
+NO_DST = "Asia/Kolkata"  # fixed UTC+05:30, no transitions ever — the negative control
+
+
+def test_ambiguous_local_time_raises_rather_than_picking_one() -> None:
+    # 01:30 Central on the fall-back day happens twice and the timestamp carries no offset to say
+    # which. Guessing yields a plausible, well-formed, possibly hour-wrong clinical time.
+    with pytest.raises(AmbiguousLocalTimeError) as excinfo:
+        convert_hl7_timestamp(AMBIGUOUS_CENTRAL, "UTC", from_tz=CENTRAL)
+    assert excinfo.value.ts == AMBIGUOUS_CENTRAL
+    assert excinfo.value.tz == CENTRAL
+
+
+def test_nonexistent_local_time_raises_rather_than_inventing_an_instant() -> None:
+    # 02:30 Central on the spring-forward day never happened — as impossible as Feb 30, which this
+    # module already rejects.
+    with pytest.raises(NonExistentLocalTimeError) as excinfo:
+        convert_hl7_timestamp(NONEXISTENT_CENTRAL, "UTC", from_tz=CENTRAL)
+    assert excinfo.value.ts == NONEXISTENT_CENTRAL
+    assert excinfo.value.tz == CENTRAL
+
+
+def test_dst_edge_errors_are_value_errors() -> None:
+    # Both subclass ValueError, so a caller already guarding this module's malformed-input path keeps
+    # catching them; only code that wants the distinction needs the new names. The two tests above
+    # already pin that these are what gets raised, so this states the hierarchy and nothing else.
+    assert issubclass(AmbiguousLocalTimeError, DstTransitionError)
+    assert issubclass(NonExistentLocalTimeError, DstTransitionError)
+    assert issubclass(DstTransitionError, ValueError)
+
+
+def test_ambiguous_opt_in_resolutions_differ_by_exactly_one_hour() -> None:
+    # "earlier"/"later" name the offset in force before/after the transition. For an overlap those
+    # are the first (CDT, -0500) and second (CST, -0600) occurrence of the same wall clock.
+    # The two differ by exactly the DST hour, and "earlier" reproduces the pre-fix fold=0 reading —
+    # now chosen by the caller rather than defaulted into.
+    earlier = convert_hl7_timestamp(
+        AMBIGUOUS_CENTRAL, "UTC", from_tz=CENTRAL, on_dst_edge="earlier"
+    )
+    later = convert_hl7_timestamp(AMBIGUOUS_CENTRAL, "UTC", from_tz=CENTRAL, on_dst_edge="later")
+    assert earlier == "20261101063000+0000"
+    assert later == "20261101073000+0000"
+
+
+def test_nonexistent_opt_in_resolutions_invert_because_the_wall_time_never_happened() -> None:
+    # For a gap the naming inverts, and the docstring says so: "earlier" keeps the PRE-gap offset
+    # (CST) and so lands after the gap; "later" keeps the POST-gap offset (CDT) and lands before it.
+    # The exact values below pin that inversion, so an edit that quietly swapped them would fail.
+    earlier = convert_hl7_timestamp(
+        NONEXISTENT_CENTRAL, "UTC", from_tz=CENTRAL, on_dst_edge="earlier"
+    )
+    later = convert_hl7_timestamp(NONEXISTENT_CENTRAL, "UTC", from_tz=CENTRAL, on_dst_edge="later")
+    assert earlier == "20260308083000+0000"
+    assert later == "20260308073000+0000"
+
+
+@pytest.mark.parametrize(
+    ("ts", "expected"),
+    [
+        # Either side of the fall-back overlap (01:00-02:00 Nov 1) — both happen exactly once.
+        ("20261101003000", "20261101053000+0000"),  # 00:30 CDT, before
+        ("20261101033000", "20261101093000+0000"),  # 03:30 CST, after
+        # Either side of the spring-forward gap (02:00-03:00 Mar 8).
+        ("20260308013000", "20260308073000+0000"),  # 01:30 CST, before
+        ("20260308033000", "20260308083000+0000"),  # 03:30 CDT, after
+    ],
+)
+def test_ordinary_times_beside_each_transition_still_convert(ts: str, expected: str) -> None:
+    # The normal path must be untouched: only the two unresolvable wall times change behaviour.
+    assert convert_hl7_timestamp(ts, "UTC", from_tz=CENTRAL) == expected
+
+
+def test_a_zone_without_dst_never_trips_the_check() -> None:
+    # Asia/Kolkata has no transitions, so no wall time is ever ambiguous or missing there — including
+    # the very clock readings that are unresolvable in Central.
+    assert convert_hl7_timestamp(AMBIGUOUS_CENTRAL, "UTC", from_tz=NO_DST) == "20261031200000+0000"
+    assert (
+        convert_hl7_timestamp(NONEXISTENT_CENTRAL, "UTC", from_tz=NO_DST) == "20260307210000+0000"
+    )
+
+
+def test_an_embedded_offset_in_the_ambiguous_hour_is_never_refused() -> None:
+    # The sender's own offset already says which occurrence it meant, so there is nothing to resolve.
+    assert convert_hl7_timestamp("20261101013000-0500", "UTC") == "20261101063000+0000"
+    assert convert_hl7_timestamp("20261101013000-0600", "UTC") == "20261101073000+0000"
+
+
+def test_date_precision_on_a_transition_day_is_not_refused() -> None:
+    # Below hour precision the time fields are this module's own "00" filler, not anything the sender
+    # wrote — there is no sender-asserted wall time to call ambiguous.
+    assert convert_hl7_timestamp("20261101", "UTC", from_tz=CENTRAL) == "20261101+0000"
+    assert convert_hl7_timestamp("20260308", "UTC", from_tz=CENTRAL) == "20260308+0000"
+
+
+def test_date_precision_still_honours_an_explicit_policy_in_a_midnight_transition_zone() -> None:
+    # A few zones transition AT midnight, so even the "00" filler can be ambiguous — and there it
+    # moves the emitted calendar DATE, not just the offset. America/Havana falls back at 01:00 on
+    # 2026-11-01, making local 00:00 occur twice. The default must never refuse a date, but a caller
+    # who passed a policy asked for it, so it is applied rather than silently dropped.
+    havana, cancun = "America/Havana", "America/Cancun"
+    assert convert_hl7_timestamp("20261101", cancun, from_tz=havana) == "20261031-0500"
+    assert (
+        convert_hl7_timestamp("20261101", cancun, from_tz=havana, on_dst_edge="earlier")
+        == "20261031-0500"
+    )
+    assert (
+        convert_hl7_timestamp("20261101", cancun, from_tz=havana, on_dst_edge="later")
+        == "20261101-0500"
+    )
+
+
+def test_hour_precision_inside_the_overlap_is_refused() -> None:
+    # 01:00 Central on the fall-back day is a real sender-supplied wall time, and it occurs twice.
+    with pytest.raises(AmbiguousLocalTimeError):
+        convert_hl7_timestamp("2026110101", "UTC", from_tz=CENTRAL)
+
+
+def test_unknown_dst_edge_policy_raises() -> None:
+    with pytest.raises(ValueError, match="on_dst_edge"):
+        convert_hl7_timestamp(
+            "20260115090000",
+            "UTC",
+            from_tz=CENTRAL,
+            on_dst_edge="fold0",  # type: ignore[arg-type]
+        )
 
 
 def test_to_zone_convenience_matches_convert() -> None:

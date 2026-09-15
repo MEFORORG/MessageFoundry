@@ -317,6 +317,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
+  `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
+  strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and
+  `FILTERED` (Handlers ran and sent nothing, including a sole destination that is
+  present-but-not-deployed) carry `error=None`, so the disposition was written into the row's summary
+  and never gated on. A deploying site whose Router matched nothing, or whose only outbound was not
+  yet deployed, would read a green acceptance report off a message the engine would have dropped. The
+  row now PASSES only on a delivering outcome and otherwise FAILs, naming the disposition and the
+  handler/delivery counts. That is the verdict `_classify_disposition` already reaches for the **live**
+  smoke on the **same** synthetic message, so the two halves of `verify` no longer answer one question
+  two ways; an unrecognised disposition fails closed instead of falling through to PASS. **Visible
+  change:** a config whose Router declines the fixed synthetic `ADT^A01` from `MAINHOSP` now reds this
+  row, and the failure text says to point `--inbound` at a connection that takes one. The happy-path
+  test asserted `"deliveries=" in detail`, which `deliveries=0` also satisfies, so neither the defect
+  nor the `FAIL` branch had a covering test; both do now.
+  ([BACKLOG #1707](docs/BACKLOG.md))
 - **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
   `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
   the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a

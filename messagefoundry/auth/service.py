@@ -1278,25 +1278,27 @@ class AuthService:
 
     async def _register_failure(self, user: UserRecord, now: float) -> tuple[int, bool]:
         """Record a failed attempt; return ``(attempts, just_locked)``. ``just_locked`` is True only on
-        the attempt that crosses the threshold (the caller reaches here only when not already locked),
-        so it fires exactly one lockout notification per lockout."""
-        # A lapsed lockout window restarts the counter, so one post-lockout failure cannot re-lock
-        # immediately (and the stale lock is cleared whenever the count is back below threshold).
-        prior = (
-            0
-            if (user.locked_until is not None and now >= user.locked_until)
-            else user.failed_attempts
+        the attempt that takes the account from unlocked to locked, so it fires exactly one lockout
+        notification per lockout.
+
+        **THE COUNT, THE POLICY AND THE WRITE ARE ONE STORE CALL, AND THAT IS THE WHOLE OF THIS
+        METHOD.** It used to read ``user.failed_attempts`` off a row fetched before the argon2 verify,
+        add one in Python, then write the sum back -- three steps with awaits between them. Every one
+        of those awaits is a window in which another attempt reads the SAME pre-increment count, so N
+        wrong passwords submitted in parallel all wrote 1, the account never reached the threshold,
+        and an attacker who parallelizes would evade the lockout entirely on a first deployment. The
+        lapsed-window reset, the increment and the crossing test now run inside the store, against the
+        row the store re-read under the lock that also carries the write.
+
+        ``user`` is therefore read for its id alone. **Do not recompute ``just_locked`` out here** --
+        outside the atomic section it is the stale read again, which is the defect rather than a
+        cheaper way to reach the same answer."""
+        return await self._store.increment_login_failure(
+            user.id,
+            threshold=self._policy.lockout_threshold,
+            lockout_seconds=self._policy.lockout_minutes * 60,
+            now=now,
         )
-        attempts = prior + 1
-        locked_until = (
-            now + self._policy.lockout_minutes * 60
-            if attempts >= self._policy.lockout_threshold
-            else None
-        )
-        await self._store.record_login_failure(
-            user.id, failed_attempts=attempts, locked_until=locked_until, now=now
-        )
-        return attempts, locked_until is not None
 
     async def authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True

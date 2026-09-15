@@ -20,6 +20,7 @@ from tests._directory_identity_store_contract import (
     _assert_username_compare_is_byte_exact,
     _assert_username_refresh_contract,
 )
+from tests._lockout_store_contract import _assert_lockout_contract
 
 
 async def _store() -> MessageStore:
@@ -110,6 +111,18 @@ async def test_login_failure_lockout_and_success_reset() -> None:
         u = await store.get_user("u1")
         assert u is not None and u.failed_attempts == 0 and u.locked_until is None
         assert u.last_login_at == 20.0
+    finally:
+        await store.close()
+
+
+async def test_lockout_counter_contract() -> None:
+    """The SQLite leg of the shared ``increment_login_failure`` contract.
+
+    The same body runs against live PostgreSQL and SQL Server, so the one security policy the three
+    SQL bodies implement is asserted once rather than worded three times."""
+    store = await _store()
+    try:
+        await _assert_lockout_contract(store)
     finally:
         await store.close()
 
