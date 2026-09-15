@@ -11,6 +11,10 @@ over 3203 pushed refs (1488 of them engine rescue tags).**
 
 Never quote that as a bare count. It is a property of a moment, not of the repository.
 
+**The tables below name 40 of those 47.** Seven engine-touching items are counted and never
+named. Read "Counted 47, named 40" before you conclude that any commit is absent from this
+register.
+
 Two death events happened in one evening, four hours apart: 16:11:47 to 16:13:57 CDT, then
 20:04:30 to 20:06:13 CDT. A sweep run between them was correct about its own window and wrong
 as a statement about the repository. A census run before 20:04 could not see the second event,
@@ -164,6 +168,9 @@ whole pull-request join off the REST API.
 | Unlanded branches after ranking, deduped, non-merge | **47** |
 | Of those, touching `messagefoundry/` | **19** |
 
+Those last two rows are counts, not enumerations. The tables further down name 40 of the 47 and
+12 of the 19. See "Counted 47, named 40".
+
 **121 branches are unverified.** They add no Python function or class, so a symbol check cannot
 speak to them. They are documentation, configuration, ledger and script changes. A separate
 content test would be needed and this census does not make one.
@@ -233,6 +240,69 @@ name filter and a sample drawn from already-landed branches share the same blind
 the mechanical check was cheap: one `git grep -f` pass over 637 symbols resolved all 309 branches
 at once.
 
+## Counted 47, named 40
+
+The count and the enumeration disagree. Recorded here rather than quietly corrected, because
+either number on its own misleads a reader.
+
+| Quantity | Counted | Named in a table below |
+|---|---|---|
+| Distinct unlanded work items | **47** | **40** |
+| Touching `messagefoundry/` | **19** | **12** |
+| Not touching engine packages | **28** | **28** |
+
+The counted figures partition exactly: 19 plus 28 is 47. The non-engine table is complete at 28
+rows. So the deficit is one gap and not two. The engine table below carries 12 rows against 19
+counted items, and the seven that are missing are engine-touching.
+
+**Do not read the headline down to 40.** The 19 and the 28 were measured over the ranked set. The
+12 is a count of rows that got written. Lowering 47 to 40 would throw away a real measurement to
+match an incomplete table.
+
+**Do not read the 12 rows as the whole engine-touching population either.** A reader who fails to
+find a commit in the table below has learned nothing about that commit. That is the failure this
+register exists to prevent, so it is stated here rather than left to be discovered.
+
+### It is not a severity filter, and that was checked
+
+The heading over the 12 rows names a narrower set than `messagefoundry/`, so an unstated filter
+is the natural first reading. It does not hold. The rows themselves already include `pipeline/`,
+`config/`, `support/` and `secretscrub.py`, which that heading does not cover, and the second
+table states that none of its 28 items touch engine packages. There is no third bucket for the
+seven to sit in. The heading was loose prose over an engine-touching table and is corrected
+below.
+
+### The seven are not recoverable, and this register's own scope note says why
+
+Re-derived 2026-09-15T08:51 CDT against `origin/main` `0f9206ad2`, over 1535 engine rescue-tag
+refs, against a pull-request snapshot of 1167 PRs, lowest number 1 and highest 1174. Three
+controls held: every SHA field 40 characters, zero empty dates, and a lowest PR number of 1,
+which is what rules out the list cap this register warns about. `origin/main` did not move during
+the pass. This is a second reading at a later clock, not a correction of the reading above.
+
+That pass cannot reproduce the population this register measured, for the reason recorded in
+"Scope of the PR filter" above. Of the 12 named engine rows:
+
+| Outcome of the re-derivation | Rows |
+|---|---|
+| Removed, because a PR now attaches to them | 8 |
+| Survive every join and still read as unlanded | 3 |
+| Survive every join, but their added symbols now resolve on main | 1 |
+
+The eight now carry the pull requests this register deliberately excluded: `00cf5ead4` to PR 1134,
+`1c0e442d3` to 1135, `88639f608` to 1136, `f527196e5` to 1137, `9c1efdaaf` to 1138, `071376d5b` to
+1139, `99b04deda` to 1141 and `76a39b80d` to 1142. The three still reading as unlanded are
+`ec723cc33`, `85e74facb` and `1d012f8f9`. The one whose added symbols now resolve on main is
+`b2fe6d5ea`.
+
+So a re-run now reads two thirds of this register's own engine rows as handled. That is the decay
+the snapshot section predicted, measured rather than argued.
+
+The census's intermediate files did not survive, and a later pass draws a different population
+over a moved PR oracle. Naming seven items found at a later clock would put a different population
+under the same heading, so none is offered. **The 12 named rows are the durable artifact. The
+seven unnamed items are lost unless the author's working data resurfaces.**
+
 ## Verified unlanded work, ranked
 
 Severity reads the paths against the invariants CLAUDE.md names. Nothing here is a live exposure
@@ -243,7 +313,10 @@ committed text, and it refused this file twice while it was being written. A SHA
 citation anyway: it survives a branch rename, and a rename is one of the ways this work went
 missing.
 
-### Touching auth, store, API or transports
+### Touching `messagefoundry/`, 12 rows against 19 counted
+
+**This table is incomplete by seven rows** and they are engine-touching. Not finding a commit
+here is not evidence that the census missed it. See "Counted 47, named 40".
 
 | Date (CDT) | SHA | Subject | Engine paths | Symbols on main |
 |---|---|---|---|---|
@@ -285,6 +358,9 @@ the subject before acting on any row in this register.
 
 28 further unlanded items touch `scripts/`, `docs/`, the IDE extension, the web console and
 coordination tooling. None touch engine packages.
+
+This table is complete: 28 rows for the 28 counted. The shortfall is entirely in the engine table
+above.
 
 | Date (CDT) | SHA | Subject |
 |---|---|---|
@@ -350,6 +426,9 @@ Stated plainly, because a census that hides its blind spots is worse than none.
    assigned work would not have looked for it.
 7. **The vault namespace**, deliberately. Vault refs were excluded by merge-base, not by name,
    after name-based exclusion proved to miss vault content on engine-looking branches.
+8. **Seven of the 47 items this register itself counts.** The engine table names 12 of 19. A
+   commit absent from the tables is not thereby absent from the census, and the seven cannot be
+   re-derived now. See "Counted 47, named 40".
 
 ## Re-run recipe
 
@@ -397,6 +476,11 @@ above takes both.
 
 Measured 2026-09-14T20:19:58 CDT against `origin/main` `1aa2d6a1b`, over 3203 pushed refs,
 against a pull-request snapshot of 1126 PRs with highest number 1133. Seat: Builder.
+
+The count reconciliation in "Counted 47, named 40" is a second, later reading: 2026-09-15T08:51
+CDT against `origin/main` `0f9206ad2`, over 1535 engine rescue-tag refs, against a pull-request
+snapshot of 1167 PRs with highest number 1174. Seat: Builder. It does not restate or replace the
+measurement above.
 
 This register does not rescue, rebase or re-open anything, and files no backlog numbers. Which of
 these items get rescued is a Lander or owner decision.
