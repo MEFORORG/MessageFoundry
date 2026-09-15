@@ -15,16 +15,42 @@ interchangeable: ``_encrypt_existing_rows`` runs at every keyed open and seals l
 ``reencrypt_to_active`` runs offline under ``rotate-key`` and moves values onto the active key. A
 cell covered by only the second stays plaintext at rest until someone rotates a key.
 
-**Scoped to tables the module INSERTs into, which is the part that keeps this honest.** A naive
+**Scoped to tables the module WRITES a row into, which is the part that keeps this honest.** A naive
 "every ``cell_aad`` cell must be swept" rule falsely accuses both server backends over
 ``shared_body``: they declare the table for schema parity but never write a row into it, so there is
-nothing for a migration to seal. ``INSERT INTO`` is the instrument that separates a real omission
+nothing for a migration to seal. The write scan is the instrument that separates a real omission
 from a table a backend merely declares — and it is the same instrument that corrected #1169's
 originally-reported ``shared_body`` precondition. That fact is pinned in
 ``tests/test_phi_at_rest_inventory.py`` and is deliberately not restated here.
 
-BACKLOG #1169, ASVS 11.3.3. Reads engine source; needs no database, driver or key, so it runs on the
-plain leg — the SQL Server and Postgres CI legs are all KEYLESS and return before either sweep body.
+**The write scan must know every upsert dialect, because a guard blind to one reports OK over a
+hole (BACKLOG #1723).** It originally matched ``INSERT INTO`` alone. SQLite writes ``state`` with
+``INSERT OR REPLACE INTO`` and SQL Server with ``MERGE``, so ``state.value`` — a PHI-bearing
+transform-state cell — was out of scope on exactly the two backends whose writer uses the native
+upsert, and deleting SQLite's ``state`` on-open pass left this file green. Widening the scan is not
+enough on its own: :func:`test_the_write_scan_sees_every_upsert_dialect` pins the scope so it cannot
+silently narrow again, and :func:`test_the_scanner_catches_a_deliberately_bad_line` plants an
+omission in each dialect so the widened scan is proven to create demand rather than merely parse.
+Receipt for those two, measured by pinning ``_WRITES`` back to ``INSERT INTO`` alone: 10 of the 12
+dialect cases red, the 2 that stay green are the plain-``INSERT INTO`` case that was never blind, and
+the scope receipt reds on ``store.py`` and ``sqlserver.py`` — the two backends the item named.
+
+**The scan reads executable strings, not raw source, for the same reason the sweep side does** (see
+:func:`_executable_strings`): a table named only in a comment or a docstring is prose, and prose must
+not decide scope in either direction. Measured at the widening: the two instruments agree cell-for-
+cell on all three backends, and the AST one drops 12 comment-prose captures (1 on ``store.py``, 4 on
+``postgres.py``, 7 on ``sqlserver.py`` — ``the``, ``with``, ``under``, ``would`` and the like) that a
+raw-text scan of the same pattern had been treating as table names. Nothing goes the other way.
+
+BACKLOG #1169, #1723, ASVS 11.3.3. Reads engine source; needs no database, driver or key, so it runs
+on the plain leg. The RUNTIME proof that a keyless-to-keyed open really seals these cells is a
+different test on a different leg: ``test_migration_encrypts_existing_state_value`` in
+``tests/test_store_encryption.py`` on the plain leg for SQLite,
+``test_legacy_plaintext_migrated_on_keyed_reopen`` in ``tests/test_postgres_store.py`` on the
+``postgres-store`` leg, and ``test_legacy_plaintext_error_detail_migrated_on_open`` plus
+``test_state_plaintext_migrated_on_keyed_reopen`` in ``tests/test_sqlserver_store.py`` on the
+``sqlserver-store`` leg. Those legs open KEYLESS by default, so each of those tests opens its own
+keyed handle; everything they do not name is covered only by the static parity check here.
 """
 
 from __future__ import annotations
@@ -41,10 +67,30 @@ import messagefoundry
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 _BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
 
-#: The two passes. Both are reached only on a KEYED handle, which is why CI never executes either.
+#: The two passes. Both are reached only on a KEYED handle, and the routine CI legs open keyless, so
+#: only the named migration tests in the module docstring ever execute either body.
 _SWEEPS = ("_encrypt_existing_rows", "reencrypt_to_active")
 
-_INSERT_INTO = re.compile(r"INSERT INTO\s+(\w+)", re.IGNORECASE)
+#: Every statement shape a backend uses to put a row into a table; the capture is that table.
+#:
+#: ``INSERT INTO`` alone was the original scan and it is the narrowest shape here: SQLite reaches for
+#: ``INSERT OR REPLACE INTO`` and SQL Server for ``MERGE`` wherever the write is an upsert. The
+#: optional ``[`` admits T-SQL's bracket-quoted identifiers. ``MERGE`` needs no ``INTO`` — it is
+#: optional in T-SQL and the engine omits it — so the trailing word is captured either way.
+_WRITES = re.compile(
+    r"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|MERGE(?:\s+INTO)?)\s+\[?(\w+)", re.IGNORECASE
+)
+
+#: The cell that exposed the blind spot, written by a DIFFERENT dialect on each backend
+#: (``INSERT OR REPLACE INTO`` on SQLite, ``MERGE`` on SQL Server, plain ``INSERT INTO`` on
+#: Postgres). Pinning it by name is what stops the scan narrowing back without anyone noticing.
+_UPSERT_WRITTEN_CELL = ("state", "value")
+
+#: Floor on the per-backend scope, so an instrument that quietly stops finding writes reds instead of
+#: reporting OK over a shrunken sweep. Measured at the #1723 widening: 18 on ``store.py`` (it alone
+#: writes ``shared_body``) and 17 on both server backends. A floor, not an equality: adding a
+#: cipher-covered cell is routine and must not red this file.
+_MIN_WRITTEN_CELLS = 17
 
 
 def _covered_cells(tree: ast.AST) -> set[tuple[str, str]]:
@@ -163,9 +209,25 @@ def _sweep_strings(tree: ast.AST, entry: str) -> set[str]:
     return strings
 
 
-def _written_cells(source: str, tree: ast.AST) -> set[tuple[str, str]]:
-    """Covered cells whose table this module actually INSERTs into — the ones it must sweep."""
-    written = set(_INSERT_INTO.findall(source))
+def _written_tables(tree: ast.AST) -> set[str]:
+    """Every table an executable SQL string in this module puts a row into, in any upsert dialect.
+
+    Driven off :func:`_executable_strings` rather than the raw file text, so a table named in a
+    comment or a docstring cannot decide scope. That mattered the moment ``MERGE`` entered the
+    pattern: ``MERGE`` is a common word in this codebase's prose, and a raw-text scan read
+    ``MERGE with HOLDLOCK`` and ``MERGE in dispatch 2`` as writes to tables called ``with`` and
+    ``in``. Harmless while the names were nonsense, but the rule that comments are not code is the
+    same rule :func:`_executable_strings` exists for, and it should not hold on only one side.
+    """
+    tables: set[str] = set()
+    for text in _executable_strings(tree):
+        tables |= set(_WRITES.findall(text))
+    return tables
+
+
+def _written_cells(tree: ast.AST) -> set[tuple[str, str]]:
+    """Covered cells whose table this module actually writes a row into — the ones it must sweep."""
+    written = _written_tables(tree)
     return {cell for cell in _covered_cells(tree) if cell[0] in written}
 
 
@@ -188,12 +250,11 @@ def _is_swept(cell: tuple[str, str], reach: set[str]) -> bool:
 
 
 @functools.cache
-def _parsed(backend: str) -> tuple[str, ast.Module]:
-    """Source + AST for one backend, parsed ONCE. The two parametrize axes cross (3 backends x 2
-    sweeps), and these modules are 4,700 to 8,300 lines — re-parsing per case costs about half a
-    second for nothing. The trees are only ever read here, so sharing them is safe."""
-    source = (_STORE_DIR / backend).read_text(encoding="utf-8")
-    return source, ast.parse(source)
+def _parsed(backend: str) -> ast.Module:
+    """AST for one backend, parsed ONCE. The two parametrize axes cross (3 backends x 2 sweeps), and
+    these modules are 4,700 to 8,300 lines — re-parsing per case costs about half a second for
+    nothing. The trees are only ever read here, so sharing them is safe."""
+    return ast.parse((_STORE_DIR / backend).read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
@@ -204,23 +265,121 @@ def test_every_written_cipher_cell_is_swept(backend: str, sweep: str) -> None:
     Mutation receipt: deleting the ``attachment_chunk`` pass from ``postgres.py``'s
     ``_encrypt_existing_rows`` reds this, on the plain leg, with no database — which is the state
     that shipped before BACKLOG #1169.
+
+    Second mutation receipt, measured at the #1723 widening and the reason that item existed:
+    renaming ``state`` out of ``store.py``'s ``_encrypt_existing_rows`` (8 occurrences, that function
+    only) leaves the ``INSERT INTO``-only scan reporting NOTHING unswept, and reds this one with
+    ``[('state', 'value')]``. Same tree, same sweep, same assertion — only the scope differed.
     """
-    source, tree = _parsed(backend)
-    cells = _written_cells(source, tree)
+    tree = _parsed(backend)
+    cells = _written_cells(tree)
     reach = _sweep_strings(tree, sweep)
 
     # Liveness receipts. Either of these silently empty makes the assertion below vacuous, which is
-    # the exact failure this file exists to prevent elsewhere.
-    assert cells, f"{backend}: no cell_aad cells found in INSERTed tables — the walk is broken"
+    # the exact failure this file exists to prevent elsewhere. A COUNT floor, not merely non-empty:
+    # a scan that found one table would satisfy `assert cells` and still be reporting OK over a
+    # sweep it never looked at (BACKLOG #1723). The named-cell pin lives in the test below.
+    assert len(cells) >= _MIN_WRITTEN_CELLS, (
+        f"{backend}: the write scan found only {len(cells)} cipher-covered written cells, under the "
+        f"floor of {_MIN_WRITTEN_CELLS}. The scan has narrowed, so this file is now green over the "
+        f"cells it stopped seeing.\n  found: {sorted(cells)}"
+    )
     assert reach, f"{backend}: {sweep} was not found — renamed, or the AST walk is broken"
 
     unswept = sorted(c for c in cells if not _is_swept(c, reach))
     assert not unswept, (
         f"{backend}: {sweep} never names these cipher-covered cells, so a value written to them "
         "is left behind by that transition (plaintext at rest, or stranded under a retired key). "
-        "No CI leg can catch this at runtime: every SQL Server and Postgres leg is keyless and "
-        f"returns before the sweep body.\n  unswept: {unswept}"
+        "The server legs open keyless by default, so nothing there executes the sweep body except "
+        f"the named migration tests in the module docstring.\n  unswept: {unswept}"
     )
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_the_write_scan_sees_every_upsert_dialect(backend: str) -> None:
+    """SCOPE RECEIPT. The one cell whose writer differs per backend must be in scope on ALL of them.
+
+    This is the defect from BACKLOG #1723 pinned as an assertion rather than as prose. ``state`` is
+    written by ``INSERT OR REPLACE INTO`` on SQLite, ``MERGE`` on SQL Server and plain
+    ``INSERT INTO`` on Postgres, so the original ``INSERT INTO``-only scan demanded ``state.value``
+    on exactly one of the three — and deleting SQLite's ``state`` on-open pass left this file green.
+    A guard that passes because it examined nothing is indistinguishable from one that passes
+    because the rule held, so the scope is asserted here instead of assumed.
+    """
+    cells = _written_cells(_parsed(backend))
+    assert _UPSERT_WRITTEN_CELL in cells, (
+        f"{backend}: {_UPSERT_WRITTEN_CELL} is cipher-covered and written, but the write scan does "
+        "not see it — the scan has lost an upsert dialect and the parity check above is now blind "
+        f"to that cell.\n  in scope: {sorted(cells)}"
+    )
+
+
+#: One statement per dialect the engine writes ``state`` with, each targeting
+#: ``_UPSERT_WRITTEN_CELL``'s table. The T-SQL bracket form is here because ``MERGE [state]`` is
+#: legal and a scan that stops at the bracket reports the same false clean as one that never saw
+#: ``MERGE`` at all; the lowercase case is here because SQL keywords are not case-carrying.
+_UPSERT_DIALECTS = (
+    "INSERT INTO state (namespace, key, value) VALUES (?, ?, ?)",
+    "INSERT OR REPLACE INTO state (namespace, key, value) VALUES (?, ?, ?)",
+    "insert or ignore into state (namespace, key) values (?, ?)",
+    "MERGE state WITH (HOLDLOCK) AS t USING (VALUES (?)) AS s (value) ON 1=0",
+    "MERGE INTO state AS t USING (VALUES (?)) AS s (value) ON 1=0",
+    "MERGE [state] WITH (HOLDLOCK) AS t USING (VALUES (?)) AS s (value) ON 1=0",
+)
+
+#: The planted defect: a cipher-covered cell written by one of the dialects above, under a sweep that
+#: names nothing. Every case is reported CLEAN by the ``INSERT INTO``-only scan, which is how
+#: BACKLOG #1723 shipped.
+_PLANTED = """
+class S:
+    async def put_state(self) -> None:
+        self._cipher.encrypt(v, aad=cell_aad("state", "value", ns, key))
+        await self._db.execute({statement!r})
+
+    async def _encrypt_existing_rows(self) -> None:
+        return None
+"""
+
+
+@pytest.mark.parametrize("statement", _UPSERT_DIALECTS)
+def test_each_upsert_dialect_is_read_as_a_write(statement: str) -> None:
+    """POSITIVE CONTROL on the pattern itself, one case per dialect.
+
+    Cheap, and it localises a regression: when the backend-wide scope receipt above reds, this says
+    whether the pattern lost a dialect or the engine stopped writing the cell.
+    """
+    tables = _written_tables(ast.parse(f"x = {statement!r}"))
+    assert tables == {_UPSERT_WRITTEN_CELL[0]}, tables
+
+
+@pytest.mark.parametrize("statement", _UPSERT_DIALECTS)
+def test_the_scanner_catches_a_deliberately_bad_line(statement: str) -> None:
+    """POSITIVE CONTROL end to end, and the one that proves this file can go red.
+
+    Widening a pattern and watching the suite stay green proves nothing: the same green follows from
+    a pattern that matches and a scope that demands nothing of what it matched. So plant the real
+    defect and require the guard to report it — per dialect, so the failure names which one broke.
+    """
+    tree = ast.parse(_PLANTED.format(statement=statement))
+    cells = _written_cells(tree)
+    assert _UPSERT_WRITTEN_CELL in cells, f"the scope missed the planted write: {statement}"
+
+    reach = _sweep_strings(tree, "_encrypt_existing_rows")
+    unswept = sorted(c for c in cells if not _is_swept(c, reach))
+    assert unswept == [_UPSERT_WRITTEN_CELL], (
+        "the guard did not report the planted omission — it is green over a cell written at rest "
+        f"and swept by nothing.\n  statement: {statement}\n  unswept: {unswept}"
+    )
+
+
+def test_reading_a_table_does_not_put_it_in_scope() -> None:
+    """The matching NEGATIVE control, so the widening cannot be satisfied by a pattern that matches
+    anything: a SELECT names the table without putting a row in it, so there is nothing to seal."""
+    selecting = ast.parse(
+        'x = "SELECT value FROM state WHERE namespace=?"\ny = cell_aad("state", "value", ns, key)\n'
+    )
+    assert ("state", "value") in _covered_cells(selecting)  # it IS a covered cell
+    assert _written_cells(selecting) == set(), _written_cells(selecting)
 
 
 def test_the_guard_can_actually_see_an_unswept_cell() -> None:
@@ -250,7 +409,7 @@ class S:
         await self._db.execute("INSERT INTO attachment_chunk (ciphertext) VALUES (?)")
 """
     tree = ast.parse(synthetic)
-    cells = _written_cells(synthetic, tree)
+    cells = _written_cells(tree)
     assert cells == {("messages", "raw"), ("attachment_chunk", "ciphertext")}, cells
 
     reach = _sweep_strings(tree, "_encrypt_existing_rows")
@@ -282,7 +441,7 @@ class S:
         return None
 '''
     tree = ast.parse(synthetic)
-    cells = _written_cells(synthetic, tree)
+    cells = _written_cells(tree)
     assert ("attachment_chunk", "ciphertext") in cells
 
     reach = _sweep_strings(tree, "_encrypt_existing_rows")
@@ -312,7 +471,7 @@ class S:
 """
     tree = ast.parse(synthetic)
     assert ("shared_body", "body") in _covered_cells(tree)  # it IS a covered cell
-    assert _written_cells(synthetic, tree) == set()  # but nothing here writes one
+    assert _written_cells(tree) == set()  # but nothing here writes one
     # And the CREATE TABLE text must not be what rescues it: declaring is not writing.
     assert not _is_swept(("shared_body", "body"), _sweep_strings(tree, "_encrypt_existing_rows"))
 
