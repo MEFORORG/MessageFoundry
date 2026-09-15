@@ -74,6 +74,24 @@ WHAT KEEPS THE REAL NUMBERS SMALL is the admission gating described below -- a c
 test, not a compiled alternation, and one per pass rather than one shared. Between them they took the
 plain line from 4.4 us to 0.9 us and the credential line from 7.8 us to 3.7 us; the 6 KB run naming no
 credential word went from 0.39 ms to 15 us.
+
+WHAT BACKLOG #1685's QUOTED-VALUE ALTERNATES COST, measured 2026-09-14. **A DIFFERENT INSTRUMENT FROM
+THE TABLE ABOVE, and the numbers are not comparable to it:** that table is what the whole MODULE adds
+to the four-filter chain per record, while these are one ``_CREDENTIAL_KV.sub`` call against a
+reconstruction of the pre-#1685 pattern, minimum over 25 interleaved rounds of 20 passes. Every shape
+that occurs in real log text got FASTER or stayed level -- plain line 2.18 against 2.27 us, credential
+line 1.35 against 1.39, a quoted value with a space 1.37 against 2.34, a well-formed braced password
+4.10 against 4.61, a 400-character braced password 6.77 against 40.00 (the old pattern made many small
+matches where this makes one), and the 6 KB adversarial run naming every family level within noise at
+359 against 357 us.
+
+ONE SHAPE GOT SLOWER AND IT IS STATED RATHER THAN HIDDEN: a 6 KB line whose credential value opens "{"
+and never closes costs **83 us against 25 us**. The walk is linear and runs twice -- once for
+:data:`_ODBC_BRACED`, which fails at end of line, then once for :data:`_ODBC_BRACED_OVERRUN`, which
+succeeds. It is 3x a number that was already 250x below this module's own adversarial ceiling, and the
+sibling shape with many such labels went the other way, 64 us against 141. Not bought down further: a
+``{0,N}`` bound measured 32 us on that line and costs correctness elsewhere, for the reason
+:data:`_ODBC_BRACED` records.
 """
 
 from __future__ import annotations
@@ -200,12 +218,83 @@ _MEFOR_SECRET = re.compile(
     r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"
 )
 
+# A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
+# #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
+# would otherwise end it -- ";", "=" and spaces -- and those are exactly what the plain value class
+# below stops at. So the shipped pattern replaced the HEAD of a quoted password and printed the tail.
+#
+# Measured at 1aa2d6a1b, both shapes, on both credential surfaces:
+#
+#   PWD={wt-A;B}                     ->  PWD=<redacted>;B}
+#   ad_bind_password='wt-A wt-B'     ->  ad_bind_password=<redacted> wt-B'
+#
+# THE SECOND IS THE MORE REACHABLE ONE. Brace-quoting is a connection-string form, so it rides in on
+# the SQL Server store; a password with a SPACE in it reaches every backend, and ``ad_bind_password``
+# and ``tls_key_password`` are real settings here.
+#
+# THE DOUBLED BRACE IS THE PART A NAIVE FIX GETS WRONG. ODBC ends a braced value at the first "}" that
+# is NOT doubled; an interior literal "}" is written "}}". So ``\{[^}]*\}`` -- the obvious pattern --
+# stops at the first "}" and leaks the tail of any password containing one. The repetition walks
+# non-"}" characters and doubled "}}" pairs, and the trailing ``(?!\})`` refuses a closer that is
+# really the first half of an escape.
+#
+# POSSESSIVE, AND NOT BOUNDED, WHICH IS THE OPPOSITE OF WHAT :data:`_LABEL_PREFIX` NEEDED. That bound
+# exists because "." and "-" leave ``\b`` firing, so an N-segment run offers N start positions and the
+# group re-walks from each -- genuinely quadratic. None of that applies here. The two brace branches
+# cannot both match at one position (``[^}]`` excludes the one character ``\}\}`` needs), and the
+# quoted classes exclude their own closer, so every repetition below is DETERMINISTIC: there is one
+# parse of any prefix and nothing to re-walk. ``*+`` then says so to the engine, which also costs
+# nothing in reach -- a shorter brace parse could only end at a "}" that is followed by another "}",
+# and ``(?!\})`` rejects exactly that. A ``{0,N}`` bound would buy no safety and would silently stop
+# matching a password longer than N, which is the one direction this module must not fail in.
+_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
+_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
+
+# The fallback for a "{" this module cannot close: take the rest of the physical line and nothing more.
+#
+# IT IS REQUIRED INDEPENDENTLY OF ANY BOUND, which is why it is not merely a safety net for one. A
+# driver error string is cut off wherever the driver cut it, so a truncated connection string reaches
+# this pass with an opening "{" and no closer anywhere. Dropping back to the plain value class there
+# would print the password; running to end of line over-redacts, and over-redaction is the direction
+# this module is allowed to fail in.
+#
+# STOPPING AT THE LINE IS THE LOAD-BEARING HALF, and a record CAN be multi-line here: ``exc_text``
+# carries a whole rendered traceback, so a run that crossed "\n" would redact every later frame of it
+# and hand the operator a traceback with no stack. ``[^\r\n]`` rather than "." adds only the CR --
+# "." stops at "\n" on its own, but still matches "\r", so on CRLF text a bare ".*" would pull the
+# carriage return into the redacted span and leave the line ending broken.
+_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
+
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
 # provider "secret=". The value class stops at the separators these actually appear inside (";" in an
 # ODBC string, "," and "&" in a query), so a redaction cannot swallow the rest of the line.
+#
+# THE QUOTED ALTERNATES COME FIRST because they and the plain class overlap and the first alternate
+# wins; the plain class keeps its own leading ``['\"]?`` so a value whose quote does not CLOSE on this
+# line still loses its head exactly as it did before.
+#
+# TWO RESIDUALS, WRITTEN DOWN RATHER THAN IMPLIED.
+#
+# * An UNCLOSED quote falls back to the plain class, so ``password='wt-A wt-B`` (no closing quote)
+#   still prints " wt-B". The brace form gets an overrun and this does not, deliberately: a "{" after
+#   a credential label is unambiguous, while an apostrophe is ordinary prose, and a quote overrun
+#   would eat the rest of any line whose value merely CONTAINS one.
+# * The other three label=value patterns keep their own plain classes, so a quoted or braced value
+#   under THEIR labels leaks the same way. ``_MEFOR_SECRET`` is the most exposed of the three -- it
+#   runs first and its class stops at whitespace, and a ``MEFOR_*`` variable holding a connection
+#   string is exactly the echo shape its own comment cites. ``_BEARER`` is the one with a REASON to
+#   stay narrow rather than merely a lack of evidence: ``session=`` and ``token=`` legitimately carry
+#   a "{"-opening dict or JSON repr in this engine's log text, and the overrun would eat those lines.
 _CREDENTIAL_KV = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
-    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    r"['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _ODBC_BRACED
+    + r"|"
+    + _QUOTED_VALUE
+    + r"|"
+    + _ODBC_BRACED_OVERRUN
+    + r"|['\"]?[^\s'\";,&]+)"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
