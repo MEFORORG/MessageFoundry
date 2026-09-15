@@ -836,6 +836,12 @@ def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path)
     process itself at exit, turning a clear failure into a stalled run with no report. It is also
     the only shape that actually proves the claim: asserting ``close`` was called does not prove
     the process exits.
+
+    What is asserted is that no non-daemon thread SURVIVES -- not that none is alive at one
+    instant. A closed aiosqlite worker is still winding down when ``asyncio.run`` returns, so a
+    single snapshot taken there can name a thread that is already on its way out and fail a build
+    that is behaving correctly. The child polls a bounded window instead. A thread still present
+    when the window closes is a real leak and still fails.
     """
     import subprocess
     import textwrap
@@ -849,6 +855,7 @@ def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path)
         import sqlite3
         import sys
         import threading
+        import time
 
         from messagefoundry.store import MessageStore
 
@@ -860,18 +867,27 @@ def test_a_failed_open_closes_the_connection_and_lets_the_process_exit(tmp_path)
             raise SystemExit("open succeeded on a file that is not a database")
 
         asyncio.run(main())
-        # Only a non-daemon thread can block interpreter exit, so that is what is reported.
-        left = [
-            t.name
-            for t in threading.enumerate()
-            if t is not threading.main_thread() and not t.daemon
-        ]
-        print(",".join(left))
+
+        def still_running() -> list[str]:
+            # Only a non-daemon thread can block interpreter exit, so that is what is reported.
+            return [
+                t.name
+                for t in threading.enumerate()
+                if t is not threading.main_thread() and not t.daemon
+            ]
+
+        # Wait out the wind-down the docstring describes. A leaked worker never leaves, so it
+        # outlasts the window and is still reported.
+        deadline = time.monotonic() + 2.0
+        while still_running() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        print(",".join(still_running()))
         """
     )
     # A hard timeout is the assertion: on the leaking build the child never exits and this raises
     # subprocess.TimeoutExpired. 30s sits well under the 60s pytest-timeout watchdog so THIS reports
-    # the failure rather than a thread-stack dump; a healthy child finishes in about two seconds.
+    # the failure rather than a thread-stack dump; a healthy child finishes in about two seconds
+    # (its wind-down poll returns on the first pass, so the 2s window is a ceiling, not a cost).
     proc = subprocess.run(
         [sys.executable, "-c", script, str(bad)],
         capture_output=True,
