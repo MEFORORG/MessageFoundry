@@ -2510,11 +2510,7 @@ class RegistryRunner:
                     # One connection refusing to stop must not leave the others running: this is a
                     # fail-closed halt, so a partial stop is strictly better than an abandoned one.
                     log.exception("log-failure stop: inbound %r did not stop cleanly", name)
-            for name in outbounds:
-                try:
-                    self._stop_outbound_unsafe(name)
-                except Exception:
-                    log.exception("log-failure stop: outbound %r did not pause cleanly", name)
+            self._pause_delivery_lanes(outbounds)
         for name in inbounds + outbounds:
             try:
                 # ADR 0014's connection_stopped reports a stop but was never DRIVEN by a log-write
@@ -2524,6 +2520,27 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(name, detail=detail)
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
+
+    def _pause_delivery_lanes(self, names: Iterable[str]) -> None:
+        """Pause these outbound lanes for a #122 log-failure halt. Sync and await-free.
+
+        The one place that knows HOW the halt takes the DELIVERY tier down, for the same reason
+        :meth:`_pause_internal_lanes` owns the internal one: two halts need exactly this loop and a
+        third copy is how they drift. The callers choose the lanes rather than this method selecting
+        them — :meth:`_stop_all_for_log_failure` has to build its list before the loop anyway (it
+        alerts first, and the alert carries the count), and
+        :meth:`_park_delivery_for_log_failure` takes every owned lane.
+
+        Routes through :meth:`_stop_outbound_unsafe`, so a paused lane reads as an OPERATOR pause
+        (``_gate_parked`` dropped) and no reload resumes it. Queued rows are RETAINED PENDING, never
+        dead-lettered. Callers hold the reload lock."""
+        for name in names:
+            try:
+                self._stop_outbound_unsafe(name)
+            except Exception:
+                # One lane refusing to pause must not leave the others delivering: a fail-closed halt
+                # is strictly better partial than abandoned.
+                log.exception("log-failure halt: outbound %r did not pause cleanly", name)
 
     def _pause_internal_lanes(self, names: Iterable[str]) -> None:
         """Pause the pooled INGRESS / ROUTED / RESPONSE lanes for ``names``. Sync and await-free.
@@ -2649,7 +2666,10 @@ class RegistryRunner:
         **Every caller must ask at most once per operator action.** This is not a predicate:
         :meth:`_log_recovery_ok` performs a synchronous re-validation WRITE and clears the halt latch,
         and a refusal PAGES. A caller that loops over lanes memoises the answer (see
-        :meth:`_reconcile_outbounds`) rather than probing per lane.
+        :meth:`_reconcile_outbounds`) rather than probing per lane. ``name`` reaches the page only as
+        the connection the operator asked about, so a memoising caller's page names the first lane it
+        asked for and not every lane left down — which is the honest shape anyway, since the broken
+        thing is a process-global sink with no per-connection attribution to offer.
 
         Returns True when delivery may resume. A refusal PAGES through the notifier
         (:meth:`_log_write_refused_restart`) and the caller then returns quietly — a raise here would
@@ -2680,19 +2700,16 @@ class RegistryRunner:
         Pausing after the build loop — where the intake half runs — would leave a window in both modes
         for exactly the delivery this refuses.
 
-        Routes through :meth:`_stop_outbound_unsafe`, so these lanes read as an OPERATOR pause
-        (``_gate_parked`` dropped) and no reload resumes them, which is the same property that makes
-        the mid-run halt safe. Nothing is dead-lettered: queued rows stay PENDING and drain once
-        :meth:`start_outbound` / :meth:`restart_outbound` lift the pause on a working log."""
-        for name in self.registry.outbound:
-            if not self._owns_destination(name):
-                continue  # ADR 0073: another shard owns this lane; pausing it here would be a lie
-            try:
-                self._stop_outbound_unsafe(name)
-            except Exception:
-                # One lane refusing to pause must not leave the others delivering: a fail-closed halt
-                # is better partial than abandoned (same rule as _stop_all_for_log_failure).
-                log.exception("log-failure start: outbound %r did not pause cleanly", name)
+        Shares :meth:`_pause_delivery_lanes` with the mid-run halt, which owns how a lane goes down
+        and what that leaves behind. Recovery is unchanged: :meth:`start_outbound` /
+        :meth:`restart_outbound` lift the pause once the log works.
+
+        Scoped to the lanes this process owns (ADR 0073), because pausing another shard's lane would
+        report a stop that did not happen — the same narrowest-honest-scope rule
+        :meth:`_stop_all_for_log_failure` states at length."""
+        self._pause_delivery_lanes(
+            [name for name in self.registry.outbound if self._owns_destination(name)]
+        )
 
     async def _unbind_for_log_failure(self) -> None:
         """Take intake back down when :meth:`start` came up into an unwritable application log (#122).
@@ -2729,8 +2746,8 @@ class RegistryRunner:
                 reason=(
                     "the engine started while the application log was unwritable, so it is running "
                     "HALTED: intake is down, nothing is being routed or transformed, and every "
-                    "delivery lane is paused with its queued rows retained. Fix the log, then "
-                    "restart the connections"
+                    "delivery lane this process owns is paused with its queued rows retained. Fix "
+                    "the log, then restart the connections"
                 ),
                 stopped=len(bound),
             )
@@ -3940,17 +3957,14 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
-        # #122 (ADR 0162) THE THIRD DOOR INTO RESUMING DELIVERY, and the only one a reload can open.
-        # `_stop_all_for_log_failure` pauses the lanes that are RUNNING; a lane the ENGINE parked
-        # (auto_start=False #115 / deployed=False #233) is already in `_outbound_paused`, so the halt
-        # skips it and its `_gate_parked` marker survives. `_unpark_outbound_lane` below then lifts
-        # exactly that marker — MEASURED: a reload flipping the flag back with both sinks still dead
-        # resumed the lane and shipped its queued row with no application log behind it.
+        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
+        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
+        # carries that mechanism, and its "says nothing about the lane the halt never touched"
+        # paragraph is what this gate closes.
         #
-        # Probed at most ONCE per reload, which is why the answer is memoised here rather than asked
-        # inside `_unpark_outbound_lane`: `_outbound_start_permitted` is not a predicate — it performs
-        # a synchronous re-validation WRITE and PAGES on refusal — so a per-lane call would probe and
-        # page N times for one operator action. None = not asked yet; no park to lift, no probe.
+        # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
+        # action and that helper's docstring says why. None = not asked yet; a reload with no parked
+        # lane never asks, so a healthy reload pays one set-membership test per lane and nothing else.
         unpark_permitted: bool | None = None
         for name, oc in new.outbound.items():
             # workers read retry + ordering + internal-error policy live each item, so a reload
@@ -4067,15 +4081,14 @@ class RegistryRunner:
                 # (build_check above already re-validated the whole new registry, so this build can't
                 # fail here — a still-broken connector would have raised before any quiesce).
                 #
-                # `name not in self._destinations` is the other way a live worker ends up with no
-                # connector, and the condition used to test only `failed` while its own first line
-                # promised "missing OR mismatched". In PER_LANE the boot gates pop the connector and
-                # still spawn the worker (auto_start=False #115, deployed=False #233), so `live` above
-                # — worker-keyed in per_lane — is True on the reload that re-deploys the lane, the spec
-                # is unchanged, and nothing rebuilt it: AC-4's "flip the flag back with no other
-                # change" un-parked a lane that could then never deliver, and its rows retried against
-                # a connector-less lane forever. MEASURED on a per_lane rig; POOLED is untouched
-                # (`live` is connector-keyed there, so reaching this elif already means it is built).
+                # `name not in self._destinations` makes the condition match that first line, which
+                # promised "missing OR mismatched" while only ever testing `failed` (a subset: every
+                # site that records a failure has already popped the connector). MEASURED on a
+                # per_lane rig, where `live` above is WORKER-keyed and the boot gates spawn a worker
+                # without a connector: AC-4's "flip the flag back with no other change" un-parked a
+                # lane that then had nothing to deliver through, and its rows retried forever. Pooled
+                # is untouched — `live` is connector-keyed there, so reaching this elif already means
+                # the connector is built.
                 old_conn = self._destinations.get(name)
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
