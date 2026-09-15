@@ -96,6 +96,18 @@ _HEALTH_TIMEOUT = 30.0
 # why nothing ran -- a reader comparing the two moments of a disabled step reads the difference as
 # meaningful.
 _AUDIT_DISABLED = "intake audit disabled for this profile"
+#: SQLite's PRIMARY result code for an I/O error. Extended codes are `primary | (N << 8)`, so the
+#: low byte of `sqlite_errorcode` is what identifies the family (1546 = SQLITE_IOERR_TRUNCATE).
+_SQLITE_IOERR = 10
+#: Pauses before each post-mortem store-open retry, in seconds. Cumulative elapsed at each attempt is
+#: 0.1, 0.3, 0.7, 1.5s, and the interleaved arms in `_store_reader` put the protective delay at about
+#: 370 ms -- so the THIRD attempt is already past it and the fourth carries margin, while 1.5s total
+#: stays far below the step's own timeout. That margin is deliberate: 370 ms is a median on one box
+#: at one load, not a bound, and the arms that produced it cannot see a small residual rate.
+#: Independently, the schedule is verified to absorb the failure in practice -- see the positive
+#: control in that function's comment, where the race fired 1, 3 and 2 times across three runs and
+#: every one passed. Widen it if a saturated box ever exhausts all five attempts.
+_AUDIT_OPEN_BACKOFF = (0.1, 0.2, 0.4, 0.8)
 _PORTS_READY_TIMEOUT = 60.0  # waiting for the engine to report all N inbound rows (N can be large)
 # A single trivial ADT type — the connscale graph routes every message identically, so the mix only
 # needs to drive ONE generated type (the wall is per-connection machinery, not message-type spread).
@@ -709,7 +721,85 @@ def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
         from messagefoundry.config.settings import load_settings
         from messagefoundry.store.base import open_store
 
-        store = await open_store(load_settings(environ=node_env).store)
+        settings = load_settings(environ=node_env).store
+        # THE POST-MORTEM OPEN RACES THE ENGINE'S OWN TEARDOWN ON WINDOWS, so a SQLite I/O error here
+        # is retried rather than reported. `EngineNode.stop` calls `proc.terminate()`, which on
+        # Windows is `TerminateProcess` -- a hard kill, not a graceful shutdown -- so the engine never
+        # closes its connections and leaves a hot multi-megabyte `-wal` beside a still-mapped `-shm`.
+        # Opening that store runs WAL recovery, recovery truncates, and Windows refuses to truncate a
+        # file whose section the just-reaped process still has mapped. SQLite reports that as
+        # SQLITE_IOERR_TRUNCATE (extended code 1546), which surfaces as the generic "disk I/O error".
+        #
+        # WHAT PROTECTS IS ELAPSED TIME SINCE THE HOLDER DIED, measured 2026-09-15 on Windows 11 with
+        # three arms INTERLEAVED trial by trial, so machine load cannot drift between them (it varied
+        # 3x within the hour here -- the same single test took 22s and 75s, which is why sequential
+        # arms on this box are worthless):
+        #
+        #   warm          median kill->open     0.0 ms    fired 15/20
+        #   cold child    median kill->open   376.0 ms    fired  0/20
+        #   warm+sleep    median kill->open   373.2 ms    fired  0/20
+        #
+        # warm vs warm+sleep isolates DELAY: 15/20 to 0/20. cold vs warm+sleep holds delay equal and
+        # isolates COLDNESS: identical, so coldness contributes nothing and was only ever a way of
+        # spending time. About 370 ms of any kind clears it.
+        #
+        # THE ZERO ARMS BOUND THE BIG FAILURE MODE, NOT ZERO. At the warm arm's 75% rate a 20-trial
+        # zero is ~9e-13, so delay demonstrably removes THAT. It does not exclude a small residual:
+        # at a 3% rate, 20 trials come up empty about half the time. Nobody has run this race under
+        # deliberate CPU saturation, which is the condition that matters for the residual.
+        #
+        # AN EARLIER VERSION OF THIS COMMENT CREDITED THE PROTECTION TO IMPORT WARMTH and called its
+        # arms "paired arms with one variable". They were three: the cold arm also spawned a whole
+        # process between the kill and the open, and the arms ran sequentially under drifting load.
+        # Two readings from that same setup are withdrawn and must not be reinstated from memory:
+        # that a cold process is protective (superseded by the table above -- it is the delay), and
+        # that plain `sqlite3` connections in the killed holder never reproduce it (0/30, which would
+        # have meant the store's own connection set is required). The second was never challenged
+        # because it read as mechanism rather than as an inference, which is exactly why it is named.
+        #
+        # A NEIGHBOURING RACE IN THE SAME FIRST-PRAGMA POSITION behaves differently and the two must
+        # not be merged: a lagging aiosqlite worker (BACKLOG #1670's subject) is driven by CPU
+        # contention rather than by this delay, reproducing at ~3% under 32-way load and 0/40 on a
+        # quiet box, and an injected `OperationalError` there reproduces at the same rate as the
+        # genuine error -- so for THAT one, failure POSITION matters and error CLASS does not.
+        # Measured by another session, 500 runs per arm. Cited to keep the two apart, not as
+        # evidence about this failure.
+        #
+        # THIS IS NOT A LOOSENING OF THE AUDIT, and the difference matters because the assertion this
+        # feeds exists precisely to refuse an instrument that cannot answer. The retry covers ONLY a
+        # SQLite I/O error, is bounded at ~1.5s, and re-raises the original once exhausted -- a store
+        # that genuinely cannot be read still lands as PROBE_UNUSABLE and still fails
+        # `_assert_intake_audit`. What it removes is the opposite failure: an unattributable red whose
+        # whole cause was the rig reading a fraction of a second too early. The data was never in
+        # doubt -- on every observed failure a retried read returned exactly `sent` rows with
+        # `missing_accepted=0`, so the no-loss property held while the probe was reporting that it
+        # could not tell.
+        #
+        # THE ENGINE'S OWN `MessageStore.open` HAS NO EQUIVALENT RETRY, and the table above is the
+        # reason that is probably survivable rather than the reason to worry. A restarting engine
+        # spends its whole process spawn plus imports plus config load and wiring before it opens its
+        # store -- the cold arm measured 376 ms for spawn and imports ALONE, and a real engine does
+        # strictly more -- so it lands in the region where this fired 0/20. What is NOT excluded is
+        # the small residual those 20 trials cannot see, or behaviour under saturation. Left as a
+        # product question on purpose; this function only fixes the rig.
+        store: Any = None
+        last_ioerr: BaseException | None = None
+        for pause in (0.0, *_AUDIT_OPEN_BACKOFF):
+            if pause:
+                await asyncio.sleep(pause)
+            try:
+                store = await open_store(settings)
+                break
+            except Exception as exc:  # noqa: BLE001 - re-raised below unless it is a SQLite I/O error
+                # Extended codes are `primary | (N << 8)`, so the low byte identifies the family.
+                # Absent on the server backends, which therefore never retry.
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xFF != _SQLITE_IOERR:
+                    raise
+                last_ioerr = exc
+        if store is None:  # every attempt hit a SQLite I/O error -> report the last one
+            assert last_ioerr is not None
+            raise last_ioerr
         try:
             return await intake_audit.sweep_store(store, row_cap=row_cap)
         finally:
