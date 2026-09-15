@@ -10,6 +10,8 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from messagefoundry import __version__
 from messagefoundry.support import build_bundle, redact_log_line, redact_log_text
 from messagefoundry.support.bundle import config_summary, status_snapshot
@@ -234,3 +236,158 @@ def test_redact_catches_free_text_name_and_dob_in_body() -> None:
 def test_redact_preserves_leading_timestamp() -> None:
     line = "2026-06-27 12:00:00 INFO engine started"
     assert redact_log_line(line).startswith("2026-06-27 12:00:00")
+
+
+# --- BACKLOG #1571: no caught exception's MESSAGE reaches any bundle member -------------------------
+#
+# The bundle is by definition handed OUTSIDE the environment, and the summaries wrap exceptions raised
+# by arbitrary config modules, the store driver and the filesystem — so their text is deployment- and
+# attacker-shaped, and can carry a DSN password, a bearer token, a host or a message fragment. Each
+# test below drives ONE failure branch with a synthetic payload and then reads back EVERY archive
+# member, the manifest included: a test that checks only the member it expects to be dirty cannot tell
+# you the value landed somewhere else.
+#
+# Every value here is invented. No real credential and no real PHI.
+
+#: One payload per branch, so a hit names the branch that leaked it. Credential-shaped and, where the
+#: branch wraps arbitrary module text, carrying a synthetic patient identifier too.
+_CFG_WIRING_PAYLOAD = "Server=sql01.invalid;Uid=mefor;Pwd=Wq7Zn2Kb9xLm;"
+_CFG_GENERIC_PAYLOAD = "Bearer synth0123456789abcdef PID|1||123456^^^MR||DOE^JANE^Q||19800101|F"
+_DB_PAYLOAD = "postgresql://mefor:Tr9Vb4Nm8Qz@db01.invalid:5432/MEFOR_PROD"
+#: These two must stay legal path components — they are injected as a directory and a file NAME, which
+#: the shipped branches interpolate alongside the exception text.
+_LOG_DIR_PAYLOAD = "logs-Uid-mefor-Pwd-Hs5Yt3Wc1Rk"
+_LOG_FILE_PAYLOAD = "engine-Pwd-Jd6Fp8Lq4Vn"
+
+#: The members that must exist for an absence assertion over the zip to mean anything. Without this a
+#: bundle that wrote nothing would pass every "the payload is absent" check vacuously.
+_CORE_MEMBERS = ("manifest.json", "version.txt", "status.json", "config-summary.json")
+
+
+def _assert_no_member_carries(zip_path: Path, *needles: str) -> dict[str, str]:
+    """Read EVERY member back and assert none of ``needles`` appears in any of them."""
+    members = _members(zip_path)
+    for name in _CORE_MEMBERS:
+        assert name in members, f"bundle is missing {name!r}, so the absence check would be vacuous"
+    for name, text in sorted(members.items()):
+        for needle in needles:
+            assert needle not in text, f"{needle!r} reached bundle member {name!r}"
+    return members
+
+
+def test_config_summary_wiring_error_drops_the_exception_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sink (b): the ``WiringError`` arm. A config module can raise with anything in the string."""
+    from messagefoundry.config import wiring
+
+    def boom(_config_dir: object) -> object:
+        raise wiring.WiringError(_CFG_WIRING_PAYLOAD)
+
+    monkeypatch.setattr(wiring, "load_config", boom)
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=tmp_path, settings=None)
+
+    members = _assert_no_member_carries(out, _CFG_WIRING_PAYLOAD, "Wq7Zn2Kb9xLm", "sql01.invalid")
+    summary = json.loads(members["config-summary.json"])
+    assert summary["loaded"] is False
+    # A fixed diagnostic code plus the exception TYPE — bounded, and enough to triage against.
+    assert summary["error"] == "MF-BUNDLE-CFG-001 WiringError"
+
+
+def test_config_summary_unexpected_error_drops_the_exception_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sink (a): the catch-all arm, which wraps whatever an arbitrary config module raised."""
+    from messagefoundry.config import wiring
+
+    def boom(_config_dir: object) -> object:
+        raise RuntimeError(_CFG_GENERIC_PAYLOAD)
+
+    monkeypatch.setattr(wiring, "load_config", boom)
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=tmp_path, settings=None)
+
+    members = _assert_no_member_carries(
+        out, _CFG_GENERIC_PAYLOAD, "synth0123456789abcdef", "DOE^JANE", "123456"
+    )
+    summary = json.loads(members["config-summary.json"])
+    assert summary["loaded"] is False
+    assert summary["error"] == "MF-BUNDLE-CFG-002 RuntimeError"
+
+
+def test_status_snapshot_db_failure_drops_the_exception_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sink (c): a store that will not open. A driver error routinely quotes the whole DSN."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.support import bundle as bundle_mod
+
+    async def boom(_settings: object) -> object:
+        raise RuntimeError(_DB_PAYLOAD)
+
+    monkeypatch.setattr(bundle_mod, "_db_info", boom)
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(f'[store]\npath = "{(tmp_path / "store.db").as_posix()}"\n', encoding="utf-8")
+    settings = load_settings(config_path=toml)
+
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=settings)
+
+    members = _assert_no_member_carries(out, _DB_PAYLOAD, "Tr9Vb4Nm8Qz", "db01.invalid")
+    status = json.loads(members["status.json"])
+    assert status["db"] is None
+    assert status["db_error"] == "MF-BUNDLE-DB-001 RuntimeError"
+
+
+def test_log_tail_unlistable_dir_drops_the_path_and_the_exception_message(tmp_path: Path) -> None:
+    """Sink (d), first branch: ``iterdir`` failed. The shipped branch returned BEFORE the redactor, so
+    this text reached ``app-log.txt`` — the one member the manifest claims is redacted."""
+    from messagefoundry.config.settings import load_settings
+
+    missing = tmp_path / _LOG_DIR_PAYLOAD  # never created: iterdir raises, quoting the path
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(f'[logging]\nlog_dir = "{missing.as_posix()}"\n', encoding="utf-8")
+    settings = load_settings(config_path=toml)
+
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=settings)
+
+    members = _assert_no_member_carries(out, _LOG_DIR_PAYLOAD, "Hs5Yt3Wc1Rk", str(missing))
+    # Exact equality, so nothing else can ride along in the member.
+    assert members["app-log.txt"] == "MF-BUNDLE-LOG-001 FileNotFoundError"
+
+
+def test_log_tail_unreadable_file_drops_the_name_and_the_exception_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sink (d), second branch: the read failed. Both the file NAME and the error text were carried."""
+    from messagefoundry.config.settings import load_settings
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    target = log_dir / f"{_LOG_FILE_PAYLOAD}.log"
+    target.write_text("2026-06-27 INFO engine started\n", encoding="utf-8")
+
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n', encoding="utf-8")
+    settings = load_settings(config_path=toml)
+
+    # Patched only after the settings are loaded, and only for the target file, so nothing else in the
+    # bundle path is disturbed by it.
+    real_read_text = Path.read_text
+
+    def boom(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == target.name:
+            raise OSError(_DB_PAYLOAD)
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=settings)
+
+    members = _assert_no_member_carries(
+        out, _LOG_FILE_PAYLOAD, "Jd6Fp8Lq4Vn", _DB_PAYLOAD, "Tr9Vb4Nm8Qz"
+    )
+    assert members["app-log.txt"] == "MF-BUNDLE-LOG-002 OSError"
