@@ -2666,16 +2666,15 @@ def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
 def test_version_reports_the_package_directory_that_answered(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The working directory precedes the venv's editable `.pth` entry on `sys.path`, so a directory
-    holding another copy of the package answers instead, silently. `--version` now says which tree did.
+    """Why a shadowing copy of the package can answer at all is stated once, on `_VersionAction`.
 
-    ASSERTS ON THE PRESENCE OF THE PATH TOKEN, NEVER ON A LINE INDEX. That is not fussiness: the
-    obvious implementation -- a `\n` inside `action="version"`'s text -- does not produce a second
-    line at all, because argparse re-wraps the text through `HelpFormatter._fill_text` into one
-    width-dependent paragraph. A test keyed to `lines[1]` would pass on the author's terminal and be a
-    coin flip everywhere else.
+    ASSERTS ON THE PRESENCE OF THE PATH TOKEN, NEVER ON A LINE INDEX, and that is not fussiness. The
+    obvious implementation -- a newline inside `action="version"`'s text -- yields no second line at
+    all, for the reason `_VersionAction`'s docstring gives, so a test keyed to `lines[1]` would pass
+    on the author's terminal and be a coin flip everywhere else.
     """
     import messagefoundry.__main__ as main_module
+    from messagefoundry import __version__
 
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
@@ -2683,7 +2682,9 @@ def test_version_reports_the_package_directory_that_answered(
 
     out = capsys.readouterr().out
     package_dir = Path(main_module.__file__).resolve().parent
-    assert "messagefoundry" in out
+    # two independent claims: the version is still reported, AND the tree that answered is named.
+    # (`"messagefoundry" in out` would NOT be a second claim -- the path already contains it.)
+    assert f"messagefoundry {__version__}" in out, out
     assert str(package_dir) in out, f"--version does not say which tree answered:\n{out}"
     # the reported directory is the real one, not a plausible string
     assert (package_dir / "__main__.py").is_file()

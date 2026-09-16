@@ -3405,9 +3405,9 @@ def _serve(args: argparse.Namespace) -> int:
             run_kwargs["http"] = client_cert_http_protocol_class()
     from messagefoundry.redaction import safe_exc
 
-    # The last-resort sys/threading excepthooks used to be installed here. They now go in at the top of
-    # `main()`, for every subcommand rather than for `serve` alone (BACKLOG #1674), so this path still
-    # has them and the other 32 finally do too.
+    # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
+    # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
+    # serving lifespan, inside the running loop.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
