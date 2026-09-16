@@ -16,6 +16,7 @@ import ssl
 import sys
 import types
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -505,6 +506,10 @@ def test_the_fhir_lookup_executor_default_is_the_shared_opener() -> None:
 
 _TOKEN_URL = "https://auth.internal.example.org/token"
 
+#: A settings-mapping builder — the two token auth modes differ only in their key prefix, so each
+#: case below is parametrized over one of these rather than written twice.
+_SettingsFactory = Callable[..., dict[str, object]]
+
 
 def _ec384_key_pem() -> str:
     """A P-384 private key PEM — ES384 is the cheaper of SMART's two SHALL algorithms (ADR 0024)."""
@@ -545,14 +550,16 @@ def _token_opener(provider: object) -> urllib.request.OpenerDirector:
 @pytest.mark.parametrize(
     "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
 )
-def test_the_token_hop_honours_the_internal_ca(build_settings: object, tmp_path: Path) -> None:
+def test_the_token_hop_honours_the_internal_ca(
+    build_settings: _SettingsFactory, tmp_path: Path
+) -> None:
     """The #1660 assertion: both token providers verify the authorization server against the org CA.
 
     Before this, each built its opener with no ``trust_anchor`` at all, so the credential-bearing hop
     silently fell back to the OS trust store while the data hop next to it honoured the policy."""
     ca = _ca_pem(tmp_path, "mefor-token-ca")
     provider = bearer_provider_from_settings(
-        build_settings(),  # type: ignore[operator]
+        build_settings(),
         trust_anchor_policy=_internal_policy(ca),
     )
     assert provider is not None
@@ -567,12 +574,12 @@ def test_the_token_hop_honours_the_internal_ca(build_settings: object, tmp_path:
     "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
 )
 def test_the_token_hop_honours_the_connections_own_ca(
-    build_settings: object, tmp_path: Path
+    build_settings: _SettingsFactory, tmp_path: Path
 ) -> None:
     """The other half of the row's title: a connection that pins its OWN ``tls_ca_file`` wins verbatim
     on the token hop too, with no instance ``[tls]`` block in play at all."""
     ca = _ca_pem(tmp_path, "mefor-connection-ca")
-    provider = bearer_provider_from_settings(build_settings(tls_ca_file=ca))  # type: ignore[operator]
+    provider = bearer_provider_from_settings(build_settings(tls_ca_file=ca))
     assert provider is not None
     ctx = _opener_context(_token_opener(provider))
     assert ctx is not None
@@ -582,10 +589,10 @@ def test_the_token_hop_honours_the_connections_own_ca(
 @pytest.mark.parametrize(
     "build_settings", [_smart_settings, _oauth2_settings], ids=["smart", "oauth2"]
 )
-def test_the_token_hop_default_is_the_shared_opener(build_settings: object) -> None:
+def test_the_token_hop_default_is_the_shared_opener(build_settings: _SettingsFactory) -> None:
     """The byte-identical half. Nothing configured → the very object every stock hop has always had,
     by IDENTITY — so #1660 cannot have moved an unconfigured instance."""
-    provider = bearer_provider_from_settings(build_settings())  # type: ignore[operator]
+    provider = bearer_provider_from_settings(build_settings())
     assert provider is not None
     assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
 
