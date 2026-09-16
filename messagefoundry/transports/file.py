@@ -380,7 +380,9 @@ class FileSource(SourceConnector):
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
         self.validate_directory: bool = bool(s.get("validate_directory", False))
-        self.sort: str = s.get("sort", "name")  # "name" | "mtime"
+        self.sort: str = s.get("sort", "name")
+        if self.sort not in ("name", "mtime"):
+            raise ValueError(f"file source sort must be 'name' or 'mtime', got {self.sort!r}")
         self.recursive: bool = bool(s.get("recursive", False))
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
         # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
