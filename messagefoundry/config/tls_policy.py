@@ -305,8 +305,12 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
     ``None`` (no context — a hop that is not TLS, or a caller that has none to hand) is ``False``:
     absent evidence is not evidence of checking.
 
-    ``VERIFY_CRL_CHECK_CHAIN`` implies leaf checking in OpenSSL and its value includes the leaf bit, so
-    testing the leaf bit answers for both."""
+    Testing the LEAF bit answers for ``VERIFY_CRL_CHECK_CHAIN`` too, and that is a measurement rather
+    than a reading of the names: on CPython 3.14 / OpenSSL 3.5.7, ``VERIFY_CRL_CHECK_LEAF`` is ``0x4``
+    and ``VERIFY_CRL_CHECK_CHAIN`` is ``0xc`` — the chain flag is the leaf flag OR'd with
+    ``X509_V_FLAG_CRL_CHECK_ALL``, so it carries the leaf bit. Pinned by
+    ``tests/test_tls_policy.py::test_the_chain_crl_flag_contains_the_leaf_bit``, because the two names
+    read as siblings and nothing else here would notice if they stopped overlapping."""
     if ctx is None:
         return False
     return bool(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)

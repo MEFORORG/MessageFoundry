@@ -1610,6 +1610,20 @@ def test_context_checks_revocation_answers_for_the_object_not_a_setting() -> Non
     assert context_checks_revocation(ctx) is True
 
 
+def test_the_chain_crl_flag_contains_the_leaf_bit() -> None:
+    """``context_checks_revocation`` tests the LEAF bit and claims that answers for CHAIN too.
+
+    That claim is a measurement, not a reading of the two names, so it is pinned here rather than left
+    in a docstring. Measured on CPython 3.14 / OpenSSL 3.5.7: LEAF is 0x4 and CHAIN is 0xc, because
+    CHAIN is LEAF OR'd with X509_V_FLAG_CRL_CHECK_ALL. If they ever stop overlapping, a context set to
+    check the whole chain would read as checking nothing and every guard on it would wrongly refuse --
+    and nothing else in this suite would notice."""
+    assert int(ssl.VERIFY_CRL_CHECK_CHAIN) & int(ssl.VERIFY_CRL_CHECK_LEAF)
+    chain_ctx = ssl.create_default_context()
+    chain_ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
+    assert context_checks_revocation(chain_ctx) is True
+
+
 def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str, str]) -> None:
     # requests takes one bundle path and no revocation flag. Honouring the CA while dropping the CRL
     # would report a revocation-checked hop that checks nothing, so it says so instead.
