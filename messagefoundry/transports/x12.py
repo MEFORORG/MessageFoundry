@@ -501,6 +501,8 @@ class X12Source(SourceConnector):
         # token per INTERCHANGE, which is what this connector's frame is. The port changed
         # REACHABILITY, never the default -- a stock X12 inbound still has no rate bound.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -592,7 +594,9 @@ class X12Source(SourceConnector):
             self._active += 1
             try:
                 decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
-                pacer = _MessagePacer.for_rate(self.max_messages_per_second, self.message_burst)
+                pacer = _MessagePacer.for_rate(
+                    self.max_messages_per_second, self.message_burst, name=self._pacing_name
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     if pacer is not None:
