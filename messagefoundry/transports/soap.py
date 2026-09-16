@@ -533,14 +533,20 @@ class SoapDestination(DestinationConnector):
             # character; catching it here (fail-fast, before any message flows) keeps that character out
             # of the persisted last_error a send-time failure would produce. (`encoding` defaults to
             # utf-8, which encodes any str, so this only bites a deliberately-lossy codec like 'ascii'.)
+            # The raise sits OUTSIDE the handler on purpose: `raise ... from None` would leave the
+            # UnicodeEncodeError on `__context__`, and its `.object` is the SECRET itself. See
+            # `encode_wire_body` in transports/base.py for why the flag alone does not detach it.
+            offending_position: int | None = None
             try:
                 secret.encode(self.encoding)
             except UnicodeEncodeError as exc:
+                offending_position = exc.start
+            if offending_position is not None:
                 raise ValueError(
                     f"SOAP body secret for placeholder {token!r} is not encodable as "
-                    f"{self.encoding!r} (offending code point at position {exc.start}) — set an "
-                    "encodable value or widen the connection's encoding"
-                ) from None
+                    f"{self.encoding!r} (offending code point at position {offending_position}) — "
+                    "set an encodable value or widen the connection's encoding"
+                )
             pairs.append((str(token), secret))
         # A body-carried credential over a cleartext http hop is a plaintext-credential egress, exactly
         # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
