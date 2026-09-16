@@ -3,14 +3,21 @@
 """Host / environment checks — wheel-only, no source tree or test suite required.
 
 Each check returns a :class:`CheckResult` and **never raises**: a broken check returns ``ERROR`` with
-the reason. Optional third-party imports (pyodbc, asyncpg, PySide6) are guarded — absence is ``SKIP``
-(can't verify here), so the same set runs on a minimal install and a fully-extra'd box, degrading
-honestly. Engine files are located via ``importlib`` (works from site-packages), never by assuming a
-repo layout.
+the reason. Optional third-party imports (pyodbc, asyncpg) are guarded — absence is ``SKIP`` (can't
+verify here), so the same set runs on a minimal install and a fully-extra'd box, degrading honestly.
+Engine files are located via ``importlib`` (works from site-packages), never by assuming a repo
+layout.
+
+**No check here creates what it checks** (BACKLOG #1708). A check that makes the thing it reports on
+cannot fail for the reason its title names, and on a first deployment an operator running ``verify``
+elevated would leave administrator-owned directories at the configured path before the service
+starts under another identity — which is the identity gap ``host.writable``'s own text warns about,
+manufactured by the check.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.metadata
 import importlib.util
@@ -156,84 +163,128 @@ def check_listener_ports(ports: dict[str, int]) -> CheckResult:
 
 
 def check_writable_dir(path: Path) -> CheckResult:
-    """The given dir (store/working dir) is writable by this process; ACLs for the service account are manual."""
+    """The given dir (store/working dir) exists and is writable by this process; ACLs are manual.
+
+    Does **not** create the directory (BACKLOG #1708). It used to ``mkdir(parents=True)`` first, so a
+    mistyped ``[store].path`` reported writable against a tree the check had just made — and this row
+    runs *before* ``store.connect``, so the directory it created was the one the store then filled.
+    An absent directory is now a FAIL naming the path.
+    """
+    rid, title = "host.writable", "Writable store/working dir"
     try:
-        path.mkdir(parents=True, exist_ok=True)
+        exists = path.is_dir()
+    except OSError as exc:  # e.g. a permission error stat-ing an ancestor
+        return CheckResult(rid, title, Status.FAIL, f"cannot stat {path}: {exc}")
+    if not exists:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"no directory at {path} — create it and grant the service account on it, "
+            "or check [store].path (verify does not create it for you)",
+            evidence=str(path),
+        )
+    try:
         with tempfile.NamedTemporaryFile(dir=path, prefix="._mefor_verify_", delete=True):
             pass
     except OSError as exc:
-        return CheckResult(
-            "host.writable",
-            "Writable store/working dir",
-            Status.FAIL,
-            f"cannot write {path}: {exc}",
-        )
+        return CheckResult(rid, title, Status.FAIL, f"cannot write {path}: {exc}")
     return CheckResult(
-        "host.writable",
-        "Writable store/working dir",
+        rid,
+        title,
         Status.MANUAL,
         f"{path} writable by this user; confirm the NSSM service account's ACLs on store/config/log",
         evidence=str(path),
     )
 
 
-def check_console_importable() -> CheckResult:
-    """The console package imports (PySide6 present); an interactive desktop session is a manual confirm."""
-    if not _can_import("PySide6"):
-        return CheckResult(
-            "host.console",
-            "Console importable",
-            Status.SKIP,
-            "PySide6 not importable (install the [console] extra)",
-        )
-    return CheckResult(
-        "host.console",
-        "Console importable",
-        Status.MANUAL,
-        "PySide6 present; confirm a real desktop session (not Server Core)",
-    )
+#: Modules that spawn ``sc.exe`` from a possibly-windowless host and must suppress its console.
+#: ``service_status`` carries its own ``_NO_WINDOW`` (it is the stdlib-only neutral leaf and does not
+#: import its elevated sibling), so checking one module would leave the other's regression invisible.
+_NO_WINDOW_MODULES: tuple[str, ...] = ("messagefoundry.service", "messagefoundry.service_status")
+
+
+def _spawns_without_creationflags(source: str) -> list[str]:
+    """Names of ``subprocess`` spawns in ``source`` that pass no ``creationflags=`` keyword.
+
+    An AST walk rather than a substring search (BACKLOG #1713). The old check passed on the literal
+    text ``CREATE_NO_WINDOW`` appearing anywhere in the file, which the module's own explanatory
+    comment satisfies on its own — so the check stayed MANUAL through exactly the regression its FAIL
+    text claims to catch, a call site losing ``creationflags=``. A comment cannot satisfy this.
+    """
+    spawns = {"run", "Popen", "call", "check_call", "check_output"}
+    missing: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in spawns:
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "subprocess"):
+            continue
+        if not any(kw.arg == "creationflags" for kw in node.keywords):
+            missing.append(f"subprocess.{func.attr} at line {node.lineno}")
+    return missing
 
 
 def check_console_no_window() -> CheckResult:
-    """The service-control path passes CREATE_NO_WINDOW (no console flash on the Status poll).
+    """Every ``sc.exe`` spawn suppresses its console window (no flash on the Status-page poll).
 
-    The body moved to :mod:`messagefoundry.service` (ADR 0088); it depends only on the stdlib, so
-    unlike the old console.service_control it is always importable (no [console] extra), and the SKIP
-    branch below is now effectively unreachable — retained defensively."""
-    try:
-        # find_spec imports the parent package. messagefoundry.service is stdlib-only, so this no
-        # longer risks a missing [console]-extra dep; degrade to SKIP defensively all the same.
-        spec = importlib.util.find_spec("messagefoundry.service")
-    except (ImportError, ValueError):
-        spec = None
-    if spec is None or not spec.origin:
+    Two conditions, because either alone is satisfiable by a regression (BACKLOG #1713):
+
+    1. the module's ``_NO_WINDOW`` resolves to a non-zero flag, and
+    2. every ``subprocess`` spawn in it passes ``creationflags=``.
+
+    Windows-only. ``_NO_WINDOW`` is legitimately ``0`` elsewhere (``CREATE_NO_WINDOW`` does not
+    exist off Windows and the constant is a ``getattr`` default), so this SKIPs rather than failing —
+    and :mod:`messagefoundry.service` imports ``ctypes.wintypes``, which is not importable off
+    Windows at all.
+    """
+    rid, title = "host.noflash", "Console no-window flag"
+    if sys.platform != "win32":
         return CheckResult(
-            "host.noflash",
-            "Console no-window flag",
+            rid,
+            title,
             Status.SKIP,
-            "messagefoundry.service not importable",
+            f"no console-window flash off Windows (CREATE_NO_WINDOW does not exist on {sys.platform})",
         )
-    try:
-        text = Path(spec.origin).read_text(encoding="utf-8")
-    except OSError as exc:
-        return CheckResult(
-            "host.noflash",
-            "Console no-window flag",
-            Status.ERROR,
-            f"could not read service_control source: {exc}",
-        )
-    if "CREATE_NO_WINDOW" in text:
-        return CheckResult(
-            "host.noflash",
-            "Console no-window flag",
-            Status.MANUAL,
-            "CREATE_NO_WINDOW set; visually confirm no console flashes during the Status-page poll",
-        )
+    checked: list[str] = []
+    for name in _NO_WINDOW_MODULES:
+        try:
+            module = importlib.import_module(name)
+        except ImportError as exc:
+            return CheckResult(rid, title, Status.SKIP, f"{name} not importable: {exc}")
+        flag = getattr(module, "_NO_WINDOW", None)
+        if not isinstance(flag, int) or flag == 0:
+            return CheckResult(
+                rid,
+                title,
+                Status.FAIL,
+                f"{name}._NO_WINDOW is {flag!r} on Windows — console-flash guard regressed",
+            )
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            return CheckResult(rid, title, Status.SKIP, f"{name} has no source file to inspect")
+        try:
+            missing = _spawns_without_creationflags(Path(origin).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError) as exc:
+            return CheckResult(rid, title, Status.ERROR, f"could not inspect {name}: {exc}")
+        if missing:
+            return CheckResult(
+                rid,
+                title,
+                Status.FAIL,
+                f"{name} spawns a subprocess without creationflags= ({', '.join(missing)}) — "
+                "console-flash guard regressed",
+            )
+        checked.append(f"{name} (_NO_WINDOW={flag:#x})")
     return CheckResult(
-        "host.noflash",
-        "Console no-window flag",
-        Status.FAIL,
-        "CREATE_NO_WINDOW missing from service_control — console-flash guard regressed",
+        rid,
+        title,
+        Status.MANUAL,
+        "every sc.exe spawn passes CREATE_NO_WINDOW; visually confirm no console flashes "
+        "during the Status-page poll",
+        evidence="; ".join(checked),
     )
 
 
@@ -246,6 +297,5 @@ def run_host_checks(*, ports: dict[str, int], writable_dir: Path) -> list[CheckR
         check_postgres_driver(),
         check_listener_ports(ports),
         check_writable_dir(writable_dir),
-        check_console_importable(),
         check_console_no_window(),
     ]

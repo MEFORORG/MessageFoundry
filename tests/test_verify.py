@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import importlib
 import socket
 import ssl
 import subprocess
@@ -20,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.base import open_store
 from messagefoundry.store.store import MessageStatus
 from messagefoundry.verify import checks, smoke
@@ -57,6 +58,24 @@ def test_writable_dir_pass_and_fail(tmp_path: Path) -> None:
     assert bad.status is Status.FAIL
 
 
+def test_writable_dir_never_creates_the_dir_it_checks(tmp_path: Path) -> None:
+    """#1708: the check used to ``mkdir(parents=True)`` first, so it could not fail for the reason
+    its title names — and it runs before ``store.connect``, so the tree it made was the one the store
+    then filled. An absent directory must FAIL and leave nothing behind."""
+    missing = tmp_path / "no" / "such" / "tree"
+    r = checks.check_writable_dir(missing)
+    assert r.status is Status.FAIL
+    assert str(missing) in r.detail
+    assert not missing.exists()
+    assert not (tmp_path / "no").exists()  # not even the first level
+
+
+def test_writable_dir_leaves_no_probe_file_behind(tmp_path: Path) -> None:
+    before = sorted(p.name for p in tmp_path.iterdir())
+    assert checks.check_writable_dir(tmp_path).status is Status.MANUAL
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
 def test_listener_ports_is_manual_with_evidence() -> None:
     r = checks.check_listener_ports({"MLLP": 2575, "API": 8765})
     assert r.status is Status.MANUAL
@@ -64,10 +83,54 @@ def test_listener_ports_is_manual_with_evidence() -> None:
 
 
 def test_console_no_window_detects_flag() -> None:
-    # PySide6 is a dev dep, so service_control is importable here and carries CREATE_NO_WINDOW.
+    # On Windows both sc.exe spawners must carry a non-zero _NO_WINDOW and pass creationflags=;
+    # elsewhere the flag does not exist, so the honest answer is SKIP (#1713).
     r = checks.check_console_no_window()
-    assert r.status in (Status.MANUAL, Status.SKIP)
-    assert r.status is not Status.FAIL
+    assert r.id == "host.noflash"
+    assert r.status is (Status.MANUAL if sys.platform == "win32" else Status.SKIP)
+
+
+def test_console_no_window_covers_both_sc_spawners() -> None:
+    """#1713: ``service_status`` carries its own ``_NO_WINDOW`` and the check never read it, so a
+    regression in the stdlib-only leaf was invisible. Pin that both modules are inspected."""
+    assert checks._NO_WINDOW_MODULES == (
+        "messagefoundry.service",
+        "messagefoundry.service_status",
+    )
+    for name in checks._NO_WINDOW_MODULES:
+        src = Path(importlib.import_module(name).__file__ or "").read_text(encoding="utf-8")
+        assert checks._spawns_without_creationflags(src) == []
+
+
+def test_console_no_window_is_not_satisfied_by_a_comment() -> None:
+    """The old check passed on the substring ``CREATE_NO_WINDOW`` appearing anywhere in the file,
+    which the module's own explanatory comment satisfies on its own — so it stayed MANUAL through
+    exactly the regression its FAIL text names. The AST walk must see the call site, not the prose."""
+    regressed = (
+        "import subprocess\n"
+        "# CREATE_NO_WINDOW suppresses the console window.\n"
+        "_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)\n"
+        "def q(name):\n"
+        "    return subprocess.run(['sc.exe', 'query', name], capture_output=True)\n"
+    )
+    assert "CREATE_NO_WINDOW" in regressed  # positive control: a grep would have passed this
+    missing = checks._spawns_without_creationflags(regressed)
+    assert missing and "subprocess.run" in missing[0]
+
+    guarded = regressed.replace(
+        "capture_output=True", "capture_output=True, creationflags=_NO_WINDOW"
+    )
+    assert checks._spawns_without_creationflags(guarded) == []
+
+
+def test_host_console_row_is_gone(tmp_path: Path) -> None:
+    """#1713: ``host.console`` reported PySide6 as "Console importable" and told a deploying operator
+    to install a ``[console]`` extra that ``pyproject.toml`` has never had. The desktop console was
+    retired and the operator console is served in-process at ``/ui``, so there is no host
+    prerequisite left for it to check."""
+    assert not hasattr(checks, "check_console_importable")
+    results = checks.run_host_checks(ports={"MLLP": 2575}, writable_dir=tmp_path)
+    assert "host.console" not in {r.id for r in results}
 
 
 class _HttpxBlocker:
@@ -700,10 +763,64 @@ def test_live_smoke_ssl_context_asserts_forward_secrecy(monkeypatch: pytest.Monk
 # ---- store connectivity -----------------------------------------------------------------------
 
 
+def _seed_store(path: Path) -> StoreSettings:
+    """A StoreSettings pointing at a real, already-created SQLite store.
+
+    #1708 rewrote the two tests below to seed first. Their PASS assertion was always correct; the
+    fixture was what was wrong — it handed the check a path with no database on it, and the check
+    passed by making one, so the tests certified the defect.
+    """
+    settings = StoreSettings(path=str(path))
+    asyncio.run(_seed_message(settings, control_id="SEED", status=MessageStatus.PROCESSED))
+    assert path.is_file()  # the seed, not the check, is what created it
+    return settings
+
+
 def test_store_connectivity_sqlite(tmp_path: Path) -> None:
-    settings = StoreSettings(path=str(tmp_path / "verify.db"))
+    settings = _seed_store(tmp_path / "verify.db")
     r = smoke.check_store_connectivity(settings)
     assert r.status is Status.PASS, r.detail
+
+
+def test_store_connectivity_never_creates_the_store_it_reports_on(tmp_path: Path) -> None:
+    """#1708: ``open_store``'s schema-ensure creates whatever path it is handed, so this check
+    returned PASS against a database it had just made and left it behind. A mistyped ``[store].path``
+    therefore could not fail for the reason the row's title names."""
+    missing = tmp_path / "nothing-here.db"
+    r = smoke.check_store_connectivity(StoreSettings(path=str(missing)))
+    assert r.status is Status.FAIL
+    assert str(missing) in r.detail
+    assert not missing.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []  # no -wal/-shm sidecars either
+
+
+def test_disposition_helpers_never_create_the_store(tmp_path: Path) -> None:
+    """The same defect in the two read-only ``--check-disposition`` helpers. Read-only *intent* is
+    not enough: both only ever read, and both created a database to do it."""
+    missing = tmp_path / "absent.db"
+    settings = StoreSettings(path=str(missing))
+
+    assert smoke.newest_message_id(settings, "CID") is None
+    r = smoke.check_smoke_disposition(settings, control_id="CID", baseline_id=None, timeout=3)
+    assert r.status is Status.FAIL and str(missing) in r.detail
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
+    """The gate must not fire where nothing would be created: ``:memory:`` writes no file, and
+    neither server backend ``CREATE DATABASE``s, so a wrong name there already fails at connect."""
+    assert smoke.missing_sqlite_store(StoreSettings(path=":memory:")) is None
+    for backend in (StoreBackend.SQLSERVER, StoreBackend.POSTGRES):
+        # A server backend cannot even be configured without a real DSN, which is the other half of
+        # why it needs no gate: a wrong database name fails at connect rather than being created.
+        settings = StoreSettings(
+            backend=backend,
+            path="does-not-exist.db",
+            server="db.example.invalid",
+            database="mefor",
+            username="mefor_svc",
+        )
+        assert smoke.missing_sqlite_store(settings) is None
 
 
 # ---- report -----------------------------------------------------------------------------------
@@ -794,7 +911,7 @@ def test_classify_disposition() -> None:
 
 
 def test_store_connectivity_detail_names_calling_user(tmp_path: Path) -> None:
-    settings = StoreSettings(path=str(tmp_path / "verify.db"))
+    settings = _seed_store(tmp_path / "verify.db")
     r = smoke.check_store_connectivity(settings)
     assert r.status is Status.PASS
     assert "calling user" in r.detail and "service account" in r.detail

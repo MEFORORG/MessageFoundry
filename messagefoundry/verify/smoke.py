@@ -9,8 +9,10 @@
 * ``live``  — MLLP-send a synthetic HL7 to the running engine's inbound and confirm an **AA ACK**.
   Proves the real listener accepts + acks. (Full disposition is then confirmed in the console — a
   MANUAL row — so the tool stays dependency-light and not brittle to API specifics.)
-* store     — open the configured store backend and confirm it connects (no writes beyond the
-  idempotent schema-ensure ``open_store`` already does).
+* store     — open the *existing* configured store backend and confirm it connects. For SQLite it
+  refuses to create the database file first (BACKLOG #1708): ``open_store``'s schema-ensure creates
+  whatever path it is handed, so the check used to PASS against a store it had just made and leave
+  the database behind — meaning it could not fail for the reason its title names.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
 the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
@@ -20,9 +22,10 @@ from __future__ import annotations
 
 import socket
 import ssl
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
@@ -325,11 +328,54 @@ def smoke_live(
     return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, detail)
 
 
+def missing_sqlite_store(store: StoreSettings) -> Path | None:
+    """The configured SQLite path when it is absent, else ``None`` (nothing for this gate to stop).
+
+    Every ``open_store`` call in the verifier goes through this first (BACKLOG #1708). ``open_store``
+    ensures the schema and SQLite's own connect creates an absent file, so an ungated call makes the
+    store it is about to report on. Read-only intent is not enough — ``newest_message_id`` and
+    ``check_smoke_disposition`` only ever read, and both created a database to do it.
+
+    ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop. The server
+    backends need no gate: neither ``CREATE DATABASE``s, so a wrong database name already fails at
+    connect.
+    """
+    if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
+        return None
+    path = Path(store.path)
+    try:
+        return None if path.is_file() else path
+    except OSError:  # e.g. a permission error stat-ing an ancestor — let the open report it
+        return None
+
+
 def check_store_connectivity(store: StoreSettings) -> CheckResult:
-    """Open the configured store backend and confirm it connects, then close. No test-data writes."""
+    """Open the *existing* configured store backend, confirm it connects, then close.
+
+    For SQLite the file must already be there. ``open_store`` ensures the schema, and SQLite's own
+    connect creates an absent file, so without this gate the check created the database it then
+    reported PASS against (BACKLOG #1708) — a mistyped ``[store].path`` passed, and an operator
+    running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
+    path before the service started under another identity.
+
+    The server backends need no gate: neither ``CREATE DATABASE``s, so a wrong database name there
+    already fails at connect.
+    """
     import asyncio
 
     from messagefoundry.store.base import open_store
+
+    rid, title = "store.connect", "Store connectivity"
+    absent = missing_sqlite_store(store)
+    if absent is not None:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"no SQLite store at {absent} — run `messagefoundry serve` once to create it, "
+            "or check [store].path (verify does not create it for you)",
+            evidence=str(absent),
+        )
 
     async def _open_close() -> None:
         handle = await open_store(store)
@@ -339,14 +385,14 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
         asyncio.run(_open_close())
     except Exception as exc:  # any driver/connection/auth failure
         return CheckResult(
-            "store.connect",
-            "Store connectivity",
+            rid,
+            title,
             Status.FAIL,
             f"{store.backend.value} store failed to open: {exc}",
         )
     return CheckResult(
-        "store.connect",
-        "Store connectivity",
+        rid,
+        title,
         Status.PASS,
         f"{store.backend.value} store opened and closed cleanly as the calling user "
         "(NOT proof the NSSM service account can connect — confirm the service-identity grants)",
@@ -356,10 +402,16 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
 def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     """Id of the most-recent stored message with ``control_id`` (the pre-send baseline for the
     disposition check), or ``None``. Lets a re-used synthetic control id not match a prior run's
-    message — the disposition poll waits for one NEWER than this baseline. Read-only."""
+    message — the disposition poll waits for one NEWER than this baseline. Read-only.
+
+    An absent SQLite store holds no prior message, so it yields ``None`` without opening — and so
+    without creating — one (BACKLOG #1708; see :func:`missing_sqlite_store`)."""
     import asyncio
 
     from messagefoundry.store.base import open_store
+
+    if missing_sqlite_store(store) is not None:
+        return None
 
     async def _newest() -> str | None:
         handle = await open_store(store)
@@ -417,12 +469,24 @@ def check_smoke_disposition(
     catching a **post-ACK dead-letter** (a bad transform, a delivery failure, or the service-identity
     db-grant trap), which a headless/CI acceptance run would otherwise miss. Correlates by MSH-10
     control id, waiting for a message NEWER than ``baseline_id`` (so a re-used synthetic id can't match
-    a prior run). Read-only; opens the store as the calling user.
+    a prior run). Read-only; opens the store as the calling user, and refuses to create an absent
+    SQLite one to do it (BACKLOG #1708).
     """
     import asyncio
 
     from messagefoundry.store.base import open_store
     from messagefoundry.store.store import MessageStatus
+
+    absent = missing_sqlite_store(store)
+    if absent is not None:
+        return CheckResult(
+            "smoke.disposition",
+            "Live smoke disposition",
+            Status.FAIL,
+            f"no SQLite store at {absent} — is the engine running and pointed at this same store? "
+            "(check [store].path; verify does not create it for you)",
+            evidence=str(absent),
+        )
 
     terminal = {
         MessageStatus.PROCESSED.value,
