@@ -3769,6 +3769,23 @@ class Registry:
     # Names only, deliberately not the connections: every other reader of `inbound` must keep seeing
     # only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
     all_loopback_inbound: frozenset[str] | None = None
+    # EVERY inbound NAME in the deployment, pinned beside the shard identity by the same filter (None
+    # on an unfiltered graph / single-shard config, where `inbound` IS the whole config). A shard's
+    # `inbound` map holds only its own, but "is this channel_id still configured anywhere?" is a fact
+    # about the CONFIG — and the startup orphan sweep that asks it writes to a UNIFIED store shared
+    # with every sibling shard, so keying it off one slice would dead-letter their live rows. Names
+    # only, for the same reason as `all_loopback_inbound`: every other reader of `inbound` must keep
+    # seeing only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
+    all_inbound: frozenset[str] | None = None
+
+    def inbound_names(self) -> frozenset[str]:
+        """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
+        engine shard's filtered view, else this graph's own inbounds. The key for the startup
+        ``dead_letter_missing_inbounds`` sweep, which must not mistake a sibling shard's live lane on
+        the shared store for a removed one."""
+        if self.all_inbound is not None:
+            return self.all_inbound
+        return frozenset(self.inbound)
 
     def loopback_inbound_names(self) -> frozenset[str]:
         """Every ``Loopback()`` inbound in the deployment — the pinned unfiltered set when this is one
