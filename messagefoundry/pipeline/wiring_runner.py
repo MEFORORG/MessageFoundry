@@ -5392,9 +5392,40 @@ class RegistryRunner:
         ACK), so the response is always one-way here.
 
         The lane's processing slot is held for the coalescing window (bounded by ``max_wait_ms`` and by
-        ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size."""
+        ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size.
+
+        **Member ownership on a fault (BACKLOG #1579).** The coalesced members past the head are claimed
+        *here* and named nowhere else: the pooled dispatcher's T17 arm re-pends only the head it handed
+        in, and the per_lane worker's #1611 arm re-pends only the row IT claimed. So an exception
+        escaping the body would leave ``members[1:]`` INFLIGHT with **no recovery owner** — invisible to
+        every claim path (all select ``status='pending'``) and to ``pending_depth``, waiting for
+        ``reset_stale_inflight`` at the next service start. The guard below hands those extras back and
+        re-raises. It re-pends **the extras only**: the head already has an owner in both claim modes,
+        and re-pending it twice would be a second defect."""
+        members: list[OutboxItem] = [head]
+        try:
+            return await self._deliver_coalesced_batch(name, cfg, members)
+        except Exception:
+            # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
+            # dead-lettered / re-pended failed) or released them (leadership lost), so a `finally`
+            # would re-pend rows that legitimately completed. ``reschedule_claimed`` being
+            # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
+            # it is not a licence to run the re-pend unconditionally.
+            await self._repend_claimed_on_fault(
+                "batch delivery", name, [it.id for it in members[1:]]
+            )
+            raise
+
+    async def _deliver_coalesced_batch(
+        self, name: str, cfg: BatchConfig, items: list[OutboxItem]
+    ) -> tuple[_ItemOutcome, float | None]:
+        """The body of :meth:`_process_delivery_batch` — split out ONLY so that method can wrap the whole
+        post-head region in the BACKLOG #1579 re-pend guard without re-indenting it. ``items`` is the
+        caller's list, seeded with the already-claimed head and appended to **in place** as the window
+        coalesces, so the guard can name the members this body claimed. Never call it directly: without
+        that wrapper a fault here strands every coalesced member."""
         retry = self._retry.get(name) or RetryPolicy()
-        items: list[OutboxItem] = [head]
+        head = items[0]
         # Deadline measured from the head's ingest time (ADR 0009, re-run-stable). created_at is now
         # projected by every outbound claim; fall back to now defensively (a slightly later window start).
         base = head.created_at if head.created_at is not None else time.time()
