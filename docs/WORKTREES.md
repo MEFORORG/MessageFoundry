@@ -150,6 +150,19 @@ already has an environment the script prints one line and returns, but a **fresh
 always takes the full install: measured here, **47 seconds and 887 MB** with a warm pip cache. A worker
 that runs no checks should not pay that, and 39 of the 86 nested worktrees on this machine would.
 
+**Keeping managed worktrees inherits a staleness mode the sibling pattern did not have.** The script
+decides freshness by file EXISTENCE, so a venv is only as current as the day it was built. A
+disposable sibling made and removed inside a day never meets a `constraints.lock` bump. A managed
+worktree is likelier to be **kept** -- that is much of its appeal -- and a kept one outlives lock bumps
+while the script correctly reports nothing to do. So if you keep them, **delete `.venv` and re-run** is
+a habit rather than a footnote: reach for it whenever a reused worktree gives a lint or type result CI
+disagrees with. There is deliberately no `-Force`; an untested refresh path on a script whose contract
+is "run it and it does the right thing" is a second, quieter way for it to lie.
+
+Raised 2026-09-16 by a manager who had just removed five same-day siblings and pointed out that the
+trap does not reach that pattern at all -- which is the point: this recommendation moves people onto
+the population where it does.
+
 Why the two populations differ, measured 2026-09-16: **21 of 22** `new.ps1` siblings carried a usable
 `.venv`, against **47 of 86** harness-created worktrees. `new.ps1` bootstraps one; the harness creates a
 checkout and installs nothing. Skipping the bootstrap is a false green, for the reason given under
