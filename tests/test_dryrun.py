@@ -92,9 +92,15 @@ def test_handler_filters_is_filtered() -> None:
 def test_router_to_unknown_handler_is_error() -> None:
     # Router names a handler that isn't registered (typo / renamed / removed handler). This must FAIL
     # CLOSED — ERROR (+ NAK on the live path), never a silent FILTERED accept-and-drop (review M-7).
+    #
+    # BACKLOG #1688: the assertion has to name the ROUTER stage, because ERROR-plus-"ghost" is not
+    # unique to it. With `route_only`'s fail-closed deleted, this message reaches `transform_one`,
+    # whose `registry.handlers[hname]` raises `KeyError('ghost')` a stage later; `dry_run`'s catch-all
+    # renders that as "router/handler error: 'ghost'" — still ERROR, still carrying "ghost". So the
+    # weaker pin stayed green with the guard gone and reported only that SOMETHING failed.
     result = dry_run(_registry(lambda m: ["ghost"], {}), ADT_A01)
     assert result.disposition is MessageStatus.ERROR
-    assert result.error and "ghost" in result.error
+    assert result.error and "returned unknown handler 'ghost'" in result.error
 
 
 def test_parse_error_is_error() -> None:
