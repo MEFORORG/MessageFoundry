@@ -1849,7 +1849,7 @@ def File(
     after_read: Literal[
         "move", "delete", "leave"
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
-    sort: str = "name",  # inbound: process order — "name" | "mtime"
+    sort: Literal["name", "mtime"] = "name",  # inbound: process order
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
     poll_max_files: int
