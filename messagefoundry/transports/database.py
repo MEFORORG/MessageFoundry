@@ -59,6 +59,7 @@ from messagefoundry.config.settings import (
     insecure_tls_allowed,
 )
 from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     DeliveryError,
@@ -638,13 +639,46 @@ def _is_transient(sqlstate: str) -> bool:
     return sqlstate[:2] in _TRANSIENT_PREFIXES or sqlstate in _TRANSIENT_STATES
 
 
+# The native error code an ODBC driver appends to its own message text, ANCHORED on the trailing
+# ``(SQLFunctionName)`` the driver always writes after it — ``... (2627) (SQLExecDirectW)``. Both the
+# SQL Server driver and psqlODBC use this shape, which is why :func:`_driver_code` can share one
+# pattern with :func:`messagefoundry.store.sqlserver._is_lock_timeout`'s substring convention.
+#
+# THE ANCHOR AND THE DIGIT BOUND ARE THE WHOLE POINT, not tidiness (BACKLOG #1661). A bare
+# ``\((\d+)\)`` lifts ``(900123456)`` straight out of ``The duplicate key value is (900123456).`` —
+# it would re-introduce, through the extractor, exactly the leak this function stopped interpolating.
+# So: at most six digits, an ODBC function name required immediately after, and the LAST match wins
+# (the driver's suffix is always last, so a crafted value earlier in the text cannot outrank it).
+# *Residual:* a partner-supplied value ending in a literal ``) (SQLx`` could still present 1-6 of its
+# own digits here. It is self-chosen, bounded to six characters, and no real driver text ends that
+# way; the alternative — dropping the code — costs the operator the only field that separates a PK
+# violation (2627) from a unique-index violation (2601) under one generic SQLSTATE.
+_DRIVER_CODE_RE = re.compile(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)")
+
+
+def _driver_code(message: str) -> str | None:
+    """The driver's native error number from ``message``, or ``None`` when it carries none."""
+    found = _DRIVER_CODE_RE.findall(message)
+    return str(found[-1]) if found else None
+
+
 def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
-    :class:`NegativeAckError` (dead-letter)."""
+    :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
+
+    ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
+    (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
+    meets most — SQL Server 2627/2601 (``The duplicate key value is (...)``) and PostgreSQL 23505
+    (``Key (mrn)=(...) already exists``) — and the returned error is persisted to ``queue.last_error``
+    and ``message_events.detail`` and rendered into the ``connection_error`` alert, so interpolating
+    it would carry a partner's identifier into all three on a first deployment. The same rule the
+    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows."""
+    code = _driver_code(message)
+    detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
     if _is_transient(sqlstate):
-        return DeliveryError(f"database transient error [{sqlstate}]: {message}")
+        return DeliveryError(f"database transient error {detail}")
     return NegativeAckError(
-        f"database rejected the statement [{sqlstate}]: {message}",
+        f"database rejected the statement {detail}",
         code=sqlstate or "db",
         permanent=True,
     )
@@ -658,6 +692,24 @@ def _sqlstate(exc: BaseException) -> str | None:
     if args and isinstance(args[0], str) and len(args[0]) == 5 and args[0].isalnum():
         return args[0]
     return None
+
+
+def _safe_db_error(exc: BaseException) -> str:
+    """A PHI-free rendering of a failure for a LOG line, the log-side twin of
+    :func:`_classify_db_error` (BACKLOG #1661).
+
+    A driver error renders as its type, SQLSTATE and native error number — the message is read, never
+    quoted. ``safe_exc`` is NOT enough on its own here and the difference is measured: fed the SQL
+    Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
+    because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
+    identifier in the middle rather than removing it. Anything without a SQLSTATE is not a driver
+    error, carries no embedded column value by construction, and keeps the ``safe_exc`` rendering —
+    which is the more useful text for a bug or an unreachable host."""
+    state = _sqlstate(exc)
+    if state is None:
+        return safe_exc(exc)
+    code = _driver_code(str(exc))
+    return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
 
 
 def _import_aioodbc() -> Any:
@@ -741,7 +793,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE connect failed: {exc}")
+            else DeliveryError(f"DATABASE connect failed: {safe_exc(exc)}")
         ) from exc
     cur: Any = None
     try:
@@ -752,7 +804,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {exc}")
+            else DeliveryError(f"DATABASE probe failed: {safe_exc(exc)}")
         ) from exc
     finally:
         await _close_cursor(cur)
@@ -1156,7 +1208,10 @@ class DatabaseSource(SourceConnector):
             except (ValueError, TypeError) as exc:
                 # A row we can't turn into a body (missing body_column, unserializable value) is a
                 # config/data error for that row — log and skip it rather than wedging the batch.
-                logger.error("DATABASE source: %s; skipping row", exc)
+                # safe_exc, not exc: _body raises with the offending COLUMN VALUE in the message on
+                # the decode arms, and the handler-level RedactionFilter is measured blind to a value
+                # that is not HL7-delimited and not name-shaped (BACKLOG #1661).
+                logger.error("DATABASE source: %s; skipping row", safe_exc(exc))
                 continue
             try:
                 await self._handler(body.encode(self._encoding))
@@ -1166,7 +1221,8 @@ class DatabaseSource(SourceConnector):
                 # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
                 # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
                 logger.warning(
-                    "DATABASE source handler failed (row left unmarked, will retry): %s", exc
+                    "DATABASE source handler failed (row left unmarked, will retry): %s",
+                    safe_exc(exc),
                 )
                 continue
             try:
@@ -1174,8 +1230,12 @@ class DatabaseSource(SourceConnector):
             except Exception as exc:
                 # The handler already ingested the message; a mark failure means the row re-emits next
                 # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
+                # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
+                # so the driver's rejection text quotes the bound value straight back, and safe_exc
+                # is measured to keep a partial copy of it (BACKLOG #1661).
                 logger.warning(
-                    "DATABASE source mark failed (row will re-emit, a duplicate): %s", exc
+                    "DATABASE source mark failed (row will re-emit, a duplicate): %s",
+                    _safe_db_error(exc),
                 )
 
     async def _select(self) -> tuple[list[str], list[Any]]:
