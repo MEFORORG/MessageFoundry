@@ -324,6 +324,42 @@ def test_route_message_nonhl7_shares_one_rawmessage() -> None:
     assert [d.to for d in outcome.deliveries] == ["out", "out"]  # both handlers still delivered
 
 
+# --- BACKLOG #1692: DryRunResult.meta_ops ---------------------------------------------------------
+
+
+def test_dry_run_surfaces_declared_metadata_writes_on_the_hl7_path() -> None:
+    """A Handler's ``SetMeta`` reaches ``DryRunResult.meta_ops`` (ADR 0081).
+
+    ``dry_run`` built its result without ``meta_ops=outcome.meta_ops`` from the day ``MetaOpPreview``
+    arrived, so the field was empty whatever a Handler declared and a ``SetMeta`` was invisible to the
+    CLI and the Test Bench. The ``SetState`` beside it is asserted on the SAME run: without it, an
+    outcome that produced nothing at all would satisfy the metadata assertion by being empty too.
+    """
+
+    def handle(msg: Message) -> list[Any]:
+        return [Send("out", msg), SetState("ns", "sk", "sv"), SetMeta("mk", "mv")]
+
+    result = dry_run(_registry(lambda m: ["h"], {"h": handle}), ADT_A01)
+    assert [(s.namespace, s.key, s.value) for s in result.state_ops] == [("ns", "sk", "sv")]
+    assert [(m.key, m.value) for m in result.meta_ops] == [("mk", "mv")]
+
+
+def test_dry_run_surfaces_declared_metadata_writes_on_the_raw_path() -> None:
+    """The same, through ``_dry_run_raw`` — the non-HL7 construction is a SECOND call site.
+
+    Both sites omitted ``meta_ops`` and each has to be pinned: fixing one leaves a JSON/X12 feed's
+    ``SetMeta`` as invisible as before, with the HL7 test green over it.
+    """
+
+    def handle(msg: RawMessage) -> list[Any]:
+        return [Send("out", msg.raw), SetState("ns", "sk", "sv"), SetMeta("mk", "mv")]
+
+    reg = _raw_registry(lambda m: ["h"], {"h": handle}, content_type=ContentType.JSON)
+    result = dry_run(reg, '{"a": 1}')
+    assert [(s.namespace, s.key, s.value) for s in result.state_ops] == [("ns", "sk", "sv")]
+    assert [(m.key, m.value) for m in result.meta_ops] == [("mk", "mv")]
+
+
 def test_transform_one_honors_prebuilt_payload() -> None:
     # The optional pre-parsed `payload` is used as-is instead of parsing `raw`. Pass a payload built
     # from DIFFERENT content than `raw` to prove the payload (not the raw) drove the transform.
