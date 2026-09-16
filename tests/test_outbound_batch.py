@@ -24,6 +24,7 @@ from _pace_probe import install_pace_probe
 from messagefoundry.config.models import BatchConfig, RetryPolicy
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.split import split_batch
+from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -495,18 +496,58 @@ class _FaultOnce:
 
     One-shot on purpose: a permanently-faulting store lets the worker loop re-fault while the test
     polls, which measures the retry cadence instead of the re-pend this is about.
+
+    ``fired`` is set the instant the injected call raises, and it is what :func:`_await_fault` gates
+    on. Set BEFORE the raise so a waiter cannot observe the recovered state without having observed
+    the fault that caused it.
     """
 
     def __init__(self, real: Any, *, at: int = 1) -> None:
         self.real = real
         self.at = at
         self.calls = 0
+        self.fired = asyncio.Event()
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         if self.calls == self.at:
+            self.fired.set()
             raise RuntimeError("injected store fault")
         return await self.real(*args, **kwargs)
+
+
+@pytest.fixture
+def slow_fault_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Widen both post-fault backoffs so the recovered state is STABLE while the test reads it.
+
+    Both recovery arms date the rows they hand back by a backoff and then sleep it off, so at stock
+    1.0s the "every member is PENDING again" state is a ONE-SECOND window: miss it and the (one-shot)
+    fault is spent, the retry succeeds, and depth falls to 0 with nothing left to see. Widening the
+    constant does not change WHAT is asserted -- the rows are re-pended not-due either way, and
+    ``pending_depth`` counts not-due rows -- it only stops the assertion racing the retry on a loaded
+    runner. Both workers are cancelled by the test, so nothing actually sleeps this long.
+    """
+    # per_lane worker + the #1579 guard itself:
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 30.0)
+    # pooled T17 fix A (the dispatcher's own head re-pend):
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 30.0)
+
+
+async def _await_fault(fault: _FaultOnce, *, timeout: float = 10.0) -> None:
+    """Block until the injected fault has actually fired. THE START GATE for every assertion below.
+
+    Without it these tests cannot fail, and that is exactly how they passed on one machine and failed
+    on every CI runner. ``_enqueue`` leaves N rows PENDING, so the success condition ``depth == N`` is
+    ALSO the state before the worker has claimed anything: a poll that starts at t=0 races the worker's
+    first claim against its own first round trip to the store, and whichever wins is pure scheduling.
+    Once the fault has fired every member is INFLIGHT, so a later depth of N can only have come from
+    the re-pend under test.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            await fault.fired.wait()
+    except TimeoutError:
+        pytest.fail(f"the injected store fault never fired within {timeout}s")
 
 
 async def _until_pending(store: Any, want: int, *, timeout: float = 5.0) -> int:
@@ -517,6 +558,9 @@ async def _until_pending(store: Any, want: int, *, timeout: float = 5.0) -> int:
     status, so ``depth == N`` says none of them is still claimed. It counts NOT-DUE rows too, which is
     required here because the re-pend deliberately dates the recovered rows into the future. Backend-
     agnostic, so the SQL Server and Postgres legs assert the same thing as SQLite.
+
+    Only meaningful AFTER :func:`_await_fault` — before the fault the enqueued rows satisfy it for
+    free. Never call it as the first thing a worker-driven test awaits.
     """
     deadline = time.monotonic() + timeout
     depth = -1
@@ -541,7 +585,9 @@ async def _drain_worker(runner: RegistryRunner, task: asyncio.Task[None]) -> Non
         await task
 
 
-async def test_completion_fault_repends_every_member_per_lane(store: Any) -> None:
+async def test_completion_fault_repends_every_member_per_lane(
+    store: Any, slow_fault_backoff: None
+) -> None:
     # The batch body claims MSG2/MSG3 itself and the per_lane worker's #1611 arm knows only the head
     # IT claimed, so a completion fault used to leave those two INFLIGHT with no recovery owner until
     # the next service start. Through the real worker: all three must come back PENDING, no restart.
@@ -549,10 +595,12 @@ async def test_completion_fault_repends_every_member_per_lane(store: Any) -> Non
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
-    store.mark_batch_done = _FaultOnce(store.mark_batch_done)
+    fault = _FaultOnce(store.mark_batch_done)
+    store.mark_batch_done = fault
 
     worker = asyncio.create_task(runner._delivery_worker(DEST))
     try:
+        await _await_fault(fault)  # see the helper: without this the test cannot fail
         depth = await _until_pending(store, 3)
     finally:
         await _drain_worker(runner, worker)
@@ -563,7 +611,9 @@ async def test_completion_fault_repends_every_member_per_lane(store: Any) -> Non
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
 
 
-async def test_coalescing_fault_repends_the_claimed_extras_per_lane(store: Any) -> None:
+async def test_coalescing_fault_repends_the_claimed_extras_per_lane(
+    store: Any, slow_fault_backoff: None
+) -> None:
     # The other injection point: fault DURING coalescing, after an extra is already claimed. Call 1 is
     # the worker's own head claim, call 2 pulls MSG2 into the window, call 3 raises — so MSG2 is the
     # stranded member and MSG3 never left PENDING. All three still have to be PENDING afterwards.
@@ -571,10 +621,12 @@ async def test_coalescing_fault_repends_the_claimed_extras_per_lane(store: Any) 
     runner = _runner(store)
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
-    store.claim_next_fifo = _FaultOnce(store.claim_next_fifo, at=3)
+    fault = _FaultOnce(store.claim_next_fifo, at=3)
+    store.claim_next_fifo = fault
 
     worker = asyncio.create_task(runner._delivery_worker(DEST))
     try:
+        await _await_fault(fault)  # MSG1 + MSG2 are INFLIGHT here, so depth is 1, never 3
         depth = await _until_pending(store, 3)
     finally:
         await _drain_worker(runner, worker)
@@ -583,7 +635,9 @@ async def test_coalescing_fault_repends_the_claimed_extras_per_lane(store: Any) 
     assert rec.sent == []  # the fault landed before framing, so nothing was sent
 
 
-async def test_completion_fault_repends_every_member_pooled(store: Any) -> None:
+async def test_completion_fault_repends_every_member_pooled(
+    store: Any, slow_fault_backoff: None
+) -> None:
     # The pooled arm, through the REAL StageDispatcher (not the _dispatch_delivery adapter alone): its
     # T17 machinery re-pends the head it claimed and releases its own tail, and it cannot name the
     # members the batch body coalesced — that asymmetry is the defect. Same requirement: all PENDING.
@@ -591,11 +645,13 @@ async def test_completion_fault_repends_every_member_pooled(store: Any) -> None:
     runner = _runner(store, claim_mode="pooled")
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
-    store.mark_batch_done = _FaultOnce(store.mark_batch_done)
+    fault = _FaultOnce(store.mark_batch_done)
+    store.mark_batch_done = fault
 
     dispatcher = runner._make_dispatcher(Stage.OUTBOUND)
     await dispatcher.start()
     try:
+        await _await_fault(fault)
         depth = await _until_pending(store, 3)
     finally:
         runner._stop.set()
