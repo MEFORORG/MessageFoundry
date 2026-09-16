@@ -280,7 +280,7 @@ ASVS Tracker.
 **An eighth went on 2026-09-10, by owner decision: the CONSOLE. The MANAGER replaces it, and a
 Manager is NOT a renamed Console.** A Console's workers were separate `claude -p` sessions across
 several accounts, spawned under a per-root grant, and exactly one Console ran. A Manager's workers
-are **subagents inside its own process on its own account**, it needs **no spawn grant**, and
+are **subagents inside its own process on its own account**, it needs **no spawn grant for them**, and
 **several Managers run at once, usually one per account**. The Manager also does **not enqueue** --
 that moved to the Lander. **So a Console rule does not transfer by substitution.** Read the Manager's
 row below and korus `MANAGER.md`, and decide as a Manager; do not reach for what a Console would have
@@ -354,10 +354,25 @@ own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledge
 #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
 new session to it.
 
-**NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds nothing. The owner starts each
-Manager, in a desktop instance, and a Manager's workers are subagents in its own process.** That is
-why a Manager needs no account roster and cannot reach another Manager: the shape dissolves the
-cross-account coordination problem instead of solving it.
+**A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
+ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
+workers are still subagents in its own process rather than spawned sessions. A Manager still needs
+no account roster and still cannot reach another Manager: spawning makes a NEW session, it does not
+address an existing one, so the shape still dissolves the cross-account problem rather than solving
+it.
+
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing reads a red
+PR -- `failure-signal.yml` sets a `ci-red` label no workflow reads back, and `stalled-prs.yml`
+reports green-but-unmergeable PRs rather than red ones -- so the work stops until somebody happens
+to look. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
+was written against.
+
+**THIS REPLACED A RULE READING "NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds
+nothing."** That was true when written and false by 2026-09-16, when the grant was measured present
+on all six config roots. It is named rather than deleted because a seat that read it did not try,
+rendered unable to spawn, and confirmed it -- the same self-confirming shape this section already
+records for seat declaration.
 
 **The grant's measurements are kept, not deleted, so nobody re-derives them and nobody mistakes this
 for a capability that was lost.** The grant is a rule matching `Bash(claude:*)` or
