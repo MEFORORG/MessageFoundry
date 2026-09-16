@@ -349,6 +349,42 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+class _DirectoryLoginRefused(Exception):
+    """The mirror row a directory login resolved is not eligible to sign in.
+
+    Raised by :meth:`AuthService._upsert_ad_user`, caught by its ONE caller
+    :meth:`AuthService._complete_ad_login`, which renders it as the audited refusal.
+
+    **Why the resolver signals by raising rather than by returning.** The id-keyed lookup that finds
+    a directory-side RENAMED row runs inside the resolver, below the caller's own name-keyed read,
+    and the refusal has to land BEFORE the resolver's profile, name and role writes. A resolver that
+    reported the condition in its ``UserRecord`` return value would have done those writes already,
+    which is the half of BACKLOG #1637 a check on the returned value cannot close.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
+    """The closed-set reason a directory login must refuse ``user``'s mirror row, or ``None``.
+
+    BACKLOG #1637 (``disabled``) and #1638 (``locked``). Both states used to be invisible to a
+    directory sign-in: ``_complete_ad_login`` checked provider and directory id and neither of these,
+    so an engine-disabled mirror row completed Kerberos or OIDC login with an ``auth.login_success``
+    row and a live session, and a lock set by five wrong TOTP codes was cleared by one re-login.
+
+    The slugs are literals from a closed set, never directory- or IdP-supplied text, because they are
+    stored on the audit row and read by the browser layer.
+    """
+    if user.disabled:
+        return "disabled"
+    if user.locked_until is not None and now < user.locked_until:
+        return "locked"
+    return None
+
+
 @dataclass(frozen=True)
 class ProvisionedAdministrator:
     """The outcome of an offline first-administrator provision (BACKLOG #1136).
@@ -360,6 +396,26 @@ class ProvisionedAdministrator:
     user_id: str
     username: str
     repaired: bool
+
+
+@dataclass(frozen=True)
+class IssuedCredential:
+    """An admin-issued one-time credential and the instant it stops working.
+
+    BACKLOG #1141 (ASVS 6.4.5). The renewal instruction for an expiring mechanism has to be *sent*
+    with the mechanism, and :meth:`AuthService.admin_reset_password` used to return the password
+    alone -- so the one artifact that reaches the issuing administrator carried no deadline, and
+    neither did anything downstream of it. Pairing the two in the return type means a caller cannot
+    surface the credential and forget the deadline: there is nothing else to unpack.
+
+    ``expires_at`` is :meth:`AuthService.initial_credential_deadline` over the STORED
+    ``password_changed_at``, which is the value the login gate itself refuses on -- not a fresh clock
+    read and not a second computation. ``None`` means ``[auth].initial_password_expiry_hours`` is 0,
+    i.e. the credential genuinely has no deadline, which is what the gate does in that case too.
+    """
+
+    password: str
+    expires_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -746,16 +802,13 @@ class AuthService:
             if self._settings.bootstrap_expiry_hours > 0:
                 # WP-3 retires the ACCOUNT, keyed on created_at.
                 deadlines.append(created.created_at + self._settings.bootstrap_expiry_hours * 3600)
-            if self._settings.initial_password_expiry_hours > 0 and (
-                created.password_changed_at is not None
-            ):
-                # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly
-                # minted bootstrap these two stamps are the same clock read, so at equal windows the
-                # minimum is that shared instant and the surfaced value is unchanged.
-                deadlines.append(
-                    created.password_changed_at
-                    + self._settings.initial_password_expiry_hours * 3600
-                )
+            # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly minted
+            # bootstrap these two stamps are the same clock read, so at equal windows the minimum is
+            # that shared instant and the surfaced value is unchanged. BACKLOG #1141: through
+            # initial_credential_deadline, so this file states that arithmetic exactly once.
+            credential_deadline = self.initial_credential_deadline(created.password_changed_at)
+            if credential_deadline is not None:
+                deadlines.append(credential_deadline)
         expires_at: float | None = min(deadlines) if deadlines else None
         return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
 
@@ -993,6 +1046,28 @@ class AuthService:
             detail=_json({"reason": "superseded" if superseded else "expired"}),
         )
 
+    def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
+        """The instant an admin-issued must-change credential stops working, or ``None`` when
+        ``[auth].initial_password_expiry_hours`` is 0 (no expiry) or the account carries no
+        ``password_changed_at`` stamp.
+
+        BACKLOG #1141 (ASVS 6.4.5). THE ONE COMPUTATION OF THE 6.4.1 CREDENTIAL DEADLINE. The login
+        gate refuses on it, :meth:`admin_reset_password` surfaces it to the issuing administrator,
+        :meth:`_ensure_bootstrap_admin` writes it into ``bootstrap-admin.txt`` and
+        :meth:`bootstrap_expiry_warning` warns ahead of it. Those were four open-coded copies of one
+        arithmetic, which is precisely the shape BACKLOG #1245 already cost this file once: two copies
+        of one lifecycle test let the warn path drift from the gate silently. A surfaced deadline that
+        can disagree with the enforced one is worse than no deadline at all, because the holder plans
+        around a date the gate does not honour.
+
+        The gate's own comparison is ``now > deadline`` (strictly after), so a login AT the returned
+        instant still succeeds -- stating it as the moment the credential stops working is exact.
+        """
+        hours = self._settings.initial_password_expiry_hours
+        if hours <= 0 or password_changed_at is None:
+            return None
+        return password_changed_at + hours * 3600.0
+
     async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
         """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED (the shared test,
         :meth:`_unclaimed_bootstrap`) and ``now`` sits inside its warn window
@@ -1020,13 +1095,9 @@ class AuthService:
         candidates: list[float] = []
         if self._settings.bootstrap_expiry_hours > 0:
             candidates.append(boot.created_at + self._settings.bootstrap_expiry_hours * 3600)
-        if (
-            self._settings.initial_password_expiry_hours > 0
-            and boot.password_changed_at is not None
-        ):
-            candidates.append(
-                boot.password_changed_at + self._settings.initial_password_expiry_hours * 3600
-            )
+        credential_deadline = self.initial_credential_deadline(boot.password_changed_at)
+        if credential_deadline is not None:
+            candidates.append(credential_deadline)
         if not candidates:
             return None  # no bound of either kind configured → nothing to warn about
         now = time.time() if now is None else now
@@ -1222,13 +1293,12 @@ class AuthService:
         # is near-behaviour-neutral at the stock 72/72 defaults — a freshly minted bootstrap has
         # created_at and password_changed_at within milliseconds of each other, so 6.4.1 comes due at
         # the same instant WP-3 retirement already does — while closing both misconfigurations.
+        # BACKLOG #1141: the deadline comes from initial_credential_deadline, the SAME call
+        # admin_reset_password surfaces to the issuing administrator — so the instant the response
+        # states and the instant this gate refuses on are one computation, not two that agree today.
         expiry_hours = self._settings.initial_password_expiry_hours
-        if (
-            user.must_change_password
-            and expiry_hours > 0
-            and user.password_changed_at is not None
-            and now - user.password_changed_at > expiry_hours * 3600.0
-        ):
+        deadline = self.initial_credential_deadline(user.password_changed_at)
+        if user.must_change_password and deadline is not None and now > deadline:
             await self._audit(
                 "auth.temp_password_expired",
                 actor=username,
@@ -1242,8 +1312,9 @@ class AuthService:
                 password_hash=await self._argon2(hash_password, password),
                 must_change_password=user.must_change_password,
             )
-        prior_failures = user.failed_attempts  # captured before record_login_success resets it
-        await self._store.record_login_success(user.id, now=now)
+        # Captured off the row read before the verify, so it is the count as it stood at the start of
+        # this attempt whether or not the clear below runs.
+        prior_failures = user.failed_attempts
         identity = await self._build_identity(user)
         # A second factor (TOTP / recovery code / passkey) is pending for an enrolled user — or an
         # Administrator when require_mfa is on. Issue the session un-MFA'd; the client completes via
@@ -1251,6 +1322,14 @@ class AuthService:
         mfa_required = self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=await self._second_factor_enrolled(user)
         )
+        if not mfa_required:
+            # BACKLOG #1638. CLEARED AT FULL AUTHENTICATION, NOT AT THE PASSWORD STEP. This call
+            # zeroes ``failed_attempts`` and NULLs ``locked_until``; it used to run above, before the
+            # second factor was proven, so a password holder could shed a run of wrong TOTP codes just
+            # by logging in again -- three cycles of password plus four wrong codes never locked the
+            # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
+            # it when a factor is owed; this branch covers the accounts that owe none.
+            await self._store.record_login_success(user.id, now=now)
         token = await self._issue_session(user.id, client, mfa_verified=not mfa_required)
         await self._audit(
             "auth.login_success",
@@ -1614,6 +1693,28 @@ class AuthService:
             federated_subject=(principal_claims.issuer, principal_claims.subject),
         )
 
+    async def _refuse_directory_row(
+        self, username: str, reason: str, *, client: str | None
+    ) -> LoginOutcome:
+        """Audit and render the refusal of an ineligible mirror row (BACKLOG #1637 / #1638).
+
+        **Audited in the shape of the ``local_account_conflict`` refusal, NOT through
+        :meth:`_directory_reject_audit`.** That helper requires a mechanism slug, and the Kerberos
+        leg reaches this decision point without one -- ``mech`` is optional on
+        :meth:`_complete_ad_login` and defaults to ``None``. The reason is a closed-set literal
+        either way, so no directory-supplied text is stored.
+
+        ``error`` is the generic string on purpose: an unauthenticated caller learns that the attempt
+        failed and nothing about whether the account exists, is disabled, or is locked.
+        """
+        await self._audit(
+            "auth.login_failed",
+            actor=username,
+            detail=_json({"provider": "ad", "reason": reason}),
+            client=client,
+        )
+        return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
+
     async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored."""
@@ -1689,7 +1790,35 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="account conflict", reason="directory_identity_conflict"
             )
-        user = await self._upsert_ad_user(principal, by_name=existing, client=client)
+        # BACKLOG #1637 / #1638. IS THIS ROW ELIGIBLE TO SIGN IN AT ALL.
+        #
+        # THIS ARM IS FOR THE READER, NOT FOR THE CONTROL -- said plainly, because a guard documented
+        # as load-bearing when it is not is the false-premise shape SDS-3.7 names. The gate inside
+        # ``_upsert_ad_user`` runs on ``by_name`` as well, so it already covers every row this branch
+        # covers: delete these four lines and no outcome changes. What they buy is that the refusal
+        # is VISIBLE in the login method a reviewer reads, and that the common case is refused before
+        # the resolver is entered.
+        #
+        # THE ARM THAT CLOSES THE DEFECT IS THE OTHER ONE, and this read's KEY is why: it is keyed by
+        # NAME, so on a directory-side rename it misses, ``existing`` is None, and the row the login
+        # lands on comes from the id-keyed lookup the resolver does. A check written only here would
+        # look complete and close nothing on that path.
+        #
+        # ORDERED AFTER THE TWO CONFLICT BRANCHES ABOVE, DELIBERATELY. A recycled ``sAMAccountName``
+        # meeting a stale disabled row is a ``directory_identity_conflict`` and not a ``disabled``
+        # login: the new holder's account is neither disabled nor locked, and telling them otherwise
+        # would misdirect the operator reading the audit row.
+        if existing is not None:
+            refusal = _directory_login_refusal(existing, time.time())
+            if refusal is not None:
+                return await self._refuse_directory_row(principal.username, refusal, client=client)
+        try:
+            user = await self._upsert_ad_user(principal, by_name=existing, client=client)
+        except _DirectoryLoginRefused as exc:
+            # The resolver refused before it wrote anything. Rendered here rather than there so the
+            # audit row carries the caller's ``client`` and every directory refusal in this method
+            # has one shape.
+            return await self._refuse_directory_row(principal.username, exc.reason, client=client)
         if (
             federated_subject is not None
             and (
@@ -1797,7 +1926,6 @@ class AuthService:
                 client=client,
                 detail={"roles": role_ids},
             )
-        await self._store.record_login_success(user.id)
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
         user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups)
@@ -1835,11 +1963,24 @@ class AuthService:
         # left a debt: with require_mfa off and no factor enrolled the shared rule still admits the
         # session, so `not mfa_verified` would over-report and prompt for a factor the caller does not
         # owe. One extra read on a rare path buys a single source for the answer.
+        mfa_required = not await self.mfa_satisfied(token)
+        if not mfa_required:
+            # BACKLOG #1638. THE COUNTER IS CLEARED AT FULL AUTHENTICATION, NEVER AT THE FIRST STEP.
+            # ``record_login_success`` zeroes ``failed_attempts`` and NULLs ``locked_until`` in one
+            # UPDATE, so running it here unconditionally -- which is what this method used to do,
+            # forty lines above -- handed a holder of the first factor an unlimited supply of second-
+            # factor guesses: every re-login wiped the run of wrong codes, and five wrong codes
+            # followed by one re-login cleared the lock outright. When a second factor is still owed
+            # the session is not authenticated yet, so there is nothing to record.
+            #
+            # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
+            # and both clear the counter themselves.
+            await self._store.record_login_success(user.id)
         return LoginOutcome(
             ok=True,
             token=token,
             identity=identity,
-            mfa_required=not await self.mfa_satisfied(token),
+            mfa_required=mfa_required,
         )
 
     async def _sync_ad_channel_scope(
@@ -1924,6 +2065,10 @@ class AuthService:
         no such operation existed. That was a compensating control resting on a false premise, which is
         worse than naming no remedy. #1532 re-keyed the probe and added the refresh above. Both
         spellings of the bug were the same mistake: reading a recyclable label as an identity.
+
+        Raises :class:`_DirectoryLoginRefused` when the resolved row is engine-disabled or locked
+        (BACKLOG #1637 / #1638), before any write. See the gate below the id-keyed lookup for why the
+        condition is signalled from here rather than checked on the returned record.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
@@ -1937,6 +2082,18 @@ class AuthService:
             existing = await self._store.get_user_by_directory_object_id(
                 principal.directory_object_id
             )
+        # BACKLOG #1637 / #1638. THE ELIGIBILITY GATE THAT ACTUALLY CLOSES THE DEFECT, and its
+        # POSITION is the whole of it: immediately after the id-keyed read, BEFORE the first write.
+        #
+        # The caller checks the row it read BY NAME. On a directory-side rename that read misses, and
+        # the row this login lands on is the one the id lookup above just returned -- which the caller
+        # has never seen. A check sited on this method's RETURN VALUE would be too late by then: the
+        # rename refresh, the profile write and the caller's role resync have all already run against
+        # a row that must not be signing in.
+        if existing is not None:
+            refusal = _directory_login_refusal(existing, time.time())
+            if refusal is not None:
+                raise _DirectoryLoginRefused(refusal)
         if existing is None:
             user_id = uuid4().hex
             await self._store.create_user(
@@ -3689,7 +3846,10 @@ class AuthService:
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
         0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits."""
+        route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits.
+
+        A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
+        direction and the divergence does not cover it — see the call site."""
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -3769,6 +3929,17 @@ class AuthService:
             )
             return Elevation()
         await self._store.mark_session_mfa_verified(hash_token(token))
+        # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
+        # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
+        # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
+        # and the counter has to be cleared by whichever leg completes the authentication: since
+        # #1638 the password step no longer clears it, so without this line a passkey-only account's
+        # password failures would shed only by waiting the lockout window out.
+        #
+        # Sited before ``_elevated`` rotates the session for the same reason the group in
+        # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
+        # ordering by parity rather than by necessity.
+        await self._store.record_login_success(user.id, now=now)
         await self._audit("auth.webauthn_verified", actor=user.username, client=client)
         return await self._elevated(
             token, ceremony="webauthn_assert", actor=user.username, client=client
@@ -4052,13 +4223,21 @@ class AuthService:
             if role_id in await self._store.get_user_role_ids(user.id):
                 await self._store.revoke_user_sessions(user.id)
 
-    async def admin_reset_password(self, user_id: str, *, actor: str) -> str:
+    async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
         through the active policy, set it with ``must_change_password`` (forces a change on first
         login), and revoke the user's sessions. Returns the one-time credential **once** so the caller
         can convey it out-of-band — the administrator never sets a lasting password the user keeps. The
         affected user is also notified out-of-band by email. Raises :class:`ValueError` for an unknown
-        user or a non-local (AD) account; the API maps these to 4xx."""
+        user or a non-local (AD) account; the API maps these to 4xx.
+
+        BACKLOG #1141 (ASVS 6.4.5) is why this returns an :class:`IssuedCredential` rather than the
+        bare password: the renewal instruction for an expiring mechanism has to travel WITH the
+        mechanism, and this return value is the only thing that reaches the issuing administrator.
+        ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
+        stamped — the same source :meth:`_ensure_bootstrap_admin` uses — rather than from a fresh
+        clock, so the surfaced instant is the one the login gate will actually refuse on.
+        """
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
@@ -4077,7 +4256,13 @@ class AuthService:
             detail=_json({"user_id": user_id, "username": user.username}),
         )
         await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
-        return temp
+        stamped = await self._store.get_user(user_id)
+        return IssuedCredential(
+            password=temp,
+            expires_at=self.initial_credential_deadline(
+                None if stamped is None else stamped.password_changed_at
+            ),
+        )
 
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str

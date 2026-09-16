@@ -23,7 +23,7 @@ from messagefoundry.auth.notifications import (
     ROLES_CHANGED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, IssuedCredential
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
@@ -198,7 +198,7 @@ async def test_admin_reset_does_not_re_arm_retirement_of_a_claimed_bootstrap() -
         assert (await service.login("admin", claimed)).ok
         admin = await store.get_user_by_username("admin")
         assert admin is not None
-        temp = await service.admin_reset_password(admin.id, actor="alice")
+        temp = (await service.admin_reset_password(admin.id, actor="alice")).password
         # The reset re-raises must_change_password — that write is correct and must stay; what must
         # not follow from it is a retirement.
         after_reset = await store.get_user_by_username("admin")
@@ -253,7 +253,7 @@ async def test_claimed_bootstrap_survives_restart_after_an_admin_reset() -> None
             "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
         )
         await store._db.commit()
-        temp = await service.admin_reset_password(admin.id, actor="admin")
+        temp = (await service.admin_reset_password(admin.id, actor="admin")).password
         restarted = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
         assert await restarted.initialize() is None  # non-empty store: no re-bootstrap
         still = await store.get_user_by_username("admin")
@@ -279,7 +279,7 @@ async def test_claimed_bootstrap_survives_user_creation_after_an_admin_reset() -
             "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
         )
         await store._db.commit()
-        temp = await service.admin_reset_password(admin.id, actor="admin")
+        temp = (await service.admin_reset_password(admin.id, actor="admin")).password
         await service.create_local_user(
             username="bob",
             password="a-third-long-enough-passphrase",
@@ -480,7 +480,7 @@ async def test_unclaimed_bootstrap_is_still_retired_after_an_admin_reset() -> No
         assert boot is not None
         admin = await store.get_user_by_username("admin")
         assert admin is not None
-        temp = await service.admin_reset_password(admin.id, actor="admin")
+        temp = (await service.admin_reset_password(admin.id, actor="admin")).password
         await service.create_local_user(
             username="alice",
             password="another-long-passphrase",
@@ -679,8 +679,12 @@ async def test_bootstrap_expiry_warning_silent_after_the_deadline() -> None:
 # --- ASVS 6.4.1: an admin-issued initial/reset credential expires when unclaimed -----------------
 
 
-async def _make_reset_temp(store, service, *, username: str = "alice") -> str:
-    """Create a local user, then admin-reset it → a must_change temp with password_changed_at=now."""
+async def _make_reset_temp(store, service, *, username: str = "alice") -> IssuedCredential:
+    """Create a local user, then admin-reset it → a must_change temp with password_changed_at=now.
+
+    Returns the whole :class:`IssuedCredential` (BACKLOG #1141), not just the password, so a caller
+    can assert what the ISSUING SURFACE said as well as what the gate does.
+    """
     await store.upsert_role(role_id="viewer", display_name="Viewer")
     await service.create_local_user(
         username=username,
@@ -693,6 +697,19 @@ async def _make_reset_temp(store, service, *, username: str = "alice") -> str:
     user = await store.get_user_by_username(username)
     assert user is not None
     return await service.admin_reset_password(user.id, actor="admin")
+
+
+async def _shift_deadline_to(store, user_id: str, deadline: float, *, hours: int) -> None:
+    """Move ``password_changed_at`` so the 6.4.1 deadline lands exactly on ``deadline``.
+
+    The gate reads the wall clock, so the only way to drive it to a chosen boundary is to move the
+    stamp it measures from. Writing the stamp (rather than patching ``time.time``) keeps the test on
+    the same real arithmetic the engine runs.
+    """
+    await store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?", (deadline - hours * 3600, user_id)
+    )
+    await store._db.commit()
 
 
 @pytest.mark.parametrize(
@@ -770,7 +787,7 @@ async def test_a_reset_temp_on_a_CLAIMED_bootstrap_still_expires() -> None:
 
         admin = await store.get_user_by_username("admin")
         assert admin is not None and admin.password_claimed_at is not None  # genuinely claimed
-        temp = await service.admin_reset_password(admin.id, actor="admin")
+        temp = (await service.admin_reset_password(admin.id, actor="admin")).password
 
         # POSITIVE CONTROL: inside the window the temp WORKS. Without this, the refusal below is
         # equally consistent with the reset having produced an unusable credential.
@@ -845,7 +862,7 @@ async def test_reset_temp_password_expires_when_unclaimed() -> None:
     try:
         service = AuthService(store, AuthSettings(initial_password_expiry_hours=72))
         await service.initialize()
-        temp = await _make_reset_temp(store, service)
+        temp = (await _make_reset_temp(store, service)).password
         assert (await service.login("alice", temp)).ok  # within the window: usable
         # age the temp past its expiry window (password_changed_at, not created_at)
         alice = await store.get_user_by_username("alice")
@@ -893,7 +910,7 @@ async def test_initial_password_expiry_zero_disables_the_gate() -> None:
     try:
         service = AuthService(store, AuthSettings(initial_password_expiry_hours=0))
         await service.initialize()
-        temp = await _make_reset_temp(store, service)
+        temp = (await _make_reset_temp(store, service)).password
         alice = await store.get_user_by_username("alice")
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
@@ -1462,7 +1479,7 @@ async def test_admin_reset_password_issues_one_time_must_change_credential() -> 
         await _local_user(store)  # bob / u1 / GOOD_PASSWORD / bob@example.org
         assert (await service.login("bob", GOOD_PASSWORD)).ok
 
-        temp = await service.admin_reset_password("u1", actor="admin")
+        temp = (await service.admin_reset_password("u1", actor="admin")).password
         assert temp and temp != GOOD_PASSWORD  # a fresh, non-empty one-time credential
 
         user = await store.get_user("u1")
@@ -1726,5 +1743,91 @@ async def test_the_directory_repoint_reaches_the_users_own_pull_feed() -> None:
 
         feed = await service.security_events_for("jdoe")
         assert [e for e in feed if e["action"] == "auth.ad_profile_email_changed"]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1141 (ASVS 6.4.5): the issued credential CARRIES its deadline -----------------------
+#
+# The requirement wants the renewal instruction SENT in time to act on. Asserting that the reset
+# response merely HAS an expires_at field would be an absence check wearing a positive shape: a
+# plausible-looking instant computed from a fresh clock, or from the wrong setting, would satisfy it
+# and tell the holder a date the gate does not honour. So each test below pins the surfaced instant
+# AGAINST THE GATE — the credential works up to it and is refused after it.
+
+
+async def test_the_issued_reset_deadline_is_the_instant_the_login_gate_refuses_at() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=72))
+        await service.initialize()
+        issued = await _make_reset_temp(store, service)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None and alice.password_changed_at is not None
+
+        # The surfaced instant is derived from the STORED stamp the gate reads, not a fresh clock.
+        assert issued.expires_at == alice.password_changed_at + 72 * 3600
+
+        # POSITIVE CONTROL: one second BEFORE the surfaced instant the credential still works.
+        # Without it, the refusal below is equally consistent with a reset that produced garbage.
+        await _shift_deadline_to(store, alice.id, time.time() + 1, hours=72)
+        assert (await service.login("alice", issued.password)).ok
+
+        # One second AFTER it, the gate refuses — so the response named the real boundary.
+        await _shift_deadline_to(store, alice.id, time.time() - 1, hours=72)
+        out = await service.login("alice", issued.password)
+        assert not out.ok and out.error == "invalid credentials"
+    finally:
+        await store.close()
+
+
+async def test_no_deadline_is_surfaced_when_the_expiry_setting_is_off() -> None:
+    # `initial_password_expiry_hours = 0` is a documented, supported value that removes the deadline
+    # outright. The honest surface then states NOTHING, and it must agree with the gate: the two come
+    # apart exactly when one of them is a second computation, which is what this pins shut.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=0))
+        await service.initialize()
+        issued = await _make_reset_temp(store, service)
+        assert issued.expires_at is None
+
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 9999 * 3600, alice.id),
+        )
+        await store._db.commit()
+        assert (
+            await service.login("alice", issued.password)
+        ).ok  # no deadline stated, none enforced
+    finally:
+        await store.close()
+
+
+async def test_initial_credential_deadline_is_the_single_source_every_surface_reads() -> None:
+    # The four surfaces that state or enforce this deadline used to open-code the same arithmetic,
+    # which is how BACKLOG #1245 reached the warn path unnoticed. Pin them to one function.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72, bootstrap_expiry_hours=0)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+
+        expected = service.initial_credential_deadline(admin.password_changed_at)
+        assert expected is not None
+        assert boot.expires_at == expected  # bootstrap-admin.txt states it
+        warning = await service.bootstrap_expiry_warning(now=expected - 3600)
+        assert warning is not None and warning[0] == expected  # the reminder warns ahead of it
+
+        # And the off case returns None rather than a bogus instant, on both inputs that can cause it.
+        assert service.initial_credential_deadline(None) is None
+        off = AuthService(store, AuthSettings(initial_password_expiry_hours=0))
+        assert off.initial_credential_deadline(admin.password_changed_at) is None
     finally:
         await store.close()

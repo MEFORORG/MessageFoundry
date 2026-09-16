@@ -1101,9 +1101,11 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
 # Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
 # declare its expected dry-run disposition in a sibling ``<fixture>.expect`` file. ``dry_run`` reports
 # ``RECEIVED`` (would route + deliver), ``UNROUTED`` (no handler matched), ``FILTERED`` (a handler ran
-# but delivered nothing), or ``ERROR`` (parse/validate/router-handler failure). ``PROCESSED``/``ROUTED``
-# are live-only post-delivery states, so they alias to ``RECEIVED`` for authoring ergonomics.
-_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "ERROR"})
+# but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
+# present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
+# router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
+# to ``RECEIVED`` for authoring ergonomics.
+_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
     "ROUTED": "RECEIVED",
@@ -1115,7 +1117,7 @@ _DISPOSITION_ALIASES = {
 def _expected_disposition(fixture_path: str | Path) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
-    Returns the normalized disposition name (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``), or
+    Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
     Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
     """
@@ -1216,11 +1218,24 @@ def _check_dryrun(
     # not-deployed feed must still resolve to that feed, or it would silently become "unmapped" and be
     # cross-producted against every OTHER feed — worse than the problem. It is the cross-product target
     # list that drops the not-deployed feeds: an unmapped fixture must not be run against a feed nobody
-    # deployed (its Sends are declined, so it would report FILTERED and fail a .expect). An explicitly
+    # deployed (its Sends are declined, so it would report NOT_DEPLOYED — truthfully since BACKLOG
+    # #1690, and still not what a fixture written for the OTHER feeds declared). An explicitly
     # PINNED fixture still runs against its not-deployed feed — carrying the record is the point of the
     # state, and dry-run resolves no env(), so previewing its router/handler logic stays free.
+    #
+    # A **binary** feed (BINARY, DICOM) leaves the cross-product for the same reason and on the same
+    # terms (BACKLOG #1689). `read_message_sets` reads `*.hl7` files, and a binary inbound base64-
+    # carries its bytes rather than decoding them (ADR 0028), so running an unmapped HL7 fixture
+    # against one asks "would this HL7 file route as a DICOM object" — a question whose answer is
+    # always no and which tells an author nothing about either feed. It became visible only when the
+    # preview started carrying bytes the way the listener does: the text-decoded body used to miss the
+    # feed's own `is_binary` guard and report a placid UNROUTED, where the engine would have carried
+    # it, failed the codec, and dead-lettered it. A PINNED fixture still runs against its binary feed,
+    # exactly as one pinned to a not-deployed feed does.
     inbound_names = list(reg.inbound)
-    deployed_inbounds = [n for n, ic in reg.inbound.items() if ic.deployed]
+    crossproduct_inbounds = [
+        n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
+    ]
     message_sets = read_message_sets(mpath, inbound_names)
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
@@ -1239,7 +1254,7 @@ def _check_dryrun(
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
-        targets = [target] if target is not None else deployed_inbounds
+        targets = [target] if target is not None else crossproduct_inbounds
         if target is not None:
             pinned += 1
         for ic_name in targets:
@@ -1263,16 +1278,17 @@ def _check_dryrun(
         # check claiming a pass over a verification it never performed. Every sibling marks "I
         # established nothing" with `skipped=True`, which `CheckResult.blocking` excludes; this was
         # the one path reaching a non-skipped success on zero work. Keep it a postcondition on
-        # `total`: an equivalent precondition on `deployed_inbounds` would have to be kept in
+        # `total`: an equivalent precondition on `crossproduct_inbounds` would have to be kept in
         # lockstep with the loop's branching, and it would miss any other path to zero.
         #
         # `read_message_sets` only ever pins a fixture to a name drawn from `reg.inbound`, so a
         # pinned fixture always contributes a run — reaching here means every fixture is unmapped
-        # AND nothing is deployed. The counts below are read, not inferred, so the detail stays
-        # true even if some later path arrives here for a different reason.
+        # AND no inbound is eligible for the cross-product. The counts below are read, not inferred,
+        # so the detail stays true even if some later path arrives here for a different reason.
         detail = (
             f"{len(message_sets)} fixture(s) read but 0 dry-run(s) executed — only "
-            f"{len(deployed_inbounds)} of {len(inbound_names)} inbound(s) are deployed and no "
+            f"{len(crossproduct_inbounds)} of {len(inbound_names)} inbound(s) take an unmapped "
+            f"fixture (the rest are not deployed, or carry a binary content type) and no "
             f"fixture is feed-pinned, so every target list was empty"
         )
         return CheckResult("dryrun", ok=False, required=True, detail=detail)

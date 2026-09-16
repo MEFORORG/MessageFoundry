@@ -1152,6 +1152,11 @@ class _ClaimHolder:
 # guards below are check-then-create and do NOT serialize concurrent creators on a virgin DB — see
 # _ensure_schema.
 _SCHEMA_LOCK = "mefor:schema_init"
+# Audit-chain append lock (BACKLOG #1605) — the T-SQL analog of the Postgres store's
+# ``pg_advisory_xact_lock`` on the audit chain. One fixed resource for the whole chain: the
+# read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
+# process, queues on the same name.
+_AUDIT_APPEND_LOCK = "mefor:audit_append"
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -1409,11 +1414,21 @@ _SCHEMA: list[str] = [
         uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
         since FLOAT NOT NULL)""",
+    # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
+    # self-approval refusal compares (the Store protocol's create_pending_approval says why).
+    # NVARCHAR(64) matches users.id and this table's own id column.
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
+        requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
+    # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
+    # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
+    # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
+    # matches and the column never appears, with no error.
+    """IF COL_LENGTH('pending_approvals','requester_user_id') IS NULL
+        ALTER TABLE pending_approvals ADD requester_user_id NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -3188,9 +3203,14 @@ class SqlServerStore:
                 # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
                 # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
                 # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
-                # named ...". The applock is transaction-scoped (the autocommit=False pool means this
-                # first statement opens the txn), so it auto-releases on the commit/rollback below; the
-                # second node then runs the now-no-op guarded CREATEs cleanly.
+                # named ...". The applock is transaction-scoped, so it auto-releases on the commit/
+                # rollback below; the second node then runs the now-no-op guarded CREATEs cleanly. It
+                # is NOT this transaction's first statement and must not become one: the ADR 0064 fast-
+                # path probe above already ran one or two table-reading SELECTs on this connection with
+                # no commit between, so the autocommit=False pool has an open transaction for
+                # `@LockOwner='Transaction'` to attach to. (An earlier comment here read "this first
+                # statement opens the txn" — it predated the probe and was stale, not a contradiction
+                # of the applock rule record_audit now follows.)
                 await self._applock(cur, _SCHEMA_LOCK)
                 # Double-check under the lock: the peer we queued behind may have just applied this
                 # exact batch and committed its marker — then this open has nothing to do.
@@ -9200,17 +9220,38 @@ class SqlServerStore:
         client: str | None = None,
         now: float | None = None,
     ) -> None:
-        """``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
+        """Append a row to the audit hash chain. Takes the audit-append applock first, so concurrent
+        writers — including writers in OTHER engine-shard processes — serialize on the read-tail +
+        insert and cannot fork the chain (H-7, BACKLOG #1605).
+
+        ``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
         :meth:`~messagefoundry.store.base.AuditStore.record_audit`."""
         now = time.time() if now is None else now
-        # Serialize the read-prev-then-insert append in-process so two concurrent audited actions can't
-        # read the same prev hash and FORK the hash chain (H-7). The store is the single audit writer
-        # per engine process (active-passive = one active node), so an in-process lock is sufficient and
-        # reliable — unlike a txn-scoped sp_getapplock taken as the connection's first statement, which
-        # does not release on commit and strands under concurrent contention.
+        # Serialize the read-prev-then-insert append so two concurrent audited actions can't read the
+        # same prev hash and FORK the hash chain (H-7). TWO locks, and only the second one is
+        # sufficient: `_audit_lock` is an asyncio.Lock, so it holds within ONE process, and engine
+        # sharding (`serve --shard`, ADR 0037 + ADR 0063 — the built default scaling axis) runs one
+        # process per shard over ONE unified store. N shards are N independent asyncio.Locks over one
+        # chain, so the appends have to queue at the DATABASE (BACKLOG #1605). The in-process lock is
+        # kept as the cheap near gate that keeps this process's own concurrent audits off the
+        # server-side lock queue; `_AUDIT_APPEND_LOCK` is what actually holds across shards, exactly as
+        # the Postgres twin's `pg_advisory_xact_lock` already does.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
+                    # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
+                    # `@LockOwner='Transaction'`, which requires one already open. The autocommit=False
+                    # pool begins a transaction on the first statement that touches a table, so this is
+                    # a real one-row read of audit_log's PK index rather than a bare `SELECT 1`: under
+                    # the driver's implicit-transactions mode a SELECT with no FROM begins nothing, and
+                    # the applock would then be scoped to a transaction that does not exist. Nor
+                    # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
+                    # below decrements it once, leaving the lock held on a pooled connection. The value
+                    # read here is deliberately discarded — it is read OUTSIDE the lock and only the
+                    # re-read below is authoritative.
+                    await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                    await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                    await self._applock(cur, _AUDIT_APPEND_LOCK)
                     await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
                     last = await cur.fetchone()
                     prev = last[0] if last and last[0] else ""
@@ -9583,27 +9624,37 @@ class SqlServerStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES (?,?,?,?,?,'pending',?)",
-            (approval_id, operation, params, requester, requested_at, expires_at),
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES (?,?,?,?,?,?,'pending',?)",
+            (
+                approval_id,
+                operation,
+                params,
+                requester,
+                requester_user_id,
+                requested_at,
+                expires_at,
+            ),
         )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
             " decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"

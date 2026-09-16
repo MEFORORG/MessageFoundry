@@ -222,10 +222,11 @@ def test_split_messages_separator_agnostic() -> None:
         b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
         b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
     )
+    # Bytes in, bytes out since BACKLOG #1689 — the decode belongs to the inbound, in `dry_run`.
     msgs = split_messages(batch)
     assert len(msgs) == 2
-    assert msgs[0].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")
-    assert msgs[1].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A02")
+    assert msgs[0].startswith(b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")
+    assert msgs[1].startswith(b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02")
 
 
 def test_split_messages_pipe_batch_and_single() -> None:
