@@ -3567,6 +3567,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args)
     if isinstance(resolved, int):
@@ -3628,8 +3629,6 @@ def _dryrun(args: argparse.Namespace) -> int:
                     "control_id": result.control_id,
                     # The summary is PHI (MRN + patient name from PID-3/5), so gate it like raw/
                     # payloads — dryrun stdout is routinely piped to files/CI logs (review H-12).
-                    # (The `error` text can also quote field values; that's tracked separately as
-                    # low-8, gated holistically with the API's error exposure.)
                     "summary": result.summary if show_phi else None,
                     "handlers": result.handlers,
                     "deliveries": [
@@ -3651,7 +3650,10 @@ def _dryrun(args: argparse.Namespace) -> int:
                         }
                         for s in result.state_ops
                     ],
-                    "error": result.error,
+                    # The error carries the Router/Handler's own `raise`, which can quote field
+                    # values, so it takes the same --show-phi gate as `summary` (BACKLOG #1668).
+                    # `safe_error`, not `_redact_body`: see its docstring for why the prose survives.
+                    "error": safe_error(result.error, show_phi=show_phi),
                     "raw": result.raw if show_phi else _redact_body(result.raw),
                 }
             )
