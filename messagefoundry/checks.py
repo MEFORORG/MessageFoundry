@@ -90,6 +90,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -712,22 +713,121 @@ def _folds_to_constant(node: ast.expr) -> bool:
     return False
 
 
-def _is_dynamic_string(node: ast.expr) -> bool:
-    """True when ``node`` is a string built by interpolating a *non-constant* value (f-string with a
-    ``{expr}`` / ``+`` or ``%`` with a variable operand / ``.format(...)`` with args) — the injection
+# Scopes whose body is NOT part of the enclosing scope — each is walked on its own iteration.
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scope_nodes(body: Sequence[ast.stmt]) -> list[ast.AST]:
+    """Every node in a scope's own executable body, not descending into a nested def/class body (each
+    of those is its own scope) and not into a nested signature (decorators, defaults, annotations)."""
+    nodes: list[ast.AST] = []
+    stack: list[ast.AST] = [stmt for stmt in body if not isinstance(stmt, _NESTED_SCOPES)]
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _NESTED_SCOPES):
+                continue
+            stack.append(child)
+    return nodes
+
+
+def _assigned_names(target: ast.expr) -> list[str]:
+    """The plain names a single assignment target binds (a tuple/list unpack yields each element)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for elt in target.elts for name in _assigned_names(elt)]
+    if isinstance(target, ast.Starred):
+        return _assigned_names(target.value)
+    return []  # an attribute/subscript target is not a local name this lint can resolve
+
+
+def _scope_assignments(body: Sequence[ast.stmt]) -> dict[str, list[tuple[ast.expr, bool]]]:
+    """Map each name this scope assigns to ``(value, augmented)`` pairs — every binding it takes, not
+    only the last one.
+
+    Reading *every* binding rather than the last is deliberate. A statement composed in one branch of
+    an ``if`` and a literal in the other has no "last assignment" in source order that means anything,
+    and this lint is a filter, not a boundary (ADR 0144) — so it over-reports rather than let the
+    branch that interpolates go unseen. ``augmented`` marks an ``x += ...`` binding, whose right side
+    is judged by the stricter rule in :func:`_is_dynamic_string`."""
+    env: dict[str, list[tuple[ast.expr, bool]]] = {}
+    for node in _scope_nodes(body):
+        targets: list[ast.expr]
+        if isinstance(node, ast.Assign):
+            targets, value, augmented = list(node.targets), node.value, False
+        elif isinstance(node, ast.AugAssign):
+            targets, value, augmented = [node.target], node.value, True
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value, augmented = [node.target], node.value, False
+        else:
+            continue
+        for target in targets:
+            for name in _assigned_names(target):
+                env.setdefault(name, []).append((value, augmented))
+    return env
+
+
+def _is_dynamic_string(
+    node: ast.expr,
+    env: Mapping[str, list[tuple[ast.expr, bool]]] | None = None,
+    _resolving: frozenset[str] = frozenset(),
+) -> bool:
+    """True when ``node`` is a string built by interpolating a *non-constant* value — the injection
     shape for a ``db_lookup``/``fhir_lookup`` query. A pure-literal concat folds to a constant and is
     not flagged. (A trusted-identifier concat like ``"select from " + TABLE`` still flags — SQL cannot
-    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)"""
+    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)
+
+    Reading the call site's own expression is not enough, because the ordinary way to write a longer
+    statement is to build it first and pass the variable (BACKLOG #1658). So with an ``env`` of the
+    enclosing scope's assignments this also follows:
+
+    * a ``Name``, through every value bound to it in ``env`` (cycles cut by ``_resolving``);
+    * an ``x += ...`` binding, dynamic on any right side that is not a pure literal — that is the
+      shape of a statement assembled in pieces;
+    * a wrapping call's arguments and, for a method call, its receiver — so ``dedent(stmt)``,
+      ``stmt.strip()`` and ``" ".join(parts)`` are read through rather than treated as opaque;
+    * both branches of a conditional expression, and the elements of a list/tuple/set or a
+      comprehension (what a ``.join`` is usually handed).
+
+    Following a wrapper by its arguments rather than by name keeps the rule from depending on a list
+    of blessed wrapper names, which would always be missing one."""
     if isinstance(node, ast.JoinedStr):
         return any(isinstance(part, ast.FormattedValue) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
         return not _folds_to_constant(node)
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "format"
-        and bool(node.args or node.keywords)
-    )
+    if isinstance(node, ast.IfExp):
+        return _is_dynamic_string(node.body, env, _resolving) or _is_dynamic_string(
+            node.orelse, env, _resolving
+        )
+    if isinstance(node, ast.Starred):
+        return _is_dynamic_string(node.value, env, _resolving)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_is_dynamic_string(elt, env, _resolving) for elt in node.elts)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return _is_dynamic_string(node.elt, env, _resolving)
+    if isinstance(node, ast.Name):
+        if env is None or node.id in _resolving:
+            return False
+        deeper = _resolving | {node.id}
+        return any(
+            (augmented and not _folds_to_constant(value)) or _is_dynamic_string(value, env, deeper)
+            for value, augmented in env.get(node.id, ())
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "format"
+            and (node.args or node.keywords)
+        ):
+            return True
+        parts: list[ast.expr] = list(node.args) + [kw.value for kw in node.keywords]
+        if isinstance(func, ast.Attribute):
+            parts.append(func.value)  # the receiver, e.g. the string `stmt` in `stmt.strip()`
+        return any(_is_dynamic_string(part, env, _resolving) for part in parts)
+    return False
 
 
 def _is_logger_receiver(recv: ast.expr) -> bool:
@@ -763,8 +863,37 @@ def _phi_to_log_hit(call: ast.Call, msg_sym: str) -> bool:
     return any(_references_phi(arg, msg_sym) for arg in checked)
 
 
-def _unsafe_lookup_hit(call: ast.Call) -> bool:
-    """A ``db_lookup``/``fhir_lookup`` whose statement/query argument is interpolated, not a literal."""
+def _lookup_scope_envs(tree: ast.Module) -> dict[int, dict[str, list[tuple[ast.expr, bool]]]]:
+    """``id(Call)`` to the assignment env that call should be read against: the assignments of the
+    scope holding it, over the module's own (so a module-level statement constant is visible inside a
+    function, and a same-named local shadows it).
+
+    Only calls in a scope's executable body get an entry. A call in a signature — a decorator or a
+    default argument — has no scope of its own here and is read as it always was, from its own
+    expression alone."""
+    envs: dict[int, dict[str, list[tuple[ast.expr, bool]]]] = {}
+    module_env = _scope_assignments(tree.body)
+    bodies: list[Sequence[ast.stmt]] = [tree.body]
+    bodies += [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for body in bodies:
+        env = {**module_env, **_scope_assignments(body)}
+        for node in _scope_nodes(body):
+            if isinstance(node, ast.Call):
+                envs[id(node)] = env
+    return envs
+
+
+def _unsafe_lookup_hit(
+    call: ast.Call, env: Mapping[str, list[tuple[ast.expr, bool]]] | None = None
+) -> bool:
+    """A ``db_lookup``/``fhir_lookup`` whose statement/query argument is interpolated, not a literal.
+
+    ``env`` is the enclosing scope's assignments (:func:`_lookup_scope_envs`); with it the rule also
+    sees a statement composed *before* the call, which is the ordinary way to write a long one."""
     func = call.func
     is_lookup = (isinstance(func, ast.Name) and func.id in _LOOKUP_NAMES) or (
         isinstance(func, ast.Attribute) and func.attr in _LOOKUP_NAMES
@@ -779,7 +908,7 @@ def _unsafe_lookup_hit(call: ast.Call) -> bool:
     for kw in call.keywords:
         if kw.arg in _LOOKUP_QUERY_KW:
             query = kw.value
-    return query is not None and _is_dynamic_string(query)
+    return query is not None and _is_dynamic_string(query, env)
 
 
 def _open_mode(call: ast.Call, index: int = 1) -> str | None:
@@ -1030,10 +1159,13 @@ def _check_handler_security(
             else []
         )
         # Whole-file rules — unsafe-db-lookup + ambient-authority (helpers + module level included).
+        # unsafe-db-lookup reads each call against its own scope's assignments, so a statement
+        # composed a line earlier and passed by name is seen (BACKLOG #1658).
+        lookup_envs = _lookup_scope_envs(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if _unsafe_lookup_hit(node):
+            if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
