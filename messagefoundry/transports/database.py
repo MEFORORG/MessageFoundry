@@ -49,7 +49,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -1047,6 +1047,34 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
+#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
+#: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
+#: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
+#: could log for one misconfigured column.
+#:
+#: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
+#: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
+#: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
+#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
+#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
+_MAX_SKIPPED_ROWS_PER_POLL = 64
+
+
+class _PolledBatch(NamedTuple):
+    """What one poll took from ``poll_statement``.
+
+    ``rows`` are ``(record, body)`` pairs that decoded; ``skipped`` carries one PHI-free reason per
+    row that could not become a body; ``skip_budget_spent`` says this poll stopped fetching early
+    because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than reported
+    in place so the pool connection is released before anything is logged or emitted."""
+
+    rows: list[tuple[dict[str, Any], str]]
+    skipped: list[str]
+    skip_budget_spent: bool
+
+
 class DatabaseSource(SourceConnector):
     """Poll a SQL table on an interval, hand each row to the pipeline handler, then mark it processed.
 
@@ -1196,23 +1224,45 @@ class DatabaseSource(SourceConnector):
             logger.debug("DATABASE source skipping polling (not leader; another node ingests it)")
         return False
 
+    async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
+        """Fire one connection event (ADR 0021) to the runner-injected sink, **fail-soft**: an event
+        problem must never wedge the poll loop (pure observer). No-op when the sink is unset — capture
+        off, or a direct caller / test — so that path stays byte-identical.
+
+        No ``peer_host``: a poll source dials OUT to an operator-configured server, so there is no
+        peer address to report and the column stays ``NULL``, unlike the listen sources."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, None, reason)
+        except Exception as exc:  # noqa: BLE001 - observer only; a capture bug can't stop ingest
+            logger.warning("DATABASE connection-event emit failed: %s", safe_exc(exc))
+
     async def _poll_once(self) -> None:
         assert self._handler is not None
-        columns, rows = await self._select()
-        for row in rows:
+        batch = await self._select()
+        for reason in batch.skipped:
+            # A row that cannot become a body is skipped, and the shipped code said so ONLY to the
+            # logger — no handler call, no mark, no store row, no event — so an operator watching the
+            # console saw a silent connection (BACKLOG #1662). The event is the visibility half.
+            #
+            # It is still NOT marked, and that stays deliberate: mark_statement is an operator-authored
+            # UPDATE, so marking a row that never became a message would record data DONE that was
+            # never ingested. There is no store disposition to record either — a row the source could
+            # not read was never a received message, the same reading the file sources apply to an
+            # oversize or unscannable drop.
+            logger.error("DATABASE source: %s; skipping row", reason)
+            await self._emit_event("row_undecodable", reason=reason)
+        if batch.skip_budget_spent:
+            logger.error(
+                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
+                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                len(batch.skipped),
+            )
+        for record, body in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
-            record = dict(zip(columns, row))  # noqa: B905
-            try:
-                body = self._body(record)
-            except (ValueError, TypeError) as exc:
-                # A row we can't turn into a body (missing body_column, unserializable value) is a
-                # config/data error for that row — log and skip it rather than wedging the batch.
-                # safe_exc, not exc: _body raises with the offending COLUMN VALUE in the message on
-                # the decode arms, and the handler-level RedactionFilter is measured blind to a value
-                # that is not HL7-delimited and not name-shaped (BACKLOG #1661).
-                logger.error("DATABASE source: %s; skipping row", safe_exc(exc))
-                continue
             try:
                 await self._handler(body.encode(self._encoding))
             except Exception as exc:
@@ -1238,50 +1288,107 @@ class DatabaseSource(SourceConnector):
                     _safe_db_error(exc),
                 )
 
-    async def _select(self) -> tuple[list[str], list[Any]]:
-        """Run ``poll_statement`` and return ``(column_names, rows)``, at most ``poll_max_rows`` of them.
-        The connection is released before the rows are handed to the (possibly slow) handler, so a batch
-        never holds a pool connection hostage to downstream store I/O.
+    async def _select(self) -> _PolledBatch:
+        """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most
+        ``poll_max_rows``) plus a PHI-free reason per row that could not be decoded. The connection is
+        released before the rows are handed to the (possibly slow) handler, so a batch never holds a
+        pool connection hostage to downstream store I/O.
 
-        **The ceiling is charged at the FETCH, not after it.** ``fetchmany`` leaves the rest of the
-        result set in the driver and the cursor is closed on the way out, so a poll of a table holding a
-        million rows pulls exactly the ceiling into memory rather than all of them — the ``fetchall``
-        this replaced materialised the whole set before anything could bound it.
-        The rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and
-        takes the next batch; nothing is dropped, errored or marked. Progress depends on the
-        ``mark_statement`` removing a handled row from ``poll_statement``'s own predicate, which is the
-        shape this connector already documents and requires — without a mark the same rows re-emit every
-        poll, ceiling or no ceiling.
+        **Decoding happens HERE, under the open cursor, and that is what lets the ceiling count rows
+        that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and cheap — a dict
+        lookup or a ``json.dumps`` — so running it at the fetch costs nothing extra and means a row the
+        source cannot read is replaced rather than spending a ceiling slot on nothing. The shipped code
+        charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
+        first starved a ``poll_max_rows=1`` feed forever: three polls handled nothing and the good row
+        behind it was never reached.
 
-        A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``."""
+        **The ceiling is still charged at the FETCH, not after it**, and the memory contract it exists
+        for is intact: each fetch asks only for what is still missing, so one poll pulls at most
+        ``poll_max_rows`` plus :data:`_MAX_SKIPPED_ROWS_PER_POLL` rows out of the driver, never the
+        whole result set. This is **not** the file sources' rule and must not be described as parity
+        with them: they charge on COMPLETION and can afford to, because a directory listing is already
+        in hand, while here the point of the ceiling is that the rest of the result set never leaves
+        the driver. What is shared is the reason behind it, which the file source states as *a budget
+        can only be charged by something that makes progress*.
+
+        **Undecodable rows are bounded two ways, and the bound is why this is not a log flood.** The
+        dominant ``_body`` failure is static — ``body_column`` naming a column ``poll_statement`` does
+        not select fails EVERY row — so that one is checked ONCE per poll against the cursor's own
+        description and returns immediately with a single reason, where the shipped code logged once
+        per row up to the ceiling. Everything else (an undecodable BLOB, an unserializable column type)
+        is per-row: it is skipped and replaced, up to :data:`_MAX_SKIPPED_ROWS_PER_POLL`, after which
+        this poll stops fetching and leaves the rest for the next one.
+
+        Rows not taken are untouched in the table, so the next poll re-runs ``poll_statement`` and takes
+        the next batch; nothing is dropped, errored or marked. Progress depends on the ``mark_statement``
+        removing a handled row from ``poll_statement``'s own predicate, which is the shape this connector
+        already documents and requires — without a mark the same rows re-emit every poll, ceiling or no
+        ceiling.
+
+        A falsy ``poll_max_rows`` disables the ceiling and restores the unbounded ``fetchall``; the skip
+        budget still applies there, bounding this poll's log and event volume the same way."""
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        rows: list[tuple[dict[str, Any], str]] = []
+        skipped: list[str] = []
+        budget_spent = False
+        ceiling = self._poll_max_rows
         try:
             cur = await conn.cursor()
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
-            if self._poll_max_rows is None:
-                rows = list(await cur.fetchall())
-            else:
-                # Exactly the ceiling, NOT ceiling+1. The +1 probe is the usual idiom for "is there
-                # more?", and it is wrong here: this connector's rows can carry a message BODY
-                # (`body_column`), so the probe row would marshal a whole payload out of the driver
-                # and discard it on every poll — hundreds of KB every `poll_seconds` to decide one
-                # word in a log line. A full batch is the signal instead: it means the ceiling bound
-                # this poll, and cannot distinguish "exactly N remained" from "more remain", which is
-                # why the message says at least rather than naming a remainder.
-                rows = list(await cur.fetchmany(self._poll_max_rows))
-                if len(rows) == self._poll_max_rows:
-                    logger.info(
-                        "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
-                        "left for the next poll (deferred, not dropped)",
-                        self._poll_max_rows,
-                    )
+            if self._body_column is not None and self._body_column not in columns:
+                # Static: this fails every row in every poll, so say it once and fetch nothing. The
+                # reason names the operator's own configured column, never a row value.
+                return _PolledBatch(
+                    [],
+                    [
+                        f"body_column {self._body_column!r} is not in the poll_statement result "
+                        f"columns"
+                    ],
+                    False,
+                )
+            want = 0
+            while True:
+                if ceiling is None:
+                    batch = list(await cur.fetchall())
+                else:
+                    # Exactly what is still missing, NOT ceiling+1. The +1 probe is the usual idiom
+                    # for "is there more?", and it is wrong here: this connector's rows can carry a
+                    # message BODY (`body_column`), so the probe row would marshal a whole payload out
+                    # of the driver and discard it on every poll — hundreds of KB every `poll_seconds`
+                    # to decide one word in a log line. A full batch is the signal instead: it means
+                    # the ceiling bound this poll, and cannot distinguish "exactly N remained" from
+                    # "more remain", which is why the message says at least rather than naming a
+                    # remainder.
+                    want = ceiling - len(rows)
+                    batch = list(await cur.fetchmany(want))
+                for raw in batch:
+                    record = dict(zip(columns, raw))  # noqa: B905
+                    try:
+                        body = self._body(record)
+                    except (ValueError, TypeError) as exc:
+                        skipped.append(safe_exc(exc))
+                        if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
+                            budget_spent = True
+                            break
+                        continue
+                    rows.append((record, body))
+                if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
+                    # A short batch means the driver is out of rows, so there is nothing to top up
+                    # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
+                    break
+            if ceiling is not None and len(rows) == ceiling:
+                logger.info(
+                    "DATABASE source filled poll_max_rows (%s) this poll; any remaining rows are "
+                    "left for the next poll (deferred, not dropped)",
+                    ceiling,
+                )
         finally:
             await _close_cursor(cur)
             await pool.release(conn)
-        return columns, rows
+        return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> str:
         """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""

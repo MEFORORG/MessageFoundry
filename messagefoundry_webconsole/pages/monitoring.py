@@ -262,6 +262,9 @@ _EVENT_KINDS = (
     "frame_oversize",
     "peer_reset",
     "framing_error",
+    # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
+    # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
+    "row_undecodable",
     # ADR 0154 D6 — inbound HTTP intake-auth refusals. CI asserts this tuple equals the set the
     # engine actually emits, so these are not optional garnish: without them the vocabulary test
     # fails. Each also writes an audit_log row, which is the copy that survives diagnostics being off.
