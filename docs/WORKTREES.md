@@ -116,6 +116,15 @@ session the same call raises a dialog offering only **Deny** and **Allow once**:
 `classifierApprovable: false`, so no `permissions.allow` rule matches it and there is no "don't ask
 again" row to click.
 
+**The cost is MISATTRIBUTED, which is why this is a rule and not a note.** A worker that hits the
+refusal does not read it as a bad brief. It reads it as something it did wrong, and quietly routes
+around it. Reported 2026-09-16 by a manager whose builder addendum offered relocation as one of two
+options: two of its three builders spent a call discovering the refusal, and one wrote back "so I made
+every file change through Bash, as your addendum's second option". That is a worker working around
+what it believed was its own error. **A brief that cannot succeed produces a worker that doubts a
+correct brief** -- and the manager, reading the refusals as builder trouble, was slow to see the brief
+was at fault. Bounded at three builders only because the reports kept coming.
+
 **Do not engineer around the check.** Making an outside path *resolve* as managed -- a directory
 junction, say -- defeats a deliberate safety control instead of fixing anything.
 
