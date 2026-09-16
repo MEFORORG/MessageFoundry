@@ -21,8 +21,10 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from _ingress_pace_probe import install_ingress_pace_probe, stream_debt_seconds
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports import mllp
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_MESSAGES_PER_SECOND,
     MLLPSource,
@@ -94,6 +96,10 @@ def test_an_explicit_burst_is_honoured() -> None:
 
 # --- end to end, on a real socket ---------------------------------------------------------------
 
+#: The paced scenario, named once so the timing arms can derive their bounds from it instead of
+#: restating a number the bucket arithmetic already fixes.
+_RATE, _BURST, _MESSAGES = 20.0, 2.0, 12
+
 
 async def _run_against(src: MLLPSource, count: int) -> list[str]:
     """Send ``count`` framed messages down ONE connection and return what the handler received."""
@@ -141,19 +147,28 @@ async def test_pacing_off_delivers_everything_unchanged() -> None:
     assert len(seen) == 12
 
 
-async def test_pacing_actually_delays_the_reads() -> None:
-    """Watched fail: with the pacer removed this elapsed time collapses to near zero.
+async def test_pacing_actually_delays_the_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Watched fail: with the pre-read wait removed, both arms below go to zero.
 
-    Deliberately a LOWER bound only. Asserting an upper bound would pin scheduler timing and make
-    this the flaky test that gets deleted; the claim under test is that a wait occurs at all.
+    **Neither arm is a constant, and that is the fix for BACKLOG #1538.** This asserted
+    ``elapsed >= 0.3``, which is pacing plus the runner's own work with nothing to separate them --
+    a box slow enough to spend 0.3s framing twelve messages passed it with the pacer deleted.
+    Raising the number does not help: the pacer's debt SHRINKS as the runner slows, because the
+    bucket refills on the same wall clock the work is spent on. ``tests/_ingress_pace_probe.py``
+    puts the bucket on a clock this test owns, so the DECISION arm reads exact bucket arithmetic
+    that no runner can influence, and the WALL-CLOCK arm is bounded by what this run decided rather
+    than by a guess -- it is what still catches a pacer that decides a wait and never takes it.
     """
+    probe = install_ingress_pace_probe(monkeypatch, mllp)
     loop = asyncio.get_running_loop()
     start = loop.time()
-    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), 12)
+    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), _MESSAGES)
     elapsed = loop.time() - start
-    assert len(seen) == 12
-    # 12 messages, burst 2, 20/s -> at least (12-2)/20 = 0.5s of debt must be paid somewhere.
-    assert elapsed >= 0.3
+    assert len(seen) == _MESSAGES
+    assert probe.built == 1, "the probe never replaced the pacer this intake builds"
+    # 12 messages, burst 2, 20/s -> exactly (12-2)/20 = 0.5s of debt, paid before the next read.
+    assert sum(probe.decided) == pytest.approx(stream_debt_seconds(_MESSAGES, _BURST, _RATE))
+    assert elapsed >= sum(probe.taken)
 
 
 # --- REACHABILITY: the factory surface that could not populate the pacer (BACKLOG #1249) ----------
