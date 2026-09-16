@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
@@ -23,6 +23,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import get_auth
+from messagefoundry.api.validation import EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
@@ -67,6 +68,18 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: How many report bodies of one CSP violation BATCH the WARNING line summarises before it is
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
+
+#: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
+#: route declares for ``received_from``/``received_to`` — so an instant that route answers 422 for is
+#: refused here too instead of reaching the store query (BACKLOG #1744).
+_EPOCH_BOUND: TypeAdapter[float] = TypeAdapter(EpochSeconds)
+
+#: What the console says when a received-date bound is not a value the JSON route would accept. Fixed
+#: text: pydantic's own message quotes the offending input, and operator input is never reflected.
+_BAD_RECEIVED_BOUND = (
+    "the received-date bounds must be UTC datetime-local values between "
+    "1970-01-01T00:00 and 2100-01-01T00:00"
+)
 
 # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). The GET editor page is the step-up `unlock`
 # continuation (a GET form the re-auth flow can 303-GET-redirect back to); the body-carrying POST
@@ -434,12 +447,38 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             received_to = now.strftime("%Y-%m-%dT%H:%M")
 
         def _epoch(value: str | None) -> float | None:
+            """One ``datetime-local`` bound as the epoch seconds the JSON handler takes.
+
+            BACKLOG #1744: this used to DROP a malformed bound and search without it, so the operator
+            read a result set under a filter they had typed and the engine had not applied. It now
+            RAISES and the route refuses, which is what the JSON twin does (422). Three rejects, one
+            rule — accept only what that twin would accept: a value ``fromisoformat`` cannot read; an
+            instant outside the ``EpochSeconds`` window; and a value carrying its own UTC offset, which
+            the old ``replace(tzinfo=UTC)`` silently re-stamped as a DIFFERENT instant (a
+            ``datetime-local`` field never sends one, so only a hand-built URL gets here)."""
             if not value:
                 return None
-            try:
-                return datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp()
-            except ValueError:
-                return None  # a malformed datetime-local simply drops that bound
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is not None:
+                raise ValueError("a received-date bound carries its own offset")
+            return float(_EPOCH_BOUND.validate_python(parsed.replace(tzinfo=UTC).timestamp()))
+
+        try:
+            epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
+        except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
+            return HTMLResponse(
+                pages.messages(
+                    None,
+                    error=_BAD_RECEIVED_BOUND,
+                    channel_id=channel_id or "",
+                    status=status_filter or "",
+                    message_type=message_type or "",
+                    control_id=control_id or "",
+                    received_from=received_from or "",
+                    received_to=received_to or "",
+                ),
+                status_code=400,
+            )
 
         if defer:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
@@ -464,8 +503,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             status=status_filter,
             message_type=message_type,
             control_id=control_id,
-            received_from=_epoch(received_from),
-            received_to=_epoch(received_to),
+            received_from=epoch_from,
+            received_to=epoch_to,
             limit=limit,
             offset=offset,
         )

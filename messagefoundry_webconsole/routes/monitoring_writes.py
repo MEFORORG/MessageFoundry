@@ -58,6 +58,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         await core.resolve_alert(alert_id, request=request, engine=engine, identity=identity)
         return RedirectResponse("/ui/alerts", status_code=303)
 
+    async def _refuse_on_alerts_page(
+        request: Request, engine: Any, identity: Identity, message: str
+    ) -> HTMLResponse:
+        """Re-render the alerts page carrying ``message``, refused with 400 — the shape
+        ``routes/search.py`` uses for input the JSON handler would reject (BACKLOG #1744).
+
+        The rules half of that page is gated on ``monitoring:read`` by ``/ui/alerts`` while this route
+        holds ``monitoring:diagnose`` only, so the rules are fetched only for a caller that also holds
+        read. A refusal must not widen what an actor can see."""
+        instances = await core.list_active_alerts(engine=engine, identity=identity, limit=200)
+        config = (
+            await core.alerts_rules(request, _user=identity)
+            if identity.has(Permission.MONITORING_READ)
+            else None
+        )
+        return HTMLResponse(pages.alerts(instances, config, error=message), status_code=400)
+
     @app.post("/ui/alerts/{alert_id}/suspend")
     async def ui_suspend_alert(
         alert_id: int,
@@ -67,13 +84,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # #143 windowed suspend: the mute duration arrives as a `minutes` hidden/select form field; build
         # the typed request and reuse the single audited JSON handler (scope check + store + notifier cache
-        # + audit). An out-of-range/undecodable value falls back to 60 minutes; core 404s an unknown id.
+        # + audit). core 404s an unknown id.
         assert_same_origin(request)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         try:
+            # BACKLOG #1744: REFUSE what the JSON route refuses (it 422s the same value), rather than
+            # substituting 60 minutes. The substitute told the operator their suspend succeeded, muted a
+            # window they had not asked for, and wrote `"minutes": 60.0` into the alert_suspend audit row
+            # as if that were the request.
             body = AlertSuspendRequest(minutes=float(form.get("minutes") or "60"))
-        except (ValueError, ValidationError):
-            body = AlertSuspendRequest(minutes=60.0)
+        except ValueError:  # float(), or pydantic on a window outside 1 minute .. 30 days
+            return await _refuse_on_alerts_page(
+                request,
+                engine,
+                identity,
+                "the suspend window must be a number of minutes from 1 to 43200 (30 days)",
+            )
         await core.suspend_alert(
             alert_id, body=body, request=request, engine=engine, identity=identity
         )

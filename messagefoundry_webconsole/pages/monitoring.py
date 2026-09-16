@@ -152,10 +152,15 @@ def _alert_controls(a: AlertInstanceInfo, *, now: float) -> Markup:
     return el("div", *forms, class_="ctls") if forms else Markup("")
 
 
-def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
+def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: str = "") -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
     Metadata only — no PHI, no secrets (transports are reported present-or-not by the JSON handler).
+
+    ``error`` renders a refusal banner above the tables — the shape ``pages.message_search`` uses when a
+    write is refused rather than substituted (BACKLOG #1744). ``config`` is None for a caller that holds
+    ``monitoring:diagnose`` but not ``monitoring:read``: the rules half is read-gated, so that caller
+    gets the instance list and no Rules section rather than a refusal that widens what it can read.
     """
     now = time.time()
     inst_rows = [
@@ -195,6 +200,17 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
     )
     empty = el("p", "No active alerts.", class_="muted") if not instances.alerts else Markup("")
 
+    parts: list[object] = [el("h1", "Alerts")]
+    if error:
+        parts.append(el("p", error, class_="banner"))
+    parts += [el("h2", "Active"), empty, inst_table]
+    if config is not None:
+        parts += [el("h2", "Rules"), *_alert_rules_sections(config)]
+    return page("Alerts", *parts, active="alerts")
+
+
+def _alert_rules_sections(config: AlertsConfig) -> list[object]:
+    """The transport summary + loaded-rule table, the read-gated half of the alerts page."""
     transports = ", ".join(
         [
             t
@@ -238,17 +254,7 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
         ],
         rule_rows,
     )
-    return page(
-        "Alerts",
-        el("h1", "Alerts"),
-        el("h2", "Active"),
-        empty,
-        inst_table,
-        el("h2", "Rules"),
-        summary,
-        rules_table,
-        active="alerts",
-    )
+    return [summary, rules_table]
 
 
 #: The bounded connection-event vocabulary (mirrors the engine's emit kinds + the desktop
