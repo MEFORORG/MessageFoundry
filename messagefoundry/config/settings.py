@@ -1642,6 +1642,14 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
+    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
+    # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
+    # would be the per-hop scoping error that item warns about. Applies only with
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
+    # startup rather than at the first collector handshake.
+    forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
     # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
     # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
