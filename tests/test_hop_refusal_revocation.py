@@ -8,7 +8,14 @@ connector that VERIFIES a downstream server cert over stdlib ``ssl`` (which has 
 egress, the REST/SOAP/FHIR https paths, and the Postgres asyncpg store hop. The chain is validated but a
 revoked-but-unexpired peer cert would still be accepted, so a production-PHI verified hop off-loopback is
 REFUSED at construction / ``messagefoundry check`` / dry-run (store: at open) unless revocation is
-attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env).
+attested (per-connection ``tls_revocation_attested``) or really checked.
+
+**BACKLOG #299 clamped the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env.** It used to be OR'd into the
+per-connection attestation, so setting it once crossed every verifying outbound hop in an enforcing
+instance. It now ranks BELOW the enforcing refusal: under ``enforcing`` only the hop's own facts cross it
+(loopback, a CRL actually loaded on that hop's context, a proven terminator, or the per-connection flag),
+while a non-enforcing posture still crosses on the env exactly as before. Several tests here asserted the
+pre-clamp ALLOW and now assert the refusal; each says so at its own docstring.
 
 Loopback / attested / proxy-proven hops are byte-identical; a non-enforcing hop WARNs. The fourth
 relaxation, a synthetic instance, went with BACKLOG #1279 -- every instance carries patient data. It
@@ -65,20 +72,27 @@ def test_revocation_hop_disposition_matrix() -> None:
         is_loopback_hop: bool = False,
         proxy_proven: bool = False,
         attested: bool = False,
+        crl_checked: bool = False,
+        blanket_attested: bool = False,
     ) -> HopDisposition:
         return revocation_hop_disposition(
             enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
             proxy_proven=proxy_proven,
             attested=attested,
+            crl_checked=crl_checked,
+            blanket_attested=blanket_attested,
         )
 
     # loopback → ALLOW (on-box, not a network exposure) even on enforcing-PHI.
     assert disp(enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
     # a proven revocation-checking terminator → ALLOW.
     assert disp(enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
-    # attested → ALLOW.
+    # a PER-CONNECTION attestation → ALLOW.
     assert disp(enforcing=True, attested=True) is HopDisposition.ALLOW
+    # BACKLOG #299: this hop's own context checks a CRL → ALLOW, the relaxation that replaces a
+    # declaration with a real in-engine check.
+    assert disp(enforcing=True, crl_checked=True) is HopDisposition.ALLOW
     # A fourth ALLOW arm sat here -- `not is_phi`, the synthetic instance -- and went with BACKLOG
     # #1279. Every instance carries patient data, so it had no input left to fire on and this row,
     # which used to ALLOW, now falls through to the refusal below.
@@ -87,6 +101,51 @@ def test_revocation_hop_disposition_matrix() -> None:
     assert disp(enforcing=True) is HopDisposition.REFUSE
     # non-enforcing → WARN (crosses, loud-logged).
     assert disp(enforcing=False) is HopDisposition.WARN
+
+
+def test_blanket_attestation_does_not_defeat_an_enforcing_posture() -> None:
+    """BACKLOG #299, the attestation clamp: the blanket env ranks BELOW the enforcing refusal.
+
+    Before the clamp ``RevocationHopGuard.capture`` OR'd ``MEFOR_TLS_REVOCATION_ATTESTED`` into the
+    per-connection ``attested`` argument, so this first assertion returned ALLOW and one process-wide
+    environment variable crossed every verifying outbound hop in an enforcing instance."""
+    # ENFORCING + blanket env only → REFUSE. This is the row that flipped.
+    assert (
+        revocation_hop_disposition(
+            enforcing=True,
+            is_loopback_hop=False,
+            proxy_proven=False,
+            attested=False,
+            blanket_attested=True,
+        )
+        is HopDisposition.REFUSE
+    )
+    # The clamp is scoped to the enforcing posture: a non-enforcing hop still ALLOWs on the blanket env,
+    # byte-identical to the pre-clamp behaviour (it would otherwise WARN).
+    assert (
+        revocation_hop_disposition(
+            enforcing=False,
+            is_loopback_hop=False,
+            proxy_proven=False,
+            attested=False,
+            blanket_attested=True,
+        )
+        is HopDisposition.ALLOW
+    )
+    # And the clamp never removes a hop's OWN way out: each per-hop relaxation still crosses an
+    # enforcing hop while the blanket env alone does not.
+    for relaxation in ("is_loopback_hop", "proxy_proven", "attested", "crl_checked"):
+        kwargs: dict[str, bool] = {
+            "is_loopback_hop": False,
+            "proxy_proven": False,
+            "attested": False,
+            "crl_checked": False,
+        }
+        kwargs[relaxation] = True
+        assert (
+            revocation_hop_disposition(enforcing=True, blanket_attested=True, **kwargs)
+            is HopDisposition.ALLOW
+        ), relaxation
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
@@ -123,10 +182,35 @@ def test_guard_unstamped_is_noop() -> None:
     _guard(REMOTE).enforce_construction()
 
 
-def test_guard_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guard_blanket_env_no_longer_crosses_an_enforcing_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #299 clamp, at the guard. This test asserted the OPPOSITE until the clamp landed: the
+    blanket env was OR'd into ``attested`` inside ``capture``, so it ALLOWed here."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _guard(REMOTE).enforce_construction()
+    # The refusal names the blanket env, so an operator who set it is told why it stopped working.
+    with active_hop_posture(PROD_PHI):
+        guard = _guard(REMOTE)
+    assert TLS_REVOCATION_ATTESTED_ENV in guard._detail()
+    # A per-connection attestation still crosses the same hop, and a non-enforcing posture still
+    # crosses on the env alone.
+    with active_hop_posture(PROD_PHI):
+        _guard(REMOTE, attested=True).enforce_construction()
+    with active_hop_posture(STAGING_PHI):
+        _guard(REMOTE).enforce_construction()
+
+
+def test_guard_keeps_the_blanket_env_apart_from_the_per_connection_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clamp is only expressible because ``capture`` stops collapsing the two claims into one field."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
     with active_hop_posture(PROD_PHI):
-        _guard(REMOTE).enforce_construction()  # blanket env folded into attested → ALLOW
+        guard = _guard(REMOTE)
+    assert guard.blanket_attested is True
+    assert guard.attested is False  # NOT OR'd in — that fold is what the clamp removed
 
 
 def test_guard_audits_attestation_that_suppresses_prod_refusal(caplog) -> None:
@@ -165,9 +249,17 @@ def test_mllp_tls_verify_unstamped_is_noop() -> None:
     MLLPDestination(mllp_cfg(REMOTE))  # no stamped posture → byte-identical
 
 
-def test_mllp_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mllp_blanket_env_no_longer_crosses_an_enforcing_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #299 clamp, through a real connector. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        MLLPDestination(mllp_cfg(REMOTE))
+    # Per-connection attestation and a non-enforcing posture are untouched by the clamp.
     with active_hop_posture(PROD_PHI):
+        MLLPDestination(mllp_cfg(REMOTE, revocation_attested=True))
+    with active_hop_posture(STAGING_PHI):
         MLLPDestination(mllp_cfg(REMOTE))
 
 
@@ -279,10 +371,15 @@ def test_https_verified_unstamped_is_noop(cell: str) -> None:
 
 
 @pytest.mark.parametrize("cell", _HTTP_CELLS)
-def test_https_verified_blanket_env_allows_prod(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_https_verified_blanket_env_no_longer_crosses_enforcing(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #299 clamp across the whole HTTP family. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    with active_hop_posture(PROD_PHI):
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
         _build_https(_HTTPS[cell])
+    with active_hop_posture(STAGING_PHI):
+        _build_https(_HTTPS[cell])  # non-enforcing still crosses on the env
 
 
 # --- Postgres asyncpg store hop (_build_ssl verify path) --------------------------------------------
@@ -392,9 +489,14 @@ def test_email_tls_unstamped_is_noop() -> None:
     EmailDestination(email_cfg(REMOTE))  # no stamped posture → byte-identical
 
 
-def test_email_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_email_blanket_env_no_longer_crosses_enforcing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #299 clamp on the SMTP hop. Asserted the opposite before the clamp."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        EmailDestination(email_cfg(REMOTE))
     with active_hop_posture(PROD_PHI):
+        EmailDestination(email_cfg(REMOTE, revocation_attested=True))
+    with active_hop_posture(STAGING_PHI):
         EmailDestination(email_cfg(REMOTE))
 
 

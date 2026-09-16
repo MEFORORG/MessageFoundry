@@ -82,6 +82,7 @@ __all__ = [
     "smtp_login_approved",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
+    "context_checks_revocation",
     "current_hop_posture",
     "enforce_insecure_hop",
     "harden_cipher_suites",
@@ -290,6 +291,25 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
             "against, which refuses every client rather than skipping the check"
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
+    """Whether ``ctx`` will actually consult a CRL during verification (BACKLOG #299).
+
+    Reads ``VERIFY_CRL_CHECK_LEAF`` off the context itself rather than trusting that some setting was
+    configured somewhere. That distinction is the whole point: ``[tls].crl_file`` is instance-wide, but
+    the hops it reaches are not — an ``ldap3.Tls`` or a ``truststore`` context is built by a library that
+    never sees the policy, so a setting-shaped test would report "revocation is checked" for a handshake
+    that checks nothing. Asking the object that performs the handshake cannot make that mistake.
+
+    ``None`` (no context — a hop that is not TLS, or a caller that has none to hand) is ``False``:
+    absent evidence is not evidence of checking.
+
+    ``VERIFY_CRL_CHECK_CHAIN`` implies leaf checking in OpenSSL and its value includes the leaf bit, so
+    testing the leaf bit answers for both."""
+    if ctx is None:
+        return False
+    return bool(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
 
 
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**
@@ -1378,6 +1398,8 @@ def revocation_hop_disposition(
     is_loopback_hop: bool,
     proxy_proven: bool,
     attested: bool,
+    crl_checked: bool = False,
+    blanket_attested: bool = False,
 ) -> HopDisposition:
     """Decide what to do with a VERIFYING outbound TLS hop that does no revocation checking (#201 — PURE).
 
@@ -1387,29 +1409,52 @@ def revocation_hop_disposition(
 
     #. ``is_loopback_hop`` → :attr:`~HopDisposition.ALLOW` — an on-box hop is not a network exposure, and
        a revoked cert on the local box is not the threat this gate addresses.
+    #. ``crl_checked`` → :attr:`~HopDisposition.ALLOW` — **this hop's own context** checks revocation
+       (BACKLOG #299): a CRL is loaded and ``VERIFY_CRL_CHECK_LEAF`` is set on the very
+       :class:`ssl.SSLContext` the handshake uses, so the gap this gate exists for is closed in-engine
+       rather than declared away. The caller derives it from that context (see
+       :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
+       configured CRL that a given hop's handshake never consults must not silence that hop's guard.
     #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
        revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
-       this hop (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``).
+       **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
+    #. ``blanket_attested`` → :attr:`~HopDisposition.ALLOW` — see the clamp below.
     #. else (non-enforcing — the WARN posture) → :attr:`~HopDisposition.WARN`.
 
+    **``blanket_attested`` sits BELOW the enforcing REFUSE, and that ordering is BACKLOG #299's
+    attestation clamp.** The two attestations used to be OR'd into one ``attested`` argument, so a single
+    process-wide ``MEFOR_TLS_REVOCATION_ATTESTED=1`` returned ALLOW for **every** verifying outbound hop
+    in the instance — one environment variable, set once, defeating an enforcing posture on hops the
+    operator never enumerated. A per-connection ``tls_revocation_attested`` is a claim about one named
+    hop that a reviewer can check against that hop's PKI; the env is a claim about all of them at once,
+    and it is that unreviewable shape the clamp removes. Under a non-enforcing posture the env still
+    ALLOWs, byte-identical to the pre-clamp behaviour, so nothing outside an enforcing posture moves.
+
     A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
-    so it could no longer fire and its removal leaves the remaining three relaxations as the whole set.
+    so it could no longer fire and its removal leaves the remaining relaxations as the whole set.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
-    ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator and an operator
-    attestation. This never turns verification off (the caller has already built
-    a verifying context) — it only decides whether the *unchecked-revocation* property of that verified
-    hop is tolerable, so it composes with (never weakens) the #200 cleartext/verify-off refusals."""
+    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check, a declared
+    revocation-checking terminator and a per-connection attestation. This never turns verification off
+    (the caller has already built a verifying context) — it only decides whether the
+    *unchecked-revocation* property of that verified hop is tolerable, so it composes with (never
+    weakens) the #200 cleartext/verify-off refusals."""
     if is_loopback_hop:
+        return HopDisposition.ALLOW
+    if crl_checked:
         return HopDisposition.ALLOW
     if proxy_proven:
         return HopDisposition.ALLOW
     if attested:
         return HopDisposition.ALLOW
     if enforcing:
+        # The clamp: a blanket env attestation does NOT reach this arm. Only the per-connection
+        # attestation above, a proven terminator, or a real in-engine CRL check crosses an enforcing hop.
         return HopDisposition.REFUSE
+    if blanket_attested:
+        return HopDisposition.ALLOW
     return HopDisposition.WARN
 
 
@@ -1434,6 +1479,13 @@ class RevocationHopGuard:
     attested: bool
     proxy_proven: bool
     posture: HopPosture | None
+    #: Whether the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env was set when this hop was captured.
+    #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
+    #: field is exactly what let one env var cross every enforcing hop in the instance.
+    blanket_attested: bool = False
+    #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
+    #: context in :meth:`capture`, never from a global setting.
+    crl_checked: bool = False
 
     @classmethod
     def capture(
@@ -1444,20 +1496,30 @@ class RevocationHopGuard:
         description: str,
         attested: bool,
         proxy_proven: bool = False,
+        context: ssl.SSLContext | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
-        ``attested`` is the per-connection ``tls_revocation_attested`` flag; the blanket
-        ``MEFOR_TLS_REVOCATION_ATTESTED`` env is OR'd in here so either form suppresses the refusal (the
-        same opt-out ADR 0078 gave the in-process listener). ``cell`` is a short PHI-free label of the
-        crossing; ``description`` explains the hop (scheme/host only — never a credential or a body)."""
+        ``attested`` is the per-connection ``tls_revocation_attested`` flag. The blanket
+        ``MEFOR_TLS_REVOCATION_ATTESTED`` env is read here too but kept in its **own** field: it is a
+        weaker claim and :func:`revocation_hop_disposition` ranks it below the enforcing refusal
+        (BACKLOG #299). ``cell`` is a short PHI-free label of the crossing; ``description`` explains the
+        hop (scheme/host only — never a credential or a body).
+
+        ``context`` is the :class:`ssl.SSLContext` this hop's handshake will actually use. When supplied,
+        :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off it, so a hop whose CRL was
+        really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
+        the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
+        one instance-wide setting must never silence a hop whose handshake does not consult it."""
         return cls(
             host=host,
             cell=cell,
             description=description,
-            attested=attested or tls_revocation_attested(),
+            attested=attested,
             proxy_proven=proxy_proven,
             posture=current_hop_posture(),
+            blanket_attested=tls_revocation_attested(),
+            crl_checked=context_checks_revocation(context),
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1466,14 +1528,18 @@ class RevocationHopGuard:
             is_loopback_hop=is_loopback_hop_host(self.host),
             proxy_proven=self.proxy_proven,
             attested=self.attested,
+            crl_checked=self.crl_checked,
+            blanket_attested=self.blanket_attested,
         )
 
     def _detail(self) -> str:
         return (
             f"{self.description} to {self.host}: the peer certificate is verified but NO certificate "
             "revocation checking (OCSP/CRL) is performed — stdlib ssl has none (ASVS 12.1.4, ADR 0078). "
-            "Terminate at a revocation-checking egress proxy, or set tls_revocation_attested=true / "
-            f"{TLS_REVOCATION_ATTESTED_ENV}=1 to attest a revocation-checking PKI backs this hop."
+            "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
+            "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection. "
+            f"Under an enforcing posture a blanket {TLS_REVOCATION_ATTESTED_ENV}=1 no longer suffices "
+            "(BACKLOG #299) — it cannot say which hop's PKI was reviewed."
         )
 
     def enforce_construction(self) -> None:
@@ -1487,6 +1553,10 @@ class RevocationHopGuard:
         # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
         # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
         # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
+        # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
+        # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
+        # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
+        # one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
             and (self.attested or self.proxy_proven)
