@@ -97,8 +97,11 @@ def test_an_explicit_burst_is_honoured() -> None:
 # --- end to end, on a real socket ---------------------------------------------------------------
 
 #: The paced scenario, named once so the timing arms can derive their bounds from it instead of
-#: restating a number the bucket arithmetic already fixes.
-_RATE, _BURST, _MESSAGES = 20.0, 2.0, 12
+#: restating a number the bucket arithmetic already fixes -- and so nobody can move the burst on the
+#: connector while those arms keep checking a scenario it is no longer running.
+_PACED: dict[str, float] = {"max_messages_per_second": 20.0, "message_burst": 2.0}
+_RATE, _BURST = _PACED["max_messages_per_second"], _PACED["message_burst"]
+_MESSAGES = 12
 
 
 async def _run_against(src: MLLPSource, count: int) -> list[str]:
@@ -135,7 +138,7 @@ async def test_pacing_never_drops_a_message() -> None:
     what the count-and-log invariant forbids, and a limiter that discarded would pass a
     'rate is bounded' test while breaking the thing that actually matters.
     """
-    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), 12)
+    seen = await _run_against(_source(**_PACED), _MESSAGES)
     assert len(seen) == 12
     # And in order: pacing must not reorder either, since FIFO is the project's ordering model.
     ids = [(m.decode() if isinstance(m, bytes) else m).split("|")[9] for m in seen]
@@ -162,7 +165,7 @@ async def test_pacing_actually_delays_the_reads(monkeypatch: pytest.MonkeyPatch)
     probe = install_ingress_pace_probe(monkeypatch, mllp)
     loop = asyncio.get_running_loop()
     start = loop.time()
-    seen = await _run_against(_source(max_messages_per_second=20, message_burst=2), _MESSAGES)
+    seen = await _run_against(_source(**_PACED), _MESSAGES)
     elapsed = loop.time() - start
     assert len(seen) == _MESSAGES
     assert probe.built == 1, "the probe never replaced the pacer this intake builds"

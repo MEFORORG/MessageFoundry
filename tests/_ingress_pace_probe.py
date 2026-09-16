@@ -105,10 +105,16 @@ def install_ingress_pace_probe(
     """Swap ``module``'s ``_MessagePacer`` for a recording subclass; return the record.
 
     Every intake that paces imports the class into its own namespace, so the swap is per module and
-    the recorder is not: one definition serves the raw-TCP, X12, HTTP and MLLP sites. The real
-    ``_MessagePacer`` still runs -- this subclasses it, it does not reimplement it -- so an intake
-    that stops building a pacer records no construction, and a pacer that stops waiting records no
-    decision.
+    the recorder is not: one definition serves at least the raw-TCP, X12, HTTP and MLLP sites. The
+    real ``_MessagePacer`` still runs -- this subclasses it, it does not reimplement it -- so an
+    intake that stops building a pacer records no construction, and a pacer that stops waiting
+    records no decision.
+
+    **"At least" is meant, and the DICOM association intake is the case behind it.** It drives the
+    same listener-scoped ``deficit``/``charge`` pair from ``dicom.py``, so this would swap into it
+    unchanged -- but ``tests/test_dicom_association_intake_bound.py`` already pins that intake's
+    clock with its own ``_PacingClock``, built for threads rather than a coroutine (BACKLOG #1536,
+    merged). Rehoming that onto this is a separate change, not a claim made here.
 
     Install it BEFORE the source is constructed. The HTTP listener builds its one listener-wide
     pacer in ``__init__``; the three stream intakes build one per connection inside the accept
@@ -126,6 +132,18 @@ def install_ingress_pace_probe(
 
         __slots__ = ()
 
+        @staticmethod
+        def _record(wait: float) -> None:
+            """Log a decided wait and advance the clock by exactly it.
+
+            One definition for both seams. The clock advancing by the wait REQUESTED is what keeps
+            the schedule the pacer's own arithmetic; whether the box really slept stays a question
+            for the caller's wall-clock arm rather than an input to this one.
+            """
+            if wait > 0.0:
+                probe.decided.append(wait)
+                probe.now += wait
+
         def __init__(self, rate: float, burst: float, *, now: float) -> None:
             # The caller's `now` is the runner's monotonic clock. Dropping it here is what puts
             # `_last` and every later refill on one clock, since a bucket stamped from one clock and
@@ -137,13 +155,8 @@ def install_ingress_pace_probe(
             return super().charge(messages, now=probe.now)
 
         async def pace(self) -> None:
-            # Read the debt before delegating, and advance the clock by it BEFORE the sleep: the
-            # schedule is then the pacer's own arithmetic, and whether the box really slept stays a
-            # question for the caller's wall-clock arm rather than an input to this one.
             wait = self._pending_wait
-            if wait > 0.0:
-                probe.decided.append(wait)
-                probe.now += wait
+            self._record(wait)
             await super().pace()
             if wait > 0.0:
                 probe.taken.append(wait)
@@ -153,9 +166,7 @@ def install_ingress_pace_probe(
             # clock advances here for the same reason it advances in pace(). It cannot record a
             # `taken`: the sleep happens in the listener, out of this object's sight.
             owed = super().deficit(now=now)
-            if owed > 0.0:
-                probe.decided.append(owed)
-                probe.now += owed
+            self._record(owed)
             return owed
 
     monkeypatch.setattr(module, "_MessagePacer", _RecordingPacer)

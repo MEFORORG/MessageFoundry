@@ -209,8 +209,11 @@ async def _run_stream(src: TcpSource | X12Source, frames: list[bytes]) -> tuple[
 # Two arms per site, and each catches what the other cannot. The DECISION arm says the wait came from
 # pacing rather than from work; the WALL-CLOCK arm, bounded by what that run decided rather than by a
 # constant, says the box actually slept it off.
-_PACED = {"max_messages_per_second": 20, "message_burst": 2}
-_RATE, _BURST, _MESSAGES = 20.0, 2.0, 12
+_PACED: dict[str, float] = {"max_messages_per_second": 20.0, "message_burst": 2.0}
+#: Derived from `_PACED` rather than restated. Spelling the pair twice lets somebody move the burst
+#: on the connector while the timing arms keep checking a scenario it is no longer running.
+_RATE, _BURST = _PACED["max_messages_per_second"], _PACED["message_burst"]
+_MESSAGES = 12
 
 
 async def test_tcp_pacing_never_drops_a_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -300,7 +303,7 @@ async def test_http_pacing_never_drops_a_message() -> None:
     delayed rather than replaced by a rejection. A limiter that answered ``429`` instead would move
     the loss outside the boundary the count-and-log invariant covers.
     """
-    seen, status = await _run_http(_http_source(max_messages_per_second=20, message_burst=2), 12)
+    seen, status = await _run_http(_http_source(**_PACED), _MESSAGES)
     assert [b.decode() for b in seen] == [f"BODY-{i}" for i in range(12)]
     assert status == 202
 
@@ -329,7 +332,7 @@ async def test_http_pacing_is_listener_wide_not_per_connection(
     probe = install_ingress_pace_probe(monkeypatch, http_listener)
     loop = asyncio.get_running_loop()
     start = loop.time()
-    seen, _ = await _run_http(_http_source(max_messages_per_second=20, message_burst=2), _MESSAGES)
+    seen, _ = await _run_http(_http_source(**_PACED), _MESSAGES)
     elapsed = loop.time() - start
     assert len(seen) == _MESSAGES
     assert probe.built == 1, "twelve connections must share ONE listener-wide bucket"
