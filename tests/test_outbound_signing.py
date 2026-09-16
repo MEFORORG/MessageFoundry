@@ -33,6 +33,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.signing import (
     _MIN_RSA_BITS,
+    CompactJwtSigner,
     MessageSigner,
     SigningError,
     signer_from_destination,
@@ -220,6 +221,39 @@ def test_key_from_pem_file_path(tmp_path: Path, ec_pem: str) -> None:
 def test_missing_key_file_fails_loud(tmp_path: Path) -> None:
     with pytest.raises(SigningError, match="could not read the signing-key file"):
         MessageSigner(OutboundSigning(algorithm="ES256", private_key=str(tmp_path / "nope.pem")))
+
+
+# Synthetic bytes, never a real key. A headerless value is read as a PATH, so this is what a mis-set
+# env() holding a bare base64 key BODY looks like when it reaches the file open as the "path".
+_HEADERLESS_BLOB = base64.b64encode(b"SYNTHETIC-NOT-A-REAL-KEY-" * 40).decode("ascii")
+
+
+def test_a_headerless_key_value_is_not_echoed_by_the_read_error() -> None:
+    """BACKLOG #1664 -- the rule and the four sinks it protects are in `_read_key_material`."""
+    with pytest.raises(SigningError) as caught:
+        MessageSigner(OutboundSigning(algorithm="ES256", private_key=_HEADERLESS_BLOB))
+    message = str(caught.value)
+    assert _HEADERLESS_BLOB not in message
+    # Not just the whole blob: no run of it long enough to be worth reassembling from several logs.
+    assert _HEADERLESS_BLOB[:32] not in message
+    # The operator still learns which setting to fix, and why a non-path value was opened. Matched as
+    # the rendered fragment, because a bare "sign_private_key" is also a substring of nothing useful
+    # -- but a bare "private_key" would match all three spellings and pass on a wrong one.
+    assert "named by 'sign_private_key'" in message
+    assert "-----BEGIN" in message
+
+
+def test_the_compact_jwt_signer_reports_the_setting_its_caller_named() -> None:
+    """The loader's second caller. `setting` is required there precisely so this cannot fall back to
+    a plausible-looking wrong answer: `private_key` is already the SFTP key on `remotefile`."""
+    with pytest.raises(SigningError) as caught:
+        CompactJwtSigner(
+            private_key=_HEADERLESS_BLOB,
+            algorithm=SignatureAlgorithm.ES256,
+            setting="smart_private_key",
+        )
+    assert _HEADERLESS_BLOB not in str(caught.value)
+    assert "named by 'smart_private_key'" in str(caught.value)
 
 
 def test_verify_rejects_malformed_jws_and_alg_pinning(rsa_pem: str, ec_pem: str) -> None:

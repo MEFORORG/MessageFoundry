@@ -74,7 +74,12 @@ def _mint(key: rsa.RSAPrivateKey, claims: Mapping[str, Any], kid: str = "k1") ->
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("ascii")
-    signer = CompactJwtSigner(private_key=pem, algorithm=SignatureAlgorithm.RS256, key_id=kid)
+    signer = CompactJwtSigner(
+        private_key=pem,
+        algorithm=SignatureAlgorithm.RS256,
+        key_id=kid,
+        setting="test_idp_signing_key",
+    )
     return signer.sign(dict(claims))
 
 
