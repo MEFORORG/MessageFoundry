@@ -323,9 +323,26 @@ advisory-only, restated).
   → `tests/test_webui.py::test_webauthn_extra_less_renders_notice` + `tests/test_webui.py::test_reauth_extra_less_with_credentials_renders_notice`
 - **AC-17** — IF an operator targets their OWN account on `POST /users/{user_id}/reset-mfa`, THEN
   THE SYSTEM SHALL refuse (400) and direct them to the self-service MFA settings; cross-user reset
-  is unaffected and remains the recovery path of §2. AC-10 refuses the last-factor case on the
-  self-service paths, and this closes the third route to zero factors that reached neither.
+  is unaffected and remains the recovery path of §2. AC-10 and AC-18 refuse the last-factor case on
+  the passkey-removal and TOTP-disable self-service paths respectively — **one criterion each, not
+  one criterion covering both** — and this closes the third route to zero factors that reached
+  neither.
   → `tests/test_api_auth.py::test_admin_reset_mfa_refuses_to_target_the_caller`
+- **AC-18** — IF disabling TOTP would remove the user's last second factor WHILE MFA is required for
+  them, THEN THE SYSTEM SHALL refuse with "enroll another factor first" — the same message on the
+  same condition as AC-10, which is the whole of the criterion: the two self-service routes to zero
+  factors sit behind one step-up gate and only one of them used to ask. The refusal SHALL reach the
+  caller as a **400** on the JSON route and as the **account page** on `/ui`, never a 500 and never
+  raw JSON. `admin_reset_mfa` is unaffected and stays deliberately unguarded as the recovery path of
+  §2 — AC-11 mandates that it clears both factor types, and nothing here narrows it.
+  → `tests/test_mfa.py::test_disable_mfa_REFUSES_stripping_the_last_factor_when_mfa_is_required`
+  (with `tests/test_mfa.py::test_disable_mfa_is_ALLOWED_when_mfa_is_not_required` as the positive
+  control, and `tests/test_mfa.py::test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard`
+  pinning the carve-out) +
+  `tests/test_api_auth.py::test_disabling_the_LAST_second_factor_is_a_400_not_a_500` +
+  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_disabling_the_LAST_factor_renders_the_page_not_raw_json`
+  — that last path is spelled in full on purpose: the web console suite moved under `packaging/`,
+  so the bare `tests/test_webui.py` this section uses elsewhere no longer resolves.
 
 ## Options considered
 

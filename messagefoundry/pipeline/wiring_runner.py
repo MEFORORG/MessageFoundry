@@ -4902,6 +4902,45 @@ class RegistryRunner:
 
     # --- delivery path -------------------------------------------------------
 
+    async def _repend_claimed_on_fault(self, worker: str, name: str, ids: Sequence[str]) -> None:
+        """Best-effort re-pend of the rows a per-lane worker was holding when its loop faulted
+        (BACKLOG #1611 step 1) — the per-lane analogue of the pooled T17 head re-pend in
+        :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+
+        The claim is its own committed transaction, so a fault in the handoff that follows leaves the
+        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
+        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()`` and the
+        cluster promotion path only — **not** from ``reload()``. Without this the row waits for a
+        service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
+        reports the lane healthy to the buildup and stall alerts.
+
+        Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
+        T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
+        them and a broken dependency is re-claimed ~4x/s. ``reschedule_claimed`` is guarded
+        ``status='inflight'`` and FIFO-neutral (``seq`` is never re-minted), so rows the worker already
+        resolved are left untouched and the survivors keep their lane position — which is why a caller
+        may pass its whole claimed batch without tracking which row died.
+
+        Wrapped in its own ``except`` because a re-pend that raises inside an except arm would kill the
+        worker, which is strictly worse than the leak it fixes; a failure here simply falls back to the
+        pre-existing recovery (``reset_stale_inflight`` at the next start).
+        """
+        if not ids:
+            return
+        try:
+            await self.store.reschedule_claimed(
+                list(ids), time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            )
+        except Exception:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
+            log.warning(
+                "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
+                "for reset_stale_inflight at the next start",
+                worker,
+                name,
+                len(ids),
+                exc_info=True,
+            )
+
     async def _delivery_worker(self, name: str) -> None:
         # B11: was the previous wait a wake (.set() — herd) or a poll-interval timeout (idle)? Seeds
         # False so the first claim at startup classifies as idle-poll, not a spurious wake.
@@ -4910,6 +4949,9 @@ class RegistryRunner:
         # registers the lane); else the shared singleton (byte-identical). Resolved once — the object is
         # stable for the worker's life (never replaced), so a sticky set survives a respawn.
         wait_ev = self._lane_event(Stage.OUTBOUND, name) if self._per_lane_wake else self._work
+        # #1611: the rows THIS loop claimed, for the except arm's re-pend. A batching outbound
+        # coalesces further rows inside _process_delivery_batch; those are not tracked here.
+        claimed: list[str] = []
         while not self._stop.is_set():
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
@@ -4957,6 +4999,7 @@ class RegistryRunner:
                         time.perf_counter_ns() - _claim_t0, lanes=1, rows=len(items)
                     )
                     self._claim_phase_stats.maybe_emit(stage="outbound", claimers=1)
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -4985,6 +5028,9 @@ class RegistryRunner:
                 log.exception(
                     "delivery worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("delivery", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5497,6 +5543,7 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
         )
+        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
@@ -5516,6 +5563,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.INGRESS.value, limit=self._fifo_batch
                     )
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -5539,6 +5587,9 @@ class RegistryRunner:
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
                 # back off, and keep going (mirrors the delivery worker).
                 log.exception("router worker %r: unexpected error; backing off and retrying", name)
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("router", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5631,7 +5682,9 @@ class RegistryRunner:
             # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
             # never-attempted message purely for being removed) so the message is never
             # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
+            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
+            # and drains the PENDING backlog while the tail stays in flight until a restart.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -5836,11 +5889,13 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
         )
+        claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
+                claimed = [] if item is None else [item.id]  # #1611
                 if item is None:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
@@ -5856,6 +5911,9 @@ class RegistryRunner:
                 log.exception(
                     "response worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("response", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5919,6 +5977,7 @@ class RegistryRunner:
         # B12 (ADR 0061): wait on THIS inbound's ROUTED lane Event when per-lane wake is on; else the
         # shared singleton (byte-identical). Resolved once.
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
+        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
@@ -5934,6 +5993,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.ROUTED.value, limit=self._fifo_batch
                     )
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -5961,6 +6021,9 @@ class RegistryRunner:
                 log.exception(
                     "transform worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("transform", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -6058,7 +6121,9 @@ class RegistryRunner:
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
             # router worker), so the ACKed-but-unprocessed message is never dropped. The
             # unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
+            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
+            # and drains the PENDING backlog while the tail stays in flight until a restart.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.

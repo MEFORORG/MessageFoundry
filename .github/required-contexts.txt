@@ -19,12 +19,27 @@
 # 2026-08-31: `a reviewer has read this` was armed, and the two CodeQL matrix contexts were seen
 # required earlier that day and are no longer. It moved once more on 2026-09-04, when the owner
 # RETIRED the review requirement: `a reviewer has read this` was removed from protection, fourteen
-# back to thirteen. THE LIST BELOW IS SET-EQUAL TO THE SERVER -- thirteen contexts, nothing extra on
-# either side -- read at 2026-09-04 19:05 CDT with
+# back to thirteen. It moved AGAIN between 2026-09-13 22:41Z and 2026-09-14 06:59Z, when the owner
+# added the two `security.yml` composite roll-ups, thirteen to fifteen -- step 2 of the consolidation
+# staged below.
+#
+# THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fifteen contexts, nothing extra on either side --
+# read at 2026-09-15 with
 # `gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'`.
 # A set-equal read is the only one worth writing down: a count alone cannot tell a matching set from
-# two offsetting errors. Two non-context settings also moved and are recorded because they change
-# merge semantics (both re-read at that same timestamp, `strict` and `enforce_admins` both TRUE):
+# two offsetting errors.
+#
+# THAT LAST MOVE IS THE ONE THIS FILE FAILED TO MIRROR, AND IT IS RECORDED HERE RATHER THAN QUIETLY
+# FIXED. For roughly a day the file named thirteen over a server holding fifteen, and the two it
+# omitted were the two it explicitly described as "DELIBERATELY ABSENT ... a red one BLOCKS NOTHING
+# TODAY". So the file did not merely lag -- it asserted the opposite of the server, in the reassuring
+# direction, on the one question it exists to answer from a clone. A session counting passing checks
+# against this file would have read a pull request as fully green with two required contexts still
+# unreported. `scripts/ci/check_required_contexts_drift.py` DID detect it and reported to nobody: it
+# is not itself a required context, so its workflow failed every run in that window unread.
+#
+# Two non-context settings also moved and are recorded because they change
+# merge semantics (both re-read at 2026-09-04 19:05 CDT, `strict` and `enforce_admins` both TRUE):
 #
 #   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
 #                     stale-green hole: previously a PR validated against an older base could merge
@@ -121,29 +136,37 @@ semgrep (project SAST rules)
 crypto-inventory (ASVS 11.1.3 discovery gate)
 forbidden-content (customer/PHI leak guard)
 
-# TWO MORE CONTEXTS FROM THIS FILE ARE REPORTING AND ARE DELIBERATELY ABSENT FROM THE LIST ABOVE:
+# THE TWO COMPOSITE ROLL-UPS. They are COMPOSITE jobs running the same seven scans above in two
+# runner slots instead of seven, staged ALONGSIDE the originals rather than replacing them, so during
+# the overlap every scan runs twice and both copies are required. docs/CI.md carries the reasoning and
+# the runner-slot measurement; tests/test_security_composite_parity.py asserts each copied body is
+# byte-identical to its original, which is what makes the duplication safe to review.
 #
-#     repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)
-#     dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)
+# THEY WERE DELIBERATELY ABSENT FROM THIS FILE UNTIL 2026-09-15, AND THAT ABSENCE OUTLIVED ITS REASON
+# BY ABOUT A DAY. The reason was sound while it held: recording a context here before protection
+# carries it is the lie this file exists to prevent. The owner then added both to protection (step 2
+# below) and nothing moved the file, so the absence flipped from true to false without a single edit.
+# That is the shape to watch for -- a correct note whose correctness depends on a server setting it
+# cannot see. It is recorded in this file's header rather than deleted, because the next staged
+# context will create the same window.
+repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)
+dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)
+
+# THE SEVEN ORIGINALS ABOVE ARE STILL REQUIRED AND MUST NOT BE DELETED YET. A required context is a
+# JOB NAME, so deleting a job while protection still names it wedges every pull request in the
+# repository -- protection waits forever for a context nothing produces. The remaining steps, in
+# order, are in docs/CI.md under `Consolidating the seven security contexts`:
 #
-# They are COMPOSITE jobs running the same seven scans in two runner slots instead of seven, staged
-# alongside the originals rather than replacing them. So they are reporting on every pull request and
-# a red one BLOCKS NOTHING TODAY, which is exactly the question this file exists to answer -- and the
-# answer a reader would otherwise guess wrong, because a security context that goes red looks
-# blocking. docs/CI.md carries the reasoning and the runner-slot measurement.
+#   3. A later PR deletes the seven original JOBS, and drops their seven lines from this file, the
+#      bullet list in docs/CI.md, and the classification in tests/test_security_posture.py.
+#   4. The owner removes the seven original NAMES from branch protection.
 #
-# THE ORDER IS THE POINT AND IT IS THE SAME ORDER THE `ADDING ANOTHER ONE LATER` PARAGRAPH BELOW
-# PRESCRIBES. A required context is a JOB NAME: deleting the seven while protection still names them
-# wedges every pull request, and recording these two here before protection carries them is the lie
-# this file exists to prevent. So the composites report first, protection moves second, the seven
-# originals are deleted third -- and this file is edited in that third change, together with the
-# pinned count in tests/test_required_contexts.py, docs/CI.md, and the job classification in
-# tests/test_security_posture.py.
-#
-# UNTIL THEN THIS FILE AND THE SERVER STILL AGREE, at thirteen. That is the property worth keeping:
-# the file is accurate at every moment except the window between steps 2 and 3, which the owner opens
-# deliberately. A file that described the intended end state early would be wrong for as long as the
-# staging takes, and wrong in the direction that reads as reassuring.
+# STEP 3 BEFORE STEP 4 OPENS THE WEDGE IT IS MEANT TO AVOID, and that is a real defect in the plan as
+# written rather than a subtlety of it. Between them the seven contexts are required and unreportable.
+# Whoever takes step 3 must confirm with the owner that step 4 lands in the same window, or invert the
+# pair -- protection first, the file and the jobs second, which is the order the `ADDING ANOTHER ONE
+# LATER` paragraph below already prescribes for the opposite direction. Named here, unresolved, so the
+# next reader does not discover it by wedging the repository.
 
 # --- cla.yml --------------------------------------------------------------------------------------
 cla

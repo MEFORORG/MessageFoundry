@@ -363,6 +363,26 @@ class ProvisionedAdministrator:
 
 
 @dataclass(frozen=True)
+class IssuedCredential:
+    """An admin-issued one-time credential and the instant it stops working.
+
+    BACKLOG #1141 (ASVS 6.4.5). The renewal instruction for an expiring mechanism has to be *sent*
+    with the mechanism, and :meth:`AuthService.admin_reset_password` used to return the password
+    alone -- so the one artifact that reaches the issuing administrator carried no deadline, and
+    neither did anything downstream of it. Pairing the two in the return type means a caller cannot
+    surface the credential and forget the deadline: there is nothing else to unpack.
+
+    ``expires_at`` is :meth:`AuthService.initial_credential_deadline` over the STORED
+    ``password_changed_at``, which is the value the login gate itself refuses on -- not a fresh clock
+    read and not a second computation. ``None`` means ``[auth].initial_password_expiry_hours`` is 0,
+    i.e. the credential genuinely has no deadline, which is what the gate does in that case too.
+    """
+
+    password: str
+    expires_at: float | None = None
+
+
+@dataclass(frozen=True)
 class CustomRoleInfo:
     """An admin-defined custom role and its resolved permission subset (ADR 0045)."""
 
@@ -746,16 +766,13 @@ class AuthService:
             if self._settings.bootstrap_expiry_hours > 0:
                 # WP-3 retires the ACCOUNT, keyed on created_at.
                 deadlines.append(created.created_at + self._settings.bootstrap_expiry_hours * 3600)
-            if self._settings.initial_password_expiry_hours > 0 and (
-                created.password_changed_at is not None
-            ):
-                # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly
-                # minted bootstrap these two stamps are the same clock read, so at equal windows the
-                # minimum is that shared instant and the surfaced value is unchanged.
-                deadlines.append(
-                    created.password_changed_at
-                    + self._settings.initial_password_expiry_hours * 3600
-                )
+            # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly minted
+            # bootstrap these two stamps are the same clock read, so at equal windows the minimum is
+            # that shared instant and the surfaced value is unchanged. BACKLOG #1141: through
+            # initial_credential_deadline, so this file states that arithmetic exactly once.
+            credential_deadline = self.initial_credential_deadline(created.password_changed_at)
+            if credential_deadline is not None:
+                deadlines.append(credential_deadline)
         expires_at: float | None = min(deadlines) if deadlines else None
         return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
 
@@ -993,6 +1010,28 @@ class AuthService:
             detail=_json({"reason": "superseded" if superseded else "expired"}),
         )
 
+    def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
+        """The instant an admin-issued must-change credential stops working, or ``None`` when
+        ``[auth].initial_password_expiry_hours`` is 0 (no expiry) or the account carries no
+        ``password_changed_at`` stamp.
+
+        BACKLOG #1141 (ASVS 6.4.5). THE ONE COMPUTATION OF THE 6.4.1 CREDENTIAL DEADLINE. The login
+        gate refuses on it, :meth:`admin_reset_password` surfaces it to the issuing administrator,
+        :meth:`_ensure_bootstrap_admin` writes it into ``bootstrap-admin.txt`` and
+        :meth:`bootstrap_expiry_warning` warns ahead of it. Those were four open-coded copies of one
+        arithmetic, which is precisely the shape BACKLOG #1245 already cost this file once: two copies
+        of one lifecycle test let the warn path drift from the gate silently. A surfaced deadline that
+        can disagree with the enforced one is worse than no deadline at all, because the holder plans
+        around a date the gate does not honour.
+
+        The gate's own comparison is ``now > deadline`` (strictly after), so a login AT the returned
+        instant still succeeds -- stating it as the moment the credential stops working is exact.
+        """
+        hours = self._settings.initial_password_expiry_hours
+        if hours <= 0 or password_changed_at is None:
+            return None
+        return password_changed_at + hours * 3600.0
+
     async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
         """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED (the shared test,
         :meth:`_unclaimed_bootstrap`) and ``now`` sits inside its warn window
@@ -1020,13 +1059,9 @@ class AuthService:
         candidates: list[float] = []
         if self._settings.bootstrap_expiry_hours > 0:
             candidates.append(boot.created_at + self._settings.bootstrap_expiry_hours * 3600)
-        if (
-            self._settings.initial_password_expiry_hours > 0
-            and boot.password_changed_at is not None
-        ):
-            candidates.append(
-                boot.password_changed_at + self._settings.initial_password_expiry_hours * 3600
-            )
+        credential_deadline = self.initial_credential_deadline(boot.password_changed_at)
+        if credential_deadline is not None:
+            candidates.append(credential_deadline)
         if not candidates:
             return None  # no bound of either kind configured → nothing to warn about
         now = time.time() if now is None else now
@@ -1222,13 +1257,12 @@ class AuthService:
         # is near-behaviour-neutral at the stock 72/72 defaults — a freshly minted bootstrap has
         # created_at and password_changed_at within milliseconds of each other, so 6.4.1 comes due at
         # the same instant WP-3 retirement already does — while closing both misconfigurations.
+        # BACKLOG #1141: the deadline comes from initial_credential_deadline, the SAME call
+        # admin_reset_password surfaces to the issuing administrator — so the instant the response
+        # states and the instant this gate refuses on are one computation, not two that agree today.
         expiry_hours = self._settings.initial_password_expiry_hours
-        if (
-            user.must_change_password
-            and expiry_hours > 0
-            and user.password_changed_at is not None
-            and now - user.password_changed_at > expiry_hours * 3600.0
-        ):
+        deadline = self.initial_credential_deadline(user.password_changed_at)
+        if user.must_change_password and deadline is not None and now > deadline:
             await self._audit(
                 "auth.temp_password_expired",
                 actor=username,
@@ -4052,13 +4086,21 @@ class AuthService:
             if role_id in await self._store.get_user_role_ids(user.id):
                 await self._store.revoke_user_sessions(user.id)
 
-    async def admin_reset_password(self, user_id: str, *, actor: str) -> str:
+    async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
         through the active policy, set it with ``must_change_password`` (forces a change on first
         login), and revoke the user's sessions. Returns the one-time credential **once** so the caller
         can convey it out-of-band — the administrator never sets a lasting password the user keeps. The
         affected user is also notified out-of-band by email. Raises :class:`ValueError` for an unknown
-        user or a non-local (AD) account; the API maps these to 4xx."""
+        user or a non-local (AD) account; the API maps these to 4xx.
+
+        BACKLOG #1141 (ASVS 6.4.5) is why this returns an :class:`IssuedCredential` rather than the
+        bare password: the renewal instruction for an expiring mechanism has to travel WITH the
+        mechanism, and this return value is the only thing that reaches the issuing administrator.
+        ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
+        stamped — the same source :meth:`_ensure_bootstrap_admin` uses — rather than from a fresh
+        clock, so the surfaced instant is the one the login gate will actually refuse on.
+        """
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
@@ -4077,7 +4119,13 @@ class AuthService:
             detail=_json({"user_id": user_id, "username": user.username}),
         )
         await self._notify_security(PASSWORD_RESET, username=user.username, email=user.notify_email)
-        return temp
+        stamped = await self._store.get_user(user_id)
+        return IssuedCredential(
+            password=temp,
+            expires_at=self.initial_credential_deadline(
+                None if stamped is None else stamped.password_changed_at
+            ),
+        )
 
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str
