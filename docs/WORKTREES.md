@@ -21,8 +21,12 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with
 
 ```
-pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+pip install --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault]" -e packaging/messagefoundry-webconsole
 ```
+
+That install is `scripts\worktree\ensure-venv.ps1`'s, which `new.ps1` calls -- see
+[Start the session in the worktree](#start-the-session-in-the-worktree) for why it is reachable on its
+own.
 
 **That is CI's install line, and a test holds it there.** `ci.yml`'s test leg installs the same extras
 and the same web console package, and `tests/test_worktree_venv_extras_parity.py` compares the two and
@@ -90,6 +94,62 @@ in parallel without touching each other's files.
 
 > **One-step shortcut:** `scripts\worktree\spawn.ps1 -Name alerts` runs `new.ps1` **and** opens a VS Code
 > window on the new worktree, so you just start the second chat in that window. Same flags as `new.ps1`.
+
+## Start the session in the worktree
+
+**Create the worktree, then start the session IN it** -- the One-step shortcut above does both. A
+session that starts somewhere else and then moves itself is the case this section exists to prevent.
+
+### Relocating does not work from a brief, and costs an owner prompt from a session
+
+`EnterWorktree` behaves differently depending on who calls it, and neither outcome is one you want.
+Measured against the CLI (2.1.246):
+
+| Caller | What happens |
+|---|---|
+| A **subagent** (working directory pinned at launch) | **Refused outright**: `Cannot enter worktree: <path> is not under <primary>\.claude\worktrees.` It never reaches a permission decision, so nobody is asked and nothing can allow it. |
+| A **session** (not pinned) | On first entry from its launch directory it may target any path in `git worktree list`, which includes every sibling. That reaches the permission check and **asks the owner**. |
+
+So briefing a worker to relocate into a `new.ps1` sibling is not merely expensive, it is
+**ineffective** -- the call cannot succeed, and the brief burns the worker's one turn on it. From a
+session the same call raises a dialog offering only **Deny** and **Allow once**: the decision carries
+`classifierApprovable: false`, so no `permissions.allow` rule matches it and there is no "don't ask
+again" row to click.
+
+**Do not engineer around the check.** Making an outside path *resolve* as managed -- a directory
+junction, say -- defeats a deliberate safety control instead of fixing anything.
+
+One caveat, stated because the mechanism is inferred rather than read from the code: a subagent is
+always pinned, so the measurement cannot separate "subagent" from "pinned working directory" as the
+cause. The observed behaviour is what these rules rest on.
+
+### A file-editing subagent: `isolation: worktree`, then bootstrap before the first check
+
+Dispatch it with `isolation: worktree`. It gets its own **managed** worktree, so it never relocates and
+nothing prompts.
+
+**That worktree arrives with no `.venv`**, and without one `pytest` does not run slowly against the
+wrong interpreter -- it **dies at import**. The worker cannot then run the checks its brief requires,
+and the first real signal arrives in CI after its process is gone. Have it run
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1
+```
+
+**before its first `pytest`, `mypy` or `ruff` run** -- not at the top of every brief. On a worktree that
+already has an environment the script prints one line and returns, but a **fresh** managed worktree
+always takes the full install: measured here, **47 seconds and 887 MB** with a warm pip cache. A worker
+that runs no checks should not pay that, and 39 of the 86 nested worktrees on this machine would.
+
+Why the two populations differ, measured 2026-09-16: **21 of 22** `new.ps1` siblings carried a usable
+`.venv`, against **47 of 86** harness-created worktrees. `new.ps1` bootstraps one; the harness creates a
+checkout and installs nothing. Skipping the bootstrap is a false green, for the reason given under
+[Create one](#create-one) above.
+
+### A session a person starts: create first, start second
+
+Use the One-step shortcut above and start the chat in the window it opens. Nothing needs relocating, so
+nothing prompts.
 
 ## Remove one
 
