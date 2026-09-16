@@ -16,6 +16,7 @@ indirection that bypassed the patch would leave that test passing while proving 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -205,14 +206,38 @@ def test_run_single_still_honours_a_patched_subprocess_run(
     assert seen, "run_single did not route through the patched subprocess.run"
 
 
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH")
 def test_run_single_returns_what_subprocess_run_returns(lock_root: Path) -> None:
     """The wrapper must be transparent -- it adds a lock, not a behaviour change."""
-    proc = run_single(["git", "--version"], capture_output=True, text=True, check=False, timeout=60)
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Write-Output ok"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
     assert proc.returncode == 0
-    assert "git" in proc.stdout.lower()
+    assert "ok" in proc.stdout
 
 
-def test_the_storm_counts_are_unchanged(lock_root: Path) -> None:
+def test_run_single_refuses_a_cheap_command(lock_root: Path) -> None:
+    """THE SEAM IS TYPED, NOT CONVENTIONAL, and this is the failure that makes that worth enforcing.
+
+    ``run_single`` is otherwise a total ``subprocess.run`` passthrough, so nothing would stop this
+    tier's hundreds of cheap ``git`` calls being routed through it. Every held ticket extends every
+    concurrent burst's drain wait, so bursts would stop draining, hit ``_BURST_DRAIN_S`` and proceed
+    unsynchronised -- the lock disabling itself, failing open exactly as designed, with nothing red.
+    """
+    with pytest.raises(ValueError, match="interpreter launch"):
+        run_single(["git", "--version"], capture_output=True, text=True)
+
+    # The allowlist is on the BINARY NAME, so a full path and a .exe suffix must still be accepted.
+    assert frozenset({"pwsh", "powershell"}) == _spawn_lock._LOCKED_INTERPRETERS
+    for spelling in (r"C:\Program Files\PowerShell\7\pwsh.exe", "/usr/bin/pwsh", "PowerShell.EXE"):
+        assert Path(spelling).name.lower().removesuffix(".exe") in _spawn_lock._LOCKED_INTERPRETERS
+
+
+def test_the_storm_counts_are_unchanged() -> None:
     """THE REMEDY MUST NOT HAVE WEAKENED WHAT IT PROTECTS, and this is where that is pinned.
 
     Cutting ``RACERS`` was the cheap candidate fix for #1304 and it is the wrong one: ``_race``
@@ -226,6 +251,45 @@ def test_the_storm_counts_are_unchanged(lock_root: Path) -> None:
 
     assert RACERS == 16, "RACERS moved; see tests/_spawn_lock.py for why that is not the #1304 fix"
     assert DRAINS == 8, "DRAINS moved; the same argument applies"
+
+
+def test_a_finished_run_directory_is_reaped_but_a_live_one_is_not(tmp_path: Path) -> None:
+    """The key is per-RUN, so without reaping every pytest run leaks a directory into a shared .git.
+
+    The LIVE arm is the half that matters: a reaper that also deleted the current run's directory
+    would take the lock out from under the run using it, and every test would still pass because the
+    module fails open. So both arms are asserted, not just the deletion.
+    """
+    runs = tmp_path / "pwsh-burst"
+    stale = runs / "old-run"
+    fresh = runs / "recent-run"
+    mine = runs / _spawn_lock._run_id()
+    for d in (stale, fresh, mine):
+        (d / "readers").mkdir(parents=True)
+    old = time.time() - (_spawn_lock._REAP_RUNS_AFTER_S + 3600)
+    os.utime(stale, (old, old))
+    os.utime(mine, (old, old))  # even an OLD-looking current run must survive
+
+    _spawn_lock._reap_finished_runs(runs)
+
+    assert not stale.exists(), "a finished run's directory was left behind"
+    assert fresh.exists(), "a recent run's directory was reaped"
+    assert mine.exists(), "the CURRENT run's own directory was reaped out from under it"
+
+
+def test_the_real_lock_root_resolves() -> None:
+    """THE SILENT NO-OP GUARD, and the reason it exists is that every other test here monkeypatches
+    ``_ROOT``. If ``_lock_root`` returned None in the real checkout the lock would be inert
+    everywhere, the module would fail open exactly as designed, and the whole suite would still be
+    green -- a fix that is not there, reported as one.
+
+    Asserted against the real repository rather than a fixture, because resolving the git common dir
+    is the step that would break.
+    """
+    root = _spawn_lock._lock_root()
+    assert root is not None, "the lock root did not resolve, so the lock is inert in this checkout"
+    assert (root / "readers").is_dir()
+    assert root.name == _spawn_lock._run_id()
 
 
 def test_the_run_id_is_shared_by_xdist_workers_and_private_otherwise(
