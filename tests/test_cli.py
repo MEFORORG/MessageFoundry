@@ -185,6 +185,121 @@ def test_dryrun_redacts_bodies_by_default(
     assert r["message_type"] == "ADT^A01" and r["control_id"] == "MSG1"
 
 
+# --- BACKLOG #1668: a raised exception's text is PHI on the dryrun and check surfaces -------------
+#
+# `test_dryrun_redacts_bodies_by_default` above is blind to this: it runs samples/config, whose handler
+# never raises, so `error` is null there and the assertion over it asserts nothing. These fixtures ship
+# their own handler that DOES raise, quoting PID-5 and PID-3 the way an author debugging a feed does.
+#
+# PHI: every value here is synthetic (CLAUDE.md §9). The raise is built by concatenation, not an
+# f-string, so the advisory `raise-fstring` check does not flag the probe it exists to model.
+PHI_RAISER_CONFIG = """\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import File, handler, inbound, router
+
+inbound("IB_TEST", File(directory="in"), router="r")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def h(msg):
+    raise ValueError("unmapped patient " + str(msg["PID-5"]) + " mrn " + str(msg["PID-3"]))
+"""
+
+# Whole fields, not components: PID-3 and PID-5 each carry >=2 HL7 delimiters, which is what `redact`
+# keys on. A bare component (`PID-3.1` -> "900123456") is the module's own documented residual, so a
+# fixture built from one would assert a guarantee redaction.py does not make. That is also why this is
+# spelled out rather than derived from ADT_A01 above: ADT_A01's `DOE^JANE` carries ONE delimiter, and a
+# `.replace()` off it would silently stop testing redaction the day somebody edits that constant.
+PHI_RAISER_MESSAGE = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
+    "EVN|A01|20260101\r"
+    "PID|1||900123456^^^H^MR||DOE^JANE^Q||19800505|F\r"
+)
+#: Tokens that must not reach stdout on any default path. The prose the author wrote must survive.
+PHI_TOKENS = ("DOE", "JANE", "900123456", "19800505")
+
+
+def _phi_raiser(tmp_path: Path) -> tuple[str, str, str]:
+    """A config dir whose handler raises quoting PHI, plus the two paths the two CLIs want.
+
+    ``check`` takes the fixtures ROOT and walks it; ``dryrun``'s ``read_messages`` does not recurse, so
+    it takes the message FILE. The fixture sits under ``<messages>/IB_TEST/`` so ``check`` runs it
+    against that feed by name rather than by cross-product, which does not depend on the feed's
+    deployed state."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(PHI_RAISER_CONFIG, encoding="utf-8")
+    fixtures = tmp_path / "messages" / "IB_TEST"
+    fixtures.mkdir(parents=True)
+    message = fixtures / "a.hl7"
+    message.write_bytes(PHI_RAISER_MESSAGE.encode("utf-8"))
+    return str(cfg), str(tmp_path / "messages"), str(message)
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_redacts_a_raised_exception_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """Plain and traced ``dryrun`` both withhold the PID values a handler's ``raise`` quoted."""
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace])
+    assert rc == 0
+    out = capsys.readouterr().out
+    results = json.loads(out)
+    assert isinstance(results, list) and len(results) == 1
+    error = results[0]["error"]
+    # The instrument has to have observed a raise at all, or every absence below is vacuous -- which
+    # is exactly how the pre-existing default-redaction test passed while this leak was open.
+    assert error, "the fixture handler did not raise; the assertions below would prove nothing"
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached dryrun stdout"
+    assert "[redacted]" in error
+    # `safe_text`, not a whole-string drop: the stage prefix and the author's own prose survive, which
+    # is the detail an author reaches for dryrun to read.
+    assert "router/handler error:" in error and "unmapped patient" in error
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_show_phi_still_yields_the_raised_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """``--show-phi`` still returns the raw text -- the affordance redacting at the SOURCE would destroy.
+
+    Synthetic data only (CLAUDE.md §9); this is the opt-in arm of the gate, not a licence for real PHI.
+    """
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", "--show-phi", *trace])
+    assert rc == 0
+    error = json.loads(capsys.readouterr().out)[0]["error"]
+    assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
+
+
+def test_check_redacts_a_raised_exception_and_offers_no_opt_in(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``check`` redacts unconditionally, and must never grow a ``--show-phi``.
+
+    It is the commit/CI gate: its stdout is written to a CI log by design, so an opt-in here would put
+    PHI in that log on request. The second half pins that -- an escape hatch added later fails here."""
+    cfg, messages, _message = _phi_raiser(tmp_path)
+    rc = main(["check", "--config", cfg, "--messages", messages, "--no-lint"])
+    assert rc == 1  # the raising fixture fails the required dryrun check
+    out = capsys.readouterr().out
+    dryrun_line = next(ln for ln in out.splitlines() if " dryrun" in ln)
+    assert dryrun_line.startswith("FAIL"), f"dryrun check did not run: {dryrun_line!r}"
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached check stdout"
+    assert "[redacted]" in dryrun_line and "unmapped patient" in dryrun_line
+
+    with pytest.raises(SystemExit):  # argparse: check has no --show-phi, and must not acquire one
+        main(["check", "--config", cfg, "--messages", messages, "--show-phi"])
+
+
 def test_dryrun_splits_batched_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     batch = tmp_path / "batch.hl7"
     batch.write_bytes((ADT_A01 + ADT_A01.replace("MSG1", "MSG2")).encode("utf-8"))

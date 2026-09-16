@@ -691,6 +691,14 @@ class DryRunResult:
     # is what made a decline indistinguishable from a filter (BACKLOG #1690). Connection names, never
     # message content, so no --show-phi gate applies.
     declined: list[str] = field(default_factory=list)
+    # **PHI. Every consumer that prints, logs or serves this must pass it through
+    # `messagefoundry.redaction.safe_error` first** (BACKLOG #1668). It is built unredacted on purpose:
+    # a consumer that holds a `--show-phi` opt-in has to still have the raw text to honor it, so
+    # scrubbing here would close the leak by deleting the feature. Four producers feed it below
+    # (`exc.reason`, `parse error:`, the joined strict-validation errors, `router/handler error:`) and
+    # at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
+    # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
+    # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
 
 

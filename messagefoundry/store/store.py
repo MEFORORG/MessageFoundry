@@ -43,6 +43,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -1487,6 +1488,51 @@ def _qmark_cutoff_case(
     return f"(CASE {column} {' '.join(whens)} ELSE ? END)", params
 
 
+#: Upper bound on :func:`_await_connection_worker_exit`. Measured exits land between 4 microseconds
+#: and 4 milliseconds even on a saturated box, so this is a runaway guard, not a working budget —
+#: it exists so a worker that somehow never breaks cannot reintroduce the #1670 hang.
+_CONNECTION_WORKER_EXIT_TIMEOUT: Final[float] = 5.0
+
+
+async def _await_connection_worker_exit(
+    conn: aiosqlite.Connection, *, timeout: float = _CONNECTION_WORKER_EXIT_TIMEOUT
+) -> None:
+    """Wait until the background thread ``conn`` drove its statements on has actually terminated.
+
+    ``await Connection.close()`` does **not** promise this. aiosqlite hands the close result back
+    with ``call_soon_threadsafe`` and only *then* breaks out of its loop, so the awaiting coroutine
+    can resume — and the caller run all the way to ``threading.enumerate()`` — while the worker is
+    still parked in that very call. Measured on aiosqlite 0.22.1 under CPU contention: the thread is
+    caught at ``core.py:66``, one statement short of its ``break``, and joins in 4us to 4ms.
+
+    That residue matters because the thread is created **without** ``daemon=True``: while it is
+    listed, it is a thread interpreter exit would have to join. #1670 closed the case where nothing
+    closed the connection at all; this closes the window where the close has returned but the thread
+    it stops has not yet gone.
+
+    Polls rather than joining so the event loop is never blocked (a join would park it), bounded by
+    ``timeout`` so a worker that never breaks is logged instead of hanging the caller. Reads
+    aiosqlite's private ``_thread`` and degrades to a no-op if a future release renames it — the
+    wait is a tightening, never a correctness dependency.
+    """
+    thread = getattr(conn, "_thread", None)
+    if not isinstance(thread, threading.Thread) or not thread.is_alive():
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    delay = 0.0  # first pass just yields; the worker usually only needs to be scheduled once
+    while thread.is_alive():
+        if loop.time() >= deadline:
+            log.warning(
+                "aiosqlite worker thread %s still running %.1fs after its connection closed",
+                thread.name,
+                timeout,
+            )
+            return
+        await asyncio.sleep(delay)
+        delay = 0.001 if delay == 0.0 else min(delay * 2.0, 0.05)
+
+
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -2537,6 +2583,11 @@ class MessageStore:
                     log.warning("error closing a partially-opened store", exc_info=True)
             try:
                 await db.close()
+                # `close` returns before the worker thread it stops has left `threading.enumerate()`
+                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
+                # there is — one PRAGMA, then straight out — so the caller most often wins that race
+                # here, and the caller of a raising `open` is entitled to find nothing left behind.
+                await _await_connection_worker_exit(db)
             except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
                 log.warning("error closing the connection after a failed store open", exc_info=True)
             raise
@@ -3780,11 +3831,16 @@ class MessageStore:
         for conn in self._read_conns:
             try:
                 await conn.close()
+                await _await_connection_worker_exit(conn)
             except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
                 log.warning("error closing read-pool connection", exc_info=True)
         self._read_conns = []
         self._read_pool = None
         await self._db.close()
+        # Each close above returns before the worker thread it stops has actually gone, and those
+        # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
+        # to join. Wait them out so "the store is closed" means every thread it owned is gone.
+        await _await_connection_worker_exit(self._db)
 
     # --- write path ----------------------------------------------------------
 
@@ -9859,6 +9915,9 @@ class MessageStore:
                     await self._db.backup(target)
                 finally:
                     await target.close()
+                    # A snapshot runs on a live engine, so the per-backup worker thread must be gone
+                    # before this returns — otherwise a snapshot schedule accretes non-daemon threads.
+                    await _await_connection_worker_exit(target)
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
