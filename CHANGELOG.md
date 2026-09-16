@@ -62,6 +62,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   and BACKLOG #1279.
 
 ### Changed
+- **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
+  claims about startup attestation are corrected.** An install that declares itself editable is exempt
+  from attestation by design, so a dev checkout is never bricked. That exemption silently cancels the
+  fail-closed opt-in, and the code path returned with no log, no audit row and no alert -- so a first
+  deployment that opted into hard enforcement on an editable install would have started with its
+  tripwire disarmed and nothing in the boot log to read. It now logs a WARNING naming the reason. **This
+  reports a misconfiguration; it closes no hole** -- an actor who can write the virtual environment can
+  plant the editable marker or rewrite the check in the same single write. AC-12's exemption is
+  unchanged: still no refusal, no audit row, no alert, and silence under the default alert-only posture.
+  Two ADR 0041 D3 claims were false in the shipped code and are narrowed rather than left standing: the
+  non-editable hash-locked wheel is a **recommended** production default, not an enforced one (nothing
+  in the engine refuses an editable install), and attestation runs **at startup only** -- there is no
+  on-demand surface, no `attest` CLI subcommand and no API route. ADR 0041 D3 also now records the
+  resolution of the baseline's trust domain: the wheel's own `RECORD` stays the baseline, no runtime
+  out-of-domain anchor is adopted, and the control detects an *inconsistent* in-place edit and not a
+  *consistent* one. (BACKLOG #1679)
 - **An Active Directory login is now identified by the directory's immutable id, not by
   `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
   person. The engine resolved an AD principal by that name, so a recycle without a matching
