@@ -2388,13 +2388,11 @@ Four facts that are easy to get wrong, stated plainly first:
   active-client counter is never incremented for the refused peer. The peer therefore observes a
   successful connect followed by an immediate close — not a refused connect and not a backlog wait.
   A peer failing `source_ip_allowlist` is refused the same way. **The telemetry is not uniform:** the
-  **MLLP, raw-TCP and HTTP** listeners emit an ADR 0021 `at_capacity` (and `peer_not_allowlisted`)
-  connection_event; the **X12 and DICOM** listeners refuse identically but emit **no connection event
-  at all** — `transports/x12.py` and `transports/dicom.py` contain zero `_emit_event` call sites. Nor
-  is the fallback uniform: X12's `source_ip_allowlist` refusal is a logged warning
-  (`transports/x12.py:310-312`), but its **`max_connections` refusal is entirely silent** — `:314-315`
-  returns with no event and no log, so a partner failing at capacity leaves **no engine-side evidence
-  of any kind**. Treat that gap as the thing to watch when sizing an X12 feed, not the counter.
+  **MLLP, raw-TCP, X12 and HTTP** listeners emit an ADR 0021 `at_capacity` (and
+  `peer_not_allowlisted`) connection_event; the **DICOM** listener refuses identically but emits **no
+  connection event at all** — `transports/dicom.py` contains zero `_emit_event` call sites. X12 sat
+  in that silent set until BACKLOG #1665 and no longer does: it now records the same seven kinds as
+  its raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
   The slow-loris guard is the **separate**
   `receive_timeout` (default 60 s), not `max_connections`; the HTTP listener additionally answers a
   synchronous `408` when a request read exceeds it.
@@ -2614,7 +2612,7 @@ quarantined to the error directory — charges.
 | MLLP listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed with an `at_capacity` connection_event; the counter is not incremented | the peer reconnects; a slot frees as soon as any client finishes or trips `receive_timeout` |
 | MLLP destination | 1 in-flight delivery per outbound connection (`per_lane`), else the `pooled_max_processing_lanes` budget | a lane waits for a slot; the socket itself is per-delivery unless `persistent=true` | transient failure re-queues into the `RetryPolicy` path; a stale persistent connection is not reused past `idle_timeout_seconds` |
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
-| X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. **No ADR 0021 connection_event is emitted** — `transports/x12.py` emits none at all; an allow-list refusal is a logged warning only, and the at-capacity path emits **no log line either** | as MLLP |
+| X12 listener (inbound) | `max_connections` default 256 concurrent clients | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log | as MLLP |
 | Raw TCP / X12 destination | as MLLP destination — one delivery per outbound lane | a lane waits for a processing slot; a fresh connection is dialled per delivery | transient failure re-queues into the retry path |
 | HTTP web-service listener (inbound) | `max_connections` default 256; `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout` |
 | File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bounds are the poll interval `poll_seconds` (default 1.0), `max_file_bytes` (16 MiB) and `poll_max_files` (500 files per scan, [deferring the rest to the next scan](#per-tick-poll-ceilings)) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
