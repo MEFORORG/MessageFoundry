@@ -1179,6 +1179,7 @@ def _check_dryrun(
 ) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
+    from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
     if messages_dir is None:
@@ -1260,15 +1261,22 @@ def _check_dryrun(
         for ic_name in targets:
             total += 1
             result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            # A Router/Handler's own `raise` can quote field values, so its text goes through
+            # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
+            # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in
+            # a commit hook and a CI log by design, so an opt-in here would put PHI in that log on
+            # request. The conditions still branch on `result.error` rather than on the redacted value —
+            # redaction must never decide whether the gate fails, only what the failure says — and each
+            # call sits inside its failing arm, so a clean run pays nothing for it.
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
                 if actual != expected:
-                    errors.append(
-                        f"{label} @ {ic_name}: expected {expected}, got {result.error or actual}"
-                    )
+                    got = safe_error(result.error) or actual
+                    errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
             elif result.error or result.disposition is MessageStatus.ERROR:
-                errors.append(f"{label} @ {ic_name}: {result.error or result.disposition.value}")
+                shown = safe_error(result.error) or result.disposition.value
+                errors.append(f"{label} @ {ic_name}: {shown}")
     if errors:
         detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
