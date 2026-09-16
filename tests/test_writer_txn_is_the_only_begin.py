@@ -37,8 +37,10 @@ _ALLOWED: dict[str, tuple[int, str]] = {
     ),
     "MessageStore._read": (
         1,
-        "the pooled READ snapshot on a borrowed connection, not self._db; it already unwinds on"
-        " BaseException in its own `except BaseException: ROLLBACK` arm",
+        "the pooled READ snapshot on a borrowed connection, not self._db; the BEGIN's own await is"
+        " inside the guarded region and the unwind goes through the shared `_unwind_txn`, shielded"
+        " and bounded (BACKLOG #1635 -- the earlier `except BaseException: ROLLBACK` arm started"
+        " AFTER the BEGIN and was itself cancellable, so it covered neither case)",
     ),
 }
 
