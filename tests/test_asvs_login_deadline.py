@@ -98,10 +98,14 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> _DeadlineRecorder:
 _DEADLINE_SAMPLES = 3
 assert AuthSettings().lockout_threshold > _DEADLINE_SAMPLES
 
+#: A seam's failure branches: name -> (a callable that drives it, the error it must keep returning).
+#: The call is re-invoked per sample, so it is a factory rather than a coroutine, which can only be
+#: awaited once.
+type _Branches = Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]]
+
 
 async def _least_deadline_offsets(
-    recorder: _DeadlineRecorder,
-    branches: Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]],
+    recorder: _DeadlineRecorder, branches: _Branches
 ) -> dict[str, float]:
     """Drive each branch several times and return its SMALLEST ``deadline - call start``.
 
@@ -112,12 +116,25 @@ async def _least_deadline_offsets(
     slot with no branch-dependent cause. One sample cannot tell that apart from a real side-channel,
     and the numbers it prints look identical: one branch at exactly 2x the others.
 
-    **The minimum is the reading that survives, and it does not weaken the property.** Load can only
-    make a branch read HIGH; nothing makes work finish early. So a branch whose own cost genuinely
-    needs two slots has a minimum of two slots and still reds this assertion, at the same 1 ms
-    tolerance, while a branch pushed there by a stall falls back to its true slot on another sample.
-    This is the shape ``test_the_shipped_budget_leaves_room_above_a_real_argon2_verify`` already uses
-    against the same hazard, for the same stated reason.
+    **The minimum is the reading that survives.** Load can only make a branch read HIGH; nothing makes
+    work finish early. So a branch whose own cost CONSISTENTLY needs two slots has a minimum of two
+    slots and still reds this assertion, at the same 1 ms tolerance, while a branch pushed there by a
+    stall falls back to its true slot on another sample. This is the shape
+    ``test_the_shipped_budget_leaves_room_above_a_real_argon2_verify`` already uses against the same
+    hazard, for the same stated reason.
+
+    **What the minimum costs, stated rather than glossed.** It is biased toward reading clean, so it
+    is weaker than a single sample against a branch that overruns only SOMETIMES — a data-dependent
+    cost that fires on a fraction ``p`` of calls is caught with probability ``p ** _DEADLINE_SAMPLES``,
+    so a 50/50 branch is missed seven times in eight. That is a deliberate trade and not a free one.
+    Two things bound it. A single sample is not the safer alternative: it catches that branch half the
+    time while reporting a stall as a side-channel the rest of the time, which is the failure that
+    evicted PR 1170, and a guard that reds for the wrong reason gets relaxed by whoever is unblocking
+    the queue. And an intermittent branch would have to swing across a whole 500 ms slot to be visible
+    to EITHER form, which against branches costing 0.3-55 ms is a hundredfold regression with louder
+    symptoms than this assertion. Raising ``_DEADLINE_SAMPLES`` is not the lever — it is capped by the
+    lockout threshold above. A statistical test over many samples is, if a branch of that shape is
+    ever suspected; it is not built, because none is.
 
     **Measured 2026-09-16, the eviction this fixes.** ``ad_pathway_retired`` read 1.0000056 against
     0.5000016-0.5000029 for the other four. It is the CHEAPEST branch on the seam, not the dearest:
@@ -246,7 +263,7 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
     """
     service = await _service(engine)
     retired = "Directory password sign-in has been retired; use Windows SSO or OIDC"
-    branches: Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]] = {
+    branches: _Branches = {
         "unknown_username": (
             lambda: service.login("nosuchuser", "definitely-not-it"),
             "invalid credentials",
@@ -395,7 +412,7 @@ async def test_every_kerberos_reject_answers_at_one_deadline(
 
         return _call
 
-    branches: Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]] = {
+    branches: _Branches = {
         "no_principal": (_reject(None), "SSO authentication failed"),
         "not_in_directory": (_reject("stranger"), "user not found in directory"),
         "local_account_conflict": (_reject("jdoe"), "account conflict"),
