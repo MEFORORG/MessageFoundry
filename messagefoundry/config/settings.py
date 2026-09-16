@@ -2263,6 +2263,12 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
+    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
+    # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
+    # leg carrying the client secret, the authorization code and the identity assertion. Same
+    # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
+    oidc_tls_crl_file: str | None = None
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
