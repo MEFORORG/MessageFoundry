@@ -473,6 +473,52 @@ async def test_assertion_failures_never_lock_the_account() -> None:
         await store.close()
 
 
+async def test_a_successful_assertion_clears_the_failure_counter() -> None:
+    """BACKLOG #1638. A SUCCESSFUL assertion clears the counter, and that is NOT a reversal of the
+    divergence the test above pins.
+
+    The two are different directions and only one is recorded in ADR 0068. That decision is about not
+    FEEDING ``_register_failure`` on assertion FAILURE, and it stands, unchanged, above. It says
+    nothing about success -- and since #1638 the password step no longer clears the counter, so
+    whichever leg completes the authentication has to. For a passkey-only account this leg is the only
+    one there is, so without the clear that account's password failures would shed only by waiting the
+    lockout window out.
+
+    The wrong passwords are real failures through the real path, so the count under test is one the
+    lockout machinery actually wrote rather than one the test poked into the row.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await _bootstrap_login(service)
+        auth, token = await _enroll(service, identity, token)
+
+        for _ in range(3):
+            assert (await service.login("admin", "wrong-passphrase-entirely")).ok is False
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == 3, "the failures were not counted"
+
+        out = await service.login("admin", password)
+        assert out.ok and out.token is not None
+        assert out.mfa_required, "the passkey account was not held at the second factor"
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == 3, (
+            "the password step cleared the counter before the passkey was asserted (BACKLOG #1638)"
+        )
+
+        ok, _ = await _assert_once(service, out.token, auth)
+        assert ok is True
+        user = await store.get_user(identity.user_id)
+        assert user is not None
+        assert user.failed_attempts == 0, (
+            "a successful assertion left the failure counter standing, so a passkey-only account "
+            "can only shed password failures by waiting out the lockout window"
+        )
+        assert user.locked_until is None
+    finally:
+        await store.close()
+
+
 async def test_verify_mfa_stays_totp_specific() -> None:
     """A WebAuthn-only user submitting a TOTP code gets a plain refusal — no lockout attempt is
     burned on an unanswerable factor (verify_mfa's totp_enabled check is untouched)."""

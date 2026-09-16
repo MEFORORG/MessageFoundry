@@ -743,10 +743,22 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
             "so vault_transit never applies), and allow_unencrypted writes a CLEARTEXT archive."
         )
     source = (_PKG / "pipeline" / "dr_backup.py").read_text(encoding="utf-8")
-    assert "resolve_active_key" in source and "build_store_cipher" not in source, (
-        "dr_backup now uses build_store_cipher; the doc says vault_transit never applies to a "
-        "backup — re-derive it."
+    assert "resolve_active_key" in source, (
+        "dr_backup no longer resolves the archive key directly; the doc's `.mfbak` seal sentence "
+        "rests on that — re-derive it."
     )
+    # ADR 0049 AC-13 put a SECOND cipher in this module: the full restore-verify opens the extracted
+    # snapshot's CELLS through build_store_cipher, where cipher_provider does apply. The archive's own
+    # seal still does not. This used to assert `build_store_cipher not in source`, which read as "one
+    # cipher here" and would now be a false premise under §11's compensating-control rule — so it pins
+    # the distinction instead: if the module builds the store cipher, §3 must say which governs which.
+    if "build_store_cipher" in source:
+        assert "build_store_cipher" in section3, (
+            "dr_backup builds the STORE cipher (the full restore-verify reads the snapshot's cells "
+            "back through it), and §3's PL-1 rule does not name it. Left unstated, the `.mfbak` "
+            "bullet's 'vault_transit never applies to a backup' reads as covering that read too, and "
+            "it does not — under vault_transit the cell read runs in Transit."
+        )
     assert ".mfbak.plain" in source, (
         "the cleartext-archive path is gone; remove the carve-out from §3 in the same change."
     )

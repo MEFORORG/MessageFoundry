@@ -858,3 +858,89 @@ async def test_no_secret_code_or_token_reaches_the_logs_or_the_audit(
             assert secret not in haystack
     finally:
         await store.close()
+
+
+# --- BACKLOG #1637 / #1638: the OIDC leg of the mirror-row eligibility gate ------------------------
+
+
+async def test_a_disabled_mirror_row_does_not_complete_a_federated_login(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1637's OIDC leg, driven end to end through ``authenticate_oidc``.
+
+    The eligibility gate lives on the shared ``_complete_ad_login`` path, exercised directly in
+    ``test_ad_directory_identity.py``. This test is what turns "the shared path refuses" into "the
+    FEDERATED pathway refuses": everything above the gate -- the token exchange, the signature and
+    nonce verification, the directory resolve -- succeeds, and the login still does not complete.
+
+    The success-audit count is the assertion that matters. A refusal that still wrote
+    ``auth.login_success`` would leave an operator reading a completed sign-in for a disabled
+    account, which is the defect as the ledger row states it.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        first = await _oidc_login(service, monkeypatch, rsa_key)
+        assert first.ok and first.identity is not None
+        await store.set_user_disabled(first.identity.user_id, disabled=True)
+
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok, "a disabled mirror row completed a federated login"
+        assert out.reason == "disabled"
+        assert out.token is None
+        assert len(await _audit_rows(store, "auth.login_success")) == 1, (
+            "the refused federated login wrote a second auth.login_success row"
+        )
+        rows = await _audit_rows(store, "auth.login_failed")
+        assert any('"reason": "disabled"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_a_locked_mirror_row_does_not_complete_a_federated_login(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1638's OIDC leg: the re-login that used to clear a second-factor lock.
+
+    Both halves again, because a fix that adds only the refusal leaves the clearing write in place on
+    every path that still completes.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        first = await _oidc_login(service, monkeypatch, rsa_key)
+        assert first.ok and first.identity is not None
+        user_id = first.identity.user_id
+        locked_until = time.time() + 900.0
+        await store.record_login_failure(user_id, failed_attempts=5, locked_until=locked_until)
+
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.reason == "locked"
+        row = await store.get_user(user_id)
+        assert row is not None
+        assert row.locked_until == pytest.approx(locked_until), "the federated re-login cleared it"
+        assert row.failed_attempts == 5
+    finally:
+        await store.close()
+
+
+def test_the_browser_layer_gives_a_refused_account_no_distinguishing_code() -> None:
+    """The DELIBERATE OMISSION, pinned so nobody "completes" the map (BACKLOG #1637 / #1638).
+
+    ``disabled`` and ``locked`` describe the state of an account the visitor has not authenticated
+    as. A distinct login-page code would confirm to an unauthenticated caller that the account exists
+    and say which of the two states it is in, so both slugs are left out of ``_REASON_TO_CODE`` and
+    collapse to the generic ``oidc_failed``.
+
+    Pinned as a test rather than by comment alone, because the omission looks exactly like an
+    oversight to the next reader of that map. The operator loses nothing: the precise reason is on
+    the ``auth.login_failed`` audit row either way.
+    """
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    for slug in ("disabled", "locked"):
+        assert slug not in _REASON_TO_CODE, (
+            f"{slug!r} gained a distinguishing login-page code; that tells an unauthenticated "
+            "caller the account exists"
+        )
+        assert _REASON_TO_CODE.get(slug, "oidc_failed") == "oidc_failed"

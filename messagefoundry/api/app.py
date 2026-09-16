@@ -2488,6 +2488,7 @@ def create_app(
                 "connection_purge",
                 {"name": name, "scope": scope},
                 requester=identity.username,
+                requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
@@ -2982,6 +2983,7 @@ def create_app(
                 "dead_letter_replay",
                 {"channel_id": req.channel_id, "destination_name": req.destination_name},
                 requester=identity.username,
+                requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
@@ -3029,7 +3031,11 @@ def create_app(
             raise HTTPException(503, "approval workflow is not available")
         try:
             outcome = await gate.approve(
-                approval_id, approver=identity.username, client=client_ip(request)
+                approval_id,
+                approver=identity.username,
+                # BACKLOG #1540: the self-approval refusal keys on the immutable id, not the name.
+                approver_user_id=identity.user_id,
+                client=client_ip(request),
             )
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
@@ -3089,6 +3095,7 @@ def create_app(
                 "config_reload",
                 {"config_dir": req.config_dir, "requester": user.username},
                 requester=user.username,
+                requester_user_id=user.user_id,
                 client=client_ip(request),
             )
             if pending is not None:

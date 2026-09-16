@@ -17,7 +17,7 @@ claims move with it.
 | Workflow | What it does |
 |---|---|
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
-| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals and are not required yet -- see *Consolidating the seven security contexts* below. |
+| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals and **both are now required**, so during the overlap every scan runs twice and both copies gate the merge -- see *Consolidating the seven security contexts* below. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
@@ -49,6 +49,8 @@ The stable contexts required on `main` are — mirroring
 - `semgrep (project SAST rules)`
 - `crypto-inventory (ASVS 11.1.3 discovery gate)`
 - `forbidden-content (customer/PHI leak guard)`
+- `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)`
+- `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
 
@@ -113,7 +115,8 @@ day, and both files were deleted on 2026-09-13 (BACKLOG #1490).
 
 ### Consolidating the seven security contexts
 
-`security.yml` owns **seven** of the thirteen required contexts, and each is a separate job that
+`security.yml` owns **nine** of the fifteen required contexts: the seven original scan jobs, plus the
+two composites now required alongside them. Each is a separate job that
 acquires a separate runner slot. Five of the seven finish inside **55 seconds**, so seven
 acquisitions buy about four minutes of scanning. A slot is the scarce resource here: peak concurrency
 measured **exactly 20**, the free-plan ceiling for an organisation, and healthy pull requests have
@@ -121,30 +124,69 @@ been evicted from the merge queue for want of a runner. Measured over one week t
 workflow spent about **8,211 slot-starts** for about **4,770 execution-minutes**.
 
 Two composite jobs now run those seven scans in two slots, worth roughly 4,700 to 5,900 slot-starts a
-week at no coverage cost -- the same scanners, the same arguments, the same findings:
+week at no coverage cost -- the same scanners, the same arguments, the same findings. **None of that
+saving is realised yet**: the composites run beside the originals, so the overlap costs two extra slots
+a run and pays only at step 3 below. The two are:
 
 | Composite job | Consolidates |
 | --- | --- |
 | `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)` | the four scans of the checked-out tree, which share one Python setup |
 | `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)` | the dependency audits and the secret scan, which share a full-history checkout |
 
-**A required context is a job NAME, so this lands in four steps and only the first is done.** Deleting
+**A required context is a job NAME, so this lands in four steps and the first two are done.** Deleting
 the seven jobs while branch protection still names them wedges every pull request in the repository:
 protection waits forever for a context nothing produces. Moving protection first, to names nothing
 yet reports, wedges it identically -- that is the required-but-absent trap below, and on 2026-07-30
 ten required contexts sat on disabled workflows that still carried their files and job names.
 
 1. **Done.** The composites run **alongside** the seven. Both sets report; nothing was deleted.
-2. **The owner** adds the two composite names to branch protection.
-3. **A later PR** deletes the seven original jobs and syncs `.github/required-contexts.txt`, this
-   page, and the job classification in `tests/test_security_posture.py`.
-4. **The owner** removes the seven original names from branch protection.
+2. **Done** (some time between 2026-09-13 22:41Z and 2026-09-14 06:59Z). The owner added the two
+   composite names to branch protection, taking the required set from thirteen to fifteen.
+   `.github/required-contexts.txt`, this page and `tests/test_security_posture.py` were synced to
+   match on 2026-09-15 -- a day late, which is the finding recorded at the end of this section.
+3. **Still to do, and it needs the owner in the same window.** A later PR deletes the seven original
+   **jobs** and drops their seven lines from `.github/required-contexts.txt`, the bullet list above,
+   and the classification in `tests/test_security_posture.py`.
+4. **The owner** removes the seven original **names** from branch protection.
 
-During the overlap the workflow carries two copies of every scan.
+**Steps 3 and 4 in that order open the required-but-absent trap between them**, and that is a defect in
+this plan as written rather than a subtlety of it: once the seven jobs are deleted, protection still
+names seven contexts nothing can report, and every pull request in the repository is wedged until step
+4 lands. Whoever takes step 3 must either get step 4 in the same window or invert the pair -- the
+protection edit first, the deletion second, which is the order `.github/required-contexts.txt` already
+prescribes for adding a context. Do not discover this by wedging the repository.
+
+During the overlap the workflow carries two copies of every scan, and **both copies are required**, so
+a finding blocks the merge twice over rather than once.
 `tests/test_security_composite_parity.py` asserts each copied body is **byte-identical** to its
 original, which is what makes the duplication safe to review: every control this repository already
 asserts about an original step is an assertion about a string the copy shares, so step 3 is a
 deletion rather than a rewrite.
+
+#### Step 2 landed on the server and nothing in the repository noticed for a day
+
+Recorded because the gap, not the two missing lines, is the durable finding. From step 2 until
+2026-09-15 branch protection required fifteen contexts while `.github/required-contexts.txt` named
+thirteen, and the two it omitted were the two its own header described as deliberately absent and
+blocking nothing. So the checked-in claim asserted the **opposite** of the server, in the direction that
+reads as reassuring: a context this file does not name looks advisory.
+
+Two things follow, and the second is the one worth keeping.
+
+`tests/test_required_contexts.py` stayed green throughout. Every assertion in it compares in-repo text
+to in-repo text -- the file against this page, against the workflow job names, against a pinned count --
+so the whole suite agreed with itself while the server moved underneath it. Its own comments predicted
+this; the pin's caution that it "goes stale in the direction that looks fine" was written after the same
+thing happened on 2026-09-04.
+
+`scripts/ci/check_required_contexts_drift.py` **did** catch it, on the first cron after the change, and
+reported to nobody. It reads the live API, `required-workflow-state.yml` runs it on a 07:00 UTC cron and
+on every pull request, and that workflow is **not a required context** -- so it failed every run in the
+window and no merge, label or notice surfaced the failure. The detector that exists for exactly this
+defect found it immediately and could not tell anyone. Two sessions counting passing checks against the
+file read a pull request as fully green with two required contexts unreported; one escaped only because
+it counted against branch protection instead. Giving that workflow a consumer is a separate change from
+this one, and deliberately not folded in here -- it is an alerting design over shared CI, not a doc sync.
 
 ### "What was required when this merged" is not answerable
 

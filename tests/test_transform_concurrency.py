@@ -13,9 +13,10 @@ These tests pin the two hard invariants the seam must never break:
 * **strict-FIFO** — a message's routed rows targeting the SAME destination still yield outbound rows in
   the original (routed-row) order, and message N's rows still commit before N+1's for a lane. The
   reorder test FAILS if the handoff were applied in transform-COMPLETION order instead of claim order.
-* **at-least-once** — a crash mid-batch (a handoff raises after K of N committed) recovers via
-  ``reset_stale_inflight`` and re-derives an IDENTICAL delivered set + per-destination order, no dupes,
-  no loss.
+* **at-least-once** — a crash mid-batch (a handoff raises after K of N committed) recovers via the
+  transform worker's own except-arm re-pend (BACKLOG #1611) and re-derives an IDENTICAL delivered set +
+  per-destination order, no dupes, no loss. It used to take ``reset_stale_inflight`` at the next engine
+  start; that call is still made in the test, now as a no-op proving nothing was left in flight.
 
 Plus a liveness proof (a ``threading.Barrier(N)`` inside the handlers only clears if N transforms run
 concurrently) and the default-off byte-identity (concurrency cap 1 == the sequential path).
@@ -53,7 +54,7 @@ from messagefoundry.config.wiring import (
     SetState,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, Stage
 from messagefoundry.transports import base as transport_base
 from messagefoundry.transports.base import DeliveryResponse, DestinationConnector
 
@@ -130,6 +131,17 @@ async def _wait_until(pred: Any, timeout: float = 5.0, tick: float = 0.02) -> No
         elapsed += tick
         if elapsed > timeout:
             raise AssertionError("condition not met within timeout")
+
+
+async def _routed_status_counts(store: MessageStore, channel_id: str) -> dict[str, int]:
+    """Surviving routed-stage rows for one inbound, counted by status. ``transform_handoff`` DELETEs
+    the row it consumes (the raw is canonical in ``messages.raw``), so what is left here is exactly
+    the tail the transform worker never got to."""
+    cur = await store._db.execute(
+        "SELECT status, COUNT(*) AS c FROM queue WHERE stage=? AND channel_id=? GROUP BY status",
+        (Stage.ROUTED.value, channel_id),
+    )
+    return {row["status"]: row["c"] for row in await cur.fetchall()}
 
 
 def _runner(reg: Registry, store: MessageStore, *, concurrency: int, batch: int) -> RegistryRunner:
@@ -295,9 +307,14 @@ async def test_crash_midbatch_recovers_identical_and_in_order(
     store: MessageStore, sink: list[tuple[str, str]], tmp_path: Path
 ) -> None:
     """One message → N handlers → the SAME destination D with ordered payloads p0..p{N-1}. Inject a
-    handoff fault on p2 the FIRST time it is applied (after p0, p1 committed). The worker backs off,
-    leaving p2..p{N-1} INFLIGHT; ``reset_stale_inflight`` re-pends them and a restarted runner re-runs
-    them. The final D delivery is EXACTLY p0..p{N-1}, in order, each once — no dupes, no loss."""
+    handoff fault on p2 the FIRST time it is applied (after p0, p1 committed). The worker's except arm
+    hands p2..p{N-1} back to PENDING (BACKLOG #1611) and backs off; a runner re-runs them. The final D
+    delivery is EXACTLY p0..p{N-1}, in order, each once — no dupes, no loss.
+
+    Before #1611 the tail stayed INFLIGHT and only ``reset_stale_inflight`` at the next engine start
+    could free it, so this test restarted the runner around that call. The restart is kept because it
+    also proves the recovery survives a process boundary, but the recovery itself no longer needs one.
+    """
     inbox = tmp_path / "in"
     _drop(inbox)
     n = 5
@@ -336,18 +353,26 @@ async def test_crash_midbatch_recovers_identical_and_in_order(
     runner = _runner(reg, store, concurrency=n, batch=n)
     await runner.start()
     try:
-        # Fault fires; p0, p1 delivered. The remaining rows are stuck INFLIGHT (no further progress).
+        # Fault fires; p0, p1 delivered. #1611's except arm re-pends the tail with a backoff deadline
+        # one _WORKER_ERROR_BACKOFF_SECONDS out, so it is PENDING-but-not-yet-due for this window.
         await _wait_until(lambda: fired["done"] and len(sink) == 2)
-        # A beat to confirm no further deliveries happen while the tail is stranded INFLIGHT.
+        # A beat to confirm no further deliveries happen while the tail waits out that backoff.
         await asyncio.sleep(0.2)
         assert sorted(p for _, p in sink) == ["p0", "p1"]
     finally:
         await runner.stop()
 
-    # Recover: restore the store, re-pend the INFLIGHT tail (engine-startup behavior), restart.
+    # Recover: restore the store and restart. The tail is already PENDING — the transform worker's
+    # except arm handed it back in place (#1611), so nothing waits on an engine start any more.
     store.transform_handoff = original_handoff  # type: ignore[method-assign]
+    # PIN the re-pend, don't merely tolerate it: p2..p4 are the three routed rows transform_handoff
+    # never consumed, and all three must read 'pending'. A silent regression in the except arm leaves
+    # them 'inflight' and this dict stops matching.
+    assert await _routed_status_counts(store, "IB") == {"pending": n - 2}
+    # Kept as the PROOF, not as the recovery: reset_stale_inflight was the only thing that could free
+    # this tail before #1611, and it now finds nothing in flight to free.
     recovered = await store.reset_stale_inflight()
-    assert recovered >= 1  # p2..p4 (routed rows) came back to pending
+    assert recovered == 0
 
     runner2 = _runner(reg, store, concurrency=n, batch=n)
     await runner2.start()

@@ -850,13 +850,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> PasswordResetResponse:
         """Admin password reset (ASVS 6.4.6 / WP-L3-12): issue a one-time, must-change credential the
         administrator never keeps. Returned **once** for out-of-band delivery; the affected user is also
-        notified by email. Use change-password for your own account."""
+        notified by email. Use change-password for your own account.
+
+        BACKLOG #1141 (ASVS 6.4.5): the response also carries ``expires_at``, the instant the login
+        gate stops accepting this credential, so the administrator conveying it out-of-band can state
+        the deadline. Nothing else on this path ever reaches the holder."""
         if user_id == identity.user_id:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "use change-password for your own account"
             )
         try:
-            temp = await service.admin_reset_password(user_id, actor=identity.username)
+            issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
             detail = str(exc)
             code = (
@@ -865,7 +869,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
-        return PasswordResetResponse(temp_password=temp)
+        return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
     @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)
     async def reset_user_mfa(

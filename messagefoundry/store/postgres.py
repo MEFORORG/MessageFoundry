@@ -536,13 +536,21 @@ _SCHEMA: list[str] = [
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
         params       TEXT NOT NULL,
+        -- `requester` is a DISPLAY label; `requester_user_id` is the authorization key. See the
+        -- Store protocol's create_pending_approval (BACKLOG #1540).
         requester    TEXT NOT NULL,
+        requester_user_id TEXT,
         requested_at DOUBLE PRECISION NOT NULL,
         status       TEXT NOT NULL DEFAULT 'pending',
         approver     TEXT,
         decided_at   DOUBLE PRECISION,
         expires_at   DOUBLE PRECISION
     )""",
+    # BACKLOG #1540: the immutable requester id for a pre-existing pending_approvals table; a no-op on
+    # a fresh DB (the CREATE above has it). Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once
+    # per schema version rather than taking ACCESS EXCLUSIVE on every open, and so adding it moves
+    # _schema_hash() automatically — no _MIGRATION_REV bump is needed or wanted.
+    "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT",
     "CREATE INDEX IF NOT EXISTS ix_pending_approvals_status"
     " ON pending_approvals(status, requested_at)",
     """CREATE TABLE IF NOT EXISTS users (
@@ -6174,26 +6182,28 @@ class PostgresStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES ($1,$2,$3,$4,$5,'pending',$6)",
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
             approval_id,
             operation,
             params,
             requester,
+            requester_user_id,
             requested_at,
             expires_at,
         )
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
         row: Row | None = await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = $1",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = $1",
             approval_id,
         )
         return row
@@ -6201,6 +6211,7 @@ class PostgresStore:
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
             " expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
