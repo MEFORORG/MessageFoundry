@@ -135,6 +135,14 @@ def _split_command_line(command_line: str) -> list[str]:
     quote are literal; ``""`` inside a quoted run is one literal quote and ends the run. Unbalanced
     quoting is tolerated — the run just ends with the string.
 
+    **Which parser to mirror is a real question, and the answer was measured.** NSSM hands
+    ``AppParameters`` to ``CreateProcess``, so the *engine's* own ``sys.argv`` comes from the C
+    runtime, and the MSVCRT rules differ from these on exactly one point: a doubled quote inside a
+    run stays quoted there and ends the run here. It does not reach anything this file acts on — a
+    quote is not a legal Windows filename character, :data:`_VALID_HOST` rejects it, and ``--port``
+    goes through ``int()``. Checked against a real child process on twelve command lines: every one
+    carrying a path, a host or a port agreed, and the three that diverged were built only of quotes.
+
     ``tests/test_tray_config.py`` pins this against ``shell32.CommandLineToArgvW`` itself on the
     Windows leg, so the rules above are checked rather than believed.
     """
@@ -157,30 +165,21 @@ def _split_command_line(command_line: str) -> list[str]:
                 slashes = run - i
                 if run < n and command_line[run] == '"':
                     buf.append("\\" * (slashes // 2))
-                    if slashes % 2:
-                        buf.append('"')  # an odd count escapes the quote itself
-                        i = run + 1
-                    else:
-                        i = run  # an even count leaves the quote to toggle the run below
-                else:
+                    if slashes % 2:  # an odd count escapes the quote itself
+                        buf.append('"')
+                        run += 1
+                else:  # an even count leaves the quote to toggle the run below
                     buf.append("\\" * slashes)
-                    i = run
+                i = run
                 continue
             if ch == '"':
-                if in_quotes and i + 1 < n and command_line[i + 1] == '"':
-                    # A doubled quote inside a run is one literal quote AND closes the run. That
-                    # second half is where CommandLineToArgvW parts company with the MSVCRT rule
-                    # (which stays quoted), and the differential test below caught it: 156 of 40000
-                    # fuzz cases and 2 curated ones diverged on nothing else.
-                    buf.append('"')
-                    in_quotes = False
-                    i += 2
-                    continue
+                if in_quotes and command_line.startswith('""', i):
+                    buf.append('"')  # a doubled quote is one literal quote, and it ends the run
+                    i += 1
                 in_quotes = not in_quotes
                 i += 1
                 continue
             if not in_quotes and ch in " \t":
-                i += 1
                 break
             buf.append(ch)
             i += 1

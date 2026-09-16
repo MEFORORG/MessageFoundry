@@ -25,68 +25,61 @@ from messagefoundry.tray.config import (
     service_toml_path,
 )
 
+_SPLIT_CASES = [
+    # The BACKLOG #1565 case: str.split() kept the quotes AND split inside them, so this
+    # yielded '"C:\\Program' and 'Files\\MF\\x.toml"' -- two paths that cannot exist.
+    (
+        'serve --service-config "C:\\Program Files\\MF\\x.toml"',
+        ["serve", "--service-config", "C:\\Program Files\\MF\\x.toml"],
+    ),
+    # A quoted path with NO space broke identically, so the defect is the quoting, not spaces.
+    ('--service-config "C:\\svc\\x.toml"', ["--service-config", "C:\\svc\\x.toml"]),
+    # The equals form, quoted: one token, which _iter_options splits afterwards.
+    ('--service-config="C:\\P F\\x.toml"', ["--service-config=C:\\P F\\x.toml"]),
+    # Unquoted backslash paths survive untouched -- the case that works today, and the one
+    # shlex(posix=True) would destroy ("C:datax.toml").
+    ("C:\\data\\x.toml", ["C:\\data\\x.toml"]),
+    ("\\\\server\\share\\x.toml", ["\\\\server\\share\\x.toml"]),
+    # Windows separators are space and tab only; runs of them collapse.
+    ("serve\t--host\t127.0.0.1", ["serve", "--host", "127.0.0.1"]),
+    ("   serve    --host  ::1   ", ["serve", "--host", "::1"]),
+    ("", []),
+    ("   ", []),
+    # 2n backslashes before a quote halve and toggle the run; 2n+1 escape the quote itself.
+    ('"C:\\MF\\\\"', ["C:\\MF\\"]),
+    ('x\\\\"y z', ["x\\y z"]),
+    ('x\\\\\\"y z', ['x\\"y', "z"]),
+    # A doubled quote inside a run is one literal quote and ENDS the run -- see the tokenizer's
+    # docstring, where CommandLineToArgvW parts company with the MSVCRT rule. Here that makes the
+    # LATER quote reopen a run, so the space after 'b' is literal and this is ONE argument.
+    # Verified against shell32 rather than reasoned: the first expectation written here was
+    # ['a"b', 'c'], and the oracle disagreed.
+    ('"a""b" c', ['a"b c']),
+    ('a """ b', ["a", '"', "b"]),
+    ('""""', ['"']),
+    ('"""""', ['"']),
+    # Malformed quoting is tolerated rather than raising: the run ends with the string.
+    ('--service-config "C:\\svc\\x.toml', ["--service-config", "C:\\svc\\x.toml"]),
+    # An empty quoted value is a real, empty argument.
+    ('--service-config ""', ["--service-config", ""]),
+    # Apostrophes are NOT a Windows quoting form: they stay in the token, so the path really is
+    # named with them. Pinned because it looks like a gap and is not one.
+    ("--service-config 'C:\\q\\x.toml'", ["--service-config", "'C:\\q\\x.toml'"]),
+    ('"a b" "c d"', ["a b", "c d"]),
+]
 
-@pytest.mark.parametrize(
-    ("line", "argv"),
-    [
-        # The BACKLOG #1565 case: str.split() kept the quotes AND split inside them, so this
-        # yielded '"C:\\Program' and 'Files\\MF\\x.toml"' -- two paths that cannot exist.
-        (
-            'serve --service-config "C:\\Program Files\\MF\\x.toml"',
-            ["serve", "--service-config", "C:\\Program Files\\MF\\x.toml"],
-        ),
-        # A quoted path with NO space broke identically, so the defect is the quoting, not spaces.
-        ('--service-config "C:\\svc\\x.toml"', ["--service-config", "C:\\svc\\x.toml"]),
-        # The equals form, quoted: one token, which _iter_options splits afterwards.
-        ('--service-config="C:\\P F\\x.toml"', ["--service-config=C:\\P F\\x.toml"]),
-        # Unquoted backslash paths survive untouched -- the case that works today, and the one
-        # shlex(posix=True) would destroy ("C:datax.toml").
-        ("C:\\data\\x.toml", ["C:\\data\\x.toml"]),
-        ("\\\\server\\share\\x.toml", ["\\\\server\\share\\x.toml"]),
-        # Windows separators are space and tab only; runs of them collapse.
-        ("serve\t--host\t127.0.0.1", ["serve", "--host", "127.0.0.1"]),
-        ("   serve    --host  ::1   ", ["serve", "--host", "::1"]),
-        ("", []),
-        ("   ", []),
-        # 2n backslashes before a quote halve and toggle the run; 2n+1 escape the quote itself.
-        ('"C:\\MF\\\\"', ["C:\\MF\\"]),
-        ('x\\\\"y z', ["x\\y z"]),
-        ('x\\\\\\"y z', ['x\\"y', "z"]),
-        # A doubled quote inside a run is one literal quote and ENDS the run -- see the tokenizer's
-        # docstring, where CommandLineToArgvW parts company with the MSVCRT rule. Here that makes
-        # the LATER quote reopen a run, so the space after 'b' is literal and this is ONE argument.
-        # Verified against shell32 rather than reasoned: the first expectation written here was
-        # ['a"b', 'c'], and the oracle disagreed.
-        ('"a""b" c', ['a"b c']),
-        ('a """ b', ["a", '"', "b"]),
-        # Malformed quoting is tolerated rather than raising: the run ends with the string.
-        ('--service-config "C:\\svc\\x.toml', ["--service-config", "C:\\svc\\x.toml"]),
-        # An empty quoted value is a real, empty argument.
-        ('--service-config ""', ["--service-config", ""]),
-    ],
-)
+
+@pytest.mark.parametrize(("line", "argv"), _SPLIT_CASES)
 def test_split_command_line(line: str, argv: list[str]) -> None:
     assert _split_command_line(line) == argv
 
 
-_ORACLE_CASES = [
-    "",
-    "serve --host 127.0.0.1 --port 8765",
-    'serve --service-config "C:\\Program Files\\MessageFoundry\\mefor.toml"',
-    'serve --service-config="C:\\Program Files\\MF\\mefor.toml"',
-    "serve --service-config C:\\svc\\mefor.toml",
-    'serve --service-config "C:\\MF\\\\"',
-    'serve --service-config "C:\\unbalanced\\x.toml',
+# Lines the oracle below also checks, where the real function is the only expectation worth
+# writing down: quoting no operator produces, plus the quoted host and port from the row.
+_ORACLE_EXTRA = [
     'serve --host "127.0.0.1" --port "8765"',
-    "serve\t--host\t127.0.0.1\t--port\t8765",
-    'serve --service-config ""',
     'serve --service-config "a""b.toml"',
-    "serve --service-config 'C:\\quoted\\x.toml'",
-    '"a b" "c d"',
-    'x\\\\"y z',
-    'x\\\\\\"y z',
-    '""""',
-    '"""""',
+    "serve\t--host\t127.0.0.1\t--port\t8765",
     " leading and trailing ",
 ]
 
@@ -99,6 +92,9 @@ def test_split_command_line_matches_the_win32_oracle() -> None:
     must be unit-testable on any OS), so ctypes appears HERE and nowhere in the shipped path. The
     oracle parses ``argv[0]`` under its own rules, so every case is prefixed with a bare program
     token and compared from element 1.
+
+    It runs over ``_SPLIT_CASES`` itself, so a case added to the table above is checked against the
+    real function too rather than only against a hand-written expectation.
     """
     import ctypes
     import random
@@ -117,11 +113,11 @@ def test_split_command_line_matches_the_win32_oracle() -> None:
         if not argv:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
-            return [argv[i] for i in range(count.value)][1:]
+            return [argv[i] for i in range(1, count.value)]
         finally:
             kernel32.LocalFree(ctypes.cast(argv, wintypes.HLOCAL))
 
-    for case in _ORACLE_CASES:
+    for case in [line for line, _ in _SPLIT_CASES] + _ORACLE_EXTRA:
         assert _split_command_line(case) == oracle(case), f"curated case {case!r}"
 
     # Seeded fuzz over the characters the rules turn on, so a regression in any branch shows up as
