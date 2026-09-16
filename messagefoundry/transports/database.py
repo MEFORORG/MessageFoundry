@@ -157,8 +157,10 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
     byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
     — defense-in-depth for the ADR 0010 read-only carve-out, layered with the statement guard in
-    :func:`_require_read_only` (note: ApplicationIntent is only honored by a SQL Server Always-On read
-    replica, a no-op otherwise — the statement guard is the load-bearing control)."""
+    :func:`_require_read_only`. **Neither layer is read-only authority.** ApplicationIntent is honored
+    only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
+    shape test on text. The control that actually refuses a write is the privilege of the account this
+    DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
@@ -1388,12 +1390,26 @@ class DatabaseLookupExecutor:
     ``DatabaseLookup`` specs (``env()``-resolved + ``[egress].allowed_db``-checked by the runner). Lazily
     opens one read-only ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
     while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
-    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction. Pools
-    are autocommit — a lookup is read-only, so each query is its own implicit transaction; nothing here
-    writes. **Read-only is enforced** (ADR 0010), not merely documented: every statement is gated by
-    :func:`_require_read_only` (must begin SELECT/WITH, no chained writes/EXEC) and the pool DSN carries
-    ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Production / supported (SQL Server
-    via the ``[sqlserver]`` extra), like the DATABASE connector."""
+    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction.
+
+    **Read-only here is a statement test, not read-only authority, and the difference is load-bearing.**
+    Two layers sit in front of a lookup: :func:`_require_read_only` refuses a statement that does not
+    open with SELECT/WITH or that carries a write/EXEC keyword or a chained statement, and the pool DSN
+    carries ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Neither is authority.
+    ApplicationIntent is honored only by a SQL Server Always-On read replica and is a no-op elsewhere
+    (:func:`_build_dsn`), and pools here are opened **autocommit**, so a write that got past the
+    statement test would commit rather than be rolled back. What actually bounds this connection is the
+    privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
+    (BACKLOG #1574). ADR 0010 states the same shape as a read-only *convention*: "the executor neither
+    commits nor exposes a write path."
+
+    Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
+    ``SET TRANSACTION READ ONLY``, so there is no read-only transaction to open in its place.
+
+    Production / supported (SQL Server via the ``[sqlserver]`` extra), like the DATABASE connector.
+    ``db_lookup`` is SQL-Server-only: ``__init__`` calls :func:`_build_dsn` directly rather than the
+    :func:`_build_connection` dialect dispatcher, so the ``generic`` ODBC dialect the DATABASE connector
+    accepts is not reachable from here (ADR 0010, "SQL Server backend only")."""
 
     def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
@@ -1436,8 +1452,10 @@ class DatabaseLookupExecutor:
         """Run ``statement`` against ``connection`` and return rows as ``{column: value}`` dicts.
 
         Always parameterized (``:name`` → positional ``?``, bound from ``params`` — a value can never
-        inject SQL) and **read-only enforced** (the statement must be a SELECT/WITH query — see
-        :func:`_require_read_only`). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
+        inject SQL) and statement-gated: the text must pass :func:`_require_read_only` (a SELECT/WITH
+        query carrying no write keyword and no second statement) before anything executes. That gate is
+        a statement test, not read-only authority — see this class's docstring for what actually bounds
+        the connection. Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
         non-read-only statement, a missing parameter, or a DB/driver error — the transform worker turns
         it into that message's ``ERROR`` /
         dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
