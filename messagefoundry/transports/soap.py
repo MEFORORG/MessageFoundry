@@ -464,7 +464,11 @@ class SoapDestination(DestinationConnector):
         )
 
         # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
-        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
+        # #1660: and the instance [tls] trust-anchor policy, resolved for the TOKEN host, so the hop
+        # that carries the client_secret honours the same internal CA the delivery hop already does.
+        self._token_provider = bearer_provider_from_settings(
+            s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
+        )
         if self._token_provider is not None:
             refuse_cleartext_credentials(
                 scheme,
