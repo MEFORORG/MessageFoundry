@@ -133,43 +133,30 @@ def test_host_console_row_is_gone(tmp_path: Path) -> None:
     assert "host.console" not in {r.id for r in results}
 
 
-class _HttpxBlocker:
-    """A meta_path finder that makes httpx un-importable (simulates a no-[console] install)."""
+def test_no_flash_targets_stay_wheel_only() -> None:
+    """Replaces the ``httpx_absent`` pair this diff deletes (#1713).
 
-    def find_spec(self, name: str, path: object = None, target: object = None) -> None:
-        if name == "httpx" or name.startswith("httpx."):
-            raise ModuleNotFoundError("No module named 'httpx'")
-        return None
+    Those blocked ``httpx`` to simulate a missing ``[console]`` extra, but nothing on the host path
+    imports ``httpx``, so both were vacuous — and off Windows the check now returns SKIP before
+    importing anything at all. Their comments also described a ``[console]`` extra that
+    ``pyproject.toml`` has never had, which is half of what #1713 is about.
 
-
-@pytest.fixture
-def httpx_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Evict cached httpx + console modules so find_spec re-runs the parent __init__ (a cached spec
-    # would otherwise mask the crash), then block httpx at import time.
-    import sys
-
-    for mod in list(sys.modules):
-        if mod == "httpx" or mod.startswith("httpx.") or mod.startswith("messagefoundry.console"):
-            monkeypatch.delitem(sys.modules, mod, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [_HttpxBlocker(), *sys.meta_path])
-
-
-def test_console_no_window_no_crash_without_httpx(httpx_absent: None) -> None:
-    # Regression (Bug B): on a [sqlserver]-only box (no [console] extra, so no httpx) this crashed
-    # the whole `verify --section host` run with ModuleNotFoundError. After the lazy-console fix the
-    # source still ships, so the check completes honestly (MANUAL or SKIP) rather than raising.
-    r = checks.check_console_no_window()
-    assert r.id == "host.noflash"
-    assert r.status in (Status.MANUAL, Status.SKIP)
-    assert r.status is not Status.FAIL
-
-
-def test_run_host_checks_never_errors_without_httpx(httpx_absent: None, tmp_path: Path) -> None:
-    # The whole host suite must still complete (no raise, no ERROR) on a non-[console] box.
-    results = checks.run_host_checks(ports={"MLLP": 2575}, writable_dir=tmp_path)
-    assert results
-    for r in results:
-        assert r.status is not Status.ERROR, f"{r.id} errored: {r.detail}"
+    What genuinely needs pinning is the property those tests were reaching for: the no-flash check
+    imports its targets for real, so a third-party dep creeping into either would turn a host row
+    into a SKIP on a minimal install."""
+    for name in checks._NO_WINDOW_MODULES:
+        tree = ast.parse(Path(importlib.import_module(name).__file__ or "").read_text("utf-8"))
+        roots = {
+            (node.module or "").split(".")[0]
+            if isinstance(node, ast.ImportFrom)
+            else node.names[0].name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import | ast.ImportFrom)
+        }
+        third_party = roots - set(sys.stdlib_module_names) - {"messagefoundry"}
+        assert not third_party, (
+            f"{name} grew a third-party import {third_party}; host checks must stay wheel-only"
+        )
 
 
 # ---- self smoke -------------------------------------------------------------------------------
@@ -807,12 +794,11 @@ def test_disposition_helpers_never_create_the_store(tmp_path: Path) -> None:
 
 
 def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
-    """The gate must not fire where nothing would be created: ``:memory:`` writes no file, and
-    neither server backend ``CREATE DATABASE``s, so a wrong name there already fails at connect."""
+    """The gate fires only where a *file* would be created. ``:memory:`` writes none, and the server
+    backends are out of its reach — see :func:`smoke.missing_sqlite_store` for what that leaves
+    open on Postgres and SQL Server, which is a real limit rather than a clean bill."""
     assert smoke.missing_sqlite_store(StoreSettings(path=":memory:")) is None
     for backend in (StoreBackend.SQLSERVER, StoreBackend.POSTGRES):
-        # A server backend cannot even be configured without a real DSN, which is the other half of
-        # why it needs no gate: a wrong database name fails at connect rather than being created.
         settings = StoreSettings(
             backend=backend,
             path="does-not-exist.db",
@@ -821,6 +807,42 @@ def test_missing_sqlite_store_gate_is_scoped_to_sqlite_on_disk() -> None:
             username="mefor_svc",
         )
         assert smoke.missing_sqlite_store(settings) is None
+
+
+def test_every_open_store_in_verify_goes_through_the_gate() -> None:
+    """#1708's invariant, pinned structurally instead of asserted in a docstring.
+
+    The three call sites are correct today and one PR away from being false again, with nothing to
+    notice — which is the same failure shape #1713 fixes in this very change: a check that stays
+    green through the regression it names. An AST walk, in the pattern
+    :func:`test_verify_does_not_import_the_generators` already uses on this package."""
+    verify_dir = Path(smoke.__file__).parent
+    gated, ungated = [], []
+    for source_file in sorted(verify_dir.glob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            called = {
+                sub.func.id
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+            }
+            if "open_store" not in called:
+                continue
+            where = f"{source_file.name}::{node.name}"
+            (gated if "missing_sqlite_store" in called else ungated).append(where)
+
+    assert not ungated, (
+        f"{ungated} call open_store without missing_sqlite_store first, so verify would create the "
+        "SQLite store it reports on (#1708)"
+    )
+    # Positive control: an instrument that finds no open_store at all would pass vacuously.
+    assert sorted(gated) == [
+        "smoke.py::check_smoke_disposition",
+        "smoke.py::check_store_connectivity",
+        "smoke.py::newest_message_id",
+    ]
 
 
 # ---- report -----------------------------------------------------------------------------------

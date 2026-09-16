@@ -248,7 +248,6 @@ def check_console_no_window() -> CheckResult:
             Status.SKIP,
             f"no console-window flash off Windows (CREATE_NO_WINDOW does not exist on {sys.platform})",
         )
-    checked: list[str] = []
     for name in _NO_WINDOW_MODULES:
         try:
             module = importlib.import_module(name)
@@ -263,7 +262,7 @@ def check_console_no_window() -> CheckResult:
                 f"{name}._NO_WINDOW is {flag!r} on Windows — console-flash guard regressed",
             )
         origin = getattr(module, "__file__", None)
-        if not origin:
+        if not origin:  # defensive: import_module just loaded it, so __file__ is set in practice
             return CheckResult(rid, title, Status.SKIP, f"{name} has no source file to inspect")
         try:
             missing = _spawns_without_creationflags(Path(origin).read_text(encoding="utf-8"))
@@ -277,14 +276,13 @@ def check_console_no_window() -> CheckResult:
                 f"{name} spawns a subprocess without creationflags= ({', '.join(missing)}) — "
                 "console-flash guard regressed",
             )
-        checked.append(f"{name} (_NO_WINDOW={flag:#x})")
     return CheckResult(
         rid,
         title,
         Status.MANUAL,
         "every sc.exe spawn passes CREATE_NO_WINDOW; visually confirm no console flashes "
         "during the Status-page poll",
-        evidence="; ".join(checked),
+        evidence=", ".join(_NO_WINDOW_MODULES),
     )
 
 

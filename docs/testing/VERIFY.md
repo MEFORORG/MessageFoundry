@@ -45,21 +45,35 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 
 ### What writes, and what does not
 
-**Only `--smoke live` writes anything.** It sends one synthetic message, which the engine persists.
-Everything else reads.
+**`verify` no longer creates a store or a directory that was not already there** (BACKLOG #1708).
+`host.writable` used to run `mkdir(parents=True)` before probing, and `store.connect` used to open
+the SQLite store through a schema-ensure that creates an absent file. Both now FAIL and name the
+path instead.
 
-That is a rule the tool now keeps, rather than a description of how it happens to behave. `verify`
-used to create the two things it reported on: `host.writable` ran `mkdir(parents=True)` before
-probing, and `store.connect` opened the SQLite store through a schema-ensure that creates an absent
-file. Both now FAIL and name the path instead (BACKLOG #1708).
+So a mistyped `[store].path` is now a FAIL where it used to be a PASS — the check was passing
+because it made whatever it was pointed at. Run `messagefoundry serve` once before
+`--section store`. And running `verify` elevated no longer leaves an administrator-owned store and
+directory tree at the configured path, which is the service-identity gap the `store.connect` row's
+own text tells you to go and confirm.
 
-Two consequences worth knowing before you run it on a fresh box:
+**That is narrower than "verify only reads", and the difference matters on a live box.** Three
+things still write:
 
-- **A mistyped `[store].path` is now a FAIL.** Previously it was a PASS, because the check made
-  whatever it was pointed at. Run `messagefoundry serve` once before `--section store`.
-- **Running `verify` elevated no longer leaves administrator-owned files behind.** That mattered
-  because the store and its directory would then be owned by *you*, not the NSSM service account —
-  the exact identity gap the `store.connect` row's own text tells you to go and confirm.
+| What | When | What it writes |
+|---|---|---|
+| `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
+| `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
+| `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
+
+Two limits of the SQLite gate to know before pointing `verify` at something you care about:
+
+- **It is scoped to SQLite.** On PostgreSQL and SQL Server, `open_store` builds the full schema in
+  whatever database it is pointed at. A wrong-but-*existing* database name — `postgres`, or a
+  sibling application's — connects and gets populated, and reports PASS. Only a wrong database
+  *name* fails at connect. Check `[store].database` before running `--section store` against a
+  server backend.
+- **It stops creation, not writing.** Against a store that does exist, `store.connect` still runs
+  the schema-ensure as *you*. If you are elevated, that is still the identity gap above.
 
 ### Handling a captured `id_token`
 

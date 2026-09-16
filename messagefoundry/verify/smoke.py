@@ -336,9 +336,15 @@ def missing_sqlite_store(store: StoreSettings) -> Path | None:
     store it is about to report on. Read-only intent is not enough — ``newest_message_id`` and
     ``check_smoke_disposition`` only ever read, and both created a database to do it.
 
-    ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop. The server
-    backends need no gate: neither ``CREATE DATABASE``s, so a wrong database name already fails at
-    connect.
+    ``:memory:`` creates nothing on disk and so is outside what this gate exists to stop.
+
+    **Scoped to SQLite, and that is a real limit rather than a proof the others are safe.** What the
+    server backends do not do is ``CREATE DATABASE``, so a wrong database *name* fails at connect.
+    They do build the whole schema into a database that *does* exist: ``open_store`` runs the same
+    ensure-and-migrate on all three. So a Postgres store pointed at ``postgres``, or at a sibling
+    application's database, is still populated by a PASSing check — the same defect one level up
+    from the file. Closing that needs a per-backend schema-presence probe, which is not this gate;
+    ``docs/testing/VERIFY.md`` carries the operator-facing warning meanwhile.
     """
     if store.backend is not StoreBackend.SQLITE or store.path == ":memory:":
         return None
@@ -358,12 +364,10 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
     running ``verify`` elevated on a fresh box left an administrator-owned store at the configured
     path before the service started under another identity.
 
-    The server backends need no gate: neither ``CREATE DATABASE``s, so a wrong database name there
-    already fails at connect.
+    The gate covers SQLite only, and :func:`missing_sqlite_store` says what that leaves open on the
+    server backends.
     """
     import asyncio
-
-    from messagefoundry.store.base import open_store
 
     rid, title = "store.connect", "Store connectivity"
     absent = missing_sqlite_store(store)
@@ -376,6 +380,10 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             "or check [store].path (verify does not create it for you)",
             evidence=str(absent),
         )
+
+    # Below the gate on purpose: store.base pulls store.store and aiosqlite, the edge this module's
+    # TYPE_CHECKING block exists to defer. The FAIL above needs one stat, not the store stack.
+    from messagefoundry.store.base import open_store
 
     async def _open_close() -> None:
         handle = await open_store(store)
@@ -408,10 +416,12 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     without creating — one (BACKLOG #1708; see :func:`missing_sqlite_store`)."""
     import asyncio
 
-    from messagefoundry.store.base import open_store
-
     if missing_sqlite_store(store) is not None:
         return None
+
+    from messagefoundry.store.base import (
+        open_store,
+    )  # below the gate — see check_store_connectivity
 
     async def _newest() -> str | None:
         handle = await open_store(store)
@@ -474,19 +484,21 @@ def check_smoke_disposition(
     """
     import asyncio
 
-    from messagefoundry.store.base import open_store
-    from messagefoundry.store.store import MessageStatus
-
+    rid, title = "smoke.disposition", "Live smoke disposition"
     absent = missing_sqlite_store(store)
     if absent is not None:
         return CheckResult(
-            "smoke.disposition",
-            "Live smoke disposition",
+            rid,
+            title,
             Status.FAIL,
             f"no SQLite store at {absent} — is the engine running and pointed at this same store? "
             "(check [store].path; verify does not create it for you)",
             evidence=str(absent),
         )
+
+    # Below the gate — see check_store_connectivity.
+    from messagefoundry.store.base import open_store
+    from messagefoundry.store.store import MessageStatus
 
     terminal = {
         MessageStatus.PROCESSED.value,
@@ -516,10 +528,5 @@ def check_smoke_disposition(
     try:
         status = asyncio.run(_poll())
     except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
-        return CheckResult(
-            "smoke.disposition",
-            "Live smoke disposition",
-            Status.ERROR,
-            f"could not read the store disposition: {exc}",
-        )
+        return CheckResult(rid, title, Status.ERROR, f"could not read the store disposition: {exc}")
     return _classify_disposition(status, control_id=control_id, timeout=timeout)
