@@ -92,19 +92,54 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await PostgresStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
-    # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
-    # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
-    # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
-    await s._load_state_cache()
-    await s._load_reference_cache()
-    # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
+        # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
+        # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
+        # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
+        await s._load_state_cache()
+        await s._load_reference_cache()
+        # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    Drives the fixture's own async generator with the last setup step raising;
+    ``store.__wrapped__`` is the undecorated function pytest keeps on the fixture object.
+    Without the try/finally the generator walks away from an open pool, so a single bad setup
+    would leak one handle per test and every later test would error on the connection cap
+    instead of on the real fault, leaving the true cause visible in one report out of many.
+    This is test infrastructure, so it carries no deployment axis.
+    """
+    from messagefoundry.store.postgres import PostgresStore
+
+    opened: list[PostgresStore] = []
+
+    async def _boom(self: PostgresStore) -> None:
+        opened.append(self)
+        raise RuntimeError("fixture setup failed after open")
+
+    monkeypatch.setattr(PostgresStore, "_load_reference_cache", _boom)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "the patched setup step never ran, so the rest of this test asserts nothing"
+    assert opened[0]._pool.is_closing(), "the fixture left its pool open on the failure path"
 
 
 # --- parity tests (mirror tests/test_sqlserver_store.py) -----------------------
