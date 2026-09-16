@@ -61,6 +61,12 @@ _log = logging.getLogger(__name__)
 
 #: Service-side reject reasons mapped to the login page's allow-listed short codes. Anything not in
 #: here collapses to ``oidc_failed`` — an unrecognised slug must never become a reflected error code.
+#:
+#: ``disabled`` and ``locked`` (BACKLOG #1637 / #1638) are ABSENT ON PURPOSE — do not "complete" this
+#: map. Both slugs describe the state of an account the visitor has not authenticated as, so a
+#: distinct code on the login page would confirm to an unauthenticated caller that the account exists
+#: and say which of the two states it is in. The collapse to ``oidc_failed`` is the control. The
+#: operator still gets the precise reason: it is on the ``auth.login_failed`` audit row.
 _REASON_TO_CODE = {
     "state_unknown": "flow_binding_missing",
     "state_mismatch": "flow_binding_missing",
