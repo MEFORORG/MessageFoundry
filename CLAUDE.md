@@ -833,6 +833,14 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   status glyphs: an instrument that cannot find those proves nothing by returning zero anywhere else.
   **Do not print a glyph to a Windows console while measuring** — a stock cp1252 terminal raises
   `UnicodeEncodeError` and kills the run mid-report, which happened during this very census.
+- **A command you give the owner runs in PowerShell 7, not bash.** They paste it into a terminal or
+  press Run, so hand them the pwsh spelling. Bash-only forms that are a parse error there: `<<<`
+  here-strings and `<<EOF` heredocs (pwsh uses `@'` ... `'@`, closing delimiter at column 0), an
+  inline `VAR=x cmd` prefix (`$env:VAR = 'x'; cmd`), `2>/dev/null` (`2>$null`), and backtick command
+  substitution (the backtick is pwsh's escape character). `&&`, `||` and `$(...)` all work in
+  PowerShell 7, so do not overcorrect those. Where only the bash form is tested, give both and say
+  which is which. Measured 2026-09-16: a `gh api ... --input - <<< '{...}'` line went to the owner as
+  the one step only they could run.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
