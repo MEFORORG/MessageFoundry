@@ -56,7 +56,7 @@ _LANE_ONLY = frozenset({"sqlserver"})
 
 
 def _lane_extras() -> set[str]:
-    """The default (non -Sqlserver) extras `new.ps1` installs."""
+    """The default (non -Sqlserver) extras `ensure-venv.ps1` installs."""
     text = _VENV_PS1.read_text(encoding="utf-8")
     m = re.search(
         r"^\$extras = if \(\$Sqlserver\) \{ \"([^\"]+)\" \} else \{ \"([^\"]+)\" \}", text, re.M
@@ -128,7 +128,8 @@ def test_each_extra_this_item_added_is_declared_in_pyproject(extra: str) -> None
     it next, and only after the venv is half-built."""
     pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(rf"^{re.escape(extra)}\s*=\s*\[", pyproject, re.M), (
-        f"new.ps1 installs the {extra!r} extra but pyproject.toml declares no such optional dependency"
+        f"ensure-venv.ps1 installs the {extra!r} extra but pyproject.toml declares no such optional "
+        f"dependency"
     )
 
 

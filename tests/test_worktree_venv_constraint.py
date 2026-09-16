@@ -107,7 +107,7 @@ def test_the_constraint_file_the_bootstrap_names_actually_exists() -> None:
 def test_the_bootstrap_matches_the_posture_ci_documents() -> None:
     """CI is the reference. If it stops constraining, this guard is enforcing a stale rule.
 
-    Asserted in this direction on purpose: the point is not "new.ps1 contains a flag", it is
+    Asserted in this direction on purpose: the point is not "ensure-venv.ps1 contains a flag", it is
     "developer provisioning agrees with CI provisioning". Should CI ever move off constraints.lock,
     this fails and forces the two to be reconciled deliberately rather than drifting apart again.
     """
@@ -120,6 +120,7 @@ def test_the_bootstrap_matches_the_posture_ci_documents() -> None:
     assert not ci_unconstrained, (
         "ci.yml has an editable project install without --constraint:\n  "
         + "\n  ".join(ci_unconstrained)
-        + "\nIf that is deliberate, new.ps1's constraint is now enforcing a rule CI no longer follows; "
+        + "\nIf that is deliberate, ensure-venv.ps1's constraint is now enforcing a rule CI no longer "
+        "follows; "
         "reconcile the two in one change."
     )

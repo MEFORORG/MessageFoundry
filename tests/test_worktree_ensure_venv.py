@@ -8,13 +8,13 @@ own ``--worktree``, the desktop app and ``isolation: worktree`` subagents build 
 ``<primary>/.claude/worktrees/`` and install nothing. Measured 2026-09-16 on the author's machine:
 **21 of 22** siblings carried a usable ``.venv`` against **47 of 86** nested ones.
 
-WHY THAT MATTERS BEYOND CONVENIENCE. A session in the venv-less half runs ``pytest`` against whatever
-interpreter ``PATH`` offers rather than the locked one, and the extras-gated suites skip at *module*
-scope rather than failing -- the same false green ``tests/test_worktree_venv_extras_parity.py`` exists
-for. It also had a second-order cost: a session that wanted a working environment took a SIBLING and
-then relocated into it with ``EnterWorktree``, which the harness prompts the owner for every time,
-because the path is outside ``.claude/worktrees/`` (see docs/WORKTREES.md, "Start the session in the
-worktree"). Closing the venv gap is what makes the prompt-free entry point usable.
+WHY THAT MATTERS BEYOND CONVENIENCE. Without a venv ``pytest`` does not run slowly against the wrong
+interpreter -- it **dies at import**, so the worker cannot run the checks its brief requires and the
+first real signal arrives in CI after its process is gone. It also had a second-order cost: a session
+that wanted a working environment took a SIBLING and then tried to relocate into it, which from a
+subagent is refused outright and from a session asks the owner. Closing the venv gap is what makes the
+prompt-free entry point usable. Both behaviours are recorded once, in docs/WORKTREES.md section "Start
+the session in the worktree".
 
 WHAT IS ASSERTED HERE, AND WHAT IS NOT. The refusal and no-op paths are DRIVEN as a subprocess -- they
 are fast and touch nothing. The install path is not executed: it creates a venv and downloads the
