@@ -1606,6 +1606,11 @@ class TrustAnchorPolicy:
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
+    #: ``[tls].crl_file`` — a PEM CRL (or CA+CRL bundle) applied to the OUTBOUND hops this policy
+    #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
+    #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
+    #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
+    crl_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1628,16 +1633,28 @@ class TrustAnchor:
 
     cafile: str | None
     load_system_roots: bool
+    #: A CRL to load onto this hop's context, turning on ``VERIFY_CRL_CHECK_LEAF`` (BACKLOG #299).
+    #: ``None`` — no revocation checking on this hop, the pre-#299 behaviour. Resolved per hop by
+    #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
+    #: configures one.
+    crl_file: str | None = None
 
     @property
     def narrows(self) -> bool:
-        """Whether this anchor names a CA of its own, i.e. whether it changes anything.
+        """Whether this anchor changes anything about how this hop verifies its peer.
 
-        The one predicate a caller needs: an anchor that names no CA resolves to the OS trust store,
-        which is what every hop had before an anchor was resolvable at all. Callers that must choose
-        between a shared, unanchored client and a per-connection one read THIS rather than spelling
-        out the ``cafile is not None`` test, so the five HTTP-family call sites cannot drift apart."""
-        return self.cafile is not None
+        The one predicate a caller needs. An anchor that names neither a CA nor a CRL resolves to the
+        plain OS trust store, which is what every hop had before an anchor was resolvable at all.
+        Callers that must choose between a shared, unanchored client and a per-connection one read THIS
+        rather than spelling out the test, so the five HTTP-family call sites cannot drift apart.
+
+        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared,
+        module-level opener whenever the anchor does not narrow. That opener is built once at import,
+        before any config is loaded, so a CRL could never reach it — a hop that answered "nothing to
+        narrow" here would silently keep the unrevoked shared opener while its guard was told
+        revocation was checked. Widening this predicate is what routes such a hop onto its own
+        opener, with its own context, carrying its own CRL."""
+        return self.cafile is not None or self.crl_file is not None
 
 
 #: The anchor a hop that configures nothing resolves to: the OS trust store, no private CA. The
@@ -1665,20 +1682,31 @@ def resolve_trust_anchor(
     #. Else (a non-loopback internal hop with an internal CA and ``augment``/``pinned``): ``pinned`` →
        ONLY the internal CA (no public bundle); ``augment`` → the OS roots plus the internal CA.
 
-    This only chooses WHICH roots verify the peer — it never turns verification off — so it composes
-    with the connectors' fail-closed no-CA / ``tls_verify=false`` / cleartext-hop refusals rather than
-    weakening them."""
+    ``policy.crl_file`` rides along on **every** non-loopback arm, including the per-connection-CA arm
+    and the ``system`` default (BACKLOG #299). Revocation is orthogonal to which roots anchor the hop:
+    a connection that pins its own CA still wants its issuer's CRL checked, and an instance that pins
+    no CA at all still wants revocation on its public-CA hops. A **loopback** hop gets ``None`` — the
+    same exemption ``internal_ca_file`` has, for the stronger reason that ``VERIFY_CRL_CHECK_LEAF``
+    refuses a peer whose issuer has no CRL in the store, so applying an org CRL to an on-box peer from a
+    different local PKI would break traffic the revocation guard already treats as safe.
+
+    This only chooses WHICH roots verify the peer and WHETHER a CRL is consulted — it never turns
+    verification off — so it composes with the connectors' fail-closed no-CA / ``tls_verify=false`` /
+    cleartext-hop refusals rather than weakening them."""
+    # Loopback is exempt from BOTH the internal anchor and the CRL; resolved once so the arms below
+    # cannot disagree about it.
+    crl = None if is_loopback_hop_host(host) else policy.crl_file
     if connection_ca_file is not None:
         # Per-connection pin wins verbatim (single-anchor, no OS roots — the historical behaviour).
-        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False)
+        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False, crl_file=crl)
     if policy.mode == "system" or policy.internal_ca_file is None or is_loopback_hop_host(host):
-        # Unchanged: OS trust store only (byte-identical default / loopback exemption).
-        return TrustAnchor(cafile=None, load_system_roots=True)
+        # Unchanged trust store: OS roots only (byte-identical default / loopback exemption).
+        return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl)
     if policy.mode == "pinned":
         # ONLY the internal CA — the forward_tls_ca_file template (no public bundle).
-        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False)
+        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False, crl_file=crl)
     # augment: OS roots + the internal CA.
-    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True)
+    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True, crl_file=crl)
 
 
 def build_verifying_client_context(
@@ -1692,14 +1720,21 @@ def build_verifying_client_context(
     the ``create_default_context`` secure defaults) — the caller layers the TLS floor / KEX / strict
     flags / optional mTLS client cert exactly as before. Purpose is a parameter only so a future
     client-auth context could reuse it; every current caller verifies a *server* cert."""
+    ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
         if anchor.cafile is not None:
             # augment: keep the OS default roots loaded above and add the internal CA on top.
             ctx.load_verify_locations(cafile=anchor.cafile)
-        return ctx
-    # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
-    return ssl.create_default_context(purpose, cafile=anchor.cafile)
+    else:
+        # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
+        ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
+    # BACKLOG #299: the CRL loads LAST, once the trust store is final -- harden_crl_check asserts the
+    # CRL actually landed in that store, and a later load_verify_locations would make the assertion
+    # answer for a different store than the one the handshake uses.
+    if anchor.crl_file is not None:
+        harden_crl_check(ctx, anchor.crl_file)
+    return ctx
 
 
 #: urllib's ALPN advertisement — see :func:`build_anchored_https_handler` for why it is replayed.
@@ -1737,12 +1772,18 @@ def build_anchored_https_handler(
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
     if anchor.load_system_roots:
-        # augment: urllib's OWN context, with the internal CA loaded on top. Nothing is replayed
-        # because nothing is rebuilt — the only change is one more trusted root.
+        # augment (and the CRL-only shape below): urllib's OWN context, with the internal CA and/or the
+        # CRL loaded on top. Nothing is replayed because nothing is rebuilt -- the only changes are one
+        # more trusted root and, with a CRL, the revocation flag.
         handler = build_asserted_https_handler(connector=connector)
-        urllib_handler_context(handler, connector=connector).load_verify_locations(
-            cafile=anchor.cafile
-        )
+        ctx = urllib_handler_context(handler, connector=connector)
+        if anchor.cafile is not None:
+            ctx.load_verify_locations(cafile=anchor.cafile)
+        # BACKLOG #299: `system` mode plus a CRL narrows without naming a CA, so this arm now runs with
+        # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
+        # CRL still loads last, against the final trust store.
+        if anchor.crl_file is not None:
+            harden_crl_check(ctx, anchor.crl_file)
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)
@@ -1771,8 +1812,21 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     Worth stating plainly, because the direction is counter-intuitive: this hop is not one of the
     broadly-trusting ones. ``requests`` defaults to the PUBLIC certifi bundle, not the OS store, so an
     internal-CA Vault fails closed today rather than being widely trusted. What was missing here is
-    the ability to reach such a Vault at all."""
-    if not anchor.narrows:
+    the ability to reach such a Vault at all.
+
+    A ``crl_file`` on the anchor is **refused** for the same reason ``augment`` is (BACKLOG #299):
+    ``verify=`` names one bundle and cannot carry a revocation flag, so honouring the CA while dropping
+    the CRL would report a revocation-checked hop that checks nothing. Unreachable today -- both Vault
+    callers build a default :class:`TrustAnchorPolicy`, which has no CRL -- and written anyway, because
+    the day the instance policy is threaded to these hops the silent drop is the failure that would
+    land."""
+    if anchor.crl_file is not None:
+        raise ValueError(
+            f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
+            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy or "
+            f"leave the CRL unset rather than have it silently ignored here."
+        )
+    if anchor.cafile is None:
         return None
     if anchor.load_system_roots:
         raise ValueError(

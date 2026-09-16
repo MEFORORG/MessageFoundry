@@ -1079,7 +1079,7 @@ class ApiSettings(_Section):
 
 
 class TlsSettings(_Section):
-    """``[tls]`` — the instance-wide client **trust-anchor** policy (#190, ADR 0093).
+    """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
     A small, shared fallback for outbound connectors that verify a downstream *server* certificate
     (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
@@ -1100,6 +1100,20 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
+    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
+    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
+    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    #
+    # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
+    # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
+    # covered hops present, and it must be refreshed before its nextUpdate. Both failures are
+    # fail-CLOSED (the handshake is refused, nothing crosses unverified), and harden_crl_check refuses an
+    # already-expired or unloadable CRL at construction rather than at the first partner handshake.
+    # LOOPBACK HOPS ARE EXEMPT for that reason -- an on-box peer is usually issued by a different,
+    # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
+    # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
+    crl_file: str | None = None
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1122,7 +1136,9 @@ class TlsSettings(_Section):
         outbound so a connector's client-verify context resolves the same anchor at build_check and
         live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
         return TrustAnchorPolicy(
-            internal_ca_file=self.internal_ca_file, mode=self.trust_anchor_mode
+            internal_ca_file=self.internal_ca_file,
+            mode=self.trust_anchor_mode,
+            crl_file=self.crl_file,
         )
 
 

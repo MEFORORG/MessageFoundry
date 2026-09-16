@@ -35,14 +35,21 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
+    TrustAnchorPolicy,
     active_hop_posture,
+    build_anchored_https_handler,
+    context_checks_revocation,
     revocation_hop_disposition,
+    urllib_handler_context,
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.remotefile import _ftps_ssl_context
+from messagefoundry.transports.rest import http_family_trust_anchor
 
 # The postures the gradient keys on. `is_phi` went with BACKLOG #1279 -- only the dial is left.
 PROD_PHI = HopPosture(enforcing=True)
@@ -508,3 +515,143 @@ def test_email_cleartext_refuses_via_settings_not_revocation(
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="cleartext"):
         EmailDestination(email_cfg(REMOTE, use_tls=False))
+
+
+# --- BACKLOG #299: [tls].crl_file reaches each hop's OWN context, and closes that hop's guard --------
+#
+# The item records per-hop CRL scoping as the binding risk: one instance-wide crl_file must never
+# silence a guard on a hop whose handshake does not consult it. So every assertion below reads
+# VERIFY_CRL_CHECK_LEAF off the context the connector will really hand to wrap_socket, via
+# context_checks_revocation -- never off the setting, and never off a look-alike built beside it.
+
+
+@pytest.fixture(scope="module")
+def crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads. Synthetic."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("crl299") / "ca_and_crl.pem"
+    path.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+    return str(path)
+
+
+def _crl_policy(crl: str) -> TrustAnchorPolicy:
+    """The shipped default plus a CRL -- `system` mode, no internal CA. The arm most hops reach."""
+    return TrustAnchorPolicy(crl_file=crl)
+
+
+def test_mllp_outbound_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    cfg = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": REMOTE, "port": 5000, "tls": True},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    with active_hop_posture(PROD_PHI):
+        dest = MLLPDestination(cfg)  # constructs: the CRL closes the guard that otherwise refuses
+    assert context_checks_revocation(dest._ssl) is True
+    # NEGATIVE CONTROL on the SAME connector: no CRL, and both the flag and the refusal come back.
+    bare = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": REMOTE, "port": 5000, "tls": True},
+    )
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        MLLPDestination(bare)
+
+
+def test_dicom_scu_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    # The SCU (outbound C-STORE), not the SCP. dicom.py's only harden_crl_check call site sits in the
+    # SCP's `if ca:` mTLS branch, so this hop had no revocation checking at all.
+    ctx = _dicom_client_ssl_context(
+        {"tls": True, "host": REMOTE, "port": 11112},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    assert context_checks_revocation(ctx) is True
+    bare = _dicom_client_ssl_context({"tls": True, "host": REMOTE, "port": 11112})
+    assert context_checks_revocation(bare) is False
+
+
+def test_ftps_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    ctx = _ftps_ssl_context(
+        {"host": REMOTE, "tls_verify": True}, trust_anchor_policy=_crl_policy(crl_bundle)
+    )
+    assert context_checks_revocation(ctx) is True
+    bare = _ftps_ssl_context({"host": REMOTE, "tls_verify": True})
+    assert context_checks_revocation(bare) is False
+
+
+def test_smtp_context_checks_revocation_with_a_configured_crl(crl_bundle: str) -> None:
+    cfg = email_cfg(REMOTE)
+    cfg = cfg.model_copy(update={"trust_anchor_policy": _crl_policy(crl_bundle)})
+    with active_hop_posture(PROD_PHI):
+        dest = EmailDestination(cfg)  # constructs: the CRL closes the guard
+    assert context_checks_revocation(dest._tls_context) is True
+
+
+@pytest.mark.parametrize("cell", _HTTP_CELLS)
+def test_http_family_opener_context_checks_revocation_with_a_configured_crl(
+    cell: str, crl_bundle: str
+) -> None:
+    """The HTTP family resolves the same anchor through ``http_family_trust_anchor``.
+
+    A CRL-only anchor has to ``narrow``, or these cells fall back to the module-level opener that was
+    built at import time and can carry no CRL -- the hop would then keep an unrevoked context."""
+    _ctype, factory, url = _HTTPS[cell]
+    anchor = http_family_trust_anchor(
+        factory(url=url).settings, url=url, trust_anchor_policy=_crl_policy(crl_bundle)
+    )
+    assert anchor.narrows is True  # or the shared unrevoked opener is reused
+    handler = build_anchored_https_handler(anchor=anchor, connector="probe")
+    assert context_checks_revocation(urllib_handler_context(handler, connector="probe")) is True
+    # NEGATIVE CONTROL: no CRL, no flag, and the anchor does not narrow.
+    bare = http_family_trust_anchor(factory(url=url).settings, url=url, trust_anchor_policy=None)
+    assert bare.narrows is False
+    bare_handler = build_anchored_https_handler(anchor=bare, connector="probe")
+    assert (
+        context_checks_revocation(urllib_handler_context(bare_handler, connector="probe")) is False
+    )
+
+
+def test_a_loopback_hop_gets_no_crl_and_still_crosses(crl_bundle: str) -> None:
+    # The exemption, end to end: an on-box peer is usually issued by a local PKI the org CRL does not
+    # cover, and VERIFY_CRL_CHECK_LEAF refuses a peer whose issuer has no CRL in the store. The guard
+    # already ALLOWs loopback, so applying the CRL there would break working traffic for no gain.
+    cfg = Destination(
+        name="OB_MLLP",
+        type=ConnectorType.MLLP,
+        settings={"host": LOOPBACK, "port": 5000, "tls": True},
+        trust_anchor_policy=_crl_policy(crl_bundle),
+    )
+    with active_hop_posture(PROD_PHI):
+        dest = MLLPDestination(cfg)
+    assert context_checks_revocation(dest._ssl) is False
