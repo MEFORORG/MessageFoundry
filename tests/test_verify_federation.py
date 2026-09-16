@@ -75,9 +75,12 @@ def _mint(key: rsa.RSAPrivateKey, **over: Any) -> str:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("ascii")
-    return CompactJwtSigner(private_key=pem, algorithm=SignatureAlgorithm.RS256, key_id="k1").sign(
-        claims
-    )
+    return CompactJwtSigner(
+        private_key=pem,
+        algorithm=SignatureAlgorithm.RS256,
+        key_id="k1",
+        setting="test_idp_signing_key",
+    ).sign(claims)
 
 
 def _mint_raw(key: rsa.RSAPrivateKey, claims: dict[str, Any]) -> str:
@@ -87,9 +90,12 @@ def _mint_raw(key: rsa.RSAPrivateKey, claims: dict[str, Any]) -> str:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("ascii")
-    return CompactJwtSigner(private_key=pem, algorithm=SignatureAlgorithm.RS256, key_id="k1").sign(
-        claims
-    )
+    return CompactJwtSigner(
+        private_key=pem,
+        algorithm=SignatureAlgorithm.RS256,
+        key_id="k1",
+        setting="test_idp_signing_key",
+    ).sign(claims)
 
 
 def _settings(**over: Any) -> ServiceSettings:

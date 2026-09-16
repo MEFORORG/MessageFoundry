@@ -63,7 +63,12 @@ def _jwks_bytes(*jwks: dict[str, Any]) -> bytes:
 def _mint(key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any]) -> str:
     # The signer stamps `kid` into the JWS header from key_id — which is exactly what the claims
     # ladder reads to select the verifying key, mirroring a real IdP.
-    signer = CompactJwtSigner(private_key=_pem(key), algorithm=SignatureAlgorithm.RS256, key_id=kid)
+    signer = CompactJwtSigner(
+        private_key=_pem(key),
+        algorithm=SignatureAlgorithm.RS256,
+        key_id=kid,
+        setting="test_idp_signing_key",
+    )
     return signer.sign(dict(claims))
 
 
