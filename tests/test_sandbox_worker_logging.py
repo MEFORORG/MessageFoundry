@@ -77,7 +77,6 @@ def test_the_stdout_rebind_sits_between_the_frame_capture_and_the_boot_read() ->
         Path(__file__).resolve().parents[1] / "messagefoundry" / "pipeline" / "_sandbox_worker.py"
     ).read_text(encoding="utf-8")
     main = named_func(ast.parse(source), "main")
-    nodes = list(ast.walk(main))
 
     def _call_line(name: str) -> int:
         lines = [n.lineno for n in call_sites(main, name, bare_only=True)]
@@ -87,7 +86,7 @@ def test_the_stdout_rebind_sits_between_the_frame_capture_and_the_boot_read() ->
     capture = min(
         (
             n.lineno
-            for n in nodes
+            for n in ast.walk(main)
             if isinstance(n, ast.Attribute)
             and n.attr == "buffer"
             and isinstance(n.value, ast.Attribute)
