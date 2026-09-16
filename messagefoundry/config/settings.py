@@ -2861,6 +2861,23 @@ class EgressSettings(_Section):
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
     # MEFOR_EGRESS_PROXY_NO_PROXY.
     proxy_no_proxy: list[str] = []
+    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
+    # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
+    # connection dials through, which under `proxy_auth_type = basic` receives a pre-emptive
+    # `Proxy-Authorization` header on both destination schemes (ADR 0126) and so is a second
+    # credential-bearing egress host. It is deliberately its OWN list rather than an arm of
+    # `allowed_http`: ADR 0126 rules the proxy out of that gate's scope, because one corporate proxy
+    # fronts many destinations and would have to be co-listed with every one of them.
+    #
+    # DENY-BY-DEFAULT, matching `[ai].allowed_endpoints` (ADR 0135) rather than the permissive-when-
+    # empty `allowed_*` destination lists: an explicit `proxy_url` with an EMPTY `allowed_proxy` is
+    # refused at config load. That costs an operator who configures no proxy nothing (the gate only
+    # bites once a proxy is set), and it is the whole point of the key -- permissive-when-empty would
+    # leave the credential-bearing host ungated on exactly the default posture. The `"default"`
+    # sentinel is exempt: it names no address at config time, and `proxy_config_from_settings` refuses
+    # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
+    # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
+    allowed_proxy: list[str] = []
 
     # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
     # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
@@ -2878,6 +2895,7 @@ class EgressSettings(_Section):
         "allowed_smtp",
         "allowed_direct",
         "proxy_no_proxy",
+        "allowed_proxy",
         mode="before",
     )
     @classmethod
