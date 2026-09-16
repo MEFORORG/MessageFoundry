@@ -8,7 +8,7 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
@@ -23,7 +23,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import get_auth
-from messagefoundry.api.validation import EpochSeconds
+from messagefoundry.api.validation import EPOCH_SECONDS_MAX, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
@@ -70,16 +70,30 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 _CSP_REPORT_SUMMARY_MAX = 5
 
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
-#: route declares for ``received_from``/``received_to`` — so an instant that route answers 422 for is
-#: refused here too instead of reaching the store query (BACKLOG #1744).
+#: route declares — so the two surfaces refuse the same instants (BACKLOG #1744).
 _EPOCH_BOUND: TypeAdapter[float] = TypeAdapter(EpochSeconds)
 
-#: What the console says when a received-date bound is not a value the JSON route would accept. Fixed
-#: text: pydantic's own message quotes the offending input, and operator input is never reflected.
-_BAD_RECEIVED_BOUND = (
+#: What the console says when a received-date bound is not a value the JSON route would accept. The
+#: window is DERIVED from that route's own constant rather than transcribed, so it cannot go stale.
+#: Fixed text otherwise: pydantic's message quotes the offending input, which is never reflected.
+_BAD_BOUND_MESSAGE = (
     "the received-date bounds must be UTC datetime-local values between "
-    "1970-01-01T00:00 and 2100-01-01T00:00"
+    f"{datetime.fromtimestamp(0.0, UTC):%Y-%m-%dT%H:%M} and "
+    f"{datetime.fromtimestamp(EPOCH_SECONDS_MAX, UTC):%Y-%m-%dT%H:%M}"
 )
+
+
+class _MsgFilters(TypedDict):
+    """The message-log filter values echoed back into the form, keyed as ``pages.messages`` names
+    them so the three render arms can splat one dict instead of repeating six keywords each."""
+
+    channel_id: str
+    status: str
+    message_type: str
+    control_id: str
+    received_from: str
+    received_to: str
+
 
 # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). The GET editor page is the step-up `unlock`
 # continuation (a GET form the re-auth flow can 303-GET-redirect back to); the body-carrying POST
@@ -429,6 +443,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_READ, phi=True)),
+        # The four metadata filters are length-bounded here where the JSON twin declares an alphabet
+        # (ConnectionName / StatusFilter / MessageTypeFilter / ControlIdFilter). That gap is the
+        # console-declaration item, filed separately, and closing it is an annotation swap. The two
+        # date bounds below are NOT part of it and cannot be closed that way: they are browser
+        # datetime-local STRINGS, not the epoch numbers the twin takes, so they need the hand-written
+        # parse below — which is why BACKLOG #1744 fixed them here and left the four alone. The
+        # carve-out is written down in docs/API-INPUT-VALIDATION.md.
         channel_id: str | None = Query(None, max_length=256),
         status_filter: str | None = Query(None, alias="status", max_length=64),
         message_type: str | None = Query(None, max_length=64),
@@ -451,49 +472,38 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
             BACKLOG #1744: this used to DROP a malformed bound and search without it, so the operator
             read a result set under a filter they had typed and the engine had not applied. It now
-            RAISES and the route refuses, which is what the JSON twin does (422). Three rejects, one
-            rule — accept only what that twin would accept: a value ``fromisoformat`` cannot read; an
-            instant outside the ``EpochSeconds`` window; and a value carrying its own UTC offset, which
-            the old ``replace(tzinfo=UTC)`` silently re-stamped as a DIFFERENT instant (a
-            ``datetime-local`` field never sends one, so only a hand-built URL gets here)."""
+            RAISES and the route refuses, which is what the JSON twin does (422). One rule, three
+            rejects — accept only what that twin would accept."""
             if not value:
                 return None
             parsed = datetime.fromisoformat(value)
             if parsed.tzinfo is not None:
+                # An offset the old replace(tzinfo=UTC) silently re-stamped as a DIFFERENT instant. A
+                # datetime-local field never sends one, so only a hand-built URL reaches this.
                 raise ValueError("a received-date bound carries its own offset")
-            return float(_EPOCH_BOUND.validate_python(parsed.replace(tzinfo=UTC).timestamp()))
+            return _EPOCH_BOUND.validate_python(parsed.replace(tzinfo=UTC).timestamp())
 
+        # Echoed back into the filter form by every arm below, so the operator never loses what they
+        # typed — built once, as routes/search.py does with its own criteria. A TypedDict rather than
+        # a plain dict so mypy still matches each key to its named parameter through the ``**``.
+        typed = _MsgFilters(
+            channel_id=channel_id or "",
+            status=status_filter or "",
+            message_type=message_type or "",
+            control_id=control_id or "",
+            received_from=received_from or "",
+            received_to=received_to or "",
+        )
         try:
             epoch_from, epoch_to = _epoch(received_from), _epoch(received_to)
         except ValueError:  # fromisoformat, or pydantic on an out-of-window instant
             return HTMLResponse(
-                pages.messages(
-                    None,
-                    error=_BAD_RECEIVED_BOUND,
-                    channel_id=channel_id or "",
-                    status=status_filter or "",
-                    message_type=message_type or "",
-                    control_id=control_id or "",
-                    received_from=received_from or "",
-                    received_to=received_to or "",
-                ),
-                status_code=400,
+                pages.messages(None, error=_BAD_BOUND_MESSAGE, **typed), status_code=400
             )
 
         if defer:
             # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
-            return HTMLResponse(
-                pages.messages(
-                    None,
-                    deferred=True,
-                    channel_id=channel_id or "",
-                    status=status_filter or "",
-                    message_type=message_type or "",
-                    control_id=control_id or "",
-                    received_from=received_from or "",
-                    received_to=received_to or "",
-                )
-            )
+            return HTMLResponse(pages.messages(None, deferred=True, **typed))
 
         data = await core.list_messages(
             request,
@@ -508,17 +518,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             limit=limit,
             offset=offset,
         )
-        return HTMLResponse(
-            pages.messages(
-                data,
-                channel_id=channel_id or "",
-                status=status_filter or "",
-                message_type=message_type or "",
-                control_id=control_id or "",
-                received_from=received_from or "",
-                received_to=received_to or "",
-            )
-        )
+        return HTMLResponse(pages.messages(data, **typed))
 
     @app.get("/ui/messages/{message_id}", response_class=HTMLResponse)
     async def ui_message_detail(

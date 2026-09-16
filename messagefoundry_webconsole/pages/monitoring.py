@@ -200,17 +200,20 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: 
     )
     empty = el("p", "No active alerts.", class_="muted") if not instances.alerts else Markup("")
 
-    parts: list[object] = [el("h1", "Alerts")]
-    if error:
-        parts.append(el("p", error, class_="banner"))
-    parts += [el("h2", "Active"), empty, inst_table]
-    if config is not None:
-        parts += [el("h2", "Rules"), *_alert_rules_sections(config)]
-    return page("Alerts", *parts, active="alerts")
+    return page(
+        "Alerts",
+        el("h1", "Alerts"),
+        el("p", error, class_="banner") if error else Markup(""),
+        el("h2", "Active"),
+        empty,
+        inst_table,
+        *(_alert_rules_section(config) if config is not None else ()),
+        active="alerts",
+    )
 
 
-def _alert_rules_sections(config: AlertsConfig) -> list[object]:
-    """The transport summary + loaded-rule table, the read-gated half of the alerts page."""
+def _alert_rules_section(config: AlertsConfig) -> list[Markup]:
+    """The Rules heading, transport summary and loaded-rule table — the read-gated half of the page."""
     transports = ", ".join(
         [
             t
@@ -254,7 +257,7 @@ def _alert_rules_sections(config: AlertsConfig) -> list[object]:
         ],
         rule_rows,
     )
-    return [summary, rules_table]
+    return [el("h2", "Rules"), summary, rules_table]
 
 
 #: The bounded connection-event vocabulary (mirrors the engine's emit kinds + the desktop

@@ -17,12 +17,22 @@ from messagefoundry.api.models import (
     StatsResetRequest,
     StatsResetTarget,
 )
+from messagefoundry.api.validation import ALERT_SUSPEND_MINUTES_MAX
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
 from .._auth import (
     assert_same_origin,
     require_ui,
+)
+from ._common import ACTIVE_ALERTS_LIMIT
+
+#: What the console says when it refuses a suspend window, derived from the bound the model enforces
+#: rather than transcribed (BACKLOG #1744). The model is ``gt=0``, so "positive" is the honest word:
+#: an earlier hand-written "from 1 to 43200" claimed the twin rejects 0.5 minutes, which it does not.
+_BAD_SUSPEND_WINDOW = (
+    "the suspend window must be a positive number of minutes, "
+    f"at most {ALERT_SUSPEND_MINUTES_MAX} (30 days)"
 )
 
 
@@ -61,13 +71,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def _refuse_on_alerts_page(
         request: Request, engine: Any, identity: Identity, message: str
     ) -> HTMLResponse:
-        """Re-render the alerts page carrying ``message``, refused with 400 — the shape
-        ``routes/search.py`` uses for input the JSON handler would reject (BACKLOG #1744).
+        """Re-render the alerts page carrying ``message``, refused with 400 — the per-area shape
+        ``admin._user_detail`` and the account pages already use for input a handler would reject.
 
         The rules half of that page is gated on ``monitoring:read`` by ``/ui/alerts`` while this route
         holds ``monitoring:diagnose`` only, so the rules are fetched only for a caller that also holds
         read. A refusal must not widen what an actor can see."""
-        instances = await core.list_active_alerts(engine=engine, identity=identity, limit=200)
+        instances = await core.list_active_alerts(
+            engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
+        )
         config = (
             await core.alerts_rules(request, _user=identity)
             if identity.has(Permission.MONITORING_READ)
@@ -93,13 +105,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # window they had not asked for, and wrote `"minutes": 60.0` into the alert_suspend audit row
             # as if that were the request.
             body = AlertSuspendRequest(minutes=float(form.get("minutes") or "60"))
-        except ValueError:  # float(), or pydantic on a window outside 1 minute .. 30 days
-            return await _refuse_on_alerts_page(
-                request,
-                engine,
-                identity,
-                "the suspend window must be a number of minutes from 1 to 43200 (30 days)",
-            )
+        except ValueError:  # float(), or pydantic on a window outside the model's bounds
+            return await _refuse_on_alerts_page(request, engine, identity, _BAD_SUSPEND_WINDOW)
         await core.suspend_alert(
             alert_id, body=body, request=request, engine=engine, identity=identity
         )
