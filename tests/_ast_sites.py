@@ -46,12 +46,19 @@ so a guard aimed at a module-level function can end up reading a same-named meth
 still pass. Every call site collapsed onto it here had exactly one match when it was collapsed,
 measured, so the assertion is a guard against future drift rather than a change of behaviour.
 
-**Scope: this module is for ``tests/`` only, and the reason is packaging, not taste.**
-``messagefoundry/`` and ``scripts/`` carry their own callee-name helpers. They *cannot* be collapsed
-onto this one: ``pyproject.toml``'s ``only-include`` ships ``messagefoundry`` alone, and there is no
-``tests/__init__.py``, so nothing under ``messagefoundry/`` can import ``_ast_sites`` at all. The
-dependency would have to run the other way -- production importing a test helper -- which is why
-this is a hard constraint and not a judgement to revisit.
+**Scope: this module is for ``tests/`` only, and the reason is dependency direction, not taste.**
+``messagefoundry/`` and ``scripts/`` carry their own callee-name helpers. Collapsing them onto this
+one would run the dependency backwards -- production importing a test helper -- which CLAUDE.md
+section 4 forbids outright. Packaging agrees: ``[tool.hatch.build.targets.sdist]``'s
+``only-include`` ships ``messagefoundry`` alone and the wheel is package-only, so an INSTALLED
+engine has no ``tests/`` to import from at all.
+
+**Not because there is no ``tests/__init__.py``, which is the reason this paragraph used to give.**
+It is false, and measured false: under PEP 420 ``tests`` imports as a namespace package, so
+``import tests._ast_sites`` succeeds from a source checkout with the repo root on ``sys.path``. Kept
+here rather than deleted because it is the reason a reader re-derives, and it invites checking the
+one half that does not hold and then discarding the packaging half, which does. The barrier is the
+rule plus the shipped artifact, never a missing file.
 
 **Do not read that as "a guard may not import a private engine symbol".** Guards here do exactly
 that, on purpose, and should keep doing it: ``test_relocated_key_messages.py`` imports
