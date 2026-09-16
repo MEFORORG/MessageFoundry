@@ -6,7 +6,7 @@ ADR 0041 (D3). ADR 0036 guards the **config dir** (an unauthorized writer can't 
 the loader executes); nothing checked that the installed ``messagefoundry`` **site-packages** still
 match the attested wheel. An admin with venv-write + restart rights could edit engine code in place
 (neuter ``field_authz`` redaction, the off-box audit tee, …) and it would run with **no audit row at
-all**. This module closes that gap: at startup (and on demand) it hashes every **loaded** first-party
+all**. This module closes that gap: at startup it hashes every **loaded** first-party
 ``messagefoundry`` module file against the wheel's ``*.dist-info/RECORD`` baseline (a zero-new-artifact
 manifest already shipped in the wheel) and, on drift, records a hash-chained ``startup_integrity``
 audit row and fires the :class:`~messagefoundry.pipeline.alerts.AlertSink`.
@@ -26,7 +26,10 @@ Posture (ADR 0017 amendment, 2026-06-27):
   — refuse to run unattested engine bytes.
 - **No-op only on an install that DECLARES itself editable** (``pip install -e .`` — a
   ``direct_url.json`` with ``dir_info.editable``, or an ``__editable__``/``.pth`` finder row in
-  ``RECORD``). A dev co-development checkout is **never** bricked or alerted.
+  ``RECORD``). A dev co-development checkout is **never** bricked or alerted. Under
+  ``fail_closed_on_drift`` that no-op also logs a WARNING naming the reason: the opt-in asked for
+  hard enforcement that this install cannot give, and the branch used to return silently, so a
+  first deployment in that shape would start with its tripwire disarmed and nothing to read.
 - **Attested-nothing is not clean** (BACKLOG #1679). An absent, empty or package-row-less ``RECORD``,
   an unresolvable install root, and a package imported from *outside* the install root all leave
   ``checked == 0``: no file was compared, so the pass proves nothing in either direction. That posture
@@ -38,8 +41,10 @@ Posture (ADR 0017 amendment, 2026-06-27):
 **What it detects is an INCONSISTENT edit, not a consistent one.** The baseline ships beside the code it
 attests, inside the same install the stated adversary can write, so an edit that also re-seals ``RECORD``
 passes clean. Widening the refusal above closes the shapes where the baseline is *gone*; it does not
-make the baseline trustworthy. Whether a baseline inside the adversary's own trust domain should be
-trusted at all is open — ADR 0041 AC-12, 2026-09-15 amendment.
+make the baseline trustworthy, and **no in-process anchor can**: this module attests itself, so any
+anchor it consumes is read by code the same venv-write actor already owns. The residual is accepted and
+the reasoning is in ADR 0041 D3, *"The baseline's trust domain"* — read it there rather than re-deriving
+it here.
 
 Pure + offline: it hashes file *bytes* and reads packaging metadata only — no subprocess, no network,
 no config import. The on-disk hashing is blocking, so the async entry point runs it off the event loop
@@ -531,7 +536,10 @@ async def run_startup_attestation(
 
     - **verified clean** (``checked > 0``, no drift): an INFO line, nothing recorded, nothing alerted;
     - **declared editable**: nothing recorded, nothing alerted, never refused — a dev checkout has no
-      baseline by design and is never bricked (AC-12);
+      baseline by design and is never bricked (AC-12). Under ``fail_closed_on_drift`` it additionally
+      logs a WARNING naming the reason, because the opt-in cannot be honoured on this install and the
+      branch used to return with no signal at all (AC-14). That line reports a **misconfiguration**,
+      not a tamper;
     - **drift**: an ERROR line, a hash-chained ``startup_integrity`` audit row, and
       :meth:`AlertSink.integrity_drift`;
     - **attested nothing** (``checked == 0`` on an install that declares no editable marker — an absent,
@@ -577,8 +585,25 @@ async def run_startup_attestation(
         return result
 
     if result.declared_editable:
-        # AC-12: the install declares itself editable, so it has no baseline BY DESIGN. Silent, and
-        # never refused — the one attested-nothing shape a fail-closed site still accepts.
+        # AC-12: the install declares itself editable, so it has no baseline BY DESIGN. Never refused,
+        # never audited, never alerted — the one attested-nothing shape a fail-closed site accepts.
+        if fail_closed_on_drift:
+            # AC-14 (BACKLOG #1679 act 5). A MISCONFIGURATION control, not a tamper control: the
+            # operator asked for hard enforcement and this install cannot give it, so say so. Before
+            # this line the branch returned with no log, no row and no alert, so a first deployment
+            # that opted into fail-closed on an editable install WOULD start with its tripwire
+            # disarmed and nothing in the boot log to read. It closes no hole — an adversary with
+            # venv-write plants `direct_url.json` or rewrites this check in the same single write.
+            # Keyed on the OPT-IN, not on editability: warning on every dev run is how a warning
+            # stops being read, and AC-12 exists so a dev checkout is never nagged or bricked.
+            log.warning(
+                "startup integrity: [integrity].fail_closed_on_drift is set, but this install "
+                "DECLARES itself editable (%s), so attestation compared no file and the tripwire "
+                "is DISARMED — the hard enforcement you opted into is NOT in effect. Install the "
+                "non-editable wheel to get it. This reports a misconfiguration, not a tamper: an "
+                "actor who can write the venv can plant the editable marker itself.",
+                result.unattested_reason,
+            )
         return result
 
     if result.attested_nothing:
