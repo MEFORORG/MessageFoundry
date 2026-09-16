@@ -369,11 +369,12 @@ landing means nobody checked it, and a fix written to turn CI green is checked b
 was written against.
 
 **SPAWNING SHOULD BE RARE, AND REACHING FOR IT IS WORTH NOTICING.** A Manager's subagents already
-cover almost everything it does -- they need no grant, they die with it, and they cannot outlive a
-mistake; a Manager seat reported five Builders in one day, every one through that path. So a spawn
-is better read as a SIGNAL THAT SOMETHING UPSTREAM HAS FAILED -- a seat died with work outstanding,
-or nobody was alive to take a red -- than as a routine tool. Raised by a Manager seat on 2026-09-16,
-about its own grant, which is the direction that argument is most credible from.
+cover almost everything it does, and the load-bearing property is that **a subagent cannot outlive a
+mistake** -- it needs no grant and it dies with its Manager. **A spawned session can outlive one**,
+which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT SOMETHING UPSTREAM
+HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
+routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
+that argument is most credible from.
 
 **THIS REPLACED A RULE READING "NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds
 nothing."** That was true when written and false by 2026-09-16, when the grant was measured present
