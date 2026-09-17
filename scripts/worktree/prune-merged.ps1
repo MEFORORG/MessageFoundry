@@ -1988,18 +1988,26 @@ if ($priorOrphans.Count -gt 0) {
 if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
 
 foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
-if ($exit -eq $EXIT_REFUSED) {
-    if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
-        Write-Host "  Exit 2: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
-        if ($null -ne $occ2 -and -not $occ2.Available) {
-            Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
-        }
-    }
-    if ($namedMisses.Count -gt 0) {
-        Write-Host "  Exit 2: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+# EACH LINE IS KEYED ON ITS OWN CONDITION, NEVER ON THE FINAL CODE. Both of these used to sit inside
+# `if ($exit -eq $EXIT_REFUSED)`, and two different things take a run out of that branch: the
+# `$removed -gt 0` guard on the -Name miss, which reports 1 once something has been removed, and a
+# more severe code from an unrelated cause, such as an orphaned directory reporting 3. Either way the
+# explanation went silent on exactly the run where the halves of the report disagree -- the operator
+# read `Done. removed 1` in red, or a recovery recipe, with nothing saying which request was refused.
+# The -ReapVenvs line below was moved out for this reason in edf01a954; these two follow it, and the
+# code is interpolated for the same reason it is there: 2 is not the only code either can report.
+if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
+    Write-Host "  Exit ${exit}: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
+    if ($null -ne $occ2 -and -not $occ2.Available) {
+        Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
     }
 }
-elseif ($exit -eq $EXIT_ORPHANED) {
+if ($namedMisses.Count -gt 0) {
+    Write-Host "  Exit ${exit}: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+}
+# `if`, not the `elseif` this was: with the branch above gone there is nothing to chain to. Behaviour
+# is unchanged -- the old chain reached here whenever $exit was 3, because 3 is not 2.
+if ($exit -eq $EXIT_ORPHANED) {
     Write-Host "  Exit 3: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
 }
 # OUTSIDE the branch above, because the venv refusal no longer decides the code on its own: a run that

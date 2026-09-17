@@ -483,6 +483,51 @@ def run_text(
     )
 
 
+def run_text_parsed(
+    fx: Fixture,
+    *extra: str,
+    skip_gh: bool = True,
+    skip_fetch: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Same human surface, invoked through ``-Command`` so an ARRAY argument really is an array.
+
+    ``_argv`` uses ``pwsh -File``, which hands every argument to the script as a literal string.
+    Measured on this machine against a probe script taking ``[string[]]$Name``::
+
+        pwsh -NoProfile -NonInteractive -File probe.ps1 -Name a,b   ->  count=1, [0]=a,b
+        pwsh -NoProfile -NonInteractive -File probe.ps1 -Name a b   ->  count=1, [0]=a
+
+    So no test reaching the script through ``run`` or ``run_text`` can express "one ``-Name`` value
+    HITS and another MISSES": the two collapse into a single value that misses. That state is
+    reachable for an operator, because ``docs/WORKTREES.md`` documents the invocation as a direct
+    call from a pwsh prompt (``scripts\\worktree\\prune-merged.ps1 -Apply -Name pins``) and a prompt
+    PARSES the array. ``-Command`` is the faithful surface for that case rather than a way around
+    the harness, and the tests below carry the ``-File`` reading beside it as a control, so the
+    difference between the two is measured here rather than assumed.
+
+    Quoting: every path is single-quoted for PowerShell with embedded quotes doubled, because
+    ``tmp_path`` can carry characters the parser would otherwise read as syntax.
+    """
+
+    def q(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    parts = ["&", q(SCRIPT), "-RepoRoot", q(fx.primary)]
+    if skip_fetch:
+        parts.append("-SkipFetch")
+    if skip_gh:
+        parts.append("-SkipGh")
+    parts += ["-ConfigRoot", q(fx.cfg)]
+    parts += list(extra)
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", " ".join(parts)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
 _SHIMS = 0
 
 
@@ -1650,6 +1695,98 @@ def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: i
     assert res["_exit"] == 2
     assert (
         "matched no PRUNABLE sibling" in run_text(fx, "-Apply", "-Name", "no-such-worktree").stdout
+    )
+
+
+def test_the_name_miss_is_explained_on_the_run_that_reports_FAILED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The exit-code line naming a ``-Name`` miss was keyed on 2, and the guard moves the run off 2.
+
+    ``-Name clean,no-such-worktree`` is one instruction with two halves. The first half removes a
+    worktree, so ``$removed`` is 1 and the miss reports ``$EXIT_FAILED`` rather than
+    ``$EXIT_REFUSED`` -- which is right, and is the guard this file already pins for ``-ReapVenvs``
+    in ``test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED``. But the line that
+    names the miss AND its code sat inside ``if ($exit -eq $EXIT_REFUSED)``, so it went silent on
+    exactly the run where the two halves of the report disagree. The operator saw ``Done. removed
+    1`` in red with no exit-code line anywhere saying which half went wrong.
+
+    TWO SURFACES, AND ONLY ONE WAS BROKEN. The unconditional yellow line in the decision table
+    ("matched no PRUNABLE sibling worktree") always printed; it is asserted below as the control, so
+    a failure here is attributable to the exit-code line and not to the miss having quietly stopped
+    being detected. Same shape as the venv pair, where ``VENV REAP COULD NOT RUN`` is the control
+    and ``Exit 1: -ReapVenvs ...`` is the line under test.
+
+    THE ``-File`` READING IS CARRIED AS A CONTROL, because this test is the one place in the file
+    that departs from ``run_text``. Under ``-File`` the same two names arrive as the single value
+    ``clean,no-such-worktree``, which matches nothing, removes nothing, and honestly exits 2 -- so
+    the departure is doing real work rather than dressing up the same run.
+    """
+    live_record(fx, sleeper, fx.primary)
+
+    control = run(fx, "-Apply", "-Name", "clean,no-such-worktree")
+    assert control["namedMisses"] == ["clean,no-such-worktree"], (
+        "-File collapses the array, so this invocation cannot reach the state under test"
+    )
+    assert control["counts"]["removed"] == 0
+    assert control["_exit"] == 2, "nothing was removed, so 2 is honest here"
+    assert fx.sibling("clean").exists(), "the control must leave the subject standing"
+
+    proc = run_text_parsed(fx, "-Apply", "-Name", "clean,no-such-worktree")
+
+    assert "Done. removed 1" in proc.stdout, (
+        f"the removing half did not happen, so there is nothing to disagree with: {proc.stdout}"
+    )
+    assert not fx.sibling("clean").exists()
+    assert proc.returncode == 1, (
+        f"removed a worktree and reported exit {proc.returncode}; the -Name guard should report 1"
+    )
+    assert "matched no PRUNABLE sibling" in proc.stdout, "the refusing half must still be detected"
+    assert "Exit 1: -Name named no-such-worktree" in proc.stdout, (
+        f"the run removed one worktree and refused half its instruction, and said which "
+        f"nowhere in:\n{proc.stdout}"
+    )
+
+
+def test_the_fence_refusal_is_explained_on_a_run_that_reports_ORPHANED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Same hole, same wrapper, reached without ``-Name``: any higher code silences the fence line.
+
+    ``3`` outranks ``2``, so a run that finds a broken directory from an earlier pass AND cannot
+    read the occupancy fence exits 3 -- and the line explaining that nothing was eligible, which is
+    why the table is empty, used to disappear. The operator was told a directory is broken and
+    nothing at all about the fence that made every candidate ineligible.
+
+    The orphan half is built exactly as ``test_an_orphan_is_reported_by_every_later_run`` builds it,
+    including its filesystem skip: an open handle can fail to block the removal, and a test that
+    silently examined a healthy tree instead would pass for the wrong reason.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    blocker = (fx.sibling("gone") / "seed.txt").open("rb")
+    try:
+        first = run(fx, "-Apply", "-Name", "gone")
+    finally:
+        blocker.close()
+    if by_leaf(first, "gone")["Outcome"] != "orphaned":
+        pytest.skip("git removed the directory despite the open handle on this filesystem")
+
+    # Now take the fence away. An empty registry is UNAVAILABLE, not "nobody is here" --
+    # test_empty_registry_refuses_everything pins that on its own.
+    for record in (fx.cfg / "sessions").glob("*.json"):
+        record.unlink()
+
+    later = run(fx)
+    assert later["fence"]["available"] is False, "the fence must really be down"
+    assert later["counts"]["orphansFromEarlierRuns"] == 1
+    assert later["_exit"] == 3, "3 outranks 2, which is what takes the run out of the branch"
+
+    text = run_text(fx).stdout
+    assert "ORPHANED director" in text, "the control: the tail block keyed on 3 still fires"
+    assert "Exit 3: the occupancy fence was unavailable" in text, (
+        f"nothing said why every candidate was ineligible:\n{text}"
     )
 
 
