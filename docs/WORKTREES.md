@@ -225,11 +225,14 @@ can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence
 permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
-That last one matters more than it sounds. Two shapes qualify — a file that will not parse, and one
-that parses but carries no `cwd` — and both used to be dropped by a silent `continue`, appearing in no
-count at all. Neither can be placed in *or* cleared from any candidate, and a file caught
-*half-written* is exactly what a session that launched a second ago looks like. An unavailable fence
-turns every candidate into a SKIP and exits **2**. There is deliberately no override flag.
+That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a
+record that parses but carries no `cwd`, and a record whose `cwd` is a checkout of *this* repo that
+`git worktree list` no longer carries, whether that directory is still on disk or gone. Each used to
+be dropped by a silent `continue`, appearing in no count at all, and the third went on being dropped
+after the fix for the first two. The incident above produced that shape in its still-on-disk form.
+None can be placed in *or* cleared from any candidate, and a file caught *half-written* is exactly
+what a session that launched a second ago looks like. An unavailable fence turns every candidate
+into a SKIP and exits **2**. There is deliberately no override flag.
 
 ### The candidate set is siblings only — and "sibling" is not a prefix match
 
