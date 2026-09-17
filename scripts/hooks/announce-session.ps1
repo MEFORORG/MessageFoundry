@@ -576,7 +576,14 @@ try {
             $ranked += [pscustomobject]@{ P = $p; Reason = $reason }
         }
         $reachable = @($ranked | Where-Object { -not $_.Reason } | ForEach-Object { $_.P })
-        $unreachable = @($ranked | Where-Object { $_.Reason })
+        # NAME THE CHANNEL IN THE VARIABLE. Every reason assigned above is a fact about the MCP
+        # session-messaging tool and nothing else: a surface it cannot enumerate, a login it cannot
+        # see, a peer that cannot take a session message. The repo's file-based mail channel
+        # (scripts/coord/mail.ps1) reaches all three, because it addresses a WORKTREE PATH under
+        # .git/mefor-coord/, which every config root shares, rather than a session the MCP must
+        # resolve. The former bare name, "unreachable", taught the opposite to this code's own readers
+        # and then to the roster it prints, so the name carries its channel now.
+        $mcpUnreachable = @($ranked | Where-Object { $_.Reason })
 
         if ($SelfTest) {
             # READ-ONLY AND WRITE-FREE, unconditionally. It never dispatches on marker state, never takes
@@ -610,7 +617,7 @@ try {
                 Write-Output "        hand-run, and the ancestry walk sees a shell). The list below may"
                 Write-Output "        therefore include this session. That cannot happen on the real path."
             }
-            Write-Output "  peers=$($others.Count) reachable=$($reachable.Count) unreachable=$($unreachable.Count)"
+            Write-Output "  peers=$($others.Count) reachable=$($reachable.Count) unreachable=$($mcpUnreachable.Count)"
             foreach ($r in $ranked) {
                 $verdict = if ($r.Reason) { "SKIP  ($($r.Reason))" } else { 'MESSAGE' }
                 Write-Output ("    {0,-24} {1}" -f (Get-Clean ([string]$r.P.Worktree) 24), $verdict)
@@ -686,7 +693,7 @@ try {
                 $listed += [pscustomobject]@{ P = $r; Reason = 'over the cap for this round; it will be offered again'; Target = $false }
             }
         }
-        foreach ($u in $unreachable) {
+        foreach ($u in $mcpUnreachable) {
             if ($listed.Count -ge $MaxListed) { break }
             $listed += [pscustomobject]@{ P = $u.P; Reason = $u.Reason; Target = $false }
         }
