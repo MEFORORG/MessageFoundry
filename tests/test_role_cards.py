@@ -9,8 +9,11 @@ the working agreement does not lose the argument -- it wins it, silently, for th
 THE CARDS CAME FROM KORUS AND WERE NOT COPIED. Three ways a straight copy would have been wrong,
 each measured 2026-09-06 and each guarded below:
 
-  1. ROSTER. korus runs seven seats. Section 5's table here runs five: no Reviewer. The MANAGER
-     joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529).
+  1. ROSTER. korus and this table have never matched, and neither leads the other. The MANAGER
+     joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
+     SPECIAL seat joined on 2026-09-16, taking the table to six. The Reviewer has never been on
+     it; korus retired it there too on 2026-09-12, so `elsewhere` now records where it went
+     rather than claiming it is live somewhere else.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -39,10 +42,12 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. FIVE seats, not korus's seven.
-EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander"})
+#: Section 5's table governs. SIX seats since 2026-09-16, when the owner added SPECIAL.
+EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander", "special"})
 
-#: Live in korus, absent here. They must resolve to a card-less explanation, never to silence.
+#: Held in korus, absent here. They must resolve to a card-less explanation, never to silence.
+#: "Absent here" is the whole test -- the Reviewer is retired in korus too since 2026-09-12, and
+#: this bucket still owns it, because the label outlives the seat in documents that name it.
 EXPECTED_ELSEWHERE = frozenset({"reviewer"})
 
 #: Retired 2026-09-10. Every observed spelling is listed in `retired` ON PURPOSE: an alias must land
@@ -101,7 +106,7 @@ class TheRosterIsGovernedByTheWorkingAgreement(unittest.TestCase):
         )
 
     def test_a_korus_seat_is_not_quietly_live_here(self):
-        """The specific error this port nearly shipped: seven seats where the table names five."""
+        """The error this port nearly shipped: a korus seat live where the table omits it."""
         overreach = sorted(EXPECTED_ELSEWHERE & set(seats()["live"]))
         self.assertEqual(
             [],
@@ -165,7 +170,14 @@ class TheAliasMapCollapsesDrift(unittest.TestCase):
 
 
 class EveryCardStaysWithinItsBudget(unittest.TestCase):
-    """Only one card is ever injected, so the cost is one card. The cap keeps that true."""
+    """Only one card is ever injected, so the cost is one card. The cap keeps that true.
+
+    MEASURE THE BYTE CAP THE WAY THE CHECKOUT WILL. `core.autocrlf=true` here, so every card lands
+    CRLF in a Windows working tree and one byte per line is invisible on a LF-authored draft. A card
+    written at 6120 LF bytes passes the author's own reading and arrives at 6241 on checkout, over
+    the cap, red on the Windows leg only. `stat().st_size` below reads the checked-out file, which
+    is the question; a length taken off LF source is the adjacent one.
+    """
 
     def test_no_card_exceeds_the_line_cap(self):
         over = [

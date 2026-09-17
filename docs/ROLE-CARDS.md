@@ -159,8 +159,9 @@ Set-Content .claude\seat 'builder'
 
 ## 4. The roster, and which document governs it
 
-Five seats: **Manager, Builder, Regulator, Steward, Lander.** That list comes from section 5
-of `CLAUDE.md`. The Reviewer was a sixth until 2026-09-05, when the owner retired it with the
+Six seats: **Manager, Builder, Regulator, Steward, Lander, Special.** That list comes from
+section 5 of `CLAUDE.md`. The **Special** seat joined 2026-09-16 by owner decision, for work
+outside the other five; it is an addition, and nothing retired to make room for it. The Reviewer was a sixth until 2026-09-05, when the owner retired it with the
 `reviewed` label and the review gate. The **Console** held the Manager's place until 2026-09-10,
 when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
 rule does not carry across (BACKLOG #1529).
