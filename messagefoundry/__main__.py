@@ -3650,6 +3650,16 @@ def _dryrun(args: argparse.Namespace) -> int:
                         }
                         for s in result.state_ops
                     ],
+                    # Declared metadata writes (ADR 0081, BACKLOG #1692). A SetMeta key and value are
+                    # both message-derived in the general case, so both take the same --show-phi gate
+                    # as a state write. Without this key a Handler's SetMeta was invisible here.
+                    "meta_ops": [
+                        {
+                            "key": m.key if show_phi else _redact_body(str(m.key)),
+                            "value": m.value if show_phi else _redact_body(str(m.value)),
+                        }
+                        for m in result.meta_ops
+                    ],
                     # The error carries the Router/Handler's own `raise`, which can quote field
                     # values, so it takes the same --show-phi gate as `summary` (BACKLOG #1668).
                     # `safe_error`, not `_redact_body`: see its docstring for why the prose survives.
