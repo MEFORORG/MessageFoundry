@@ -160,6 +160,10 @@ writes a receipt under `mefor-coord/mail/receipts/`. That distinction is the fai
 exists to make visible, so `-Send` says it on every send and `-Status` reports undelivered and
 already-shown counts separately.
 
+**An absent receipt means one of two things, and only one of them is "not yet".** The drain sweeps
+`receipts/` of files past its retention window, so a missing receipt is either a message no drain has
+reached or a receipt that aged out. Read a receipt inside the window or not at all.
+
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
 being queued and is not lost; it is not shown. It reaches **already-running** sessions, which an
 environment variable cannot, and that is the point of it being a file. Delete it to resume.

@@ -243,11 +243,17 @@ $MAX_LINE_CHARS = 240
 # receipts' "did it actually deliver" question answerable.
 $RETAIN_DAYS = 7
 
-# The one directory under the coordination root that the receipt sweep's citation guard does NOT read.
-# It is a frozen copy of an older coordination tree, so a stem quoted inside it cites state nobody
-# reads back, and honouring those citations would pin receipts to a snapshot forever. mail/ is the
-# other exclusion and is not spelled here: the sweep already knows where the queue is.
-$CITATION_EXCLUDED_DIR = '_retired-2026-08-22'
+# The directory-name PREFIX the receipt sweep's citation guard does NOT read. A `_retired-<date>` tree
+# is a frozen copy of an older coordination tree, so a stem quoted inside one cites state nobody reads
+# back, and honouring those citations would pin receipts to a snapshot forever. mail/ is the other
+# exclusion and is not spelled here: the sweep already knows where the queue is.
+#
+# A PREFIX RATHER THAN ONE DATE, because these are MINTED and not authored:
+# scripts/coord/handoff.ps1 builds `_retired-$($now.ToString('yyyy-MM-dd'))` on every -Retire, so a
+# literal date stops matching the day somebody retires a handoff. That failure would be silent and
+# permanent -- every stem quoted in the new frozen tree would pin its receipt forever, while the
+# counter line went on truthfully reporting a sweep that ran.
+$CITATION_EXCLUDED_PREFIX = '_retired-'
 
 # The hook-authored frame around each body: the id delimiter, the two [UNVERIFIED] metadata lines,
 # the closing delimiter and a blank. Its width is driven by the metadata caps above, so it is bounded
@@ -579,12 +585,13 @@ function Get-CitedStems {
     # THE TWO EXCLUSIONS ARE WHAT MAKE THE GUARD MEAN ANYTHING. mail/ is the queue itself -- every
     # message filename, every receipt name and every marker name IS a stem -- so scanning it would
     # report every receipt as cited, and the sweep would then delete nothing while looking exactly
-    # like a sweep that ran. The other exclusion is the frozen tree named by $CITATION_EXCLUDED_DIR.
+    # like a sweep that ran. The other is the frozen-tree FAMILY named by $ExcludedPrefix, matched as a
+    # whole path SEGMENT so a file merely named like one is not exempted with it.
     #
-    # LATIN1 OVER BYTES, NOT Get-Content. Every byte decodes under Latin1, so a binary file in the
-    # tree -- there is at least one git bundle -- can neither throw nor swallow a match, and a stem is
-    # ASCII by construction so nothing inside one decodes differently. A false match out of binary
-    # noise only ever protects a receipt, which is the safe direction.
+    # LATIN1, NOT UTF8, AND ReadAllText RATHER THAN Get-Content. Every byte decodes under Latin1, so a
+    # binary file in the tree -- there is at least one git bundle -- can neither throw nor swallow a
+    # match, and a stem is ASCII by construction so nothing inside one decodes differently. A false
+    # match out of binary noise only ever protects a receipt, which is the safe direction.
     #
     # IT THROWS RATHER THAN RETURNING A SHORT ANSWER, for the same reason as the keep set above: an
     # unreadable corner of the tree is indistinguishable from a corner with no citations in it.
@@ -592,18 +599,22 @@ function Get-CitedStems {
     param(
         [Parameter(Mandatory)][string]$CoordRoot,
         [Parameter(Mandatory)][string]$MailRoot,
-        [Parameter(Mandatory)][string]$ExcludedDir
+        [Parameter(Mandatory)][string]$ExcludedPrefix
     )
     $out = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $sep = [System.IO.Path]::DirectorySeparatorChar
     $mailPrefix = [System.IO.Path]::GetFullPath($MailRoot).TrimEnd($sep) + $sep
-    $excluded = "$sep$ExcludedDir$sep"
+    $excluded = "$sep$ExcludedPrefix"
     $re = [regex]::new((Get-MailStemPattern), [System.Text.RegularExpressions.RegexOptions]::Compiled)
     $base = [System.IO.Path]::GetFullPath($CoordRoot)
     foreach ($p in [System.IO.Directory]::EnumerateFiles($base, '*', [System.IO.SearchOption]::AllDirectories)) {
         if ($p.StartsWith($mailPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
-        if ($p.IndexOf($excluded, [StringComparison]::OrdinalIgnoreCase) -ge 0) { continue }
-        $text = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($p))
+        # The prefix must start a SEGMENT, and the thing carrying it must be a DIRECTORY, so another
+        # separator has to follow. `...\_retired-2026-08-22\x.md` is excluded; a live note called
+        # `_retired-notes.md` in an ordinary directory is not, and stays a citation like any other.
+        $at = $p.IndexOf($excluded, [StringComparison]::OrdinalIgnoreCase)
+        if ($at -ge 0 -and $p.IndexOf($sep, $at + 1) -ge 0) { continue }
+        $text = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::Latin1)
         foreach ($m in $re.Matches($text)) {
             # Test-MailStem is the authority; the pattern only proposes. See Get-MailStemPattern.
             if (Test-MailStem -Stem $m.Value) { [void]$out.Add($m.Value) }
@@ -766,7 +777,6 @@ try {
     # answer different questions: $swept bounds the queue, this bounds the record OF the queue, and a
     # reader who sees one move and not the other is entitled to know which one ran.
     $sweptReceipts = 0
-    $boxesSwept = 0
     # FAIL CLOSED, AND SAY SO. A guard that could not be evaluated keeps every receipt, and a silent
     # skip would be indistinguishable from a sweep that found nothing to do.
     $receiptSweepSkipped = $false
@@ -842,7 +852,6 @@ try {
     $boxDirs = @()
     try { $boxDirs = @([System.IO.Directory]::EnumerateDirectories($boxRoot)) }
     catch { $sweepFailed = $true }
-    $boxesSwept = $boxDirs.Count
 
     # THE KEEP SET FOR THE RECEIPT SWEEP, READ BEFORE ANY DELETE. Its position in this file is load
     # bearing, not incidental: see Get-LiveMessageStems. $null means it could not be built, and the
@@ -890,12 +899,12 @@ try {
     # THE RECORD GREW WITHOUT BOUND BECAUSE NOTHING EVER SWEPT IT. receipts/ is one flat directory for
     # the whole queue, so it was never box-scoped and never reached by the loop above either.
     #
-    # A RECEIPT NAME IS A BARE STEM, <stem>.json, SO Test-MailStem IS THE VALIDATOR AND
+    # A RECEIPT NAME IS A BARE STEM, <stem>.json, SO Split-ReceiptFileName IS THE VALIDATOR AND
     # Split-MailFileName IS THE WRONG ONE. Split-MailFileName requires the --<claim token> half that a
     # message filename carries and a receipt name does not, so it rejects every receipt in the
     # directory -- and a sweep guarded by it deletes nothing while reporting, truthfully, that it ran.
-    # That failure is silent in both directions, which is why it is written down rather than left to
-    # the reader of the two function names.
+    # That failure is silent in both directions, which is why mail-key.ps1 says it again at the
+    # function rather than leaving it to a reader comparing two function names.
     #
     # FAIL CLOSED. Either guard set failing to build keeps every receipt and says so in the counters.
     if ($null -eq $messageStems) { $receiptSweepSkipped = $true }
@@ -906,27 +915,28 @@ try {
         # the real set before anything is removed. An empty set can only ever under-protect, so a
         # receipt kept here is one no citation could have released.
         $emptyCited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        $candidates = @()
+        # A List, not `$candidates += ...`. Appending to a PowerShell array reallocates and copies the
+        # whole array every time, and the first pass after this shipped had 33,121 aged receipts to
+        # consider -- quadratic on exactly the run that is largest.
+        $candidates = [System.Collections.Generic.List[pscustomobject]]::new()
         try {
             foreach ($old in @(([System.IO.DirectoryInfo]::new($receiptDir)).EnumerateFiles('*.json'))) {
                 if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
-                $rname = $old.Name
-                if (-not $rname.EndsWith('.json', [StringComparison]::Ordinal)) { continue }
-                $rstem = $rname.Substring(0, $rname.Length - 5)
-                if (-not (Test-MailStem -Stem $rstem)) { continue }
-                if (Test-ReceiptProtected -Stem $rstem -MessageStems $messageStems -CitedStems $emptyCited) { continue }
-                $candidates += [pscustomobject]@{ File = $old; Stem = $rstem }
+                $rparts = Split-ReceiptFileName -Name $old.Name
+                if (-not $rparts) { continue }
+                if (Test-ReceiptProtected -Stem $rparts.Stem -MessageStems $messageStems -CitedStems $emptyCited) { continue }
+                $candidates.Add([pscustomobject]@{ File = $old; Stem = $rparts.Stem })
             }
         }
-        catch { $sweepFailed = $true; $receiptSweepSkipped = $true; $candidates = @() }
+        catch { $sweepFailed = $true; $receiptSweepSkipped = $true; $candidates.Clear() }
 
         if ($candidates.Count -gt 0 -and -not $receiptSweepSkipped) {
             # PASS B: the citation walk, then the verdict. The walk reads the whole coordination tree
-            # outside mail/ -- measured 4,092 files and 45MB in about 0.7s on the live tree,
-            # 2026-09-17 -- so a drain with nothing to sweep must not pay for it, and that is the only
-            # reason the two passes exist.
+            # outside mail/ -- measured 4,092 files and 45MB in 0.9s warm and 2.1s cold on the live
+            # tree, 2026-09-17 -- so a drain with nothing to sweep must not pay for it, and that is the
+            # only reason the two passes exist.
             $citedStems = $null
-            try { $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedDir $CITATION_EXCLUDED_DIR }
+            try { $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX }
             catch { $citedStems = $null; $sweepFailed = $true }
             if ($null -eq $citedStems) { $receiptSweepSkipped = $true }
             else {
@@ -1297,7 +1307,10 @@ try {
     if ($duplicateStems -gt 0) { $counterLines += "$duplicateStems file(s) repeat a message id already seen this pass and were left in the inbox." }
     if ($sweepFailed) { $counterLines += "A housekeeping sweep of seen/, expired/, shown/ or receipts/ could not complete; delivery was unaffected." }
     if ($unownedClaims -gt 0) { $counterLines += "$unownedClaims file(s) in claiming/ carry a name this channel did not mint and were left alone." }
-    if ($swept -gt 0) { $counterLines += "$swept message(s) older than $RETAIN_DAYS days were removed from seen/ and expired/ across $boxesSwept box(es)." }
+    # $boxDirs.Count is what the sweep EXAMINED, which includes any box whose own try threw. That is
+    # the honest number here: the reader is being told how wide the pass was, not how many boxes lost
+    # a file, and $sweepFailed is what reports the difference.
+    if ($swept -gt 0) { $counterLines += "$swept message(s) older than $RETAIN_DAYS days were removed from seen/ and expired/ across $($boxDirs.Count) box(es) examined." }
     if ($sweptReceipts -gt 0) {
         $counterLines += "$sweptReceipts receipt(s) older than $RETAIN_DAYS days were removed. Each named a message that is"
         $counterLines += "in no box any more and is quoted nowhere outside mail/."

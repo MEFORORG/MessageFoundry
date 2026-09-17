@@ -22,6 +22,7 @@ from _session_mail_harness import (
     COORD,
     DRAIN,
     MAIL,
+    MAIL_CLAIM,
     MAIL_KEY,
     TIMEOUT,
     _const,
@@ -94,6 +95,17 @@ def markers(repo: Path, key: str) -> list[str]:
     """
     d = mail_root(repo) / "box" / key / "shown"
     return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def age_out(p: Path) -> float:
+    """Put a file one day past the retention window, and return the mtime it was given.
+
+    One definition: three arms age a planted file, and the one that measures whether the sweep
+    actually ran does it by comparing the timestamp afterwards, so it needs the value back.
+    """
+    aged = p.stat().st_mtime - (RETAIN_DAYS + 1) * 86400
+    os.utime(p, (aged, aged))
+    return aged
 
 
 def marker_name(stem: str, session_id: str) -> str:
@@ -526,8 +538,7 @@ def test_a_marker_older_than_the_retention_window_is_swept(repo: Path, tmp_path:
     assert marker.is_file()
     # Only the marker is aged. The message stays fresh, so the message-based orphan sweep cannot be
     # what removes it and the age path is what this measures.
-    aged = marker.stat().st_mtime - (RETAIN_DAYS + 1) * 86400
-    os.utime(marker, (aged, aged))
+    aged = age_out(marker)
 
     text = injection(run_drain(repo, event="SessionStart", session_id=SESSION_A))
     assert re.search(r"(\d+) shown-marker\(s\)", text), f"the age sweep was silent:\n{text}"
@@ -574,9 +585,7 @@ def test_a_message_whose_sender_set_no_ttl_is_still_bounded_by_the_receiver(
     key = str(info["key"])
     inbox = mail_root(repo) / "box" / key / "inbox"
     for row in info["rows"]:
-        p = inbox / str(row["name"])
-        aged = p.stat().st_mtime - (RETAIN_DAYS + 1) * 86400
-        os.utime(p, (aged, aged))
+        age_out(inbox / str(row["name"]))
 
     text = injection(run_drain(repo, event="SessionStart", session_id=SESSION_A))
     assert "no ttl, old" not in text, (
@@ -913,10 +922,9 @@ def test_the_held_count_only_counts_names_this_channel_minted(repo: Path, tmp_pa
 # --- 8g. Retention reaches every box, and the receipt sweep is guarded. --------------------------
 #
 # THE DEFECT THESE EXIST FOR. The retention sweep read this worktree's box and nothing else, so a box
-# whose worktree has been removed never drained, never swept, and kept everything forever. Measured
-# read-only on the live spool 2026-09-17, over 188 boxes: 23,855 of 24,205 files in seen/ were already
-# past a rule written to delete them. receipts/ is one flat directory for the whole queue, which no
-# box-scoped loop could reach at all: 33,121 of its 33,474 files were past the same rule.
+# whose worktree has been removed never drained, never swept, and kept everything forever. The live
+# spool reading that sizes it is in mail-drain.ps1 beside the loop it justifies -- cite it, do not
+# restate it here, for the reason mail-claim.ps1's header records about a measurement copied six ways.
 #
 # WIDENING A DELETE IS NOT LIKE WIDENING A READ, which is why every arm below plants a SURVIVOR beside
 # the file it expects to lose. A sweep that deletes everything and a guard that protects everything
@@ -939,24 +947,32 @@ STEM_C5_CLAIMING = "20260101T000000105-aaaaaa"  # C5: its message is mid-claim
 STEM_C5_STRANDED = "20260101T000000106-aaaaaa"  # C5: its message was left by a dead claimer
 STEM_C8 = "20260101T000000107-aaaaaa"  # C8: quoted in a handoff outside mail/
 STEM_C8_MAIL_ONLY = "20260101T000000108-aaaaaa"  # quoted only INSIDE mail/ -- must go
-STEM_C8_RETIRED = "20260101T000000109-aaaaaa"  # quoted only in the frozen tree -- must go
+STEM_C8_RETIRED = "20260101T000000109-aaaaaa"  # quoted only in a frozen tree -- must go
 STEM_BOTH_HALVES = "20260101T000000110-aaaaaa"  # receipt AND an aged seen/ twin
 STEM_MAIL_CITER = "20260101T000000111-aaaaaa"  # the in-queue message that does the quoting
 STEM_UNMINTED = "20260101T000000112-aaaaaa"  # a receipts/ name this channel does not mint
+STEM_C8_LOOKALIKE = "20260101T000000113-aaaaaa"  # quoted in a FILE named like a frozen tree
+
+# The frozen tree the C8 plant quotes from. DELIBERATELY NOT the date sitting in the live
+# coordination directory: scripts/coord/handoff.ps1 mints `_retired-<yyyy-MM-dd>` on every -Retire, so
+# a drain that matched one literal date would stop excluding the next one -- silently, and forever.
+# This date is the control for that: it can only pass against a family match.
+RETIRED_TREE = "_retired-2099-12-31"
 
 # The stems that must still have a receipt after a guarded pass, one per guard.
-SURVIVORS = (STEM_C5_INBOX, STEM_C5_CLAIMING, STEM_C5_STRANDED, STEM_C8, STEM_BOTH_HALVES)
+SURVIVORS = (
+    STEM_C5_INBOX,
+    STEM_C5_CLAIMING,
+    STEM_C5_STRANDED,
+    STEM_C8,
+    STEM_C8_LOOKALIKE,
+    STEM_BOTH_HALVES,
+)
 
 
 def coord_root(repo: Path) -> Path:
     """``.git/mefor-coord`` -- the tree the citation guard reads, of which ``mail/`` is one child."""
     return mail_root(repo).parent
-
-
-def age_out(p: Path) -> None:
-    """Put a file one day past the retention window, the way 8d already ages a marker."""
-    aged = p.stat().st_mtime - (RETAIN_DAYS + 1) * 86400
-    os.utime(p, (aged, aged))
 
 
 def plant_message(
@@ -986,13 +1002,13 @@ def plant_receipt(repo: Path, stem: str, *, name: str | None = None) -> Path:
     return p
 
 
-def plant(repo: Path, tmp_path: Path) -> dict[str, Any]:
+def plant(repo: Path, tmp_path: Path) -> None:
     """ONE tree, planted identically for the guarded arms and for the unguarded control.
 
     Shared on purpose: a control that measures a different tree from the thing it controls proves
     nothing, and two copies would drift the first time an arm gained a plant of its own.
     """
-    info = seed(repo, tmp_path, [{"body": "live mail, so the drain gets past its own box"}])
+    seed(repo, tmp_path, [{"body": "live mail, so the drain gets past its own box"}])
 
     # A box whose worktree is gone. Nothing will ever drain it again, which is the whole defect.
     plant_message(repo, DEAD_BOX, "seen", STEM_SWEPT)
@@ -1020,6 +1036,7 @@ def plant(repo: Path, tmp_path: Path) -> dict[str, Any]:
         STEM_C8,
         STEM_C8_MAIL_ONLY,
         STEM_C8_RETIRED,
+        STEM_C8_LOOKALIKE,
         STEM_BOTH_HALVES,
     ):
         plant_receipt(repo, stem)
@@ -1030,31 +1047,16 @@ def plant(repo: Path, tmp_path: Path) -> dict[str, Any]:
     (handoffs / "NOTE.md").write_text(
         f"Handed over mid-flight. The record of what happened is {STEM_C8}.\n", encoding="ascii"
     )
-    frozen = coord_root(repo) / "_retired-2026-08-22"
+    # A FILE whose name begins like a frozen tree. The exclusion is a directory rule, so this one is
+    # an ordinary live document and the stem in it is an ordinary live citation.
+    (handoffs / "_retired-notes.md").write_text(
+        f"Still a live note, whatever it is called: {STEM_C8_LOOKALIKE}.\n", encoding="ascii"
+    )
+    frozen = coord_root(repo) / RETIRED_TREE
     frozen.mkdir(parents=True, exist_ok=True)
     (frozen / "old-handoff.md").write_text(
         f"Frozen tree, read back by nobody: {STEM_C8_RETIRED}.\n", encoding="ascii"
     )
-    return info
-
-
-def run_script(
-    script: Path, repo: Path, *, event: str = "Stop", session_id: str = SESSION_A
-) -> subprocess.CompletedProcess[str]:
-    """``run_drain`` against a drain that is not the shipped one, for the planted controls."""
-    payload = {"hook_event_name": event, "cwd": str(repo), "session_id": session_id}
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
-        cwd=str(repo),
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=TIMEOUT,
-        check=False,
-    )
-    assert proc.returncode == 0, f"{script.name} exited {proc.returncode}: {proc.stderr}"
-    assert not proc.stderr.strip(), f"{script.name} wrote to stderr: {proc.stderr}"
-    return proc
 
 
 def rewrite_drain(tmp_path: Path, filename: str, func: str, replacement: str) -> Path:
@@ -1161,8 +1163,16 @@ def test_a_receipt_is_kept_while_anything_outside_the_queue_quotes_it(
         "a stem quoted only INSIDE the queue protected its receipt, so the scan reads mail/ and the"
         " sweep is a no-op wearing a counter line"
     )
+    # The frozen tree here is dated 2099, so this can only pass against a `_retired-` FAMILY match.
+    # handoff.ps1 mints one of these per retirement day; a literal date would stop excluding them.
     assert f"{STEM_C8_RETIRED}.json" not in left, (
-        "a citation in the frozen tree protected its receipt"
+        f"a citation in {RETIRED_TREE} protected its receipt, so the exclusion is pinned to one date"
+    )
+    # ...and the exclusion is a DIRECTORY rule. A live note that merely starts with the same word is
+    # still read, or the family match would be a way to opt a document out of being a citation.
+    assert f"{STEM_C8_LOOKALIKE}.json" in left, (
+        "a file NAMED like a frozen tree was skipped, so the exclusion is matching a name not a"
+        " directory"
     )
     # A name this channel does not mint for a receipt is left alone, exactly as an unowned file in
     # claiming/ or shown/ is. Test-MailStem is what refuses it; Split-MailFileName would have refused
@@ -1210,7 +1220,7 @@ def test_an_unguarded_sweep_takes_every_one_of_the_planted_survivors(
     unguarded = rewrite_drain(
         tmp_path, "mail-drain-unguarded.ps1", "Test-ReceiptProtected", NO_GUARD
     )
-    run_script(unguarded, repo)
+    run_drain(repo, session_id=SESSION_A, script=unguarded)
 
     left = receipts(repo)
     for stem in SURVIVORS:
@@ -1237,7 +1247,7 @@ def test_the_receipt_sweep_keeps_everything_when_a_guard_cannot_be_built(
     plant(repo, tmp_path)
     stub = f"function {func} {{\n    param($A, $B, $C)\n    throw 'injected failure'\n}}"
     broken = rewrite_drain(tmp_path, f"mail-drain-{func}.ps1", func, stub)
-    text = injection(run_script(broken, repo))
+    text = injection(run_drain(repo, session_id=SESSION_A, script=broken))
 
     left = receipts(repo)
     assert f"{STEM_FREE}.json" in left, "a guard could not be built and the sweep deleted anyway"
@@ -1248,41 +1258,68 @@ def test_the_receipt_sweep_keeps_everything_when_a_guard_cannot_be_built(
     assert "live mail, so the drain gets past its own box" in text
 
 
-STEM_PROBE = r"""
+SHAPE_PROBE = r"""
+# Comma-joined, and split here. `pwsh -File` gives every argument to the script as its own string and
+# never collects several into a [string[]] parameter -- the second value lands as a positional one and
+# the script refuses to start.
+param([Parameter(Mandatory)][string]$PlantedMessages, [Parameter(Mandatory)][string]$PlantedReceipts)
+# New names, not a reassignment: a [string]-typed parameter variable coerces an array back to one
+# space-joined string, so re-using the parameter name would silently undo the split.
+$msgNames = @($PlantedMessages -split ',')
+$rcpNames = @($PlantedReceipts -split ',')
 . "__MAIL_KEY__"
-$anchored = [regex]::new('\A' + (Get-MailStemPattern) + '\z')
-$rows = @()
-foreach ($i in 1..50) {
-    $id = New-MessageId
-    $rows += [pscustomobject]@{
-        s = $id; v = (Test-MailStem -Stem $id); p = $anchored.IsMatch($id)
-    }
-}
-$bads = @('', 'not-a-stem', '20260101T000000001-AAAAAA', '20260101T00000000-aaaaaa')
-foreach ($bad in $bads) {
-    $rows += [pscustomobject]@{
-        s = $bad; v = (Test-MailStem -Stem $bad); p = $anchored.IsMatch($bad)
-    }
-}
+. "__MAIL_CLAIM__"
+# The pattern is what FINDS a stem quoted inside a sentence; Test-MailStem is what decides it.
 $q = New-MessageId
 $loose = [regex]::new((Get-MailStemPattern))
 $found = @($loose.Matches("see message $q, which never arrived") | ForEach-Object { $_.Value })
-([pscustomobject]@{ rows = @($rows); quoted = $q; found = @($found) } | ConvertTo-Json -Depth 5)
+$msg = @($msgNames | ForEach-Object {
+        [pscustomobject]@{ n = $_; ok = $null -ne (Split-MailFileName -Name $_) } })
+$rcp = @($rcpNames | ForEach-Object {
+        [pscustomobject]@{ n = $_; ok = $null -ne (Split-ReceiptFileName -Name $_) } })
+([pscustomobject]@{
+        quoted = $q; found = @($found); messages = $msg; receipts = $rcp
+        mintedAccepted = (Test-MailStem -Stem (New-MessageId))
+        nonsenseRejected = (-not (Test-MailStem -Stem 'not-a-stem'))
+    } | ConvertTo-Json -Depth 5)
 """
 
 
-def test_the_stem_search_pattern_and_the_stem_validator_agree(tmp_path: Path) -> None:
-    """THE ONE DRIFT THAT WOULD LOSE DATA, PINNED.
+def test_the_planted_names_are_names_this_channel_mints(tmp_path: Path) -> None:
+    """WITHOUT THIS, EVERY ARM ABOVE COULD PASS BY MEASURING THE WRONG PATH.
 
-    ``Get-MailStemPattern`` proposes citations and ``Test-MailStem`` decides them, so a pattern that
-    is too loose costs a wasted comparison. A pattern that is too TIGHT misses a citation, and a
-    missed citation deletes a receipt somebody is still pointing at. The two live beside each other
-    in mail-key.ps1; this is what keeps them agreeing.
+    The plants are written by hand rather than through ``seed``, because the seeder addresses the
+    drain's own box by construction and these have to land in a box nobody drains. The cost of that
+    is a literal claim token and a literal ``<stem>--<token>.json`` join sitting in a test file. If
+    either shape moves, those names silently become names this channel did NOT mint -- which the
+    drain leaves alone -- and every 8g arm would keep passing while measuring the unowned-name path.
+    So the real validators are asked, once, about the exact strings the plants use.
+
+    It also pins the half of ``Get-MailStemPattern`` a test still has to state: that it finds a stem
+    quoted mid-sentence. The other half -- that it agrees with ``Test-MailStem`` -- needs no test,
+    because the validator is composed from it.
     """
-    probe = tmp_path / "stem-probe.ps1"
-    probe.write_text(STEM_PROBE.replace("__MAIL_KEY__", str(MAIL_KEY)), encoding="ascii")
+    probe = tmp_path / "shape-probe.ps1"
+    probe.write_text(
+        SHAPE_PROBE.replace("__MAIL_KEY__", str(MAIL_KEY)).replace(
+            "__MAIL_CLAIM__", str(MAIL_CLAIM)
+        ),
+        encoding="ascii",
+    )
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(probe),
+            "-PlantedMessages",
+            f"{STEM_SWEPT}--{PLANT_TOKEN}.json",
+            # One comma-joined argument, split inside the script. `pwsh -File` hands every argument
+            # to the script separately and never collects several into one [string[]] parameter.
+            "-PlantedReceipts",
+            f"{STEM_FREE}.json,{STEM_C8}.json",
+        ],
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -1290,8 +1327,11 @@ def test_the_stem_search_pattern_and_the_stem_validator_agree(tmp_path: Path) ->
     )
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
-    for row in out["rows"]:
-        assert row["v"] == row["p"], f"validator and search pattern disagree on {row['s']!r}"
-    # A control, so a pattern that rejects everything cannot pass by agreeing everywhere.
-    assert sum(1 for row in out["rows"] if row["v"]) == 50
+    for row in out["messages"]:
+        assert row["ok"], f"a planted message name is not one this channel mints: {row['n']}"
+    for row in out["receipts"]:
+        assert row["ok"], f"a planted receipt name is not one this channel mints: {row['n']}"
     assert out["found"] == [out["quoted"]], "the pattern cannot find a stem quoted in a sentence"
+    # Controls, so a validator that accepted or rejected everything could not pass this test.
+    assert out["mintedAccepted"] is True
+    assert out["nonsenseRejected"] is True
