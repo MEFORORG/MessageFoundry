@@ -522,3 +522,39 @@ async def test_dicomweb_http_error_response_body_not_logged(
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert _PHI_CANARY not in blob and "Secretpatient" not in blob
     assert _PHI_CANARY not in str(exc.value) and "Secretpatient" not in str(exc.value)
+
+
+# --- BACKLOG #1663: the ValueError arm, which had no test at any of the three sites ----------------
+
+
+async def test_dicomweb_invalid_request_value_is_a_permanent_nak() -> None:
+    """`_post`'s `except ValueError` arm: urllib refusing an illegal request value is a PERMANENT
+    dead-letter, because a retry re-sends the byte-identical request.
+
+    This passes at origin/main -- the arm already existed. It is NEW COVERAGE (a tree-wide grep for
+    `bad-request-value` in tests/ returned zero before this change), added alongside the rest.py
+    connector, whose `_post` had no such arm at all.
+
+    Mutation: delete the `except ValueError` arm. Red: the ValueError escapes `send()` unclassified
+    and `pytest.raises(NegativeAckError)` does not match."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=ValueError("Invalid header name b'X-Bad\\n'"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(PAYLOAD)
+    assert ei.value.permanent is True
+    assert ei.value.code == "bad-request-value"
+    # PHI-safe: the redacted URL only. urllib's ValueError text quotes the offending request value,
+    # so it must not be interpolated. Pinned as an equality -- a bare "not in" passes on an empty
+    # message too.
+    assert str(ei.value) == f"DICOMweb {BASE} rejected an invalid request value"
+
+
+async def test_dicomweb_value_arm_leaves_the_transient_classes_alone() -> None:
+    """Negative control for the test above, matching the pair test_fhir_transport.py keeps: a
+    connection failure must STILL be a retryable DeliveryError, not swept into the permanent class
+    by a widened arm."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=urllib.error.URLError("connection refused"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(PAYLOAD)
+    assert not isinstance(ei.value, NegativeAckError)  # transient — it retries

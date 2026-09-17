@@ -817,11 +817,19 @@ async def test_source_run_loop_skips_poll_when_gate_false() -> None:
 
 async def test_source_follower_real_poll_issues_no_sql() -> None:
     # Higher-fidelity follower test (matches the FILE source's end-to-end check): let the REAL
-    # _poll_once run under a False gate against a pool that raises if touched. The gate must short-
-    # circuit before any acquire/SELECT/mark — so a regression where _may_poll returns True but
-    # _poll_once is reached would surface as the pool being acquired (not just a spy never called).
+    # _poll_once run under a False gate against a pool that counts and refuses every acquire. The
+    # gate must short-circuit before any acquire/SELECT/mark, so a regression where _may_poll
+    # returns True but _poll_once is reached shows up as a nonzero acquire count.
+    #
+    # THE COUNT IS THE ASSERTION, and the raise on its own asserts nothing (BACKLOG #1667): _run
+    # deliberately catches every Exception so that a poll error cannot kill the poller, and
+    # AssertionError is an Exception, so a poisoned acquire is swallowed and logged like any other
+    # poll failure. `await runner` returns cleanly whether the gate holds or not.
+    acquires = {"n": 0}
+
     class _PoisonPool:
         async def acquire(self) -> object:
+            acquires["n"] += 1
             raise AssertionError("a follower must not acquire a connection / issue any SQL")
 
     src = _src(body_column="payload")
@@ -833,6 +841,7 @@ async def test_source_follower_real_poll_issues_no_sql() -> None:
     await asyncio.sleep(0.02)  # several ticks — each must skip the poison pool
     src._stop.set()
     await runner  # must not raise: the gate kept the real _poll_once away from the pool
+    assert acquires["n"] == 0  # the gate short-circuited every tick before any SQL was issued
 
 
 async def test_source_run_loop_polls_when_gate_true() -> None:

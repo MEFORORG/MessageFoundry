@@ -9,6 +9,7 @@ exception classification (transient DeliveryError vs permanent NegativeAckError)
 from __future__ import annotations
 
 import email.message
+import http.client
 import urllib.error
 import urllib.request
 
@@ -22,7 +23,7 @@ from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports import rest as rest_mod
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
-from messagefoundry.transports.rest import RestDestination
+from messagefoundry.transports.rest import RestDestination, outbound_headers_from_metadata
 
 URL = "https://api.example.com/ingest"
 
@@ -592,3 +593,183 @@ def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:
     assert first == {"X-Trace-Id": "t-1", "X-Bad": "line1line2"}
     assert outbound_headers_from_metadata(None) == {}
     assert outbound_headers_from_metadata({}) == {}
+
+
+# --- BACKLOG #1663: an illegal request value is a permanent NAK, not an escaping internal error ----
+#
+# `_post` carried arms for HTTPError, URLError and (TimeoutError, OSError) but not the
+# `(ValueError, http.client.InvalidURL)` arm fhir.py and dicomweb.py already had. The live limb is a
+# message-derived header VALUE: `outbound_headers_from_metadata` strips C0 controls and DEL but not
+# non-Latin-1 codepoints, and `http.client.putheader` latin-1-encodes a str value -- so a Handler that
+# stamps a CJK value raised `UnicodeEncodeError`, which is a ValueError and NOT an OSError, matched no
+# arm, and left `send()` (which wraps `_post` in no try at all) as an unhandled internal error.
+
+
+async def test_rest_invalid_request_value_is_a_permanent_nak() -> None:
+    """The arm's ValueError limb, driven as the backstop it is: urllib refusing an illegal request
+    value dead-letters, because a retry re-sends the byte-identical request.
+
+    Mutation: delete the `(ValueError, http.client.InvalidURL)` arm from `_post`. Red: the ValueError
+    escapes `send()` unclassified. Confirmed red at origin/main, where the arm did not exist."""
+    dest = _dest()
+    dest._opener = _FakeOpener(ValueError("Invalid header name b'X-Bad\\n'"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x")
+    assert exc.value.permanent is True
+    assert exc.value.code == "bad-request-value"
+    # PHI-safe: the redacted URL only. urllib's ValueError text quotes the offending request value,
+    # so it must not be interpolated. Pinned as an EQUALITY -- a bare "not in" passes just as well on
+    # an empty message, and would not notice a value appended later.
+    assert str(exc.value) == f"REST {URL} rejected an invalid request value"
+
+
+async def test_rest_invalid_url_is_a_permanent_nak() -> None:
+    """`http.client.InvalidURL` is named EXPLICITLY in the arm because it is not a `ValueError`: its
+    MRO is InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError.
+
+    Mutation: narrow the arm to a bare `except ValueError`. Red: InvalidURL escapes `send()`."""
+    assert not issubclass(http.client.InvalidURL, (ValueError, OSError))  # the reason it is named
+    dest = _dest()
+    dest._opener = _FakeOpener(http.client.InvalidURL("nonnumeric port"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x")
+    assert exc.value.permanent is True
+    assert exc.value.code == "bad-request-value"
+
+
+async def test_the_invalid_value_arm_leaves_the_transient_classes_alone() -> None:
+    """A guard on the new arm's blast radius, not a reproduction of the bug -- it passes before the
+    fix too. `ResponseTooLargeError` is a `DeliveryError`, not a `ValueError`, so an over-large reply
+    must still RETRY. Mutation: widen the arm to `except Exception`. Red: the over-large reply
+    dead-letters instead, and every transient class below is silently made permanent."""
+    from messagefoundry.transports.bounded_read import ResponseTooLargeError
+
+    for cls in (DeliveryError, NegativeAckError, ResponseTooLargeError):
+        assert not issubclass(cls, (ValueError, http.client.InvalidURL))
+    dest = _dest()
+    dest._opener = _FakeOpener(ResponseTooLargeError("reply too large"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("x")
+    assert not isinstance(ei.value, NegativeAckError)  # transient — it retries
+
+
+# --- BACKLOG #1663 step 2: the header-name token is \Z-anchored, not $-anchored --------------------
+
+
+def test_header_name_token_is_end_anchored_not_dollar_anchored() -> None:
+    """Python's `$` also matches just before a TRAILING NEWLINE, so the `$`-anchored pattern accepted
+    `X-Foo\\n` -- a name carrying the one character this screen exists to keep out of the header
+    block. `\\Z` matches only at the true end of the string.
+
+    Mutation: put `$` back in `_HEADER_NAME_TOKEN`. Red: the newline name matches and the bag emits
+    it. Confirmed red at origin/main against the shipped literal."""
+    assert rest_mod._HEADER_NAME_TOKEN.match("X-Foo\n") is None
+    assert rest_mod._HEADER_NAME_TOKEN.match("X-Foo\r\n") is None
+    assert rest_mod._HEADER_NAME_TOKEN.match("X-Foo") is not None  # the ordinary name still passes
+
+
+async def test_rest_trailing_newline_header_name_never_reaches_the_wire() -> None:
+    """The same defect end to end through `send()`: a metadata key whose suffix ends in a newline is
+    DROPPED, and an ordinary sibling in the same bag is unaffected.
+
+    Mutation: put `$` back in `_HEADER_NAME_TOKEN`. Red: `X-Foo\\n` is emitted as a header name."""
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.X-Foo\n": "v", "http.header.X-Ok": "v"})
+    req = opener.requests[0]
+    assert req.get_header("X-ok") == "v"
+    assert not any(name.lower().startswith("x-foo") for name, _ in req.header_items())
+
+
+# --- BACKLOG #1663 step 3: a non-Latin-1 header value is REFUSED, content-free ---------------------
+#
+# `http.client.putheader` latin-1-encodes a str header value, and `_strip_header_control_chars` removes
+# C0 controls and DEL, not non-Latin-1 codepoints. So the value reached urllib and raised
+# UnicodeEncodeError from deep inside it. The arm above would now classify that -- but classifying it
+# late is not enough, because `str(UnicodeEncodeError)` names the offending character, and that
+# character is a character of the MESSAGE. Refusing in the helper keeps it off `last_error`,
+# `message_events.detail` and the off-box AlertSink. Same ruling `encode_wire_body` already made for
+# the BODY (tests/test_encode_wire_body.py); this is the header path that fix left open.
+
+#: Un-encodable as ASCII *and* as latin-1. Same constant and same reason as
+#: tests/test_encode_wire_body.py's.
+CJK_CHAR = "患"
+
+
+def test_non_latin1_header_value_is_refused_permanently() -> None:
+    """Mutation: delete the `safe.encode("latin-1")` guard from `outbound_headers_from_metadata`.
+    Red: the call returns a dict instead of raising. Confirmed red at origin/main."""
+    with pytest.raises(NegativeAckError) as exc:
+        outbound_headers_from_metadata({"http.header.X-Note": f"ok{CJK_CHAR}"})
+    # Permanent: the same value will never encode, so it dead-letters instead of looping the lane.
+    assert exc.value.permanent is True
+    assert exc.value.code == "encoding"  # matches encode_wire_body, NOT the _post arm's code
+
+
+def test_the_encoding_refusal_names_neither_the_value_nor_the_header() -> None:
+    """THE POINT OF THE LIMB. Both halves are message-derived: the value is the Handler's, and at send
+    time the NAME is a metadata key suffix that `_HEADER_NAME_TOKEN` bounds by CHARSET, not content --
+    so `X-Patient-MRN-12345` is a well-formed token. This string reaches `last_error`,
+    `message_events.detail` and, on a DeliveryError arm, the off-box webhook AlertSink. Only the
+    codec and an index may leave, exactly as `test_the_message_header_arm_never_names_the_header`
+    already requires of the over-length arm.
+
+    Mutation: interpolate `name` (or the value) into the message. Red: the assertions below."""
+    with pytest.raises(NegativeAckError) as exc:
+        outbound_headers_from_metadata({"http.header.X-Patient-MRN-12345": f"ok{CJK_CHAR}"})
+    text = str(exc.value)
+    assert CJK_CHAR not in text  # never the content
+    assert "X-Patient-MRN-12345" not in text and "MRN" not in text  # never the name either
+    # Pinned as an equality: a "not in" assertion passes on an empty message too, and would not
+    # notice a value appended later.
+    assert (
+        text
+        == "per-message request-header value is not encodable as 'latin-1' (first offending character at position 2)"
+    )
+    # Neither `__cause__` NOR `__context__` retains the UnicodeEncodeError, because it carries
+    # `.object` -- the whole offending value -- so anything walking either chain would resurrect
+    # exactly what was just refused. `raise ... from None` alone is NOT enough: it clears
+    # `__cause__` and sets `__suppress_context__`, but leaves `__context__` populated and readable
+    # (measured on the shipped body-path guard, transports/base.py encode_wire_body). The guard
+    # therefore raises from OUTSIDE the encode's except block.
+    # Mutation: move the raise back inside an `except UnicodeEncodeError` with `from None`. Red: the
+    # `__context__` assertion below.
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
+async def test_rest_non_latin1_header_is_refused_before_a_request_is_built() -> None:
+    """End to end through `send()`: the refusal happens in the helper, so NOTHING reaches the opener.
+    Asserting the opener saw no request is what distinguishes a refusal from a late classification --
+    a test that only checks the exception type passes under either.
+
+    Mutation: move the guard into `_post`'s arm instead. Red: `opener.requests` is non-empty."""
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x", metadata={"http.header.X-Note": CJK_CHAR})
+    assert exc.value.code == "encoding"
+    assert opener.requests == []  # refused before a single byte was addressed
+
+
+async def test_a_latin1_header_value_still_ships() -> None:
+    """Byte-identity control, and the reason the refusal is narrow: latin-1 covers the accented Latin
+    alphabet, so an ordinary European name still rides the request. Mutation: tighten the guard to
+    `ascii`. Red: this ships today and would start dead-lettering."""
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.X-Clinician": "Zoë Café"})
+    assert opener.requests[0].get_header("X-clinician") == "Zoë Café"
+
+
+def test_the_encoding_refusal_does_not_disturb_the_ordinary_bag() -> None:
+    """The guard is on the emit path only: a non-Latin-1 value under a NON-header metadata key, or
+    under a key the name screen already drops, is not a header and must not raise."""
+    assert outbound_headers_from_metadata({"note": CJK_CHAR}) == {}  # not an http.header.* key
+    assert outbound_headers_from_metadata({"http.header.Bad Name": CJK_CHAR}) == {}  # name dropped
+    assert (
+        outbound_headers_from_metadata({"http.header.Authorization": CJK_CHAR}) == {}
+    )  # never set
