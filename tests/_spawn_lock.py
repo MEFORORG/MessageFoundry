@@ -98,7 +98,42 @@ from typing import Any, Final, cast
 #: THE BURSTS DO NOT OVERLAP EACH OTHER: all four live in one file, and ``--dist loadfile`` gives a
 #: file to ONE worker, which runs its tests in sequence. So a waiting test queues behind at most one
 #: burst, and this bound is a per-test bound in practice rather than only a per-call one.
-_SINGLE_WAIT_S: Final = 30.0
+#:
+#: WAS 30.0, AND CI MEASURED THAT TOO SMALL -- raised 2026-09-16 on the evidence the ``_note`` below
+#: was added to collect, from job 104922278187 on PR 1203. Two launches each waited the ceiling out
+#: and gave up while the storm still held the turnstile::
+#:
+#:     [spawn-lock] single launch waited 30.4s behind session_mail._race claimed x16 pid=1064 ...
+#:     [spawn-lock] single launch waited 30.1s behind session_mail._race claimed x16 pid=1064 ...
+#:
+#: Same storm, same pid, both launches. Each then launched INTO it and blew its caller's 45s bound.
+#: The old value was sized from the 20-core box's 26.5s of bursts above, while the SAME paragraph
+#: already recorded CI's window as 30-39s -- so the ceiling sat at the bottom of the range it had to
+#: cover. A storm is not faster on a smaller runner, which is the direction that matters here.
+#:
+#: THIS IS NOT THE "RAISING THE CEILING" THE MODULE DOCSTRING REFUTES, and the two are easy to fuse
+#: because both are seconds. That refutation is about ``GATE_TIMEOUT_S``, the caller's bound on a
+#: launch ALREADY RUNNING: a launch that never returns does not return any sooner for being given
+#: longer, so raising it only delays the same failure. This constant is the opposite end -- how long
+#: a launch WAITS BEFORE IT STARTS, so that it starts on an idle machine instead of inside a storm.
+#: Raising it removes the contention rather than tolerating more of it.
+#:
+#: RAISING THIS CANNOT PUSH A LAUNCH PAST ITS OWN TIMEOUT, which is the objection to check before
+#: believing that. The wait happens in ``single_spawn`` BEFORE ``subprocess.run`` is called, so the
+#: caller's ``timeout=`` clock starts at process launch and never includes the wait. Nor does a
+#: waiter hold anything: it registers its reader ticket only once the turnstile is clear, so a long
+#: wait cannot be reaped by ``_READER_STALE_S`` and cannot stall a storm's drain.
+#:
+#: WAITING IS ALSO CHEAPER THAN THE FAILURE IT REPLACES. The poll exits the instant the turnstile
+#: clears, so a run with no storm in flight pays nothing at all. The observed failure cost 30s of
+#: waiting plus a 45s timeout; waiting the storm out instead costs its remaining seconds plus a
+#: launch at the ~2s median recorded below.
+#:
+#: 90.0 IS DELIBERATELY GENEROUS RATHER THAN TIGHT, because a tight ceiling is what produced this
+#: failure. It is ~2.3x the top of the only measured window, and stays well under both the storm's
+#: own ``@pytest.mark.timeout(300)`` bound and the 360s ``_BURST_STALE_S`` reap -- so an ABANDONED
+#: turnstile is still cleared by staleness, never by a waiter giving up on a live one.
+_SINGLE_WAIT_S: Final = 90.0
 
 #: Longest a storm will wait for in-flight single launches to drain before starting anyway. A single
 #: hold is one ``pwsh`` launch, bounded by its caller at 45s but observed at a ~2s median, so this is

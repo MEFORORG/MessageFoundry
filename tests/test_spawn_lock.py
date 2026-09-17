@@ -282,6 +282,34 @@ def test_the_storm_counts_are_unchanged() -> None:
     assert DRAINS == 8, "DRAINS moved; the same argument applies"
 
 
+def test_the_single_wait_outlasts_the_storm_window_ci_measured() -> None:
+    """THE CEILING MUST EXCEED THE STORM, and nothing caught it the first time it did not.
+
+    ``_SINGLE_WAIT_S`` shipped at 30.0, sized from a 20-core box's 26.5s of bursts, while the same
+    comment block already recorded CI's own overlap window as 30-39s. So it was set AT THE BOTTOM of
+    the range it exists to cover, and on a 4-vCPU runner two launches waited it out, gave up while
+    the storm still held the turnstile, launched into it and blew their caller's 45s bound.
+
+    A WAIT SHORTER THAN THE STORM IS WORSE THAN NO WAIT: it pays the full delay and still lands in
+    the contention, which is the shape the job log showed. Nothing failed when the constant was too
+    small -- the module fails open by design, so the symptom surfaced as somebody else's timeout on
+    a different leg. That is exactly the defect a pin is for.
+
+    The bound is asserted against the MEASURED window rather than a literal, so re-sizing the wait on
+    new evidence is free while dropping it back under the storm is not.
+    """
+    ci_overlap_window_top_s = 39.0  # tests/_spawn_lock.py: 2.4-3.1 percent of a ~1250s CI run
+
+    assert ci_overlap_window_top_s < _spawn_lock._SINGLE_WAIT_S, (
+        "a single launch gives up before CI's measured storm ends, so it launches into the "
+        "contention anyway -- the #1304 failure this constant exists to remove"
+    )
+    assert _spawn_lock._SINGLE_WAIT_S < _spawn_lock._BURST_STALE_S, (
+        "a waiter must give up before the turnstile reap, or an ABANDONED storm is waited out "
+        "instead of being cleared by staleness"
+    )
+
+
 def test_a_finished_run_directory_is_reaped_but_a_live_one_is_not(tmp_path: Path) -> None:
     """The key is per-RUN, so without reaping every pytest run leaks a directory into a shared .git.
 
