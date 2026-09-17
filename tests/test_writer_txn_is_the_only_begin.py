@@ -25,10 +25,17 @@ transaction. So a stray or mispaired `RELEASE` does not leak an open transaction
 what the caller still expected to be able to roll back. Both halves of the savepoint pairing are
 live hazards, in opposite directions, so all three verbs are scanned on the same count pin.
 
-`COMMIT` and bare `ROLLBACK` are deliberately NOT scanned. `MessageStore._read` ends its snapshot
-with one of each (store.py:2650 and :2652), the ordinary whole-transaction close, which is the
-behaviour this guard wants rather than the behaviour it bans. Matching either would red a clean tree
-on the statements that keep it clean.
+`COMMIT` and bare `ROLLBACK` are deliberately NOT scanned, and the reason is the RULE rather than any
+particular site: both CLOSE a whole transaction, which is precisely what `_writer_txn` and `_read`
+exist to do. Matching either would red correct code.
+
+Do not re-derive that from the tree, because the tree is about to stop showing it. On `main` today
+`MessageStore._read` ends its snapshot with one of each (store.py:2650 and :2652). PR 1227 rewrites
+that unwind to go through `_unwind_txn`, which rolls back with `db.rollback()` -- a method call, not
+a statement -- after which **no `execute("ROLLBACK")` constant remains anywhere in the module**, while
+the `COMMIT` survives. The exclusion is not weakened by that: it keeps a class legal whether or not
+the tree currently holds a specimen. The control arm below plants its own specimens for exactly that
+reason, so the proof never depends on `store.py` still containing one.
 
 WHAT THIS GUARD IS AGAINST is an honest eighteenth writer reaching for the old shape, not an
 attacker hiding a statement from a scanner. It reads SQL that is present in the source as text, so
@@ -472,6 +479,11 @@ def test_the_scanner_finds_a_hand_rolled_begin_and_ignores_prose() -> None:
         ("MessageStore._read", "BEGIN"): _ALLOWED["MessageStore._read"],
     }
 
+    # The negative arm. Every statement here is SYNTHETIC on purpose and must stay that way: PR 1227
+    # moves `_read`'s unwind to `db.rollback()`, after which store.py holds no `execute("ROLLBACK")`
+    # at all. An arm anchored on the real tree would then pass by finding nothing of that class
+    # rather than by the exclusion holding -- a green that measures absence of the input instead of
+    # correctness of the rule. Planting the specimens keeps it a proof either way.
     scan = _txn_sites(
         "class S:\n"
         "    async def innocent(self):\n"
