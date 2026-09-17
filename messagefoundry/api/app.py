@@ -7084,6 +7084,25 @@ def create_managed_app(
                 # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
                 # propagate here and skip engine.stop() (the reaper precedent).
                 await asyncio.gather(bootstrap_reminder, return_exceptions=True)
+            # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
+            # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
+            # called it, so every clean restart dropped the open hour's PHI-summary access audit --
+            # the rows the control exists to produce, lost exactly when an operator restarts after a
+            # bulk census fetch.
+            #
+            # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
+            # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
+            # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
+            # service. getattr because an app built without create_app's state has no auditor.
+            summary_auditor = getattr(app.state, "summary_auditor", None)
+            if summary_auditor is not None:
+                try:
+                    await summary_auditor.flush(store)
+                except Exception:
+                    _log.exception(
+                        "summary-access coalescer: the shutdown flush failed, so the open "
+                        "window's audit row is lost; continuing the teardown"
+                    )
             await engine.stop()
             # B11: shut down the harness-only instrumented executor (None in production / other tests).
             # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
