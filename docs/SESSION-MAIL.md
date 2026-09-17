@@ -406,20 +406,54 @@ plain delete of files this channel minted, and it is the one move-free path in t
 
 ## What the retention sweep removes, and the three guards on `receipts/`
 
-The sweep runs on every drain, over **every box**, and deletes only files older than `RETAIN_DAYS`
-(7) whose names this channel minted:
+The sweep runs on every drain, over **every box**, deletes only files older than `RETAIN_DAYS` (7)
+whose names this channel minted, and removes **at most a fixed number per pass**:
 
-| Directory | Swept | Why |
-|---|---|---|
-| `seen/`, `expired/` | Yes, in every box | Terminal. Nothing is ever read out of one into a delivery. |
-| `shown/` | Yes, in every box, markers only | An aged marker costs a duplicate display and nothing else. |
-| `receipts/` | Yes, under the guards below | One flat directory for the whole queue, so no box-scoped loop reached it. |
-| `inbox/`, `claiming/`, `stranded/` | **Never** | Undelivered mail, a claim in flight, and the record of a claim whose owner died. |
+| Directory | Swept | Per-pass budget | Why |
+|---|---|---|---|
+| `seen/`, `expired/` | Yes, in every box | `$MESSAGE_DELETE_BUDGET` | Terminal. Nothing is ever read out of one into a delivery. |
+| `shown/` | Yes, in every box, markers only | `$MARKER_DELETE_BUDGET` | An aged marker costs a duplicate display and nothing else. |
+| `receipts/` | Yes, under the guards below | `$RECEIPT_DELETE_BUDGET` | One flat directory for the whole queue, so no box-scoped loop reached it. |
+| `inbox/`, `claiming/`, `stranded/` | **Never** | -- | Undelivered mail, a claim in flight, and the record of a claim whose owner died. |
 
 **A box outlives its worktree, which is why the sweep had to widen.** A box is keyed by worktree path,
 worktrees are removed once their work lands, and a removed worktree's box is never drained again. The
 sweep used to read only the current worktree's box, so the only boxes it ever reached were the ones
 still being drained.
+
+**Widening it gave the first pass a five-week backlog, and the drain is killed at 20 seconds.** The
+hook is registered with `"timeout": 20` on `SessionStart` and on `Stop` in every config root. A pass
+killed there renders nothing at all -- no counter block, no partial line -- and a pass cut short
+inside the message loop never reaches `receipts/`, the largest class of all. So the record that grows
+fastest would be the one that silently never drains.
+
+**Each phase carries its OWN budget rather than a share of one.** A pooled budget spent entirely on
+`seen/` would leave `receipts/` unreached, which is that defect rather than a smaller version of it.
+The three numbers, the measurements behind them and the arithmetic against the 20-second timeout live
+beside the constants in [`mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) -- read them there.
+
+**A pass that stopped at a budget prints a line naming the phase and saying it did not reach the end
+of its input.** "Swept 1,000" and "swept 1,000, and did not reach the end" are different facts about
+the queue, and a reader who cannot separate them reads a bounded pass as a finished one. The flag
+means the second sentence exactly: it is set only where a file or a box was left **unexamined**, never
+by comparing a counter to its cap, so a pass that spends its last delete on the last file it had to
+examine is finished and says nothing.
+
+**The receipt phase budgets its DELETES and not its scan; the other two budget the loop itself.** A
+guard-protected receipt stays a candidate until its guard releases it, so capping the candidate list
+would let a block of protected receipts at the front of the enumeration fill it on every pass and hide
+everything behind them forever. Nothing protects an aged, well-named file in `seen/`, so that loop can
+stop where it stands.
+
+**Boxes come back in the same order every pass, so a bounded sweep always stops in the same place.**
+That is not starvation -- the front of the enumeration shrinks monotonically, so a box at the back is
+reached in a bounded number of passes -- but the back does wait for the front, which is why the
+truncation line exists rather than a bare claim that the sweep ran.
+
+`tests/test_session_mail_held.py` section 8h plants more deletable files than one pass may remove,
+asserts the remainder survives and the sentence prints, asserts a second pass clears it and the
+sentence stops, asserts `receipts/` is still swept when the message phase stops short, and runs the
+same plants against a build with the budgets lifted in which the whole pile dies.
 
 **Three guards stand between that sweep and `receipts/`,** because a receipt is the only record of what
 was observed about a message:

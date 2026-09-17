@@ -1335,3 +1335,193 @@ def test_the_planted_names_are_names_this_channel_mints(tmp_path: Path) -> None:
     # Controls, so a validator that accepted or rejected everything could not pass this test.
     assert out["mintedAccepted"] is True
     assert out["nonsenseRejected"] is True
+
+
+# --- 8h. The sweep is bounded per pass, and a bounded pass says so. ------------------------------
+#
+# THE DEFECT THESE EXIST FOR, AND IT IS NOT DATA LOSS. Widening the sweep to every box gave the first
+# pass a five-week backlog: 33,159 deletable files measured on the live spool at 0bb2605b4, against a
+# hook registered with ``"timeout": 20`` on SessionStart and on Stop in every config root. The sweep
+# is idempotent and every guard fails closed, so a killed pass resumes -- but it is killed at a TURN
+# BOUNDARY, its counter line never renders, and a pass cut short inside the MESSAGE loop never reaches
+# the receipt sweep at all. So the largest class silently never drains, and nothing anywhere says so.
+#
+# WHICH MAKES THE REPORT HALF THE FIX, NOT A COURTESY. "swept 1,000" and "swept 1,000, and did not
+# reach the end" are different facts about the queue, and a reader who cannot separate them reads a
+# bounded pass as a finished one. Every arm below therefore asserts the SENTENCE as well as the
+# filesystem, and the second-pass arm asserts the sentence is ABSENT once the work is done -- which is
+# the only way to show the two do not render alike.
+#
+# A BUDGET AND A BROKEN SWEEP FAIL IDENTICALLY FROM THE OUTSIDE, exactly as 8g's guards do, so the
+# same discipline applies: one build with the budgets lifted, the same plants, and every file that
+# survived a budgeted pass must die there.
+
+# Read from the drain, never restated. A copy here would stop testing the shipped value the moment
+# somebody re-times the sweep, and these numbers are meant to be re-tuned against a measurement.
+MESSAGE_DELETE_BUDGET = _const("MESSAGE_DELETE_BUDGET")
+MARKER_DELETE_BUDGET = _const("MARKER_DELETE_BUDGET")
+RECEIPT_DELETE_BUDGET = _const("RECEIPT_DELETE_BUDGET")
+
+# A second dead box, so the bulk plant never shares a directory with 8g's one-file-per-guard plants
+# and a failure still names which pile it is about.
+BULK_BOX = "bulk-wt-deadbee5"
+# Enough over the budget to prove a REMAINDER was left rather than an off-by-one. Small, because the
+# thing being measured is the boundary and every extra file is wall time in a suite that already
+# drives real subprocesses.
+BULK_OVER = 25
+
+TRUNCATED_MESSAGES = (
+    f"seen/ and expired/ sweep stopped at its per-pass budget of {MESSAGE_DELETE_BUDGET}"
+)
+NOT_FINISHED = "without reaching the end of its input"
+
+
+def plant_bulk_messages(repo: Path, n: int, *, box: str = BULK_BOX) -> list[str]:
+    """``n`` aged, well-named, guard-free message files in one box's ``seen/``.
+
+    Every one of them MUST be deleted by an unbounded sweep: aged past the window, named the way this
+    channel names a message, and in a terminal directory. Nothing protects a file in this state --
+    that is what makes the pile a clean measurement of the budget and nothing else.
+
+    The mtime is computed once and applied with ``os.utime``, rather than through ``age_out``, because
+    that helper re-stats every file and this plant is over a thousand of them.
+    """
+    d = mail_root(repo) / "box" / box / "seen"
+    d.mkdir(parents=True, exist_ok=True)
+    aged = datetime.datetime.now().timestamp() - (RETAIN_DAYS + 1) * 86400
+    stems = []
+    for i in range(n):
+        # Valid under Test-MailStem: eight digits, 'T', nine digits, dash, six lowercase. The 'bbbbbb'
+        # tail keeps these disjoint from 8g's 'aaaaaa' plants even where the digits would collide.
+        stem = f"20260101T000{i:06d}-bbbbbb"
+        p = d / f"{stem}--{PLANT_TOKEN}.json"
+        p.write_text('{"v": 1}', encoding="ascii")
+        os.utime(p, (aged, aged))
+        stems.append(stem)
+    return stems
+
+
+def bulk_left(repo: Path, *, box: str = BULK_BOX) -> int:
+    d = mail_root(repo) / "box" / box / "seen"
+    return len(list(d.glob("*.json"))) if d.is_dir() else 0
+
+
+def rewrite_budgets(tmp_path: Path, filename: str, value: int) -> Path:
+    """A copy of the shipped drain with every per-pass delete budget set to ``value``.
+
+    THE COPY IS THE CONTROL, for the reason ``rewrite_drain`` above records: asserting that a budget
+    stopped a sweep proves nothing on its own, because a sweep that never reached the pile passes the
+    same assertion. Lifting the budgets and watching the whole pile die is what separates them.
+
+    Each substitution must match exactly once, and the dot-source rewrite must find both libraries --
+    ``$PSScriptRoot`` points at ``tmp_path`` in the copy. A rewrite that silently matched nothing
+    would leave a control agreeing with its subject for the wrong reason.
+    """
+    text = DRAIN.read_text(encoding="ascii")
+    prefix = '"$PSScriptRoot\\..\\coord\\'
+    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
+    out = text.replace(prefix, '"' + str(COORD) + "\\")
+    for name in ("MESSAGE_DELETE_BUDGET", "MARKER_DELETE_BUDGET", "RECEIPT_DELETE_BUDGET"):
+        out, n = re.subn(rf"(?m)^\${name} = \d+$", f"${name} = {value}", out)
+        assert n == 1, f"the ${name} rewrite matched {n} times, so this control proves nothing"
+    p = tmp_path / filename
+    p.write_text(out, encoding="ascii")
+    return p
+
+
+def test_a_pass_stops_at_the_message_budget_and_leaves_the_rest_for_the_next_one(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE BOUND, THE REMAINDER, THE SENTENCE, AND THE SECOND PASS THAT CLEARS IT.
+
+    One pile of aged, unguarded files, larger than one pass may remove. The pass must take exactly the
+    budget, leave the remainder on disk, and SAY it did not finish -- and the next pass must clear the
+    remainder and stop saying it, because a truncation line that never goes away is no more useful
+    than one that never appears.
+    """
+    seed(repo, tmp_path, [{"body": "live mail, so housekeeping cannot break the turn it precedes"}])
+    plant_bulk_messages(repo, MESSAGE_DELETE_BUDGET + BULK_OVER)
+
+    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
+
+    assert bulk_left(repo) == BULK_OVER, (
+        "the pass did not stop at the budget, so the hook's 20-second kill is still reachable"
+    )
+    m = re.search(r"(\d+) message\(s\) older than \d+ days were removed", text)
+    assert m, f"the sweep was silent about what it removed:\n{text}"
+    assert int(m.group(1)) == MESSAGE_DELETE_BUDGET, (
+        f"the counter reports {m.group(1)} removed against a budget of {MESSAGE_DELETE_BUDGET}"
+    )
+    assert TRUNCATED_MESSAGES in text and NOT_FINISHED in text, (
+        f"a bounded pass rendered as a finished one, which is the whole defect:\n{text}"
+    )
+    # Housekeeping must never break the turn it precedes, budget or no budget.
+    assert "live mail, so housekeeping cannot break the turn it precedes" in text
+
+    second = injection(run_drain(repo, event="Stop", session_id=SESSION_B))
+    assert bulk_left(repo) == 0, "the remainder was not cleared, so the budget is a cap not a delay"
+    assert TRUNCATED_MESSAGES not in second, (
+        f"a pass that finished still says it stopped, so the two facts render alike:\n{second}"
+    )
+    assert re.search(rf"{BULK_OVER} message\(s\) older than \d+ days were removed", second), (
+        f"the second pass did not report the remainder it took:\n{second}"
+    )
+
+
+def test_the_receipt_sweep_still_runs_when_the_message_phase_hits_its_budget(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE SPECIFIC FAILURE THE BUDGETS EXIST FOR, AND IT GETS ITS OWN ARM.
+
+    receipts/ is the largest class and it is swept LAST. A pass killed inside the message loop never
+    reaches it, so under a single pooled budget -- or under no budget at all and a 20-second kill --
+    the biggest record grows forever while every counter line a seat reads looks orderly. Each phase
+    therefore carries its own budget, and this is the assertion that says so: the message phase stops
+    short, and the receipt sweep still deletes the receipt it was always going to delete.
+    """
+    plant(repo, tmp_path)
+    plant_bulk_messages(repo, MESSAGE_DELETE_BUDGET + BULK_OVER)
+
+    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
+
+    assert TRUNCATED_MESSAGES in text, (
+        f"the message phase never hit its budget, so this arm proves nothing:\n{text}"
+    )
+    assert "The receipt sweep did not run" not in text, (
+        f"the message phase's budget skipped the receipt sweep entirely:\n{text}"
+    )
+    assert f"{STEM_FREE}.json" not in receipts(repo), (
+        "the receipt sweep never reached a receipt with no message and no citation, which is exactly"
+        " the class that silently never drains"
+    )
+    # The guards are untouched by the budget: a bounded pass must not become a permissive one.
+    left = receipts(repo)
+    for stem in SURVIVORS:
+        assert f"{stem}.json" in left, f"a guarded receipt died on a budgeted pass: {stem}"
+
+
+def test_a_build_with_the_budgets_lifted_takes_the_whole_pile_and_never_says_it_stopped(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE PLANTED CONTROL, and the reason the two arms above are evidence rather than assertion.
+
+    Same plant, same tree, one build whose budgets are larger than anything this test can plant. The
+    whole pile dies and no truncation line is printed. If it did not, the arms above would be passing
+    because the sweep never reached the pile -- a bound and a broken sweep are the same silence from
+    the outside -- and no assertion inside them could tell the two apart.
+    """
+    seed(repo, tmp_path, [{"body": "live mail"}])
+    planted = MESSAGE_DELETE_BUDGET + BULK_OVER
+    plant_bulk_messages(repo, planted)
+    unbounded = rewrite_budgets(tmp_path, "mail-drain-unbounded.ps1", 10_000_000)
+
+    text = injection(run_drain(repo, session_id=SESSION_A, script=unbounded))
+
+    assert bulk_left(repo) == 0, (
+        "the pile survived a build with no budget in it, so the budgeted arms prove nothing"
+    )
+    assert re.search(rf"{planted} message\(s\) older than \d+ days were removed", text), (
+        f"the unbounded build did not report taking the whole pile:\n{text}"
+    )
+    for phrase in ("stopped at its per-pass budget", NOT_FINISHED):
+        assert phrase not in text, f"a build with no budget reported a bounded pass:\n{text}"

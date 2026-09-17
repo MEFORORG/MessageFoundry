@@ -243,6 +243,42 @@ $MAX_LINE_CHARS = 240
 # receipts' "did it actually deliver" question answerable.
 $RETAIN_DAYS = 7
 
+# --- PER-PASS DELETE BUDGETS. --------------------------------------------------------------------
+# THE HOOK IS KILLED AT 20 SECONDS, AND A KILLED PASS IS NOT MERELY A SLOW ONE. The registration is
+# `"timeout": 20` on SessionStart and on Stop, in the settings.json of every config root -- measured
+# 2026-09-17, twelve registrations across six roots, every one of them 20. A pass killed inside the
+# message loop never reaches the receipt sweep at all, so the LARGEST class silently never drains
+# while the counter line that would have said so never renders either. That is the failure these
+# numbers exist to stop, and it is strictly worse than sweeping less per pass.
+#
+# THE ARITHMETIC. Measured on this machine, live spool, 2026-09-17:
+#   Remove-Item + Test-Path, the pair this file runs per file  0.77 ms  (3,000 files, temp directory)
+#   keep-set build, 188 boxes / 24,584 stems                   709-998 ms over three runs
+#   receipt pass A, enumerate + validate + C5 over 33,480      729-929 ms over three runs
+#   citation walk, 4,100 files                                 706 ms warm; 2.1 s cold at 1ab08076a
+#   bare pwsh startup                                          ~267 ms (see the PreToolUse paragraph)
+#   the rest -- box enumeration, dead-owner sweep, delivery, injection      call it 1 s
+# Fixed cost at the worst of each: 0.27 + 1.0 + 0.93 + 2.1 + 1.0 = 5.3 s.
+# Deletes at 1000 + 250 + 1000 = 2,250 per pass: 1.73 s, for 7.0 s total -- 35% of the timeout.
+#
+# THE BENCHMARK IS OPTIMISTIC AND IS SIZED AS SUCH. It ran in a throwaway temp directory with no
+# on-access scanner in the path, which the live spool does not have. At THREE times that cost the
+# deletes take 5.2 s and the pass 10.5 s; at FIVE times, 8.7 s and 14.0 s. Both are inside 20 s.
+#
+# WHAT IT COSTS. The first widened pass had 33,159 deletable files measured across the spool, so the
+# message phase needs 24 passes and the receipt phase 10. The hook fires at SessionStart and at every
+# Stop, so an ordinary working day clears it. A backlog that drains over a day is not the problem; a
+# pass that is killed before it reaches receipts/ is.
+#
+# EACH PHASE GETS ITS OWN BUDGET RATHER THAN A SHARE OF ONE. Three phases delete: seen/ and expired/
+# across every box, shown/ markers, and receipts/. A single pooled budget spent entirely on seen/
+# would leave receipts/ unreached -- which is the defect being fixed, not a smaller version of it --
+# so no phase can be starved by another's backlog here, and the worst-case wall time is the SUM
+# above, which is the number sized against the timeout.
+$MESSAGE_DELETE_BUDGET = 1000
+$MARKER_DELETE_BUDGET = 250
+$RECEIPT_DELETE_BUDGET = 1000
+
 # The directory-name PREFIX the receipt sweep's citation guard does NOT read. A `_retired-<date>` tree
 # is a frozen copy of an older coordination tree, so a stem quoted inside one cites state nobody reads
 # back, and honouring those citations would pin receipts to a snapshot forever. mail/ is the other
@@ -780,6 +816,19 @@ try {
     # FAIL CLOSED, AND SAY SO. A guard that could not be evaluated keeps every receipt, and a silent
     # skip would be indistinguishable from a sweep that found nothing to do.
     $receiptSweepSkipped = $false
+    # --- TRUNCATION, ONE FLAG PER BUDGETED PHASE. -------------------------------------------------
+    # "swept 1,000" and "swept 1,000, and did not reach the end" are different facts about the queue,
+    # and the whole reason the budgets exist is that the second one must never print as the first. A
+    # reader who cannot tell them apart reads a bounded pass as a finished one and stops looking.
+    #
+    # THE FLAG MEANS "THIS PHASE DID NOT REACH THE END OF ITS INPUT", NOT "deletes == budget". A pass
+    # whose budget ran out on the very last file it had to examine IS complete, and saying otherwise
+    # would cost a wholly pointless next pass and teach the reader to ignore the line. So each flag is
+    # set only where a candidate was left UNEXAMINED -- a file the loop broke before, or a box the
+    # loop skipped -- never by comparing a counter to its cap.
+    $messageSweepTruncated = $false
+    $markerSweepTruncated = $false
+    $receiptSweepTruncated = $false
     $duplicateStems = 0
     # --- The show/consume split's own counters. ---
     $alreadyShown = 0       # the held count, named for what the reader cares about.
@@ -860,9 +909,22 @@ try {
     try { $messageStems = Get-LiveMessageStems -BoxRoot $boxRoot }
     catch { $messageStems = $null; $sweepFailed = $true }
 
+    # THE BUDGETS BIND HERE, AND THE ORDER THIS LOOP RUNS IN IS WORTH ONE SENTENCE. Boxes come back in
+    # the same enumeration order every pass, so a bounded pass always stops in the same place. That is
+    # not starvation: the front of the enumeration shrinks monotonically, so a box at the back is
+    # reached in a bounded number of passes. It does mean the back waits for the front, which is the
+    # honest description and is why the truncation line exists rather than a claim that the sweep ran.
     foreach ($bd in $boxDirs) {
+        # A BOX THIS PHASE IS ABOUT TO SKIP IS A BOX IT DID NOT EXAMINE, which is the flag's exact
+        # meaning. Set here rather than by comparing the counter to its cap at the end, because the
+        # pass that spends its last delete on the last file of the last box is COMPLETE and must not
+        # claim otherwise.
+        if ($swept -ge $MESSAGE_DELETE_BUDGET) { $messageSweepTruncated = $true }
+        if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true }
+        if ($messageSweepTruncated -and $markerSweepTruncated) { break }
         try {
             foreach ($state in @('seen', 'expired')) {
+                if ($messageSweepTruncated) { break }
                 $d = [System.IO.Path]::Combine($bd, $state)
                 if (-not [System.IO.Directory]::Exists($d)) { continue }
                 # EnumerateFiles RETURNS FILES ONLY, which is the same guarantee -File was carrying and
@@ -872,6 +934,10 @@ try {
                 # -ErrorAction SilentlyContinue did not suppress it. It is also the fast path: Get-ChildItem
                 # over 188 boxes measured 2,699ms against 159ms here on the live spool, 2026-09-17.
                 foreach ($old in @(([System.IO.DirectoryInfo]::new($d)).EnumerateFiles('*.json'))) {
+                    # At the TOP, so reaching it proves there was another file to examine. Placing it
+                    # after the delete would fire on a pass that had just finished its input and
+                    # report a complete sweep as a bounded one.
+                    if ($swept -ge $MESSAGE_DELETE_BUDGET) { $messageSweepTruncated = $true; break }
                     if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
                     if (-not (Split-MailFileName -Name $old.Name)) { continue }
                     Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
@@ -883,8 +949,9 @@ try {
             # Widened with the rest, and for the same reason -- age is a property of the marker, not of
             # whose box it sits in, and a dead worktree's markers were never swept by anything.
             $shownForBox = [System.IO.Path]::Combine($bd, 'shown')
-            if ([System.IO.Directory]::Exists($shownForBox)) {
+            if ([System.IO.Directory]::Exists($shownForBox) -and -not $markerSweepTruncated) {
                 foreach ($old in @(([System.IO.DirectoryInfo]::new($shownForBox)).EnumerateFiles('*.marker'))) {
+                    if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true; break }
                     if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
                     if (-not (Split-ShownMarkerName -Name $old.Name)) { continue }
                     Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
@@ -930,6 +997,14 @@ try {
         }
         catch { $sweepFailed = $true; $receiptSweepSkipped = $true; $candidates.Clear() }
 
+        # THE SCAN ABOVE IS NOT BUDGETED; ONLY THE DELETES BELOW ARE, AND THAT ASYMMETRY IS THE WHOLE
+        # DESIGN OF THIS PHASE. Capping the candidate LIST would wedge the sweep: a block of
+        # guard-protected receipts at the front of the enumeration would fill the list on every pass,
+        # be released by nothing, and every receipt behind them would go unexamined forever.
+        # Guard-protected files exist here by design and do not exist in the message phase -- nothing
+        # protects an aged, well-named file in seen/ -- which is why that loop may break on its budget
+        # and this one may not. Full-width scanning is affordable: 729-929 ms over all 33,480 receipts,
+        # three runs on the live spool 2026-09-17, and it is charged in the arithmetic at the budgets.
         if ($candidates.Count -gt 0 -and -not $receiptSweepSkipped) {
             # PASS B: the citation walk, then the verdict. The walk reads the whole coordination tree
             # outside mail/ -- measured 4,092 files and 45MB in 0.9s warm and 2.1s cold on the live
@@ -941,6 +1016,9 @@ try {
             if ($null -eq $citedStems) { $receiptSweepSkipped = $true }
             else {
                 foreach ($c in $candidates) {
+                    # At the TOP, so reaching it proves a candidate was left unexamined. A pass that
+                    # spends its last delete on the last candidate finished its input and says so.
+                    if ($sweptReceipts -ge $RECEIPT_DELETE_BUDGET) { $receiptSweepTruncated = $true; break }
                     if (Test-ReceiptProtected -Stem $c.Stem -MessageStems $messageStems -CitedStems $citedStems) { continue }
                     Remove-Item -LiteralPath $c.File.FullName -Force -ErrorAction SilentlyContinue
                     if (-not (Test-Path -LiteralPath $c.File.FullName)) { $sweptReceipts++ }
@@ -1010,7 +1088,12 @@ try {
             $lp = Split-MailFileName -Name $lf.Name
             if ($lp) { [void]$liveStems.Add($lp.Stem) }
         }
+        # THE SAME MARKER BUDGET, BECAUSE THIS INCREMENTS THE SAME COUNTER. Two sweeps remove markers
+        # -- the by-age one in the box loop above and this by-message one over the current box -- and a
+        # budget that bound only the first would leave $sweptMarkers unbounded and the truncation line
+        # reporting on half of what produced it.
         foreach ($mk in @(Get-ChildItem -LiteralPath $shownDir -Filter *.marker -File -EA SilentlyContinue)) {
+            if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true; break }
             $mp = Split-ShownMarkerName -Name $mk.Name
             if (-not $mp) { $unownedMarkers++; continue }
             if ($liveStems.Contains($mp.Stem)) { continue }
@@ -1320,6 +1403,24 @@ try {
         # rendering as the same silence.
         $counterLines += "The receipt sweep did not run: a guard could not be evaluated, so every receipt was kept."
     }
+    # --- WHAT A BOUNDED PASS SAYS ABOUT ITSELF. ---------------------------------------------------
+    # A hook killed at its 20-second timeout renders NOTHING -- no counter block, no sentence, no
+    # partial line -- so the only thing that can report a bounded sweep is a sweep that chose to stop.
+    # These lines are that report, and they say the fact the budget actually establishes: the phase
+    # did not reach the end of its input. Each names its own phase, because the budgets are
+    # independent and "the sweep is behind" would not tell a reader WHICH record is still growing.
+    if ($messageSweepTruncated) {
+        $counterLines += "The seen/ and expired/ sweep stopped at its per-pass budget of $MESSAGE_DELETE_BUDGET delete(s)"
+        $counterLines += "without reaching the end of its input. The rest is still on disk and the next drain resumes."
+    }
+    if ($markerSweepTruncated) {
+        $counterLines += "The shown/ marker sweep stopped at its per-pass budget of $MARKER_DELETE_BUDGET delete(s)"
+        $counterLines += "without reaching the end of its input. The rest is still on disk and the next drain resumes."
+    }
+    if ($receiptSweepTruncated) {
+        $counterLines += "The receipt sweep stopped at its per-pass budget of $RECEIPT_DELETE_BUDGET delete(s) without"
+        $counterLines += "reaching the end of its candidates. The rest is still on disk and the next drain resumes."
+    }
     # The show/consume split's own outcome. ONE sentence now, because there is only one: a marker can
     # suppress a re-display at a non-consuming event and nothing else. A consuming drain ignores markers
     # entirely, so $alreadyShown is unreachable when $consuming and the branch that used to report a
@@ -1365,7 +1466,13 @@ try {
         $anything = ($unreadable + $expired + $malformed + $filtered + $deferred + $ceded + $stranded +
             $unownedClaims + $duplicateStems + $alreadyShown + $unownedMarkers + $sweptMarkers +
             $swept + $sweptReceipts)
-        if ($anything -gt 0) {
+        # A TRUNCATED PHASE IS SOMETHING THAT HAPPENED, and it is carried separately rather than
+        # folded into the sum because a boolean is not a count. Today every truncation implies a
+        # non-zero counter above it -- a budget cannot be spent without deletes -- so this clause
+        # changes nothing. It is here so that the day somebody moves a break, a bounded pass cannot
+        # start rendering as silence, which is the failure this whole block exists to prevent.
+        $bounded = ($messageSweepTruncated -or $markerSweepTruncated -or $receiptSweepTruncated)
+        if ($anything -gt 0 -or $bounded) {
             $z = @("[mefor-mail] Drain ran at $asOf over $inboxDir. Nothing is being shown to you.")
             $z += $counterLines
             $z += "If that is surprising, run scripts\coord\mail.ps1 -List."
