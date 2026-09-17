@@ -357,12 +357,22 @@ co-occur with a removal:
 
 Measured over the parsed script rather than by grep, because a grep for `^\s*exit` misses four
 keywords and any wrapper that reads the exit variable. Classifying every `Exit`, `Return`, `Throw`,
-`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89: 5
-`Exit` and 1 `Throw` at top level, 49 `Return` and 1 `Break` nested, 20 `Continue` at top level and
-13 nested. **0 `Exit` sits inside any function**, and the two that end an ordinary run are both
-`exit $exit`. The standing pin is `test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills
-the fence between the decision pass and the removal pass and asserts `counts.removed == 0` beside
-the `2`.
+`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89 —
+outside a function 5 `Exit`, 1 `Throw`, 20 `Continue` and 2 `Return`; inside one 47 `Return`, 13
+`Continue` and 1 `Break`.
+
+The 2 `Return`s outside a function are not script-level either, and the distinction is worth the
+sentence because anyone re-running that predicate will meet them: they are the `return $true` /
+`return $false` of the `$matchesName` scriptblock literal, returning from that scriptblock.
+Counting a `ScriptBlockExpressionAst` as a nesting level too moves exactly those two rows and
+nothing else. This paragraph published that broader reading — *"49 `Return` ... nested"* — while
+naming the narrower predicate, so a reader who followed the stated method got a different table.
+
+What the argument rests on survives both readings: **0 `Exit` sits inside a function** under
+either, so no `exit` in the file is scoped to anything narrower than the process, and the two that
+end an ordinary run are both `exit $exit`. The standing pin is
+`test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills the fence between the decision
+pass and the removal pass and asserts `counts.removed == 0` beside the `2`.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the

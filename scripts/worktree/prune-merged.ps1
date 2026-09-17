@@ -145,9 +145,19 @@
     ESTABLISHED OVER THE AST RATHER THAN BY GREP, because a grep for ^\s*exit misses four keywords
     and any wrapper that reads the exit variable. Parsing the file and classifying every Exit,
     Return, Throw, Break and Continue statement by whether an ancestor is a FunctionDefinitionAst
-    gives 89: 5 Exit and 1 Throw at top level, 49 Return and 1 Break nested, 20 Continue at top
-    level and 13 nested. 0 Exit sits inside any function, and the two that end an ordinary run are
-    both `exit $exit`. tests/test_worktree_prune_merged.py's
+    gives 89. Outside a function: 5 Exit, 1 Throw, 20 Continue, 2 Return. Inside one: 47 Return,
+    13 Continue, 1 Break.
+
+    THE 2 RETURNS OUTSIDE A FUNCTION ARE NOT SCRIPT-LEVEL EITHER, and the line is worth spending
+    because a reader re-running the predicate above will meet them. They are the `return $true` /
+    `return $false` of the `$matchesName` scriptblock literal, and they return from that
+    scriptblock. Counting a ScriptBlockExpressionAst as a nesting level too moves exactly those two
+    rows and nothing else, which is the whole of what the two predicates disagree about. This
+    paragraph published the broader reading, 49 Return nested, while naming the narrower predicate.
+
+    WHAT THE ARGUMENT RESTS ON SURVIVES BOTH READINGS: 0 Exit sits inside a function under either,
+    so no `exit` here is scoped to anything narrower than the process, and the two that end an
+    ordinary run are both `exit $exit`. tests/test_worktree_prune_merged.py's
     test_a_fence_that_dies_mid_run_refuses_and_says_so is the standing pin: it kills the fence
     between the decision pass and the removal pass, and asserts counts.removed is 0 beside the 2.
 

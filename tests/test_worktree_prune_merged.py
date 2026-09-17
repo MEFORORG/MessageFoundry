@@ -505,6 +505,21 @@ def run_text_parsed(
     the harness, and the tests below carry the ``-File`` reading beside it as a control, so the
     difference between the two is measured here rather than assumed.
 
+    ``-Command`` COSTS THE EXIT CODE, AND THE TRAILING ``exit $LASTEXITCODE`` IS WHAT BUYS IT BACK.
+    ``-Command`` reports its own success or failure, not the script's: it collapses every non-zero
+    code to 1. Measured on pwsh 7.6.6 against a probe that exits with what it is asked for::
+
+        asked  0   1   2   3
+        -File  0   1   2   3
+        -Cmd   0   1   1   1
+        -Cmd + "; exit $LASTEXITCODE"   0   1   2   3
+
+    Without that clause an ``assert returncode == 1`` here is satisfied by 1, 2 and 3 alike, and
+    reads identically to the genuine one in
+    ``test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED``, which goes through
+    ``run_text``. A helper that silently cannot distinguish a refusal from a failure has no place
+    in a file about a destructive tool's exit codes.
+
     Quoting: every path is single-quoted for PowerShell with embedded quotes doubled, because
     ``tmp_path`` can carry characters the parser would otherwise read as syntax.
     """
@@ -520,7 +535,13 @@ def run_text_parsed(
     parts += ["-ConfigRoot", q(fx.cfg)]
     parts += list(extra)
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", " ".join(parts)],
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            " ".join(parts) + "; exit $LASTEXITCODE",
+        ],
         capture_output=True,
         text=True,
         timeout=300,
@@ -1695,6 +1716,23 @@ def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: i
     assert res["_exit"] == 2
     assert (
         "matched no PRUNABLE sibling" in run_text(fx, "-Apply", "-Name", "no-such-worktree").stdout
+    )
+
+
+def test_run_text_parsed_reports_the_scripts_own_exit_code(fx: Fixture) -> None:
+    """The helper's own pin, because `-Command` silently collapses every non-zero code to 1.
+
+    Without the trailing ``exit $LASTEXITCODE`` this returns 1 for a run that exited 2, and every
+    ``assert returncode == 1`` written through the helper becomes unfalsifiable. ``-IdleHours -1``
+    is the cheapest refusal in the script: it exits 2 from the preamble, before the fence is read
+    or a candidate exists, so nothing else in the fixture can move the code.
+
+    The control is the same refusal through ``run_text`` (``-File``), which has always propagated
+    faithfully. Both must read 2; if only the ``-File`` one does, the clause has been dropped.
+    """
+    assert run_text(fx, "-IdleHours", "-1").returncode == 2, "the -File control must refuse with 2"
+    assert run_text_parsed(fx, "-IdleHours", "-1").returncode == 2, (
+        "-Command reported a different code than the script exited with"
     )
 
 
