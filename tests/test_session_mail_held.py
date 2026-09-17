@@ -19,8 +19,10 @@ from typing import Any
 
 import pytest
 from _session_mail_harness import (
+    COORD,
     DRAIN,
     MAIL,
+    MAIL_KEY,
     TIMEOUT,
     _const,
     box_files,
@@ -906,3 +908,390 @@ def test_the_held_count_only_counts_names_this_channel_minted(repo: Path, tmp_pa
     run_drain(repo, event="SessionStart", session_id=SESSION_A)
     (mail_root(repo) / "box" / key / "shown" / "evil.marker").write_text("{}", encoding="ascii")
     assert json.loads(mail_cmd(repo, "-Status", "-Json").stdout)["ShownHeld"] == 1
+
+
+# --- 8g. Retention reaches every box, and the receipt sweep is guarded. --------------------------
+#
+# THE DEFECT THESE EXIST FOR. The retention sweep read this worktree's box and nothing else, so a box
+# whose worktree has been removed never drained, never swept, and kept everything forever. Measured
+# read-only on the live spool 2026-09-17, over 188 boxes: 23,855 of 24,205 files in seen/ were already
+# past a rule written to delete them. receipts/ is one flat directory for the whole queue, which no
+# box-scoped loop could reach at all: 33,121 of its 33,474 files were past the same rule.
+#
+# WIDENING A DELETE IS NOT LIKE WIDENING A READ, which is why every arm below plants a SURVIVOR beside
+# the file it expects to lose. A sweep that deletes everything and a guard that protects everything
+# fail identically from the outside: both leave a drain that exits 0 and a counter line that reads as
+# if it worked. The controls are therefore planted in both directions -- one file per guard that must
+# survive, and files that must go, in the same tree and in the same pass.
+
+DEAD_BOX = "gone-wt-deadbeef"
+# Valid under Test-ClaimToken: four hex, three short hex groups, then eight hex.
+PLANT_TOKEN = "abcd-1-1-1-deadbeef"
+
+# One stem per plant, so a failure names the guard rather than a file. All are valid under
+# Test-MailStem. Minted by hand rather than through New-MessageId deliberately: an arm that asserts a
+# file SURVIVED has to be able to name it afterwards.
+STEM_SWEPT = "20260101T000000101-aaaaaa"  # aged, in a dead box's seen/ -- must go
+STEM_FRESH = "20260101T000000102-aaaaaa"  # inside the window -- must stay
+STEM_FREE = "20260101T000000103-aaaaaa"  # aged receipt, no message, uncited -- must go
+STEM_C5_INBOX = "20260101T000000104-aaaaaa"  # C5: its message is still undelivered
+STEM_C5_CLAIMING = "20260101T000000105-aaaaaa"  # C5: its message is mid-claim
+STEM_C5_STRANDED = "20260101T000000106-aaaaaa"  # C5: its message was left by a dead claimer
+STEM_C8 = "20260101T000000107-aaaaaa"  # C8: quoted in a handoff outside mail/
+STEM_C8_MAIL_ONLY = "20260101T000000108-aaaaaa"  # quoted only INSIDE mail/ -- must go
+STEM_C8_RETIRED = "20260101T000000109-aaaaaa"  # quoted only in the frozen tree -- must go
+STEM_BOTH_HALVES = "20260101T000000110-aaaaaa"  # receipt AND an aged seen/ twin
+STEM_MAIL_CITER = "20260101T000000111-aaaaaa"  # the in-queue message that does the quoting
+STEM_UNMINTED = "20260101T000000112-aaaaaa"  # a receipts/ name this channel does not mint
+
+# The stems that must still have a receipt after a guarded pass, one per guard.
+SURVIVORS = (STEM_C5_INBOX, STEM_C5_CLAIMING, STEM_C5_STRANDED, STEM_C8, STEM_BOTH_HALVES)
+
+
+def coord_root(repo: Path) -> Path:
+    """``.git/mefor-coord`` -- the tree the citation guard reads, of which ``mail/`` is one child."""
+    return mail_root(repo).parent
+
+
+def age_out(p: Path) -> None:
+    """Put a file one day past the retention window, the way 8d already ages a marker."""
+    aged = p.stat().st_mtime - (RETAIN_DAYS + 1) * 86400
+    os.utime(p, (aged, aged))
+
+
+def plant_message(
+    repo: Path, box: str, state: str, stem: str, *, aged: bool = True, body: str = ""
+) -> Path:
+    """A message file under any box and any state, named the way this channel names one.
+
+    Written by hand rather than through ``seed``: the seeder addresses the DRAIN's own box by
+    construction, and the whole subject here is the boxes it does not address.
+    """
+    d = mail_root(repo) / "box" / box / state
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{stem}--{PLANT_TOKEN}.json"
+    p.write_text(json.dumps({"v": 1, "id": stem, "body": body}), encoding="ascii")
+    if aged:
+        age_out(p)
+    return p
+
+
+def plant_receipt(repo: Path, stem: str, *, name: str | None = None) -> Path:
+    """An aged receipt. ``name`` overrides the ``<stem>.json`` shape, for the unminted-name arm."""
+    d = mail_root(repo) / "receipts"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / (name or f"{stem}.json")
+    p.write_text(json.dumps({"v": 2, "messageId": stem}), encoding="ascii")
+    age_out(p)
+    return p
+
+
+def plant(repo: Path, tmp_path: Path) -> dict[str, Any]:
+    """ONE tree, planted identically for the guarded arms and for the unguarded control.
+
+    Shared on purpose: a control that measures a different tree from the thing it controls proves
+    nothing, and two copies would drift the first time an arm gained a plant of its own.
+    """
+    info = seed(repo, tmp_path, [{"body": "live mail, so the drain gets past its own box"}])
+
+    # A box whose worktree is gone. Nothing will ever drain it again, which is the whole defect.
+    plant_message(repo, DEAD_BOX, "seen", STEM_SWEPT)
+    plant_message(repo, DEAD_BOX, "seen", STEM_FRESH, aged=False)
+    plant_message(repo, DEAD_BOX, "seen", STEM_BOTH_HALVES)
+    plant_message(repo, DEAD_BOX, "inbox", STEM_C5_INBOX)
+    plant_message(repo, DEAD_BOX, "claiming", STEM_C5_CLAIMING)
+    plant_message(repo, DEAD_BOX, "stranded", STEM_C5_STRANDED)
+    # Inside the queue, quoting another message's id. The citation guard must NOT see this one, or
+    # every receipt in the directory would read as cited and the sweep would delete nothing.
+    plant_message(
+        repo,
+        DEAD_BOX,
+        "seen",
+        STEM_MAIL_CITER,
+        aged=False,
+        body=f"chasing {STEM_C8_MAIL_ONLY}, which never arrived",
+    )
+
+    for stem in (
+        STEM_FREE,
+        STEM_C5_INBOX,
+        STEM_C5_CLAIMING,
+        STEM_C5_STRANDED,
+        STEM_C8,
+        STEM_C8_MAIL_ONLY,
+        STEM_C8_RETIRED,
+        STEM_BOTH_HALVES,
+    ):
+        plant_receipt(repo, stem)
+    plant_receipt(repo, STEM_UNMINTED, name=f"{STEM_UNMINTED}--{PLANT_TOKEN}.json")
+
+    handoffs = coord_root(repo) / "handoffs"
+    handoffs.mkdir(parents=True, exist_ok=True)
+    (handoffs / "NOTE.md").write_text(
+        f"Handed over mid-flight. The record of what happened is {STEM_C8}.\n", encoding="ascii"
+    )
+    frozen = coord_root(repo) / "_retired-2026-08-22"
+    frozen.mkdir(parents=True, exist_ok=True)
+    (frozen / "old-handoff.md").write_text(
+        f"Frozen tree, read back by nobody: {STEM_C8_RETIRED}.\n", encoding="ascii"
+    )
+    return info
+
+
+def run_script(
+    script: Path, repo: Path, *, event: str = "Stop", session_id: str = SESSION_A
+) -> subprocess.CompletedProcess[str]:
+    """``run_drain`` against a drain that is not the shipped one, for the planted controls."""
+    payload = {"hook_event_name": event, "cwd": str(repo), "session_id": session_id}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
+        cwd=str(repo),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, f"{script.name} exited {proc.returncode}: {proc.stderr}"
+    assert not proc.stderr.strip(), f"{script.name} wrote to stderr: {proc.stderr}"
+    return proc
+
+
+def rewrite_drain(tmp_path: Path, filename: str, func: str, replacement: str) -> Path:
+    """A copy of the shipped drain with ONE function replaced, dot-sourcing the REAL libraries.
+
+    THE COPY IS THE CONTROL. Asserting that a guard protects a file proves nothing on its own -- a
+    sweep that deletes nothing at all passes every such assertion -- so each guard is also run in a
+    build where that guard is gone, against the same plants, and the plants must die there.
+
+    Two assertions keep the instrument honest. The dot-source rewrite must find both library paths,
+    because ``$PSScriptRoot`` points at ``tmp_path`` in the copy and an un-rewritten copy would load
+    neither library. The function substitution must match exactly once. Without them a strip that
+    silently matched nothing would leave a control agreeing with its subject for the wrong reason.
+    """
+    text = DRAIN.read_text(encoding="ascii")
+    prefix = '"$PSScriptRoot\\..\\coord\\'
+    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
+    dotted = text.replace(prefix, '"' + str(COORD) + "\\")
+    pattern = re.compile(rf"(?ms)^function {re.escape(func)} \{{.*?^\}}")
+    out, n = pattern.subn(lambda _m: replacement, dotted)
+    assert n == 1, f"the {func} rewrite matched {n} times, so this control proves nothing"
+    p = tmp_path / filename
+    p.write_text(out, encoding="ascii")
+    return p
+
+
+# The guard, neutralised. Everything else about the drain is byte-identical.
+NO_GUARD = """function Test-ReceiptProtected {
+    param($Stem, $MessageStems, $CitedStems)
+    return $false
+}"""
+
+
+def test_the_retention_sweep_reaches_a_box_whose_worktree_is_gone(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE WIDENING, WITH ITS OWN DISCRIMINATOR BESIDE IT.
+
+    A sweep that reached every box and deleted every file in it would pass the first assertion here,
+    so the fresh plant in the same directory is what makes the aged one mean something. The three
+    non-terminal states are the other half: the state list is the whole safety property of widening a
+    delete, and on the live spool it is what stands between this loop and 285 undelivered messages
+    plus 6 stranded records.
+    """
+    plant(repo, tmp_path)
+    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
+
+    dead = mail_root(repo) / "box" / DEAD_BOX / "seen"
+    assert not (dead / f"{STEM_SWEPT}--{PLANT_TOKEN}.json").exists(), (
+        "a dead worktree's box was still not swept"
+    )
+    assert (dead / f"{STEM_FRESH}--{PLANT_TOKEN}.json").exists(), (
+        "the sweep took a file inside the retention window"
+    )
+    for state, stem in (
+        ("inbox", STEM_C5_INBOX),
+        ("claiming", STEM_C5_CLAIMING),
+        ("stranded", STEM_C5_STRANDED),
+    ):
+        p = mail_root(repo) / "box" / DEAD_BOX / state / f"{stem}--{PLANT_TOKEN}.json"
+        assert p.exists(), f"the sweep reached {state}/, which is not a terminal directory"
+
+    m = re.search(r"(\d+) message\(s\) older than \d+ days were removed .* across (\d+) box", text)
+    assert m, f"the widened sweep was silent:\n{text}"
+    assert int(m.group(2)) >= 2, "the sweep only ever saw this worktree's own box"
+
+
+def test_a_receipt_is_kept_while_the_message_it_describes_is_still_in_play(
+    repo: Path, tmp_path: Path
+) -> None:
+    """GUARD C5, over all three of its states.
+
+    A receipt is the only record of what was observed about a message. While that message is still in
+    inbox/, claiming/ or stranded/ -- undelivered, mid-claim, or left behind by a session that died --
+    deleting its receipt makes ``mail.ps1 -Status`` report a file anyone can open as delivery
+    UNPROVEN, which is a false statement rather than a missing one.
+    """
+    plant(repo, tmp_path)
+    run_drain(repo, event="Stop", session_id=SESSION_A)
+    left = receipts(repo)
+    for stem in (STEM_C5_INBOX, STEM_C5_CLAIMING, STEM_C5_STRANDED):
+        assert f"{stem}.json" in left, f"C5 did not hold for a message still in play: {stem}"
+    # The discriminator: the sweep was running, and it did take the receipt beside them.
+    assert f"{STEM_FREE}.json" not in left, "the sweep deleted nothing, so C5 proves nothing"
+
+
+def test_a_receipt_is_kept_while_anything_outside_the_queue_quotes_it(
+    repo: Path, tmp_path: Path
+) -> None:
+    """GUARD C8, AND THE TWO EXCLUSIONS THAT MAKE IT MEAN ANYTHING.
+
+    Stems are quoted by hand into handoff notes and seat records, so a receipt is a citation target
+    and deleting one turns a live citation into a dangling one. The exclusions are the other half.
+    The queue is made of stems, so a scan that read ``mail/`` would report every receipt as cited and
+    the sweep would delete nothing while looking exactly like a sweep that ran. The frozen tree is
+    excluded for the opposite reason: a citation nobody reads back would pin receipts forever.
+    """
+    plant(repo, tmp_path)
+    run_drain(repo, event="Stop", session_id=SESSION_A)
+    left = receipts(repo)
+
+    assert f"{STEM_C8}.json" in left, "a receipt quoted in a handoff was deleted"
+    assert f"{STEM_C8_MAIL_ONLY}.json" not in left, (
+        "a stem quoted only INSIDE the queue protected its receipt, so the scan reads mail/ and the"
+        " sweep is a no-op wearing a counter line"
+    )
+    assert f"{STEM_C8_RETIRED}.json" not in left, (
+        "a citation in the frozen tree protected its receipt"
+    )
+    # A name this channel does not mint for a receipt is left alone, exactly as an unowned file in
+    # claiming/ or shown/ is. Test-MailStem is what refuses it; Split-MailFileName would have refused
+    # every receipt in the directory instead, and the sweep would have done nothing at all.
+    assert f"{STEM_UNMINTED}--{PLANT_TOKEN}.json" in left, (
+        "the sweep deleted a receipts/ name this channel did not mint"
+    )
+
+
+def test_a_receipt_and_its_message_are_never_removed_by_the_same_pass(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE BOTH-HALVES RULE, AND THE SECOND PASS THAT PROVES IT IS A DELAY AND NOT A PARDON.
+
+    The keep set is read before anything is deleted, so a receipt whose message this same drain is
+    about to remove from seen/ is still protected when its own turn comes. A reader who finds one
+    half gone can therefore always still find the other. One drain later the message is gone from
+    every box and the receipt follows it.
+    """
+    plant(repo, tmp_path)
+    twin = mail_root(repo) / "box" / DEAD_BOX / "seen" / f"{STEM_BOTH_HALVES}--{PLANT_TOKEN}.json"
+
+    run_drain(repo, event="Stop", session_id=SESSION_A)
+    assert not twin.exists(), "the message half was not swept, so the rule was never exercised"
+    assert f"{STEM_BOTH_HALVES}.json" in receipts(repo), (
+        "a receipt and its message were removed by one pass"
+    )
+
+    run_drain(repo, event="Stop", session_id=SESSION_B)
+    assert f"{STEM_BOTH_HALVES}.json" not in receipts(repo), (
+        "the receipt is pardoned rather than delayed, so nothing ever bounds receipts/"
+    )
+
+
+def test_an_unguarded_sweep_takes_every_one_of_the_planted_survivors(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE PLANTED CONTROL FOR ALL THREE GUARDS, and the reason the arms above are evidence.
+
+    Same plants, same tree, one build in which ``Test-ReceiptProtected`` answers "not protected".
+    Every survivor dies here. If one did not, the arms above would be passing because the sweep never
+    reached that file, and no assertion inside them could tell the two apart.
+    """
+    plant(repo, tmp_path)
+    unguarded = rewrite_drain(
+        tmp_path, "mail-drain-unguarded.ps1", "Test-ReceiptProtected", NO_GUARD
+    )
+    run_script(unguarded, repo)
+
+    left = receipts(repo)
+    for stem in SURVIVORS:
+        assert f"{stem}.json" not in left, (
+            f"{stem} survived a build with no guard in it, so its guarded arm proves nothing"
+        )
+    assert f"{STEM_FREE}.json" not in left
+
+
+@pytest.mark.parametrize("func", ["Get-LiveMessageStems", "Get-CitedStems"])
+def test_the_receipt_sweep_keeps_everything_when_a_guard_cannot_be_built(
+    repo: Path, tmp_path: Path, func: str
+) -> None:
+    """FAIL CLOSED, BY FAULT INJECTION, because the real condition is not reachable from a test.
+
+    Either guard set can fail to build -- an unreadable directory, an I/O error part way through a
+    walk -- and a half-built set is byte-identical to a complete one. The rule is that a guard which
+    could not be evaluated keeps the file, and says so.
+
+    THE WIRING IS WHAT IS TESTED HERE, NOT THE CONDITION. Making the real walk fail needs an ACL
+    change or a cross-process file lock, so this arm proves that a throw out of either builder
+    reaches the skip, that the drain still delivers, and that the reader is told.
+    """
+    plant(repo, tmp_path)
+    stub = f"function {func} {{\n    param($A, $B, $C)\n    throw 'injected failure'\n}}"
+    broken = rewrite_drain(tmp_path, f"mail-drain-{func}.ps1", func, stub)
+    text = injection(run_script(broken, repo))
+
+    left = receipts(repo)
+    assert f"{STEM_FREE}.json" in left, "a guard could not be built and the sweep deleted anyway"
+    for stem in SURVIVORS:
+        assert f"{stem}.json" in left
+    assert "The receipt sweep did not run" in text, f"the skip was silent:\n{text}"
+    # Delivery is unaffected: housekeeping must never break the turn it precedes.
+    assert "live mail, so the drain gets past its own box" in text
+
+
+STEM_PROBE = r"""
+. "__MAIL_KEY__"
+$anchored = [regex]::new('\A' + (Get-MailStemPattern) + '\z')
+$rows = @()
+foreach ($i in 1..50) {
+    $id = New-MessageId
+    $rows += [pscustomobject]@{
+        s = $id; v = (Test-MailStem -Stem $id); p = $anchored.IsMatch($id)
+    }
+}
+$bads = @('', 'not-a-stem', '20260101T000000001-AAAAAA', '20260101T00000000-aaaaaa')
+foreach ($bad in $bads) {
+    $rows += [pscustomobject]@{
+        s = $bad; v = (Test-MailStem -Stem $bad); p = $anchored.IsMatch($bad)
+    }
+}
+$q = New-MessageId
+$loose = [regex]::new((Get-MailStemPattern))
+$found = @($loose.Matches("see message $q, which never arrived") | ForEach-Object { $_.Value })
+([pscustomobject]@{ rows = @($rows); quoted = $q; found = @($found) } | ConvertTo-Json -Depth 5)
+"""
+
+
+def test_the_stem_search_pattern_and_the_stem_validator_agree(tmp_path: Path) -> None:
+    """THE ONE DRIFT THAT WOULD LOSE DATA, PINNED.
+
+    ``Get-MailStemPattern`` proposes citations and ``Test-MailStem`` decides them, so a pattern that
+    is too loose costs a wasted comparison. A pattern that is too TIGHT misses a citation, and a
+    missed citation deletes a receipt somebody is still pointing at. The two live beside each other
+    in mail-key.ps1; this is what keeps them agreeing.
+    """
+    probe = tmp_path / "stem-probe.ps1"
+    probe.write_text(STEM_PROBE.replace("__MAIL_KEY__", str(MAIL_KEY)), encoding="ascii")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    for row in out["rows"]:
+        assert row["v"] == row["p"], f"validator and search pattern disagree on {row['s']!r}"
+    # A control, so a pattern that rejects everything cannot pass by agreeing everywhere.
+    assert sum(1 for row in out["rows"] if row["v"]) == 50
+    assert out["found"] == [out["quoted"]], "the pattern cannot find a stem quoted in a sentence"

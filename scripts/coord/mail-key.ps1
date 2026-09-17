@@ -97,3 +97,19 @@ function Test-MailStem {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Stem)
     return ($Stem -cmatch '\A[0-9]{8}T[0-9]{9}-[0-9a-z]{6}\z')
 }
+
+function Get-MailStemPattern {
+    # THE SAME SHAPE AS A SEARCH PATTERN: unanchored, for FINDING a stem quoted inside a document
+    # rather than deciding whether a whole string is one. The drain's receipt sweep uses it to read
+    # the coordination tree for hand-written citations of a message id.
+    #
+    # IT SITS HERE RATHER THAN IN THE DRAIN for the reason this whole file exists: a second copy of a
+    # shared shape drifts, and the copy that drifts is the one nobody is testing.
+    #
+    # Test-MailStem ABOVE REMAINS THE AUTHORITY, and that is what bounds the cost of a drift. This
+    # pattern only proposes candidates; every match is passed back through Test-MailStem before it is
+    # believed, so a pattern that is too LOOSE costs a wasted comparison. A pattern that is too TIGHT
+    # would miss a citation, which is the direction that loses data, so
+    # test_the_stem_search_pattern_and_the_stem_validator_agree pins the two together.
+    return '[0-9]{8}T[0-9]{9}-[0-9a-z]{6}'
+}

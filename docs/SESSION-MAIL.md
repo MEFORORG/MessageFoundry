@@ -267,9 +267,10 @@ its `SKIP_DIRS`. A queue full of tokens would leave the forbidden-content gate g
 not evidence about this path**, and must never be cited as though it were.
 
 **3. The retention sweep bounds the queue copy only.** The drain sweeps `seen/` and `expired/` of files
-older than 7 days. That bounds the copy this repo controls. It does not reach the transcript copy from
-(1), and citing it as PHI coverage would be exactly the compensating-control-resting-on-a-false-premise
-defect CLAUDE.md section 11 forbids.
+older than 7 days, in **every** box rather than only the one belonging to the worktree it is running in,
+and sweeps `receipts/` under the guards below. That bounds the copy this repo controls. It does not
+reach the transcript copy from (1), and citing it as PHI coverage would be exactly the
+compensating-control-resting-on-a-false-premise defect CLAUDE.md section 11 forbids.
 
 **4. A body here would be PL-1 content with none of PL-1's controls.** By [PHI.md](PHI.md) section 2's
 own classification, a full clinical message body is PL-1. This queue has no cipher, no ACL beyond the
@@ -398,6 +399,43 @@ meant editing all six.
 `claiming`-to-`seen` finalize, its dead-owner sweep to `stranded/`, and the sender's publish out of
 `tmp/`. The retention sweep of `seen`/`expired` is **not** in that list and does not use it -- it is a
 plain delete of files this channel minted, and it is the one move-free path in the drain.
+
+## What the retention sweep removes, and the three guards on `receipts/`
+
+The sweep runs on every drain, over **every box**, and deletes only files older than `RETAIN_DAYS`
+(7) whose names this channel minted:
+
+| Directory | Swept | Why |
+|---|---|---|
+| `seen/`, `expired/` | Yes, in every box | Terminal. Nothing is ever read out of one into a delivery. |
+| `shown/` | Yes, in every box, markers only | An aged marker costs a duplicate display and nothing else. |
+| `receipts/` | Yes, under the guards below | One flat directory for the whole queue, so no box-scoped loop reached it. |
+| `inbox/`, `claiming/`, `stranded/` | **Never** | Undelivered mail, a claim in flight, and the record of a claim whose owner died. |
+
+**A box outlives its worktree, which is why the sweep had to widen.** A box is keyed by worktree path,
+worktrees are removed once their work lands, and a removed worktree's box is never drained again. The
+sweep used to read only the current worktree's box, so the only boxes it ever reached were the ones
+still being drained.
+
+**Three guards stand between that sweep and `receipts/`,** because a receipt is the only record of what
+was observed about a message:
+
+1. **The message is still in play.** A stem with a file in `inbox/`, `claiming/` or `stranded/` in any
+   box keeps its receipt. Deleting it would make `mail.ps1 -Status` report a file anyone can open as
+   delivery UNPROVEN, which is a false statement rather than a missing one.
+2. **Something outside the queue quotes it.** Stems are quoted by hand into handoff notes and seat
+   records under `mefor-coord/`, so a receipt is a citation target. The scan excludes `mail/` itself --
+   the queue is made of stems, so reading it would mark every receipt as cited and the sweep would
+   delete nothing while looking exactly like a sweep that ran -- and excludes the frozen
+   `_retired-2026-08-22/` tree, whose citations nobody reads back.
+3. **Never both halves in one pass.** The keep set is read before anything is deleted, so a receipt
+   whose message this same drain removes from `seen/` survives to the next drain. A reader who finds
+   one half gone can always still find the other.
+
+**A guard that cannot be evaluated keeps the file.** If either set fails to build, the receipt sweep
+does not run and the injection says so. `tests/test_session_mail_held.py` section 8g plants one
+survivor per guard, a file that must be deleted beside them, and a build with the guard removed in
+which every survivor dies.
 
 **Ceding is the safe failure direction.** The exclusive open is very slightly over-strict, so a claimer
 occasionally cannot prove a claim it actually won. That message stays in `claiming/`, is never
