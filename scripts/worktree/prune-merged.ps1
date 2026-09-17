@@ -121,15 +121,35 @@
     not be established; 3 ORPHANED -- a directory is broken on disk right now and needs the recovery
     recipe. 3 outranks 2 because damage on disk outranks a refusal to act.
 
-    2 IS PER-REQUEST, NOT PER-RUN, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing
-    was attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)", and both halves
-    were wrong. The enumeration went stale silently: -ReapVenvs added four refusal causes of its own
-    -- the fence down, transcript roots unreadable, no config root carrying a projects/ directory,
-    and -IdleHours 0 emptying both idle windows -- and this list did not move. The universal is false
-    on its own terms too: a fence that dies PART WAY through the apply loop sets 2 over removals that
-    already landed. -Name and -ReapVenvs both report 1 instead once something has been removed; the
-    mid-run fence death does not. So read 2 as "some request of yours was refused", and read the
+    2 IS PER-REQUEST, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing was
+    attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)". The list went stale
+    silently: -ReapVenvs added four refusal causes of its own -- the fence down, transcript roots
+    unreadable, no config root carrying a projects/ directory, and -IdleHours 0 emptying both idle
+    windows -- and it did not move. So read 2 as "some request of yours was refused", and read the
     removed / failed counts for what the run did.
+
+    BUT 2 STILL MEANS NOTHING WAS REMOVED, AND THIS PARAGRAPH SAID OTHERWISE FOR ONE COMMIT. It read
+    "The universal is false on its own terms too: a fence that dies PART WAY through the apply loop
+    sets 2 over removals that already landed ... the mid-run fence death does not [report 1]". No
+    such run exists. Seven sites can produce 2, and not one of them can co-occur with a removal:
+
+      * three bare `exit $EXIT_REFUSED` in the preamble -- a negative -IdleHours, not a repository,
+        not the primary checkout -- every one of them before a candidate set exists;
+      * the decision-pass fence check, where an unavailable $occ adds a SKIP reason to EVERY
+        candidate, so $prunable is empty and the apply loop never runs at all;
+      * the mid-loop fence check, where $occ2 is read ONCE on the line above
+        `foreach ($d in $prunable)` and nothing inside the loop re-reads it or mutates Available --
+        so a fence that is down skips iteration 1 and every later one, and $removed stays 0;
+      * the -Name and -ReapVenvs guards, both explicitly ternary on `$removed -gt 0`.
+
+    ESTABLISHED OVER THE AST RATHER THAN BY GREP, because a grep for ^\s*exit misses four keywords
+    and any wrapper that reads the exit variable. Parsing the file and classifying every Exit,
+    Return, Throw, Break and Continue statement by whether an ancestor is a FunctionDefinitionAst
+    gives 89: 5 Exit and 1 Throw at top level, 49 Return and 1 Break nested, 20 Continue at top
+    level and 13 nested. 0 Exit sits inside any function, and the two that end an ordinary run are
+    both `exit $exit`. tests/test_worktree_prune_merged.py's
+    test_a_fence_that_dies_mid_run_refuses_and_says_so is the standing pin: it kills the fence
+    between the decision pass and the removal pass, and asserts counts.removed is 0 beside the 2.
 
     A BRANCH IS NEVER FORCE-DELETED ON A STALE VERDICT. `git branch -d` refuses a branch merged only
     into origin/main when the local main lags, so `-D` used to be the ROUTINE path and git's last
@@ -264,8 +284,11 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $EXIT_OK = 0
 $EXIT_FAILED = 1   # something was attempted and did not fully succeed
-# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR. It does not
-# promise the run removed nothing -- the header's exit-code paragraph names the case where it did.
+# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR, and the causes
+# are not a closed list. It DOES promise nothing was removed, and the header's exit-code paragraph
+# walks all seven sites that can set it. This comment read "It does not promise the run removed
+# nothing" for one commit, on the strength of a mid-run fence death that paragraph now retracts as
+# unreachable.
 $EXIT_REFUSED = 2
 $EXIT_ORPHANED = 3 # a directory is broken on disk right now (this run, or one before it)
 
@@ -1528,6 +1551,13 @@ $occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
+    #
+    # ONCE, AND OUTSIDE THE LOOP, WHICH IS WHAT KEEPS EXIT 2 HONEST. Available is a plain [bool] on
+    # the object this returns; nothing in the loop re-reads it or writes it. So the refusal below is
+    # all-or-nothing: down here means down on iteration 1, every candidate skips, and $removed stays
+    # 0. Move this read inside the loop and that stops being true -- the Set-Exit below would then
+    # need the `$removed -gt 0` guard the -Name and -ReapVenvs sites carry, and the header paragraph
+    # that says 2 means nothing was removed would need retracting with it.
     $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
     Write-Note ""
     foreach ($d in $prunable) {

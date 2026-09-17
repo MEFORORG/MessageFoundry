@@ -335,15 +335,34 @@ outranks `2` because damage on disk outranks a refusal to act. In the JSON recei
 is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
 skipped` covers every candidate exactly once.
 
-**`2` is per-request, not per-run, and its causes are not a closed list.** The line above read
-*"nothing was attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*, and both
-halves were wrong. The enumeration went stale silently: `-ReapVenvs` added four refusal causes of its
-own — the fence down, transcript roots unreadable, no config root carrying a `projects/` directory,
-and `-IdleHours 0` emptying both idle windows — and this list did not move. The universal is false on
-its own terms too: a fence that dies **part way through** the apply loop sets `2` over removals that
-already landed. `-Name` and `-ReapVenvs` both report `1` instead once something has been removed; the
-mid-run fence death does not. Read `2` as "some request of yours was refused", and read
+**`2` is per-request, and its causes are not a closed list.** The line above read *"nothing was
+attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*. The list went stale
+silently: `-ReapVenvs` added four refusal causes of its own — the fence down, transcript roots
+unreadable, no config root carrying a `projects/` directory, and `-IdleHours 0` emptying both idle
+windows — and it did not move. Read `2` as "some request of yours was refused", and read
 `counts.removed` for what the run did.
+
+**`2` does still mean nothing was removed, and this page said otherwise for one commit.** The
+paragraph above read *"The universal is false on its own terms too: a fence that dies part way
+through the apply loop sets `2` over removals that already landed ... the mid-run fence death does
+not [report `1`]"*. No such run exists. Seven sites can produce `2`, and not one of them can
+co-occur with a removal:
+
+| Site | Why a removal cannot have happened |
+|---|---|
+| three bare exits in the preamble | a negative `-IdleHours`, not a repository, not the primary checkout — all before a candidate set exists |
+| the decision-pass fence check | an unavailable fence adds a SKIP reason to **every** candidate, so the prunable set is empty and the apply loop never runs |
+| the mid-loop fence check | the fence is read **once**, on the line above the loop, and nothing inside re-reads it — so a fence that is down skips the first candidate and every later one |
+| the `-Name` and `-ReapVenvs` guards | both explicitly conditioned on something having been removed, and both report `1` when it has |
+
+Measured over the parsed script rather than by grep, because a grep for `^\s*exit` misses four
+keywords and any wrapper that reads the exit variable. Classifying every `Exit`, `Return`, `Throw`,
+`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89: 5
+`Exit` and 1 `Throw` at top level, 49 `Return` and 1 `Break` nested, 20 `Continue` at top level and
+13 nested. **0 `Exit` sits inside any function**, and the two that end an ordinary run are both
+`exit $exit`. The standing pin is `test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills
+the fence between the decision pass and the removal pass and asserts `counts.removed == 0` beside
+the `2`.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the
