@@ -550,9 +550,9 @@ gates a merge**, and no seat has to clear one.
 - **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
   warned that a checkout is not a ref. Both halves were right and the first one won.
 - **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
-  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
   on `origin/main`.
-- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
   is not evidence that you have a file, and a missing file is the quietest failure in this list.
 - **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
   two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and

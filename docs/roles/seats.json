@@ -66,9 +66,9 @@
     "live seat, so a spelling left out of this map would resolve to 'MATCHES NO SEAT' and read as a",
     "typo. The retirement has to be the loud answer, because substituting the Manager for the",
     "Console is the exact error this retirement was written to stop.",
-    "Reviewer is NOT retired here -- it was never a seat in this repository, so there is nothing",
-    "here to retire. korus retired it on 2026-09-12 (korus 3e81bd4, roles/retired/REVIEWER.md), so",
-    "the line that used to say it is LIVE in korus was true when written and is not true now."
+    "One label was removed from this file entirely on 2026-09-16 by owner instruction, rather than",
+    "retired into the map above: a seat retired in korus on 2026-09-12 that was never a seat here.",
+    "It is not named, here or anywhere else in this repository. Do not re-add it from git history."
   ],
   "retired": {
     "console": "Retired 2026-09-10 by owner decision. The MANAGER replaces it, and is NOT a renamed Console: a Manager's workers are subagents inside its own process on its own account, several Managers run at once, and it needs no spawn grant. It also does not enqueue -- that moved to the Lander. Read docs/roles/manager.card.md and korus roles/MANAGER.md; do not carry a Console rule across.",
@@ -84,13 +84,14 @@
     "process-improvement": "Retired 2026-09-01 by owner decision. Nothing replaced it."
   },
   "_elsewhere_comment": [
-    "Seats a session may hold or have held in korus, absent from this repository's table, and",
-    "therefore resolving to nothing here. Named so such a session learns why no card arrived,",
-    "rather than reading silence as a missing file. Being listed here does not mean the seat is",
-    "still live in korus -- read the reason, which says where the seat actually stands.",
+    "Seats a session may hold in korus that this table does not run. A label here resolves to no",
+    "card AND to a stated reason, so the session learns it is a roster difference rather than",
+    "reading silence as a missing file or the warning as a typo.",
+    "THIS MAP IS EMPTY, AND EMPTY IS THE CORRECT CURRENT STATE, not an unfinished edit. Its one",
+    "occupant was removed 2026-09-16 by owner instruction. The MECHANISM stays: seat.ps1 and",
+    "role-card-inject.ps1 both keep their elsewhere branch, and tests exercise it against an",
+    "injected roster so the path is covered with no occupant here to name.",
     "The Manager LEFT this map on 2026-09-10: it is live here now, so it resolves to a card."
   ],
-  "elsewhere": {
-    "reviewer": "Never a seat here, and no longer one in korus either -- korus retired it 2026-09-12 (3e81bd4); the playbook now sits at roles/retired/REVIEWER.md there. No seat in this table reviews as its own job. Kept in this map rather than dropped, so a session carrying the label from an older document gets a roster fact instead of silence."
-  }
+  "elsewhere": {}
 }
