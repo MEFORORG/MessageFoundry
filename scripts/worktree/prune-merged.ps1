@@ -1218,9 +1218,13 @@ if ($ReapVenvs) {
             })
     }
 
-    # The operator asked for a reading and did not get one. Same standing as a -Name that matched
-    # nothing: a request that could not be carried out must not exit green.
-    if ($cannotRun.Count -gt 0) { Set-Exit $EXIT_REFUSED }
+    # THE EXIT CODE FOR A REFUSED PASS IS NOT SET HERE, and the comment that used to sit on it said
+    # why without noticing: "same standing as a -Name that matched nothing". The -Name path reports
+    # FAILED rather than REFUSED once a removal has happened, and it can only do that because it runs
+    # AFTER the apply loop. This block runs before it, where $removed does not exist yet, so setting
+    # REFUSED from here let `-ReapVenvs -Apply` remove worktrees and still exit 2 -- which this
+    # script's own header defines as "nothing was attempted". Set beside the -Name guard instead;
+    # search for `$venvReap.ran`.
 }
 
 # -Name is the loudest thing an operator can do to the fence: it is -IdleHours 0 scoped to one tree,
@@ -1716,6 +1720,12 @@ if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
 # wrong-cwd case this script now refuses outright.
 if ($namedMisses.Count -gt 0) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
 
+# -ReapVenvs asked for a reading and did not get one, which has the same standing and now takes the
+# same guard. HERE rather than beside the pass that decided it, for the one reason that settles the
+# placement: $removed does not exist until the apply loop has run, and REFUSED means nothing was
+# attempted. A run that pruned two worktrees and could not judge a venv did attempt something.
+if ($null -ne $venvReap -and -not $venvReap.ran) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
+
 # BEFORE the report, not after it. The -Json branch below emits the receipt and EXITS, so an exit-code
 # decision made after it would be reached only on the human path -- the receipt would carry exitCode 0
 # over a key nothing can claim, and a CI consumer reading the JSON would see a clean run.
@@ -1975,11 +1985,14 @@ if ($exit -eq $EXIT_REFUSED) {
     if ($namedMisses.Count -gt 0) {
         Write-Host "  Exit 2: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
     }
-    if ($null -ne $venvReap -and -not $venvReap.ran) {
-        Write-Host "  Exit 2: -ReapVenvs was asked for and could not answer, so the empty venv list means nothing." -ForegroundColor Red
-    }
 }
 elseif ($exit -eq $EXIT_ORPHANED) {
     Write-Host "  Exit 3: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
+}
+# OUTSIDE the branch above, because the venv refusal no longer decides the code on its own: a run that
+# also removed a worktree reports 1. A line keyed on 2 would go silent on exactly the run where the
+# two halves of the report disagree, which is the run an operator most needs it on.
+if ($null -ne $venvReap -and -not $venvReap.ran) {
+    Write-Host "  Exit ${exit}: -ReapVenvs was asked for and could not answer, so the empty venv list means nothing." -ForegroundColor Red
 }
 exit $exit

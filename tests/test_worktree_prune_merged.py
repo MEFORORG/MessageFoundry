@@ -2425,6 +2425,66 @@ def test_c9_an_absent_transcript_store_refuses_the_whole_pass(fx: Fixture, sleep
     assert res["_exit"] == 2
 
 
+def test_a_refused_venv_pass_that_removed_a_worktree_is_FAILED_not_REFUSED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Exit 2 is this script's own "nothing was attempted", so a run that pruned must not claim it.
+
+    The venv pass computes its verdict BEFORE the apply loop and used to set the refusal code from
+    there -- where ``$removed`` does not exist yet, so the guard the ``-Name`` path has always
+    carried could not be applied. ``-ReapVenvs -Apply`` could therefore remove worktrees and still
+    exit 2, which is the code an automated caller reads as "safe, nothing happened".
+
+    THE REFUSAL CAUSE IS C9's ABSENT TRANSCRIPT STORE, NOT ``-IdleHours 0``. The fence stays
+    available and the activity window stays armed, so the removing half and the refusing half move
+    independently; one flag doing both jobs would make this a single-variable test of nothing.
+
+    THE CONTROL IS ``test_c9_an_absent_transcript_store_refuses_the_whole_pass`` -- the same refusal
+    on a dry run, still exiting 2. So a 1 here comes from the removals, not from the refusal having
+    quietly stopped happening.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    shutil.rmtree(fx.cfg / "projects")
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    res = run(fx, "-Apply", "-ReapVenvs")
+
+    # Both halves, asserted in the SAME run. Either one alone says nothing about the join.
+    assert res["venvReap"]["ran"] is False, "the venv pass was supposed to refuse"
+    assert any("projects/" in c for c in res["venvReap"]["cannotRun"])
+    assert res["counts"]["removed"] == 2, "nothing was removed, so exit 2 would have been honest"
+    assert not fx.sibling("clean").exists()
+
+    assert res["_exit"] == 1, (
+        f"removed {res['counts']['removed']} worktree(s) and reported exit {res['_exit']}; "
+        "2 is documented as REFUSED -- nothing was attempted"
+    )
+
+
+def test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The human surface is a separate surface and can go silent on its own.
+
+    The line naming the venv refusal used to be nested under "if the code is 2", which is exactly
+    the branch the guard above takes the run out of. An operator would then read ``Done. removed 2``
+    in red with nothing anywhere saying which half of the run went wrong.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    shutil.rmtree(fx.cfg / "projects")
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    proc = run_text(fx, "-Apply", "-ReapVenvs")
+    assert proc.returncode == 1
+    assert "Done. removed 2" in proc.stdout
+    assert "VENV REAP COULD NOT RUN" in proc.stdout
+    assert "Exit 1: -ReapVenvs was asked for and could not answer" in proc.stdout
+
+
 def test_idle_hours_zero_refuses_the_venv_pass(fx: Fixture, sleeper: int) -> None:
     """-IdleHours 0 empties BOTH idle windows, and an empty C9 window clears every tree.
 
