@@ -20,7 +20,8 @@ import shutil
 import subprocess
 import threading
 import time
-from pathlib import Path
+from collections.abc import Sequence
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -220,21 +221,49 @@ def test_run_single_returns_what_subprocess_run_returns(lock_root: Path) -> None
     assert "ok" in proc.stdout
 
 
-def test_run_single_refuses_a_cheap_command(lock_root: Path) -> None:
+def test_run_single_refuses_a_cheap_command(
+    lock_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """THE SEAM IS TYPED, NOT CONVENTIONAL, and this is the failure that makes that worth enforcing.
 
-    ``run_single`` is otherwise a total ``subprocess.run`` passthrough, so nothing would stop this
-    tier's hundreds of cheap ``git`` calls being routed through it. Every held ticket extends every
-    concurrent burst's drain wait, so bursts would stop draining, hit ``_BURST_DRAIN_S`` and proceed
-    unsynchronised -- the lock disabling itself, failing open exactly as designed, with nothing red.
+    ``run_single`` is otherwise a total ``subprocess.run`` passthrough, so nothing would stop
+    this tier's hundreds of cheap ``git`` calls being routed through it. Every held ticket
+    extends every concurrent burst's drain wait, so bursts would stop draining, hit
+    ``_BURST_DRAIN_S`` and proceed unsynchronised -- the lock disabling itself, failing open
+    exactly as designed, with nothing red.
+
+    THE ACCEPT ARM CALLS ``run_single`` RATHER THAN RE-IMPLEMENTING ITS PARSE, and
+    re-implementing it is why this row was red. The first version copied
+    ``Path(cmd[0]).name.lower()`` into the assertion, so it exercised ``pathlib`` and never the
+    seam. That copy passes on Windows, where ``Path`` is ``WindowsPath`` and splits on both
+    separators; on Linux ``PurePosixPath`` splits on neither backslash nor drive, so the Windows
+    spelling below parsed to ITSELF and the ubuntu leg raised ``AssertionError``. A test that
+    re-implements the function it checks agrees with that function by construction and disagrees
+    with the host instead, which is the wrong argument to be having.
     """
     with pytest.raises(ValueError, match="interpreter launch"):
         run_single(["git", "--version"], capture_output=True, text=True)
 
-    # The allowlist is on the BINARY NAME, so a full path and a .exe suffix must still be accepted.
     assert frozenset({"pwsh", "powershell"}) == _spawn_lock._LOCKED_INTERPRETERS
-    for spelling in (r"C:\Program Files\PowerShell\7\pwsh.exe", "/usr/bin/pwsh", "PowerShell.EXE"):
-        assert Path(spelling).name.lower().removesuffix(".exe") in _spawn_lock._LOCKED_INTERPRETERS
+
+    # THE REFUTED VALUE, pinned rather than described. ``PurePosixPath`` is host-independent by
+    # construction, so this computes the same everywhere and keeps the reason the parse cannot be
+    # ``pathlib``'s sitting beside the parse that replaced it.
+    windows_pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe"
+    assert PurePosixPath(windows_pwsh).name.lower().removesuffix(".exe") != "pwsh"
+
+    # The allowlist is on the BINARY NAME, so a full path and a .exe suffix must still be ACCEPTED,
+    # and must reach ``subprocess.run`` unaltered -- ``run_single`` adds a lock, not a rewrite.
+    spellings = [windows_pwsh, "/usr/bin/pwsh", "PowerShell.EXE"]
+    seen: list[str] = []
+
+    def record(cmd: Sequence[str], **kwargs: object) -> None:
+        seen.append(cmd[0])
+
+    monkeypatch.setattr(subprocess, "run", record)
+    for spelling in spellings:
+        run_single([spelling, "-NoProfile", "-Command", "exit 0"])
+    assert seen == spellings, "a valid interpreter spelling was refused or rewritten"
 
 
 def test_the_storm_counts_are_unchanged() -> None:

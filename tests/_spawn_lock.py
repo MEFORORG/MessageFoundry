@@ -387,10 +387,18 @@ def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess
     diagnostic -- still intercepts this call. A ``from subprocess import run`` here would silently
     bypass that test's patch and the test would stop proving anything.
     """
-    binary = Path(cmd[0]).name.lower().removesuffix(".exe") if cmd else ""
+    # SPLIT ON BOTH SEPARATORS REGARDLESS OF HOST, which pathlib alone does not. PurePosixPath
+    # does not treat a backslash as a separator, so on Linux the .name of a Windows-spelled pwsh
+    # path is the WHOLE SPELLING and this allowlist then refuses a launch it should take. That is
+    # measured on the ubuntu leg, which is where it failed. The tier writes Windows spellings and
+    # this module is imported on both platforms, so the parse cannot be the host path flavour.
+    # test_spawn_lock.py pins the refuted value beside the fixed one, so a later simplification
+    # back to pathlib has to argue with it rather than rediscover it on a red leg.
+    spelling = cmd[0] if cmd else ""
+    binary = spelling.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
     if binary not in _LOCKED_INTERPRETERS:
         raise ValueError(
-            f"run_single is for an interpreter launch, not {cmd[0]!r}. Only "
+            f"run_single is for an interpreter launch, not {spelling!r}. Only "
             f"{sorted(_LOCKED_INTERPRETERS)} are expensive enough to be worth the lock; holding a "
             "ticket across a cheap call starves every concurrent burst's drain and silently "
             "disables this module. Call subprocess.run directly."
