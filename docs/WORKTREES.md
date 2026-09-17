@@ -195,7 +195,37 @@ scripts\worktree\prune-merged.ps1                   # dry run: the decision tabl
 scripts\worktree\prune-merged.ps1 -Apply            # remove the ones that pass every check
 scripts\worktree\prune-merged.ps1 -Apply -Name pins # also confirm that one past the activity veto
 scripts\worktree\prune-merged.ps1 -Json             # machine-readable decisions + the fence receipt
+scripts\worktree\prune-merged.ps1 -ReapVenvs        # ALSO report reapable .venv dirs. Deletes nothing.
 ```
+
+### `-ReapVenvs` reports virtualenvs and removes none of them
+
+A `.venv` is **rebuildable** state — `.venv/` is gitignored, `constraints.lock` is tracked, and
+[`new.ps1`](../scripts/worktree/new.ps1) rebuilds with `pip install --constraint constraints.lock`.
+Deleting one costs a rebuild; deleting a worktree costs work. Different blast radii, so different
+gates — and **there is no venv deletion path in this script at all**, not behind `-Apply`, not behind
+a confirmation. An adversarial review returned `NEEDS_A_GUARD` on every reaper proposed, so the dry
+run ships first and is meant to run for a week before anything destructive is written.
+
+A venv is reported **reapable** only when nine conjuncts hold. `C1` venv-present, `C2` rebuildable
+(`constraints.lock` — **not** `uv.lock`, which sits beside it, is also a real lockfile, and is read
+by no install here), `C3` fence-available, `C4` unlocked, `C5` unoccupied, `C6` clean, `C7` idle,
+`C8` merged, `C9` **unowned**. `C1`–`C8` are the worktree rule above, reused rather than re-derived.
+
+`C9` is new and it is the one the other eight miss. The owning session id is the six-hex token a
+Claude-managed slug carries; the conjunct looks for `<config-root>/projects/*<id>*/*.jsonl` across
+every `.claude*` root and holds the venv unless the newest write is older than `-IdleHours`. **No id
+parsed and no transcript found both mean SKIP** — absence of a transcript is the absence of evidence,
+not proof of death. Measured: nine idle venvs of about 8.0 GB belonged to a session that had written
+a transcript 4.4 hours before the sweep, and `C1`–`C8` cleared every one of them.
+
+The pass reaches trees `-Apply` never will, including the `.claude/worktrees` population, which is
+where most of the bytes are. That is safe **only** because it removes nothing; arming a removal would
+have to answer the population question again from scratch.
+
+Every count it prints carries its denominator, and "nobody was reapable" and "the check could not
+run" print different things — the second refuses the whole pass and exits **2**, because an empty
+list from a check that could not look is not a clean result.
 
 ### The rule is `merged AND clean AND NOT occupied`
 
@@ -212,9 +242,15 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
 1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
-2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
+2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
    git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
    **not** depend on a recorded cwd.
+
+**The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
+largest idle reading ever taken on a worktree somebody was demonstrably in was **34.4h**, against a
+36h window — 1.6h of margin on the only signal that sees a session writing in by absolute path. That
+is a coincidence, not a margin. 72h is that worst measured reading doubled, and it outlives a
+weekend, which 36 did not. The cost is fewer removals, which is the cheap direction here.
 
 Both are re-read **immediately before each removal**, not just when the table was built — a gh round
 trip per candidate plus every prior removal is a real window, and it is the window the incident
