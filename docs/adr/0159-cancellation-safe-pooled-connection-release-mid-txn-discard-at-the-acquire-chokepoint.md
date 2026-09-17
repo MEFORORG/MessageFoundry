@@ -204,7 +204,13 @@ the next reader does not re-derive the wrong precedent from the same comment.
   `_read`'s pooled read snapshot, which runs on a borrowed connection and already unwinds in its own
   `except BaseException: ROLLBACK`. So **no writer opens a transaction on `self._db` outside
   `_writer_txn`**, and an eighteenth that tried would fail the build rather than quietly reopen the
-  hole.
+  hole. The same scan covers the nested-transaction verbs. `SAVEPOINT` and `ROLLBACK TO` open and
+  unwind a nested transaction, so they carry this ADR's shape exactly. `RELEASE` is scanned for the
+  mirror-image hazard rather than the same one: it commits a savepoint and every savepoint opened
+  after it, so a stray or mispaired one does not leak an open transaction, it makes durable what the
+  caller still expected to be able to roll back. `store.py` holds none of the three today, so their
+  carve-out table is empty and the first one added has to register itself with a count and a reason
+  rather than arrive as grounds for deleting the check.
 
   **What remains is the SHORT writers: a different property, the same mechanism.** A short writer
   takes `self._lock`, issues its DML with no `BEGIN` of its own, and calls `_commit()`. The paragraph
