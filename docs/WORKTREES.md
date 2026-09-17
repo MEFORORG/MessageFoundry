@@ -335,15 +335,52 @@ outranks `2` because damage on disk outranks a refusal to act. In the JSON recei
 is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
 skipped` covers every candidate exactly once.
 
-**`2` is per-request, not per-run, and its causes are not a closed list.** The line above read
-*"nothing was attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*, and both
-halves were wrong. The enumeration went stale silently: `-ReapVenvs` added four refusal causes of its
-own — the fence down, transcript roots unreadable, no config root carrying a `projects/` directory,
-and `-IdleHours 0` emptying both idle windows — and this list did not move. The universal is false on
-its own terms too: a fence that dies **part way through** the apply loop sets `2` over removals that
-already landed. `-Name` and `-ReapVenvs` both report `1` instead once something has been removed; the
-mid-run fence death does not. Read `2` as "some request of yours was refused", and read
+**`2` is per-request, and its causes are not a closed list.** The line above read *"nothing was
+attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*. The list went stale
+silently: `-ReapVenvs` added four refusal causes of its own — the fence down, transcript roots
+unreadable, no config root carrying a `projects/` directory, and `-IdleHours 0` emptying both idle
+windows — and it did not move. Read `2` as "some request of yours was refused", and read
 `counts.removed` for what the run did.
+
+**A tail line names the outcome it is reporting, never the run's code.** Each explanation at the
+foot of the report opens `REFUSED:`, `FAILED:` or `ORPHANED:` — the same words the preamble
+refusals and the per-candidate failures already use. They used to open `Exit 2:`, which was true
+only while all of them were nested inside "if the run exited 2". Prefixing the run's actual code
+instead would attribute it: on a run with the fence down **and** a broken directory, `Exit 3: the
+occupancy fence was unavailable` sends you to fix a fence that was only ever worth `2`. The run's
+code is in the `Done.` summary and in `$LASTEXITCODE`, which are the only places that ever knew it.
+
+**`2` does still mean nothing was removed, and this page said otherwise for one commit.** The
+paragraph above read *"The universal is false on its own terms too: a fence that dies part way
+through the apply loop sets `2` over removals that already landed ... the mid-run fence death does
+not [report `1`]"*. No such run exists. Seven sites can produce `2`, and not one of them can
+co-occur with a removal:
+
+| Site | Why a removal cannot have happened |
+|---|---|
+| three bare exits in the preamble | a negative `-IdleHours`, not a repository, not the primary checkout — all before a candidate set exists |
+| the decision-pass fence check | an unavailable fence adds a SKIP reason to **every** candidate, so the prunable set is empty and the apply loop never runs |
+| the mid-loop fence check | the fence is read **once**, on the line above the loop, and nothing inside re-reads it — so a fence that is down skips the first candidate and every later one |
+| the `-Name` and `-ReapVenvs` guards | both explicitly conditioned on something having been removed, and both report `1` when it has |
+
+Measured over the parsed script rather than by grep, because a grep for `^\s*exit` misses four
+keywords and any wrapper that reads the exit variable. Classifying every `Exit`, `Return`, `Throw`,
+`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89 —
+outside a function 5 `Exit`, 1 `Throw`, 20 `Continue` and 2 `Return`; inside one 47 `Return`, 13
+`Continue` and 1 `Break`.
+
+The 2 `Return`s outside a function are not script-level either, and the distinction is worth the
+sentence because anyone re-running that predicate will meet them: they are the `return $true` /
+`return $false` of the `$matchesName` scriptblock literal, returning from that scriptblock.
+Counting a `ScriptBlockExpressionAst` as a nesting level too moves exactly those two rows and
+nothing else. This paragraph published that broader reading — *"49 `Return` ... nested"* — while
+naming the narrower predicate, so a reader who followed the stated method got a different table.
+
+What the argument rests on survives both readings: **0 `Exit` sits inside a function** under
+either, so no `exit` in the file is scoped to anything narrower than the process, and the two that
+end an ordinary run are both `exit $exit`. The standing pin is
+`test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills the fence between the decision
+pass and the removal pass and asserts `counts.removed == 0` beside the `2`.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the

@@ -483,6 +483,84 @@ def run_text(
     )
 
 
+def run_text_parsed(
+    fx: Fixture,
+    *extra: str,
+    skip_gh: bool = True,
+    skip_fetch: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Same human surface, invoked through ``-Command`` so an ARRAY argument really is an array.
+
+    ``_argv`` uses ``pwsh -File``, which hands every argument to the script as a literal string.
+    Measured on this machine against a probe script taking ``[string[]]$Name``::
+
+        pwsh -NoProfile -NonInteractive -File probe.ps1 -Name a,b   ->  count=1, [0]=a,b
+        pwsh -NoProfile -NonInteractive -File probe.ps1 -Name a b   ->  count=1, [0]=a
+
+    So no test reaching the script through ``run`` or ``run_text`` can express "one ``-Name`` value
+    HITS and another MISSES": the two collapse into a single value that misses. That state is
+    reachable for an operator, because ``docs/WORKTREES.md`` documents the invocation as a direct
+    call from a pwsh prompt (``scripts\\worktree\\prune-merged.ps1 -Apply -Name pins``) and a prompt
+    PARSES the array. ``-Command`` is the faithful surface for that case rather than a way around
+    the harness, and ``test_the_name_miss_is_explained_on_the_run_that_reports_FAILED`` -- the one
+    test that needs the array -- carries the ``-File`` reading beside it as a control, so the
+    difference between the two is measured there rather than assumed.
+
+    IT COSTS THE EXIT CODE, AND THE TRAILING ``exit $LASTEXITCODE`` IS WHAT BUYS IT BACK. BUT
+    THE RULE IS NOT "``-Command`` LOSES THE EXIT CODE". Under ``-Command``, an INVOKED script's or
+    a NATIVE command's non-zero exit is reported as pwsh's own "a command failed" status of 1,
+    unless the last thing you do is re-exit ``$LASTEXITCODE``. A bare ``exit N`` typed into
+    ``-Command`` propagates perfectly well. Measured on pwsh 7.6.6, asked code to actual exit::
+
+        form                                             0  1  2  3
+        -Command "exit N"                                0  1  2  3   propagates
+        -Command "& probe.ps1 -Code N"                   0  1  1  1   COLLAPSES  <- this helper
+        -Command "cmd /c exit N"                         0  1  1  1   COLLAPSES
+        -Command "& probe.ps1 -Code N; exit $LASTEXIT"   0  1  2  3   propagates
+        -File probe.ps1 -Code N                          0  1  2  3   propagates
+
+    So the two traps here have OPPOSITE remedies and must not be merged into one rule: ``-File``
+    is faithful on the exit code and lossy on the array, ``-Command`` is the reverse. Reading the
+    collapse as a property of ``-Command`` itself leads someone to distrust ``-Command "exit 2"``,
+    which is sound, and to trust ``-File`` for an array, which is not.
+
+    Without the re-exit clause an ``assert returncode == 1`` here is satisfied by 1, 2 and 3 alike,
+    and reads identically to the genuine one in
+    ``test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED``, which goes through
+    ``run_text``. A helper that silently cannot distinguish a refusal from a failure has no place
+    in a file about a destructive tool's exit codes.
+
+    Quoting: every PATH is single-quoted for PowerShell with embedded quotes doubled, because
+    ``tmp_path`` can carry characters the parser would otherwise read as syntax. Caller arguments
+    in ``extra`` are passed VERBATIM -- they are flags and slugs, and quoting ``-Apply`` would make
+    it a positional string rather than a switch. A value carrying a space needs its own quoting.
+    """
+
+    def q(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    parts = ["&", q(SCRIPT), "-RepoRoot", q(fx.primary)]
+    if skip_fetch:
+        parts.append("-SkipFetch")
+    if skip_gh:
+        parts.append("-SkipGh")
+    parts += ["-ConfigRoot", q(fx.cfg)]
+    parts += list(extra)
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            " ".join(parts) + "; exit $LASTEXITCODE",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
 _SHIMS = 0
 
 
@@ -1410,7 +1488,7 @@ def test_a_fence_that_dies_mid_run_refuses_and_says_so(
         ),
     )
     assert "Occupancy fence: 1 config root(s)" in proc.stdout, "available at decision time"
-    assert "Exit 2:" in proc.stdout, "the summary must explain the refusal it just exited with"
+    assert "REFUSED:" in proc.stdout, "the summary must explain the refusal it just exited with"
     assert "gone by the time of the removal" in proc.stdout
     assert "Done. removed 0" in proc.stdout
 
@@ -1650,6 +1728,153 @@ def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: i
     assert res["_exit"] == 2
     assert (
         "matched no PRUNABLE sibling" in run_text(fx, "-Apply", "-Name", "no-such-worktree").stdout
+    )
+
+
+def test_a_clean_run_prints_no_exit_code_line_at_all(fx: Fixture, sleeper: int) -> None:
+    """Silence on a green run used to be structural, and the hoist makes it an invariant instead.
+
+    Before, every exit-code line sat inside ``if ($exit -eq $EXIT_REFUSED)`` or its ``elseif``, so a
+    run that exited 0 could not reach one. Now each line is keyed on its own condition and stays
+    silent on 0 only because the sites that set those conditions also raise the code -- an
+    unavailable fence sets 2, a ``-Name`` miss sets 2 or 1. That invariant is load-bearing and was
+    asserted nowhere: every ``REFUSED:``/``FAILED:`` assertion in this file is a presence check.
+
+    So this one checks absence. The positive control is in the same invocation: the run really does
+    prune two worktrees and exit 0, which is what makes the absence mean "nothing to explain"
+    rather than "the run did nothing".
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    proc = run_text(fx, "-Apply")
+
+    assert proc.returncode == 0, f"the control: this run must be green, got {proc.returncode}"
+    assert "Done. removed 2, failed 0" in proc.stdout, "and it must really have pruned"
+    for label in ("REFUSED:", "FAILED:", "ORPHANED:"):
+        assert label not in proc.stdout, (
+            f"a green run explained a code it did not exit with: {label}\n{proc.stdout}"
+        )
+
+
+def test_run_text_parsed_reports_the_scripts_own_exit_code(fx: Fixture) -> None:
+    """The helper's own pin, because `-Command` silently collapses every non-zero code to 1.
+
+    Without the trailing ``exit $LASTEXITCODE`` this returns 1 for a run that exited 2, and every
+    ``assert returncode == 1`` written through the helper becomes unfalsifiable. ``-IdleHours -1``
+    is the cheapest refusal in the script: it exits 2 from the preamble, before the fence is read
+    or a candidate exists, so nothing else in the fixture can move the code.
+
+    The control is the same refusal through ``run_text`` (``-File``), which has always propagated
+    faithfully. Both must read 2; if only the ``-File`` one does, the clause has been dropped.
+    """
+    assert run_text(fx, "-IdleHours", "-1").returncode == 2, "the -File control must refuse with 2"
+    assert run_text_parsed(fx, "-IdleHours", "-1").returncode == 2, (
+        "-Command reported a different code than the script exited with"
+    )
+
+
+def test_the_name_miss_is_explained_on_the_run_that_reports_FAILED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The exit-code line naming a ``-Name`` miss was keyed on 2, and the guard moves the run off 2.
+
+    ``-Name clean,no-such-worktree`` is one instruction with two halves. The first half removes a
+    worktree, so ``$removed`` is 1 and the miss reports ``$EXIT_FAILED`` rather than
+    ``$EXIT_REFUSED`` -- which is right, and is the guard this file already pins for ``-ReapVenvs``
+    in ``test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED``. But the line that
+    names the miss AND its code sat inside ``if ($exit -eq $EXIT_REFUSED)``, so it went silent on
+    exactly the run where the two halves of the report disagree. The operator saw ``Done. removed
+    1`` in red with no exit-code line anywhere saying which half went wrong.
+
+    TWO SURFACES, AND ONLY ONE WAS BROKEN. The unconditional yellow line in the decision table
+    ("matched no PRUNABLE sibling worktree") always printed; it is asserted below as the control, so
+    a failure here is attributable to the exit-code line and not to the miss having quietly stopped
+    being detected. Same shape as the venv pair, where ``VENV REAP COULD NOT RUN`` is the control
+    and ``FAILED: -ReapVenvs ...`` is the line under test.
+
+    THE ``-File`` READING IS CARRIED AS A CONTROL, because this test is the one place in the file
+    that departs from ``run_text``. Under ``-File`` the same two names arrive as the single value
+    ``clean,no-such-worktree``, which matches nothing, removes nothing, and honestly exits 2 -- so
+    the departure is doing real work rather than dressing up the same run.
+    """
+    live_record(fx, sleeper, fx.primary)
+
+    control = run(fx, "-Apply", "-Name", "clean,no-such-worktree")
+    assert control["namedMisses"] == ["clean,no-such-worktree"], (
+        "-File collapses the array, so this invocation cannot reach the state under test"
+    )
+    assert control["counts"]["removed"] == 0
+    assert control["_exit"] == 2, "nothing was removed, so 2 is honest here"
+    assert fx.sibling("clean").exists(), "the control must leave the subject standing"
+
+    proc = run_text_parsed(fx, "-Apply", "-Name", "clean,no-such-worktree")
+
+    assert "Done. removed 1" in proc.stdout, (
+        f"the removing half did not happen, so there is nothing to disagree with: {proc.stdout}"
+    )
+    assert not fx.sibling("clean").exists()
+    assert proc.returncode == 1, (
+        f"removed a worktree and reported exit {proc.returncode}; the -Name guard should report 1"
+    )
+    assert "matched no PRUNABLE sibling" in proc.stdout, "the refusing half must still be detected"
+    assert "FAILED: -Name named no-such-worktree" in proc.stdout, (
+        f"the run removed one worktree and refused half its instruction, and said which "
+        f"nowhere in:\n{proc.stdout}"
+    )
+
+
+def test_the_fence_refusal_is_explained_on_a_run_that_reports_ORPHANED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Same hole, same wrapper, reached without ``-Name``: any higher code silences the fence line.
+
+    ``3`` outranks ``2``, so a run that finds a broken directory from an earlier pass AND cannot
+    read the occupancy fence exits 3 -- and the line explaining that nothing was eligible, which is
+    why the table is empty, used to disappear. The operator was told a directory is broken and
+    nothing at all about the fence that made every candidate ineligible.
+
+    The orphan half is built exactly as ``test_an_orphan_is_reported_by_every_later_run`` builds it,
+    including its filesystem skip: an open handle can fail to block the removal, and a test that
+    silently examined a healthy tree instead would pass for the wrong reason.
+
+    AND THE LINE SAYS ``REFUSED`` ON A RUN THAT EXITS 3. That is the point rather than an
+    oversight: the fence is worth 2, and the broken directory on disk is what makes the run a 3, so
+    no line here prefixes the run's code. One that did would send the operator to fix the fence to
+    clear a 3 the fence never set.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    blocker = (fx.sibling("gone") / "seed.txt").open("rb")
+    try:
+        first = run(fx, "-Apply", "-Name", "gone")
+    finally:
+        blocker.close()
+    if by_leaf(first, "gone")["Outcome"] != "orphaned":
+        pytest.skip("git removed the directory despite the open handle on this filesystem")
+
+    # Now take the fence away. An empty registry is UNAVAILABLE, not "nobody is here" --
+    # test_empty_registry_refuses_everything pins that on its own.
+    for record in (fx.cfg / "sessions").glob("*.json"):
+        record.unlink()
+
+    later = run(fx)
+    assert later["fence"]["available"] is False, "the fence must really be down"
+    assert later["counts"]["orphansFromEarlierRuns"] == 1
+    assert later["_exit"] == 3, "3 outranks 2, which is what takes the run out of the branch"
+
+    # The human surface is a SECOND process, so read its own code rather than borrowing the JSON
+    # run's. run_text goes through -File, which propagates faithfully. The script branches on $Json
+    # in its preamble refusals, so equal codes are a reading here, not an assumption.
+    proc = run_text(fx)
+    assert proc.returncode == 3, "the text run must be in the same state as the JSON one"
+    text = proc.stdout
+    assert "ORPHANED director" in text, "the control: the tail block keyed on 3 still fires"
+    assert "ORPHANED:" in text, "and so does its outcome line"
+    assert "REFUSED: the occupancy fence was unavailable" in text, (
+        f"nothing said why every candidate was ineligible:\n{text}"
     )
 
 
@@ -2428,7 +2653,7 @@ def test_c9_an_absent_transcript_store_refuses_the_whole_pass(fx: Fixture, sleep
 def test_a_refused_venv_pass_that_removed_a_worktree_is_FAILED_not_REFUSED(
     fx: Fixture, sleeper: int
 ) -> None:
-    """Exit 2 is this script's own "nothing was attempted", so a run that pruned must not claim it.
+    """Exit 2 is this script's own "nothing was removed", so a run that pruned must not claim it.
 
     The venv pass computes its verdict BEFORE the apply loop and used to set the refusal code from
     there -- where ``$removed`` does not exist yet, so the guard the ``-Name`` path has always
@@ -2459,7 +2684,7 @@ def test_a_refused_venv_pass_that_removed_a_worktree_is_FAILED_not_REFUSED(
 
     assert res["_exit"] == 1, (
         f"removed {res['counts']['removed']} worktree(s) and reported exit {res['_exit']}; "
-        "2 is documented as REFUSED -- nothing was attempted"
+        "2 is documented as REFUSED, which promises nothing was removed"
     )
 
 
@@ -2482,7 +2707,7 @@ def test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED(
     assert proc.returncode == 1
     assert "Done. removed 2" in proc.stdout
     assert "VENV REAP COULD NOT RUN" in proc.stdout
-    assert "Exit 1: -ReapVenvs was asked for and could not answer" in proc.stdout
+    assert "FAILED: -ReapVenvs was asked for and could not answer" in proc.stdout
 
 
 def test_idle_hours_zero_refuses_the_venv_pass(fx: Fixture, sleeper: int) -> None:

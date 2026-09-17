@@ -139,15 +139,45 @@
     not be established; 3 ORPHANED -- a directory is broken on disk right now and needs the recovery
     recipe. 3 outranks 2 because damage on disk outranks a refusal to act.
 
-    2 IS PER-REQUEST, NOT PER-RUN, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing
-    was attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)", and both halves
-    were wrong. The enumeration went stale silently: -ReapVenvs added four refusal causes of its own
-    -- the fence down, transcript roots unreadable, no config root carrying a projects/ directory,
-    and -IdleHours 0 emptying both idle windows -- and this list did not move. The universal is false
-    on its own terms too: a fence that dies PART WAY through the apply loop sets 2 over removals that
-    already landed. -Name and -ReapVenvs both report 1 instead once something has been removed; the
-    mid-run fence death does not. So read 2 as "some request of yours was refused", and read the
+    2 IS PER-REQUEST, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing was
+    attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)". The list went stale
+    silently: -ReapVenvs added four refusal causes of its own -- the fence down, transcript roots
+    unreadable, no config root carrying a projects/ directory, and -IdleHours 0 emptying both idle
+    windows -- and it did not move. So read 2 as "some request of yours was refused", and read the
     removed / failed counts for what the run did.
+
+    BUT 2 STILL MEANS NOTHING WAS REMOVED, AND THIS PARAGRAPH SAID OTHERWISE FOR ONE COMMIT. It read
+    "The universal is false on its own terms too: a fence that dies PART WAY through the apply loop
+    sets 2 over removals that already landed ... the mid-run fence death does not [report 1]". No
+    such run exists. Seven sites can produce 2, and not one of them can co-occur with a removal:
+
+      * three bare `exit $EXIT_REFUSED` in the preamble -- a negative -IdleHours, not a repository,
+        not the primary checkout -- every one of them before a candidate set exists;
+      * the decision-pass fence check, where an unavailable $occ adds a SKIP reason to EVERY
+        candidate, so $prunable is empty and the apply loop never runs at all;
+      * the mid-loop fence check, where $occ2 is read ONCE on the line above
+        `foreach ($d in $prunable)` and nothing inside the loop re-reads it or mutates Available --
+        so a fence that is down skips iteration 1 and every later one, and $removed stays 0;
+      * the -Name and -ReapVenvs guards, both explicitly ternary on `$removed -gt 0`.
+
+    ESTABLISHED OVER THE AST RATHER THAN BY GREP, because a grep for ^\s*exit misses four keywords
+    and any wrapper that reads the exit variable. Parsing the file and classifying every Exit,
+    Return, Throw, Break and Continue statement by whether an ancestor is a FunctionDefinitionAst
+    gives 89. Outside a function: 5 Exit, 1 Throw, 20 Continue, 2 Return. Inside one: 47 Return,
+    13 Continue, 1 Break.
+
+    THE 2 RETURNS OUTSIDE A FUNCTION ARE NOT SCRIPT-LEVEL EITHER, and the line is worth spending
+    because a reader re-running the predicate above will meet them. They are the `return $true` /
+    `return $false` of the `$matchesName` scriptblock literal, and they return from that
+    scriptblock. Counting a ScriptBlockExpressionAst as a nesting level too moves exactly those two
+    rows and nothing else, which is the whole of what the two predicates disagree about. This
+    paragraph published the broader reading, 49 Return nested, while naming the narrower predicate.
+
+    WHAT THE ARGUMENT RESTS ON SURVIVES BOTH READINGS: 0 Exit sits inside a function under either,
+    so no `exit` here is scoped to anything narrower than the process, and the two that end an
+    ordinary run are both `exit $exit`. tests/test_worktree_prune_merged.py's
+    test_a_fence_that_dies_mid_run_refuses_and_says_so is the standing pin: it kills the fence
+    between the decision pass and the removal pass, and asserts counts.removed is 0 beside the 2.
 
     A BRANCH IS NEVER FORCE-DELETED ON A STALE VERDICT. `git branch -d` refuses a branch merged only
     into origin/main when the local main lags, so `-D` used to be the ROUTINE path and git's last
@@ -282,8 +312,11 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $EXIT_OK = 0
 $EXIT_FAILED = 1   # something was attempted and did not fully succeed
-# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR. It does not
-# promise the run removed nothing -- the header's exit-code paragraph names the case where it did.
+# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR, and the causes
+# are not a closed list. It DOES promise nothing was removed, and the header's exit-code paragraph
+# walks all seven sites that can set it. This comment read "It does not promise the run removed
+# nothing" for one commit, on the strength of a mid-run fence death that paragraph now retracts as
+# unreachable.
 $EXIT_REFUSED = 2
 $EXIT_ORPHANED = 3 # a directory is broken on disk right now (this run, or one before it)
 
@@ -1254,7 +1287,7 @@ if ($ReapVenvs) {
     # FAILED rather than REFUSED once a removal has happened, and it can only do that because it runs
     # AFTER the apply loop. This block runs before it, where $removed does not exist yet, so setting
     # REFUSED from here let `-ReapVenvs -Apply` remove worktrees and still exit 2, which the header
-    # then defined as "nothing was attempted". Set beside the -Name guard instead; search for
+    # defines as "nothing was removed". Set beside the -Name guard instead; search for
     # `$venvReap.ran`.
 }
 
@@ -1546,6 +1579,13 @@ $occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
+    #
+    # ONCE, AND OUTSIDE THE LOOP, WHICH IS WHAT KEEPS EXIT 2 HONEST. Available is a plain [bool] on
+    # the object this returns; nothing in the loop re-reads it or writes it. So the refusal below is
+    # all-or-nothing: down here means down on iteration 1, every candidate skips, and $removed stays
+    # 0. Move this read inside the loop and that stops being true -- the Set-Exit below would then
+    # need the `$removed -gt 0` guard the -Name and -ReapVenvs sites carry, and the header paragraph
+    # that says 2 means nothing was removed would need retracting with it.
     $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
     Write-Note ""
     foreach ($d in $prunable) {
@@ -1753,8 +1793,8 @@ if ($namedMisses.Count -gt 0) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } 
 
 # -ReapVenvs asked for a reading and did not get one, which has the same standing and now takes the
 # same guard. HERE rather than beside the pass that decided it, for the one reason that settles the
-# placement: $removed does not exist until the apply loop has run, and REFUSED means nothing was
-# attempted. A run that pruned two worktrees and could not judge a venv did attempt something.
+# placement: $removed does not exist until the apply loop has run, and REFUSED promises nothing was
+# removed. A run that pruned two worktrees and could not judge a venv removed something.
 if ($null -ne $venvReap -and -not $venvReap.ran) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
 
 # BEFORE the report, not after it. The -Json branch below emits the receipt and EXITS, so an exit-code
@@ -2006,24 +2046,49 @@ if ($priorOrphans.Count -gt 0) {
 if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
 
 foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
-if ($exit -eq $EXIT_REFUSED) {
-    if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
-        Write-Host "  Exit 2: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
-        if ($null -ne $occ2 -and -not $occ2.Available) {
-            Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
-        }
-    }
-    if ($namedMisses.Count -gt 0) {
-        Write-Host "  Exit 2: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+# EACH LINE IS KEYED ON ITS OWN CONDITION, NEVER ON THE FINAL CODE. These used to sit inside
+# `if ($exit -eq $EXIT_REFUSED)`, and two different things take a run out of that branch: the
+# `$removed -gt 0` guard on the -Name miss, which reports 1 once something has been removed, and a
+# more severe code from an unrelated cause, such as an orphaned directory reporting 3. Either way the
+# explanation went silent on exactly the run where the halves of the report disagree -- the operator
+# read `Done. removed 1` in red, or a recovery recipe, with nothing saying which request was refused.
+# The -ReapVenvs line below was moved out for this reason in #1244 (6896b3921); these follow it.
+#
+# AND NO LINE PREFIXES THE RUN'S CODE, BECAUSE DOING SO ATTRIBUTES IT. These lines used to open
+# `Exit 2:`, which was true only while the wrapper guaranteed the run WAS a 2. Interpolating $exit
+# instead gets the arithmetic right and the meaning wrong: with the fence down AND a directory
+# broken on disk, `Exit 3: the occupancy fence was unavailable` sends an operator to fix the fence
+# to clear a 3 the fence never set. The fence is worth 2; the broken directory is what makes it 3.
+#
+# So each line opens with the OUTCOME WORD, which is already this file's vocabulary -- the three
+# preamble refusals print bare `REFUSED:` and a failed removal prints bare `FAILED:`. The run's
+# code stays where it was always authoritative: the `Done.` summary and $LASTEXITCODE. The number
+# is not merely moved, either -- `FAILED (1)` would have read as a sibling of the per-candidate
+# `FAILED (exit $removeExit)` above, which is a git exit code and a different thing entirely.
+#
+# The -ReapVenvs line takes the same treatment rather than staying the odd one out: it landed with
+# `Exit ${exit}:` in #1244 (6896b3921) and has the same hole.
+$refusalWord = if ($removed -gt 0) { 'FAILED' } else { 'REFUSED' }
+if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
+    # REFUSED unconditionally, never $refusalWord: an unavailable fence makes every candidate SKIP,
+    # so this branch and a non-zero $removed cannot co-occur. The header paragraph walks that.
+    Write-Host "  REFUSED: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
+    if ($null -ne $occ2 -and -not $occ2.Available) {
+        Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
     }
 }
-elseif ($exit -eq $EXIT_ORPHANED) {
-    Write-Host "  Exit 3: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
+if ($namedMisses.Count -gt 0) {
+    Write-Host "  ${refusalWord}: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+}
+# `if`, not the `elseif` this was: with the branch above gone there is nothing to chain to. Behaviour
+# is unchanged -- the old chain reached here whenever $exit was 3, because 3 is not 2.
+if ($exit -eq $EXIT_ORPHANED) {
+    Write-Host "  ORPHANED: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
 }
 # OUTSIDE the branch above, because the venv refusal no longer decides the code on its own: a run that
 # also removed a worktree reports 1. A line keyed on 2 would go silent on exactly the run where the
 # two halves of the report disagree, which is the run an operator most needs it on.
 if ($null -ne $venvReap -and -not $venvReap.ran) {
-    Write-Host "  Exit ${exit}: -ReapVenvs was asked for and could not answer, so the empty venv list means nothing." -ForegroundColor Red
+    Write-Host "  ${refusalWord}: -ReapVenvs was asked for and could not answer, so the empty venv list means nothing." -ForegroundColor Red
 }
 exit $exit
