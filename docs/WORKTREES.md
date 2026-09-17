@@ -342,6 +342,14 @@ unreadable, no config root carrying a `projects/` directory, and `-IdleHours 0` 
 windows — and it did not move. Read `2` as "some request of yours was refused", and read
 `counts.removed` for what the run did.
 
+**A tail line names the outcome it is reporting, never the run's code.** Each explanation at the
+foot of the report opens `REFUSED:`, `FAILED:` or `ORPHANED:` — the same words the preamble
+refusals and the per-candidate failures already use. They used to open `Exit 2:`, which was true
+only while all of them were nested inside "if the run exited 2". Prefixing the run's actual code
+instead would attribute it: on a run with the fence down **and** a broken directory, `Exit 3: the
+occupancy fence was unavailable` sends you to fix a fence that was only ever worth `2`. The run's
+code is in the `Done.` summary and in `$LASTEXITCODE`, which are the only places that ever knew it.
+
 **`2` does still mean nothing was removed, and this page said otherwise for one commit.** The
 paragraph above read *"The universal is false on its own terms too: a fence that dies part way
 through the apply loop sets `2` over removals that already landed ... the mid-run fence death does
