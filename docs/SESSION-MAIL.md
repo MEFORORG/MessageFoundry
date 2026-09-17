@@ -464,11 +464,32 @@ was observed about a message:
 2. **Something outside the queue quotes it.** Stems are quoted by hand into handoff notes and seat
    records under `mefor-coord/`, so a receipt is a citation target. The scan excludes `mail/` itself --
    the queue is made of stems, so reading it would mark every receipt as cited and the sweep would
-   delete nothing while looking exactly like a sweep that ran -- and excludes the frozen
-   `_retired-2026-08-22/` tree, whose citations nobody reads back.
+   delete nothing while looking exactly like a sweep that ran -- and it excludes the frozen
+   **`_retired-` family, matched as a whole path segment**, whose citations nobody reads back.
 3. **Never both halves in one pass.** The keep set is read before anything is deleted, so a receipt
    whose message this same drain removes from `seen/` survives to the next drain. A reader who finds
    one half gone can always still find the other.
+
+**Guard 2 excludes a PREFIX, not a date, because these trees are minted rather than authored.**
+[`scripts/coord/handoff.ps1`](../scripts/coord/handoff.ps1) builds `_retired-<yyyy-MM-dd>` from the
+current date on every `-Retire`, so a literal date stops excluding the next one. That failure would be
+silent and permanent: every stem quoted in the new frozen tree pins its receipt forever, while the
+counter line goes on truthfully reporting a sweep that ran.
+
+**This page said "the frozen `_retired-2026-08-22/` tree" until now, and the code stopped reading that
+date at `0bb2605b4`.** Recorded rather than quietly swapped, because a documented claim that no longer
+matches its code is the same defect class the guard itself was rewritten to close, and the pointer
+and the thing it points at are two edits with nothing failing when only the first is made.
+
+**The match is on a path SEGMENT, so it names a directory and never a filename.** A live note called
+`_retired-notes.md` is read like any other document and the stems in it stay ordinary live citations.
+Without that, the family match would double as a way to opt a document out of counting.
+
+**Guard 2's MARGINAL protection is 1 receipt, not 16.** Measured read-only on the live spool at
+`0bb2605b4`: the citation walk finds 16 cited stems among the aged receipts, and 15 of them are
+already held by guard 1, whose message is still sitting in a box. Written down because an overstated
+guard invites the next reader to delete it the day they measure the real figure. One file is still the
+right answer -- a dangling citation is the failure nothing else here reports.
 
 **A guard that cannot be evaluated keeps the file.** If either set fails to build, the receipt sweep
 does not run and the injection says so. `tests/test_session_mail_held.py` section 8g plants one
