@@ -1619,9 +1619,14 @@ def _serve(args: argparse.Namespace) -> int:
     # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
-    # [egress] declares EIGHT allowed_* lists and every one is enforced downstream by _allowlist_for
-    # (pipeline/wiring_runner.py). Counting only six here meant a mail-only or Direct-only instance
-    # could enumerate every destination it actually uses and still be refused as "UNRESTRICTED", with
+    # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
+    # _allowlist_for (pipeline/wiring_runner.py). ([egress].allowed_proxy is a ninth allowed_* key and
+    # is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a destination, is
+    # not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG #1659 — so listing a
+    # proxy says nothing about where PHI may be sent and must not satisfy this gate.)
+    #
+    # Counting only six here meant a mail-only or Direct-only instance could enumerate every
+    # destination it actually uses and still be refused as "UNRESTRICTED", with
     # nothing in the refusal naming the two lists that did not count. allowed_smtp/allowed_direct are
     # counted only when [security].block_unlisted_outbound was NOT set explicitly — precisely the state
     # the flip below turns deny-by-default ON for, so such an instance still starts fail-closed. An

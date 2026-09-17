@@ -944,7 +944,9 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 # byte-identical.
 
 #: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
-_PROXY_DEFAULT = "default"
+#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``pipeline/wiring_runner.py`` has to exempt it
+#: (it names no address at config time), and a second copy of the literal would be free to drift.
+PROXY_DEFAULT = "default"
 
 
 def _normalize_no_proxy(value: Any) -> tuple[str, ...]:
@@ -1150,7 +1152,7 @@ def proxy_config_from_settings(
         return None
     bypass = _normalize_no_proxy(s.get("proxy_no_proxy"))
     proxy_url = str(raw).strip()
-    if proxy_url.lower() == _PROXY_DEFAULT:
+    if proxy_url.lower() == PROXY_DEFAULT:
         # "Use Default Web Proxy" — explicit creds are meaningless here (the system proxy carries its own),
         # so reject the ambiguous combo rather than silently drop a configured credential.
         if s.get("proxy_user") or s.get("proxy_password") or s.get("proxy_auth_type"):
