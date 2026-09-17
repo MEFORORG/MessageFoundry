@@ -128,28 +128,49 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 ) -> None:
     """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
 
-    Drives the fixture's own async generator with the last setup step raising;
-    ``store.__wrapped__`` is the undecorated function pytest keeps on the fixture object.
-    Without the try/finally the generator walks away from an open pool, so a single bad setup
-    would leak one handle per test and every later test would error on the connection cap
-    instead of on the real fault, leaving the true cause visible in one report out of many.
-    This is test infrastructure, so it carries no deployment axis.
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``SqlServerStore.open``
+    carries its own M-6 guard (``except Exception:`` -> ``pool.close()``/``wait_closed()`` plus the
+    executor shutdown), so a failure injected into any step ``open()`` performs is caught and the
+    pool closed *there*, ``open()`` never returns, and the fixture's ``try``/``finally`` is never
+    entered -- the closed-pool assertion below would then hold with the fix reverted, which is no
+    test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance rather
+    than on the class. ``open()`` therefore runs its own ``_load_reference_cache`` for real, and the
+    raise can only land in the fixture's own call to it -- after the clean-slate DELETE batch,
+    before the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool,
+    so one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
     """
+    from messagefoundry.config.settings import StoreSettings
     from messagefoundry.store.sqlserver import SqlServerStore
 
     opened: list[SqlServerStore] = []
 
-    async def _boom(self: SqlServerStore) -> None:
-        opened.append(self)
+    async def _boom() -> None:
         raise RuntimeError("fixture setup failed after open")
 
-    monkeypatch.setattr(SqlServerStore, "_load_reference_cache", _boom)
+    real_open = SqlServerStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> SqlServerStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.closed, "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_reference_cache", _boom)  # noqa: B010 - shadows the method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(SqlServerStore, "open", _open_then_arm)
 
     gen = store.__wrapped__()
     with pytest.raises(RuntimeError, match="fixture setup failed after open"):
         await anext(gen)
 
-    assert opened, "the patched setup step never ran, so the rest of this test asserts nothing"
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
     assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
