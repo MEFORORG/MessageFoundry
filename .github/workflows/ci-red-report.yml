@@ -1,0 +1,98 @@
+name: ci-red report
+
+# Read the `ci-red` label back and say WHICH run reddened each pull request (BACKLOG #1385).
+#
+# THE DEFECT THIS CLOSES. `scripts/ci/report_ci_red.py` landed 2026-09-04 with
+# `tests/test_ci_red_reader.py` beside it, and NO WORKFLOW RAN IT. Verified 2026-09-16:
+# `git grep -l report_ci_red origin/main -- .github` returned nothing. Meanwhile
+# `failure-signal.yml` writes the label and no workflow triggers on it. The signal was written and
+# never read -- which is #1385's own residual 3, stated there verbatim, and the same defect class
+# that item exists to end one level down.
+#
+# ADVISORY, AND IT MUST NEVER BECOME A REQUIRED CONTEXT. A required check that cannot report wedges
+# every pull request in the repository -- the required-but-absent trap `.github/required-contexts.txt`
+# and docs/CI.md both name. This workflow holds no required context and adding one here would gate
+# merges on a REPORT ABOUT OTHER MERGES, which is circular.
+#
+# `--warn-only` IS A MEASUREMENT, NOT A PREFERENCE, and without it this job would be red from the day
+# it landed. Measured 2026-09-16: 22 of the 41 open pull requests carried `ci-red`. Nothing removes
+# the label -- `failure-signal.yml` only ever adds it, and a grep for `--remove-label ci-red` finds no
+# caller -- so the population only grows until a pull request closes. A daily cron exiting 1 on a
+# finding would therefore be red every day forever, which is decoration, and this repository's own
+# prose says so repeatedly: a signal that always fires trains the reader to skip it.
+#
+# SO THE JOB RULES ON WHETHER IT COULD MEASURE, NOT ON WHAT IT FOUND -- the same split
+# `quality-advisory.yml`'s `liveness` job makes in its own words. `--warn-only` downgrades a FINDING
+# to exit 0 and `::warning::` annotations. It does NOT touch the fail-closed path: an unreadable query
+# still returns 2 and reds this job, because "I could not ask" must never render as "nothing is red".
+# `tests/test_ci_red_reader.py` pins that, so the flag cannot quietly become a blanket "always green".
+#
+# WHY A SCHEDULE RATHER THAN A TRIGGER ON THE LABEL. A `pull_request: types: [labeled]` arm would run
+# on the exact pull request at the exact moment, and it would also put a new check-run on every pull
+# request in the repository and execute from a fork's head on a fork pull request. The established
+# shape here for an advisory checker is a cron -- `required-workflow-state.yml` runs
+# `check_required_contexts_drift.py` this way -- and this file copies it deliberately.
+#
+# A RED HERE STILL REACHES NOBODY, ON THE RECORD. `failure-signal.yml` watches CI, Security and
+# backlog-hygiene; it does not watch this workflow, so an exit-2 run fails unread. That is the open
+# half, and it is written up in that file's header alongside the two sibling crons it also misses. It
+# is NOT closed by adding this workflow to that watch list: the label that signal applies says a
+# REQUIRED check went red, which is false of an advisory cron.
+
+on:
+  schedule:
+    # 07:35 UTC -- after required-workflow-state (07:00) and stalled-prs (07:05), so the three
+    # repo-health crons land together in the morning without sharing a minute.
+    - cron: "35 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the run: the schedule and a manual dispatch ask the same question of a moving repository,
+  # and cancelling either would discard an answer rather than supersede one.
+  group: ci-red-report-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: attribute the pull requests carrying ci-red
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The reader calls `/actions/runs` and `/actions/runs/<id>/jobs`; `gh pr list` reads the labels.
+      # Both actions endpoints answer WITHOUT this scope on a public repository -- measured
+      # 2026-09-16 on run 35171248441 -- and both respond `X-Accepted-Github-Permissions: actions=read`
+      # anyway. Declared for the same reason failure-signal.yml declares it: a report that silently
+      # stops naming runs is worse than one that cannot start. Neither scope can modify anything.
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      # NO PIP INSTALL STEP, DELIBERATELY. `scripts/ci/report_ci_red.py` imports only the standard
+      # library and shells out to `gh`, which the runner image ships. The sibling advisory workflows
+      # install `ci/locks/ci-scanners.lock` because their scripts import PyYAML; this one does not,
+      # and adding the step anyway would be a dependency nobody can later tell was unnecessary.
+      - name: Attribute every pull request carrying the ci-red label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/ci/report_ci_red.py --repo "$GITHUB_REPOSITORY" --warn-only \
+            | tee ci-red.txt
+          # The annotations above are the signal; this puts the same lines where a reader lands
+          # first. `::warning::` prefixes are stripped so the summary reads as prose.
+          {
+            echo "## Pull requests carrying \`ci-red\`"
+            echo
+            echo '```'
+            sed -e 's/^::warning:://' -e 's/^::error:://' ci-red.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
