@@ -502,26 +502,38 @@ def run_text_parsed(
     reachable for an operator, because ``docs/WORKTREES.md`` documents the invocation as a direct
     call from a pwsh prompt (``scripts\\worktree\\prune-merged.ps1 -Apply -Name pins``) and a prompt
     PARSES the array. ``-Command`` is the faithful surface for that case rather than a way around
-    the harness, and the tests below carry the ``-File`` reading beside it as a control, so the
-    difference between the two is measured here rather than assumed.
+    the harness, and ``test_the_name_miss_is_explained_on_the_run_that_reports_FAILED`` -- the one
+    test that needs the array -- carries the ``-File`` reading beside it as a control, so the
+    difference between the two is measured there rather than assumed.
 
-    ``-Command`` COSTS THE EXIT CODE, AND THE TRAILING ``exit $LASTEXITCODE`` IS WHAT BUYS IT BACK.
-    ``-Command`` reports its own success or failure, not the script's: it collapses every non-zero
-    code to 1. Measured on pwsh 7.6.6 against a probe that exits with what it is asked for::
+    IT COSTS THE EXIT CODE, AND THE TRAILING ``exit $LASTEXITCODE`` IS WHAT BUYS IT BACK. BUT
+    THE RULE IS NOT "``-Command`` LOSES THE EXIT CODE". Under ``-Command``, an INVOKED script's or
+    a NATIVE command's non-zero exit is reported as pwsh's own "a command failed" status of 1,
+    unless the last thing you do is re-exit ``$LASTEXITCODE``. A bare ``exit N`` typed into
+    ``-Command`` propagates perfectly well. Measured on pwsh 7.6.6, asked code to actual exit::
 
-        asked  0   1   2   3
-        -File  0   1   2   3
-        -Cmd   0   1   1   1
-        -Cmd + "; exit $LASTEXITCODE"   0   1   2   3
+        form                                             0  1  2  3
+        -Command "exit N"                                0  1  2  3   propagates
+        -Command "& probe.ps1 -Code N"                   0  1  1  1   COLLAPSES  <- this helper
+        -Command "cmd /c exit N"                         0  1  1  1   COLLAPSES
+        -Command "& probe.ps1 -Code N; exit $LASTEXIT"   0  1  2  3   propagates
+        -File probe.ps1 -Code N                          0  1  2  3   propagates
 
-    Without that clause an ``assert returncode == 1`` here is satisfied by 1, 2 and 3 alike, and
-    reads identically to the genuine one in
+    So the two traps here have OPPOSITE remedies and must not be merged into one rule: ``-File``
+    is faithful on the exit code and lossy on the array, ``-Command`` is the reverse. Reading the
+    collapse as a property of ``-Command`` itself leads someone to distrust ``-Command "exit 2"``,
+    which is sound, and to trust ``-File`` for an array, which is not.
+
+    Without the re-exit clause an ``assert returncode == 1`` here is satisfied by 1, 2 and 3 alike,
+    and reads identically to the genuine one in
     ``test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED``, which goes through
     ``run_text``. A helper that silently cannot distinguish a refusal from a failure has no place
     in a file about a destructive tool's exit codes.
 
-    Quoting: every path is single-quoted for PowerShell with embedded quotes doubled, because
-    ``tmp_path`` can carry characters the parser would otherwise read as syntax.
+    Quoting: every PATH is single-quoted for PowerShell with embedded quotes doubled, because
+    ``tmp_path`` can carry characters the parser would otherwise read as syntax. Caller arguments
+    in ``extra`` are passed VERBATIM -- they are flags and slugs, and quoting ``-Apply`` would make
+    it a positional string rather than a switch. A value carrying a space needs its own quoting.
     """
 
     def q(value: object) -> str:
