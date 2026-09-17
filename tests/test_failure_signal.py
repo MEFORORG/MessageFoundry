@@ -39,7 +39,11 @@ header was written to prevent.
 from __future__ import annotations
 
 import functools
+import importlib.util
+import json
 import re
+import subprocess
+import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -63,6 +67,26 @@ FILE = WORKFLOWS / "failure-signal.yml"
 _NOT_WATCHED = re.compile(
     r"^#\s*not-watched:\s*(?P<file>[A-Za-z0-9_.-]+\.yml)\s+--\s+(?P<reason>\S.*?)\s*$", re.M
 )
+
+#: Two jobs of run 33903044674 as the Actions API reported them on 2026-09-04 -- a real leg reddened
+#: by its margin watchdog, and the roll-up that fails alongside it in every red run. Transcribed
+#: rather than invented, and deliberately the SAME shape `tests/test_ci_red_reader.py` drives the
+#: reader with: the two rules are compared against each other below, so they must be asked the same
+#: question. A fixture may be duplicated; the RULE may not, which is why that one is read out of the
+#: workflow and run rather than restated here.
+_REAL_TIMING_GATE_JOB: dict[str, object] = {
+    "name": "web console tests (windows-2025, py3.14)",
+    "conclusion": "failure",
+    "steps": [
+        {"name": "Web console tests (pytest)", "conclusion": "success"},
+        {"name": "Step margin -- web console suite", "conclusion": "failure"},
+    ],
+}
+_REAL_ROLLUP_JOB: dict[str, object] = {
+    "name": "CI gate",
+    "conclusion": "failure",
+    "steps": [{"name": "Fail -- a gated leg FAILED", "conclusion": "failure"}],
+}
 
 
 def _doc() -> dict:
@@ -209,17 +233,41 @@ def test_it_pulls_in_no_third_party_actions() -> None:
 
 
 def test_it_is_least_privilege_and_cannot_modify_code() -> None:
-    """The token can label a pull request or comment on an issue. It cannot push, tag or write code."""
+    """The token can label a pull request or comment on an issue. It cannot push, tag or write code.
+
+    THE WRITE SET, AND ONLY THE WRITE SET. This is the property the zizmor suppression rests on, and
+    it is asserted apart from the exact-permissions pin below on purpose. The two used to be one
+    assertion, which meant a scope added to the block moved the security claim with it in the same
+    edit -- and on 2026-09-16 a scope WAS added (`actions: read`, so the ejection comment can name the
+    failing job). A read scope is harmless here; the point is that granting one must not be the same
+    keystroke as re-blessing the write set.
+    """
     doc = _doc()
     assert doc["permissions"] == {"contents": "read"}, (
         f"top-level permissions are {doc.get('permissions')!r}. Keep the file default read-only so a "
         "job added here cannot inherit write scope by accident."
     )
-    job_perms = doc["jobs"]["signal"].get("permissions")
-    assert job_perms == {"pull-requests": "write", "issues": "write"}, (
-        f"the signal job's permissions are {job_perms!r}. It needs exactly these two writes. Anything "
-        "that can modify code -- `contents: write`, `packages: write`, `id-token: write` -- turns the "
-        "open fork path into the escalation the zizmor suppression says is closed."
+    job_perms = doc["jobs"]["signal"].get("permissions") or {}
+    writes = {scope for scope, level in job_perms.items() if level == "write"}
+    assert writes == {"pull-requests", "issues"}, (
+        f"the signal job holds the write scopes {sorted(writes)}. It needs exactly these two. "
+        "Anything that can modify code -- `contents: write`, `packages: write`, `id-token: write` -- "
+        "turns the open fork path into the escalation the zizmor suppression says is closed."
+    )
+
+
+def test_the_signal_job_declares_no_scope_nobody_decided_to_grant() -> None:
+    """The exact block, so a new scope has to be a deliberate edit with a reason beside it.
+
+    Separate from the write-set test above rather than folded into it: an unexplained scope is how a
+    write one eventually arrives, and a single assertion cannot report both failures distinctly.
+    """
+    job_perms = _doc()["jobs"]["signal"].get("permissions")
+    assert job_perms == {"actions": "read", "pull-requests": "write", "issues": "write"}, (
+        f"the signal job's permissions are {job_perms!r}. `actions: read` backs the jobs fetch that "
+        "names the ejecting job -- the permissions block's own comment carries the measurement for "
+        "why it is declared on a public repo that answers without it. Adding another scope means "
+        "writing down what needs it."
     )
 
 
@@ -455,4 +503,131 @@ def test_the_ejection_step_reads_its_run_values_from_the_environment() -> None:
     assert from_event >= {"RUN_NAME", "RUN_URL"}, (
         f"the attribution step's env carries {sorted(from_event)}. The run name and URL must reach "
         "the script through the environment, never spliced into the body."
+    )
+
+
+# ---------------------------------------------------------------------------------------------------
+# NAMING THE JOB, NOT THE WORKFLOW (#1403's unmet acceptance, closed 2026-09-16).
+#
+# The step has been TITLED "Say which job ejected it" since #1403 and interpolated
+# `github.event.workflow_run.name`, which is the WORKFLOW name. So an ejection comment read "CI
+# failed ..." -- a fact the reader already had from the label and the checks tab -- and named no job.
+# #1403's banner reads closed over that gap.
+#
+# The rule lives in the step's `env:` as a Python program because this workflow may not check the
+# repository out (`test_it_pulls_in_no_third_party_actions`), so it cannot import the identical rule
+# from `scripts/ci/report_ci_red.py`. Held in `env:` it is a string these tests can RUN, which is the
+# only way to test the bytes that ship rather than a copy of them beside the file.
+# ---------------------------------------------------------------------------------------------------
+
+
+def _blame(jobs: list[dict[str, object]]) -> str:
+    """Run the SHIPPED attribution rule, read out of the workflow, over a jobs payload."""
+    program = str(_step("attribute-ejection")["env"]["BLAME_PY"])
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", program],
+        input=json.dumps({"jobs": jobs}),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert out.returncode == 0, f"the attribution rule crashed:\n{out.stderr}"
+    return out.stdout.strip()
+
+
+def test_the_ejection_comment_names_the_failing_job_and_step() -> None:
+    """The defect, on the payload shape it was measured against.
+
+    Run 33903044674's own job list: a real leg reddened by its margin watchdog, plus the roll-up that
+    fails alongside it in every red run. Before this change the comment said "CI".
+    """
+    assert (
+        _blame([_REAL_TIMING_GATE_JOB, _REAL_ROLLUP_JOB])
+        == "web console tests (windows-2025, py3.14) / Step margin -- web console suite"
+    )
+
+
+def test_the_ejection_comment_never_names_the_roll_up_when_a_real_leg_failed() -> None:
+    """`CI gate` fails in every red run and its failing step names no leg.
+
+    The roll-up is placed FIRST so a pass cannot be an accident of ordering -- the same guard
+    `tests/test_ci_red_reader.py` puts on the reader's copy of this rule.
+    """
+    assert _blame([_REAL_ROLLUP_JOB, _REAL_TIMING_GATE_JOB]).startswith(
+        "web console tests (windows-2025, py3.14)"
+    )
+
+
+def test_a_roll_up_that_is_the_only_failing_job_is_still_named() -> None:
+    """Suppressing it outright would put the bare label back -- "I could not tell" rendered as
+    "nothing failed", which is the defect this whole signal chain refuses."""
+    assert _blame([_REAL_ROLLUP_JOB]) == "CI gate / Fail -- a gated leg FAILED"
+
+
+def test_a_cancelled_sibling_is_never_named_as_the_cause() -> None:
+    """The merge queue cancels siblings on the way out, so counting one would misattribute every
+    ejection -- the same rule the job's own `if:` applies to the run."""
+    cancelled = {
+        "name": "test (ubuntu-latest, py3.14)",
+        "conclusion": "cancelled",
+        "steps": [{"name": "Tests (pytest)", "conclusion": "cancelled"}],
+    }
+    assert _blame([cancelled]) == ""
+
+
+def test_the_roll_up_the_workflow_refuses_is_the_one_the_reader_refuses() -> None:
+    """Two copies of one rule, so they are compared rather than trusted.
+
+    `scripts/ci/report_ci_red.py` refuses the same job by name. If either moves alone, an ejection
+    comment and the ci-red report disagree about the cause of the same red -- and the one that is
+    wrong is unknowable from either file.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "report_ci_red", Path(__file__).resolve().parents[1] / "scripts" / "ci" / "report_ci_red.py"
+    )
+    assert spec is not None and spec.loader is not None
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+
+    program = str(_step("attribute-ejection")["env"]["BLAME_PY"])
+    for name in reader._ROLLUP_JOBS:
+        assert f'"{name}"' in program or f"'{name}'" in program, (
+            f"report_ci_red.py refuses to name {name!r} as a cause, and the ejection comment's rule "
+            "does not mention it. A roll-up named as the cause tells the reader nothing, and the two "
+            "readers of the same red must not disagree about which job that is."
+        )
+
+
+def test_the_attribution_reads_the_jobs_of_the_run_it_is_commenting_on() -> None:
+    """The fetch itself, and the run id it is keyed on.
+
+    The rule above is only reached if something supplies it a payload. Asserting the rule without
+    asserting the call would pass for a step that computes the right answer from nothing.
+    """
+    env = _step("attribute-ejection").get("env", {})
+    assert "github.event.workflow_run.id" in str(env.get("RUN_ID", "")), (
+        "the attribution step no longer takes the failing run's id from the event, so it cannot ask "
+        "which of that run's jobs failed"
+    )
+    body = _run_block("attribute-ejection")
+    assert "/jobs" in body and "$RUN_ID" in body, (
+        "the attribution step no longer fetches the run's jobs. Without that call the comment is back "
+        "to naming the WORKFLOW, which is the defect #1403 left open."
+    )
+
+
+def test_a_jobs_fetch_that_fails_still_posts_a_comment_and_says_what_is_missing() -> None:
+    """FAIL SOFT, AND SAY SO. An ejection comment is the only record there is, so losing it to a 403
+    or an aged-out run would be worse than the defect being fixed. Degrading to the old
+    workflow-only text is acceptable; degrading SILENTLY is not -- a reader cannot tell "no job
+    failed" from "I could not look".
+    """
+    body = _run_block("attribute-ejection")
+    assert "if gh api" in body, (
+        "the jobs fetch is no longer guarded, so a non-zero exit trips `set -e` and the comment is "
+        "never posted at all"
+    )
+    assert "names the workflow only" in body, (
+        "the degraded path no longer tells the reader the job could not be read, so a comment naming "
+        "only the workflow is indistinguishable from a run in which nothing failed"
     )
