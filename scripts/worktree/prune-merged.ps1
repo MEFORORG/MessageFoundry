@@ -80,11 +80,29 @@
     path-based (the Desktop app's own session tooling only lists what it spawned).
 
     FENCE UNAVAILABLE => NOTHING IS PRUNED, LOUDLY (exit 2). "The fence found nobody" and "the fence
-    could not look" are the same empty answer, so availability is checked explicitly: at least one
-    config root with a session registry, at least one readable record, and NO record that failed to
-    parse (an unparseable record's cwd is unknowable, so it cannot be cleared from any candidate -- and
-    a file caught half-written is precisely what a session that launched a second ago looks like). When
-    it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
+    could not look" are the same empty answer, so availability is checked explicitly.
+    Get-WorktreeOccupancy in scripts/coord/occupancy.ps1 withholds it on five conditions of two
+    DIFFERENT kinds, and a flat list of the five drops the half that matters:
+
+      * IT COULD NOT LOOK -- the -Repo hint resolves to no worktree at all, the session registry throws
+        on read, no config root carries a registry, or not one readable record is in them. Nothing was
+        examined, so nothing can be cleared. The first of those sets RepoFound false too and this
+        script refuses on THAT at its first read, but the re-check before each removal reads Available
+        alone, so it arrives here instead.
+      * IT LOOKED, AND A SESSION IS SOMEWHERE IT CANNOT NAME -- one or more records it did examine can
+        be placed in no worktree. Three shapes qualify: a file that will not parse, a record that
+        parses but carries no cwd, and a record whose cwd is a checkout of THIS repo that `git worktree
+        list` no longer carries. This is the only refusal resting on POSITIVE evidence. A session
+        demonstrably exists, the fence cannot say which tree it is in, so it clears NONE of them -- and
+        the tree it is in could be the one this run is about to delete. A file caught half-written is
+        precisely what a session that launched a second ago looks like, and the third shape is what the
+        incident above LEAVES BEHIND: deregister a worktree out from under its occupant and that
+        session's recorded cwd names a checkout git no longer lists.
+
+    The second kind is tested BEFORE the empty-record count, so a registry holding nothing but
+    unreadable files reports the unplaceable record rather than "not one readable record".
+
+    When it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
     pruning unfenced, and the fence is re-read immediately before each removal so a fence that DIES
     mid-run stops the rest. There is deliberately no override flag.
 
