@@ -203,6 +203,15 @@ def _build(root: Path) -> Fixture:
     _git(fx.primary, "config", "user.name", "t")
     _git(fx.primary, "remote", "add", "origin", str(origin))
     _commit(fx.primary, "seed.txt", "seed")
+    # Committed BEFORE any worktree exists, so every tree inherits it. The venv-reap tests plant a
+    # `.venv` and a `constraints.lock` into a worktree and then assert it is CLEAN -- without this
+    # both show up as untracked and the cleanliness conjunct fails, which would make every
+    # single-variable control in that block a two-variable one.
+    #
+    # `constraints.lock` is IGNORED here where the real repo TRACKS it, deliberately: the script's
+    # predicate is `Test-Path`, so trackedness is not a variable it can see, and ignoring the file
+    # lets a test remove it to fail C2 alone instead of also dirtying the tree.
+    _commit(fx.primary, ".gitignore", ".venv/\nconstraints.lock\nuv.lock\n")
     main_tip = _head(fx.primary)
     _git(fx.primary, "update-ref", "refs/remotes/origin/main", main_tip)
 
@@ -253,6 +262,10 @@ def _build(root: Path) -> Fixture:
     _git(decoy, "init", "-q")
 
     (fx.cfg / "sessions").mkdir(parents=True)
+    # The transcript store the ownership conjunct reads. Present and EMPTY by default, because an
+    # ABSENT store is a different state with a different verdict -- the pass refuses outright rather
+    # than clearing anybody -- and a fixture that conflated the two would hide that.
+    (fx.cfg / "projects").mkdir(parents=True)
     return fx
 
 
@@ -989,7 +1002,10 @@ def test_activity_veto_fires_then_releases(fx: Fixture, sleeper: int) -> None:
     _backdate(fx.primary, fx.sibling("clean"), hours=100)
     d = by_leaf(run(fx), "clean")
     assert d["Decision"] == "PRUNE"
-    assert d["ActivityAgeHours"] > 36
+    # Past the DEFAULT window, which is 72h since the 36h one was measured with 1.6h of margin on
+    # two occupied worktrees. Pinning the literal keeps this asserting "outside the default" rather
+    # than "outside some number that used to be the default".
+    assert d["ActivityAgeHours"] > 72
 
 
 def test_name_overrides_activity_but_never_occupancy_or_a_lock(fx: Fixture, sleeper: int) -> None:
@@ -2101,3 +2117,476 @@ def test_a_worktree_holding_a_coordination_claim_is_never_reported(
         "a worktree holding a coordination claim was suggested for removal"
     )
     assert after["counts"]["reportOnlyHeld"] > before["counts"]["reportOnlyHeld"]
+
+
+# --------------------------------------------------------------------------------------------------
+# -ReapVenvs: the REPORT-ONLY venv pass
+#
+# A `.venv` is rebuildable state and a worktree is not, so the two have different blast radii. The
+# script fences the cheaper loss with the ENTIRE worktree conjunction plus two more (C2 rebuildable,
+# C9 unowned) and provides NO deletion path at all -- these tests are the guard on both halves.
+#
+# EVERY CONJUNCT GETS A PLANTED CANDIDATE THAT SATISFIES ALL THE OTHERS AND IS STOPPED ONLY BY IT.
+# A row that fails two conjuncts proves nothing about either: the verdict would survive deleting the
+# one under test. ``_plant_venv_tree`` exists to make the single-variable shape the default, and
+# every test below carries ``reap-aa11bb`` as a POSITIVE CONTROL in the SAME invocation -- without
+# it, a run that refused for an unrelated reason satisfies every "was not reapable" assertion for
+# free.
+# --------------------------------------------------------------------------------------------------
+
+_VENV_CFG_BYTES = 4096
+_VENV_PKG_BYTES = 1024
+# What a correctly-walked `.venv` weighs in these fixtures: the top-level file plus one nested two
+# directories down, so a size walk that forgot -Recurse reports 4096 and fails rather than passing.
+_VENV_TOTAL_BYTES = _VENV_CFG_BYTES + _VENV_PKG_BYTES
+
+
+def _plant_venv_tree(
+    fx: Fixture,
+    slug: str,
+    *,
+    lock_name: str | None = "constraints.lock",
+    idle_hours: float = 500.0,
+    transcript_hours: float | None = 500.0,
+    project_dir: str | None = None,
+    with_venv: bool = True,
+) -> Path:
+    """A nested worktree carrying a venv that satisfies every conjunct, unless told otherwise.
+
+    NESTED under the primary, at ``.claude/worktrees/<slug>``, for two reasons. It is the population
+    the venv pass reaches and ``-Apply`` never will, so planting here exercises that reach. And it
+    leaves the sibling decision table -- which several other tests assert exactly -- untouched.
+
+    The branch is cut from the primary's HEAD, which IS ``origin/main`` in this fixture, so C8 passes
+    by construction ("never used: 0 commits"). ``idle_hours`` backdates the private git metadata for
+    C7; ``transcript_hours`` writes and backdates a ``*.jsonl`` for C9. ``transcript_hours=None``
+    writes no transcript at all, which is C9's "found nothing" arm rather than a fresh one.
+    """
+    path = fx.primary / ".claude" / "worktrees" / slug
+    _add_worktree(fx.primary, path, slug)
+
+    if with_venv:
+        venv = path / ".venv"
+        (venv / "Lib" / "site-packages").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_bytes(b"c" * _VENV_CFG_BYTES)
+        (venv / "Lib" / "site-packages" / "mod.py").write_bytes(b"m" * _VENV_PKG_BYTES)
+    if lock_name:
+        (path / lock_name).write_text("pinned==1.0\n", encoding="utf-8")
+
+    if transcript_hours is not None:
+        # A project directory's name is the session's encoded cwd, and the script globs it as
+        # `*<id>*` -- so the slug's own six-hex token is what has to appear in it.
+        d = fx.cfg / "projects" / (project_dir or f"C--fixture-worktrees-{slug}")
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "1c0ffee0-0000-4000-8000-000000000001.jsonl"
+        f.write_text('{"type":"user"}\n', encoding="utf-8")
+        when = time.time() - transcript_hours * 3600
+        os.utime(f, (when, when))
+
+    # LAST: `worktree add` and the writes above both move the metadata this backdates.
+    _backdate(fx.primary, path, hours=idle_hours)
+    return path
+
+
+def venv_row(res: dict[str, Any], slug: str) -> dict[str, Any]:
+    reap = res["venvReap"]
+    assert reap is not None, "-ReapVenvs produced no venvReap object at all"
+    assert reap["ran"], f"the venv pass did not run: {reap['cannotRun']}"
+    hits: list[dict[str, Any]] = [r for r in reap["rows"] if r["leaf"] == slug]
+    assert hits, f"{slug} was not a venv candidate; got {[r['leaf'] for r in reap['rows']]}"
+    return hits[0]
+
+
+def assert_control_is_reapable(res: dict[str, Any]) -> None:
+    """The positive control, asserted in every SKIP test in this block."""
+    ctl = venv_row(res, "reap-aa11bb")
+    assert ctl["verdict"] == "REAPABLE", (
+        f"the control was not reapable ({ctl['stoppedBy']}: {ctl['stoppedDetail']}), so this "
+        "invocation could not have cleared anything and the SKIP under test proves nothing"
+    )
+
+
+def plant_control(fx: Fixture) -> Path:
+    return _plant_venv_tree(fx, "reap-aa11bb")
+
+
+def only_failing(row: dict[str, Any]) -> list[str]:
+    return [c["id"] for c in row["conjuncts"] if c["verdict"] == "FAIL"]
+
+
+def test_a_venv_satisfying_every_conjunct_is_reported_reapable(fx: Fixture, sleeper: int) -> None:
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "reap-aa11bb")
+    assert row["verdict"] == "REAPABLE"
+    assert row["stoppedBy"] == ""
+    # Every conjunct's verdict, not only the failures: a row reporting just what said no cannot be
+    # told from one where the rest were never asked.
+    assert [c["id"] for c in row["conjuncts"]] == [f"C{n}" for n in range(1, 10)]
+    assert {c["verdict"] for c in row["conjuncts"]} == {"PASS"}
+    assert row["bytes"] == _VENV_TOTAL_BYTES
+    assert res["venvReap"]["reapableBytes"] == _VENV_TOTAL_BYTES
+    assert res["venvReap"]["reapable"] == 1
+
+
+def test_c1_a_worktree_without_a_venv_is_not_a_candidate(fx: Fixture, sleeper: int) -> None:
+    """C1 is the population gate, so its failure is ABSENCE from the table, not a SKIP row."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "novenv-bb22cc", with_venv=False)
+
+    res = run(fx, "-ReapVenvs")
+    assert "novenv-bb22cc" not in {r["leaf"] for r in res["venvReap"]["rows"]}
+    assert_control_is_reapable(res)
+
+
+def test_c2_uv_lock_is_not_constraints_lock(fx: Fixture, sleeper: int) -> None:
+    """The rebuild predicate is `constraints.lock`, which is what new.ps1 installs from.
+
+    `uv.lock` sits right beside it, is also a real lockfile, and is read by no install in this repo.
+    A predicate on it is green here and measures something else -- so this plants `uv.lock` ALONE
+    and requires the tree to be held.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "uvonly-cc33dd", lock_name="uv.lock")
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "uvonly-cc33dd")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C2 rebuildable"
+    assert "constraints.lock" in row["stoppedDetail"]
+    assert only_failing(row) == ["C2"], (
+        "C2 must be the ONLY failing conjunct, or deleting it would not change this verdict"
+    )
+    assert_control_is_reapable(res)
+
+
+def test_c3_an_unavailable_fence_stops_the_whole_pass(fx: Fixture) -> None:
+    """No session record at all: the fence could not look, so nothing may be cleared.
+
+    No positive control is possible here, by design -- the refusal is run-wide. The decision, the
+    reason and the exit code are asserted instead.
+    """
+    plant_control(fx)
+    res = run(fx, "-ReapVenvs")
+    assert res["venvReap"]["ran"] is False
+    assert any(c.startswith("C3") for c in res["venvReap"]["cannotRun"])
+    assert res["venvReap"]["rows"] == []
+    assert res["_exit"] == 2, "a reading that could not be taken must not exit green"
+
+
+def test_c4_a_git_locked_worktree_is_held(fx: Fixture, sleeper: int) -> None:
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "locked-dd44ee")
+    _git(fx.primary, "worktree", "lock", "--reason", "in use by a bench run", str(victim))
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "locked-dd44ee")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C4 unlocked"
+    assert "in use by a bench run" in row["stoppedDetail"]
+    assert only_failing(row) == ["C4"]
+    assert_control_is_reapable(res)
+
+
+def test_c5_a_live_session_in_the_tree_holds_its_venv(fx: Fixture, sleeper: int) -> None:
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "busy-ee55ff")
+    live_record(fx, sleeper, victim, "beef0001-1111")
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "busy-ee55ff")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C5 unoccupied"
+    # LIVE explicitly. A STALE record would also produce a SKIP, under some other conjunct, and this
+    # test would then be green while proving nothing about the fence.
+    assert "[LIVE]" in row["stoppedDetail"]
+    assert only_failing(row) == ["C5"]
+    assert_control_is_reapable(res)
+
+
+def test_c6_an_untracked_file_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "messy-ff6600")
+    (victim / "brand_new_module.py").write_text("# never committed anywhere\n", encoding="utf-8")
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "messy-ff6600")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C6 clean"
+    assert "untracked" in row["stoppedDetail"]
+    assert only_failing(row) == ["C6"]
+    assert_control_is_reapable(res)
+
+
+def test_c7_recent_git_metadata_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    # Not backdated: `worktree add` stamped its metadata seconds ago.
+    _plant_venv_tree(fx, "fresh-006611", idle_hours=0.0)
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "fresh-006611")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C7 idle"
+    assert "inside the 72 h window" in row["stoppedDetail"]
+    assert only_failing(row) == ["C7"]
+    assert_control_is_reapable(res)
+
+
+def test_c8_an_unmerged_branch_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "ahead-117722")
+    _commit(victim, "ahead.txt", "unique work")
+    _backdate(fx.primary, victim, hours=500.0)  # the commit re-stamped the metadata C7 reads
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "ahead-117722")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C8 merged"
+    assert "no merge signal" in row["stoppedDetail"]
+    assert only_failing(row) == ["C8"]
+    assert_control_is_reapable(res)
+
+
+def test_c9_a_recent_transcript_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    """The measured case: nine idle venvs of about 8.0 GB whose owner wrote 4.4h before the sweep.
+
+    Every other conjunct clears this tree. C7 cannot see the owner at all -- that session was
+    writing from somewhere else -- so without C9 the venv reads as abandoned.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "owned-228833", transcript_hours=4.4)
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "owned-228833")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C9 unowned"
+    assert "wrote a transcript 4.4" in row["stoppedDetail"]
+    assert only_failing(row) == ["C9"]
+    assert row["sessionIds"] == ["228833"]
+    assert_control_is_reapable(res)
+
+
+def test_c9_no_transcript_found_is_a_skip_not_a_clearance(fx: Fixture, sleeper: int) -> None:
+    """Absence of a transcript is not proof of death, so it must hold the venv, not release it."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "silent-339944", transcript_hours=None)
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "silent-339944")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C9 unowned"
+    assert "no transcript found is not proof the session is gone" in row["stoppedDetail"]
+    # The denominators travel with the verdict, so a reader can see the search really ran.
+    assert "matched 0 of" in row["stoppedDetail"]
+    assert only_failing(row) == ["C9"]
+    assert_control_is_reapable(res)
+
+
+def test_c9_no_session_id_in_the_name_is_a_skip_too(fx: Fixture, sleeper: int) -> None:
+    """`agent-a050617fac2865a9d` carries no six-hex token, so its owner is UNKNOWN.
+
+    Unknown is not absent. This is the second of C9's two empty answers and it has to SKIP as
+    firmly as the first, because an unparsed name is a fence that could not look at all.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "agent-a050617fac2865a9d", transcript_hours=None)
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "agent-a050617fac2865a9d")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C9 unowned"
+    assert "no session id could be parsed" in row["stoppedDetail"]
+    assert row["sessionIds"] == []
+    assert only_failing(row) == ["C9"]
+    assert_control_is_reapable(res)
+
+
+def test_c9_an_absent_transcript_store_refuses_the_whole_pass(fx: Fixture, sleeper: int) -> None:
+    """No projects/ directory anywhere: C9 can never clear anybody, so nothing may be reported."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    shutil.rmtree(fx.cfg / "projects")
+
+    res = run(fx, "-ReapVenvs")
+    assert res["venvReap"]["ran"] is False
+    assert any("projects/" in c for c in res["venvReap"]["cannotRun"])
+    assert res["venvReap"]["rows"] == []
+    assert res["_exit"] == 2
+
+
+def test_a_refused_venv_pass_that_removed_a_worktree_is_FAILED_not_REFUSED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Exit 2 is this script's own "nothing was attempted", so a run that pruned must not claim it.
+
+    The venv pass computes its verdict BEFORE the apply loop and used to set the refusal code from
+    there -- where ``$removed`` does not exist yet, so the guard the ``-Name`` path has always
+    carried could not be applied. ``-ReapVenvs -Apply`` could therefore remove worktrees and still
+    exit 2, which is the code an automated caller reads as "safe, nothing happened".
+
+    THE REFUSAL CAUSE IS C9's ABSENT TRANSCRIPT STORE, NOT ``-IdleHours 0``. The fence stays
+    available and the activity window stays armed, so the removing half and the refusing half move
+    independently; one flag doing both jobs would make this a single-variable test of nothing.
+
+    THE CONTROL IS ``test_c9_an_absent_transcript_store_refuses_the_whole_pass`` -- the same refusal
+    on a dry run, still exiting 2. So a 1 here comes from the removals, not from the refusal having
+    quietly stopped happening.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    shutil.rmtree(fx.cfg / "projects")
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    res = run(fx, "-Apply", "-ReapVenvs")
+
+    # Both halves, asserted in the SAME run. Either one alone says nothing about the join.
+    assert res["venvReap"]["ran"] is False, "the venv pass was supposed to refuse"
+    assert any("projects/" in c for c in res["venvReap"]["cannotRun"])
+    assert res["counts"]["removed"] == 2, "nothing was removed, so exit 2 would have been honest"
+    assert not fx.sibling("clean").exists()
+
+    assert res["_exit"] == 1, (
+        f"removed {res['counts']['removed']} worktree(s) and reported exit {res['_exit']}; "
+        "2 is documented as REFUSED -- nothing was attempted"
+    )
+
+
+def test_the_venv_refusal_is_explained_on_the_run_that_reports_FAILED(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The human surface is a separate surface and can go silent on its own.
+
+    The line naming the venv refusal used to be nested under "if the code is 2", which is exactly
+    the branch the guard above takes the run out of. An operator would then read ``Done. removed 2``
+    in red with nothing anywhere saying which half of the run went wrong.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    shutil.rmtree(fx.cfg / "projects")
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    proc = run_text(fx, "-Apply", "-ReapVenvs")
+    assert proc.returncode == 1
+    assert "Done. removed 2" in proc.stdout
+    assert "VENV REAP COULD NOT RUN" in proc.stdout
+    assert "Exit 1: -ReapVenvs was asked for and could not answer" in proc.stdout
+
+
+def test_idle_hours_zero_refuses_the_venv_pass(fx: Fixture, sleeper: int) -> None:
+    """-IdleHours 0 empties BOTH idle windows, and an empty C9 window clears every tree.
+
+    That is an inverted guard, not a narrowed one -- "older than 0 hours ago" is true of every
+    transcript ever written -- so it refuses instead of merely declaring reduced assurance.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+
+    res = run(fx, "-ReapVenvs", "-IdleHours", "0")
+    assert res["venvReap"]["ran"] is False
+    assert any("C7/C9" in c for c in res["venvReap"]["cannotRun"])
+    assert res["_exit"] == 2
+
+
+def test_nothing_reapable_and_could_not_run_do_not_print_the_same_thing(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The whole point of the receipt. Both produce an empty list; they must not read alike."""
+    live_record(fx, sleeper, fx.primary)
+    _plant_venv_tree(fx, "fresh-4a4a4a", idle_hours=0.0)  # a candidate, held by C7
+
+    ran = run_text(fx, "-ReapVenvs").stdout
+    assert "0 of 1 venv(s) reapable" in ran
+    assert "COULD NOT RUN" not in ran
+
+    shutil.rmtree(fx.cfg / "projects")
+    refused = run_text(fx, "-ReapVenvs").stdout
+    assert "VENV REAP COULD NOT RUN" in refused
+    assert "This is NOT 'nothing is reapable'" in refused
+    assert "venv(s) reapable" not in refused
+
+
+def test_every_count_the_receipt_prints_carries_its_denominator(fx: Fixture, sleeper: int) -> None:
+    """A bare zero cannot be told from a detector that never fired.
+
+    The measured case this exists for: "462 of 462 process module lists read, 0 unreadable" did not
+    survive re-measurement, which found 464 processes, 222 readable and 242 unreadable.
+    """
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "fresh-5b5b5b", idle_hours=0.0)
+
+    reap = run(fx, "-ReapVenvs")["venvReap"]
+    # A numerator and a denominator for every population the pass inspects.
+    assert reap["venvsFound"] == 2
+    assert reap["worktreesExamined"] < reap["worktreesTotal"]  # the primary is never examined
+    assert reap["reapable"] + reap["skipped"] == reap["venvsFound"]
+    assert reap["configRootsWithProjects"] == 1
+    assert reap["configRootsSeen"] == 1
+    assert reap["configRootsUnreadable"] == 0
+    assert len(reap["configRootsRead"]) == reap["configRootsWithProjects"]
+    assert reap["projectDirsScanned"] >= 1
+    assert reap["sizeWalkFaults"] == 0
+    assert "SKIP" in reap["failsClosedToward"]
+
+    text = run_text(fx, "-ReapVenvs").stdout
+    assert "of 1 config root(s)" in text
+    assert "1 of 2 venv(s) reapable" in text
+    assert "1 of 2 skipped" in text
+    assert "registered worktree(s)" in text
+
+
+def test_the_receipt_names_the_conjunct_that_stopped_each_skip(fx: Fixture, sleeper: int) -> None:
+    """A SKIP that does not say which conjunct stopped it is not actionable."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    _plant_venv_tree(fx, "uvonly-6c6c6c", lock_name="uv.lock")
+
+    text = run_text(fx, "-ReapVenvs").stdout
+    assert "SKIP - C2 rebuildable:" in text
+    assert "stopped by C2 rebuildable: 1" in text
+    assert "REAPABLE" in text
+
+
+def test_there_is_no_venv_deletion_path_anywhere_in_the_script(fx: Fixture, sleeper: int) -> None:
+    """-ReapVenvs deletes nothing, and -Apply does not change that.
+
+    Asserted on the DISK, not on the report: a report saying REAPABLE beside a venv that is gone
+    would be the exact defect this guard exists to make impossible. -Apply is included because the
+    switch must not become destructive by being combined with the destructive one.
+    """
+    live_record(fx, sleeper, fx.primary)
+    venv = plant_control(fx) / ".venv"
+
+    res = run(fx, "-ReapVenvs", "-Apply")
+    assert venv_row(res, "reap-aa11bb")["verdict"] == "REAPABLE"
+    assert (venv / "pyvenv.cfg").exists(), "-ReapVenvs -Apply deleted a venv it only reported"
+    assert (venv / "Lib" / "site-packages" / "mod.py").exists()
+
+    # And the source carries no call that could. `Remove-Item` appears in this script for the orphan
+    # ledger and for coordination claims; neither may ever be pointed at a venv path.
+    src = SCRIPT.read_text(encoding="utf-8")
+    for line in src.splitlines():
+        if "Remove-Item" in line or "worktree remove" in line:
+            assert ".venv" not in line and "VenvPath" not in line, (
+                f"a removal call names a venv path: {line.strip()}"
+            )
+
+
+def test_venv_reap_is_null_when_it_was_not_asked_for(fx: Fixture, sleeper: int) -> None:
+    """`null` is "not requested"; an object with `ran: false` is "requested and refused"."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    assert run(fx)["venvReap"] is None
