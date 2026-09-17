@@ -210,7 +210,10 @@ run ships first and is meant to run for a week before anything destructive is wr
 A venv is reported **reapable** only when nine conjuncts hold. `C1` venv-present, `C2` rebuildable
 (`constraints.lock` — **not** `uv.lock`, which sits beside it, is also a real lockfile, and is read
 by no install here), `C3` fence-available, `C4` unlocked, `C5` unoccupied, `C6` clean, `C7` idle,
-`C8` merged, `C9` **unowned**. `C1`–`C8` are the worktree rule above, reused rather than re-derived.
+`C8` merged, `C9` **unowned**. `C1`–`C8` are the worktree rule above, reused rather than re-derived —
+with one deliberate drop, recorded here because nothing else records it: the worktree pass also
+vetoes a tree that *contains* another registered worktree, and the venv pass does not, because
+removing a parent orphans its children and deleting only `.venv` cannot.
 
 `C9` is new and it is the one the other eight miss. The owning session id is the six-hex token a
 Claude-managed slug carries; the conjunct looks for `<config-root>/projects/*<id>*/*.jsonl` across
@@ -224,8 +227,9 @@ where most of the bytes are. That is safe **only** because it removes nothing; a
 have to answer the population question again from scratch.
 
 Every count it prints carries its denominator, and "nobody was reapable" and "the check could not
-run" print different things — the second refuses the whole pass and exits **2**, because an empty
-list from a check that could not look is not a clean result.
+run" print different things — the second refuses the whole pass, because an empty list from a check
+that could not look is not a clean result. That refusal exits **2**, or **1** when the same run also
+removed a worktree — a refusal code must never read as a run that did nothing.
 
 ### The rule is `merged AND clean AND NOT occupied`
 
@@ -322,11 +326,21 @@ the directory is gone or re-registered — as is any unregistered `<repo>-*` dir
 pointer still names this repo.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — nothing was attempted because safety could not be
-established (wrong cwd, unavailable fence, a `-Name` that matched nothing); `3` **orphaned** — a
-directory is broken on disk right now. `3` outranks `2` because damage on disk outranks a refusal to
-act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
-spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
+without destroying anything; `2` **refused** — something you asked for was not attempted, because
+safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
+is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
+skipped` covers every candidate exactly once.
+
+**`2` is per-request, not per-run, and its causes are not a closed list.** The line above read
+*"nothing was attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*, and both
+halves were wrong. The enumeration went stale silently: `-ReapVenvs` added four refusal causes of its
+own — the fence down, transcript roots unreadable, no config root carrying a `projects/` directory,
+and `-IdleHours 0` emptying both idle windows — and this list did not move. The universal is false on
+its own terms too: a fence that dies **part way through** the apply loop sets `2` over removals that
+already landed. `-Name` and `-ReapVenvs` both report `1` instead once something has been removed; the
+mid-run fence death does not. Read `2` as "some request of yours was refused", and read
+`counts.removed` for what the run did.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the

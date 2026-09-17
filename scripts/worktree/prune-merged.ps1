@@ -117,10 +117,19 @@
     repo's worktree admin area while git no longer lists it is reported the same way, ledger or not.
 
     EXIT CODES, highest severity wins: 0 nothing wrong; 1 something was attempted and failed without
-    destroying anything; 2 REFUSED -- nothing was attempted because safety could not be established
-    (bad cwd, unavailable fence, a -Name that matched nothing); 3 ORPHANED -- a directory is broken on
-    disk right now and needs the recovery recipe. 3 outranks 2 because damage on disk outranks a
-    refusal to act.
+    destroying anything; 2 REFUSED -- something you asked for was not attempted, because safety could
+    not be established; 3 ORPHANED -- a directory is broken on disk right now and needs the recovery
+    recipe. 3 outranks 2 because damage on disk outranks a refusal to act.
+
+    2 IS PER-REQUEST, NOT PER-RUN, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing
+    was attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)", and both halves
+    were wrong. The enumeration went stale silently: -ReapVenvs added four refusal causes of its own
+    -- the fence down, transcript roots unreadable, no config root carrying a projects/ directory,
+    and -IdleHours 0 emptying both idle windows -- and this list did not move. The universal is false
+    on its own terms too: a fence that dies PART WAY through the apply loop sets 2 over removals that
+    already landed. -Name and -ReapVenvs both report 1 instead once something has been removed; the
+    mid-run fence death does not. So read 2 as "some request of yours was refused", and read the
+    removed / failed counts for what the run did.
 
     A BRANCH IS NEVER FORCE-DELETED ON A STALE VERDICT. `git branch -d` refuses a branch merged only
     into origin/main when the local main lags, so `-D` used to be the ROUTINE path and git's last
@@ -211,7 +220,9 @@ param(
     [switch]$Json,
     # ALSO report which `.venv` directories are reapable. REPORT ONLY -- this switch has no
     # destructive path anywhere in this script, and adding one needs the week of dry-run evidence the
-    # header describes, not an -Apply. It prints a receipt and returns.
+    # header describes, not an -Apply. It adds a receipt to the report and does NOT return: the run
+    # CONTINUES past the pass, so `-ReapVenvs -Apply` still prunes worktrees. That is why the suite
+    # covers the combination, and why the refusal exit code is decided after the apply loop.
     [switch]$ReapVenvs,
     # Repo to operate on. Defaults to this script's own checkout; tests point it at a fixture so the
     # real logic is what gets exercised.
@@ -253,7 +264,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $EXIT_OK = 0
 $EXIT_FAILED = 1   # something was attempted and did not fully succeed
-$EXIT_REFUSED = 2  # nothing was attempted, because safety could not be established
+# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR. It does not
+# promise the run removed nothing -- the header's exit-code paragraph names the case where it did.
+$EXIT_REFUSED = 2
 $EXIT_ORPHANED = 3 # a directory is broken on disk right now (this run, or one before it)
 
 # The MOST SEVERE outcome decides the code, and severity is the numeric order above. A run that
@@ -1222,9 +1235,9 @@ if ($ReapVenvs) {
     # why without noticing: "same standing as a -Name that matched nothing". The -Name path reports
     # FAILED rather than REFUSED once a removal has happened, and it can only do that because it runs
     # AFTER the apply loop. This block runs before it, where $removed does not exist yet, so setting
-    # REFUSED from here let `-ReapVenvs -Apply` remove worktrees and still exit 2 -- which this
-    # script's own header defines as "nothing was attempted". Set beside the -Name guard instead;
-    # search for `$venvReap.ran`.
+    # REFUSED from here let `-ReapVenvs -Apply` remove worktrees and still exit 2, which the header
+    # then defined as "nothing was attempted". Set beside the -Name guard instead; search for
+    # `$venvReap.ran`.
 }
 
 # -Name is the loudest thing an operator can do to the fence: it is -IdleHours 0 scoped to one tree,
