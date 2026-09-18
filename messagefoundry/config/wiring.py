@@ -284,6 +284,52 @@ _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
 _ENVREF_KEYS = frozenset({"env", "default", "cast"})
 
 
+def _is_env_marker(value: Any) -> bool:
+    """Is ``value`` a ``connections.toml`` env-ref inline table -- ``{env = "k", default = "..."}``?
+
+    Factored out of :func:`parse_env_setting` so the nested-reference refusals test the SAME predicate
+    the decoder does. The two used to be one expression in one place; once a second caller needed it
+    (:func:`_reject_envref_headers`), a copy would have been free to drift, and a drifted copy fails
+    open -- it stops recognizing a marker the decoder still recognizes, and the refusal goes quiet."""
+    return isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS
+
+
+def _reject_envref_headers(factory: str, headers: Mapping[str, Any] | None) -> None:
+    """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
+
+    Nested settings are NOT env-resolved: :func:`resolve_env_settings` walks only the TOP level, which
+    is the same ruling :func:`_hoist_body_secrets` and :func:`_reject_envref_odbc_params` are built on.
+    So an ``env()`` inside ``headers`` reaches the connector unresolved and every ``_build_headers``
+    does ``str(v)`` on it -- putting the reference's ``repr``, ``default=`` and all, on the wire to the
+    partner. Fail loud at authoring instead, pointing at the typed credential fields, which ARE
+    env-resolved and secret-redacted.
+
+    TWO value shapes reach here and BOTH have to be refused. Code-first authoring gives an
+    :class:`EnvRef` instance. ``connections.toml`` gives a RAW ``{"env": ..., "default": ...}`` dict,
+    because :func:`parse_env_setting` decodes only top-level values and does not descend into a nested
+    table -- so an ``isinstance(..., EnvRef)`` test alone would refuse the code-first surface while the
+    TOML one still shipped the default to the partner. Measured on ``Rest`` before this guard existed:
+    ``{'env': 'acme_key', 'default': 'FALLBACK-SECRET'}`` arrived as the header value, stringified.
+
+    This refuses rather than resolves, which is the row's other option. Recursive resolution would have
+    to reach into every nested settings shape and would undercut the top-level-only ruling the two
+    functions named above already depend on."""
+    if not headers:
+        return
+    offenders = sorted(
+        str(name)
+        for name, value in headers.items()
+        if isinstance(value, EnvRef) or _is_env_marker(value)
+    )
+    if offenders:
+        raise WiringError(
+            f"{factory} headers may not use env() ({', '.join(offenders)}) - nested settings are not "
+            "env-resolved, so the reference reaches the partner as its repr with any default= inside "
+            "it. Put a credential in the top-level bearer_token / basic_user / basic_password fields "
+            "(env-resolved and secret-redacted); headers carries only static, non-secret values."
+        )
+
+
 def parse_env_setting(value: Any) -> Any:
     """Decode one ``connections.toml`` settings value into a literal or an :class:`EnvRef` (ADR 0007).
 
@@ -292,7 +338,7 @@ def parse_env_setting(value: Any) -> Any:
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
     returned verbatim. Raises :class:`WiringError` on a malformed env marker or an unknown cast name."""
-    if not (isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS):
+    if not _is_env_marker(value):
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
@@ -607,6 +653,7 @@ def FhirLookup(
     ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
     loud at load."""
+    _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
@@ -2074,6 +2121,7 @@ def Rest(
     default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
     Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
+    _reject_envref_headers("Rest", headers)
     return ConnectionSpec(
         ConnectorType.REST,
         {
@@ -2156,6 +2204,7 @@ def FHIR(
     and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
+    _reject_envref_headers("FHIR", headers)
     return ConnectionSpec(
         ConnectorType.FHIR,
         {
@@ -2482,6 +2531,7 @@ def DICOMweb(
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
+    _reject_envref_headers("DICOMweb", headers)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
         {
@@ -2847,6 +2897,7 @@ def Soap(
     use ``ws_security`` (above) and this is unnecessary. The
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
     WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
+    _reject_envref_headers("Soap", headers)
     return ConnectionSpec(
         ConnectorType.SOAP,
         {

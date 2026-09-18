@@ -633,12 +633,21 @@ def test_an_env_ref_inside_a_headers_table_does_not_disclose_its_default() -> No
     default is now dropped for EVERY header rather than only credential-shaped ones: a header value
     sourced from `env()` is a credential by intent, and the name heuristic is precisely the gate that
     failed here.
+
+    THE SETTINGS DICT IS BUILT DIRECTLY, NOT THROUGH `Rest()` (BACKLOG #1649). The factory now REFUSES
+    an `env()` ref inside `headers` outright, because a nested ref is never env-resolved and reaches
+    the partner as its repr. That refusal does not retire this assertion -- it is about the DISPLAY
+    redactor, which sees settings from more places than one factory call (a hand-built `ConnectionSpec`,
+    a stored graph, a settings map built before the refusal existed), and it must keep dropping the
+    default wherever the value came from. Constructing the value here rather than through the guarded
+    door keeps that property pinned. The refusal itself is pinned separately, in
+    `tests/test_nested_env_ref_headers_refusal.py`.
     """
-    spec = messagefoundry.Rest(
-        url="https://example.invalid/x",
-        headers={"X-Vendor-Thing": messagefoundry.env("acme_key", default=SENTINEL)},
-    )
-    got = redacted_settings(dict(spec.settings))["headers"]["X-Vendor-Thing"]
+    # The shape `Rest()` emits, with the nested ref put in afterwards -- past the factory guard, which
+    # is a different control with its own test.
+    settings = dict(messagefoundry.Rest(url="https://example.invalid/x").settings)
+    settings["headers"] = {"X-Vendor-Thing": messagefoundry.env("acme_key", default=SENTINEL)}
+    got = redacted_settings(settings)["headers"]["X-Vendor-Thing"]
     assert got == {"env": "acme_key"}, got
     assert SENTINEL not in str(got)
 
