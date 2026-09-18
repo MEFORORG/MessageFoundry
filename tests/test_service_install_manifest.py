@@ -939,3 +939,145 @@ def test_the_smoke_leg_reads_the_dacl_it_produced() -> None:
             f"the smoke DACL check must look for {needle!r}: on an English runner icacls prints "
             "the NAME and a SID-only grep returns a false clean"
         )
+
+
+# --- the run-as account and the ACLs must agree on EVERY path (BACKLOG #1553) ---------------------
+# -AllowLocalSystem on a RERUN left the previous account configured (ObjectName was written only on the
+# non-LocalSystem branch) and then stripped that still-running account's access to the data dir. The
+# config dir goes the same way, and losing READ there makes SEC-003 source-trust refuse to load config
+# at all -- three ACL sites, not the one the row names.
+#
+# The fix is an ORDERING-FREE one: write ObjectName unconditionally, so the assumption about what NSSM
+# defaults to at create time stops mattering. The guards are therefore about which branches write it.
+
+_ACL_CALLS = ["Set-SecureDataDirAcl", "Set-SecureConfigAcl", "Set-ConfigReadAcl"]
+
+
+def _objectname_calls(facts: dict) -> list[dict]:
+    return [
+        c for c in facts["commands"] if c["name"] == "Invoke-Nssm" and "ObjectName" in c["text"]
+    ]
+
+
+def test_objectname_is_written_on_every_run_as_branch(tmp_path: Path) -> None:
+    """Three branches set the run-as account -- password, password-less, and the LocalSystem opt-out
+    -- and all three must write ObjectName.
+
+    The opt-out used to write nothing, on the reasoning that NSSM defaults to LocalSystem. That is
+    true of a FRESH install only; on a rerun it leaves whatever account is already registered.
+    """
+    facts = _preflight_facts(tmp_path)
+    calls = _objectname_calls(facts)
+    assert len(calls) == 3, (
+        "expected ObjectName to be set on all three run-as branches (password, password-less, "
+        f"LocalSystem opt-out); found {len(calls)}:\n"
+        + "\n".join(f"  line {c['line']}: {c['text']}" for c in calls)
+    )
+
+
+def test_the_localsystem_optout_writes_objectname_rather_than_leaving_it(tmp_path: Path) -> None:
+    """Locate the opt-out branch, then prove a real ObjectName CALL sits inside its offsets.
+
+    A call counted anywhere in the file is not the question; the question is whether the branch a
+    rerun with -AllowLocalSystem actually takes writes it.
+
+    MATCHED ON COMMANDS, NOT ON THE BRANCH TEXT. An extent includes its comments, and the comment
+    explaining why ObjectName is written here contains the word "ObjectName" -- so a substring test
+    over the branch text passes on a branch whose call has been deleted. Measured: it did.
+    """
+    assert _SCRIPT is not None
+    body = """
+  $ifs = @(foreach ($i in $ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.IfStatementAst] }, $true)) {
+    $else = $i.ElseClause
+    [pscustomobject]@{
+      cond      = $i.Clauses[0].Item1.Extent.Text
+      elseStart = $(if ($else) { $else.Extent.StartOffset } else { -1 })
+      elseEnd   = $(if ($else) { $else.Extent.EndOffset } else { -1 })
+      elseText  = $(if ($else) { $else.Extent.Text } else { '' })
+    }
+  })
+  @($ifs) | ConvertTo-Json -Depth 4 -Compress
+"""
+    blocks = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    optout = [b for b in blocks if "Service will run as LocalSystem" in (b["elseText"] or "")]
+    assert len(optout) == 1, (
+        "could not locate the -AllowLocalSystem opt-out branch by its warning text; found "
+        f"{len(optout)} candidates"
+    )
+    facts = _preflight_facts(tmp_path)
+    inside = [
+        c
+        for c in _objectname_calls(facts)
+        if optout[0]["elseStart"] <= c["start"] < optout[0]["elseEnd"]
+    ]
+    assert inside, (
+        "the -AllowLocalSystem branch does not CALL nssm to set ObjectName, so a rerun over a "
+        "service already registered with another account leaves THAT account configured while the "
+        "ACL block below strips its access (BACKLOG #1553)"
+    )
+    assert any("$RunAsObjectName" in c["text"] for c in inside), (
+        "the opt-out branch must write the derived run-as value, not a literal: "
+        f"{[c['text'] for c in inside]}"
+    )
+
+
+def test_the_acl_calls_never_receive_the_literal_localsystem(tmp_path: Path) -> None:
+    """The nssm ObjectName value and the account needing an explicit ACL grant are DIFFERENT values.
+
+    Set-SecureDataDirAcl already grants ``*S-1-5-18``, which IS LocalSystem; adding a named
+    "LocalSystem" grant is redundant and can make icacls exit non-zero. Passing $RunAsObjectName to
+    an ACL call is the collapse this guards against.
+    """
+    facts = _preflight_facts(tmp_path)
+    for fn in _ACL_CALLS:
+        for call in [c for c in facts["commands"] if c["name"] == fn]:
+            assert "LocalSystem" not in call["text"], (
+                f"{fn} is being handed a literal LocalSystem at line {call['line']}: {call['text']}"
+            )
+            assert "$RunAsObjectName" not in call["text"], (
+                f"{fn} at line {call['line']} takes the nssm ObjectName value rather than the "
+                f"ACL-grant account; the two must stay separate: {call['text']}"
+            )
+            assert "$ServiceAccount" in call["text"], (
+                f"{fn} at line {call['line']} must take $ServiceAccount, which is EMPTY for the "
+                f"LocalSystem opt-out: {call['text']}"
+            )
+
+
+def test_the_run_as_value_and_the_acl_account_are_separate_variables(tmp_path: Path) -> None:
+    """$RunAsObjectName exists, is derived from $ServiceAccount, and does not overwrite it.
+
+    Assigning "LocalSystem" back into $ServiceAccount would satisfy the ObjectName guards above and
+    then feed the literal straight into all three ACL calls -- one variable answering two questions,
+    which is the shape #1553 is made of.
+    """
+    facts = _preflight_facts(tmp_path)
+    runas = [a for a in facts["assignments"] if a["lhs"] == "RunAsObjectName"]
+    assert len(runas) == 1, f"expected exactly one $RunAsObjectName assignment, found {len(runas)}"
+    assert "LocalSystem" in runas[0]["rhsText"], (
+        "the run-as value must fall back to LocalSystem for the opt-out: " + runas[0]["rhsText"]
+    )
+    bad = [
+        a
+        for a in facts["assignments"]
+        if a["lhs"] == "ServiceAccount" and "LocalSystem" in (a["rhsText"] or "")
+    ]
+    assert not bad, (
+        f"$ServiceAccount is assigned LocalSystem at line(s) {[a['line'] for a in bad]}; it must "
+        "stay EMPTY for the opt-out so the ACL calls add no redundant named grant"
+    )
+
+
+def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
+    """The row names the data dir. There are THREE: the data dir, and both config-dir paths.
+
+    Repairing only the data dir leaves the still-configured account without READ on the config dir,
+    and SEC-003 source-trust then stops the engine loading config at all.
+    """
+    facts = _preflight_facts(tmp_path)
+    for fn in _ACL_CALLS:
+        calls = [c for c in facts["commands"] if c["name"] == fn]
+        assert len(calls) == 1, f"expected exactly one {fn} call, found {len(calls)}"

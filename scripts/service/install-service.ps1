@@ -681,6 +681,12 @@ if (-not $ServiceAccount -and -not $AllowLocalSystem) {
         "password). Pass -AllowLocalSystem to run as LocalSystem, or -ServiceAccount for a gMSA / " +
         "dedicated account instead (docs/SERVICE.md 'Least-privilege service account').")
 }
+# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what NSSM is told to run the service as;
+# $ServiceAccount stays "the account that needs an EXPLICIT ACL grant", and is EMPTY for LocalSystem.
+# They must not be collapsed: Set-SecureDataDirAcl already grants *S-1-5-18, which IS LocalSystem, so
+# adding a named "LocalSystem" grant is redundant and can make icacls exit non-zero.
+$RunAsObjectName = if ($ServiceAccount) { $ServiceAccount } else { "LocalSystem" }
+
 if ($ServiceAccount) {
     # gMSA preflight (#99): verify the account is installed + usable on this host, then grant it the
     # "Log on as a service" right BEFORE registering (NSSM's ObjectName does not grant it). Both steps
@@ -700,21 +706,32 @@ if ($ServiceAccount) {
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServiceAccountPassword)
         try {
             $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $ServiceAccount
+            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $RunAsObjectName
         } finally {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
     } else {
         # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password. NSSM
         # wants a gMSA's ObjectName with a trailing '$' and no password.
-        Invoke-Nssm set $ServiceName ObjectName $ServiceAccount
+        Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
     }
-    Write-Host "  Account: $ServiceAccount" -ForegroundColor Green
+    Write-Host "  Account: $RunAsObjectName" -ForegroundColor Green
 } else {
     # $ServiceAccount is empty only when -AllowLocalSystem was passed (the default above otherwise fills
-    # it with the virtual account), so this branch is now the explicit LocalSystem opt-out (#224). Leave
-    # ObjectName unset -> NSSM runs the service as LocalSystem (most-privileged); warn that it is the
-    # acknowledged, non-default choice.
+    # it with the virtual account), so this branch is the explicit LocalSystem opt-out (#224).
+    #
+    # OBJECTNAME IS SET EXPLICITLY HERE, AND IT USED TO BE LEFT ALONE (BACKLOG #1553). The comment that
+    # stood here said "leave ObjectName unset -> NSSM runs the service as LocalSystem", and that is
+    # true only of a FRESH install. On a RERUN over a service already registered with another account,
+    # not writing ObjectName leaves THAT account configured - and the ACL block below then locks the
+    # data and config dirs to SYSTEM/Administrators, stripping the account the service is still
+    # running as. The service loses write on its data dir and read on its config dir, and SEC-003
+    # source-trust then refuses to load config at all. Writing it every time makes the run-as account
+    # and the ACLs agree on every path.
+    #
+    # It also makes NSSM's create-time default irrelevant. Whether that default really is LocalSystem
+    # was never measured; setting the value explicitly removes the need to know.
+    Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
     Write-Warning ("Service will run as LocalSystem (most-privileged) - acknowledged via " +
         "-AllowLocalSystem. The default is now the least-privilege virtual account " +
         "'NT SERVICE\$ServiceName' (no password); prefer it or a gMSA for production. See docs/SERVICE.md " +
@@ -728,6 +745,15 @@ if ($ServiceAccount) {
 # read on the data dir (+ key file) it needs at startup (#44 / WIN2025 S2.2) - a grant that can only name
 # the account once its SID resolves. For a LocalSystem opt-out ($ServiceAccount empty) the grants lock
 # the dirs to SYSTEM/Administrators only, which LocalSystem (= SYSTEM) can read/write.
+#
+# THESE GRANTS ARE ONLY CORRECT BECAUSE OBJECTNAME IS NOW WRITTEN ON EVERY PATH (BACKLOG #1553). They
+# name $ServiceAccount, so "the account the ACLs are built for" and "the account the service actually
+# runs as" have to be the same thing. That held on a fresh install and NOT on a rerun: a rerun with
+# -AllowLocalSystem left the previous account configured while these three calls stripped its access -
+# the data dir here, and the config dir below, where losing READ makes SEC-003 source-trust refuse to
+# load config at all. $ServiceAccount stays EMPTY for LocalSystem on purpose; the LocalSystem grant is
+# the *S-1-5-18 ACE Set-SecureDataDirAcl already writes, and naming "LocalSystem" as well is redundant
+# and can make icacls exit non-zero.
 #
 # Harden the PHI sink (review H-13): NSSM writes the engine's stdout/stderr under $LogDir, so lock the
 # data dir (logs inherit) down to SYSTEM/Administrators/(service account) - not world-readable.
