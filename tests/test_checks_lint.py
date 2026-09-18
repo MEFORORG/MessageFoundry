@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The advisory ``raise-fstring`` lint (SEC-023): an AST scan of the config-dir Router/Handler modules
-that flags a ``raise`` whose message is built from a variable — an f-string, ``+`` concatenation,
-``%`` formatting or ``.format(...)``, all four carrying the same free-text payload past the
-exception-path redaction. It only ever prints a heuristic reminder; it never blocks the gate."""
+that flags a ``raise`` whose message is built from a variable — at least the f-string, ``+``
+concatenation, ``%`` formatting and ``.format(...)`` spellings, which carry the same free-text
+payload past the exception-path redaction. It only ever prints a heuristic reminder; it never blocks
+the gate, which is what pays for the over- and under-flags pinned in the tests below."""
 
 from __future__ import annotations
 
@@ -101,13 +102,60 @@ def test_raise_fstring_flags_format_call_raise(tmp_path: Path) -> None:
 
 
 def test_raise_fstring_ignores_literal_only_concatenation(tmp_path: Path) -> None:
-    """A concat/percent of literals folds to a constant — no variable reaches the message."""
+    """A ``+``/``%`` of literal *scalars* folds to a constant — no variable reaches the message.
+
+    Scoped to the two spellings that actually fold. A literal-only ``.format`` and a literal *tuple*
+    operand do NOT fold and are pinned as known over-flags below, so keeping them here would have
+    made this test pass for a reason other than the one it asserts.
+    """
     _write(
         tmp_path / "literal.py",
-        "def f():\n"
-        "    raise ValueError('a' + 'b')\n"
-        "    raise RuntimeError('a %s' % 'b')\n"
-        "    raise KeyError('a {}'.format())\n",
+        "def f():\n    raise ValueError('a' + 'b')\n    raise RuntimeError('a %s' % 'b')\n",
     )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is True
+    assert "no interpolated raises" in result.detail
+
+
+def test_raise_fstring_ignores_bare_name_message(tmp_path: Path) -> None:
+    """``raise ValueError(msg)`` stays unflagged: a bare ``Name`` is resolved nowhere.
+
+    A deliberate false negative, pinned so it cannot move silently. Reaching the interpolation that
+    built ``msg`` is scope resolution, a separate concern from which message shapes this check reads.
+    """
+    _write(
+        tmp_path / "bare.py",
+        "def f(x):\n    msg = f'bad {x}'\n    raise ValueError(msg)\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is True
+    assert "no interpolated raises" in result.detail
+
+
+def test_raise_fstring_over_flags_nonfolding_literals_and_arithmetic(tmp_path: Path) -> None:
+    """Three measured over-flags, pinned so the noise floor is a recorded choice, not a surprise.
+
+    ``'%s' % ('b',)`` — the folding helper has no tuple case. ``'{}'.format('b')`` — the ``.format``
+    branch counts arguments without inspecting them. ``retry + 1`` — the first constructor argument
+    need not be a string. All three are literal or numeric and carry no PHI. Tolerated because the
+    check only ever prints; narrowing any of them would move the shared predicate the ADR 0144
+    lookup lint also reads.
+    """
+    _write(
+        tmp_path / "noise.py",
+        "def f(retry):\n"
+        "    raise ValueError('a %s' % ('b',))\n"
+        "    raise RuntimeError('a {}'.format('b'))\n"
+        "    raise KeyError(retry + 1)\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is False
+    for line in ("noise.py:2", "noise.py:3", "noise.py:4"):
+        assert line in result.detail
+
+
+def test_raise_fstring_ignores_argless_format_call(tmp_path: Path) -> None:
+    """``'a {}'.format()`` is unflagged by the zero-argument guard, not by constant folding."""
+    _write(tmp_path / "argless.py", "def f():\n    raise ValueError('a {}'.format())\n")
     result = _check_raise_fstring(tmp_path)
     assert result.ok is True and result.skipped is True

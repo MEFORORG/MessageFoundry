@@ -56,11 +56,11 @@ settings/config that won't load).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
-config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable in any
-of its four spellings (f-string, ``+`` concatenation, ``%`` formatting, ``.format(...)``), the exact
+config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
+least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
 pattern that can carry free-text PHI past the exception-path redaction (``redaction.py``); it only
 ever **prints** a heuristic reminder of the "never put PHI in an exception message" convention,
-never blocks the gate.
+never blocks the gate. ``_check_raise_fstring`` catalogues what it over- and under-flags.
 So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
 (``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
 where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
@@ -333,14 +333,24 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
 
 def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     """Advisory: flag an interpolated ``raise`` message in the config-dir Router/Handler modules — a
-    ``raise`` whose message is built from a variable, the one pattern that can carry **free-text PHI**
+    ``raise`` whose message is built from a variable, the pattern that can carry **free-text PHI**
     past the exception-path redaction (``redaction.py``) into the stored ``last_error``/``detail`` and
-    the log. All four spellings count, because they carry the same payload: an f-string
-    (``f"bad {x}"``), ``+`` concatenation (``"bad " + x``), ``%`` formatting (``"bad %s" % x``) and
-    ``.format(...)``. A message built only from literals folds to a constant and is not flagged.
-    It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
-    hard rule: a benign interpolation (``raise ValueError(f"port {p} in use")``) trips it too, so the
-    check is **advisory** (prints, never blocks).
+    the log. :func:`_is_dynamic_string` is the shared predicate and defines the shapes it reaches: at
+    least the f-string, ``+``, ``%`` and ``.format(...)`` spellings, which carry the same payload.
+
+    It is a heuristic reminder of the "never put PHI in an exception message" convention, not a hard
+    rule, so it is **advisory** (prints, never blocks) — which is what pays for both error directions,
+    measured against the predicate:
+
+    * Over-flags. A benign interpolation (``raise ValueError(f"port {p} in use")``). Arithmetic, since
+      the first constructor argument need not be a string at all (``raise ValueError(retry + 1)``).
+      And two *literal-only* messages that do not fold to a constant: ``"bad %s" % ("b",)`` (the
+      folding helper has no tuple case) and ``"a {}".format("b")`` (the ``.format`` branch counts
+      arguments without inspecting them).
+    * Under-flags. A message assigned to a local first (``m = f"bad {x}"``; ``raise ValueError(m)``),
+      because a bare ``Name`` is resolved nowhere. That boundary is deliberate here and pinned by
+      ``test_raise_fstring_ignores_bare_name_message``; widening it is scope resolution, not this
+      check.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
@@ -363,11 +373,9 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
                 continue
             args = node.exc.args
             first = args[0] if args else None
-            # Any message built by interpolating a non-constant value, in all four spellings
-            # (f-string / ``+`` / ``%`` / ``.format``) — :func:`_is_dynamic_string` is the shared
-            # predicate. A literal-only message (including a literal-only concat) folds to a
-            # constant and is not flagged. Called with the node alone, so a bare
-            # ``raise ValueError(msg)`` — a Name, resolved nowhere — stays unflagged.
+            # Shared with the ADR 0144 lookup lint rather than re-implemented, so the two cannot
+            # drift on what counts as interpolation. Both directions of its error are advisory and
+            # catalogued in this function's docstring.
             if first is not None and _is_dynamic_string(first):
                 hits.append(f"{path.name}:{node.lineno}")
     if not hits:
@@ -723,7 +731,12 @@ def _is_dynamic_string(node: ast.expr) -> bool:
     ``{expr}`` / ``+`` or ``%`` with a variable operand / ``.format(...)`` with args) — the injection
     shape for a ``db_lookup``/``fhir_lookup`` query. A pure-literal concat folds to a constant and is
     not flagged. (A trusted-identifier concat like ``"select from " + TABLE`` still flags — SQL cannot
-    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)"""
+    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)
+
+    **Two callers, and tuning this moves both.** :func:`_unsafe_lookup_hit` passes a query string;
+    :func:`_check_raise_fstring` passes the first argument of any ``raise`` constructor, which need not
+    be a string. The SQL rationale above does not transfer to that caller — see its docstring for the
+    error directions it accepts."""
     if isinstance(node, ast.JoinedStr):
         return any(isinstance(part, ast.FormattedValue) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):

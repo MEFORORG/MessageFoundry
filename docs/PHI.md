@@ -905,9 +905,12 @@ delimiters — so the prior free-text residual is **narrowed** to an adversarial
 or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
 Reinforcing that convention, `messagefoundry check` ships an **advisory `raise-fstring` lint** that
 AST-scans the config-dir Router/Handler modules and flags a `raise` whose message is built from a
-variable — an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format or a
-`.format(...)` call, all four carrying the same free-text payload past redaction; it prints a
-heuristic reminder and never blocks the gate. The existing controls — never log full bodies at
+variable — at least an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format and
+a `.format(...)` call, which carry the same free-text payload past redaction; it prints a heuristic
+reminder and never blocks the gate. **It is a nudge, not a boundary, and does not narrow the residual
+above.** It reads the `raise` expression only, so a message assigned to a local first
+(`m = f"bad {x}"`; `raise ValueError(m)`) goes unflagged — the convention is what governs, and
+`_check_raise_fstring` records the check's own over- and under-flags. The existing controls — never log full bodies at
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).
 
