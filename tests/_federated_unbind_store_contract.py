@@ -96,10 +96,11 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     rebound = await store.get_user_by_federated_subject(ISSUER, REBOUND_SUB)
     assert rebound is not None and rebound.id == "fed-first"
 
-    # 8. POSITIVE CONTROL, and LAST on purpose. The index is live on this backend: a second account
-    #    taking a bound pair is refused with the backend's own integrity class. Last because on
-    #    SQLite a refused bind leaves the writer connection inside an implicit transaction, and the
-    #    next writer that opens its own would fail on BEGIN.
+    # 8. POSITIVE CONTROL. The index is live on this backend: a second account taking a bound pair
+    #    is refused with the backend's own integrity class. It was placed last because on SQLite a
+    #    refused bind used to leave the writer connection inside an implicit transaction, so the
+    #    next writer to open its own failed on BEGIN. BACKLOG #1801 fixed that, and
+    #    tests/test_backlog1801_refused_bind_rolls_back.py pins it; the order no longer matters.
     try:
         await store.set_user_federated_subject("fed-second", ISSUER, REBOUND_SUB, now=5_000.0)
     except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
