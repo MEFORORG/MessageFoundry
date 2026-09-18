@@ -125,6 +125,7 @@ from messagefoundry.store.store import (
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
@@ -4162,10 +4163,46 @@ class PostgresStore:
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        # Pure observer: a single short INSERT in its own statement — no queue row, no finalizer, never
-        # inside a handoff txn. reason rides the safe_text PHI chokepoint (#120) + the cipher. Bound to
-        # (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
-        now = time.time() if now is None else now
+        # Pure observer: no queue row, no finalizer, never inside a handoff txn. A burst of one, so
+        # the scrub and seal live in ONE place for both writers.
+        await self.record_connection_events(
+            [
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
+            ]
+        )
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        # A burst in ONE transaction (BACKLOG #1731): one commit per drained burst, not per event.
+        # record=False keeps this diagnostic side path out of the worker acquire-wait histogram, the
+        # same exemption the low-frequency convenience helpers take.
+        rows = [self._connection_event_params(ev) for ev in events]
+        if not rows:
+            return
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.executemany(
+                "INSERT INTO connection_event"
+                " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                rows,
+            )
+
+    def _connection_event_params(self, ev: ConnectionEventWrite) -> tuple[Any, ...]:
+        """The INSERT parameters for one connection event. ``reason`` rides the safe_text PHI
+        chokepoint (#120), then the cipher."""
+        now = ev.get("now")
+        if now is None:
+            now = time.time()
+        connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        # Bound to (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
                 safe_text(reason)[:200],
@@ -4174,17 +4211,14 @@ class PostgresStore:
             if reason
             else None
         )
-        await self._pool.execute(
-            "INSERT INTO connection_event"
-            " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        return (
             now,
             connection,
-            transport,
-            direction,
+            ev["transport"],
+            ev["direction"],
             kind,
-            peer_host,
-            message_id,
+            ev["peer_host"],
+            ev["message_id"],
             reason_enc,
         )
 

@@ -152,6 +152,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.store import ConnectionEventWrite
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -333,6 +334,9 @@ _BUILDUP_REALERT_SECONDS = 300.0
 _CONN_EVENT_QUEUE_MAX = 10000
 # How long teardown waits for the drain queue to flush before cancelling the drainer (bounded shutdown).
 _CONN_EVENT_FLUSH_GRACE = 2.0
+# Most events one drainer write takes (BACKLOG #1731). Bounded so a flood backlog is written in slices,
+# each holding the store's write lock briefly, rather than as one 10,000-row transaction.
+_CONN_EVENT_BURST_MAX = 256
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -1146,7 +1150,7 @@ class RegistryRunner:
         self._connection_events = connection_events
         # Master switch for "Response Sent" ACK capture (#46); a per-inbound capture_ack overrides it.
         self._response_sent_default = response_sent_default
-        self._conn_event_q: asyncio.Queue[dict[str, Any]] | None = None
+        self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
@@ -1433,33 +1437,63 @@ class RegistryRunner:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
 
-    def _enqueue_connection_event(self, **fields: Any) -> None:
+    def _enqueue_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None,
+        message_id: str | None,
+        reason: str | None,
+    ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
         connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
         q = self._conn_event_q
         if q is None:
             return
         try:
-            q.put_nowait(fields)
+            q.put_nowait(
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                )
+            )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
 
     async def _connection_event_drainer(self) -> None:
-        """Write queued connection events to the store OFF the listener/delivery hot path (#46). One
-        write per event, **fail-soft**: a store error drops that one observation, never a message or the
-        listener. Cancelled (after a best-effort flush) on teardown."""
+        """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
+        transaction per BURST (BACKLOG #1731): after the blocking get, whatever else is already queued,
+        up to ``_CONN_EVENT_BURST_MAX``, rides the same write. There is no linger timer, so an event on
+        a quiet connection is written as promptly as before. **Fail-soft**: a store error drops that
+        burst, never a message or the listener. ``task_done`` runs once per event, after the write
+        resolves, so teardown's ``join`` still means "written or dropped". Cancelled (after a
+        best-effort flush) on teardown."""
         q = self._conn_event_q
         assert q is not None
         while True:
-            fields = await q.get()
+            burst = [await q.get()]
+            while len(burst) < _CONN_EVENT_BURST_MAX:
+                try:
+                    burst.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
             try:
-                await self.store.record_connection_event(**fields)
+                await self.store.record_connection_events(burst)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.warning("connection-event write failed; dropping one event")
+                log.warning("connection-event write failed; dropping %d event(s)", len(burst))
             finally:
-                q.task_done()
+                for _ in burst:
+                    q.task_done()
 
     def _outbound_transport(self, name: str) -> str:
         """The transport label of an outbound connection for a connection event, read live from the

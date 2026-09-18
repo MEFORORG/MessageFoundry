@@ -52,6 +52,7 @@ from messagefoundry.store.store import (
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
+    ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
     LatencyHistogram,
@@ -1114,6 +1115,14 @@ class QueueStore(StoreLifecycle, Protocol):
         events). ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend; the
         raw frame / message body is **never** passed here. The caller (runner) wraps every emit
         fail-soft, so a store error here can never wedge a listener or delivery lane."""
+        ...
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        """Append a burst of connection events in **one** transaction (BACKLOG #1731), each row
+        scrubbed, sealed and AAD-bound exactly as :meth:`record_connection_event` does it. The runner's
+        drainer calls this with whatever was already queued, so the cost is one commit per burst
+        rather than one per event. All-or-nothing: a failure writes none of the burst, and the caller
+        drops it fail-soft. An empty sequence writes nothing."""
         ...
 
     async def list_connection_events(
