@@ -426,7 +426,7 @@ def test_encoding_census_counts_what_was_probed(tmp_path: Path) -> None:
         "outbound('b', File(directory='.', encoding=env('charset')))\n"
         "outbound('c', MLLP(host='h', port=1234))",
     )
-    assert load_config(tmp_path).encoding_census() == (3, 1)
+    assert load_config(tmp_path).encoding_census() == (3, 1, 0)
 
 
 def test_an_all_env_config_is_counted_as_unchecked_not_reported_as_clean(tmp_path: Path) -> None:
@@ -440,7 +440,7 @@ def test_an_all_env_config_is_counted_as_unchecked_not_reported_as_clean(tmp_pat
     )
     reg = load_config(tmp_path)  # no WiringError, no TypeError
     assert validate_config(tmp_path) == []
-    assert reg.encoding_census() == (0, 2)
+    assert reg.encoding_census() == (0, 2, 0)
 
 
 def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> None:
@@ -454,7 +454,118 @@ def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> No
     )
     result = _check_validate(tmp_path)
     assert result.ok is True
-    assert "encodings checked: 1, unchecked env() refs: 1" in result.detail
+    assert (
+        "encodings checked: 1, env() refs deferred to build-check: 1, unchecked: 0" in result.detail
+    )
+
+
+# --- the RESOLVED env() encoding pass (BACKLOG #1767) ------------------------
+# The second half of the pass above: an env()-supplied encoding is legible only once this instance's
+# environment values are in hand, so it is probed in build_check_registry. See
+# resolved_encoding_problems in messagefoundry/config/wiring.py.
+
+
+def _build_check(reg: Registry, env_values: dict[str, object]) -> None:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    build_check_registry(
+        reg, inbound_bind_host="127.0.0.1", env_values=env_values, egress=EgressSettings()
+    )
+
+
+def test_env_supplied_encoding_naming_a_real_codec_builds_clean(tmp_path: Path) -> None:
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    _build_check(load_config(tmp_path), {"charset": "latin-1"})  # no WiringError
+
+
+def test_env_supplied_encoding_naming_no_codec_is_refused_at_build_check(tmp_path: Path) -> None:
+    # The whole point of #1767: this config LOADS clean (the literal pass has nothing to probe) and is
+    # caught only once the environment values resolve it.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    reg = load_config(tmp_path)  # no WiringError at load
+    assert reg.encoding_problems() == []  # ... and nothing for the literal pass to say
+    with pytest.raises(WiringError) as exc:
+        _build_check(reg, {"charset": "not-a-real-codec"})
+    assert "outbound connection 'o'" in str(exc.value)
+    assert "'charset'" in str(exc.value)  # names the env key, so the operator knows where to fix it
+    assert "not a Python text codec" in str(exc.value)
+
+
+def test_a_non_text_codec_from_the_environment_is_refused_too(tmp_path: Path) -> None:
+    # `base64` IS a registered codec, so codecs.lookup() accepts it — str.encode/bytes.decode do not,
+    # and those are what the transports call. Same probe as the literal pass, same verdict.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError, match="'base64'"):
+        _build_check(load_config(tmp_path), {"charset": "base64"})
+
+
+def test_env_supplied_encoding_on_a_not_deployed_connection_is_skipped(tmp_path: Path) -> None:
+    # ADR 0111: a not-deployed connection's env() values are NEVER resolved, on any path — so the
+    # resolved pass cannot follow the literal pass there, and the bad value goes unchecked. That is
+    # the accepted cost of the owner ruling, and this pins it rather than leaving it to drift.
+    # The deployed sibling carrying the SAME bad key is the positive control: without it this test
+    # would pass just as well if the resolved pass never ran at all.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))",
+    )
+    reg = load_config(tmp_path)
+    with pytest.raises(WiringError) as exc:
+        _build_check(reg, {"charset": "not-a-real-codec"})
+    assert "'live'" in str(exc.value)
+    assert "'parked'" not in str(exc.value)  # the not-deployed one produced nothing
+
+
+def test_a_not_deployed_env_encoding_with_no_value_at_all_does_not_raise(tmp_path: Path) -> None:
+    # ADR 0111 AC-1, at this seam: an entirely-absent value set must not raise for a not-deployed
+    # connection. Probing its encoding would have resolved the ref and broken exactly that.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    _build_check(load_config(tmp_path), {})  # no WiringError
+
+
+def test_an_unresolvable_env_encoding_is_left_to_the_connector_build(tmp_path: Path) -> None:
+    # A DEPLOYED connection whose env key has no value is already reported loud by
+    # resolve_env_settings. The resolved pass must not pre-empt that with a second, vaguer message —
+    # the first error an operator reads should be the one naming the missing key.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as exc:
+        _build_check(load_config(tmp_path), {})
+    assert "missing: charset" in str(exc.value)
+    assert "not a Python text codec" not in str(exc.value)
+
+
+def test_encoding_census_separates_deferred_from_unchecked(tmp_path: Path) -> None:
+    # The three populations, each with exactly one member, so a collapse of any pair is visible.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('lit', File(directory='.', encoding='utf-8'))\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))\n"
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    assert load_config(tmp_path).encoding_census() == (1, 1, 1)
+
+
+def test_check_validate_detail_reports_the_three_populations_distinctly(tmp_path: Path) -> None:
+    # A census that folded "deferred" into "unchecked" would report an env() ref the build-check line
+    # DOES probe as one nothing looks at, and vice versa. The operator-visible line keeps them apart.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(
+        tmp_path,
+        "outbound('lit', File(directory='.', encoding='utf-8'))\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))\n"
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    result = _check_validate(tmp_path)
+    assert result.ok is True
+    assert (
+        "encodings checked: 1, env() refs deferred to build-check: 1, unchecked: 1" in result.detail
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (CONFIG-2 / review M-21)")

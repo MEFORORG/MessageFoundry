@@ -1087,14 +1087,20 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
-    # examined NOTHING and one that examined everything and found it good both report no problems.
-    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
-    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # Say how many declared `encoding` values were probed, and BY WHICH PASS (BACKLOG #1613, #1767):
+    # a pass that examined NOTHING and one that examined everything and found it good both report no
+    # problems. Three populations, never collapsed into two — a literal probed here; an env() ref
+    # DEFERRED to the `build-check` line, which resolves it against this environment; and one left
+    # UNCHECKED on every path because its connection is not deployed, whose env() values ADR 0111
+    # forbids resolving anywhere. A census that folded the last two would read as a clean pass over
+    # values nothing had looked at, which is the false-green this line exists to prevent.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.
-    checked, unchecked = load_config(config_dir).encoding_census()
-    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    checked, deferred, unchecked = load_config(config_dir).encoding_census()
+    census = (
+        f"encodings checked: {checked}, env() refs deferred to build-check: {deferred}, "
+        f"unchecked: {unchecked}"
+    )
     return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
