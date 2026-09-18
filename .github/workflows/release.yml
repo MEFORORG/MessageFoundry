@@ -4,10 +4,19 @@
 # Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
 #                 the artifacts for inspection. It does NOT create a GitHub release and does NOT publish
-#                 to PyPI (both are gated on a tag push), so the dry-run validates build/SBOM/sign/upload
-#                 ONLY — the publish step never runs on a branch ref. The first live PyPI publish is the
-#                 first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also matched below)
-#                 once Trusted Publishing is configured.
+#                 to PyPI, so the dry-run validates build/SBOM/sign/upload ONLY. The first live PyPI
+#                 publish is the first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also
+#                 matched below) once Trusted Publishing is configured.
+#
+#                 EVERY MUTATING STEP TESTS THE EVENT AS WELL AS THE REF — `github.event_name == 'push'
+#                 && startsWith(github.ref, 'refs/tags/')` (BACKLOG #1584). A ref test ALONE does not
+#                 keep the dry-run promise above: `workflow_dispatch` accepts any ref this workflow is
+#                 present on, a TAG included, and on such a run `github.ref` IS `refs/tags/...`. So a
+#                 manual dispatch picked against a tag would satisfy a ref-only guard and publish to
+#                 PyPI — which is what "run it manually to dry-run it" invites an operator to do.
+#                 Reading the old guard as "a branch ref isn't `refs/tags/...`" is what hid this: a
+#                 true sentence about the wrong half of the trigger. The six steps that carry the pair
+#                 are the three PyPI publishes and the three GitHub-release mutations.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -363,7 +372,7 @@ jobs:
         continue-on-error: true
         run: |
           # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
-          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a gate.
+          # SBOM completeness is visible in the release log. Advisory â€” SBOM quality is a signal, not a gate.
           # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
           VER=2.0.11
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
@@ -448,7 +457,7 @@ jobs:
       # leave a failure here with an un-retryable PyPI version and no release. The defect was never the
       # ordering — it was that the reversible half could not be repeated.
       - name: Create or update the GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -491,15 +500,16 @@ jobs:
 
       # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
       # after build/smoke/sign/release — the step's `if` has an implicit success(), so any earlier
-      # failure skips it and nothing can fail AFTER an upload. Tag-gated, so the workflow_dispatch
-      # dry-run skips it entirely (a branch ref isn't `refs/tags/...`). Reads dist-pub/ (clean wheel +
+      # failure skips it and nothing can fail AFTER an upload. Gated on a tag PUSH — the EVENT and the
+      # ref, not the ref alone: a `workflow_dispatch` can be pointed at a tag, where `github.ref` is
+      # `refs/tags/...` and a ref-only guard would have published (BACKLOG #1584). Reads dist-pub/ (clean wheel +
       # sdist; dist/ now also holds the *.sigstore bundles, which twine would reject). Trusted Publishing
       # (OIDC) — no token, uses the job's `id-token: write`. attestations: PEP 740 provenance ON PyPI,
       # distinct from the Sigstore bundle attached to the GitHub release above. skip-existing: a re-run /
       # same-version re-push is a no-op, NOT a failure (a version bump is required to republish; the
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist-pub/
@@ -593,7 +603,7 @@ jobs:
       # engine: the reversible action (a GitHub release, deletable) precedes the irreversible one (a PyPI
       # upload burns that version forever).
       - name: Create or update the console GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -627,7 +637,7 @@ jobs:
       # build + version-check above still run on every console tag, so the publish path is exercised
       # before it is armed. Flipping the variable is what actually claims the PyPI name.
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
-        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
@@ -724,7 +734,7 @@ jobs:
           fi
 
       - name: Attach the harness wheel to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
@@ -740,7 +750,7 @@ jobs:
       # GATED: no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
       # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
-        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: harness-dist/

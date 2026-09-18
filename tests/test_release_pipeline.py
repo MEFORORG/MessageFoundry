@@ -235,9 +235,15 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     # The publish must be tag-gated: its `if:` line must guard on a tag ref (so workflow_dispatch dry-runs
     # never publish). Grab the block from the publish step name to end-of-job.
     pub_block = release_job[release_job.index("Publish to PyPI") :]
-    assert "if: startsWith(github.ref, 'refs/tags/')" in pub_block, (
-        "the PyPI publish step is no longer tag-gated — a branch/workflow_dispatch run could publish"
-    )
+    # BOTH halves, not the ref alone (BACKLOG #1584). This asserted the exact literal
+    # `if: startsWith(github.ref, 'refs/tags/')`, which pinned the ref-only spelling that was the
+    # defect: `workflow_dispatch` accepts any ref this workflow is present on, a TAG included, so
+    # `github.ref` is `refs/tags/...` on such a run and a ref-only guard would let it publish.
+    for _tok in (_EVENT_GUARD, _REF_GUARD):
+        assert _tok in pub_block, (
+            f"the PyPI publish step's guard no longer carries {_tok!r} — a workflow_dispatch pointed "
+            f"at a tag could publish (BACKLOG #1584)"
+        )
 
     # Publish (irreversible) must come AFTER build, leak-gate, sign and the GitHub release.
     #
@@ -259,6 +265,90 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     ]
     assert order == sorted(order), (
         f"release steps are out of order — the irreversible PyPI upload must run last: {order}"
+    )
+
+
+# --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
+
+#: The two halves every publish/release guard in release.yml must carry.
+#:
+#: The ref test alone was the defect. `workflow_dispatch` is a trigger on this workflow and it accepts
+#: ANY ref the workflow is present on -- a TAG included. On a dispatch picked against a tag
+#: `github.ref` IS `refs/tags/...`, so a ref-only guard is satisfied and the step runs. The file's own
+#: dry-run promise ("run it manually to dry-run it") is what makes that the likely operator action.
+_EVENT_GUARD = "github.event_name == 'push'"
+_REF_GUARD = "startsWith(github.ref, 'refs/tags/')"
+
+#: Every step in release.yml that mutates a PUBLIC sink -- the three PyPI publishes and the three
+#: GitHub-release mutations. Pinned as a count so a NEW mutating step cannot be added without either
+#: carrying the pair or landing here deliberately. An empty scan must never read as a pass.
+_EXPECTED_MUTATING_STEPS = 6
+
+
+def _mutating_steps(job: dict) -> list[tuple[str, str]]:
+    """``(step name, if-expression)`` for every step in ``job`` that mutates a public sink.
+
+    Found by what a step DOES, never by its ``name:`` -- the names differ per distribution and a name
+    is the one thing in these files that may be reworded freely. Two sinks: the pinned PyPI publish
+    action, and any ``gh release create|edit|upload`` in an EXECUTED shell line.
+
+    Comments are stripped before matching, for the reason ``_executed_shell`` exists: this workflow's
+    rationale prose quotes the very commands being matched (the v0.3.1 deadlock note contains a
+    literal ``gh release create``), so a whole-body match would report the explanation as a step.
+    """
+    found: list[tuple[str, str]] = []
+    for raw_step in job.get("steps") or []:
+        step = raw_step or {}
+        name = step.get("name") or step.get("uses") or "<unnamed step>"
+        publishes = str(step.get("uses") or "").startswith("pypa/gh-action-pypi-publish@")
+        body = _executed_shell(str(step.get("run") or ""))
+        releases = re.search(r"\bgh release (?:create|edit|upload)\b", body) is not None
+        if publishes or releases:
+            found.append((str(name), str(step.get("if") or "")))
+    return found
+
+
+def test_every_mutating_release_step_gates_on_the_event_and_the_ref() -> None:
+    """No mutating step may publish on a `workflow_dispatch`, however the run's ref is spelled.
+
+    The header of release.yml promises a manual run is a dry-run: it "does NOT create a GitHub
+    release and does NOT publish to PyPI". A guard testing only `startsWith(github.ref, 'refs/tags/')`
+    does not keep that promise, because a dispatch can be pointed at a tag.
+
+    Scope of the exposure, stated so this test is not read as more than it is: the publish action
+    carries `skip-existing: true`, so re-dispatching an ALREADY-PUBLISHED tag is a no-op. What a
+    ref-only guard WOULD have admitted is a tag whose version is not yet on PyPI, or an actor holding
+    workflow_dispatch permission without tag-push permission. MessageFoundry has zero deployments and
+    this workflow has never been dispatched against a tag, so nothing was published this way.
+
+    Mutation: drop either half of any of the six guards. Red here, naming the step.
+    """
+    yaml = pytest.importorskip("yaml")
+    jobs = (yaml.safe_load(_release()) or {}).get("jobs") or {}
+    assert jobs, "release.yml declares no jobs — the workflow shape moved"
+
+    checked = 0
+    offenders: list[str] = []
+    for job_key, job in jobs.items():
+        for name, guard in _mutating_steps(job or {}):
+            checked += 1
+            missing = [tok for tok in (_EVENT_GUARD, _REF_GUARD) if tok not in guard]
+            if missing:
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} guard {guard!r} omits {missing}"
+                )
+
+    # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
+    # the same green, and this detector keys on step shape, which a refactor can move.
+    print(f"[release-pipeline] examined {checked} mutating step(s) in release.yml")
+    assert checked == _EXPECTED_MUTATING_STEPS, (
+        f"expected {_EXPECTED_MUTATING_STEPS} mutating steps in release.yml, found {checked}. A new "
+        f"publish or `gh release` step must carry {_EVENT_GUARD!r} AND {_REF_GUARD!r}; if one was "
+        f"deliberately removed, lower the constant in the same commit."
+    )
+    assert not offenders, (
+        "a mutating release step does not test the EVENT as well as the ref, so a workflow_dispatch "
+        "pointed at a tag could reach it (BACKLOG #1584):\n  " + "\n  ".join(offenders)
     )
 
 
