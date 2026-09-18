@@ -219,3 +219,117 @@ def test_every_credential_token_url_key_is_gated_on_the_lookup_arm() -> None:
         settings = {"url": "https://fhir.example.org/fhir", key: "https://evil.example/token"}
         with pytest.raises(WiringError, match=what):
             check_fhir_lookup_allowed("epic", settings, egress)
+
+
+# --- The forward/egress web proxy host (ADR 0126, BACKLOG #1659) ---------------------------------
+# The proxy is a THIRD egress host on an http-family connection, distinct from the data `url` and from
+# the token endpoints above, and it is credential-bearing: `proxy_auth_type = basic` (the default)
+# mints a pre-emptive `Proxy-Authorization` that urllib delivers to the proxy on an http destination
+# as a request header and on an https one inside the CONNECT tunnel. It is gated by its OWN
+# `[egress].allowed_proxy` list and NOT by `allowed_http` — ADR 0126 puts the proxy host out of that
+# gate's scope ("one corporate proxy fronts many hosts, and it would have to be co-listed with every
+# destination"), so folding it in would re-create exactly the co-listing the ADR rejected.
+
+
+def test_proxy_url_is_not_in_the_credential_token_url_table() -> None:
+    """The mechanism ADR 0126 forbids, pinned so the next pass does not re-file it.
+
+    The #1659 ledger row's own closing step said to add `proxy_url` to `_CREDENTIAL_EGRESS_URL_KEYS`.
+    That table gates against `[egress].allowed_http`, which the ADR rules the proxy host out of, so
+    the key must stay out and the dedicated list below must do the gating instead.
+
+    NOT A RED-FIRST TEST, deliberately: `proxy_url` was never in the table, so this passed before the
+    gate was built and passes after. It is a regression pin against a FUTURE edit, and it earns its
+    place only because that edit is what the ledger row asks for in writing.
+    """
+    from messagefoundry.pipeline.wiring_runner import _CREDENTIAL_EGRESS_URL_KEYS
+
+    assert "proxy_url" not in {key for key, _what in _CREDENTIAL_EGRESS_URL_KEYS}
+
+
+def test_outbound_denies_unlisted_proxy_host() -> None:
+    egress = EgressSettings(allowed_http=["api.partner.org"], allowed_proxy=["proxy.corp.example"])
+    dest = _rest("https://api.partner.org/v1", proxy_url="http://evil.example:3128")
+    with pytest.raises(WiringError, match="allowed_proxy"):
+        check_egress_allowed(dest, egress)
+
+
+def test_outbound_permits_listed_proxy_host() -> None:
+    egress = EgressSettings(
+        allowed_http=["api.partner.org"], allowed_proxy=["proxy.corp.example:3128"]
+    )
+    dest = _rest("https://api.partner.org/v1", proxy_url="http://proxy.corp.example:3128")
+    check_egress_allowed(dest, egress)  # no raise
+    # A host-only entry permits any port, matching every other [egress] list's host[:port] shape.
+    host_only = EgressSettings(
+        allowed_http=["api.partner.org"], allowed_proxy=["proxy.corp.example"]
+    )
+    check_egress_allowed(
+        _rest("https://api.partner.org/v1", proxy_url="http://proxy.corp.example:8080"), host_only
+    )
+    with pytest.raises(WiringError, match="allowed_proxy"):  # pinned port must match
+        check_egress_allowed(
+            _rest("https://api.partner.org/v1", proxy_url="http://proxy.corp.example:8080"), egress
+        )
+
+
+def test_proxy_gate_is_deny_by_default_with_an_empty_list() -> None:
+    """The asymmetry with the destination lists, asserted rather than left to the comment.
+
+    `allowed_http` is permissive when empty; `allowed_proxy` is not, matching `[ai].allowed_endpoints`
+    (ADR 0135). It costs an operator who configures no proxy nothing — the gate only bites once a
+    proxy is set — and permissive-when-empty would leave this credential-bearing host ungated on the
+    default posture, which is the hole the key exists to close.
+    """
+    wide_open = EgressSettings()  # no allowed_http, no allowed_proxy, no deny_by_default
+    with pytest.raises(WiringError, match="allowed_proxy is empty"):
+        check_egress_allowed(
+            _rest("https://api.partner.org/v1", proxy_url="http://p.example"), wide_open
+        )
+    # ...and with no proxy configured the same empty list refuses nothing.
+    check_egress_allowed(_rest("https://api.partner.org/v1"), wide_open)
+
+
+def test_proxy_gate_skips_the_default_sentinel() -> None:
+    """`proxy_url = "default"` names no address at config time (urllib resolves the OS proxy at
+    request time) and `proxy_config_from_settings` refuses to pair it with proxy credentials, so that
+    path mints no Proxy-Authorization and there is nothing here to match against a host list.
+
+    NOT A RED-FIRST TEST: it asserts a NON-raise, so it would pass with no gate at all. Its job is to
+    pin the carve-out against a later tightening that would refuse every `"default"` proxy at load.
+    The deny-by-default arm it must not trip IS red-first — see the test above."""
+    from messagefoundry.transports.rest import PROXY_DEFAULT
+
+    egress = EgressSettings()  # empty allowed_proxy — the deny-by-default arm must NOT fire
+    check_egress_allowed(_rest("https://api.partner.org/v1", proxy_url=PROXY_DEFAULT), egress)
+    check_egress_allowed(_rest("https://api.partner.org/v1", proxy_url="DEFAULT"), egress)
+
+
+def test_proxy_gate_covers_the_fhir_lookup_read_arm() -> None:
+    """The read arm dials through the same proxy as the outbound, so it must stay in lockstep —
+    DELTA-04 was exactly that drift. Gated OUTSIDE the `allowed_http` guard: that list being empty
+    says nothing about whether the proxy is permitted."""
+    from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+
+    egress = EgressSettings(allowed_http=["fhir.example.org"], allowed_proxy=["proxy.corp.example"])
+    settings = {"url": "https://fhir.example.org/fhir", "proxy_url": "http://evil.example:3128"}
+    with pytest.raises(WiringError, match="allowed_proxy"):
+        check_fhir_lookup_allowed("epic", settings, egress)
+    ok = {"url": "https://fhir.example.org/fhir", "proxy_url": "http://proxy.corp.example:3128"}
+    check_fhir_lookup_allowed("epic", ok, egress)  # no raise
+    # The deny-by-default arm reaches the read arm too, and fires with allowed_http empty.
+    with pytest.raises(WiringError, match="allowed_proxy is empty"):
+        check_fhir_lookup_allowed("epic", settings, EgressSettings())
+
+
+def test_a_listed_proxy_does_not_satisfy_the_destination_gate() -> None:
+    """`allowed_proxy` is not a destination list: listing a proxy must not permit an unlisted PHI
+    destination. The two lists are independent gates, and this is the confusion the dedicated key
+    invites.
+
+    NOT A RED-FIRST TEST: the refusal it asserts is `allowed_http`'s, which predates this change. It
+    pins that the new list did not weaken the old one."""
+    egress = EgressSettings(allowed_http=["api.partner.org"], allowed_proxy=["proxy.corp.example"])
+    dest = _rest("https://evil.example/v1", proxy_url="http://proxy.corp.example:3128")
+    with pytest.raises(WiringError, match="allowed_http"):
+        check_egress_allowed(dest, egress)

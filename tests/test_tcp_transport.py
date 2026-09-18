@@ -287,16 +287,25 @@ async def test_destination_no_reply_returns_when_not_expecting_one() -> None:
 
 
 async def test_destination_expect_reply_reads_framed_reply() -> None:
+    received: list[bytes] = []
+
     async def handler(raw: bytes) -> str:
+        received.append(raw)
         return "ACK-OPAQUE"  # the source frames + sends this back on the same connection
 
     source = _source()
     await source.start(handler)
     try:
-        # With expect_reply the destination reads one framed reply and treats it as confirmation.
-        await _dest(source.sockport, expect_reply=True).send(X12)
+        # With expect_reply the destination reads one framed reply and treats it as confirmation:
+        # the frame is CONSUMED, not returned. capture_response (ADR 0013) is the knob that hands
+        # one back as a DeliveryResponse.
+        assert await _dest(source.sockport, expect_reply=True).send(X12) is None
     finally:
         await source.stop()
+    # Settled by the time send() returns, because the source awaits the handler before writing the
+    # reply: the payload reached the peer verbatim. That the destination BLOCKS for the reply is the
+    # sibling test below, which raises DeliveryError when none is sent.
+    assert received == [X12.encode("utf-8")]
 
 
 async def test_destination_expect_reply_times_out_when_none_sent() -> None:

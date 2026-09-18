@@ -90,7 +90,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 continue
             seen.add((role, name))
             try:
-                result = await core.dual_role_control(engine, identity, name, action, role=role)
+                # ADR 0150: `request` is the browser's (the console mounts in-process), so a
+                # per-channel denial names the operator's host, as the JSON and per-name console
+                # controls already do.
+                result = await core.dual_role_control(
+                    engine, identity, name, action, role=role, client=client_ip(request)
+                )
                 outcomes.append((name, f"applied (running={result['running']})"))
             except HTTPException as exc:
                 outcomes.append((name, f"{exc.status_code}: {exc.detail}"))

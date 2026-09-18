@@ -26,8 +26,14 @@ import time
 from typing import Any
 
 import pytest
+from _ingress_pace_probe import (
+    install_ingress_pace_probe,
+    listener_waits,
+    stream_debt_seconds,
+)
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports import http_listener, tcp, x12
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import _MessagePacer
 from messagefoundry.transports.tcp import TcpSource
@@ -159,8 +165,8 @@ async def _run_stream(src: TcpSource | X12Source, frames: list[bytes]) -> tuple[
     """Write every frame down ONE connection; return what the handler got and the elapsed seconds.
 
     Elapsed comes back with the payloads so one paced run answers both questions a caller has --
-    that nothing was dropped, and that a wait happened at all. Running the same 0.5s scenario twice
-    to ask them separately would buy nothing but a slower suite.
+    that nothing was dropped, and that the box really slept off the waits its pacer decided. Running
+    the same 0.5s scenario twice to ask them separately would buy nothing but a slower suite.
     """
     seen: list[bytes] = []
     done = asyncio.Event()
@@ -190,25 +196,40 @@ async def _run_stream(src: TcpSource | X12Source, frames: list[bytes]) -> tuple[
     return seen, loop.time() - start
 
 
-# 12 messages, burst 2, 20/s -> at least (12-2)/20 = 0.5s of debt must be paid somewhere. The
-# assertions below take a LOWER bound only: an upper bound would pin scheduler timing and make this
-# the flaky test that gets deleted. The claim under test is that a wait occurs at all.
-_PACED = {"max_messages_per_second": 20, "message_burst": 2}
-_MIN_DELAY = 0.3
+# 12 messages, burst 2, 20/s -> exactly (12-2)/20 = 0.5s of debt.
+#
+# **The timing arms below read the pacer's own arithmetic, not a constant (BACKLOG #1538).** They
+# used to assert `elapsed >= 0.3`, and elapsed seconds are pacing plus the runner's work with nothing
+# to tell them apart: a box slow enough to spend 0.3s framing twelve messages passed with the pacer
+# deleted. Raising the constant does not fix it, because the debt SHRINKS as the runner slows -- the
+# bucket refills on the same wall clock the work is spent on -- so a higher floor turns into a false
+# red on exactly the hosts a lower one is vacuous on. `tests/_ingress_pace_probe.py` puts the bucket
+# on a clock the test owns, which takes the runner out of the arithmetic and makes the schedule exact.
+#
+# Two arms per site, and each catches what the other cannot. The DECISION arm says the wait came from
+# pacing rather than from work; the WALL-CLOCK arm, bounded by what that run decided rather than by a
+# constant, says the box actually slept it off.
+_PACED: dict[str, float] = {"max_messages_per_second": 20.0, "message_burst": 2.0}
+#: Derived from `_PACED` rather than restated. Spelling the pair twice lets somebody move the burst
+#: on the connector while the timing arms keep checking a scenario it is no longer running.
+_RATE, _BURST = _PACED["max_messages_per_second"], _PACED["message_burst"]
+_MESSAGES = 12
 
 
-async def test_tcp_pacing_never_drops_a_message() -> None:
+async def test_tcp_pacing_never_drops_a_message(monkeypatch: pytest.MonkeyPatch) -> None:
     """THE test for this control on raw TCP. A paced sender is SLOWED, never truncated.
 
-    Rate 20/s with burst 2 against 12 messages guarantees the pacer engages several times. Every
-    message must still reach the handler, and in order -- pacing must not reorder either, since FIFO
-    is the project's ordering model. The elapsed check is the watched-fail half: with the pre-read
-    wait removed it collapses to near zero.
+    Rate 20/s with burst 2 against 12 messages guarantees the pacer engages. Every message must still
+    reach the handler, and in order -- pacing must not reorder either, since FIFO is the project's
+    ordering model.
     """
-    frames = [_tcp_frame(f"MSG-{i}") for i in range(12)]
+    probe = install_ingress_pace_probe(monkeypatch, tcp)
+    frames = [_tcp_frame(f"MSG-{i}") for i in range(_MESSAGES)]
     seen, elapsed = await _run_stream(_tcp_source(**_PACED), frames)
-    assert [b.decode() for b in seen] == [f"MSG-{i}" for i in range(12)]
-    assert elapsed >= _MIN_DELAY
+    assert [b.decode() for b in seen] == [f"MSG-{i}" for i in range(_MESSAGES)]
+    assert probe.built == 1, "the probe never replaced the pacer this intake builds"
+    assert sum(probe.decided) == pytest.approx(stream_debt_seconds(_MESSAGES, _BURST, _RATE))
+    assert elapsed >= sum(probe.taken)
 
 
 async def test_tcp_pacing_off_delivers_everything_unchanged() -> None:
@@ -217,13 +238,16 @@ async def test_tcp_pacing_off_delivers_everything_unchanged() -> None:
     assert len(seen) == 12
 
 
-async def test_x12_pacing_never_drops_an_interchange() -> None:
+async def test_x12_pacing_never_drops_an_interchange(monkeypatch: pytest.MonkeyPatch) -> None:
     """A paced X12 partner is slowed, never truncated -- and the interchanges stay in order."""
-    frames = [_interchange(f"{i:09d}").encode("utf-8") for i in range(12)]
+    probe = install_ingress_pace_probe(monkeypatch, x12)
+    frames = [_interchange(f"{i:09d}").encode("utf-8") for i in range(_MESSAGES)]
     seen, elapsed = await _run_stream(_x12_source(**_PACED), frames)
-    assert len(seen) == 12
-    assert [b.decode("utf-8")[90:99] for b in seen] == [f"{i:09d}" for i in range(12)]
-    assert elapsed >= _MIN_DELAY
+    assert len(seen) == _MESSAGES
+    assert [b.decode("utf-8")[90:99] for b in seen] == [f"{i:09d}" for i in range(_MESSAGES)]
+    assert probe.built == 1, "the probe never replaced the pacer this intake builds"
+    assert sum(probe.decided) == pytest.approx(stream_debt_seconds(_MESSAGES, _BURST, _RATE))
+    assert elapsed >= sum(probe.taken)
 
 
 async def test_x12_pacing_off_delivers_everything_unchanged() -> None:
@@ -279,7 +303,7 @@ async def test_http_pacing_never_drops_a_message() -> None:
     delayed rather than replaced by a rejection. A limiter that answered ``429`` instead would move
     the loss outside the boundary the count-and-log invariant covers.
     """
-    seen, status = await _run_http(_http_source(max_messages_per_second=20, message_burst=2), 12)
+    seen, status = await _run_http(_http_source(**_PACED), _MESSAGES)
     assert [b.decode() for b in seen] == [f"BODY-{i}" for i in range(12)]
     assert status == 202
 
@@ -290,23 +314,30 @@ async def test_http_pacing_off_delivers_everything_unchanged() -> None:
     assert status == 202
 
 
-async def test_http_pacing_is_listener_wide_not_per_connection() -> None:
+async def test_http_pacing_is_listener_wide_not_per_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The property that makes the HTTP pacer real rather than decorative.
 
     This connector answers exactly ONE request per connection (``build_response`` hardcodes
     ``Connection: close``), so a per-connection bucket would be charged once and thrown away: with
     any burst of 1 or more it could never pace anything, and the knob would read as a rate bound
-    while bounding nothing. Twelve requests here arrive on twelve separate connections, so the delay
-    below can only come from a bucket the listener shares across them.
+    while bounding nothing. Twelve requests here arrive on twelve separate connections.
 
-    Lower bound only, for the reason given on the raw-TCP twin.
+    **The probe states that property directly rather than inferring it from a delay.** One pacer was
+    built for the whole listener, and the schedule it decided is the flat run only a bucket carried
+    ACROSS those twelve connections can produce -- a fresh bucket per connection would decide nothing
+    at all. The wall-clock arm then says the partner really waited.
     """
+    probe = install_ingress_pace_probe(monkeypatch, http_listener)
     loop = asyncio.get_running_loop()
     start = loop.time()
-    seen, _ = await _run_http(_http_source(max_messages_per_second=20, message_burst=2), 12)
+    seen, _ = await _run_http(_http_source(**_PACED), _MESSAGES)
     elapsed = loop.time() - start
-    assert len(seen) == 12
-    assert elapsed >= 0.3
+    assert len(seen) == _MESSAGES
+    assert probe.built == 1, "twelve connections must share ONE listener-wide bucket"
+    assert probe.decided == pytest.approx(listener_waits(_MESSAGES, _BURST, _RATE))
+    assert elapsed >= sum(probe.decided)
 
 
 async def test_http_health_probes_wait_but_charge_nothing() -> None:
