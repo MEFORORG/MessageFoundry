@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._spawn_lock import spawn_burst
+
 LOCK = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lock.ps1"
 
 pytestmark = pytest.mark.skipif(
@@ -141,7 +143,13 @@ def test_eight_concurrent_claimants_never_hold_it_at_once(repo: Path, tmp_path: 
     barrier = tmp_path / "barrier"
     barrier.mkdir()
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    # Eight concurrent pwsh, and the winner holds for 8 s -- the same shape as the storm BACKLOG #1304
+    # is about, found by sweeping the tier rather than by CI evidence. Nothing about the claimants
+    # changes; the lock only keeps single-launch tests off these vCPUs while they run.
+    with (
+        spawn_burst("coord_lock.mutex_under_load x8"),
+        ThreadPoolExecutor(max_workers=8) as pool,
+    ):
         claims = [
             pool.submit(
                 acquire,

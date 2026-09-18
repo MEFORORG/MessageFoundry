@@ -87,6 +87,33 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 MAX_REQUEST_URL_LEN = 8192
 MAX_REQUEST_HEADER_VALUE_LEN = 8192
 
+# ASVS 15.2.2 (BACKLOG #1577), the RESPONSE half: the ceiling on a reply body this client will
+# buffer. The bound is enforced ON THE STREAM (see _buffer_bounded), so a reply past it costs one
+# chunk of headroom rather than whatever the responder chose to send.
+#
+# WHY 128 MiB AND NOT THE ENGINE'S OWN 16 MiB. The engine's one-message ceiling is 16 MiB
+# (parsing.peek.DEFAULT_MAX_MESSAGE_BYTES), and the obvious move is to reuse it the way
+# transports/bounded_read.py does. It is wrong here. ``GET /messages/{id}`` answers with a
+# MessageDetail whose ``raw`` field carries the WHOLE message body JSON-escaped, and worst-case
+# ``\uXXXX`` escaping costs 6 bytes per source byte -- so a 16 MiB message the engine legitimately
+# accepted can come back as roughly 96 MiB of JSON. A flat 16 MiB client ceiling would refuse that
+# reply: the client would break on a message the engine was configured to take. 128 MiB clears the
+# 6x worst case with room for the envelope around ``raw``, and it is still a bound -- what it
+# replaces is an unbounded read. BOTH halves are the property to preserve: it must never refuse a
+# reply describing a message the engine accepted, and it must never be removed.
+#
+# Pinned against that arithmetic by ``test_apiclient_response_bound_clears_the_worst_case_escape``.
+# DUPLICATED rather than imported, for the ADR 0088 reason the request bounds above give: this
+# package stays engine-free, so it must not import transports/ or parsing/ to share a number.
+MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+
+# Reply headers that describe the ON-THE-WIRE framing of a body we have already read and decoded.
+# They must not ride onto the in-memory replacement response: httpx would try to gunzip an
+# already-gunzipped body (Content-Encoding), or advertise a length that is no longer the body's
+# (Content-Length, Transfer-Encoding). Every other header carries through -- Content-Type, and the
+# X-MFA-Required / X-Step-Up-Required / X-Step-Up-Action headers the retry branches below read.
+_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+
 # ASVS 2.3.5 (BACKLOG #1113): the status the engine answers when dual-control holds a gated
 # operation for a second approver instead of running it. Pinned against the engine's own route
 # handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
@@ -99,6 +126,66 @@ class ApiError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
+    """Drain ``streaming`` into memory under ``limit`` bytes and return an in-memory replacement.
+
+    ``streaming`` MUST come from ``send(..., stream=True)``: this is where the reply body stops being
+    read until EOF (ASVS 15.2.2, BACKLOG #1577). Chunks are accumulated and the read stops the moment
+    the running total passes ``limit``, so the peak allocation is the ceiling plus one chunk rather
+    than whatever the responder decided to send. Nothing is silently truncated -- a body at or under
+    the bound comes back whole, and a body past it raises :class:`ApiError`.
+
+    **The bound counts DECODED bytes**, because ``iter_bytes`` is where a ``Content-Encoding`` is
+    undone. That is the number that matters: it is what would land in the caller's memory. It does
+    leave a compressed responder able to amplify a single network chunk, which is a smaller and
+    different surface from the unbounded read this closes, and is not addressed here.
+
+    **Why a replacement object rather than the original.** httpx has no public way to hand a
+    streaming response a body you read yourself, and reaching into ``_content`` would pin this client
+    to a private attribute. Constructing a new :class:`httpx.Response` is public API and leaves every
+    caller's ``.json()`` / ``.text`` / ``.status_code`` / ``.headers`` / ``.reason_phrase`` working
+    unchanged. See :data:`_FRAMING_HEADERS` for the three headers that must not carry over.
+
+    The ``finally`` is load-bearing: it releases the connection back to the pool on EVERY path --
+    body under the bound, body over it, read error mid-stream. Leaking it instead would exhaust the
+    pool under the console's repeating background poll, which fails as a hang rather than as an error.
+    """
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in streaming.iter_bytes():
+            total += len(chunk)
+            if total > limit:
+                raise ApiError(
+                    f"engine reply is over the {limit}-byte response limit; "
+                    "refusing to buffer the rest",
+                    status=streaming.status_code,
+                )
+            chunks.append(chunk)
+    finally:
+        streaming.close()
+    headers = [
+        (name, value)
+        for name, value in streaming.headers.multi_items()
+        if name.lower() not in _FRAMING_HEADERS
+    ]
+    # Carry only the two extensions that are still true of a buffered copy. `network_stream` is
+    # deliberately dropped: the socket it names is back in the pool, and handing callers a live
+    # reference to it through a detached response is how a use-after-release starts.
+    extensions = {
+        key: value
+        for key, value in streaming.extensions.items()
+        if key in ("http_version", "reason_phrase")
+    }
+    return httpx.Response(
+        streaming.status_code,
+        headers=headers,
+        content=b"".join(chunks),
+        request=streaming.request,
+        extensions=extensions,
+    )
 
 
 _Model = TypeVar("_Model", bound=BaseModel)
@@ -485,8 +572,24 @@ class EngineClient:
                 f"the session Authorization header is {len(headers['Authorization'])} chars, over "
                 f"the {MAX_REQUEST_HEADER_VALUE_LEN}-char limit"
             )
+        # ASVS 15.2.2 (BACKLOG #1577): `stream=True` plus `_buffer_bounded` is what stops the reply
+        # body being read to EOF. The bounded read happens HERE, immediately, so the three exits
+        # below -- the MFA retry, the step-up retry, and the >= 400 raise through `_error_detail`
+        # (which reads the body itself) -- all act on an already-buffered, already-closed response.
+        # Collapsing them to one release point is deliberate: a per-exit close is three chances to
+        # leak a pooled connection, and the symptom of leaking one is the console's background poll
+        # hanging on an exhausted pool, not a test failure.
+        #
+        # Both calls sit under ONE `except httpx.HTTPError`, because streaming moves where a
+        # transport failure lands: a socket that dies mid-body now fails inside `_buffer_bounded`
+        # rather than at `send`, and both have to read as "could not reach engine" rather than
+        # escaping as a raw httpx error out of a Qt slot. The over-the-bound refusal is an `ApiError`
+        # and so passes through this handler untouched; `_buffer_bounded` releases the connection on
+        # its own `finally` either way.
         try:
-            response = self._http.send(request)
+            response = _buffer_bounded(
+                self._http.send(request, stream=True), limit=MAX_RESPONSE_BYTES
+            )
         except httpx.HTTPError as exc:
             raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
         # Second factor (WP-14, ASVS 6.3.3): the engine refuses a sensitive op with 403 +

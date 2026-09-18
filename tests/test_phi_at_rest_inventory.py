@@ -764,6 +764,282 @@ def test_pl1_encryption_rule_carves_out_the_backup_codec() -> None:
     )
 
 
+#: ``dr_backup`` functions that SEAL or UNSEAL the ``.mfbak`` archive itself. §3's carve-out
+#: ("the archive's own seal is keyed by `resolve_active_key` and not `build_store_cipher`, so
+#: `vault_transit` never applies") is a claim about THESE functions and no others.
+_MFBAK_CODEC_FUNCS = frozenset(
+    {"_do_backup", "_resolve_key", "_build_archive_blocking", "_verify_archive_blocking"}
+)
+#: ``dr_backup`` functions that read the EXTRACTED snapshot's own store cells during a full
+#: restore-verify. Reading a store cell is what the store cipher is FOR, so these are where
+#: ``build_store_cipher`` (and ``open_store``, which builds one internally) belong.
+_SNAPSHOT_READ_FUNCS = frozenset({"_full_open_check", "_decrypt_check"})
+#: Names that construct or obtain the STORE cipher. ``open_store`` is in the list because it calls
+#: ``build_store_cipher`` itself — a file-wide token scan could not see that, which is half of why
+#: it was the wrong instrument.
+_STORE_CIPHER_CTORS = frozenset(
+    {"build_store_cipher", "make_cipher", "build_transit_cipher", "open_store"}
+)
+#: The archive codec's own entry points (``store/backup_codec.py``), which take RAW DEK BYTES.
+_ARCHIVE_CODEC_CALLS = frozenset({"encrypt_stream", "decrypt_stream"})
+
+
+def _callee_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _dr_backup_tree() -> ast.Module:
+    return ast.parse((_PKG / "pipeline" / "dr_backup.py").read_text(encoding="utf-8"))
+
+
+def _named_func(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    found = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name
+    ]
+    assert len(found) == 1, (
+        f"pipeline/dr_backup.py declares {len(found)} functions named {name!r}; this guard names the "
+        "backup's key paths by function, so a rename or a duplicate must be re-derived here, not "
+        "silently skipped."
+    )
+    return found[0]
+
+
+def _sites(calls: list[ast.Call]) -> list[str]:
+    """Call nodes rendered for a failure message — the callee and the line it sits on."""
+    return [f"{_callee_name(c)} at line {c.lineno}" for c in calls]
+
+
+def _split_call_sites(
+    tree: ast.Module, funcs: frozenset[str], names: frozenset[str]
+) -> tuple[list[ast.Call], list[ast.Call]]:
+    """``(inside, outside)`` — call sites of ``names``, split by whether they sit LEXICALLY in one of
+    ``funcs``. No call is followed: a helper defined outside ``funcs`` and called from inside one
+    lands in ``outside``, which errs toward reporting rather than toward a false green.
+
+    Keyed on AST node identity (``ast`` nodes hash by identity), not on a line range, so a nested
+    helper such as ``_full_open_check._open`` counts as INSIDE its enclosing function and nothing is
+    double-counted.
+
+    DELIBERATE DUPLICATION. ``tests/_ast_sites.py`` on the unlanded PR 1176 exports near-twins of
+    this and the three helpers above. These stay private so this guard lands independently of a
+    branch that is still conflicting. Whoever collapses them once both are on ``main`` must keep the
+    LEXICAL bucketing: 1176's ``call_sites`` answers a different question, and a de-duplication that
+    matches on the name alone would silently swap the semantics this test's verdict rests on.
+    """
+    inside_nodes = {
+        sub
+        for name in funcs
+        for sub in ast.walk(_named_func(tree, name))
+        if isinstance(sub, ast.Call)
+    }
+    inside: list[ast.Call] = []
+    outside: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _callee_name(node) in names:
+            (inside if node in inside_nodes else outside).append(node)
+    return inside, outside
+
+
+def test_the_mfbak_seal_never_reaches_for_the_store_cipher() -> None:
+    """§3's `.mfbak` carve-out, pinned by CALL PATH rather than by a file-wide token.
+
+    RULE: sealing a `.mfbak` under the store cipher would make §3's "`vault_transit` never applies
+    to sealing or unsealing a `.mfbak`" false, and would put a per-value string cipher on a multi-GB
+    stream. That is the thing forbidden, and this asserts it where it happens — the functions that
+    write and read the archive.
+
+    WHY A SEPARATE TEST FROM ``test_pl1_encryption_rule_carves_out_the_backup_codec`` ABOVE. That one
+    asks whether §3 still NAMES the tokens the codec tier needs; this one asks whether the CODE stays
+    inside the boundary §3 describes. Two failure modes, two reds, and the message tells you which:
+    a sentence deleted from the document, versus a call that crossed the line. Measured on this
+    branch: planting a ``build_store_cipher`` call in ``_build_archive_blocking`` reds THIS test and
+    leaves that one green, and deleting §3's scoping sentence does the same — so neither subsumes the
+    other in either direction.
+
+    WHAT THIS DELIBERATELY DOES NOT ASSERT. That the bytes sealing the archive ARE the
+    ``resolve_active_key`` DEK is proved by behaviour, not by syntax, in
+    ``tests/test_backup_runner.py::test_archive_encrypted_under_store_dek`` — it runs the real
+    ``BackupRunner`` and decrypts the produced ``.mfbak`` with the configured store DEK, so any other
+    key fails there. An AST re-derivation of that chain was tried and removed: it pinned call SHAPE,
+    so rewriting ``encrypt_stream(src, dst, key, ...)`` to pass ``key=key`` would have reddened it
+    with a message reporting a key-material regression that had not happened.
+
+    WHAT THE OLD INSTRUMENT COULD NOT DO. Before the AC-13 restore-verify landed, the assertion was
+    ``"build_store_cipher" not in dr_backup.py`` — the whole file, by token — and it was wrong in
+    both directions. It **under-fired**: ``_full_open_check`` has always called ``open_store``, which
+    builds a store cipher internally, so the token scan could never have caught a seal that obtained
+    its cipher that way, nor one that aliased the import. And it **over-fired**: a full restore-verify
+    decrypts the extracted snapshot's own cells, which is a store read and legitimately needs the
+    store cipher — a different operation from sealing the archive, in a different function, on a
+    different key use. A file-wide token cannot tell those two apart, so it was replaced by a
+    conditional documentation-sync check, which forbids nothing. This guard restores the prohibition
+    at the resolution the claim is actually made: the permitted region is named and closed, and a
+    seal that reaches for the store cipher by ANY of the four constructor names fails.
+
+    SCOPE. ``_split_call_sites`` buckets LEXICALLY and follows no calls; its own docstring states the
+    consequences. It is why this test says "in" rather than "reached".
+    """
+    # (0) The doc limb. Every sibling in this file pins the §3 prose before it pins the code, and a
+    # code-only guard would stay green if the scoped sentence were deleted — pinning a claim the
+    # document no longer makes, which is the defect this whole file exists to catch. The phrase is
+    # matched against the FLATTENED section so a reflow of the bullet does not read as a deletion.
+    section3 = _section(3)
+    flat3 = " ".join(section3.split())
+    assert "never applies to sealing or unsealing a `.mfbak`" in flat3, (
+        "§3's PL-1 encryption rule no longer scopes `vault_transit` off the archive seal. The code "
+        "assertions below pin only half of that claim; without the sentence they pin nothing a "
+        "reader is told."
+    )
+    # `build_store_cipher` is deliberately NOT re-asserted here: the sibling test above already pins
+    # it in §3 whenever dr_backup builds one, and limb (2) below pins that it does. Asserting it in
+    # both places would give one deletion two reds pointing at one edit.
+    assert "resolve_active_key" in section3, (
+        "§3's PL-1 encryption rule no longer names `resolve_active_key`. The carve-out is SCOPED — "
+        "the store cipher is OFF the archive seal and ON the full restore-verify's snapshot read — "
+        "and the seal's own key source has to stay stated for that scoping to mean anything."
+    )
+
+    # (0b) The forbidden-constructor list is hand-named, so pin each name to a real symbol. Without
+    # this a rename in store/ leaves an entry matching nothing and the arm below passes on a list of
+    # dead strings — the same shape of defect as the token scan this test replaces. Resolved by
+    # GETATTR rather than by scanning source text: this test's whole thesis is that a token scan
+    # answers the wrong question, and it would be answering the wrong one here too — a decorated or
+    # re-exported constructor has no literal `def name(` to find.
+    from messagefoundry.store import base, crypto, crypto_transit
+
+    _ctor_modules = (base, crypto, crypto_transit)
+    unresolved = sorted(
+        n
+        for n in _STORE_CIPHER_CTORS
+        if not any(callable(getattr(m, n, None)) for m in _ctor_modules)
+    )
+    assert not unresolved, (
+        f"_STORE_CIPHER_CTORS names {unresolved}, which no longer resolve to a callable in "
+        "messagefoundry.store.{base,crypto,crypto_transit}. Re-derive the store-cipher entry points "
+        "(or the module that holds them); a stale name guards nothing."
+    )
+
+    tree = _dr_backup_tree()
+
+    # (1) The archive codec is called ONLY from the seal/unseal region. A new sealing site added
+    # elsewhere lands in `outside` and reds, rather than escaping a region named once and forgotten.
+    codec_inside, codec_outside = _split_call_sites(tree, _MFBAK_CODEC_FUNCS, _ARCHIVE_CODEC_CALLS)
+    assert {_callee_name(c) for c in codec_inside} == _ARCHIVE_CODEC_CALLS, (
+        f"the instrument did not find both archive-codec entry points; it saw {_sites(codec_inside)}. "
+        "A guard that cannot see the thing it guards proves nothing by passing."
+    )
+    assert not codec_outside, (
+        f"pipeline/dr_backup.py seals or unseals a .mfbak outside the named codec region: "
+        f"{_sites(codec_outside)}. Add the function to _MFBAK_CODEC_FUNCS and re-derive §3's "
+        "carve-out for it."
+    )
+
+    # (2) The store cipher is constructed ONLY on the snapshot-read path. This is the prohibition the
+    # old token scan was written for, now scoped to where it is true.
+    cipher_inside, cipher_outside = _split_call_sites(
+        tree, _SNAPSHOT_READ_FUNCS, _STORE_CIPHER_CTORS
+    )
+    assert cipher_inside, (
+        "the instrument found no store-cipher construction anywhere in pipeline/dr_backup.py, so its "
+        "'none outside the snapshot-read path' result is vacuous. Re-derive which functions open the "
+        "extracted snapshot."
+    )
+    assert not cipher_outside, (
+        f"pipeline/dr_backup.py builds the STORE cipher outside the snapshot-read path: "
+        f"{_sites(cipher_outside)}. §3 says the `.mfbak` seal is keyed by resolve_active_key and NOT "
+        "by build_store_cipher, so `cipher_provider = vault_transit` never applies to the archive — "
+        "sealing with the store cipher makes that sentence false."
+    )
+
+
+#: A synthetic ``dr_backup`` in miniature for the self-test below: every function the guard names,
+#: each call in the region the guard permits. The clean arm must produce two empty ``outside``
+#: buckets, so each planted violation below is attributable to the one line it adds.
+_SEAL_GUARD_FIXTURE = """
+def _resolve_key():
+    return resolve_active_key(settings)
+
+def _do_backup():
+    key = _resolve_key()
+    return to_thread(self._build_archive_blocking, key=key)
+
+def _build_archive_blocking(key):
+    encrypt_stream(src, dst, key)
+
+def _verify_archive_blocking(keys):
+    decrypt_stream(src, dst, keys[0])
+
+def _full_open_check(snap, settings):
+    return open_store(settings)
+
+def _decrypt_check(snap, settings):
+    return build_store_cipher(settings)
+"""
+
+
+def _seal_guard_buckets(source: str) -> tuple[list[ast.Call], list[ast.Call]]:
+    """``(codec_outside, cipher_outside)`` — the two buckets the guard above renders its verdict on."""
+    tree = ast.parse(source)
+    _, codec_outside = _split_call_sites(tree, _MFBAK_CODEC_FUNCS, _ARCHIVE_CODEC_CALLS)
+    _, cipher_outside = _split_call_sites(tree, _SNAPSHOT_READ_FUNCS, _STORE_CIPHER_CTORS)
+    return codec_outside, cipher_outside
+
+
+def test_the_mfbak_seal_guard_reds_on_a_planted_violation() -> None:
+    """The planted-violation self-test this file's claim-truth banner requires, for the seal guard.
+
+    A guard that cannot fail is worse than none: it licenses the behaviour it appears to forbid. The
+    vacuity limb inside the guard proves the instrument SEES the archive codec; it does not prove a
+    misplaced call lands in ``outside``, which is what the verdict is actually read off. This plants
+    one, against a synthetic module rather than by editing ``pipeline/dr_backup.py``, so the proof
+    runs on every CI leg instead of once in the session that hand-mutated the engine.
+
+    The two violations are mutated in OPPOSITE directions and asserted to red DISJOINTLY, by COUNT.
+    Paired arms that both red prove only that something is wrong; requiring each arm to leave the
+    other bucket EMPTY is what shows the two limbs discriminate rather than co-firing on any change.
+    """
+    clean_codec, clean_cipher = _seal_guard_buckets(_SEAL_GUARD_FIXTURE)
+    assert not clean_codec and not clean_cipher, (
+        f"the self-test fixture is not clean to begin with (codec {_sites(clean_codec)}, cipher "
+        f"{_sites(clean_cipher)}), so neither planted violation below is attributable to its own line."
+    )
+
+    # (a) A seal that reaches for the store cipher: the prohibition the guard exists for.
+    seal_reaches = _SEAL_GUARD_FIXTURE.replace(
+        "    encrypt_stream(src, dst, key)",
+        "    encrypt_stream(src, dst, build_store_cipher(settings))",
+    )
+    codec_a, cipher_a = _seal_guard_buckets(seal_reaches)
+    assert len(cipher_a) == 1 and _callee_name(cipher_a[0]) == "build_store_cipher", (
+        f"a store cipher built inside _build_archive_blocking did not land outside the snapshot-read "
+        f"path; the guard would pass a seal keyed by the store cipher. Saw {_sites(cipher_a)}."
+    )
+    assert not codec_a, (
+        f"the codec limb co-fired on a store-cipher violation ({_sites(codec_a)}); the two limbs do "
+        "not discriminate, so neither red identifies its own cause."
+    )
+
+    # (b) A seal added outside the named region: the escape a region named once and forgotten allows.
+    stray_seal = (
+        _SEAL_GUARD_FIXTURE + "\ndef _sneaks_a_seal(key):\n    encrypt_stream(src, dst, key)\n"
+    )
+    codec_b, cipher_b = _seal_guard_buckets(stray_seal)
+    assert len(codec_b) == 1 and _callee_name(codec_b[0]) == "encrypt_stream", (
+        f"a .mfbak sealed from a function outside _MFBAK_CODEC_FUNCS did not land outside the codec "
+        f"region; a new sealing site would escape the guard. Saw {_sites(codec_b)}."
+    )
+    assert not cipher_b, (
+        f"the store-cipher limb co-fired on a stray-seal violation ({_sites(cipher_b)}); the two "
+        "limbs do not discriminate, so neither red identifies its own cause."
+    )
+
+
 def test_pl1_retention_covers_every_tier_it_lists() -> None:
     """The PL-1 retention/destruction bullet used to cover 8 of the 10 tiers it enumerates."""
     section3 = _section(3)

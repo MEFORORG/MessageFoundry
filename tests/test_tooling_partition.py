@@ -139,6 +139,16 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
+        # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` outside
+        # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose
+        # subject is a store module it reads rather than imports -- and it stays here for this file's
+        # standard gating reason, checked against the gate rather than assumed: what it catches is an
+        # eighteenth writer hand-rolling its own transaction, which arrives as a diff to
+        # messagefoundry/store/store.py, and the `tooling=true` predicate in ci.yml does not name
+        # `messagefoundry/` at all. Listed as tooling it would be deselected by `-m 'not tooling'` on
+        # the engine legs AND unreached by the tooling gate, so it would run on ZERO legs for the one
+        # change it exists to stop.
+        "test_writer_txn_is_the_only_begin.py",
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate

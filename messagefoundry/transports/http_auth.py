@@ -44,7 +44,12 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.tls_policy import InsecureHopRefused
+from messagefoundry.config.tls_policy import (
+    SYSTEM_TRUST_ANCHOR,
+    InsecureHopRefused,
+    TrustAnchor,
+    TrustAnchorPolicy,
+)
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 from messagefoundry.transports.rest import (
@@ -55,6 +60,7 @@ from messagefoundry.transports.rest import (
     cleartext_acceptance_from_settings,
     ech_readdressed_request,
     enforce_outbound_length_limits,
+    http_family_trust_anchor,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
 )
@@ -140,6 +146,12 @@ class OAuth2ClientCredentialsProvider:
         # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
         # (default) -> byte-identical.
         ech_sidecar: str | None = None,
+        # #1660 (#1180, ADR 0093): the client trust anchor for the TOKEN hop, already resolved against
+        # the token host by :func:`oauth2_cc_provider_from_settings`. Identical reasoning to the SMART
+        # sibling in smart.py -- the data hop has carried one since #1180 and the hop that carries the
+        # client_secret did not. The default is the OS trust store, so a direct test construction and
+        # an unconfigured instance are byte-identical.
+        trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
     ) -> None:
         if not token_url:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_token_url' setting")
@@ -200,9 +212,16 @@ class OAuth2ClientCredentialsProvider:
         token_proxy = (
             proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
         )
+        # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
+        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
+        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
+        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
         self._opener: urllib.request.OpenerDirector = (
-            _no_redirect_opener(*token_proxy.opener_handlers())
-            if token_proxy is not None
+            _no_redirect_opener(
+                *(token_proxy.opener_handlers() if token_proxy is not None else ()),
+                trust_anchor=trust_anchor,
+            )
+            if token_proxy is not None or trust_anchor.narrows
             else _NO_REDIRECT_OPENER
         )
         self._proxy_auth: dict[str, str] = (
@@ -318,21 +337,29 @@ class OAuth2ClientCredentialsProvider:
 
 
 def oauth2_cc_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
+    s: Mapping[str, Any],
+    *,
+    proxy: ProxyConfig | None = None,
+    ech_sidecar: str | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
     when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
     any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
     token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
     re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
-    construction."""
+    construction.
+
+    ``trust_anchor_policy`` (#1660) is the instance-wide ``[tls]`` policy the caller already holds, off
+    its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
     if not s.get("oauth2_token_url"):
         return None
     if not s.get("oauth2_enabled", True):
         return None
     _accepted = cleartext_acceptance_from_settings(s)
+    token_url = str(s.get("oauth2_token_url") or "")
     return OAuth2ClientCredentialsProvider(
-        token_url=str(s.get("oauth2_token_url") or ""),
+        token_url=token_url,
         client_id=str(s.get("oauth2_client_id") or ""),
         client_secret=str(s.get("oauth2_client_secret") or ""),
         scope=(str(s["oauth2_scope"]) if s.get("oauth2_scope") else None),
@@ -352,11 +379,22 @@ def oauth2_cc_provider_from_settings(
         connection=_accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
+        # #1660: resolved against the TOKEN url, not the connection's data url -- the authorization
+        # server is frequently a different host from the REST/SOAP endpoint, and both the loopback
+        # exemption and the internal-vs-public decision key on the host actually being dialled. The
+        # connection's own ``tls_ca_file`` still wins verbatim, exactly as it does on the data hop.
+        trust_anchor=http_family_trust_anchor(
+            s, url=token_url, trust_anchor_policy=trust_anchor_policy
+        ),
     )
 
 
 def bearer_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
+    s: Mapping[str, Any],
+    *,
+    proxy: ProxyConfig | None = None,
+    ech_sidecar: str | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> BearerTokenProvider | None:
     """The active bearer-token provider for an HTTP destination, or ``None`` when none is configured
     (byte-identical). Unifies the SMART Backend Services provider (ADR 0024, asymmetric JWT) and the
@@ -365,7 +403,9 @@ def bearer_provider_from_settings(
     :class:`HttpAuthError` (a connection has exactly one identity). ``proxy`` (ADR 0126) routes whichever
     provider's token-endpoint call through the connection's forward proxy; ``ech_sidecar`` (#1176,
     ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead, so the ECH connection's
-    token hop stops leaking the authorization server's SNI while its payload hop is routed."""
+    token hop stops leaking the authorization server's SNI while its payload hop is routed.
+    ``trust_anchor_policy`` (#1660) likewise reaches whichever provider is built, so the token hop
+    verifies against the same instance ``[tls]`` anchor the delivery hop has used since #1180."""
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
@@ -377,8 +417,10 @@ def bearer_provider_from_settings(
             "(mutually exclusive — configure exactly one)"
         )
     return token_provider_from_settings(
-        s, proxy=proxy, ech_sidecar=ech_sidecar
-    ) or oauth2_cc_provider_from_settings(s, proxy=proxy, ech_sidecar=ech_sidecar)
+        s, proxy=proxy, ech_sidecar=ech_sidecar, trust_anchor_policy=trust_anchor_policy
+    ) or oauth2_cc_provider_from_settings(
+        s, proxy=proxy, ech_sidecar=ech_sidecar, trust_anchor_policy=trust_anchor_policy
+    )
 
 
 #: Digest algorithms this engine will answer a challenge with (BACKLOG #1171, ASVS 11.4.1). The

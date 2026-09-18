@@ -498,7 +498,11 @@ def test_known_security_keys_load_clean(tmp_path: Path, caplog: pytest.LogCaptur
 def test_open_egress_gate_counts_smtp_and_direct_when_deny_by_default_is_unset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """[egress] declares EIGHT allowed_* lists; the gate used to count six.
+    """[egress] declares EIGHT allowed_* DESTINATION lists; the gate used to count six.
+
+    (`allowed_proxy` is a ninth allowed_* key and is not one of them — it gates a transport
+    intermediary, not a destination, so it must never satisfy this gate. BACKLOG #1659.)
+
 
     A mail-only or Direct-only PHI instance could enumerate every destination it actually uses and
     still be refused as "UNRESTRICTED", with nothing in the refusal naming the two lists that did not

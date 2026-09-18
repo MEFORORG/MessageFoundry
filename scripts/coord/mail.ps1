@@ -518,7 +518,13 @@ if ($Send) {
         # answer, which is worse than silence because it looks like the check was performed.
         Write-Host "  Read that file to see what became of it. disposition 'shown-consumed' or"
         Write-Host "  'shown-held' means it was rendered; 'expired-unshown' means it reached its TTL"
-        Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet."
+        Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet, OR the"
+        Write-Host "  receipt is older than the drain's retention window and has been swept."
+        # THE SECOND HALF OF THAT LAST LINE IS NOT HEDGING. The drain sweeps receipts/ of files past
+        # RETAIN_DAYS, so an absent receipt stopped meaning one thing the day that sweep shipped. A
+        # sender reading the old sentence a week later would conclude their message was never drained,
+        # which is a false statement rather than a missing one -- the failure the sweep's own guards
+        # exist to prevent, one file over. Read it within the window, or not at all.
         Write-Host ""
     }
     if (@($written | Where-Object { $_.Status -ne 'queued' }).Count -gt 0) { exit 1 }
