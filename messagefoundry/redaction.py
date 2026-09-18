@@ -183,6 +183,21 @@ def _safe_suffixes(base: str) -> str:
     return "".join(reversed(kept))
 
 
+#: The password ``http.client`` quotes as a "port" when an endpoint URL carries userinfo: its
+#: ``InvalidURL("nonnumeric port: 'PW@host'")`` (BACKLOG #1793; the mechanism is on
+#: ``transports/rest.py`` ``refuse_url_credentials``). It is a CREDENTIAL, not PHI. It lives here
+#: because :func:`redact` is the one pass that the stored error, the log chain and the support bundle
+#: all run.
+#:
+#: The span runs to the LAST ``@`` because a decoded ``%40`` puts an ``@`` inside the password, and it
+#: admits quotes and spaces because ``http.client`` formats with ``'%s'``, not ``repr``. The host after
+#: the ``@`` is kept so the diagnostic still says where. The bound is load-bearing on
+#: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
+#: A password tail longer than the bound is NOT matched -- the construction-time refusal in
+#: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
+_INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+
+
 def redact(text: str) -> str:
     """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs, then apply a
     conservative free-text heuristic for delimiter-free identifiers. Conservative (errs toward over-
@@ -197,6 +212,7 @@ def redact(text: str) -> str:
     matches any pattern, so ``redact(redact(x)) == redact(x)``."""
     if not text:
         return text
+    text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
