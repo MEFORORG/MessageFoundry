@@ -149,9 +149,13 @@ target, no `pickle` import left to mis-suppress:
   and — since the 2026-08-04 amendment — a transform result with `_partition`'s own logic, the shared
   `wiring.handler_result_items` rule. A **container** return (list, tuple, set, generator) is described
   element-wise, so both modes deliver the **same `Send`s, into the same three partitions**; anything
-  that rule does not recognise as a container stays a single item, and an item `_partition` would ignore
-  is **described rather than omitted**, so it still drops and a `Send` **subclass** still delivers,
-  byte-identically to `mode=off`. The materialization runs inside the child's `with run_contexts(...)`,
+  that rule does not recognise as a container stays a single item, and a `Send` **subclass** still
+  delivers, byte-identically to `mode=off`. **Amended 2026-09-14 (BACKLOG #1687):** this bullet said an
+  item `_partition` would ignore is *"described rather than omitted, so it still drops"*. Neither side
+  ignores one any more — both test admissibility against one shared rule
+  (`wiring.handler_item_fault`) and **raise**, so the `Ignored` placeholder and its `"other"` wire tag
+  are gone and the grammar closed to three item tags. Parity is unchanged and is now over the verdict
+  as well as the partitions. The materialization runs inside the child's `with run_contexts(...)`,
   so a **generator Handler's** lazily-executed body sees the same run-scoped providers (`code_set`,
   `state_get`, …) it sees under `mode=off` — materialising it later, at describe time, would make those
   raise under `mode=subprocess` only.
@@ -260,15 +264,24 @@ target, no `pickle` import left to mis-suppress:
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (it previously dead-lettered every message), and SHALL preserve
   `_partition` parity for **every** return shape — where, since the 2026-08-04 amendment, a
-  tuple/set/generator of `Send`s **delivers** in both modes (BACKLOG #341), a `Send` subclass still
-  delivers, and a non-iterable unrecognized value (a bare `int`, a `__reduce__` gadget) still drops.
-  Parity is over the **multiset** of items in each of the three partitions, plus their **order for an
-  ordered container**; a `set` return has no defined iteration order in either mode, so its fan-out
-  order is explicitly **not** covered by this SHALL (see the Result-parity bullet).
+  tuple/set/generator of `Send`s **delivers** in both modes (BACKLOG #341) and a `Send` subclass still
+  delivers. Parity is over the **multiset** of items in each of the three partitions, plus their
+  **order for an ordered container**; a `set` return has no defined iteration order in either mode, so
+  its fan-out order is explicitly **not** covered by this SHALL (see the Result-parity bullet).
+  **Amended 2026-09-14 (BACKLOG #1687).** This criterion read *"and a non-iterable unrecognized value
+  (a bare `int`, a `__reduce__` gadget) still drops"*. It no longer drops in either mode: both sides
+  now test admissibility against the one shared rule (`wiring.handler_item_fault`) and **raise** — the
+  parent a `ValueError` from `_partition`, the child a codec rejection its parent re-raises as
+  `SandboxError` — so the transform stage records `ERROR`/dead-letter instead of a `FILTERED` that
+  reads as a deliberate decline. The SHALL itself is unchanged: parity is still over every shape, and
+  the shapes that moved moved in BOTH modes together, which is the property this criterion exists to
+  hold.
   WHERE the Handler is a **generator**, its body SHALL execute inside the child's run context, so a
   run-scoped accessor within it resolves as it does under `mode=off` rather than raising.
   → `tests/test_sandbox.py::test_generator_router_routes_under_mode_subprocess`,
   `tests/test_sandbox_codec.py::test_partition_parity_table`,
+  `tests/test_sandbox_codec.py::test_partition_parity_table_rejects`,
+  `tests/test_sandbox_codec.py::test_an_empty_dict_return_still_filters`,
   `tests/test_sandbox.py::test_a_generator_handler_delivers_under_mode_subprocess`,
   `tests/test_sandbox.py::test_a_generator_handlers_body_runs_inside_the_childs_run_context`,
   `tests/test_sandbox_codec.py::test_handler_result_items_treats_a_str_as_a_single_value`

@@ -36,6 +36,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination, build_source
+from messagefoundry.transports import x12 as x12_mod
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.x12 import X12Destination, X12Source
 
@@ -202,16 +203,25 @@ async def test_destination_no_reply_returns_when_not_expecting_one() -> None:
 
 async def test_destination_expect_reply_reads_returned_interchange() -> None:
     reply = _interchange(sender="ACK")
+    received: list[bytes] = []
 
     async def handler(raw: bytes) -> str:
+        received.append(raw)
         return reply  # written back verbatim on the same connection
 
     source = _source()
     await source.start(handler)
     try:
-        await _dest(source.sockport, expect_reply=True).send(EDI)
+        # The legacy expect_reply confirmation is CONSUMED, not captured: send() returns None even
+        # though a complete interchange came back. capture_response (ADR 0016) is the knob that
+        # hands one back as a DeliveryResponse, and test_x12_rte.py covers that path.
+        assert await _dest(source.sockport, expect_reply=True).send(EDI) is None
     finally:
         await source.stop()
+    # Settled by the time send() returns, because the source awaits the handler before writing the
+    # reply: the interchange reached the peer verbatim. That the destination BLOCKS for the reply is
+    # the sibling test below, which raises DeliveryError when none is sent.
+    assert received == [EDI.encode("utf-8")]
 
 
 async def test_destination_expect_reply_times_out_when_none_sent() -> None:
@@ -250,6 +260,96 @@ async def test_source_drops_oversize_interchange() -> None:
     finally:
         await source.stop()
     assert received == []
+
+
+# --- the reply write is bounded ----------------------------------------------
+
+
+class _StalledPeer:
+    """A sender that takes the reply bytes and then never drains them.
+
+    A fake rather than a real socket: wedging a real loopback peer means filling its receive window,
+    which takes hundreds of KiB of a size the OS picks, so the wedge would be slow and
+    platform-dependent. The bound under test is on ``drain()``, and this reproduces exactly that.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        # TEST-NET-2 (RFC 5737) — a documentation address, never a routable one.
+        return ("198.51.100.7", 2575) if name == "peername" else default
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        await asyncio.sleep(3600)  # the peer is not reading; nothing here ever completes
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+class _OneInterchangeThenSilent:
+    """Hands over one complete interchange, then holds the connection open without reaching EOF."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, _n: int) -> bytes:
+        if self._data:
+            chunk, self._data = self._data, b""
+            return chunk
+        await asyncio.sleep(3600)
+        return b""
+
+
+async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sender that stops reading must not pin the connection or the slot it holds.
+
+    ``receive_timeout`` bounds the READ. The reply write's ``drain()`` was unbounded, so a peer whose
+    receive window filled while it kept the connection open would hold its ``max_connections`` slot
+    for as long as it liked, with nothing to time it out. ``X12Destination``'s own drains were
+    already bounded by ``self.timeout``, so the inbound reply was the outlier, not the convention.
+
+    Unlike the MLLP and raw-TCP listeners, ``X12Source`` emits no ADR 0021 ``connection_event`` at
+    all, so there is no ``peer_reset`` to assert here — the slot and the socket are the evidence.
+    """
+    # The release the fix rides on, asserted rather than assumed: were TimeoutError to stop being an
+    # OSError, _on_client's existing arm would miss it and the slot would leak, while the outcome
+    # assertions below could still pass on a cancelled task.
+    assert issubclass(TimeoutError, OSError)
+
+    async def reply_handler(raw: bytes) -> str:
+        return _interchange(sender="ACKSENDER")  # a verbatim 997/TA1-shaped reply
+
+    source = _source(max_connections=1)
+    await source.start(reply_handler)
+    # Bound the reply write ONLY. Shrinking _CLIENT_SHUTDOWN_GRACE instead would also shrink the
+    # teardown measured at the end, and a stop() that returned fast because its own grace was 0.05 s
+    # would say nothing about the connection.
+    monkeypatch.setattr(x12_mod, "_REPLY_DRAIN_GRACE", 0.05)
+    peer = _StalledPeer()
+    try:
+        client = asyncio.create_task(
+            source._on_client(_OneInterchangeThenSilent(EDI.encode("utf-8")), peer)  # type: ignore[arg-type]
+        )
+        # Unbounded, this never returns. The 2 s is how the regression FAILS, not the assertion.
+        await asyncio.wait_for(client, timeout=2.0)
+        assert peer.closed  # dropped, not left open on a peer that had stopped reading
+        assert source._active == 0  # ... and the max_connections slot went back
+    finally:
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+        elapsed = asyncio.get_running_loop().time() - started
+    # Nothing was left in flight, so stop() must not have spent its shutdown grace waiting. The
+    # threshold is deliberately well UNDER _CLIENT_SHUTDOWN_GRACE (5.0) rather than equal to it:
+    # the wait_for above already raises at 5.0, so `elapsed < 5.0` could never fail and would pin
+    # nothing. 2 s leaves a wide margin for a slow runner while still catching a teardown that waits.
+    assert elapsed < 2.0
 
 
 # --- registry build ----------------------------------------------------------

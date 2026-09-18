@@ -150,6 +150,7 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
     "dead_letter_missing_destinations": (1, 0),
     "dead_letter_missing_handlers": (1, 0),
+    "dead_letter_missing_inbounds": (1, 0),
     "replay": (1, 0),
     "replay_dead": (1, 0),
     "cancel_queued": (1, 0),
@@ -194,6 +195,10 @@ _UNGUARDED_REASONS: dict[str, str] = {
         " not silently skipped."
     ),
     "dead_letter_missing_handlers": "ADR 0157 D11: the twin of dead_letter_missing_destinations.",
+    "dead_letter_missing_inbounds": (
+        "ADR 0157 D11: the third lane key, same standing as its two siblings — also writes over"
+        " PENDING rows, runs only from _start_graph, and the successor re-runs the identical sweep."
+    ),
     "replay": "Operator action. Guarding it would leave an operator on a standby unable to act.",
     "replay_dead": (
         "Operator action, as replay: it revives a DEAD row to PENDING, which is re-pend direction, not a"

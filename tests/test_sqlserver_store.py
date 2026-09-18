@@ -470,6 +470,30 @@ async def test_totp_store_contract(store) -> None:
     await _assert_totp_contract(store)
 
 
+async def test_lockout_store_contract(store) -> None:
+    """The account-lockout counter on the real SQL Server backend.
+
+    ``increment_login_failure`` collapsed a read-modify-write that let parallel failures each read the
+    same pre-increment count and evade the lockout. This leg is the only thing that executes its
+    UPDLOCK body at all -- the shared contract is otherwise proven on SQLite, where the row lock this
+    backend needs does not exist."""
+    from tests._lockout_store_contract import _assert_lockout_contract
+
+    await _assert_lockout_contract(store)
+
+
+async def test_pending_approval_store_contract(store) -> None:
+    """BACKLOG #1540 ``pending_approvals.requester_user_id`` on the real SQL Server backend.
+
+    This backend is the one where getting the migration wrong is SILENT: the ADR 0064 schema marker
+    skips the whole batch once it matches, so an ``ALTER`` placed outside ``_SCHEMA`` never runs and
+    the column simply never appears. ``test_store_schema_hash.py`` pins the DDL text; only this leg
+    proves the column is really there and that the ``INSERT``/``SELECT`` carry it."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real SQL Server backend.
 
@@ -986,6 +1010,24 @@ async def test_dead_letter_missing_handlers_errors_the_message(store) -> None:
     )
     assert await store.dead_letter_missing_handlers({"OtherHandler"}, now=200.0) == 1
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+
+
+async def test_dead_letter_missing_inbounds_errors_the_message(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
 
 
 async def test_transform_state_persists_and_reloads_on_reopen(store) -> None:
@@ -1942,6 +1984,84 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         assert (await keyed.list_dead())[0]["last_error"] == fail
     finally:
         await keyed.close()
+
+
+async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:
+    """BACKLOG #1723: the no-key -> key open must seal ``state.value`` on THIS backend too.
+
+    ``state`` is the cell the static parity guard could not see here, because SQL Server writes it
+    with ``MERGE`` and ``tests/test_store_cipher_sweep_parity.py`` scoped itself with ``INSERT INTO``
+    alone. The scan is widened there; this is the runtime half, and it is separate from
+    ``test_legacy_plaintext_error_detail_migrated_on_open`` above because ``state`` reaches the sweep
+    through the COMPOSITE-PK pass rather than the id-keyed ``_CIPHER_COLUMNS`` loop that test drives —
+    a pass dropped from one is invisible to the other.
+
+    ``state`` carries transform state, which is PHI-bearing by design — that is why
+    ``test_keyless_open_of_encrypted_state_fails_closed`` exists — so leaving it plaintext through a
+    keying is the defect this pins.
+    """
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    key = b"s" * 32
+    try:
+        # (1) KEYLESS: the MERGE lands the value as plaintext at rest.
+        plain = await SqlServerStore.open(settings)
+        try:
+            mid, ing = await _ingress_and_claim(plain, "IB", RAW)
+            await plain.route_handoff(
+                ingress_id=ing.id,
+                message_id=mid,
+                channel_id="IB",
+                handlers=[("H", RAW)],
+                disposition=MessageStatus.ROUTED,
+                now=100.0,
+            )
+            rtd = await plain.claim_next_fifo("IB", stage=Stage.ROUTED.value, now=100.0)
+            await plain.transform_handoff(
+                routed_id=rtd.id,
+                message_id=mid,
+                channel_id="IB",
+                deliveries=[("OB", "b")],
+                state_ops=[("ns", "k", {"mrn": "M-LEGACY-STATE"})],
+                now=100.0,
+            )
+            rows = await plain._fetchall("SELECT value FROM state")
+            # A NEGATIVE assert, so it must exclude EVERY marker version: a v1-only spelling passes
+            # on an encrypted v2 value and would make this whole setup vacuous. Over EVERY row, not
+            # row 0: the CI database is shared, so which row comes back first is not this test's to
+            # decide, and a `rows[0]` spelling would pass while a sibling row stayed plaintext.
+            assert rows and all(not r["value"].startswith(MARKER_PREFIX) for r in rows), rows
+        finally:
+            await plain.close()
+
+        # (2) Re-open WITH a key: open() runs _encrypt_existing_rows over the legacy plaintext.
+        keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(key))
+        try:
+            rows = await keyed._fetchall("SELECT value FROM state")
+            assert rows and all(r["value"].startswith(MARKER_PREFIX) for r in rows), (
+                f"state.value is still plaintext at rest after a keyed reopen: {rows}"
+            )
+            assert all("M-LEGACY-STATE" not in r["value"] for r in rows), rows
+            # ... and the read path still returns the original cleartext through the new key.
+            assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
+        finally:
+            await keyed.close()
+    finally:
+        # Shared-DB hygiene, even on assertion failure: state sealed under this test's key makes the
+        # next KEYLESS fixture open fail closed inside _load_state_cache, cascading setup ERRORs
+        # across every later test in the run.
+        cleanup = await SqlServerStore.open(settings, cipher=AesGcmCipher(key))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                cur = await conn.cursor()
+                for table in ("message_events", "state", "response", "queue", "messages"):
+                    await cur.execute(f"DELETE FROM {table}")
+                await conn.commit()
+        finally:
+            await cleanup.close()
 
 
 # --- ADR 0006 reference snapshots (BACKLOG #235) — the T-SQL port proof --------------------------

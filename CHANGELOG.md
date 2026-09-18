@@ -62,6 +62,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   and BACKLOG #1279.
 
 ### Changed
+- **Setting `[integrity].fail_closed_on_drift` on an editable install now says so at startup, and two
+  claims about startup attestation are corrected.** An install that declares itself editable is exempt
+  from attestation by design, so a dev checkout is never bricked. That exemption silently cancels the
+  fail-closed opt-in, and the code path returned with no log, no audit row and no alert -- so a first
+  deployment that opted into hard enforcement on an editable install would have started with its
+  tripwire disarmed and nothing in the boot log to read. It now logs a WARNING naming the reason. **This
+  reports a misconfiguration; it closes no hole** -- an actor who can write the virtual environment can
+  plant the editable marker or rewrite the check in the same single write. AC-12's exemption is
+  unchanged: still no refusal, no audit row, no alert, and silence under the default alert-only posture.
+  Two ADR 0041 D3 claims were false in the shipped code and are narrowed rather than left standing: the
+  non-editable hash-locked wheel is a **recommended** production default, not an enforced one (nothing
+  in the engine refuses an editable install), and attestation runs **at startup only** -- there is no
+  on-demand surface, no `attest` CLI subcommand and no API route. ADR 0041 D3 also now records the
+  resolution of the baseline's trust domain: the wheel's own `RECORD` stays the baseline, no runtime
+  out-of-domain anchor is adopted, and the control detects an *inconsistent* in-place edit and not a
+  *consistent* one. (BACKLOG #1679)
 - **An Active Directory login is now identified by the directory's immutable id, not by
   `sAMAccountName`.** A directory frees a deleted account's name and may reissue it to a different
   person. The engine resolved an AD principal by that name, so a recycle without a matching
@@ -317,6 +333,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
 
 ### Fixed
+- **`audit-verify` accepted a zero-byte database, wrote a schema into it, and reported a clean chain
+  of nothing.** The existing guard on `audit-verify`, `audit-anchor` and `rekey-audit` only asked
+  whether the `--db` path *existed*. A zero-byte file exists and is a valid, empty SQLite database —
+  what a `touch` in an install script, a failed copy or a log-rotation mistake leaves behind — so it
+  walked past the guard, `open_store` migrated 372,736 bytes of schema **into the file that was
+  meant to be the evidence**, and the command printed `OK: verified 0 audit row(s)` and exited 0. A
+  scheduled compliance job reads the exit code, so a first deployment with one would have reported
+  OK forever while the real audit log went unchecked. All three subcommands now probe the path over
+  a **read-only** SQLite handle before the store opens — it can neither create the file nor migrate
+  it — and exit **2** when there is no `audit_log` table, naming which of absent, zero-byte or
+  not-a-database it found.
+  **`audit-verify` also splits "verified nothing" out of its success code:** a clean walk over an
+  empty log is now exit **3**, and `--allow-empty` (new) turns that back into 0, as does an expected
+  anchor of `0:`, which asserts emptiness and is checked. Exit 1 stays a BROKEN CHAIN, so a job can
+  no longer read an empty log as detected tamper. `audit-anchor` keeps exit 0 on a real store whose
+  log is legitimately empty — sealing a fresh instance as `0:` is a supported workflow — and refuses
+  only the non-audit-database paths. ([BACKLOG #1669](docs/BACKLOG.md))
+- **`verify --smoke self` reported PASS on a synthetic message the config would have dropped.**
+  `smoke_self` failed only on `DryRunResult.error`, which `dry_run` sets for a parse failure, a
+  strict-validation failure or a Router/Handler raise. `UNROUTED` (the Router selected no handler) and
+  `FILTERED` (Handlers ran and sent nothing, including a sole destination that is
+  present-but-not-deployed) carry `error=None`, so the disposition was written into the row's summary
+  and never gated on. A deploying site whose Router matched nothing, or whose only outbound was not
+  yet deployed, would read a green acceptance report off a message the engine would have dropped. The
+  row now PASSES only on a delivering outcome and otherwise FAILs, naming the disposition and the
+  handler/delivery counts. That is the verdict `_classify_disposition` already reaches for the **live**
+  smoke on the **same** synthetic message, so the two halves of `verify` no longer answer one question
+  two ways; an unrecognised disposition fails closed instead of falling through to PASS. **Visible
+  change:** a config whose Router declines the fixed synthetic `ADT^A01` from `MAINHOSP` now reds this
+  row, and the failure text says to point `--inbound` at a connection that takes one. The happy-path
+  test asserted `"deliveries=" in detail`, which `deliveries=0` also satisfies, so neither the defect
+  nor the `FAIL` branch had a covering test; both do now.
+  ([BACKLOG #1707](docs/BACKLOG.md))
 - **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
   `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
   the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a

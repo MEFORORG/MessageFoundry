@@ -18,12 +18,20 @@ name: Scorecard
 # github/codeql-action/upload-sarif alike. This was a PINNING CAVEAT saying the latter two were "on
 # version tags pending a SHA-pin lookup"; that was true when written and has been false since they
 # were pinned. It also named actions/upload-artifact, which this workflow no longer uses.
+#
+# NO `push:` ARM, DELETED DELIBERATELY AND NOT AN OVERSIGHT. It read `push: branches: [main]`, and
+# against roughly 23 merges a day that turned a workflow declaring a WEEKLY cron into 167 runs a week
+# -- about 164 of them measuring a posture that had not moved. Scorecard scores repository hygiene
+# (Pinned-Dependencies, Token-Permissions, Branch-Protection, Maintained), which changes on the scale
+# of a policy edit, not of a merge. NO SCAN IS DROPPED: the weekly cron still produces the badge and
+# the SARIF, `branch_protection_rule` still fires on the one event most likely to move the score, and
+# `workflow_dispatch` re-runs it on demand. The saving is runner SLOTS, which is the contended
+# resource here -- this account's peak concurrency is 20, the free-plan ceiling, and a merge-queue
+# entry waits behind anything holding one.
 on:
   branch_protection_rule:
   schedule:
     - cron: "0 8 * * 1" # weekly (Mon 08:00 UTC)
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions: read-all

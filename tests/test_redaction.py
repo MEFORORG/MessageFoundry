@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PHI redaction on the exception/logging path (WP-6c, ASVS 16.2.5 / PHI.md P1-3): redact() scrubs
-HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message."""
+HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message;
+safe_name() derives a safe label for a partner-chosen file name, which redact() is measured blind to
+(BACKLOG #1748)."""
 
 from __future__ import annotations
 
@@ -9,9 +11,10 @@ import re
 import time
 
 import pytest
+from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
 from messagefoundry import redaction
-from messagefoundry.redaction import redact, safe_exc, safe_text
+from messagefoundry.redaction import redact, safe_error, safe_exc, safe_name, safe_text
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -288,3 +291,229 @@ def test_the_linear_scan_guard_does_not_change_what_is_redacted(line: str) -> No
     assert redaction._HL7_FIELD_RUN.sub("[redacted]", line) == _PRE_GUARD_FIELD_RUN.sub(
         "[redacted]", line
     )
+
+
+# --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_redact_is_blind_to_an_identifier_shaped_file_name(name: str) -> None:
+    """The measurement this fix rests on, pinned so it cannot quietly change meaning.
+
+    ``_NAME_RUN`` needs ``\\s+`` between its tokens and ``_DATE_RUN`` needs a word boundary before the
+    digits; a file name supplies neither, so all three of these pass through untouched. The control
+    below proves the same chain is not simply inert."""
+    line = f"file {name} exceeds max_file_bytes (10); routing to error dir"
+    assert redact(line) == line
+
+
+def test_redact_control_a_whitespace_name_with_a_delimited_date_is_caught() -> None:
+    """The positive control for the test above. Without it, ``redact(line) == line`` would be equally
+    consistent with a redactor that had stopped working altogether."""
+    line = "file DOE JANE 1980-05-05.hl7 exceeds max_file_bytes (10); routing to error dir"
+    out = redact(line)
+    assert "DOE JANE" not in out and "1980-05-05" not in out
+    assert out.count("[redacted]") == 2
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_name_drops_every_identifier_shape(name: str) -> None:
+    label = safe_name(name)
+    assert name not in label
+    for token in ("MRN123456789", "DOE", "JANE", "19800505", "100001"):
+        assert token not in label
+    assert re.fullmatch(r"\[name:[0-9a-f]{12}\.hl7\]", label)
+
+
+def test_safe_name_is_stable_and_distinguishing() -> None:
+    """Both halves are the point: stable, so an operator recognises the same stuck file across polls;
+    distinguishing, so two files in one directory are not one line."""
+    assert safe_name("a.hl7") == safe_name("a.hl7")
+    assert safe_name("a.hl7") != safe_name("b.hl7")
+
+
+def test_safe_name_keeps_a_double_extension_so_the_gzip_mode_stays_legible() -> None:
+    assert safe_name("msg1.hl7.gz").endswith(".hl7.gz]")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_suffix"),
+    [
+        ("patient.MRN123456789", "]"),  # not a format marker, so nothing is carried through
+        ("drop.2026_MRN00042", "]"),  # nor this
+        ("plainname", "]"),  # no extension at all
+        ("msg.HL7", ".hl7]"),  # recognised case-insensitively, emitted lower-cased
+        ("msg.hl7", ".hl7]"),
+    ],
+)
+def test_safe_name_only_carries_a_known_format_marker(name: str, expected_suffix: str) -> None:
+    """The extension is the one part of a partner's name that passes through, so it is an allowlist."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+# --- the suffix allowlist: a length bound let a dotted identifier through (BACKLOG #1748) ------
+#
+# Measured on the pre-fix `_SAFE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,8}\Z")`: any segment of eight
+# or fewer alphanumerics qualified as an "extension", and a dotted identifier is exactly that. Nine
+# characters failed the bound and eight passed it, so it separated a long identifier from a short one
+# rather than an identifier from an extension. Each value below is SYNTHETIC.
+
+#: A partner-chosen name whose trailing dotted segment is an identifier, paired with the fragment the
+#: pre-fix code carried into the log line. Reverting the allowlist turns every one of these red.
+LEAKED_DOTTED_IDENTIFIERS = [
+    ("ACC.12345678.hl7", "12345678"),  # an 8-digit accession
+    ("patient.MRN12345.hl7", "MRN12345"),  # an MRN token
+    ("DOE.19800505.hl7", "19800505"),  # a birthdate `_DATE_RUN` exists to catch
+    ("A.87654321.txt", "87654321"),
+]
+
+#: Names the product itself builds or ingests, whose marker MUST still reach the log line. These are
+#: the control arm: they pass before and after the fix, so a red one means the fix over-reached.
+KEPT_FORMAT_MARKERS = [
+    ("report.hl7.gz", ".hl7.gz]"),  # the FILE destination's own gzip-mode name
+    ("x.dcm", ".dcm]"),
+    ("scan.xml", ".xml]"),
+    ("note.txt", ".txt]"),
+    ("msg1.hl7", ".hl7]"),
+]
+
+
+@pytest.mark.parametrize(("name", "leaked"), LEAKED_DOTTED_IDENTIFIERS)
+def test_safe_name_drops_a_dotted_identifier_that_a_length_bound_admitted(
+    name: str, leaked: str
+) -> None:
+    """A dotted segment is kept only when it IS a format marker, so an identifier that happens to be
+    short contributes nothing. On a first deployment the pre-fix code would have written the fragment
+    asserted absent here into the general application log."""
+    label = safe_name(name)
+    assert leaked not in label
+    # And what IS kept is the real marker, not simply everything dropped.
+    assert label.endswith(f".{name.rsplit('.', 1)[-1]}]")
+
+
+@pytest.mark.parametrize(("name", "expected_suffix"), KEPT_FORMAT_MARKERS)
+def test_safe_name_keeps_the_format_markers_the_product_reads_and_writes(
+    name: str, expected_suffix: str
+) -> None:
+    """The compatibility arm of the control above. ``.hl7.gz`` is the load-bearing one: the FILE
+    destination appends ``.gz`` to the rendered name in gzip mode, so collapsing it to ``.gz`` would
+    lose which format the operator is looking at."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+def test_safe_name_suffix_is_a_literal_from_the_allowlist_never_partner_bytes() -> None:
+    """The property the length bound could not state: the label's suffix is a concatenation of at most
+    two literals from a fixed set, so nothing a partner chose survives the digest — not even a segment
+    that looks like an extension."""
+    for name, _ in [*LEAKED_DOTTED_IDENTIFIERS, ("weird.MRN1.Z9", "")]:
+        suffix = safe_name(name).removeprefix("[name:")[12:].removesuffix("]")
+        parts = [f".{p}" for p in suffix.split(".") if p]
+        assert len(parts) <= redaction._SAFE_SUFFIX_MAX
+        assert all(p in redaction._SAFE_SUFFIXES for p in parts)
+
+
+def test_safe_name_allowlist_covers_every_format_the_engine_discriminates() -> None:
+    """The drift gate the allowlist's own comment promises. ``redaction`` is pure stdlib by design and
+    cannot import ``parsing``, so the entries are duplicated literals; this asserts the duplication
+    stays a superset of the source maps rather than silently falling behind one."""
+    from messagefoundry.parsing import sniff
+    from messagefoundry.uploads import _ALLOWED_UPLOAD_EXTENSIONS
+
+    for source in (
+        sniff._EXTENSION_CONTENT_TYPE,
+        sniff._EXTENSION_MAGIC,
+        _ALLOWED_UPLOAD_EXTENSIONS,
+    ):
+        assert set(source) <= redaction._SAFE_SUFFIXES
+
+
+def test_log_capture_helper_marker_list_matches_the_allowlist() -> None:
+    """``_phi_log_capture`` keeps its own copy of the markers on purpose — it decides what is stripped
+    out of a log line before that line is scanned for an identifier, so deriving it from the module it
+    is grading would let a widened allowlist widen the strip. Independent, but not free to rot."""
+    assert {f".{s}" for s in SAFE_NAME_SUFFIXES} == redaction._SAFE_SUFFIXES
+
+
+def test_safe_name_takes_the_basename_so_a_path_never_leaks() -> None:
+    """Callers pass a basename today, but a directory component can itself embed an identifier, so the
+    helper is total rather than trusting its callers."""
+    label = safe_name("/drops/MRN123456789/ADT_DOE_JANE.hl7")
+    assert "MRN123456789" not in label and "DOE" not in label
+    assert safe_name("C:\\drops\\ADT_DOE_JANE.hl7") == safe_name("ADT_DOE_JANE.hl7")
+
+
+@pytest.mark.parametrize("name", [*IDENTIFIER_SHAPED_NAMES, "msg1.hl7.gz", "plainname"])
+def test_safe_name_output_survives_the_redactor_unchanged(name: str) -> None:
+    """The label is emitted INTO a log line the RedactionFilter then redacts. If ``redact`` ate part of
+    it, the operator would lose the correlation the label exists to give."""
+    label = safe_name(name)
+    assert redact(label) == label
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_exc_file_name_swaps_the_name_out_of_the_exception_message(name: str) -> None:
+    """An OSError renders its path INTO its message, so routing a file source's error arm through
+    ``safe_exc`` alone would keep the name. This is the half of #1748 that the call-site swap to
+    ``safe_name`` does not reach on its own."""
+    exc = OSError(f"[WinError 32] file in use: 'C:\\\\drops\\\\{name}'")
+    out = safe_exc(exc, file_name=name)
+    assert name not in out
+    assert out.startswith("OSError:")  # the type survives
+    assert "WinError 32" in out  # and so does the OS diagnostic, which is the point of keeping it
+    assert safe_name(name) in out
+
+
+def test_safe_exc_without_file_name_is_unchanged() -> None:
+    """The parameter is opt-in: every existing caller keeps its exact rendering."""
+    exc = ValueError("patient DOE JANE dob 1980-05-05 not found")
+    assert safe_exc(exc, file_name=None) == safe_exc(exc)
+
+
+def test_safe_exc_file_name_covers_a_bare_basename_too() -> None:
+    """A remote client quotes the name without a directory; the swap must still fire."""
+    out = safe_exc(
+        OSError("550 no such file: MRN123456789_ADT.hl7"), file_name="MRN123456789_ADT.hl7"
+    )
+    assert "MRN123456789" not in out and "550" in out
+
+
+def test_safe_name_is_exported() -> None:
+    assert "safe_name" in redaction.__all__
+
+
+# --- safe_error: the optional, opt-in-gated form the CLI surfaces use (BACKLOG #1668) -------------
+
+
+def test_safe_error_passes_none_through() -> None:
+    """An absent error is not a value to redact -- the CLIs emit it as JSON ``null``, not ``""``."""
+    assert safe_error(None) is None
+    assert safe_error(None, show_phi=True) is None
+
+
+def test_safe_error_redacts_by_default_and_keeps_the_prose() -> None:
+    """The stage prefix and the author's own words survive; only the HL7-shaped runs collapse.
+
+    That is the whole reason this is ``safe_text`` and not a whole-string drop: the diagnostic is what
+    somebody ran ``dryrun`` to read."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q mrn 900123456^^^H^MR"
+    out = safe_error(raised)
+    assert out is not None
+    assert "DOE" not in out and "900123456" not in out
+    assert out.startswith("router/handler error: unmapped patient ")
+
+
+def test_safe_error_show_phi_returns_the_text_unchanged() -> None:
+    """The opt-in arm is byte-identical -- a caller that may see it gets exactly what was raised."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q"
+    assert safe_error(raised, show_phi=True) == raised
+
+
+def test_safe_error_defaults_closed() -> None:
+    """A surface with no opt-in (the ``check`` gate) passes no keyword, so the default must redact."""
+    raised = "parse error: PID|1||900123456^^^H^MR"
+    assert safe_error(raised) == safe_error(raised, show_phi=False)
+    assert "900123456" not in str(safe_error(raised))
+
+
+def test_safe_error_is_exported() -> None:
+    assert "safe_error" in redaction.__all__

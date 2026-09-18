@@ -19,8 +19,9 @@
   (notes `/config/reload` is gated by `CONFIG_DEPLOY` + step-up + reload-roots allow-list),
   [ADR 0037](0037-multi-process-sharding-l3.md) (the multi-process / cluster `config_version`
   convergence path the fingerprint should eventually surface across — see *To resolve*),
-  [ADR 0017](0017-consumer-deployment-model.md) (the non-editable installed wheel D3 **tightens** from
-  recommendation to enforced default), [ADR 0018](0018-per-message-signatures-accepted-risk.md) (the
+  [ADR 0017](0017-consumer-deployment-model.md) (the non-editable installed wheel D3 attests against —
+  a **recommendation**; nothing in the engine enforces it, BACKLOG #1679),
+  [ADR 0018](0018-per-message-signatures-accepted-risk.md) (the
   detached-JWS signing core a future signed manifest would reuse), [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md)
   (`KeyProvider`), [ADR 0010](0010-handler-callable-db-lookup.md) (the one sanctioned non-pure input),
   [ADR 0031](0031-startup-connection-fault-isolation.md) (startup posture this composes with),
@@ -114,16 +115,75 @@ audited) must release a reload. The maker-checker machinery already exists; relo
 This is the one *preventive* control that makes the code author and a second authorizer both required for a
 change to go live. **Opt-in / deny-by-default** — single-operator deployments are unchanged until enabled.
 
-### D3 — Startup self-attestation + enforced non-editable wheel  *(BUILT — BACKLOG #54, shipped in 0.2.9; drafted as "planned")*
+### D3 — Startup self-attestation on a non-editable wheel  *(BUILT — BACKLOG #54, shipped in 0.2.9; drafted as "planned")*
 
-At startup (and on demand) hash the loaded `messagefoundry` module files against the wheel's
+At startup hash the loaded `messagefoundry` module files against the wheel's
 `*.dist-info/RECORD` (a zero-new-artifact baseline already shipped in the wheel); on drift, **fail-closed
 or alert (policy-driven)** and write a `startup_integrity` row into the hash-chained, off-box-teed audit.
-Make the **non-editable, hash-locked wheel the enforced production default** — tightening
-[ADR 0017](0017-consumer-deployment-model.md) from recommendation to default and retiring editable
-`pip install -e .` from production docs. This converts install-time provenance (SLSA/Sigstore/hash-lock)
+Make the **non-editable, hash-locked wheel the recommended production default** — carrying
+[ADR 0017](0017-consumer-deployment-model.md)'s recommendation into the docs and retiring editable
+`pip install -e .` from production guidance. This converts install-time provenance (SLSA/Sigstore/hash-lock)
 into a **runtime tripwire** and closes gap #3 (an in-place engine edit + restart that leaves no audit row).
 Must be a no-op / advisory off an editable dev install so it never bricks development.
+
+> **Two as-drafted claims are narrowed here, because they are false in the shipped code (BACKLOG
+> #1679).** *"Enforced production default"* was the first: nothing enforces it. `[integrity].enabled`
+> defaults true and `fail_closed_on_drift` defaults false, a declared-editable install is exempt under
+> either, and no code path anywhere refuses to start on one. It is a recommendation, and the word
+> above now says so. *"And on demand"* was the second, and it is dropped throughout: `attest_engine`
+> has exactly one caller, `run_startup_attestation` in its own module; that has exactly one caller,
+> the ASGI lifespan in `messagefoundry/api/app.py`. There is no `attest`/`integrity` CLI subcommand
+> and no API route (`POST /status/integrity-check` is the store's SQLite `quick_check`, a different
+> control). Attestation runs once, at startup. Filing either surface is separate work, not a doc edit.
+
+#### The baseline's trust domain — resolved, and what remains
+
+**Decision: the wheel's own `RECORD` stays the baseline, and no runtime out-of-domain anchor is
+adopted.** This replaces the open question AC-13's amendment left (BACKLOG #1679). Two grounds, and the
+first is sufficient on its own.
+
+**1. Any in-process anchor is circular.** `_loaded_module_files` walks `messagefoundry.__path__`, so
+`integrity.py` is inside the set it attests — it attests itself, and nothing else attests it. An
+adversary holding venv-write rewrites `integrity.py` in one write, the same primitive that re-seals
+`RECORD`. So *any* anchor the engine consumes at startup is consumed by code that adversary already
+owns: an operator-supplied `RECORD` pin, this ADR's own deferred signed manifest used as a **runtime**
+check, and Sigstore-as-runtime-anchor all fail for the same reason. This is a logical collapse, not a
+cost, so no amount of effort buys past it — it holds even if the anchor were free.
+
+**2. The project already ruled the structurally identical question.** Admin-authored Python executed
+in-process is **trust boundary 5** in the (vaulted) threat model, and the answer recorded there is a
+filesystem ACL owned by the deployer rather than a cryptographic control. Same shape, same answer.
+
+**The residual, stated plainly: this control detects an INCONSISTENT in-place edit and cannot detect a
+CONSISTENT one.** An edit that also re-seals `RECORD` passes clean. That is accepted.
+
+**Out-of-domain anchoring is real here; it just is not at runtime.** **Origin** is anchored at *install*
+time — the hash-locked, non-editable wheel and its SLSA/Sigstore provenance, checked by the installer
+before the bytes are on the box. **Detection** is anchored by the *off-box audit tee*: a
+`startup_integrity` row leaves the host, so an actor who owns the venv does not own the evidence. Two
+anchors, both outside the adversary's domain, neither of them read by the engine at startup.
+
+**What still earns the control its keep.** The shadowed-package shape needs **no venv write at all** —
+only a `messagefoundry/` directory the process resolves ahead of site-packages. AC-13 therefore raises
+the bar against an actor strictly **weaker** than the stated adversary. That is a real gain, not a
+consolation prize.
+
+**The assumption this decision depends on, and it is not settled in these sources:** that the install
+root can be made non-writable in the intended deployment shape. Ground 2 hands the question to a
+filesystem ACL, so if the deployment cannot hold that ACL the resolution loses its floor. Nothing in
+this repository establishes it either way. It is an owner/deployment question, recorded here as the
+premise rather than answered.
+
+**Declined, each for its own reason — do not reintroduce them:**
+
+| Option | Why not |
+|---|---|
+| Operator-supplied `[integrity].record_pin` | The comparison runs in the venv, so the pin is read by code the adversary owns (ground 1). |
+| An `[integrity].editable_install_allowed` key | Config-dir write already buys total silent disablement via `[integrity].enabled=false`, so a second key raises no bar. |
+| A publisher-signed boot manifest | This ADR already deferred the equivalent, and verifying one at boot breaks the module's pure-and-offline property. |
+| A digest recorded in the repository | Already forbidden by `_ATTESTED_ASSETS`' own comment in `messagefoundry/integrity.py` and pinned by a test. |
+| Fold the `RECORD` digest into a `startup_integrity` row and diff against the prior one | **No row is written on a clean boot**, so the comparison has an empty set to diff against. |
+| A per-boot heartbeat row | An adversary who can suppress it can forge it, and absence is already ambiguous — a healthy engine that has not restarted writes nothing either. |
 
 ### Deferred option — signed config manifest
 
@@ -149,7 +209,7 @@ fingerprint+git-HEAD covers more cheaply for now.
 
 > EARS form; each linked (`→`) to its test. D1's tests landed with this change; D2's and D3's landed
 > with BACKLOG #53 / #54 in 0.2.9. **The as-drafted "D2/D3 are planned targets" was true when written
-> and under-claims now** — all twelve ACs below have a test on disk. (AC-5 to AC-8 name
+> and under-claims now** — every AC below has a test on disk. (AC-5 to AC-8 name
 > `tests/test_approvals.py`; those four tests live in `tests/test_dual_control_reload.py`.)
 
 - **AC-1** — WHEN `config_fingerprint(dir)` is called twice on an unchanged bundle, THE SYSTEM SHALL return
@@ -188,9 +248,9 @@ fingerprint+git-HEAD covers more cheaply for now.
   before — single-operator deployments are unchanged until dual-control is opted in.
   → `tests/test_approvals.py::test_config_reload_inline_when_not_gated`
 
-**D3 — startup self-attestation + enforced non-editable wheel** *(BUILT — BACKLOG #54, shipped in 0.2.9)*
+**D3 — startup self-attestation on a non-editable wheel** *(BUILT — BACKLOG #54, shipped in 0.2.9)*
 
-- **AC-9** — WHEN the engine starts (and on demand) on a non-editable wheel install, THE SYSTEM SHALL hash
+- **AC-9** — WHEN the engine starts on a non-editable wheel install, THE SYSTEM SHALL hash
   every loaded `messagefoundry` module file and compare it against the wheel's `*.dist-info/RECORD` baseline.
   → `tests/test_startup_attestation.py::test_attests_loaded_modules_against_record`
 - **AC-10** — IF a loaded engine module's content does not match its `dist-info/RECORD` hash at startup, THEN
@@ -205,6 +265,39 @@ fingerprint+git-HEAD covers more cheaply for now.
   engine starts, THE SYSTEM SHALL treat attestation as a no-op/advisory and SHALL NOT fail or alert — dev is
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
+- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
+  against a baseline on an install that does not declare itself editable — an absent, empty or
+  package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
+  root — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
+  and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
+  → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
+  → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
+- **AC-14** — WHERE `[integrity].fail_closed_on_drift` is true AND the install declares itself editable,
+  WHEN the engine starts, THE SYSTEM SHALL log at WARNING naming the reason — the opted-in enforcement
+  cannot be honoured on this install — and SHALL still start, record nothing and alert nothing (AC-12 is
+  unchanged). WHILE the default alert-only posture is in force, it SHALL stay silent.
+  → `tests/test_startup_attestation.py::test_declared_editable_under_fail_closed_warns_and_names_the_reason`
+  → `tests/test_startup_attestation.py::test_declared_editable_under_the_default_posture_stays_silent`
+
+> **Amendment 2026-09-15 (BACKLOG #1679) — AC-12's "editable = no `RECORD` baseline" equation is
+> incomplete.** AC-12 reads the two as one condition, so the shipped code took *any* absent baseline as a
+> dev install and returned a clean no-op. Three shapes reach that no-op without a dev checkout in sight: a
+> deleted or emptied `RECORD`, a `RECORD` stripped of its package rows, and a package imported from
+> outside the install root. AC-13 splits them off: only an install that **declares** itself editable (a
+> PEP 610 `direct_url.json`, or an `__editable__`/`.pth` finder row) keeps the AC-12 no-op; "no baseline"
+> on its own is now attested-nothing, which warns, audits, alerts, and refuses under fail-closed.
+>
+> **The baseline's trust domain was left open by this amendment and is now RESOLVED** — the `RECORD`
+> baseline stays, and no runtime out-of-domain anchor is adopted. The reasoning, the residual, the
+> premise it rests on and the six declined alternatives are in D3 above, *"The baseline's trust
+> domain"*. Read it there; it is not restated here.
+>
+> **AC-14 closes the last act of #1679.** The declared-editable branch used to return with no log at
+> all, so a first deployment that opted into `fail_closed_on_drift` on an editable install WOULD start
+> with its tripwire disarmed and nothing in the boot log to read. It now warns and names the reason.
+> That is a **misconfiguration** control: it tells an operator their opt-in is not in effect. It closes
+> no hole, because an adversary with venv-write plants the editable marker or rewrites the check in the
+> same single write.
 
 ## Options considered
 

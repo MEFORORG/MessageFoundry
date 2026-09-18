@@ -594,3 +594,100 @@ place rather than deleted.
     lock's CONTENT is verified every pull request; only its INSTALLATION is not.** That split is the
     useful one to carry forward: this register's residuals here are about an unexecuted command, not an
     unchecked artifact.
+
+## Amendment — 2026-09-16: a new dismissal class — a sensitive-labelled Mapping taints every key read from it
+
+**Alerts 185, 186 and 187 — `py/clear-text-logging-sensitive-data`, HIGH, CodeQL 2.27.0, on
+`refs/pull/1205/merge`. All three dismissed `false positive`, each traced per AC-4 before dismissal.**
+
+This section is the class-level half the Decision requires. The three per-alert comments remain
+canonical, and they file these under the *Misclassified value* class in the 2026-06-26 register. That
+was the closest existing wording, and it is not quite the mechanism: *Misclassified value* is about
+what the sink RENDERS, while this is about where the sensitive LABEL comes from. The two adjacent
+dismissals already on `main` sit on the first axis — **122** (`__main__.py`, `trusted_proxies`, source
+and sink the same expression) and **123**/**124** (`pipeline/alerts.py`, a secret's env-var NAME rather
+than its value). This class is the second axis, and it is recorded separately so a future reader
+recognises the shape without re-tracing the flows.
+
+### The class, stated generally
+
+CodeQL applies its sensitive-data NAME heuristic to a **whole `Mapping`** on the strength of **one**
+key, then propagates that label **field-insensitively**. Reading an unrelated key back off the labelled
+mapping carries the label with it, so a value that never touched a secret arrives at a logging sink
+reported as *"This expression logs sensitive data (password) as clear text."*
+
+Any mapping holding one secret-named key therefore taints every value read from it. That is the
+ordinary shape of this engine's `env()`-resolved connection settings — a secret and an endpoint sit
+side by side in one `Mapping[str, Any]` — so expect the shape to recur on any `*_from_settings` seam
+that logs something derived from its argument. Two further properties travel with it and are worth
+naming, because both make the alert read as worse than it is: the source can be a **test fixture**
+while every sink is product code, and one labelled fixture fans out to **several** alerts because the
+tainted value reaches more than one logging site.
+
+### The worked example
+
+| Step | Where | What |
+|---|---|---|
+| Source | `tests/test_tls_trust_anchor.py`, the loopback leg's call to the `_oauth2_settings` helper | The helper is new in PR 1205 and returns a dict whose keys include `oauth2_client_secret`. That one key name is what the heuristic fires on; the call overrides only `oauth2_token_url`, with a synthetic loopback URL. |
+| Propagation | `messagefoundry/transports/http_auth.py`, `bearer_provider_from_settings` | `token_url = str(s.get("oauth2_token_url") or "")` — a **different** key off the same mapping, which is where the label is carried across field boundaries. |
+| Narrowing | `messagefoundry/transports/rest.py`, `refuse_cleartext_credential_hop` | Receives that URL as `url`, then `host = urllib.parse.urlsplit(url).hostname or ""`. |
+| Rendering | same function | `message=f"sends a {credential} over cleartext http to {host!r}"`. `credential` is a **literal label supplied by the caller** — `http_auth.py` passes `credential="OAuth2 client_secret"`. |
+| Sinks | `rest.py` `_enforce_shipped_hop` (alert 185, the attested-hop `logger.warning`); `config/tls_policy.py` `enforce_insecure_hop` (alert 186, the WARN log) and `cleartext_acceptance_audit_sink`'s `_record` (alert 187, the acceptance record) | The rendered line carries a credential **name** and a **hostname**. |
+
+So the whole flow ends at a string built from a caller-side literal and a hostname. The secret is read
+on a **separate** path in the same function — `client_secret=str(s.get("oauth2_client_secret") or "")`,
+passed into the provider constructor — and appears on none of the flows. `http_auth.py` already states
+that invariant in a comment at the refusal call site: the message never carries the secret.
+
+**One limit on the evidence, stated rather than glossed.** The code-scanning REST payload for these
+alerts returns no `code_flows`, so the flow structure above is recorded from the triage reading of the
+alert pages, while every code step in the table was re-read in the tree. The two agree.
+
+### The discriminator — what would make a future alert of this shape real
+
+A dismissal that only says "field-insensitive taint" would silence a genuine finding the next time this
+rule fires on a settings mapping. These are the checks that separated the two here, and all four must
+hold before this class is reused:
+
+1. **Which key does the tainted `get` name?** A sibling endpoint or identifier key (`*_token_url`,
+   `*_client_id`, `url`, `host`) is the false case. A read of the **secret-named key itself** reaching a
+   log sink is real, and no amount of field-insensitivity explains it away.
+2. **Is every interpolated part either a caller-side literal or a narrowed value?** Here the credential
+   name is a literal at the call site and the host is `urlsplit(...).hostname`, which cannot carry
+   userinfo, path or query. An f-string that interpolates the raw setting, or the mapping itself, is
+   real — `logger.warning("%s", s)` over an `env()`-resolved settings mapping would be a true positive
+   of exactly this rule.
+3. **Does any path put the secret-bearing read into the same sink?** Trace the secret separately rather
+   than assuming the flows are exhaustive. If the value read from the secret key reaches the rendered
+   message on any branch, the finding is real whatever the reported flow says.
+4. **Does the sink carry an exception?** The same discipline the 2026-07-28 `log-injection` correction
+   records applies here: a rationale about the **rendered message** does not cover `exc_info=True` /
+   `record.exc_text`, where an exception's own text is appended by the formatter and is not the string
+   this class reasoned about.
+
+### No suppression, per Options considered 3
+
+Nothing here is filtered. There is no inline `codeql` suppression anywhere in this repository and no
+CodeQL configuration file — `.github/workflows/codeql.yml` is the only CodeQL artifact — and that stays
+true: option 3 was rejected because an invisible filter drifts away from its rationale, and this class
+is noisy enough to be a tempting place to break the rule. The visible dismissal plus this register is
+the whole mechanism.
+
+### Convergence note
+
+Per the line-drift rule above, these three anchors will re-fire under new alert numbers. Two things
+make that likelier here than usual, so re-dismiss with this rationale rather than re-triaging:
+
+- The **sinks** are in two long, actively-edited modules (`rest.py`, `config/tls_policy.py`), and the
+  anchors sit near the middle of each, so almost any insertion above them drifts the line.
+- The **source** is a test fixture on a pull-request branch, and the scanned ref was
+  `refs/pull/1205/merge`. Whether a dismissal recorded against a pull-request ref carries to the same
+  expression once it is scanned on `refs/heads/main` is **not measured here**, and the merge of PR 1205
+  is the occasion to measure it. If it does not carry, expect three fresh alerts at the same three
+  sinks with no behaviour change.
+
+Line numbers in this section are navigation aids, not evidence: locate `_enforce_shipped_hop`,
+`enforce_insecure_hop`, `cleartext_acceptance_audit_sink` and `bearer_provider_from_settings` by name.
+The dismissal comments cite `http_auth.py:337` for the secret read, which is that expression's line on
+`main` and not on the scanned merge ref, where the same expression sits further down — a small instance
+of the same point.

@@ -41,7 +41,7 @@ class _Operation:
 
 class ApprovalError(Exception):
     """A pending-approval decision could not be made. ``status`` is the HTTP code the API should map
-    to (404 unknown, 409 already-decided/expired, 403 self-approval)."""
+    to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval."""
 
     def __init__(self, status: int, detail: str) -> None:
         super().__init__(detail)
@@ -70,14 +70,25 @@ class ApprovalGate:
         params: Mapping[str, Any],
         *,
         requester: str,
+        requester_user_id: str,
         client: str | None = None,
     ) -> str | None:
         """Call at the start of a gated endpoint, **after** the requester's own permission/scope checks
         pass. If dual-control is active for ``operation``, persist a pending request, audit
         ``approval.requested``, and return its **id** (the endpoint should respond 202). Otherwise
-        return ``None`` — the endpoint executes inline exactly as before."""
+        return ``None`` — the endpoint executes inline exactly as before.
+
+        ``requester_user_id`` is the requester's immutable ``users.id`` and is what
+        :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540)."""
         if not self._gated(operation):
             return None
+        # Enforce the write half of the invariant here, matching `create_upload`'s guard on
+        # `uploader_id`: a row persisted without an owner id is unapprovable, and refusing it at the
+        # write boundary turns that into a caller bug instead of a request nobody can ever release.
+        if not requester_user_id:
+            raise ValueError(
+                "requester_user_id is required (a request with no owner id is unapprovable)"
+            )
         now = time.time()
         approval_id = uuid4().hex
         expires_at = (
@@ -88,6 +99,7 @@ class ApprovalGate:
             operation=operation,
             params=json.dumps(dict(params), sort_keys=True),
             requester=requester,
+            requester_user_id=requester_user_id,
             requested_at=now,
             expires_at=expires_at,
         )
@@ -114,12 +126,39 @@ class ApprovalGate:
         ]
 
     async def approve(
-        self, approval_id: str, *, approver: str, client: str | None = None
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        approver_user_id: str,
+        client: str | None = None,
     ) -> dict[str, Any]:
         """Release a pending request: the captured operation is re-executed and both identities are
-        audited. Refuses self-approval (the requester is not a valid second approver)."""
+        audited. Refuses self-approval (the requester is not a valid second approver).
+
+        **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
+        and the live ``approver`` are two snapshots of a directory-writable name, taken up to
+        ``[approvals].expiry_hours`` apart (``users.username`` became mutable in BACKLOG #1532), so a
+        name comparison is wrong in both directions: a requester renamed inside the window passes the
+        refusal and releases their own request, and whoever is later given the freed name is refused
+        as a self-approver they are not. ``users.id`` never changes, so it is the key."""
         row = await self._require_pending(approval_id)
-        if str(row["requester"]) == approver:
+        requester_user_id = row["requester_user_id"]
+        if not requester_user_id:
+            # Fail closed. A request with no recorded requester id cannot be checked for
+            # self-approval, and the stored NAME is not a usable fallback — after a rename it may
+            # belong to somebody else, so comparing it would key the refusal on the wrong person.
+            # Deliberately NOT the 403 text below: this is a stale row, not an accusation.
+            #
+            # FALSY, not `is None`. An empty id would otherwise pass this check and then compare
+            # unequal below, silently switching the refusal off for that row — the same shape the
+            # read side of the upload-ownership check guards against with `bool(meta.uploader_id)`.
+            raise ApprovalError(
+                409,
+                "this request predates requester-id attribution and can no longer be approved — "
+                "reject it and request the operation again",
+            )
+        if str(requester_user_id) == approver_user_id:
             raise ApprovalError(403, "you cannot approve your own request")
         operation = str(row["operation"])
         op = self._ops.get(operation)

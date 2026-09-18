@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -35,6 +36,17 @@ def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
 
 def _check(report: dict[str, object], name: str) -> dict[str, object]:
     return next(c for c in report["checks"] if c["name"] == name)  # type: ignore[union-attr,index]
+
+
+def _run_count(detail: object) -> int:
+    """The ``N`` from a passing dryrun's ``N run(s) clean ...`` detail (BACKLOG #1671).
+
+    Every dryrun happy-path assertion below goes through this rather than checking ``ok`` alone: a
+    gate that stops executing runs still reports ``ok=True`` with ``N`` at zero, so the flag cannot
+    tell a real pass from a pass earned by verifying nothing. The count can."""
+    m = re.match(r"(\d+) run\(s\) clean", str(detail))
+    assert m is not None, f"not a clean-dryrun detail: {detail!r}"
+    return int(m.group(1))
 
 
 def test_check_clean_sample_passes(capsys: pytest.CaptureFixture[str]) -> None:
@@ -68,6 +80,7 @@ def test_check_dryrun_gates_when_fixtures_present(
     assert rc == 0
     dr = _check(_out_json(capsys), "dryrun")
     assert dr["required"] is True and dr["ok"] is True and dr["skipped"] is False
+    assert _run_count(dr["detail"]) > 0  # a pass has to have RUN something (BACKLOG #1671)
 
 
 def test_check_dryrun_skipped_without_fixtures(
@@ -132,6 +145,7 @@ def test_check_dryrun_accepts_single_file(
     assert rc == 0
     dr = _check(_out_json(capsys), "dryrun")
     assert dr["required"] is True and dr["ok"] is True and dr["skipped"] is False
+    assert _run_count(dr["detail"]) > 0
 
 
 # --- stdout belongs to the payload (BACKLOG #1489) ---------------------------
@@ -238,6 +252,7 @@ def test_check_dryrun_pins_fixture_to_feed_subdir(tmp_path: Path) -> None:
     )
     assert dr.ok and dr.required and not dr.skipped, dr.detail
     assert "feed-pinned" in dr.detail
+    assert _run_count(dr.detail) == 1  # IB_RAW only — the pin is what keeps it off IB_HL7
 
 
 def test_check_dryrun_unmapped_fixture_runs_every_inbound(tmp_path: Path) -> None:
@@ -275,7 +290,60 @@ def test_check_dryrun_skips_a_not_deployed_inbound(tmp_path: Path) -> None:
         r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
     )
     assert dr.ok and dr.required and not dr.skipped, dr.detail
-    assert "1 run(s) clean" in dr.detail  # IB_RAW only — not the 2 runs an all-×-all would do
+    # IB_RAW only — not the 2 runs a cross-product would do. Exact, via the anchored helper: the
+    # substring form this replaced ("1 run(s) clean" in detail) also matched "11 run(s) clean".
+    assert _run_count(dr.detail) == 1
+
+
+# --- the gate must not pass on zero runs (BACKLOG #1671) ---------------------
+# The two tests below share ONE config so they differ in exactly one variable: where the fixture
+# sits. Both inbounds are deployed=False, so an unmapped fixture has no target at all while a
+# pinned one still runs against its feed.
+
+
+def _no_deployed_feeds_config(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB_ONE', File(directory='in1'), router='r', deployed=False)\n"
+        "inbound('IB_TWO', File(directory='in2'), router='r', deployed=False)\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_check_dryrun_fails_when_nothing_was_actually_run(tmp_path: Path) -> None:
+    # The degenerate case of the #233 filter above: every fixture is unmapped and no inbound is
+    # deployed, so the cross-product target list is empty for every fixture and the inner loop
+    # never executes. The gate used to fall through to "0 run(s) clean" — a REQUIRED check
+    # reporting a pass having dry-run nothing, over fixtures that were read and are sitting there.
+    cfg = _no_deployed_feeds_config(tmp_path)
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    (msgs / "x.hl7").write_bytes(ADT_A01.encode("utf-8"))  # top-level, so unmapped
+    dr = _run_dryrun(cfg, msgs)
+    assert not dr.ok and dr.required and not dr.skipped, dr.detail
+    # Attributable to the zero, not merely to some failure: a flag-only assertion would also be
+    # satisfied by the gate failing for an unrelated reason.
+    assert "0 dry-run(s) executed" in dr.detail
+    assert "0 of 2 inbound(s)" in dr.detail
+
+
+def test_check_dryrun_pinned_fixture_still_runs_against_a_not_deployed_feed(tmp_path: Path) -> None:
+    # Same config, fixture pinned instead: the guard above must NOT catch this. An explicit pin
+    # runs against its feed even when that feed is not deployed (ADR 0111 — carrying the record is
+    # the point of the state), so one run happens and the gate reports a real pass. Without this,
+    # the #1671 fix would wrongly FAIL a legitimate pinned-only, nothing-deployed config.
+    cfg = _no_deployed_feeds_config(tmp_path)
+    msgs = tmp_path / "messages"
+    (msgs / "IB_ONE").mkdir(parents=True)
+    (msgs / "IB_ONE" / "x.hl7").write_bytes(ADT_A01.encode("utf-8"))
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and dr.required and not dr.skipped, dr.detail
+    assert _run_count(dr.detail) == 1 and "1 feed-pinned" in dr.detail
 
 
 def test_check_dryrun_non_feed_subdir_falls_back_to_all(tmp_path: Path) -> None:

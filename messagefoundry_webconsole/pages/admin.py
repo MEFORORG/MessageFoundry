@@ -13,6 +13,7 @@ password ``<input>`` — and is never echoed back into a re-rendered form.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 
 from messagefoundry.api.auth_models import (
     AdGroupMapEntry,
@@ -40,6 +41,11 @@ __all__ = [
 
 def _banner(error: str | None) -> Markup:
     return el("p", error, class_="banner") if error else Markup("")
+
+
+def _deadline_text(ts: float) -> str:
+    """A Unix instant as the console's usual UTC stamp (``audit``/``connections`` use this shape)."""
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
 def _admin_links(active_page: str) -> Markup:
@@ -323,8 +329,30 @@ def user_detail_page(
     )
 
 
-def temp_password_page(username: str, temp_password: str) -> Markup:
-    """The one-time result of an admin password reset — shown once, never stored or logged."""
+def temp_password_page(
+    username: str, temp_password: str, expires_at: float | None = None
+) -> Markup:
+    """The one-time result of an admin password reset — shown once, never stored or logged.
+
+    BACKLOG #1141 (ASVS 6.4.5): when the credential expires, the deadline is stated HERE, on the one
+    artifact the issuing administrator actually reads. The renewal instruction for an expiring
+    mechanism has to be sent in time to act on it, and this page and the JSON response are the only
+    two things the reset produces — a settings reference table is something an operator consults, not
+    something sent with the credential. ``expires_at`` is the engine's enforced instant
+    (``AuthService.initial_credential_deadline``), so the sentence below cannot overstate the window.
+    ``None`` means ``[auth].initial_password_expiry_hours`` is 0 and there is genuinely no deadline;
+    the sentence is then omitted rather than softened, because a vague one would be worse than none.
+    """
+    deadline: list[object] = []
+    if expires_at is not None:
+        deadline = [
+            el(
+                "p",
+                f"It stops working at {_deadline_text(expires_at)}. Tell {username} to sign in and "
+                "set a password before then, or the credential has to be reissued.",
+                class_="muted",
+            )
+        ]
     body = el(
         "div",
         el("h1", "Temporary password issued"),
@@ -335,6 +363,7 @@ def temp_password_page(username: str, temp_password: str) -> Markup:
             class_="muted",
         ),
         el("p", el("code", temp_password)),
+        *deadline,
         el("p", el("a", "← Users", href="/ui/users")),
         class_="card",
     )

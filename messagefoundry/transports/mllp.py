@@ -43,6 +43,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     RevocationHopGuard,
     TrustAnchorPolicy,
+    apply_connection_tls_ciphers,
     build_verifying_client_context,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
@@ -119,6 +120,21 @@ DEFAULT_MAX_MESSAGES_PER_SECOND: float | None = None
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
 _CLIENT_SHUTDOWN_GRACE = 5.0
+
+# Seconds one ACK gets to drain to the sender before the connection is dropped (BACKLOG #1617).
+# `receive_timeout` bounds the READ and nothing bounded the WRITE, so a peer that stops consuming —
+# its receive window full, the connection still open — would pin the client task and the
+# `max_connections` slot it holds for as long as it liked: the slow-READER half of the slow-loris the
+# read bound exists to stop. Deliberately the shutdown grace rather than a new per-connection knob.
+# An MLLP ACK is engine-generated and receipt-sized (`InboundHandler` returns a `str`, never a
+# partner-sized body), so there is nothing to size an operator budget against; and reusing
+# `receive_timeout` would be worse than useless, since its documented `None`/`0` = "no timeout" would
+# restore the unbounded drain through a supported setting. The HTTP listener bounds its
+# `202`-on-receipt write by this same constant for the same reason (`http_listener._drain_budget`).
+# Named apart from the grace it equals because the two answer different questions — how long one ACK
+# may take to leave, versus how long teardown waits for in-flight handlers — and a test that bounds
+# one must not silently shrink the other.
+_ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -563,6 +579,10 @@ def _mllp_ssl_context(
             if crl := s.get("tls_crl_file"):
                 harden_crl_check(ctx, str(crl))
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
+        # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below
+        # the assertion this seam has always made on the inherited suite list.
+        apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
         harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
@@ -602,6 +622,10 @@ def _mllp_ssl_context(
     if cert:  # optional client identity for mTLS
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
+    # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a
+    # suite, and an operator who narrowed this connection meant that hop as much as any other.
+    apply_connection_tls_ciphers(ctx, s, connector="MLLP destination")  # opt-in per-hop suite list
     harden_cipher_suites(ctx, connector="MLLP destination")  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
@@ -1553,6 +1577,26 @@ class MLLPSource(SourceConnector):
         except Exception as exc:  # swallow + log; a capture bug can't drop an MLLP client
             logger.warning("MLLP connection-event emit failed: %s", safe_exc(exc))
 
+    async def _drain_ack(self, writer: asyncio.StreamWriter) -> None:
+        """Flush one already-written ACK to the sender under :data:`_ACK_DRAIN_GRACE` (BACKLOG #1617).
+
+        Re-raises the ``TimeoutError`` rather than handling it here. That is deliberate: a
+        ``TimeoutError`` IS an ``OSError``, so a peer that stopped reading is released down the
+        **same** path a real reset already takes — ``_on_client``'s outer ``OSError`` arm frees the
+        ``max_connections`` slot, emits ``peer_reset`` and closes the socket. A second release path
+        beside that one is how a slot leaks. Only the warning is added here, where the peer is still
+        in hand and the outer arm's redacted ``peer_reset`` alone would not say which bound fired.
+        """
+        try:
+            await asyncio.wait_for(writer.drain(), _ACK_DRAIN_GRACE)
+        except TimeoutError:
+            logger.warning(
+                "MLLP ACK to %s not drained within %.1fs; dropping the connection",
+                writer.get_extra_info("peername"),
+                _ACK_DRAIN_GRACE,
+            )
+            raise
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection — no race
@@ -1607,7 +1651,7 @@ class MLLPSource(SourceConnector):
                             reply = await self._handler(message)
                             if reply is not None:
                                 writer.write(frame(reply, self.encoding))
-                                await writer.drain()
+                                await self._drain_ack(writer)
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:
                             pacer.settle(decoded)

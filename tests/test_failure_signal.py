@@ -271,10 +271,17 @@ def test_every_watched_workflow_exists() -> None:
     retires the watch -- no error, no run, permanent silence. That is the failure this signal exists
     to end, one level up.
 
-    It asserts EXISTENCE only. An earlier name for this test also claimed each watched workflow
-    produces a required context, and that is false: `.github/required-contexts.txt` lists CodeQL
-    under "DELIBERATELY NOT REQUIRED", because its SARIF upload needs a scope fork-PR tokens lack.
-    Watching a non-required workflow is intentional -- a red CodeQL run is still worth attributing.
+    It asserts EXISTENCE only, and that stays the right scope even though every watched name happens
+    to report a required context today. An earlier name for this test CLAIMED the stronger property,
+    and the claim was false while CodeQL was watched: `.github/required-contexts.txt` lists it under
+    "DELIBERATELY NOT REQUIRED", because its SARIF upload needs a scope fork-PR tokens lack.
+
+    CodeQL has since come off the watch list -- the label this file applies says a REQUIRED check
+    went red, which was untrue of every CodeQL red it ever fired on; failure-signal.yml's header
+    carries the reasoning. Do not turn that coincidence into an assertion here. Watching a
+    non-required workflow remains a legitimate choice, and the question this test asks is only
+    whether a watched NAME still answers to a real workflow -- the one thing a rename breaks
+    silently.
     """
     watched = _watched_names()
     present = set(_workflow_names().values())

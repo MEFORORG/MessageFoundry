@@ -581,3 +581,50 @@ async def test_fhir_no_metadata_is_byte_identical() -> None:
     await dest.send(PATIENT)  # no metadata → no dynamic headers, unchanged request
     req = opener.requests[0]
     assert req.get_header("Content-type") == "application/fhir+json"
+
+
+# --- BACKLOG #1663 step 3 reaches FHIR too, through the SHARED helper -----------------------------
+#
+# `FhirDestination.send` calls rest.py's `outbound_headers_from_metadata` (fhir.py imports it), so the
+# non-Latin-1 refusal added there for #1663 governs this connector as well -- with no edit to fhir.py.
+# That shared reach is exactly what this test pins: delete the guard in rest.py and THIS file reds.
+
+#: Un-encodable as ASCII *and* as latin-1 — the encoding ``putheader`` uses on a header value.
+CJK_CHAR = "患"
+
+
+async def test_fhir_non_latin1_message_header_is_refused_content_free() -> None:
+    """Mutation: delete the latin-1 guard from rest.py's `outbound_headers_from_metadata`. Red: the
+    send completes, `UnicodeEncodeError` escapes at the wire, and this does not raise.
+
+    Confirmed red without the fix. Note the cross-file reach -- the guard is in rest.py."""
+    dest = _dest(interaction="create")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(PATIENT, metadata={"http.header.X-Note": f"ok{CJK_CHAR}"})
+    assert ei.value.permanent is True
+    assert ei.value.code == "encoding"  # the body path's code, not the _post arm's
+    # Refused BEFORE the request is built: nothing reached the opener. This is what separates a
+    # refusal from a late classification; an exception-type-only assertion passes under either.
+    assert opener.requests == []
+    # PHI-safe: neither the offending value nor the message-derived header name may leave.
+    text = str(ei.value)
+    assert CJK_CHAR not in text and "X-Note" not in text
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+async def test_fhir_invalid_request_value_is_a_permanent_nak() -> None:
+    """NEW COVERAGE of the ValueError limb of this file's shipped `(ValueError, InvalidURL)` arm --
+    #1241 pinned only the InvalidURL limb above, and `bad-request-value` had zero coverage tree-wide.
+    Passes at origin/main; it is coverage, not a reproduction of #1663, which was rest.py's.
+
+    Mutation: drop `ValueError` from the arm. Red: the ValueError escapes `_post` unclassified."""
+    dest = _dest(interaction="create")
+    dest._opener = _FakeOpener(exc=ValueError("Invalid header name b'X-Bad\\n'"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(PATIENT)
+    assert ei.value.permanent is True
+    assert ei.value.code == "bad-request-value"
+    # PHI-safe: urllib's ValueError text quotes the offending value, so it must not be interpolated.
+    assert str(ei.value) == f"FHIR {BASE} rejected an invalid request value"

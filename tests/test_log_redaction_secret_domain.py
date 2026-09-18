@@ -59,6 +59,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from _ast_sites import named_func
 
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
@@ -86,6 +87,121 @@ class Family:
     line: str
     secret: str
     patterns: tuple[str, ...] = field(default=())
+
+
+# --- BACKLOG #1685: a QUOTED credential value, whose tail the shipped pattern wrote to the bundle ---
+#
+# A value is quoted PRECISELY so it may carry the characters that would otherwise end it -- ";", "="
+# and spaces -- and those are what ``_CREDENTIAL_KV``'s value class stopped at. So the shipped pattern
+# redacted the HEAD of a quoted password and wrote the tail into the support archive and
+# ``GET /logs/tail``. Measured against this module at 1aa2d6a1b:
+#
+#   PWD={pw-A;B}                     ->  PWD=[REDACTED];B}
+#   ad_bind_password='pw-A pw-B'     ->  ad_bind_password=[REDACTED] pw-B'
+#
+# THE SENTINELS ARE SPLIT IN TWO ON PURPOSE. A family names ONE ``secret``; the defect printed the
+# LATER piece, so a family naming the whole value would have gone green throughout. Both halves carry a
+# hyphen AND an underscore so ``_LONG_B64`` cannot reach them -- this surface has a backstop the
+# write-time one does not, and a sentinel the backstop covers proves nothing about ``_CREDENTIAL_KV``.
+
+
+@dataclass(frozen=True)
+class QuotedValue:
+    """One log line carrying a quoted credential, split into the pieces none of which may survive.
+
+    ``survives`` is what the redaction must NOT eat. Over-redaction is the safe direction for a file
+    that leaves the box, but it is not free: which server the failing connection named is most of what
+    the reader opened the bundle for."""
+
+    name: str
+    line: str
+    fragments: tuple[str, ...]
+    survives: tuple[str, ...]
+
+
+def odbc_line(value: str) -> str:
+    """An ODBC connection-string log line whose password is ``value``, brace-quoted.
+
+    ``value`` is already ODBC-ENCODED, so a doubled ``}}`` here means one ``}`` in the password."""
+    return "odbc conn Driver={ODBC Driver 18};UID=svc;PWD={" + value + "};Server=db-1.invalid"
+
+
+#: What survives an ODBC line: the server, and a brace-quoted value under a NON-credential keyword.
+_ODBC_SURVIVES = ("Driver={ODBC Driver 18}", "Server=db-1.invalid")
+
+QUOTED_VALUES: tuple[QuotedValue, ...] = (
+    QuotedValue(
+        "brace_semicolon",
+        odbc_line("pw-Semi_A-13;pw-Semi_B-14"),
+        ("pw-Semi_A-13", "pw-Semi_B-14"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        "brace_space",
+        odbc_line("pw-Spc_A-15 pw-Spc_B-16"),
+        ("pw-Spc_A-15", "pw-Spc_B-16"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        # A REGRESSION GUARD, NOT A REPRODUCTION, recorded because the difference is invisible from the
+        # table. The pre-fix class admitted "=", so this row went green before the fix; it proves only
+        # that the new alternates did not narrow it.
+        "brace_equals",
+        odbc_line("pw-Eq_A-17=pw-Eq_B-18"),
+        ("pw-Eq_A-17", "pw-Eq_B-18"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        "brace_comma",
+        odbc_line("pw-Cma_A-19,pw-Cma_B-20"),
+        ("pw-Cma_A-19", "pw-Cma_B-20"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        # THE ROW THAT TELLS A CORRECT FIX FROM A NAIVE ONE; the reasoning is on the test that pins it,
+        # ``test_a_first_closing_brace_pattern_would_still_leak_the_doubled_brace_row``.
+        "brace_doubled",
+        odbc_line("pw-Dbl_A-21}}pw-Dbl_B-23;pw-Dbl_C-24"),
+        ("pw-Dbl_A-21", "pw-Dbl_B-23", "pw-Dbl_C-24"),
+        _ODBC_SURVIVES,
+    ),
+    QuotedValue(
+        # THE MORE REACHABLE HALF OF THE DEFECT. Brace-quoting rides in on the SQL Server store; a
+        # password with a SPACE in it reaches every backend, and this is a real engine setting.
+        "single_quoted_space",
+        "ldap bind failed ad_bind_password='pw-Sq_A-25 pw-Sq_B-26' for svc",
+        ("pw-Sq_A-25", "pw-Sq_B-26"),
+        ("ldap bind failed", "for svc"),
+    ),
+    QuotedValue(
+        "double_quoted_space",
+        'api tls tls_key_password="pw-Dq_A-27 pw-Dq_B-28" could not open the chain',
+        ("pw-Dq_A-27", "pw-Dq_B-28"),
+        ("api tls", "could not open the chain"),
+    ),
+    QuotedValue(
+        "single_quoted_semicolon",
+        "connect failed password='pw-Qsc_A-29;pw-Qsc_B-30' retrying",
+        ("pw-Qsc_A-29", "pw-Qsc_B-30"),
+        ("connect failed", "retrying"),
+    ),
+)
+
+
+#: The quoted rows as families, so they inherit this file's four parametrized assertions: the backstop
+#: cannot reach the sentinel, the value is redacted, the DECLARED pattern is what did it, and the
+#: scoped case fold matches a global one. DERIVED rather than restated, so the two cannot drift.
+#:
+#: ``secret`` is the LAST fragment -- the piece the shipped pattern printed verbatim.
+QUOTED_FAMILIES: tuple[Family, ...] = tuple(
+    Family(
+        name=f"quoted_{case.name}",
+        line=case.line,
+        secret=case.fragments[-1],
+        patterns=("_CREDENTIAL_KV",),
+    )
+    for case in QUOTED_VALUES
+)
 
 
 #: Every secret family the redactor applies a pattern for. Tokens carry a hyphen AND an underscore on
@@ -245,6 +361,7 @@ FAMILIES: tuple[Family, ...] = (
         secret="ek-Upr_Key-12",
         patterns=("_KEY_MATERIAL",),
     ),
+    *QUOTED_FAMILIES,
 )
 
 
@@ -296,11 +413,7 @@ def _applied_pattern_names(module: ModuleType, applier: str) -> set[str]:
     without a fixture cannot hide. Parameterised by module since BACKLOG #1547, because the cost guard
     below has to read the write-time copy of this vocabulary as well as this one."""
     tree = ast.parse(inspect.getsource(module))
-    func = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == applier
-    )
+    func = named_func(tree, applier)
     module_patterns = {
         name for name, value in vars(module).items() if isinstance(value, re.Pattern)
     }
@@ -372,6 +485,101 @@ def test_each_family_survives_when_its_own_patterns_are_disabled(
         f"{fam.name}: disabling {list(fam.patterns)} did NOT make the secret leak -- something else "
         f"is covering it, so this family proves nothing about its declared pattern. Got {out!r}"
     )
+
+
+@pytest.mark.parametrize("case", QUOTED_VALUES, ids=lambda c: c.name)
+def test_no_fragment_of_a_quoted_credential_value_reaches_the_bundle(case: QuotedValue) -> None:
+    """EVERY piece of a quoted value must be gone, and the rest of the line must still be there.
+
+    The family assertion above cannot make the first half: it names a single ``secret``, so a pattern
+    that replaced the value's head and printed the rest satisfies it for whichever piece it happened to
+    name. This surface is the support ARCHIVE and ``GET /logs/tail`` -- a file that leaves the box --
+    so the assertion enumerates the fragments instead.
+
+    The second half pulls the other way and is why it shares a test. Over-redaction is the safe
+    direction here, but an alternate that ran to end of line on a WELL-FORMED value would pass the
+    first half while deleting which server the failing connection named."""
+    out = redact_log_line(case.line)
+
+    survivors = [fragment for fragment in case.fragments if fragment in out]
+    assert not survivors, f"{case.name}: {survivors} survived a quoted value -- got {out!r}"
+    assert REDACTION_PLACEHOLDER in out, f"{case.name}: nothing was marked redacted -- got {out!r}"
+
+    eaten = [context for context in case.survives if context not in out]
+    assert not eaten, f"{case.name}: the redaction ate {eaten} -- got {out!r}"
+
+
+def test_a_first_closing_brace_pattern_would_still_leak_the_doubled_brace_row() -> None:
+    """THE CONTROL THAT MAKES THE DOUBLED-BRACE ROW WORTH ITS PLACE.
+
+    ODBC ends a brace-quoted value at the first ``}`` that is not doubled; an interior literal ``}``
+    is written ``}}``. The obvious fix -- ``\\{[^}]*\\}`` -- therefore passes every other row in
+    :data:`QUOTED_VALUES` and leaks on this one. Built here rather than described in a comment, because
+    a fixture whose discriminating power is only claimed is one nobody notices losing.
+
+    The expected leak is DERIVED, not transcribed: a first-brace pattern stops after the head, so
+    everything after ``fragments[0]`` survives by construction."""
+    case = next(c for c in QUOTED_VALUES if c.name == "brace_doubled")
+    naive = re.compile(r"(?i)\b(pwd)\b\s*[:=]\s*\{[^}]*\}")
+    naive_out = naive.sub(lambda m: f"{m.group(1)}={REDACTION_PLACEHOLDER}", case.line)
+
+    assert REDACTION_PLACEHOLDER in naive_out, "the naive pattern did not fire at all"
+    assert [f for f in case.fragments if f in naive_out] == list(case.fragments[1:]), (
+        f"a first-closing-brace pattern was expected to leak every fragment after the head -- "
+        f"{naive_out!r}"
+    )
+
+
+def test_an_unclosed_brace_redacts_to_the_end_of_the_line() -> None:
+    """A ``{`` this module cannot close must not fall back to printing the password.
+
+    A truncated connection string reaches this surface as readily as a well-formed one -- a driver
+    error string is cut off wherever the driver cut it. Dropping back to the plain value class there
+    would emit the tail, so the run takes the rest of the line instead. That over-redacts, which is the
+    direction a file leaving the box is allowed to fail in."""
+    out = redact_log_line("odbc conn UID=svc;PWD={pw-Uncl_A-31;pw-Uncl_B-32")
+    assert "pw-Uncl_A-31" not in out
+    assert "pw-Uncl_B-32" not in out
+    assert REDACTION_PLACEHOLDER in out
+    # The line's own prefix survives, so an operator still sees which connection failed.
+    assert out.startswith("odbc conn UID=svc;PWD=")
+
+
+def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
+    """THE READ-TIME COPY OF THE FRAGMENTS NEEDS ITS OWN BOUND GUARD, and this is it.
+
+    ``test_every_applied_credential_pattern_scans_a_bounded_prefix`` below pins ``_LABEL_PREFIX``'s
+    ``{0,N}``, and every other applied pattern's, because an unbounded repetition a fresh start
+    position can enter is quadratic. This sentence named that guard's narrow predecessor until
+    BACKLOG #1547 widened it from one pattern to the derived applied set.
+
+    THE FRAGMENTS BELOW ARE OUT OF THAT GUARD'S REACH, which is why this one is not redundant: they
+    are bare pattern-source strings rather than applied ``re.Pattern`` objects, so the derived set
+    never sees them. They reach the same property by the other
+    route -- a DETERMINISTIC repetition made POSSESSIVE, which cannot re-walk at all -- so what has to
+    be pinned is the ``*+``, not a bound. Without this, the read-time copy could be relaxed to a plain
+    ``*`` with the whole suite green, and this is the copy that feeds the support archive and
+    ``GET /logs/tail``.
+
+    Structural rather than a stopwatch, for the reason the sibling guard already gives: a timing
+    assertion on a shared runner flakes, and the property that matters is that the mitigation is
+    there."""
+    for name in ("_ODBC_BRACED", "_QUOTED_VALUE"):
+        fragment = getattr(redact_mod, name)
+        assert "*+" in fragment, (
+            f"{name} is {fragment!r} -- its repetition must stay POSSESSIVE. A plain '*' re-walks a "
+            "value whose closer never arrives, on attacker-influenceable log text."
+        )
+        assert "*" not in fragment.replace("*+", ""), (
+            f"{name} is {fragment!r} -- it grew a repetition that is neither possessive nor bounded."
+        )
+
+    # Anti-vacuity: both fragments must still be REACHED, or the assertions above pin dead strings.
+    # Taken from the table rather than written fresh, so this cannot go green over a shape the suite
+    # does not actually cover.
+    for name in ("brace_semicolon", "single_quoted_space"):
+        case = next(c for c in QUOTED_VALUES if c.name == name)
+        assert REDACTION_PLACEHOLDER in redact_log_line(case.line), name
 
 
 #: Diagnostics carrying no credential, which the credential patterns must NOT eat. Over-redaction is

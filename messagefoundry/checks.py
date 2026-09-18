@@ -1079,7 +1079,7 @@ def _check_handler_security(
 
 
 def _check_validate(config_dir: str | Path) -> CheckResult:
-    from messagefoundry.config.wiring import validate_config
+    from messagefoundry.config.wiring import load_config, validate_config
 
     errors = [d for d in validate_config(config_dir) if d.severity == "error"]
     if errors:
@@ -1087,15 +1087,25 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
-    return CheckResult("validate", ok=True, required=True, detail="no problems")
+    # Say how many declared `encoding` values this pass actually probed (BACKLOG #1613): a pass that
+    # examined NOTHING and one that examined everything and found it good both report no problems.
+    # An env() ref carries no value at config time and NOTHING checks it later either, so the word is
+    # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
+    # load_config here rather than a second return value out of validate_config, matching the sibling
+    # checks above; the config is known to load, since every error diagnostic returned already.
+    checked, unchecked = load_config(config_dir).encoding_census()
+    census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
+    return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 
 
 # Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
 # declare its expected dry-run disposition in a sibling ``<fixture>.expect`` file. ``dry_run`` reports
 # ``RECEIVED`` (would route + deliver), ``UNROUTED`` (no handler matched), ``FILTERED`` (a handler ran
-# but delivered nothing), or ``ERROR`` (parse/validate/router-handler failure). ``PROCESSED``/``ROUTED``
-# are live-only post-delivery states, so they alias to ``RECEIVED`` for authoring ergonomics.
-_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "ERROR"})
+# but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
+# present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
+# router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
+# to ``RECEIVED`` for authoring ergonomics.
+_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
     "ROUTED": "RECEIVED",
@@ -1107,7 +1117,7 @@ _DISPOSITION_ALIASES = {
 def _expected_disposition(fixture_path: str | Path) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
-    Returns the normalized disposition name (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``), or
+    Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
     Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
     """
@@ -1169,6 +1179,7 @@ def _check_dryrun(
 ) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
+    from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
     if messages_dir is None:
@@ -1208,11 +1219,24 @@ def _check_dryrun(
     # not-deployed feed must still resolve to that feed, or it would silently become "unmapped" and be
     # cross-producted against every OTHER feed — worse than the problem. It is the cross-product target
     # list that drops the not-deployed feeds: an unmapped fixture must not be run against a feed nobody
-    # deployed (its Sends are declined, so it would report FILTERED and fail a .expect). An explicitly
+    # deployed (its Sends are declined, so it would report NOT_DEPLOYED — truthfully since BACKLOG
+    # #1690, and still not what a fixture written for the OTHER feeds declared). An explicitly
     # PINNED fixture still runs against its not-deployed feed — carrying the record is the point of the
     # state, and dry-run resolves no env(), so previewing its router/handler logic stays free.
+    #
+    # A **binary** feed (BINARY, DICOM) leaves the cross-product for the same reason and on the same
+    # terms (BACKLOG #1689). `read_message_sets` reads `*.hl7` files, and a binary inbound base64-
+    # carries its bytes rather than decoding them (ADR 0028), so running an unmapped HL7 fixture
+    # against one asks "would this HL7 file route as a DICOM object" — a question whose answer is
+    # always no and which tells an author nothing about either feed. It became visible only when the
+    # preview started carrying bytes the way the listener does: the text-decoded body used to miss the
+    # feed's own `is_binary` guard and report a placid UNROUTED, where the engine would have carried
+    # it, failed the codec, and dead-lettered it. A PINNED fixture still runs against its binary feed,
+    # exactly as one pinned to a not-deployed feed does.
     inbound_names = list(reg.inbound)
-    deployed_inbounds = [n for n, ic in reg.inbound.items() if ic.deployed]
+    crossproduct_inbounds = [
+        n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
+    ]
     message_sets = read_message_sets(mpath, inbound_names)
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
@@ -1231,23 +1255,50 @@ def _check_dryrun(
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
-        targets = [target] if target is not None else deployed_inbounds
+        targets = [target] if target is not None else crossproduct_inbounds
         if target is not None:
             pinned += 1
         for ic_name in targets:
             total += 1
             result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            # A Router/Handler's own `raise` can quote field values, so its text goes through
+            # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
+            # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in
+            # a commit hook and a CI log by design, so an opt-in here would put PHI in that log on
+            # request. The conditions still branch on `result.error` rather than on the redacted value —
+            # redaction must never decide whether the gate fails, only what the failure says — and each
+            # call sits inside its failing arm, so a clean run pays nothing for it.
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
                 if actual != expected:
-                    errors.append(
-                        f"{label} @ {ic_name}: expected {expected}, got {result.error or actual}"
-                    )
+                    got = safe_error(result.error) or actual
+                    errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
             elif result.error or result.disposition is MessageStatus.ERROR:
-                errors.append(f"{label} @ {ic_name}: {result.error or result.disposition.value}")
+                shown = safe_error(result.error) or result.disposition.value
+                errors.append(f"{label} @ {ic_name}: {shown}")
     if errors:
         detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
+        return CheckResult("dryrun", ok=False, required=True, detail=detail)
+    if total == 0:
+        # BACKLOG #1671: fixtures exist (the "no *.hl7" skip above already returned) yet the inner
+        # loop never ran, so the success return below would report "0 run(s) clean" — a REQUIRED
+        # check claiming a pass over a verification it never performed. Every sibling marks "I
+        # established nothing" with `skipped=True`, which `CheckResult.blocking` excludes; this was
+        # the one path reaching a non-skipped success on zero work. Keep it a postcondition on
+        # `total`: an equivalent precondition on `crossproduct_inbounds` would have to be kept in
+        # lockstep with the loop's branching, and it would miss any other path to zero.
+        #
+        # `read_message_sets` only ever pins a fixture to a name drawn from `reg.inbound`, so a
+        # pinned fixture always contributes a run — reaching here means every fixture is unmapped
+        # AND no inbound is eligible for the cross-product. The counts below are read, not inferred,
+        # so the detail stays true even if some later path arrives here for a different reason.
+        detail = (
+            f"{len(message_sets)} fixture(s) read but 0 dry-run(s) executed — only "
+            f"{len(crossproduct_inbounds)} of {len(inbound_names)} inbound(s) take an unmapped "
+            f"fixture (the rest are not deployed, or carry a binary content type) and no "
+            f"fixture is feed-pinned, so every target list was empty"
+        )
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
     pin_note = f", {pinned} feed-pinned" if pinned else ""
     exp_note = f", {asserted} expectation-checked" if asserted else ""

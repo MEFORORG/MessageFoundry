@@ -280,6 +280,21 @@ def test_parse_env_setting_discriminates_plain_dicts() -> None:
     assert isinstance(ref, EnvRef) and ref.key == "some_key" and ref.default == "d"
 
 
+def test_named_bool_cast_is_not_the_builtin(tmp_path: Path) -> None:
+    """``cast = "bool"`` must not decode to the builtin ``bool`` (BACKLOG #1651).
+
+    ``bool("false")`` is ``True``, as is ``bool`` of every other non-empty string, so the builtin
+    inverts exactly the values an operator writes to turn a flag OFF. The behaviour is pinned in
+    tests/test_environments.py; this asserts the ADR-0007 *decode* hands over a real parser, which is
+    the half a resolve-side test cannot see."""
+    ref = parse_env_setting({"env": "Debug_Flag", "cast": "bool"})
+    assert isinstance(ref, EnvRef) and ref.key == "debug_flag"
+    assert ref.cast is not None and ref.cast is not bool
+    assert ref.cast("false") is False and ref.cast("true") is True
+    # The other named casts are unchanged, and `int` is still the builtin it always was.
+    assert parse_env_setting({"env": "p", "cast": "int"}).cast is int
+
+
 def test_duplicate_name_across_file_and_code_fails(tmp_path: Path) -> None:
     py = LOGIC_PY + textwrap.dedent(
         """

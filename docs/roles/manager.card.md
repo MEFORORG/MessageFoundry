@@ -14,7 +14,7 @@ not transfer.** The differences are the whole design:
 |---|---|---|
 | Your workers | separate `claude -p` sessions | **subagents, in your own process** |
 | Accounts you touch | several | **one: yours** |
-| The spawn grant | required | **not needed, and not used** |
+| The spawn grant | required | **not needed for your workers, who are subagents. You MAY still spawn a session (2026-09-16)** |
 | Peers beside you | none, it was the only one | **several, usually one per account** |
 | Enqueuing a PR | its call | **the Lander's. Not yours.** |
 

@@ -40,7 +40,6 @@ from messagefoundry.pipeline._sandbox_codec import (
     _MAX_DEPTH,
     _MAX_HEADER,
     MAX_FRAME,
-    Ignored,
     SandboxCodecError,
     SandboxError,
     _Blobs,
@@ -143,19 +142,20 @@ def _rt_transform(result: object) -> object:
 def test_a_reduce_gadget_never_reaches_the_parent() -> None:
     """The confirmed defect, both halves.
 
-    (a) CHILD side — describing a Handler return value never invokes ``__reduce__``: a gadget is an
-    item ``_partition`` would ignore, so it is described as ``{"o": "other"}`` and the parent rebuilds
-    an inert :class:`Ignored`.
+    (a) CHILD side — describing a Handler return value never invokes ``__reduce__``: a gadget is not
+    an admissible Handler item, so the encoder REJECTS it (BACKLOG #1687) without ever reading an
+    attribute off it. The security property is unchanged by that raise and is what this half pins:
+    nothing about the gadget executes on either side of the pipe. It used to be described as
+    ``{"o": "other"}`` and rebuilt as an inert placeholder, which was equally non-executing — and
+    equally silent, so the message finalized ``FILTERED``.
 
     (b) PARENT side — the EXACT bytes the old child wrote (``pickle.dumps({"ok": True, "result":
     gadget})``) are fed to both codecs. ``pickle.loads`` — which is literally what the old
     ``sandbox._read_frame`` did on the reader thread, before any envelope inspection — DETONATES the
     gadget in this process. ``decode_frame`` refuses the same bytes with the tripwire untouched."""
-    # (a) describing the gadget executes nothing, and the parent rebuilds an inert placeholder.
-    blobs = _Blobs()
-    node = enc_result("transform", Gadget(), blobs)
-    assert node == {"r": "items", "shape": "one", "i": {"o": "other"}}
-    assert isinstance(dec_result("transform", node, _Reader(blobs.items)), Ignored)
+    # (a) describing the gadget executes nothing — it is refused as an inadmissible item instead.
+    with pytest.raises(SandboxCodecError, match="unsupported Gadget"):
+        enc_result("transform", Gadget(), _Blobs())
     assert EXECUTED == []
 
     # (b) the exact frame body the OLD child produced for a gadget-returning Handler.
@@ -199,7 +199,6 @@ _ALLOWED_TYPES = {
     Send,
     SetState,
     SetMeta,
-    Ignored,
     CapturedResponse,
     Message,
     RawMessage,
@@ -241,13 +240,15 @@ def test_decoder_constructs_only_the_closed_type_set() -> None:
     corpus: list[object] = []
 
     # a full transform result
+    # Every ADMISSIBLE item kind at once. An inadmissible one is no longer part of this corpus: the
+    # encoder rejects it (BACKLOG #1687), so it can no longer contribute a type to the decoder's
+    # output at all — which is a strictly smaller closed set, not a weaker assertion.
     corpus.append(
         _rt_transform(
             [
                 Send("OB_A", "x" * 5000),
                 SetState("ns", "k", {"a": [1, 2.5, True, None, ("t",)]}),
                 SetMeta("mk", "mv"),
-                object(),
             ]
         )
     )
@@ -318,7 +319,7 @@ def _two_sends(ref_a: Any, ref_b: Any) -> dict[str, Any]:
 def test_sequential_segment_references_decode() -> None:
     """The happy path the discipline has to keep working: two out-of-band bodies, in order."""
     resp = _decode(_body(_two_sends({"$": 0}, {"$": 1}), (_BIG_A, _BIG_B)))
-    sends, _, _ = _partition(resp.result)  # type: ignore[arg-type]
+    sends, _, _ = _partition(resp.result, NAME)  # type: ignore[arg-type]
     assert [(s.to, s.message) for s in sends] == [("OB_A", _BIG_A), ("OB_B", _BIG_B)]
 
 
@@ -615,12 +616,11 @@ def _generator_result() -> Any:
 _PARITY: dict[str, list[int]] = {
     "none": [0, 0, 0],
     "bare_send": [1, 0, 0],
-    "mixed_list": [1, 1, 1],  # the trailing `7` is unrecognised and drops
+    "mixed_list": [1, 1, 1],  # one of each admissible kind, in one container
     "send_subclass": [1, 0, 0],
     "tuple_of_sends": [2, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
     # >1 element on purpose — a 1-element set has only one ordering, so it cannot see _UNORDERED.
     "set_of_sends": [3, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
-    "bare_int": [0, 0, 0],  # not a container, not a recognised item — still DROPS
     "generator": [1, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
     # THE acceptance criterion of #341 — `return []` / `return ()` must keep FILTERING, not start
     # delivering and not start raising — carried across the process boundary, not just in-process.
@@ -641,11 +641,10 @@ _UNORDERED = {"set_of_sends"}
     [
         ("none", lambda: None),
         ("bare_send", lambda: Send("OB_A", "x")),
-        ("mixed_list", lambda: [Send("OB_A", "x"), SetState("n", "k", 1), SetMeta("m", "v"), 7]),
+        ("mixed_list", lambda: [Send("OB_A", "x"), SetState("n", "k", 1), SetMeta("m", "v")]),
         ("send_subclass", lambda: _SubSend("OB_A", "x")),
         ("tuple_of_sends", lambda: (Send("OB_A", "x"), Send("OB_B", "y"))),
         ("set_of_sends", lambda: {Send("OB_A", "x"), Send("OB_B", "y"), Send("OB_C", "z")}),
-        ("bare_int", lambda: 7),
         ("generator", _generator_result),
         ("empty_list", list),
         ("empty_tuple", tuple),
@@ -658,10 +657,10 @@ def test_partition_parity_table(case: str, make: Any) -> None:
     (:func:`~messagefoundry.config.wiring.handler_result_items`), exactly as it already materialises a
     router return with ``_handler_names``' logic — so a tuple/set/generator fan-out delivers under
     ``mode=subprocess`` precisely as it does under ``mode=off`` (BACKLOG #341), an EMPTY container still
-    FILTERS, a ``Send`` **subclass** still delivers, and a value neither rule recognises still drops
-    (described as an ``Ignored`` slot rather than omitted, so ``_partition`` stays the SOLE filter).
-    Fixing the parent's ``_partition`` alone would make the disposition MODE-DEPENDENT — in-process
-    delivers while subprocess drops — which is worse than the original accept-and-drop this closes.
+    FILTERS, and a ``Send`` **subclass** still delivers. Fixing the parent's ``_partition`` alone would
+    make the disposition MODE-DEPENDENT — in-process delivers while subprocess drops — which is worse
+    than the original accept-and-drop this closes. Inadmissible shapes moved to
+    :func:`test_partition_parity_table_rejects` when both sides started raising on them (#1687).
 
     **Destinations are compared, not just counts** — equal lengths would pass even if the codec swapped
     one outbound for another. For an ordered container the exact ORDER is pinned too; for a ``set``
@@ -669,8 +668,8 @@ def test_partition_parity_table(case: str, make: Any) -> None:
     scope honestly: this round-trip is **in-process**, so it cannot observe the cross-process reordering
     a real child imposes on a ``set`` — which is precisely why the contract is stated over the multiset
     rather than asserted over an order that only holds within one hash seed."""
-    direct = _partition(make())
-    through_codec = _partition(_rt_transform(make()))  # type: ignore[arg-type]
+    direct = _partition(make(), NAME)
+    through_codec = _partition(_rt_transform(make()), NAME)  # type: ignore[arg-type]
     assert [len(x) for x in direct] == _PARITY[case]
     assert [len(x) for x in through_codec] == _PARITY[case]
     if case == "send_subclass":
@@ -682,12 +681,59 @@ def test_partition_parity_table(case: str, make: Any) -> None:
     else:
         assert dests_codec == dests_direct
     if case in ("empty_list", "empty_tuple"):
-        # The filter idiom must cross the pipe AS A CONTAINER, and `[0, 0, 0]` alone cannot see that:
-        # an empty container mis-described as an *unrecognised single value* also partitions to
-        # `[0, 0, 0]` (the parent rebuilds an `Ignored`). Pinning the described shape is what makes
-        # this row falsifiable at all — a truthiness gate in `handler_result_items` (`and result`,
-        # the natural "simplification") flips `shape` to `"one"` while every count stays green.
+        # The filter idiom must cross the pipe AS A CONTAINER, and `[0, 0, 0]` alone cannot see that.
+        # Pinning the DESCRIBED SHAPE is what makes this row falsifiable: a truthiness gate in
+        # `handler_result_items` (`and result`, the natural "simplification") flips `shape` to `"one"`,
+        # which since #1687 turns the documented filter idiom into a RAISE — a failure this row would
+        # report as a wrong shape rather than leaving to whichever caller happened to notice.
         assert enc_result("transform", make(), _Blobs()) == {"r": "items", "shape": "list", "i": []}
+
+
+@pytest.mark.parametrize(
+    ("make", "offender"),
+    [
+        (lambda: 7, "int"),
+        (lambda: Message.parse(RAW), "Message"),
+        (lambda: Message.parse(RAW).encode().encode(), "bytes"),
+        (lambda: "OB_A", "str"),
+        (lambda: {"to": "OB_A", "body": "x"}, "str"),  # a dict is iterated -> its KEYS
+        (lambda: ("OB_A", Message.parse(RAW)), "str"),
+        (lambda: [Send("OB_A", "x"), 7], "int"),
+    ],
+    ids=[
+        "bare_int",
+        "bare_message",
+        "encoded_bytes",
+        "bare_str",
+        "bare_dict",
+        "name_message_tuple",
+        "stray_in_list",
+    ],
+)
+def test_partition_parity_table_rejects(make: Any, offender: str) -> None:
+    """The other half of the parity contract: a shape NEITHER side may accept (BACKLOG #1687) — see
+    :func:`~messagefoundry.config.wiring.handler_item_fault` for what swallowing them used to cost.
+
+    Parity here is over the VERDICT, not the exception type: the parent raises ``ValueError`` from
+    ``_partition`` and the child raises a codec rejection its parent re-raises as ``SandboxError``,
+    and both land on the transform stage's internal-error policy (ERROR / dead-letter, replayable).
+    The offending TYPE NAME is asserted on both sides, so the two messages cannot drift into naming
+    different things about the same value."""
+    with pytest.raises(ValueError, match=f"unsupported {offender}") as in_process:
+        _partition(make(), NAME)
+    assert NAME in str(in_process.value)  # the parent names the handler; the child's parent does
+    with pytest.raises(SandboxCodecError, match=f"unsupported {offender}"):
+        enc_result("transform", make(), _Blobs())
+
+
+def test_an_empty_dict_return_still_filters() -> None:
+    """The boundary of the rule above, and the one ``dict`` that must NOT raise. ``{}`` is an empty
+    container, so it yields no items and there is nothing to find inadmissible — it filters exactly
+    like ``return []`` / ``return ()``. Pinned because the natural over-correction (fault the
+    CONTAINER's type instead of its items) would break the documented filter idiom for it while
+    leaving every other row of the table green."""
+    assert _partition({}, NAME) == ([], [], [])  # type: ignore[arg-type]
+    assert enc_result("transform", {}, _Blobs()) == {"r": "items", "shape": "list", "i": []}
 
 
 def test_handler_result_items_treats_a_str_as_a_single_value() -> None:
@@ -697,9 +743,10 @@ def test_handler_result_items_treats_a_str_as_a_single_value() -> None:
     partition its characters. And the gate is an explicit ``__iter__`` (``isinstance(..., Iterable)``),
     never a duck-typed ``list(result)``, so a non-iterable value is a single item rather than a raise.
 
-    An end-to-end "a ``str`` return still drops" test could NOT catch the first carve-out: characters
-    are not ``Send``\\ s, so the disposition is ``[0, 0, 0]`` with or without it. Asserting on the rule
-    is what makes the carve-out falsifiable at all."""
+    An end-to-end "a ``str`` return is rejected" test could NOT catch the first carve-out: a character
+    is not a ``Send`` either, so a ``str`` faults with or without it — only the reported TYPE differs
+    (``str`` for the whole value vs ``str`` for its first character, which is the same word). Asserting
+    on the rule is what makes the carve-out falsifiable at all."""
     s1, s2 = Send("OB_A", "x"), Send("OB_B", "y")
     assert handler_result_items("OB_A") is None
     assert handler_result_items(b"x") is None
@@ -710,7 +757,6 @@ def test_handler_result_items_treats_a_str_as_a_single_value() -> None:
     assert handler_result_items((s1, s2)) == [s1, s2]
     assert handler_result_items([s1]) == [s1]
     assert handler_result_items(()) == []
-    assert _partition("OB_A") == ([], [], [])  # and a str return still DROPS end to end
 
 
 # --- (8) parent-side constructor faults are wrapped --------------------------

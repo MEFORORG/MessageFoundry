@@ -36,6 +36,19 @@ _ADVERSARIAL = [
     "\rMSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||9^^^H^MR||X^Y\r",
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||9^^^H^MR||X^Y\r\rNK1|1|Z^Q",
     "\x0bMSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||9^^^H^MR||X^Y\x1c\r",
+    # OBX-5 preserve allowlist: the two adapters read OBX-2/OBX-5 by different routes (a parsed
+    # Message vs a field split), so every branch of the shared decision is a divergence surface.
+    # An embedded document, an absent value type, a numeric label over prose, and a coded element
+    # both with and without a populated text component — the last two must land on OPPOSITE sides,
+    # so a seam that collapsed the rule to one answer cannot pass this line.
+    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|M1|P|2.5.1\rOBX|1|ED|D^R^L||S^AP^PDF^Base64^JVBERi0xLjQK",
+    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|M1|P|2.5.1\rOBX|1||D^R^L||PATIENT X^Y SEEN",
+    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|M1|P|2.5.1\rOBX|1|NM|8480-6^S^LN||PATIENT X^Y SEEN",
+    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|M1|P|2.5.1\rOBX|1|CWE|DX^D^L||I10^ESSENTIAL HTN^ICD10",
+    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|M1|P|2.5.1\rOBX|1|CWE|DX^D^L||I10^^ICD10",
+    # The same allowlist under non-default encoding characters — MSH-2 is `*~\&`, so a hardcoded
+    # `^` anywhere in the component walk would split this CWE wrongly on exactly one of the seams.
+    "MSH!*~\\&!A!B!C!D!20260101!!ORU*R01!M1!P!2.5.1\rOBX!1!CWE!DX*D*L!!I10*ESSENTIAL HTN*ICD10",
 ]
 # Inputs neither side can safely anonymize — BOTH must fail closed (refuse, never emit).
 _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]

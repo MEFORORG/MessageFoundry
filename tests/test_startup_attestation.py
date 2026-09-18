@@ -8,7 +8,9 @@ The engine hashes its loaded ``messagefoundry`` module files against the install
 - AC-9  — attests loaded modules against RECORD on a (simulated) non-editable wheel install.
 - AC-10 — drift ALERTS + records a ``startup_integrity`` audit row by default (engine still starts).
 - AC-11 — drift FAILS-CLOSED (``IntegrityError``) when ``[integrity].fail_closed_on_drift``.
-- AC-12 — an EDITABLE install is a NO-OP (no fail, no alert) so dev is never bricked.
+- AC-12 — an install that DECLARES itself editable is a NO-OP (no fail, no alert) so dev is never bricked.
+- AC-13 — a pass that compared NOTHING (no baseline, a stripped baseline, a shadowed package) warns,
+  records and alerts, and fails closed when opted in (BACKLOG #1679).
 
 The attestation logic is exercised against a fabricated install root (a fake ``mfengine`` package +
 its ``*.dist-info/RECORD``) so the test never depends on how *this* repo happens to be installed.
@@ -312,6 +314,13 @@ async def test_drift_fails_closed_when_opted_in(
 
 
 async def test_editable_install_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC-12, and the PAIRED ARM for the #1679 refusals below.
+
+    This install DECLARES itself editable (a PEP 610 ``direct_url.json`` plus an ``__editable__`` finder
+    row in RECORD) and compares nothing, exactly like the four shapes in the #1679 block. It must still
+    start silently. So what causes those refusals is the MISSING declaration, not ``checked == 0``,
+    which no single-arm test could establish.
+    """
     pkg = "mfengine"
     files = {
         f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
@@ -325,14 +334,19 @@ async def test_editable_install_is_noop(tmp_path: Path, monkeypatch: pytest.Monk
     (tmp_path / f"{pkg}/core.py").write_bytes(b"def go():\n    return 2  # dev edit\n")
     result = attest_engine()
     assert result.editable is True and result.attested is False
-    assert result.drift == [] and result.ok
+    assert result.drift == []
+    # It compared nothing, so it is NOT `ok` (#1679) — `ok` now means VERIFIED clean. What keeps it
+    # from being refused is the declaration.
+    assert result.attested_nothing is True and result.ok is False
+    assert result.declared_editable is True
+    assert result.unattested_reason == "declared_editable"
 
     store = await open_store(sqlite_settings(str(tmp_path / "ed.db")))
     sink = _RecordingSink()
     try:
         # fail_closed_on_drift=True must STILL not brick a dev editable install.
         out = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
-        assert out.editable is True and out.ok
+        assert out.editable is True and out.declared_editable is True
         assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
         assert sink.events == []  # no alert on a dev install
     finally:
@@ -593,3 +607,255 @@ def test_declared_assets_exist_in_the_shipped_package() -> None:
         assert path.is_file(), f"declared attested asset does not exist: {rel} ({path})"
         # A zero-byte asset in the shipped tree is the very state this tripwire exists to catch.
         assert path.stat().st_size > 0, f"declared attested asset is empty: {rel}"
+
+
+# --- BACKLOG #1679: fail-closed must refuse when attestation verified NOTHING ---
+#
+# `fail_closed_on_drift` used to branch on `result.drift` alone, and three shapes reach the caller with
+# `drift == []` having compared ZERO files: an absent or empty RECORD, a RECORD stripped of its package
+# rows on an install that declares no editable marker, and a package imported from outside the install
+# root (the #1677 shadow, which needs no venv write at all). A site that opted into hard enforcement
+# would start cleanly on first deployment with its tripwire disarmed, and the INFO line said clean.
+#
+# The adversary this module names holds venv-write + restart rights, so it can strip the baseline as
+# easily as it can edit a module. Verifying nothing is therefore the expected end state of a competent
+# in-place edit, not an exotic packaging accident.
+
+#: One arm per shape the row measured. `record_deleted`/`record_empty` are the two ways a baseline goes
+#: absent; the other two are the stripped and shadowed shapes.
+_ATTESTS_NOTHING_SHAPES = ("record_deleted", "record_empty", "record_rowless", "shadowed_package")
+
+
+def _build_install_that_attests_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Fabricate a NON-editable install whose attestation compares nothing.
+
+    Every arm starts from the same clean wheel fixture as ``test_attests_loaded_modules_against_record``
+    and keeps the package source on disk; none writes a ``direct_url.json`` or an ``__editable__``/
+    ``.pth`` RECORD row, so no arm declares itself editable. What differs is only the baseline's reach,
+    which is what makes ``test_editable_install_is_noop`` a usable paired arm.
+
+    The install root is a ``site-packages`` subdirectory rather than ``tmp_path`` itself, because the
+    shadow arm needs a package tree OUTSIDE that root — see its comment.
+    """
+    pkg = "mfengine"
+    root = tmp_path / "site-packages"
+    files = {
+        f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
+        f"{pkg}/core.py": b"SAFE = True\n",
+    }
+    dist, loaded = _build_wheel_install(root, pkg=pkg, files=files)
+    record = root / f"{pkg}-1.0.dist-info" / "RECORD"
+    if shape == "record_deleted":
+        record.unlink()
+    elif shape == "record_empty":
+        record.write_text("", encoding="utf-8")
+    elif shape == "record_rowless":
+        # RECORD stripped of its package source rows. The one row left carries no hash, so the parsed
+        # baseline is empty — which is also what a real editable install looks like to the "no package
+        # rows" signal. That collision is the defect: the signal cannot tell the two apart, so it must
+        # not be read as a declaration.
+        record.write_text(f"{pkg}-1.0.dist-info/RECORD,,\n", encoding="utf-8")
+    elif shape == "shadowed_package":
+        # #1677 seen from this control's side: the package is imported from a directory resolved BEFORE
+        # site-packages, so no loaded file is under the install root and every one is skipped as
+        # unattestable. RECORD is untouched and correct; it is simply about a different tree.
+        #
+        # OUTSIDE the install root is the whole shape, and it is worth stating because the first cut of
+        # this fixture got it wrong: a shadow tree planted INSIDE the root is relpath-able against
+        # RECORD, finds no row, and is reported as `missing` drift — which the control already handles.
+        # Only a tree the install root cannot reach produces the silent `checked == 0`.
+        shadow = tmp_path / "shadow"
+        for rel, data in files.items():
+            path = shadow / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        loaded = [(shadow / rel).resolve() for rel in files]
+    else:  # pragma: no cover — a typo in the parametrize list
+        raise AssertionError(f"unknown shape: {shape}")
+    _patch(monkeypatch, dist, loaded, pkg)
+
+
+@pytest.mark.parametrize("shape", _ATTESTS_NOTHING_SHAPES)
+def test_an_install_that_compared_nothing_is_not_reported_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """A pass that compared zero files must not report ``ok``. It proves nothing either way."""
+    _build_install_that_attests_nothing(tmp_path, monkeypatch, shape)
+
+    result = attest_engine()
+    assert result.drift == []  # the hole: no drift, and nothing was looked at
+    assert result.checked == 0
+    assert result.ok is False, "a pass that compared NOTHING must not report ok"
+    assert result.attested_nothing is True
+    assert result.declared_editable is False, "no arm here declares an editable install"
+    assert result.unattested_reason is not None, (
+        "the shape that disarmed the tripwire must be named"
+    )
+
+
+@pytest.mark.parametrize("shape", _ATTESTS_NOTHING_SHAPES)
+async def test_attested_nothing_fails_closed_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Under ``fail_closed_on_drift`` the engine must refuse to start when it verified nothing, and it
+    must record + alert BEFORE refusing (the same order the drift path uses)."""
+    import json
+
+    _build_install_that_attests_nothing(tmp_path, monkeypatch, shape)
+
+    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")))
+    sink = _RecordingSink()
+    try:
+        with pytest.raises(IntegrityError):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        rows = [a for a in await store.list_audit() if a["action"] == "startup_integrity"]
+        assert rows, "the attested-nothing posture must be recorded BEFORE refusing to start"
+        detail = json.loads(rows[0]["detail"])
+        assert detail["checked"] == 0 and detail["drift_count"] == 0
+        assert detail["fail_closed"] is True
+        assert detail["unattested_reason"], (
+            "the audit row must name which shape disarmed the tripwire"
+        )
+        assert sink.events, "the posture must page off-box, not only log"
+        # A distinct subject from the drift label so the two resolve as separate alert instances.
+        assert sink.events[-1][0] == "engine-unattested"
+        assert sink.events[-1][2] == 0  # nothing drifted; nothing was compared either
+    finally:
+        await store.close()
+
+
+async def test_attested_nothing_warns_records_and_alerts_under_alert_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default posture: the engine still starts, and the signal is still WARNING + audited +
+    alerted. The refusal is in ADDITION to those, never instead of them — an operator who has not
+    opted into hard enforcement must still be able to see that attestation proved nothing.
+
+    WARNING, not the DEBUG line this used to emit: a DEBUG line in a service running at INFO is not a
+    signal, it is silence.
+    """
+    import json
+    import logging
+
+    _build_install_that_attests_nothing(tmp_path, monkeypatch, "record_deleted")
+
+    store = await open_store(sqlite_settings(str(tmp_path / "alert_only.db")))
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            result = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert result.attested_nothing is True and result.ok is False
+        assert any("verified NOTHING" in message for message in caplog.messages), caplog.messages
+        rows = [a for a in await store.list_audit() if a["action"] == "startup_integrity"]
+        assert rows, "alert-only must STILL record the attested-nothing row"
+        assert json.loads(rows[0]["detail"])["fail_closed"] is False
+        assert sink.events, "alert-only must STILL fire the alert"
+    finally:
+        await store.close()
+
+
+async def test_a_verified_clean_install_still_starts_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE NEGATIVE CONTROL on the four arms above, and on the widened refusal.
+
+    An ordinary non-editable wheel install with an intact baseline compares its files, reports ``ok``,
+    records nothing and alerts nothing — under ``fail_closed_on_drift=true``. Without this arm the
+    #1679 change could be satisfied by refusing every install, which would brick the shape the control
+    exists to serve.
+    """
+    pkg = "mfengine"
+    files = {
+        f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
+        f"{pkg}/core.py": b"SAFE = True\n",
+    }
+    dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files)
+    _patch(monkeypatch, dist, loaded, pkg)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")))
+    sink = _RecordingSink()
+    try:
+        result = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert result.ok is True and result.checked == 2 and result.attested_nothing is False
+        assert result.unattested_reason is None
+        assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1679 act 5: an editable install under an opted-in fail-closed posture ---
+
+
+def _editable_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fabricated install that DECLARES itself editable — the AC-12 no-op shape."""
+    pkg = "mfengine"
+    files = {
+        f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
+        f"{pkg}/core.py": b"def go():\n    return 1\n",
+    }
+    dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files, editable=True)
+    _patch(monkeypatch, dist, loaded, pkg)
+
+
+async def test_declared_editable_under_fail_closed_warns_and_names_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An operator who set ``[integrity].fail_closed_on_drift`` on an editable install WOULD start
+    with the tripwire disarmed, and before this change with zero signal (BACKLOG #1679 act 5).
+
+    AC-12 keeps the exemption — a declared-editable install is still never refused, never audited and
+    never alerted, so a dev checkout is not bricked. What was missing is the operator's side of it:
+    the posture readout said nothing at all, so the opt-in looked honoured.
+
+    This is a MISCONFIGURATION control and nothing more. It closes no hole: an adversary with
+    venv-write plants a ``direct_url.json`` or rewrites this module in the same single write.
+    """
+    import logging
+
+    _editable_install(tmp_path, monkeypatch)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_fc.db")))
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            out = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert out.declared_editable is True and out.attested_nothing is True
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "a fail-closed opt-in on an editable install must not start silently"
+        assert any("DISARMED" in m for m in warnings), warnings
+        # The reason token is what carries the cause into the boot-log posture readout.
+        assert any("declared_editable" in m for m in warnings), warnings
+        # AC-12 is untouched: still no refusal, no audit row, no alert.
+        assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_declared_editable_under_the_default_posture_stays_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE PAIRED ARM. The warning above is keyed on the fail-closed OPT-IN, not on editability.
+
+    Off the default alert-only posture an editable install is an ordinary dev checkout and there is no
+    misconfiguration to report, so it must stay silent. Without this arm the change could be satisfied
+    by warning on every dev run, which is how a warning stops being read.
+    """
+    import logging
+
+    _editable_install(tmp_path, monkeypatch)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_default.db")))
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            out = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert out.declared_editable is True
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
+        assert sink.events == []
+    finally:
+        await store.close()

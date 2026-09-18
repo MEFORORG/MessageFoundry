@@ -4,9 +4,20 @@
 
 Half the assessment record is prose nothing checks. Roughly two thousand ``file:line`` citations
 live inside ``residual`` text across ~250 cells; a sample measured 44.9% of them stale. The
-demonstration case is cell 6.3.3, where the GATED evidence anchor for ``instance_exposed`` points at
-``messagefoundry/__main__.py:1125`` -- which is correct -- while the prose in the SAME CELL cites
-``__main__.py:1917``, which is a different statement altogether. **A reviewer reads the prose.**
+demonstration case is one cell, about one control: its GATED evidence anchor resolves to the
+``instance_exposed`` assignment in ``messagefoundry/__main__.py``, the file's only assignment of
+that name, while the prose in the SAME CELL points a reader at a different line of the same file,
+holding an unrelated statement. The gated half is right and the read half is wrong.
+**A reviewer reads the prose.**
+
+THAT PARAGRAPH CITES A SYMBOL AND NOT A LINE, DELIBERATELY. It used to cite a line and assert it
+correct. The line had moved by the time anyone looked, so the lint built to refuse a stale citation
+was shipped carrying one of its own, in the paragraph that justifies the lint -- and no gate
+reported it, because nothing reads this docstring. Three tests in
+``tests/test_asvs_residual_lint.py`` now resolve what this docstring claims about engine code -- at
+least the paths it names, the symbol it demonstrates, and the absence of a resolvable line number --
+and red when one drifts (BACKLOG #1205). Keep new claims here in the same form: name the symbol and
+the file, say what makes it unique, and let the test find it.
 
 WHAT THIS IS NOT. It does not promote those citations into gated anchors. That was costed and
 refused: roughly a thousand hand-authored tokens, it doubles the gated surface, and it makes

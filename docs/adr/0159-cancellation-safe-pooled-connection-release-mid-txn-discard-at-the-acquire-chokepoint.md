@@ -161,9 +161,116 @@ the next reader does not re-derive the wrong precedent from the same comment.
   the intended outcome. What is fixed is pool integrity and the silent EMPTY-all yield.
 - **Backend scope: SQL Server only.** Postgres is structurally safe twice over — `async with
   conn.transaction()` rolls back on any `BaseException` (asyncpg's `__aexit__` tests `extype is not None`,
-  with no `Exception` filter), and asyncpg's pool additionally resets under `asyncio.shield`. SQLite shares
-  the `except Exception` shape but has a single writer connection under an `asyncio.Lock` and no pool, so
-  there is no next-borrower to inherit anything.
+  with no `Exception` filter), and asyncpg's pool additionally resets under `asyncio.shield`.
+
+  **CORRECTED 2026-09-14 (BACKLOG #1548).** This bullet used to end: *"SQLite shares the `except
+  Exception` shape but has a single writer connection under an `asyncio.Lock` and no pool, so there is
+  no next-borrower to inherit anything."* The first clause was right and the conclusion was wrong.
+  **One connection does not remove the next borrower — it makes every later writer the next
+  borrower**, because they all inherit that one connection as soon as the lock is released. A SQLite
+  writer cancelled mid-transaction left it open; the next writer took the lock and its statements
+  joined it. Most of the store's short writers issue no `BEGIN` of their own, so their `COMMIT` would
+  make the abandoned statements durable too. On a stage handoff that is **work loss**, not pool
+  damage: the ingress row's guarded `DELETE` would commit while the routed rows it should have
+  produced never existed. What is genuinely SQL-Server-only is this ADR's **remedy** — quarantine-and-
+  reopen presupposes a pool with spare connections, and SQLite has one writer it cannot throw away.
+  It unwinds in place instead, through the single `_writer_txn` context manager in
+  `messagefoundry/store/store.py`, which carries the mechanism and the reasoning.
+
+  One difference there is worth naming here, because it looks like a copy of `_release_dirty` and is
+  not: both shield the cleanup, but `_release_dirty` swallows a SECOND cancellation and returns at
+  once, which is safe only because the connection is already out of the pool. SQLite's unwind keeps
+  waiting out its bound instead — returning early would release the lock over a half-open
+  transaction, which is the whole hazard.
+
+  **That remedy was PARTIAL, recorded here because the paragraphs above read as though it were
+  total.** `_writer_txn` first reached only the writers carrying a **stage handoff**: `_run_grouped`'s
+  inline arm, the group committer's shared batch transaction, the fused `route_handoff`, and
+  `dead_letter_now`'s standalone arm. The property it named for what was left is a writer that opens
+  its own `BEGIN` directly under `self._lock` and unwinds on `except Exception`.
+
+  **AMENDED 2026-09-15. Every writer matching that property is now converted, and a DIFFERENT residual
+  remains, so the caveat below stays.** The population was re-derived from the property rather than
+  carried from the count, and seventeen matched, which is the figure this paragraph already held:
+  `enqueue_message`, `release_message_attachments`, `write_reference_snapshot`, `record_received`,
+  `ingress_handoff`, `record_ack_sent`, `resend_to`, `reingress`, `delete_user`, `delete_custom_role`,
+  `upsert_search_preset`, `set_user_roles`, `set_ad_group_role_map`, `set_ad_group_scope_map`,
+  `purge_message_bodies`, `_apply_document_strips` and `purge_dead_letters`. All seventeen shared one
+  shape exactly — a single `except Exception:` doing `rollback(); raise`, no `else`, no `finally` — so
+  all seventeen took the existing helper and none needed a variant. Take that roster as the state at
+  this commit rather than as a live index; what is kept live instead is the invariant, and it is now
+  enforced rather than asserted. `tests/test_writer_txn_is_the_only_begin.py` AST-scans `store.py`
+  and reds on any `execute("BEGIN")` outside two pinned carve-outs: `_writer_txn` itself, and
+  `_read`'s pooled read snapshot, which runs on a borrowed connection and already unwinds in its own
+  `except BaseException: ROLLBACK`. So **no writer opens a transaction on `self._db` outside
+  `_writer_txn`**, and an eighteenth that tried would fail the build rather than quietly reopen the
+  hole.
+
+  **What remains is the SHORT writers: a different property, the same mechanism.** A short writer
+  takes `self._lock`, issues its DML with no `BEGIN` of its own, and calls `_commit()`. The paragraph
+  above casts those as the victims — the next borrower whose `COMMIT` would make an abandoned
+  statement durable — and they are, but they are also exposed in their own right. sqlite3 auto-begins
+  before DML, so a cancellation between the first DML and the `_commit()` would leave an implicit
+  transaction open exactly as an abandoned explicit one would.
+
+  **The population is SEVENTY-FOUR, not the seventy this paragraph first recorded (re-measured
+  2026-09-15).** The original scan looked for DML issued *directly* inside the `self._lock` block, and
+  that shape returns exactly 70 — which is why the wrong number looked right. Four further blocks
+  reach their DML through a helper that takes no lock of its own, so a direct scan cannot see them:
+  `attachment_decref` (via `_decref_attachment`, three statements), `record_view` and
+  `record_message_event` (both via `_event`), and `add_cipher_invocations` (via
+  `_add_cipher_invocations_locked`). Following one level of `self.`-helper call returns 74, and the
+  set difference against the direct scan is exactly those four. The 74 include `claim_ready` and
+  `claim_next_fifo`, so this residual is not confined to auxiliary writers.
+
+  **The split that should drive priority is by BLAST RADIUS, not by which blocks already carry a
+  handler.** Of the 74, **55** issue exactly one DML statement outside any loop: a cancellation there
+  would risk one phantom write, committed by whichever writer next took the lock. The other **19** are
+  multi-statement or loop-driven — among them `claim_next_fifo`, `claim_fifo_heads`, `release_claimed`,
+  `reschedule_claimed`, `reset_stale_inflight`, `replay` and `cancel_queued` — where the same
+  cancellation would risk a **torn multi-row write** finished and committed by a stranger. That is
+  broken atomicity rather than broken isolation, and it is the harder failure to reason about after
+  the fact. (Criterion for the split: more than one DML statement in the block, or any DML reachable
+  from a loop, counting helper-mediated statements. State the criterion when re-running it — the
+  count moves with it.)
+
+  The handler tier is **nine**, not the eight first recorded, and the ninth is one of the four the
+  direct scan missed. `put_attachment`, `attachment_incref`, `attachment_decref`,
+  `sweep_orphan_attachments`, `claim_fifo_heads`, `release_claimed`, `reschedule_claimed`,
+  `reset_stale_inflight` and `replay_dead` already carry the same `except Exception: rollback(); raise`
+  handler the seventeen had. Those are not merely inheriting victims: they are the same
+  cancellation-blind handler this work exists to delete, reached through the implicit begin instead of
+  an explicit one. The remaining sixty-five have no handler at all.
+
+  **The early exits are NOT an exposure today, and an earlier draft of this paragraph implied they
+  were.** They are a blocker for one particular remedy, which is a different claim. All 52 `return`
+  and `raise` sites inside the 74 blocks were classified (2026-09-15): every one either fires before
+  the block's first DML — so nothing has auto-begun and there is no transaction to strand — or sits
+  after a `_commit()`, or already rolls back itself, as `attachment_incref` does before its
+  `raise KeyError`. Thirteen blocks hold an exit that falls before the block's last `_commit()`, by
+  that criterion; a previous figure of fifteen was recorded without one and is not reproducible.
+  What makes them matter is that `_writer_txn` opens its `BEGIN` **unconditionally**, so wrapping a
+  read-only guard in it would convert a harmless exit into an open, empty transaction. That cost is
+  created by the remedy; it is not a defect being carried.
+
+  **The recommended remedy for this residual is NOT to give `_writer_txn` the `COMMIT`.** Doing that
+  forces an abort sentinel for every no-op exit and drags in `_note_commit` accounting and the
+  `_GroupCommitter` path. A second helper is the smaller change: a writer *guard* that takes the lock,
+  issues **no** `BEGIN` and **no** `COMMIT`, unwinds on `BaseException` exactly as `_writer_txn` does,
+  and on a clean exit checks `db.in_transaction` — rolling back and raising if the block wrote without
+  committing. It leaves the auto-begin semantics alone, so a read-only early exit stays free, and it
+  needs no sentinel: `in_transaction` already reports precisely what a sentinel would have to encode.
+  This is unfiled work, named by subject here rather than by a number, because none is allocated for
+  it. **So do not cite this ADR as evidence that a given SQLite writer unwinds on cancellation; check
+  whether that writer goes through `_writer_txn`.**
+
+  One property the whole residual rests on is worth stating once: **`isolation_level` is never set
+  anywhere in the package.** `MessageStore.open` calls `aiosqlite.connect(str(path))` with no such
+  argument, so all 74 sites inherit sqlite3's stock `''` — a future move to `autocommit=` would change
+  every one of them at once. Measured 2026-09-15: auto-begin fires for DML only. `INSERT` and `UPDATE`
+  leave `in_transaction` `True`; a bare `SELECT`, `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and
+  `PRAGMA` all leave it `False`. That asymmetry is what makes the early exits safe today and what
+  makes `in_transaction` a sound completion check for the guard above.
 - **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
   instance 2, found independently and concurrently). That work traced the other end of this same chain:
   a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),

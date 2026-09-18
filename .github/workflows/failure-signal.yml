@@ -46,13 +46,40 @@
 # transcribes it into `required-contexts.txt`. Reconciling the file against the live set is
 # `scripts/ci/check_required_contexts_drift.py`'s job, on a schedule. Neither covers the other.
 #
+# CODEQL CAME OFF THE WATCH LIST, AND IT IS NOT A `not-watched:` LINE. That register is scoped to
+# REQUIRED workflows by construction -- the rule above is "every required workflow must be either
+# watched or named here" -- and tests/test_failure_signal.py enforces the scope from the other side:
+# an exclusion naming a workflow that reports no required context reds
+# `test_a_recorded_exclusion_names_a_real_workflow_that_really_is_required`, on the ground that it
+# excuses nothing. Measured here: adding the line reddened exactly that test. So the reason is
+# written as prose, where it can be read, rather than as a record the parser would have to be
+# loosened to accept.
+#
+# THE REASON IS THE LABEL'S OWN TEXT, not the cost. `.github/required-contexts.txt` lists CodeQL
+# under DELIBERATELY NOT REQUIRED -- its SARIF upload needs a scope fork-PR tokens lack -- so a red
+# CodeQL run blocks no merge. The label this file applies reads "A required check went red. Attribute
+# it before retrying." On a CodeQL red that sentence is FALSE, and a seat reading it stops a pull
+# request that nothing was stopping. A signal that misreports what it means is worse than no signal,
+# which is the same argument the cla.yml exclusion below makes in its own words.
+#
+# WHAT IT COSTS, STATED HONESTLY SO NOBODY OVERSELLS IT: about 1,236 workflow-run records a week stop
+# being created. Those are RECORDS, not runner slots -- the `signal` job's `if:` is false on a
+# non-failure, so a skipped job starts no runner -- and the removal only reaches the failures anyway.
+# The saving is real and it is small; the wrong label is the reason.
+#
+# A CODEQL RED NOW SIGNALS NOTHING FROM HERE, deliberately. It is still visible on the checks tab and
+# in code scanning, which is where an advisory finding belongs. If CodeQL is ever promoted to a
+# required context, this watch has to come back in the SAME change -- and so does removing the
+# `github.event_name != 'merge_group'` guard on codeql.yml's analyze job, which required-contexts.txt
+# records under its own coupling note.
+#
 # not-watched: cla.yml -- a CLA failure is the contributor's to resolve and needs no attribution, and labelling it would train readers to ignore the label
 
 name: failure signal
 
 on:
   workflow_run:
-    workflows: [CI, Security, CodeQL, backlog-hygiene]
+    workflows: [CI, Security, backlog-hygiene]
     types: [completed]
 
 # Least privilege at the top; the one job that needs to write says so for itself.

@@ -163,9 +163,41 @@ _MEFOR_SECRET = re.compile(r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"
 # credential-bearing spelling "api_key" is carried by ``_BEARER`` instead.
 #
 # The case fold is scoped to the alternation; the reason and the numbers are on ``_BEARER``.
+#
+# THE QUOTED ALTERNATES CARRY THE TWO FORMS A CREDENTIAL VALUE ARRIVES QUOTED IN (BACKLOG #1685) --
+# an ODBC "PWD={p@ss;w0rd}" and an ordinary "password='a b'". A value is quoted precisely so it may
+# hold ";", "=" and spaces, which are the characters the plain class stops at, so without them this
+# pattern redacted the HEAD of a quoted password and wrote the tail into the support archive and
+# ``GET /logs/tail``. Measured at 1aa2d6a1b: ``PWD={wt-A;B}`` -> ``PWD=[REDACTED];B}`` and
+# ``ad_bind_password='wt-A wt-B'`` -> ``ad_bind_password=[REDACTED] wt-B'``.
+#
+# ODBC ends a braced value at the first "}" that is NOT doubled, which is why the repetition admits
+# "}}" and the closer carries ``(?!\})``: the obvious ``\{[^}]*\}`` stops at the first "}" and leaks
+# the tail of any password containing one. ``messagefoundry/secretscrub.py`` carries the same three
+# fragments with the full reasoning -- why every repetition here is deterministic and therefore
+# possessive rather than bounded, why the BRACE form gets an overrun and the quote form does not, and
+# which residuals are left open.
+#
+# THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED, which follows this module's shape rather than
+# setting it: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``, ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``
+# and ``_DSN_PASSWORD`` are ALREADY stated in both files, and nothing here imports ``secretscrub``
+# today. Folding the two pattern sets into one is a real question and a separate change --
+# ``secretscrub``'s own docstring works through which markers belong to the vocabulary and which to a
+# surface -- so this fix does not settle it in passing by making one file depend on the other.
+_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
+_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
+_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
+
 _CREDENTIAL_KV = re.compile(
     r"\b(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
-    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    r"['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _ODBC_BRACED
+    + r"|"
+    + _QUOTED_VALUE
+    + r"|"
+    + _ODBC_BRACED_OVERRUN
+    + r"|['\"]?[^\s'\";,&]+)"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern

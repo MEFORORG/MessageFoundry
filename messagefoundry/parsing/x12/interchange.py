@@ -158,6 +158,11 @@ class X12FrameReader:
         return term
 
     def _check_cap(self) -> None:
+        # Called from every path that returns with the interchange still open. Only two of those can
+        # grow the buffer without bound: "no IEA in sight" and the segment walk. The rest are already
+        # capped by the control flow that reaches them (a 2-byte noise tail, or a partial ISA, so 106
+        # bytes at most), and could not fire unless the cap were smaller than one ISA header. The two
+        # that can grow are the ones tests/test_x12_parsing.py pins; keep them pinned if this moves.
         if self.max_interchange_bytes is not None and len(self._buf) > self.max_interchange_bytes:
             self._buf.clear()
             raise X12FrameError(
