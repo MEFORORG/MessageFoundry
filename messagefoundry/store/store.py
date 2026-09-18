@@ -9110,6 +9110,23 @@ class MessageStore:
             )
             await self._commit()
 
+    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+        """Unbind the federated pair and revoke the account's live sessions in one transaction
+        (BACKLOG #1474). See :meth:`Store.clear_user_federated_subject` for why the two cannot be
+        separated. Returns the number of sessions revoked."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute(
+                "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
+                (now, user_id),
+            )
+            cur = await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                (now, user_id),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:

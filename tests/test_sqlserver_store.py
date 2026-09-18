@@ -510,6 +510,19 @@ async def test_directory_identity_store_contract(store) -> None:
     await _assert_directory_identity_contract(store)
 
 
+async def test_federated_unbind_store_contract(store) -> None:
+    """BACKLOG #1474 ``clear_user_federated_subject`` on the real SQL Server backend.
+
+    The shared body is the one the SQLite and Postgres suites run. What this leg executes that no
+    other does: the two UPDATEs on one cursor under ``autocommit=False`` with a single commit, and
+    the FILTERED ``ux_users_federated_subject`` admitting several NULL pairs. This backend treats
+    NULLs as equal in a unique index, so the filter is what lets two unbound rows coexist here.
+    """
+    from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
+
+    await _assert_federated_unbind_contract(store)
+
+
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
     """The layer under the lookup, on the real SQL Server backend.
 

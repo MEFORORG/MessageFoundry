@@ -1900,6 +1900,25 @@ class AuthStore(Protocol):
         carries a different subject is refused, not handed the account."""
         ...
 
+    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+        """Unbind a user's federated ``(issuer, sub)`` identity and revoke every live session the
+        account holds, in ONE transaction (BACKLOG #1474). Returns the number of sessions revoked.
+
+        The complement of :meth:`set_user_federated_subject`, which takes ``str`` for both halves and
+        so cannot spell "no binding". Both columns go NULL together, which puts the row back in the
+        state every AD account is in before its first federated login. ``auth_provider`` is left
+        alone on purpose: a federated account IS an AD row carrying an extra pair, so the unbound row
+        is still a directory account and the directory session sweep is still right for it.
+
+        **The two writes are not separable, and that is the contract.** A session issued under the old
+        binding is exactly what the unbind exists to stop. If the unbind committed and the revocation
+        did not, those sessions would outlive the identity that earned them, with the account
+        reporting itself unbound. So a failure in either statement rolls both back.
+
+        A missing user is a no-op returning 0; the caller decides whether that is an error.
+        """
+        ...
+
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         """The account bound to this verified ``(issuer, sub)``, or ``None`` (BACKLOG #1256).
 

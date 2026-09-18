@@ -20,6 +20,7 @@ from tests._directory_identity_store_contract import (
     _assert_username_compare_is_byte_exact,
     _assert_username_refresh_contract,
 )
+from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
 from tests._lockout_store_contract import _assert_lockout_contract
 
 
@@ -409,3 +410,60 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
             assert (await store.get_user("u1")).directory_object_id is None
         finally:
             await store.close()
+
+
+# --- federated unbind (BACKLOG #1474) ------------------------------------------
+
+
+async def test_the_federated_unbind_contract_on_sqlite() -> None:
+    """``clear_user_federated_subject`` on the SQLite backend, against the same shared body the
+    PostgreSQL and SQL Server suites run."""
+    store = await _store()
+    try:
+        await _assert_federated_unbind_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_a_failed_revocation_leaves_the_binding_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unbind and the revocation commit together or not at all.
+
+    The failure is injected into the SESSIONS statement, the second of the two, so the users UPDATE
+    has already run when it fires. Split into two commits, the pair would be NULL here while every
+    session issued under it stayed live -- the account reporting itself unbound while the old
+    identity's sessions still work. Measured: with the method split that way, this test fails on the
+    first assertion below.
+    """
+    store = await _store()
+    try:
+        await store.create_user(user_id="u1", username="alice", auth_provider="ad", now=1.0)
+        await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
+        await store.create_session(token_hash="t1", user_id="u1", expires_at=9e9, now=1.0)
+
+        real_execute = store._db.execute
+
+        def failing_execute(sql: str, *args: object, **kwargs: object) -> object:
+            if sql.startswith("UPDATE sessions"):
+                raise sqlite3.OperationalError("injected: revocation failed")
+            return real_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(store._db, "execute", failing_execute)
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            await store.clear_user_federated_subject("u1", now=2.0)
+        monkeypatch.undo()
+
+        user = await store.get_user("u1")
+        assert user is not None
+        assert (user.oidc_issuer, user.oidc_subject) == ("https://idp.example", "S-1-a"), (
+            "the pair was cleared although the revocation failed"
+        )
+        assert user.updated_at == 1.0
+        session = await store.get_session("t1")
+        assert session is not None and session.revoked_at is None
+
+        # The writer is clean afterwards: the rollback ran under the lock, so the retry succeeds.
+        assert await store.clear_user_federated_subject("u1", now=3.0) == 1
+    finally:
+        await store.close()
