@@ -431,7 +431,8 @@ gates a merge**, and no seat has to clear one.
    `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
    Bash call itself. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
-4. Its process exits when the PR opens. The worktree stays behind.
+4. Its process exits when it has pushed and reported. The Manager opens the PR. The worktree stays
+   behind.
 5. **It CAN declare its own seat, through the Bash tool.** Measured 2026-09-02: a headless `-p`
    Builder ran `seat.ps1 -Declare` and its record carries `seatSource: declared` with a real goal,
    which no hook can write. **Quote the Windows path.** Unquoted, the SHELL eats the backslashes:
@@ -487,8 +488,9 @@ gates a merge**, and no seat has to clear one.
   stuck after two attempts, push what is green and say in the PR body that the brief needs re-cutting.
 - **Your workers die when you do, and that is the one way work is lost here.** A subagent that has
   not pushed has produced nothing -- not a branch, not a stash, not a file anyone can find later. So
-  every brief ends with push, then open the PR, then report; never "finish and I will push for you",
-  never "hold this until I say". Check before you close the instance.
+  every brief ends with push, then report; never "finish and I will push for you", never "hold this
+  until I say". Check before you close the instance. **You open the PR afterwards**, verifying the
+  branch with `git ls-remote --heads origin` rather than trusting the worker's report.
 - **Say who else is running, in three fields that are always present, including when the answer is
   nobody:** who is working, what paths they touch, and **whether they share this worktree.** The
   third field is the whole of the collision -- two workers given one worktree each reported the
@@ -601,9 +603,13 @@ gates a merge**, and no seat has to clear one.
   is shared with every subagent and background task the session spawns, so a sibling writing the same
   generic name between your write and your `commit -F` silently substitutes its message for yours --
   measured 2026-09-03, BACKLOG #1440. Same rule for any file whose content is later fed to a command.
-- **Every seat pushes its own branch and opens its own PR, without asking.** Owner ruling 2026-08-29,
-  anchored at `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions
-  push their own."*
+- **Every seat pushes its own branch, without asking.** Owner ruling 2026-08-29, anchored at
+  `refs/liaison/owner-ruling-20260829-push` (`987705dfb`), in their words: *"Sessions push their
+  own."* **ONLY THE PULL-REQUEST HALF MOVED, on 2026-09-18: the MANAGER opens the PR**, verifying
+  the branch with `git ls-remote --heads origin` rather than trusting the Builder's report. The push
+  half of the 2026-08-29 ruling is untouched, so do not read this as a return to asking permission
+  to push. A Builder's final commit message carries the proposed PR title and ledger banner text, so
+  the branch is self-describing if the Manager dies before opening it.
 - **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge is branch protection and
   the required contexts, nothing else. **Reading a diff before merging it is still the job; no check
   now asks whether you did.** That asymmetry is the point: a label records that a step *happened*, not
@@ -654,8 +660,9 @@ gates a merge**, and no seat has to clear one.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
   Record in the PR body which checks you ran and which you skipped. An unpushed branch is lost.
 - Some checks only ever run on a hosted runner, for example NSSM under `windows-service-smoke`. A
-  Builder never sees their result. Push, open the PR, and name in the body which legs must be read.
-  The Manager or the Regulator reads them after the process exits.
+  Builder never sees their result. Push, and name in your exit report which legs must be read, so
+  the Manager carries it into the PR body it opens. The Manager or the Regulator reads them after
+  the process exits.
 
 ### Product security rules outlive any method rewrite
 
