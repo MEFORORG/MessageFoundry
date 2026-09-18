@@ -9,19 +9,33 @@ connection. The next ``_writer_txn`` writer then failed its own ``BEGIN``; the n
 joined the stranger's transaction and its ``COMMIT`` made the partial work durable.
 
 The CONTRACT tests drive :func:`_writer_guard` on a bare connection, so they prove the helper itself
-and not whichever writer happens to use it.
+and not whichever writer happens to use it. The STORE tests drive the real writers the census found
+reachable on an ordinary path, each through a refusal it can really hit, then check the two things
+the defect broke: nothing is left open, and the next writer that opens its own transaction succeeds
+on the first try. The last one is the torn write, where a cipher failing between two statements used
+to leave a partial claim for an unrelated writer to commit.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
-from messagefoundry.store.store import UncommittedWriteError, _writer_guard
+from messagefoundry.store.crypto import CipherError, IdentityCipher
+from messagefoundry.store.store import (
+    MessageStatus,
+    MessageStore,
+    OutboxStatus,
+    Stage,
+    UncommittedWriteError,
+    _writer_guard,
+)
+from tests._webauthn_store_contract import _cred
 
 # Bound on every handshake with a parked writer, so a wedged case fails as a timeout, not a hang.
 WAIT = 5.0
@@ -187,3 +201,154 @@ async def test_a_transaction_left_open_by_another_block_is_rolled_back_on_entry(
         assert await _keys(db) == ["mine"]
     finally:
         await db.close()
+
+
+# --- the writers the census found reachable on an ordinary path ----------------------------------
+
+
+async def _store(tmp_path: Path, cipher: IdentityCipher | None = None) -> MessageStore:
+    # A file database, so reads go through the pooled read connections and never mask the writer.
+    return await MessageStore.open(str(tmp_path / "store.db"), cipher=cipher)
+
+
+async def _assert_writer_clean(store: MessageStore, bystander: str) -> None:
+    """The two things the defect broke, checked in the order it broke them."""
+    assert not store._db.in_transaction, "the refused write left the writer inside a transaction"
+    # A writer that opens its OWN transaction. With the refusal's transaction left open, its BEGIN
+    # failed with "cannot start a transaction within a transaction".
+    await store.delete_user(bystander)
+    assert await store.get_user(bystander) is None
+
+
+async def test_a_duplicate_passkey_label_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """BACKLOG #1804: two enrolments, or a double-submit, of one label for one user."""
+    store = await _store(tmp_path)
+    try:
+        for uid in ("alice", "bystander"):
+            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+        await store.add_webauthn_credential(_cred("alice", "laptop", id_hash="h1"))
+        # The refusal still reaches the caller: auth/service.py renders it as "label in use".
+        with pytest.raises(sqlite3.IntegrityError, match="webauthn_credentials.label"):
+            await store.add_webauthn_credential(_cred("alice", "laptop", id_hash="h2"))
+        await _assert_writer_clean(store, "bystander")
+        creds = await store.list_webauthn_credentials("alice")
+        assert [c.credential_id_hash for c in creds] == ["h1"]
+    finally:
+        await store.close()
+
+
+async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """A double-submit of POST /users, or two admins racing, past the endpoint's pre-check."""
+    store = await _store(tmp_path)
+    try:
+        for uid in ("alice", "bystander"):
+            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            await store.create_user(
+                user_id="alice-2", username="alice", auth_provider="local", now=2_000.0
+            )
+        await _assert_writer_clean(store, "bystander")
+        assert await store.get_user("alice-2") is None
+    finally:
+        await store.close()
+
+
+async def test_a_session_for_a_deleted_user_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """A login between authentication and session issue, racing an admin deleting the account."""
+    store = await _store(tmp_path)
+    try:
+        for uid in ("alice", "bystander"):
+            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+        await store.delete_user("alice")
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            await store.create_session(token_hash="t" * 64, user_id="alice", expires_at=9e9)
+        await _assert_writer_clean(store, "bystander")
+    finally:
+        await store.close()
+
+
+class _FlakyTransit(IdentityCipher):
+    """Stands in for a Vault Transit cipher whose encrypt round trip fails mid-claim."""
+
+    fail = False
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        if self.fail:
+            raise CipherError("Transit encrypt failed (key='k'): ConnectError")
+        return super().encrypt(plaintext, aad=aad)
+
+
+async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``claim_next_fifo``'s already-delivered skip path writes two UPDATEs, then encrypts the
+    delivered event. A Transit failure there used to leave both UPDATEs open, and the next unrelated
+    short writer committed them: queue row DONE, no delivered event, message stuck ROUTED."""
+    cipher = _FlakyTransit()
+    store = await _store(tmp_path, cipher)
+    db = store._db
+    try:
+        now = 1_000.0
+        await db.execute(
+            "INSERT INTO messages (id, channel_id, received_at, raw, status) VALUES (?,?,?,?,?)",
+            ("m1", "IB", now, "MSH|x", MessageStatus.ROUTED.value),
+        )
+        await db.execute(
+            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, payload,"
+            " status, attempts, next_attempt_at, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "q1",
+                "m1",
+                Stage.OUTBOUND.value,
+                "IB",
+                "OB",
+                "body",
+                OutboxStatus.PENDING.value,
+                0,
+                now - 1,
+                now,
+                now,
+            ),
+        )
+        # The ledger row that sends the claim down the skip path: this row was already delivered.
+        await db.execute(
+            "INSERT INTO delivered_keys (delivery_key, outbox_id, message_id, destination_name,"
+            " delivery_seq, delivered_at) VALUES (?,?,?,?,?,?)",
+            ("dk1", "q1", "m1", "OB", 1, now),
+        )
+        await db.commit()
+        await store.create_user(user_id="bystander", username="b", auth_provider="local")
+
+        cipher.fail = True
+        with pytest.raises(CipherError):
+            await store.claim_next_fifo("OB", stage="outbound", now=now)
+        cipher.fail = False
+        assert not db.in_transaction, "the failed claim left its partial write open"
+
+        # An unrelated SHORT writer takes the lock next and commits.
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
+            await store.record_login_success("bystander")
+        leaked = [r for r in caplog.records if "already open" in r.getMessage()]
+        assert not leaked, "the next writer found the failed claim's transaction still open"
+
+        async def state() -> tuple[str, int, int, str]:
+            cur = await db.execute("SELECT status, attempts FROM queue WHERE id='q1'")
+            queue = await cur.fetchone()
+            cur = await db.execute("SELECT COUNT(*) FROM message_events WHERE message_id='m1'")
+            events = await cur.fetchone()
+            cur = await db.execute("SELECT status FROM messages WHERE id='m1'")
+            message = await cur.fetchone()
+            assert queue is not None and events is not None and message is not None
+            return queue[0], queue[1], events[0], message[0]
+
+        # Nothing of the failed claim became durable: the row is still pending and unclaimed.
+        assert await state() == (OutboxStatus.PENDING.value, 0, 0, MessageStatus.ROUTED.value)
+
+        # And the claim re-runs to the complete, consistent outcome (at-least-once).
+        assert await store.claim_next_fifo("OB", stage="outbound", now=now) is None
+        status, attempts, events, message_status = await state()
+        assert (status, attempts, events) == (OutboxStatus.DONE.value, 1, 1)
+        assert message_status == MessageStatus.PROCESSED.value, message_status
+    finally:
+        await store.close()
