@@ -10327,6 +10327,28 @@ class SqlServerStore:
             (issuer, subject, now, user_id),
         )
 
+    async def clear_user_federated_subject(self, user_id: str, *, now: float | None = None) -> int:
+        """Unbind the federated pair and revoke the account's live sessions in one transaction
+        (BACKLOG #1474). Returns the number of sessions revoked. This leg is CI-only, so a
+        divergence from the SQLite and Postgres bodies surfaces first in CI."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
+                    (now, user_id),
+                )
+                await cur.execute(
+                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    (now, user_id),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) if count is not None else 0
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:

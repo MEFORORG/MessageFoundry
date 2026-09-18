@@ -943,6 +943,18 @@ async def test_directory_identity_store_contract(store) -> None:
     await _assert_directory_identity_contract(store)
 
 
+async def test_federated_unbind_store_contract(store) -> None:
+    """BACKLOG #1474 ``clear_user_federated_subject`` on the real Postgres backend.
+
+    The shared body is the one the SQLite and SQL Server suites run. What this leg executes that no
+    other does: the ``conn.transaction()`` block holding the two UPDATEs together, and the ``$1``
+    placeholders in both. Neither runs anywhere but here, so this is the first place they execute.
+    """
+    from tests._federated_unbind_store_contract import _assert_federated_unbind_contract
+
+    await _assert_federated_unbind_contract(store)
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
