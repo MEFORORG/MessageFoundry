@@ -93,6 +93,39 @@ _MANIFEST_MEMBER = "manifest.json"
 #: :func:`_extract_member` ``max_member_bytes`` parameter overrides it (tests pass a small cap).
 _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 
+#: The same ASVS 5.2.3 bound as :data:`_MAX_RESTORE_MEMBER_BYTES`, at the stage that consumes the temp
+#: dir FIRST. Passed to ``decrypt_stream(..., max_plaintext_bytes=...)``; the codec takes it as a
+#: parameter rather than declaring it, because the budget is the restore's and ``store/`` may not import
+#: ``pipeline/`` (see ``store/backup_codec.py``'s module docstring).
+#:
+#: **POST-AUTHENTICATION, and it must not be described as anything else.** Every byte counted here has
+#: already passed its AES-GCM frame tag. The pre-authentication bounds are ``MAX_HEADER_BYTES``, the
+#: declared ``chunk_size`` against ``MAX_CHUNK_SIZE``, and the per-frame ``ctlen`` — all in the codec,
+#: all checked before the read they drive. This is a RESOURCE bound against an archive sealed under a
+#: key the site legitimately holds: an oversized one, or one a key-holder crafted. It defends nothing
+#: against an unauthenticated attacker, who cannot get a frame past its tag to be counted at all.
+#:
+#: **Why the per-member cap does not already cover this.** :func:`_extract_member` bounds ``store.db``
+#: so a lying header or stream cannot exhaust the extract temp dir — but it runs on ``archive.tar``,
+#: which the decrypt has already written to that same temp dir in full. So the member cap is reached
+#: only after the disk it protects is spent. This moves the bound to the first write.
+#:
+#: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
+#: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
+#: member cap anyway — plus the config bundle, the manifest and tar framing. So the cumulative ceiling
+#: cannot sit AT the member cap without refusing a store snapshot that is itself legal, and nothing on
+#: this branch bounds the config bundle, so there is no exact second term to add. Rather than fork a
+#: second number, the remainder gets the ceiling the store gets: one whole extra maximal snapshot of
+#: headroom, which no real config dir (a few Python modules, a TOML, some codesets) approaches.
+#: Written as a multiple so it TRACKS the member cap: a literal would silently begin false-refusing
+#: legal archives the day that cap was raised.
+#:
+#: A file-size cap (``max_plaintext_bytes = archive.stat().st_size``) looks like the exact bound and is
+#: not one — it can never fire. Each frame carries 12 nonce + 4 length + 16 tag bytes around at most
+#: ``chunk_size`` of plaintext, so a ``.mfbak`` is strictly LARGER than what it decrypts to. The format
+#: cannot amplify, which is also why this is not a decompression-bomb defence.
+_MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
+
 
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
@@ -739,7 +772,13 @@ def _verify_archive_blocking(
             with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
                 if encrypted:
                     assert match_key is not None
-                    decrypt_stream(src, dst, match_key)
+                    # Post-authentication resource bound on the temp dir (see the constant). An over-cap
+                    # archive raises BackupCodecError, which the `except BackupCodecError` arm below
+                    # already turns into a FAIL — no new failure arm, and the TemporaryDirectory
+                    # discards the partial tar on the way out.
+                    decrypt_stream(
+                        src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                    )
                 else:
                     while True:
                         buf = src.read(1024 * 1024)

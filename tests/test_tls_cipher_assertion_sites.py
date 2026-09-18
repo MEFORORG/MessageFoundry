@@ -43,6 +43,7 @@ from typing import Any
 
 import ldap3
 import pytest
+from _ast_sites import call_sites, find_funcs
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -1089,17 +1090,8 @@ def _factory_calls_the_assertion(path: Path) -> bool:
     reds if the call is moved somewhere that never runs.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    factories = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == _HVAC_FACTORY
-    ]
-    return any(
-        isinstance(call.func, ast.Name) and call.func.id == _HVAC_ASSERTION
-        for factory in factories
-        for call in ast.walk(factory)
-        if isinstance(call, ast.Call)
-    )
+    factories = find_funcs(tree, _HVAC_FACTORY)
+    return any(call_sites(factory, _HVAC_ASSERTION, bare_only=True) for factory in factories)
 
 
 def test_the_hvac_arm_stays_built_and_stays_executable(request: Any) -> None:

@@ -164,6 +164,13 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
     # ACKed at ingress, then the ingress worker hits the unknown-handler error and dead-letters it
     # (message ERROR), never a silent FILTERED accept-and-drop (review M-7). The failure is post-ACK,
     # so there is no NAK — the ERROR disposition is the operator's signal.
+    #
+    # BACKLOG #1688: ERROR-plus-no-file does not distinguish the router stage from the transform one.
+    # Delete `route_only`'s raise and a routed row IS committed for the ghost handler; the transform
+    # worker's own missing-handler branch (pinned separately at test_adr0071_dispatch_wiring.py) then
+    # dead-letters that row — same terminal ERROR, same absent file, so this test stayed green with
+    # the guard it names deleted. What the router-stage fail-closed actually promises is the STAGE:
+    # no routed row for a handler no transform worker could run, and the dead row is the ingress one.
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -178,6 +185,19 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
     assert not (
         outdir / "MSG1.hl7"
     ).exists()  # nothing delivered — failed closed, not accept-and-drop
+
+    rows = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    mid = rows[0]["id"]
+    cur = await store._db.execute(
+        "SELECT stage, status, handler_name FROM queue WHERE message_id=?", (mid,)
+    )
+    staged = [(r["stage"], r["status"], r["handler_name"]) for r in await cur.fetchall()]
+    # The whole queue footprint, not a filtered probe: a bare "no routed row" query cannot tell a
+    # fail-closed apart from a message that never got past the listener at all.
+    assert staged == [(Stage.INGRESS.value, OutboxStatus.DEAD.value, None)]
+    # And the stored signal names the router-stage guard, not merely the ghost handler — the
+    # transform-stage branch reaches the same disposition with different wording.
+    assert "returned unknown handler" in await _last_errors(store, mid)
 
 
 async def _last_errors(store: MessageStore, message_id: str) -> str:

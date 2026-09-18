@@ -16,6 +16,7 @@ import sqlite3
 from pathlib import Path
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
+from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import (
     BackupRunner,
     _verify_archive_blocking,
@@ -356,3 +357,40 @@ async def test_verify_missing_archive_is_reported(tmp_path) -> None:
     ss = StoreSettings(path=str(tmp_path / "msg.db"), encryption_key=generate_key())
     res = await run_restore_verify(str(tmp_path / "nope.mfbak"), store_settings=ss)
     assert res.status == "FAIL"
+
+
+async def test_cumulative_plaintext_cap_stops_a_restore_that_would_fill_the_temp_dir(
+    tmp_path, monkeypatch
+) -> None:
+    """The decrypt is what consumes the extract temp dir, and the per-member cap fires only after it.
+
+    ``_extract_member`` bounds ``store.db``, but it reads ``archive.tar`` — which the decrypt has by
+    then written to the same temp dir in full. So the cumulative ceiling has to be enforced at the
+    decrypt, and this pins that it is: with the ceiling set below the archive's plaintext, the verify
+    refuses. POST-AUTHENTICATION — every counted byte passed its GCM tag first; this is a resource
+    bound on a legitimately-keyed archive, not a defence against an unauthenticated attacker.
+
+    The control is not a sibling assertion here but every PASS test in this module: they all now run
+    with the real ceiling in force, so a cap that refused ordinary archives would red them, and the
+    refusal below is the cap firing rather than the cap breaking the restore path.
+    """
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+
+    monkeypatch.setattr(dr_backup, "_MAX_RESTORE_PLAINTEXT_BYTES", 2048)
+    res = await run_restore_verify(archive, store_settings=ss)
+    # Lands on the EXISTING codec arm — a FAIL reading "decrypt failed: ...", not a new status and not
+    # a KEY_MISMATCH (the key matched; the archive was simply over the ceiling).
+    assert res.status == "FAIL", res.reason
+    assert res.reason is not None and "plaintext ceiling" in res.reason
+    assert res.integrity_ok is False
+    await store.close()
+
+
+def test_cumulative_ceiling_stays_above_the_per_member_ceiling() -> None:
+    """The off-by-one the docstring claims. A ``store.db`` at exactly the per-member cap is legal — the
+    extract admits it — so a cumulative ceiling at or below that cap would refuse an archive this build
+    is supposed to restore. The tar also carries the config bundle, the manifest and framing, so the
+    cumulative ceiling must sit strictly above the member one. Pinned because the two constants are
+    edited independently."""
+    assert dr_backup._MAX_RESTORE_PLAINTEXT_BYTES > dr_backup._MAX_RESTORE_MEMBER_BYTES

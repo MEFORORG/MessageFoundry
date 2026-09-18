@@ -205,6 +205,24 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
         raise ValueError("tls_hop_attested_reason must be non-empty when provided")
 
 
+def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
+    """Read and load-validate the insecure-hop attestation pair out of a raw settings mapping
+    (BACKLOG #1666), for the two DB cells that have no :class:`Source`/:class:`Destination` model to
+    carry it: the ``db_lookup`` executor and the SQL-backed reference source.
+
+    Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
+    mapping read in front of it, so the two cells cannot drift from the modelled ones or each other.
+
+    A mapping is the ONLY carrier for those cells, and reading one here does **not** make the setting
+    authorable: neither ``DatabaseLookup()`` nor ``DatabaseRef()`` takes the parameter and neither has
+    a ``connections.toml`` surface, so a direct embedding is the only way to populate it. Giving a
+    factory the parameter is a separate question."""
+    attested = bool(settings.get("tls_hop_attested", False))
+    reason = settings.get("tls_hop_attested_reason")
+    _check_hop_attestation(attested, None if reason is None else str(reason))
+    return attested
+
+
 def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
     """Load-validate the per-outbound cleartext-acceptance pair (ADR 0153 decision 2).
 
