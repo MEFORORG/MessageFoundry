@@ -27,6 +27,7 @@ import pytest
 from _phi_log_capture import (
     IDENTIFIER_SHAPE,
     IDENTIFIER_SHAPED_NAMES,
+    FilteredCapture,
     filtered_sink,
     strip_safe_labels,
 )
@@ -53,11 +54,22 @@ _PATH = "/in/a.hl7"
 _names = pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
 
 
-def _assert_no_name(text: str, name: str, *, strip: str = "") -> None:
-    """``strip`` removes the operator's own directory path, which a WARNING may carry and which a
-    pytest temp path (``pytest-21248``) can make look identifier-shaped."""
-    assert name not in text
-    assert IDENTIFIER_SHAPE.search(strip_safe_labels(text.replace(strip, ""))) is None
+def _assert_no_name(
+    sink: FilteredCapture, caplog: pytest.LogCaptureFixture, name: str, *, strip: str = ""
+) -> None:
+    """The WARNINGs must name ``name`` by its safe label only, checked on two instruments.
+
+    ``sink`` is what a shipped log would write, after the production redaction filters. ``caplog``
+    sees each record before any handler filter runs, so it pins the call site itself: a filter that
+    later learned to scrub file names could not hide a WARNING that logged the raw one.
+
+    ``strip`` removes the operator's own directory path, which a WARNING may carry and which a
+    pytest temp path (``pytest-21248``) can make look identifier-shaped. The last check is the
+    control: an instrument that caught nothing would pass the first two by default."""
+    for instrument, text in (("sink", sink.text), ("caplog", caplog.text)):
+        assert name not in text, f"{instrument}: the raw file name was logged"
+        assert IDENTIFIER_SHAPE.search(strip_safe_labels(text.replace(strip, ""))) is None
+        assert "[name:" in text, f"{instrument}: no WARNING naming the file reached it"
 
 
 class _Recorder:
@@ -93,7 +105,7 @@ def _append_tail(path: Path) -> None:
 @_names
 @pytest.mark.parametrize("after_read", ["move", "delete"])
 async def test_a_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
-    tmp_path: Path, after_read: str, name: str
+    tmp_path: Path, after_read: str, name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The probe's case: the partner finishes writing while the message is in flight."""
     inbox = tmp_path / "in"
@@ -110,7 +122,7 @@ async def test_a_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
     assert drop.read_bytes() == _WHOLE
     assert list((inbox / ".processed").iterdir()) == []
     assert "changed after it was read" in sink.text
-    _assert_no_name(sink.text, name, strip=str(inbox))
+    _assert_no_name(sink, caplog, name, strip=str(inbox))
     # The next poll reads the settled file whole and only then disposes of it: nothing is lost.
     await src._scan_once()
     assert handler.got == [_HEAD, _WHOLE]
@@ -119,7 +131,7 @@ async def test_a_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
 
 @_names
 async def test_a_file_that_grows_during_the_read_is_not_emitted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     inbox = tmp_path / "in"
     inbox.mkdir()
@@ -143,7 +155,7 @@ async def test_a_file_that_grows_during_the_read_is_not_emitted(
     assert handler.got == [], "a file read mid-write was emitted as a complete message"
     assert drop.read_bytes() == _WHOLE  # left in place for the next poll
     assert "changed while it was read" in sink.text
-    _assert_no_name(sink.text, name, strip=str(inbox))
+    _assert_no_name(sink, caplog, name, strip=str(inbox))
     await src._scan_once()
     assert handler.got == [_WHOLE]
 
@@ -227,7 +239,10 @@ async def test_leave_mode_warns_and_reingests_a_file_that_grew_after_the_read(
 @_names
 @pytest.mark.parametrize("after_read", ["move", "delete"])
 async def test_a_remote_file_that_grows_after_the_read_is_neither_archived_nor_deleted(
-    monkeypatch: pytest.MonkeyPatch, after_read: str, name: str
+    monkeypatch: pytest.MonkeyPatch,
+    after_read: str,
+    name: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     path = f"/in/{name}"
     client = _FakeClient(files={path: _HEAD})
@@ -245,7 +260,7 @@ async def test_a_remote_file_that_grows_after_the_read_is_neither_archived_nor_d
     assert client.files[path] == _WHOLE
     assert not any(p.startswith("/in/.processed/") for p in client.files)
     assert "changed after it was read" in sink.text
-    _assert_no_name(sink.text, name)
+    _assert_no_name(sink, caplog, name)
     await src._poll_once()
     assert handler.got == [_HEAD, _WHOLE]
     assert path not in client.files
@@ -253,7 +268,7 @@ async def test_a_remote_file_that_grows_after_the_read_is_neither_archived_nor_d
 
 @_names
 async def test_a_remote_file_that_changed_during_the_retrieve_is_not_emitted(
-    monkeypatch: pytest.MonkeyPatch, name: str
+    monkeypatch: pytest.MonkeyPatch, name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The source's arm for the client's refusal. The clients' own detection is pinned below."""
 
@@ -277,7 +292,7 @@ async def test_a_remote_file_that_changed_during_the_retrieve_is_not_emitted(
     assert handler.got == []
     assert client.files[path] == _WHOLE  # left in place, not quarantined
     assert "changed while it was retrieved" in sink.text
-    _assert_no_name(sink.text, name)
+    _assert_no_name(sink, caplog, name)
     await src._poll_once()
     assert handler.got == [_WHOLE]
     assert client.files[f"/in/.processed/{name}"] == _WHOLE
