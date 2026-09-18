@@ -52,7 +52,12 @@ from decimal import Decimal
 from typing import Any
 
 from messagefoundry.config.db_lookup import DbLookupError
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    Source,
+    hop_attestation_from_settings,
+)
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     hop_insecure_escape_downgrades,
@@ -1308,9 +1313,15 @@ class DatabaseLookupExecutor:
             for req in ("server", "database"):
                 if not s.get(req):
                     raise ValueError(f"DatabaseLookup {cname!r} requires a {req!r} setting")
+            # Per-connection insecure-hop attestation (#200), honoured here as the DATABASE
+            # destination and poll source honour theirs: a live read crosses the same wire a write
+            # does, so dropping it refused a hop the operator had attested. The mapping is the only
+            # carrier this cell has (no Source/Destination model), and reading it does not make the
+            # setting authorable — see :func:`hop_attestation_from_settings`.
+            attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
-            self._dsn[cname] = _build_dsn(dict(s), read_only=True)
+            self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
             self._pool_max[cname] = int(s.get("pool_max", 5))
             self._acquire_timeout[cname] = float(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)

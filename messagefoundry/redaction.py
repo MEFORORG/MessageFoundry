@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-__all__ = ["redact", "safe_exc", "safe_name", "safe_text"]
+__all__ = ["redact", "safe_error", "safe_exc", "safe_name", "safe_text"]
 
 _REDACTED = "[redacted]"
 #: Max characters of a (redacted) exception message to keep — a raw HL7 body is long, so bound what
@@ -214,6 +214,33 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     if len(message) > limit:
         message = f"{message[:limit]}…(+{len(message) - limit} chars)"
     return message
+
+
+def safe_error(error: str | None, *, show_phi: bool = False) -> str | None:
+    """A PHI-redacted rendering of an **optional** diagnostic string, for a caller that may hold a
+    ``--show-phi``-style opt-in. ``None`` passes through as ``None`` (an absent error is not a value to
+    redact, and the CLIs emit it as JSON ``null``); otherwise the text goes through :func:`safe_text`
+    unless ``show_phi`` says the caller may see it.
+
+    **Why this exists rather than the guard being written at each call site (BACKLOG #1668).** The
+    ``error`` of a :class:`~messagefoundry.pipeline.dryrun.DryRunResult` is the one field every consumer
+    has to make the same decision about, and that decision was previously made nowhere: ``dryrun``,
+    ``dryrun --trace`` and the ``check`` gate each emitted it verbatim. It carries a Router/Handler's own
+    ``raise``, and ``raise ValueError(f"bad MRN {msg['PID-3']}")`` is the commonest debugging idiom, so
+    it can quote field values.
+
+    **:func:`safe_text`, not a whole-string drop.** The stage prefix (``"router/handler error: "``,
+    ``"parse error: "``) and the author's own prose are the diagnostic somebody ran the tool to read;
+    only the HL7-shaped runs inside them are PHI. Dropping the string wholesale would close the leak by
+    removing the feature. :func:`safe_exc` is not reachable at these call sites — a consumer holds a
+    string that was already built, never the exception object.
+
+    **``show_phi`` defaults to closed, and a surface that must never open is expected to omit it.** The
+    ``check`` gate passes no keyword at all: its stdout goes to a commit hook and a CI log by design, so
+    an opt-in there would put PHI in that log on request — the opposite of the control."""
+    if error is None or show_phi:
+        return error
+    return safe_text(error)
 
 
 def safe_name(name: str) -> str:

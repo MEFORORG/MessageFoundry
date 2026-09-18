@@ -839,6 +839,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`dead_letter_missing_destinations`; call once at startup. Returns the rows killed."""
         ...
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal **channel-keyed** rows (ingress, routed, response) whose
+        ``channel_id`` left the registry — a removed inbound for which no router, transform or
+        re-ingress worker is spawned and whose lane no dispatcher claims. The third startup sweep
+        beside :meth:`dead_letter_missing_destinations` and :meth:`dead_letter_missing_handlers`;
+        call once at startup. ``valid_names`` is the WHOLE deployment's inbound names (an engine
+        shard's own ``registry.inbound`` is only its slice). Returns the rows killed."""
+        ...
+
     # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
     async def is_file_processed(self, *, channel_id: str, file_key: str) -> bool:
         """True iff the leave-in-place (``after_read='leave'``) source ``channel_id`` already ingested

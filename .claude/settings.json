@@ -64,6 +64,18 @@
               "-NoProfile",
               "-NonInteractive",
               "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/precompact-reprime.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Restoring seat, goal and held ledger numbers"
+          },
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/role-card-inject.ps1",
               "-Worktree",
               "${CLAUDE_PROJECT_DIR}"

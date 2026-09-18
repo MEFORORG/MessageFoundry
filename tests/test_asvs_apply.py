@@ -35,6 +35,7 @@ from scripts.asvs.apply import (  # noqa: E402
     main,
     render,
 )
+from scripts.asvs.scorecard import repo_stamp  # noqa: E402
 
 #: A two-cell record. `5.4.3` is owner-CLOSED, mirroring the real one, because the closed-cell guards
 #: are the ones with the worst failure mode: an un-closing is invisible to every downstream check.
@@ -1805,11 +1806,21 @@ def test_an_EXISTING_witness_is_not_overwritten_by_a_legacy_flag(tmp_path: Path)
 #
 # TWO GUARDS, EACH WITH A MUST-FIRE AND A MUST-NOT-FIRE ARM.
 #
-# (a) WHERE THE RECORD IS. `repo_stamp` reads the clone holding `--scorecard`, and BEHIND or DIVERGED
-#     refuses. Driven against a REAL clone of a REAL origin that is genuinely behind, because the row
-#     says the check "must run against a clone that is genuinely behind, not a fresh one, or it
-#     passes on the only state that was never the problem". A monkeypatched stamp would assert the
-#     branch and prove nothing about reading a work tree, which is the half that stops measuring.
+# (a) WHERE THE RECORD IS -- MEASURED AGAINST THE RECORD LINE, NOT AGAINST WHATEVER REF THIS BRANCH
+#     HAPPENS TO TRACK. Driven against a REAL clone of a REAL origin that is genuinely behind,
+#     because the row says the check "must run against a clone that is genuinely behind, not a fresh
+#     one, or it passes on the only state that was never the problem". A monkeypatched stamp would
+#     assert the branch and prove nothing about reading a work tree, which is the half that stops
+#     measuring.
+#
+#     THE FIRST VERSION OF THIS GUARD ASKED THE ADJACENT QUESTION. It refused on `repo_stamp`'s
+#     `freshness` alone, and that field is measured against the branch's OWN `@{upstream}` when it
+#     has one. On a pushed feature branch -- the ordinary way to work in the vault -- those are
+#     different questions with different answers: the branch reads CURRENT while the clone is
+#     missing every cell landed on the record line since the branch was cut. That is the exact state
+#     the row exists to stop, and the guard printed CURRENT while waving it through. The arms below
+#     hold BOTH ends: a feature branch whose base is stale must be refused, and a feature branch
+#     whose base is current must not be, or the fix is over-refusing and nobody can tell.
 #
 # (b) STATED SCOPE AGAINST CELLS WRITTEN. Inside this writer "named versus changed" is vacuous -- it
 #     only ever edits the spans it was handed. The gap that is not vacuous is between the OPERATOR's
@@ -1885,6 +1896,108 @@ def test_the_stale_clone_override_actually_unlocks_the_write(tmp_path: Path) -> 
     """The escape hatch exists and works -- and it is a FLAG, so it appears in the shell history of
     whoever used it, which a silently-relaxed guard does not."""
     rec = _clone_holding_the_record(tmp_path, behind=True)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111()])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-stale-clone",
+        ]
+    )
+    assert rc == 0
+
+
+def _clone_on_a_pushed_feature_branch(
+    tmp_path: Path, *, record_line_advances: bool, own_commit: bool = False
+) -> Path:
+    """A clone whose HEAD is a PUSHED feature branch, so its own `@{upstream}` is that branch.
+
+    Cutting a worktree from `origin/main`, pushing it as its own branch and landing it through a pull
+    request is the ORDINARY way to work on the record, so this fixture is not an exotic shape. It is
+    also the one that separates the two questions: `record_line_advances` moves `origin/main` after
+    the branch is cut, which leaves the branch perfectly current with `origin/feature` and the clone
+    missing a commit from the record line. `own_commit` adds the other ordinary half -- local work on
+    top of a current base, which must stay permitted.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git("init", "-b", "main", ".", cwd=origin)
+    _git("config", "user.email", "t@example.com", cwd=origin)
+    _git("config", "user.name", "t", cwd=origin)
+    (origin / "asvs-scorecard.toml").write_text(FIXTURE, encoding="utf-8")
+    _git("add", "-A", cwd=origin)
+    _git("commit", "-m", "the record", cwd=origin)
+
+    clone = tmp_path / "clone"
+    _git("clone", str(origin), str(clone), cwd=tmp_path)
+    _git("config", "user.email", "t@example.com", cwd=clone)
+    _git("config", "user.name", "t", cwd=clone)
+    _git("checkout", "-b", "feature", cwd=clone)
+    _git("push", "-u", "origin", "feature", cwd=clone)
+    if own_commit:
+        (clone / "work-in-progress").write_text("x", encoding="utf-8")
+        _git("add", "-A", cwd=clone)
+        _git("commit", "-m", "local work on the branch", cwd=clone)
+    if record_line_advances:
+        (origin / "landed-on-the-record-line").write_text("x", encoding="utf-8")
+        _git("add", "-A", cwd=origin)
+        _git("commit", "-m", "another session landed a cell", cwd=origin)
+        _git("fetch", "origin", cwd=clone)
+    return clone / "asvs-scorecard.toml"
+
+
+def test_a_write_from_a_feature_branch_BEHIND_THE_RECORD_LINE_is_REFUSED(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUST FIRE, and it is the arm the branch-only reading cannot pass.
+
+    The two assertions above the call are the control: they show the fixture is in the state the old
+    predicate calls CURRENT, so a refusal below cannot be coming from the branch's own upstream.
+    """
+    rec = _clone_on_a_pushed_feature_branch(tmp_path, record_line_advances=True)
+    stamp = repo_stamp(rec)
+    assert stamp.freshness == "CURRENT", "the fixture is not in the shape this arm exists to test"
+    assert stamp.upstream == "origin/feature", "the branch must track ITSELF, not the record line"
+
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    out = capsys.readouterr().out
+    assert "origin/main" in out, "the refusal must name the line it measured against"
+    assert "BEHIND 1" in out, "the gap must be the MEASURED count, not an adjective"
+
+
+def test_a_write_from_a_feature_branch_whose_BASE_IS_CURRENT_is_NOT_refused(tmp_path: Path) -> None:
+    """MUST NOT FIRE, and this is the arm that decides whether the guard is usable at all.
+
+    A worktree cut from `origin/main` and pushed as its own branch is how the record is edited. A
+    predicate that refuses every feature branch stops the defect and the workflow together, which is
+    the shape that gets a guard reverted or overridden by habit. This arm passes both before and
+    after the fix on purpose: it is a control on over-refusal, not a demonstration of the fix.
+    """
+    rec = _clone_on_a_pushed_feature_branch(tmp_path, record_line_advances=False)
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    assert "3333333333" in rec.read_text(encoding="utf-8"), "the write did not happen"
+
+
+def test_a_write_from_a_feature_branch_AHEAD_of_its_own_upstream_is_NOT_refused(
+    tmp_path: Path,
+) -> None:
+    """MUST NOT FIRE. Unpushed local commits on top of a current base are the other ordinary half of
+    that workflow, and being ahead of anything was never the defect."""
+    rec = _clone_on_a_pushed_feature_branch(tmp_path, record_line_advances=False, own_commit=True)
+    assert repo_stamp(rec).freshness == "AHEAD 1", "the fixture is not ahead of its own upstream"
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+
+
+def test_the_override_unlocks_a_write_from_a_clone_behind_the_RECORD_LINE(tmp_path: Path) -> None:
+    """The escape hatch covers the new refusal too -- and it is a FLAG, so it lands in the shell
+    history of whoever used it, which a silently-relaxed guard does not."""
+    rec = _clone_on_a_pushed_feature_branch(tmp_path, record_line_advances=True)
     rc = main(
         [
             str(_payload(tmp_path, [_cell_111()])),

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import ssl
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -180,3 +182,211 @@ def test_make_probe_client_https_does_not_reach_a_dead_socket_silently() -> None
     ) as c:
         assert probe_health(c) is HealthProbe.DOWN
         assert probe_ui(c) is UiProbe.UNKNOWN
+
+
+# --- ASVS 15.2.2 (BACKLOG #1577): both probes bound the reply body ------------------------------
+#
+# Both probes read a body from a port the tray does not control -- `classify_health` exists
+# precisely because a NON-ENGINE server can answer it. `client.get(...)` reads to EOF, and the
+# poller calls both probes on a repeating schedule, so a squatting process could drive the tray's
+# memory one tick at a time. `probe_ui` was the quieter half: it buffered a body it never parses.
+
+
+class _CountingStream(httpx.SyncByteStream):
+    """A reply body that records how many chunks were pulled and whether it was closed."""
+
+    def __init__(self, chunk: bytes, count: int) -> None:
+        self._chunk = chunk
+        self._count = count
+        self.yielded = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self._count):
+            self.yielded += 1
+            yield self._chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StreamTransport(httpx.BaseTransport):
+    def __init__(self, stream: _CountingStream, status: int = 200) -> None:
+        self._stream = stream
+        self._status = status
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            self._status, headers={"content-type": "application/json"}, stream=self._stream
+        )
+
+
+def _streaming_client(stream: _CountingStream, status: int = 200) -> httpx.Client:
+    return httpx.Client(
+        base_url="http://127.0.0.1:8765",
+        transport=_StreamTransport(stream, status),
+        follow_redirects=False,
+    )
+
+
+def test_probe_health_refuses_an_oversized_reply_without_buffering_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound FIRES on ``/health``, and it fires ON THE STREAM.
+
+    FOREIGN is the right verdict, not a fallback: the engine's ``/health`` is a few hundred bytes, so
+    whatever answered with a megabyte is some other server -- which is exactly what
+    ``classify_health`` exists to say. The pull count is the real assertion; a probe that read the
+    whole body and then returned FOREIGN would pass the verdict check alone while still buffering
+    everything.
+
+    Mutation: drop ``stream=True`` from ``_get_bounded``. Red: ``yielded`` is 8, not 2."""
+    from messagefoundry.tray import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
+    stream = _CountingStream(b"a" * 4096, count=8)
+    with _streaming_client(stream) as c:
+        assert probe_health(c) is HealthProbe.FOREIGN
+    assert stream.yielded == 2, (
+        f"the read pulled {stream.yielded} of 8 chunks; a stream-enforced bound stops at the first "
+        "chunk past the ceiling, so 8 means the whole body was buffered first"
+    )
+    assert stream.closed, "the oversized reply leaked the connection"
+
+
+def test_probe_health_still_reads_a_normal_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NEGATIVE CONTROL: a probe that refused EVERY reply would pass the test above.
+
+    The body sits exactly on the ceiling -- the largest ``/health`` that must still classify OK."""
+    from messagefoundry.tray import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
+    padding = "v" * (4096 - len(json.dumps({"status": "ok", "version": ""}).encode()))
+    body = json.dumps({"status": "ok", "version": padding}).encode()
+    assert len(body) == 4096, "the control is only a control if the body sits exactly on the bound"
+
+    stream = _CountingStream(body, count=1)
+    with _streaming_client(stream) as c:
+        assert probe_health(c) is HealthProbe.OK
+    assert stream.closed
+
+
+def test_probe_ui_bounds_the_body_it_never_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``/ui`` is read for its STATUS CODE alone, and the body was buffered anyway.
+
+    Two claims. The body is bounded (the pull count), and the verdict is unchanged by the body
+    hitting that bound -- ``classify_ui`` reads the status, which arrived before any of the body did,
+    so an oversized ``/ui`` page cannot flip the tray to DISABLED or UNKNOWN. It just is not
+    buffered.
+
+    Mutation: leave ``probe_ui`` on ``client.get(...)``. Red: ``yielded`` is 8, not 2."""
+    from messagefoundry.tray import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
+    stream = _CountingStream(b"a" * 4096, count=8)
+    with _streaming_client(stream, status=200) as c:
+        assert probe_ui(c) is UiProbe.ENABLED
+    assert stream.yielded == 2, f"probe_ui pulled {stream.yielded} of 8 chunks; its body is unbound"
+    assert stream.closed
+
+
+def test_probe_ui_404_still_reads_disabled_under_the_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NEGATIVE CONTROL for the verdict half: the status still decides, oversized body or not."""
+    from messagefoundry.tray import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
+    stream = _CountingStream(b"a" * 4096, count=8)
+    with _streaming_client(stream, status=404) as c:
+        assert probe_ui(c) is UiProbe.DISABLED
+
+
+def test_probe_read_error_mid_body_is_down_not_a_raw_httpx_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming moves the failure point: a socket that dies mid-body used to fail inside
+    ``client.get``, and now fails while iterating. Both probes must still map it to their own
+    down-state rather than letting ``httpx.ReadError`` escape into the poller thread.
+
+    Mutation: narrow the ``try`` in ``probe_health`` to the request build alone. Red: ReadError."""
+    from messagefoundry.tray import probe as probe_mod
+
+    monkeypatch.setattr(probe_mod, "MAX_PROBE_RESPONSE_BYTES", 4096)
+
+    class _DyingStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            yield b"{"
+            raise httpx.ReadError("connection reset mid-body")
+
+    class _DyingTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=_DyingStream())
+
+    with httpx.Client(base_url="http://127.0.0.1:8765", transport=_DyingTransport()) as c:
+        assert probe_health(c) is HealthProbe.DOWN
+        assert probe_ui(c) is UiProbe.UNKNOWN
+
+
+def test_tray_probe_bound_is_generous_for_health_and_far_under_the_apiclient() -> None:
+    """The SIZE of the tray's ceiling, and why it is not the apiclient's.
+
+    Two different jobs. The apiclient has to be able to receive a whole HL7 message back inside a
+    JSON envelope, so its bound clears a 6x escape of the engine's 16 MiB message ceiling. The tray
+    reads a status object and a status code, so a ceiling sized for the apiclient's job would be
+    dead headroom on a hop the tray polls on a schedule.
+
+    Mutation: raise the tray bound to the apiclient's. Red: the second assertion names both."""
+    from messagefoundry.apiclient.client import MAX_RESPONSE_BYTES
+    from messagefoundry.tray.probe import MAX_PROBE_RESPONSE_BYTES
+
+    assert MAX_PROBE_RESPONSE_BYTES >= 64 * 1024, (
+        "the tray bound has to clear a real /health object with room to spare; a tight one would "
+        "turn a healthy engine FOREIGN"
+    )
+    assert MAX_PROBE_RESPONSE_BYTES < MAX_RESPONSE_BYTES // 16, (
+        f"the tray bound is {MAX_PROBE_RESPONSE_BYTES} against the apiclient's {MAX_RESPONSE_BYTES};"
+        " the tray never asks for a message body, so it must not carry a message-sized ceiling"
+    )
+
+
+def test_every_request_in_the_probe_module_goes_through_the_bounded_helper() -> None:
+    """Frozen (AST): ``_get_bounded`` is a helper a future probe has to REMEMBER to call, and this
+    is what stops that being the weak link.
+
+    ``make_probe_client`` already bakes the module's other two cross-cutting properties into the
+    client itself -- TLS verification and the no-redirect policy -- so neither depends on a call site
+    behaving. The response bound cannot be baked in the same way without a transport subclass, so it
+    is guarded here instead, beside the escape-hatch test that exists for the same reason. A version
+    or metrics probe added to this file later with a bare ``client.get(...)`` reintroduces exactly
+    the unbounded read BACKLOG #1577 closed, and nothing else in the module would notice.
+
+    Mutation: add ``client.get("/version")`` anywhere in tray/probe.py. Red: the call is named."""
+    source = Path(inspect.getfile(probe_module)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    bounded = {
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_get_bounded"
+    }
+    inside_helper = {n for root in bounded for n in ast.walk(root)}
+
+    verbs = {
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "request",
+        "stream",
+        "send",
+    }
+    for node in ast.walk(tree):
+        if node in inside_helper or not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in verbs:
+            raise AssertionError(
+                f"tray/probe.py line {node.lineno} issues `.{func.attr}(...)` outside "
+                "`_get_bounded`; every probe read must go through the bounded helper"
+            )

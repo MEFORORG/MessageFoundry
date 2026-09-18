@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from messagefoundry.tray.config import (
     DEFAULT_ENGINE_URL,
     DEFAULT_SERVICE_NAME,
     ServiceRegistryInfo,
+    _split_command_line,
     build_engine_url,
     compose_config,
     engine_serves_https,
@@ -22,6 +24,109 @@ from messagefoundry.tray.config import (
     parse_service_config_arg,
     service_toml_path,
 )
+
+_SPLIT_CASES = [
+    # The BACKLOG #1565 case: str.split() kept the quotes AND split inside them, so this
+    # yielded '"C:\\Program' and 'Files\\MF\\x.toml"' -- two paths that cannot exist.
+    (
+        'serve --service-config "C:\\Program Files\\MF\\x.toml"',
+        ["serve", "--service-config", "C:\\Program Files\\MF\\x.toml"],
+    ),
+    # A quoted path with NO space broke identically, so the defect is the quoting, not spaces.
+    ('--service-config "C:\\svc\\x.toml"', ["--service-config", "C:\\svc\\x.toml"]),
+    # The equals form, quoted: one token, which _iter_options splits afterwards.
+    ('--service-config="C:\\P F\\x.toml"', ["--service-config=C:\\P F\\x.toml"]),
+    # Unquoted backslash paths survive untouched -- the case that works today, and the one
+    # shlex(posix=True) would destroy ("C:datax.toml").
+    ("C:\\data\\x.toml", ["C:\\data\\x.toml"]),
+    ("\\\\server\\share\\x.toml", ["\\\\server\\share\\x.toml"]),
+    # Windows separators are space and tab only; runs of them collapse.
+    ("serve\t--host\t127.0.0.1", ["serve", "--host", "127.0.0.1"]),
+    ("   serve    --host  ::1   ", ["serve", "--host", "::1"]),
+    ("", []),
+    ("   ", []),
+    # 2n backslashes before a quote halve and toggle the run; 2n+1 escape the quote itself.
+    ('"C:\\MF\\\\"', ["C:\\MF\\"]),
+    ('x\\\\"y z', ["x\\y z"]),
+    ('x\\\\\\"y z', ['x\\"y', "z"]),
+    # A doubled quote inside a run is one literal quote and ENDS the run -- see the tokenizer's
+    # docstring, where CommandLineToArgvW parts company with the MSVCRT rule. Here that makes the
+    # LATER quote reopen a run, so the space after 'b' is literal and this is ONE argument.
+    # Verified against shell32 rather than reasoned: the first expectation written here was
+    # ['a"b', 'c'], and the oracle disagreed.
+    ('"a""b" c', ['a"b c']),
+    ('a """ b', ["a", '"', "b"]),
+    ('""""', ['"']),
+    ('"""""', ['"']),
+    # Malformed quoting is tolerated rather than raising: the run ends with the string.
+    ('--service-config "C:\\svc\\x.toml', ["--service-config", "C:\\svc\\x.toml"]),
+    # An empty quoted value is a real, empty argument.
+    ('--service-config ""', ["--service-config", ""]),
+    # Apostrophes are NOT a Windows quoting form: they stay in the token, so the path really is
+    # named with them. Pinned because it looks like a gap and is not one.
+    ("--service-config 'C:\\q\\x.toml'", ["--service-config", "'C:\\q\\x.toml'"]),
+    ('"a b" "c d"', ["a b", "c d"]),
+]
+
+
+@pytest.mark.parametrize(("line", "argv"), _SPLIT_CASES)
+def test_split_command_line(line: str, argv: list[str]) -> None:
+    assert _split_command_line(line) == argv
+
+
+# Lines the oracle below also checks, where the real function is the only expectation worth
+# writing down: quoting no operator produces, plus the quoted host and port from the row.
+_ORACLE_EXTRA = [
+    'serve --host "127.0.0.1" --port "8765"',
+    'serve --service-config "a""b.toml"',
+    "serve\t--host\t127.0.0.1\t--port\t8765",
+    " leading and trailing ",
+]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32.CommandLineToArgvW is Windows-only")
+def test_split_command_line_matches_the_win32_oracle() -> None:
+    """Differential against ``shell32.CommandLineToArgvW`` -- the rules, not a reading of them.
+
+    The tokenizer itself stays pure Python (the tray is stdlib-ctypes-only and this module's core
+    must be unit-testable on any OS), so ctypes appears HERE and nowhere in the shipped path. The
+    oracle parses ``argv[0]`` under its own rules, so every case is prefixed with a bare program
+    token and compared from element 1.
+
+    It runs over ``_SPLIT_CASES`` itself, so a case added to the table above is checked against the
+    real function too rather than only against a hand-written expectation.
+    """
+    import ctypes
+    import random
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    def oracle(params: str) -> list[str]:
+        count = ctypes.c_int(0)
+        argv = shell32.CommandLineToArgvW("prog " + params, ctypes.byref(count))
+        if not argv:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return [argv[i] for i in range(1, count.value)]
+        finally:
+            kernel32.LocalFree(ctypes.cast(argv, wintypes.HLOCAL))
+
+    for case in [line for line, _ in _SPLIT_CASES] + _ORACLE_EXTRA:
+        assert _split_command_line(case) == oracle(case), f"curated case {case!r}"
+
+    # Seeded fuzz over the characters the rules turn on, so a regression in any branch shows up as
+    # a concrete counter-example rather than as a gap in the curated list.
+    rng = random.Random(1565)
+    alphabet = ' \t"\\abC:.=-'
+    for _ in range(4000):
+        case = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+        assert _split_command_line(case) == oracle(case), f"fuzz case {case!r}"
 
 
 @pytest.mark.parametrize(
@@ -34,6 +139,10 @@ from messagefoundry.tray.config import (
         ("serve --port 70000", None, None),  # out of range
         ("serve --port notanint", None, None),
         ("serve --host bad;host --port 8765", None, 8765),  # ';' is not a valid host char
+        # BACKLOG #1565: a quoted host failed the host regex and a quoted port failed int(), so the
+        # discovered URL was wrong by more than its scheme.
+        ('serve --host "127.0.0.1" --port "8765"', "127.0.0.1", 8765),
+        ('serve --host="10.0.0.5" --port="9000"', "10.0.0.5", 9000),
     ],
 )
 def test_parse_serve_args(args: str, host: str | None, port: int | None) -> None:
@@ -165,6 +274,21 @@ def test_monitor_only_keys_on_locality_not_scheme() -> None:
         ("serve --config C:\\cfg --host 127.0.0.1", None),
         ("serve --service-config", None),  # trailing flag, no value
         ("serve --service-config bad\x00path", None),  # NUL-bearing → rejected
+        # BACKLOG #1565, the filed case: a quoted path with a space.
+        (
+            'serve --service-config "C:\\Program Files\\MF\\mefor.toml" --env prod',
+            "C:\\Program Files\\MF\\mefor.toml",
+        ),
+        # ...and the same quoting with no space in the path, which failed identically.
+        ('serve --service-config "C:\\svc\\mefor.toml"', "C:\\svc\\mefor.toml"),
+        # The equals form with a quoted value. The unquoted equals form already worked; the '='
+        # split is unchanged and now runs on a dequoted token.
+        ('serve --service-config="C:\\P F\\mefor.toml"', "C:\\P F\\mefor.toml"),
+        # Malformed quoting yields the path rather than nothing -- fail-soft, as before.
+        ('serve --service-config "C:\\svc\\mefor.toml', "C:\\svc\\mefor.toml"),
+        # NOT COVERED, and correctly so: apostrophes are not a Windows quoting form, so
+        # CommandLineToArgvW keeps them and the path really is named with them.
+        ("serve --service-config 'C:\\svc\\x.toml'", "'C:\\svc\\x.toml'"),
     ],
 )
 def test_parse_service_config_arg(args: str, expected: str | None) -> None:
@@ -221,6 +345,13 @@ def test_service_toml_path_resolution(tmp_path: Path) -> None:
     # No flag → the engine's own default filename under AppDirectory.
     reg = ServiceRegistryInfo(app_directory=str(repo), app_parameters="serve --host 127.0.0.1")
     assert service_toml_path(reg) == repo / "messagefoundry.toml"
+    # A quoted absolute path with a space resolves to that same file (BACKLOG #1565). Before the
+    # tokenizer this became '"<tmp>/svc' -- a relative-looking fragment joined onto AppDirectory.
+    spaced = tmp_path / "svc dir" / "x.toml"
+    reg = ServiceRegistryInfo(
+        app_directory=str(repo), app_parameters=f'serve --service-config "{spaced}"'
+    )
+    assert service_toml_path(reg) == spaced
     # Nothing to anchor on → nothing to read.
     assert service_toml_path(ServiceRegistryInfo(app_parameters="serve")) is None
     assert service_toml_path(None) is None
@@ -312,6 +443,33 @@ def test_load_config_a_declared_upstream_terminator_stays_http(tmp_path: Path) -
     reader = _FakeReader(
         ServiceRegistryInfo(
             app_directory=str(repo), app_parameters="serve --host 127.0.0.1 --port 8765"
+        )
+    )
+    assert load_config(tmp_path, reader).engine_url == "http://127.0.0.1:8765"
+
+
+def test_load_config_finds_a_quoted_service_config_path_with_a_space(tmp_path: Path) -> None:
+    """BACKLOG #1565 end to end, on the one topology where losing the file changes the answer.
+
+    A ``--service-config`` path with a space is quoted in ``AppParameters``, and ``str.split()``
+    turned that into fragments, so the settings read as absent and the tray composed https. A
+    deploying site that had declared ``tls_terminated_upstream`` would then have probed https
+    against an engine deliberately speaking plaintext to its proxy, and rendered a running engine
+    as WEDGED.
+
+    The shipped ``scripts/service/install-service.ps1`` writes no ``--service-config`` at all, so
+    this is the hand-edited posture rather than the stock one. Its quoted ``--config``/``--db``
+    values fragmented too, but harmlessly: neither flag is in ``wanted``, and ``--host``/``--port``
+    sat outside the quotes, so a stock install parsed the same before and after this change.
+    """
+    repo = tmp_path / "Program Files" / "MessageFoundry"
+    repo.mkdir(parents=True)
+    svc = repo / "svc settings.toml"
+    svc.write_text("[api]\ntls_terminated_upstream = true\n", encoding="utf-8")
+    reader = _FakeReader(
+        ServiceRegistryInfo(
+            app_directory=str(repo),
+            app_parameters=f'serve --host 127.0.0.1 --port 8765 --service-config "{svc}"',
         )
     )
     assert load_config(tmp_path, reader).engine_url == "http://127.0.0.1:8765"

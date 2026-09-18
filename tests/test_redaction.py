@@ -14,7 +14,7 @@ import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
 from messagefoundry import redaction
-from messagefoundry.redaction import redact, safe_exc, safe_name, safe_text
+from messagefoundry.redaction import redact, safe_error, safe_exc, safe_name, safe_text
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -479,3 +479,41 @@ def test_safe_exc_file_name_covers_a_bare_basename_too() -> None:
 
 def test_safe_name_is_exported() -> None:
     assert "safe_name" in redaction.__all__
+
+
+# --- safe_error: the optional, opt-in-gated form the CLI surfaces use (BACKLOG #1668) -------------
+
+
+def test_safe_error_passes_none_through() -> None:
+    """An absent error is not a value to redact -- the CLIs emit it as JSON ``null``, not ``""``."""
+    assert safe_error(None) is None
+    assert safe_error(None, show_phi=True) is None
+
+
+def test_safe_error_redacts_by_default_and_keeps_the_prose() -> None:
+    """The stage prefix and the author's own words survive; only the HL7-shaped runs collapse.
+
+    That is the whole reason this is ``safe_text`` and not a whole-string drop: the diagnostic is what
+    somebody ran ``dryrun`` to read."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q mrn 900123456^^^H^MR"
+    out = safe_error(raised)
+    assert out is not None
+    assert "DOE" not in out and "900123456" not in out
+    assert out.startswith("router/handler error: unmapped patient ")
+
+
+def test_safe_error_show_phi_returns_the_text_unchanged() -> None:
+    """The opt-in arm is byte-identical -- a caller that may see it gets exactly what was raised."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q"
+    assert safe_error(raised, show_phi=True) == raised
+
+
+def test_safe_error_defaults_closed() -> None:
+    """A surface with no opt-in (the ``check`` gate) passes no keyword, so the default must redact."""
+    raised = "parse error: PID|1||900123456^^^H^MR"
+    assert safe_error(raised) == safe_error(raised, show_phi=False)
+    assert "900123456" not in str(safe_error(raised))
+
+
+def test_safe_error_is_exported() -> None:
+    assert "safe_error" in redaction.__all__

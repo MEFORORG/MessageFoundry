@@ -42,6 +42,7 @@ which on Windows also reads the machine CA/ROOT stores; see ``auth/oidc_http``).
 
 from __future__ import annotations
 
+import json
 import ssl
 
 import httpx
@@ -50,6 +51,27 @@ from messagefoundry.tray.config import is_tls_url
 from messagefoundry.tray.state import HealthProbe, UiProbe
 
 DEFAULT_TIMEOUT_S = 2.0
+
+#: ASVS 15.2.2 (BACKLOG #1577): the ceiling on a reply body either probe will buffer.
+#:
+#: The tray reads exactly two things. ``/health`` is a small JSON object -- a status word, a version,
+#: a little metadata. ``/ui`` is read for its STATUS CODE alone and its body is thrown away. 1 MiB is
+#: generous for the first and irrelevant to the second, and it is the same shape of number, chosen
+#: the same way, as the 256 KiB ceiling the engine applies to a token endpoint
+#: (``transports.bounded_read.MAX_TOKEN_RESPONSE_BYTES``).
+#:
+#: It is deliberately far below the ``apiclient``'s 128 MiB. That client has to be able to receive a
+#: whole HL7 message back inside a JSON envelope; the tray never asks for one, so a ceiling sized for
+#: the apiclient's job would be dead headroom on this hop.
+#:
+#: The bound matters here more than its size suggests: the poller calls both probes on a repeating
+#: schedule, and :func:`classify_health` explicitly models a NON-ENGINE server answering that port. A
+#: local process squatting it would otherwise drive the tray's memory one poll at a time. Nothing
+#: raises -- see :func:`_get_bounded` for what a probe does instead.
+#:
+#: The number is NOT imported from ``transports/``: ADR 0113 keeps ``tray/`` to stdlib plus httpx,
+#: which is the same layering reason ``apiclient`` duplicates its own bounds.
+MAX_PROBE_RESPONSE_BYTES = 1024 * 1024
 
 
 def classify_health(status_code: int | None, body: object) -> HealthProbe:
@@ -80,29 +102,81 @@ def classify_ui(status_code: int | None) -> UiProbe:
     return UiProbe.ENABLED
 
 
-def _safe_json(response: httpx.Response) -> object:
+def _safe_json(body: bytes | None) -> object:
+    """Parse ``body`` as JSON, or return ``None`` when it is absent or not JSON.
+
+    ``None`` in means the reply was over :data:`MAX_PROBE_RESPONSE_BYTES` and was discarded unread.
+    ``None`` out is what :func:`classify_health` already reads as "not our ``/health``", so an
+    oversized reply classifies :data:`~messagefoundry.tray.state.HealthProbe.FOREIGN` with no extra
+    branch -- which is the correct answer, not a fallback: the engine's ``/health`` is a few hundred
+    bytes, so whatever sent a megabyte is some other server.
+    """
+    if body is None:
+        return None
     try:
-        return response.json()
+        return json.loads(body)
     except ValueError:
         return None
+
+
+def _get_bounded(client: httpx.Client, path: str) -> tuple[int, bytes | None]:
+    """``GET path`` and return its status plus at most :data:`MAX_PROBE_RESPONSE_BYTES` of body.
+
+    ASVS 15.2.2 (BACKLOG #1577). The request is dispatched with ``stream=True`` so the body is read
+    a chunk at a time and abandoned the moment it passes the ceiling -- the peak allocation is the
+    ceiling plus one chunk, not whatever answered the port. Over the ceiling, the body comes back
+    ``None``; the STATUS is still returned, because it arrived before any of the body did and both
+    classifiers are keyed on it.
+
+    Nothing raises for being too large. A tray probe reports a state, and an oversized reply has a
+    correct state to report on both paths (``FOREIGN`` for ``/health``, the status's own verdict for
+    ``/ui``). A transport failure still raises ``httpx.HTTPError`` for the callers to map to
+    ``DOWN``/``UNKNOWN``, and it can now surface mid-body rather than only at connect.
+
+    The body is drained rather than dropped unread so the connection returns to the pool: the poller
+    runs ``/health`` then ``/ui`` sequentially on one client, and abandoning a socket per probe would
+    force a fresh connect on every tick.
+
+    ``follow_redirects`` is passed explicitly rather than left to the client default. ``/ui`` answers
+    ``303``; a followed redirect would turn it into the ``200`` login page and destroy the only
+    signal :func:`classify_ui` reads.
+    """
+    request = client.build_request("GET", path)
+    response = client.send(request, stream=True, follow_redirects=False)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > MAX_PROBE_RESPONSE_BYTES:
+                return response.status_code, None
+            chunks.append(chunk)
+        return response.status_code, b"".join(chunks)
+    finally:
+        response.close()
 
 
 def probe_health(client: httpx.Client) -> HealthProbe:
     """Probe ``GET /health`` tokenlessly via ``client`` (its ``base_url`` is the engine URL)."""
     try:
-        response = client.get("/health")
+        status_code, body = _get_bounded(client, "/health")
     except httpx.HTTPError:
         return HealthProbe.DOWN
-    return classify_health(response.status_code, _safe_json(response))
+    return classify_health(status_code, _safe_json(body))
 
 
 def probe_ui(client: httpx.Client) -> UiProbe:
-    """Probe ``GET /ui`` tokenlessly, without following the login redirect."""
+    """Probe ``GET /ui`` tokenlessly, without following the login redirect.
+
+    The body is read only to keep the connection reusable and is never looked at --
+    :func:`classify_ui` decides on the status code alone. A ``/ui`` page past the bound therefore
+    cannot change this verdict, it just does not get buffered.
+    """
     try:
-        response = client.get("/ui", follow_redirects=False)
+        status_code, _ = _get_bounded(client, "/ui")
     except httpx.HTTPError:
         return UiProbe.UNKNOWN
-    return classify_ui(response.status_code)
+    return classify_ui(status_code)
 
 
 def build_verify(engine_url: str) -> ssl.SSLContext | bool:

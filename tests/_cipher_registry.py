@@ -33,6 +33,8 @@ import ast
 import re
 from pathlib import Path
 
+from _ast_sites import callee_name
+
 _ROOT = Path(__file__).resolve().parent.parent
 PKG = _ROOT / "messagefoundry"
 
@@ -60,8 +62,7 @@ def cell_aad_pairs() -> set[tuple[str, str]]:
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "cell_aad"
+                and callee_name(node, bare_only=True) == "cell_aad"
                 and len(node.args) >= 2
             ):
                 continue

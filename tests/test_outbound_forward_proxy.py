@@ -27,8 +27,12 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     active_hop_posture,
 )
-from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
-from messagefoundry.pipeline.wiring_runner import _apply_egress_proxy_default
+from messagefoundry.config.wiring import FHIR, DICOMweb, OutboundConnection, Rest, Soap, WiringError
+from messagefoundry.pipeline.wiring_runner import (
+    _apply_egress_proxy_default,
+    _dest_config,
+    check_egress_allowed,
+)
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
@@ -373,6 +377,27 @@ def test_egress_default_proxy() -> None:
     none_settings: dict[str, object] = {"url": HTTPS_DEST}
     _apply_egress_proxy_default(none_settings, EgressSettings())
     assert "proxy_url" not in none_settings
+
+
+def test_egress_default_proxy_is_gated_by_allowed_proxy() -> None:
+    """The site-wide default is gated too, through the SAME copy-in the runner does (BACKLOG #1659).
+
+    `_apply_egress_proxy_default` runs inside `_dest_config`, ahead of `check_egress_allowed`, so the
+    merged value is already in `dest.settings` when the gate reads it — asserted here rather than
+    assumed, because an inherited `[egress].proxy_url` is precisely the case a per-connection-only
+    gate would miss.
+    """
+    oc = OutboundConnection("OB", Rest(url=HTTPS_DEST))
+    unlisted = EgressSettings(allowed_http=["api.example.com"], proxy_url=PROXY)
+    dest = _dest_config(oc, {}, egress=unlisted)
+    assert dest.settings["proxy_url"] == PROXY  # the copy-in happened before the gate sees it
+    with pytest.raises(WiringError, match="allowed_proxy"):
+        check_egress_allowed(dest, unlisted)
+
+    listed = EgressSettings(
+        allowed_http=["api.example.com"], proxy_url=PROXY, allowed_proxy=["proxy.example.com:3128"]
+    )
+    check_egress_allowed(_dest_config(oc, {}, egress=listed), listed)  # no raise
 
 
 # --- FhirLookup read executor honours the proxy --------------------------------------------------
