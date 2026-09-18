@@ -5071,8 +5071,9 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
-    except StoreNotFoundError as exc:  # #1780: open_store no longer creates the store it backs up
-        return _emit_error(str(exc), as_json=args.json)
+    except StoreNotFoundError as exc:  # #1780: could not start, so exit 2 like #1670 below
+        _emit_error(str(exc), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if result is None:  # leader-gated no-op (never on the single-node CLI path) — defensive

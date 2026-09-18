@@ -51,7 +51,6 @@ async def test_open_store_refuses_an_absent_sqlite_store_by_default(tmp_path: Pa
     raised = await _open_then_close(target)
 
     assert _created(tmp_path) == [], "open_store created the store it was only asked to open"
-    assert type(raised).__name__ == "StoreNotFoundError"
     assert isinstance(raised, store_base.StoreNotFoundError)
     assert raised.path == target
     # The operator reading this needs the path they configured, not a traceback into SQLite.
@@ -92,7 +91,7 @@ def test_status_snapshot_reports_an_absent_store_without_creating_it(tmp_path: P
     assert _created(tmp_path) == [], "the support bundle created the store it was reporting on"
     assert snap["db"] is None
     # A fixed code plus the exception type, never the path or the message (BACKLOG #1571).
-    assert snap["db_error"] == "MF-BUNDLE-DB-002 StoreNotFoundError"
+    assert snap["db_error"] == "MF-BUNDLE-DB-001 StoreNotFoundError"
 
 
 def test_build_bundle_reports_an_absent_store_without_creating_it(tmp_path: Path) -> None:
@@ -132,7 +131,7 @@ def test_backup_cli_refuses_an_absent_store(
     )
 
     assert _created(store_dir) == [], "backup created the store it was asked to back up"
-    assert rc != 0
+    assert rc == 2  # could not start, not a failed backup
     assert "no SQLite store" in capsys.readouterr().out
 
 

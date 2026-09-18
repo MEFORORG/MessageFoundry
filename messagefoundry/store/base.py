@@ -2073,12 +2073,8 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
 
 
 class StoreNotFoundError(RuntimeError):
-    """:func:`open_store` was pointed at a SQLite store that does not exist, and its caller did not
-    pass ``create=True`` (BACKLOG #1780). ``path`` is the absent file, as configured.
-
-    Raised instead of creating the file, because SQLite's own connect creates an absent one and the
-    schema ensure then fills it. A caller that meant *report on this store* would otherwise get *make
-    this store*, and a mistyped path would read as a healthy, empty store."""
+    """:func:`open_store` was pointed at an absent SQLite store without ``create=True`` (BACKLOG
+    #1780). ``path`` is the absent file, as configured."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -2093,7 +2089,9 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
 
     ``:memory:`` puts nothing on disk, so it has no file to be absent. Only ``FileNotFoundError``
     counts as absent. Any other stat failure, such as a permission error on an ancestor, is left for
-    the open to report, because SQLite could not have created a file there either."""
+    the open to report, because SQLite could not have created a file there either. The verifier keeps
+    a stricter twin, ``verify/smoke.py::missing_sqlite_store`` (``is_file``), so that it can refuse
+    without importing the store stack."""
     if settings.backend is not StoreBackend.SQLITE or settings.path == ":memory:":
         return None
     path = Path(settings.path)
@@ -2102,7 +2100,7 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     except FileNotFoundError:
         return path
     except OSError:
-        return None
+        pass
     return None
 
 
@@ -2116,12 +2114,11 @@ async def open_store(
     """Open the store for the configured backend — the single backend-selection seam.
 
     ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
-    first run and the ``provision-admin`` bootstrap. Every other caller gets the default, and on SQLite
-    an absent file raises :class:`StoreNotFoundError` BEFORE anything connects, so a caller that means
-    *open this store* can no longer create one. It governs creation only. An existing file still gets
-    the schema ensure and the migrations, and the server backends ignore it: they do not
-    ``CREATE DATABASE``, but they do build the whole schema into a database that exists, which is the
-    half of #1780 this does not close.
+    first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
+    :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
+    the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
+    the server backends ignore it (they never ``CREATE DATABASE``, but do build the schema into any
+    database that exists).
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2137,12 +2134,9 @@ async def open_store(
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
-    # First, and before the cipher: a refusal must not wait on a key provider (a Vault round trip under
-    # vault_transit) for a store that is not there.
-    if not create:
-        absent = _absent_sqlite_store(settings)
-        if absent is not None:
-            raise StoreNotFoundError(absent)
+    # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
+    if not create and (absent := _absent_sqlite_store(settings)) is not None:
+        raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
     # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v2;
