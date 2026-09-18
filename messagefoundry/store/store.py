@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, NotRequired, Protocol, TypedDict, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -829,6 +829,30 @@ class ConnectionEvent:
     peer_host: str | None
     message_id: str | None
     reason: str | None
+
+
+class ConnectionEventWrite(TypedDict):
+    """One connection event on its way INTO the store (#46): the write-side twin of
+    :class:`ConnectionEvent`, without the ``id`` the store assigns. A ``TypedDict`` rather than a
+    dataclass because it is also the runner's drain-queue item, which stays a plain dict.
+    ``now`` absent or ``None`` stamps the row at write time, as the singular writer does."""
+
+    connection: str
+    transport: str
+    direction: str
+    kind: str
+    peer_host: str | None
+    message_id: str | None
+    reason: str | None
+    now: NotRequired[float | None]
+
+
+# The one connection_event INSERT, shared by MessageStore's singular and burst writers.
+_CONNECTION_EVENT_INSERT: Final = (
+    "INSERT INTO connection_event"
+    " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+    " VALUES (?,?,?,?,?,?,?,?)"
+)
 
 
 @dataclass(frozen=True)
@@ -7643,8 +7667,45 @@ class MessageStore:
     ) -> None:
         # Pure observer: a single short INSERT under the write lock — NOT inside any handoff txn, no
         # queue row, no finalizer call (connection_event is invisible to _maybe_finalize_message, which
-        # scans `FROM queue`). reason goes through the safe_text PHI chokepoint (#120) + the cipher.
-        now = time.time() if now is None else now
+        # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
+        # writer as their probe for an inherited open transaction
+        # (tests/test_backlog1548_writer_txn_cancel_unwind.py).
+        params = self._connection_event_params(
+            ConnectionEventWrite(
+                connection=connection,
+                transport=transport,
+                direction=direction,
+                kind=kind,
+                peer_host=peer_host,
+                message_id=message_id,
+                reason=reason,
+                now=now,
+            )
+        )
+        async with self._lock:
+            await self._db.execute(_CONNECTION_EVENT_INSERT, params)
+            await self._commit()
+
+    async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
+        # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
+        # already queued, so a connect-per-message sender pays one commit per burst, not per event.
+        # _writer_txn rather than the bare lock the singular takes: teardown cancels the drainer, and a
+        # multi-row write cancelled mid-flight must not leave its transaction open (ADR 0159).
+        rows = [self._connection_event_params(ev) for ev in events]
+        if not rows:
+            return
+        async with _writer_txn(self._db, self._lock):
+            await self._db.executemany(_CONNECTION_EVENT_INSERT, rows)
+            await self._commit()
+
+    def _connection_event_params(self, ev: ConnectionEventWrite) -> tuple[Any, ...]:
+        """The INSERT parameters for one connection event, shared by both writers so the scrub and
+        seal can never drift between them. ``reason`` goes through the safe_text PHI chokepoint
+        (#120), then the cipher."""
+        now = ev.get("now")
+        if now is None:
+            now = time.time()
+        connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
         # Bound to (connection, ts, kind) — the row's insert-time-known identity; connection_event.id is
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
@@ -7655,14 +7716,16 @@ class MessageStore:
             if reason
             else None
         )
-        async with self._lock:
-            await self._db.execute(
-                "INSERT INTO connection_event"
-                " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (now, connection, transport, direction, kind, peer_host, message_id, reason_enc),
-            )
-            await self._commit()
+        return (
+            now,
+            connection,
+            ev["transport"],
+            ev["direction"],
+            kind,
+            ev["peer_host"],
+            ev["message_id"],
+            reason_enc,
+        )
 
     async def list_connection_events(
         self,
