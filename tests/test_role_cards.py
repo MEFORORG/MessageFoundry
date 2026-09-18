@@ -370,6 +370,29 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
             re.compile(r"open(?:ing)? (?:a |the )?PR[^.\n]{0,60}approval", re.I),
             "opening a PR needs no approval here (owner ruling 2026-08-29)",
         ),
+        # The SECOND shape, added 2026-09-18. This screen was built from the push case alone and
+        # therefore found only that shape -- builder.card.md carried "Declare its own seat. Your
+        # Manager does that." for the whole time this class existed. CLAUDE.md:418 records the
+        # opposite and says why the old rule was worth naming: it was SELF-CONFIRMING, because a
+        # Builder told it cannot declare does not try, renders undeclared, and confirms the rule.
+        # The shipped shape: "**Declare its own seat.** Your Manager does that." Note it crosses a
+        # sentence boundary, so the window CANNOT exclude "." the way the push patterns do -- the
+        # first draft of this pattern used `[^.\n]` and stayed quiet on the very line it was
+        # written for. `test_the_scan_fires_on_the_seat_declaration_line_this_card_shipped` is
+        # what caught that, which is the whole reason a positive control is not optional.
+        (
+            re.compile(
+                r"declare\b[^\n]{0,30}\bseat\b[^\n]{0,20}(?:your |the )?"
+                r"(?:manager|console|owner)\s+does",
+                re.I,
+            ),
+            "a seat declares its own seat (CLAUDE.md:418, measured 2026-09-02); the Manager "
+            "supplies the seat and goal at dispatch but does not declare for it",
+        ),
+        (
+            re.compile(r"(?:cannot|can't|must not|never)\s+declare\b[^\n]{0,30}\bseat\b", re.I),
+            "a seat CAN declare itself through the Bash tool (CLAUDE.md:418, measured 2026-09-02)",
+        ),
     )
 
     def test_no_card_says_a_push_needs_approval(self):
@@ -387,6 +410,18 @@ class NoCardContradictsAnAnchoredRuling(unittest.TestCase):
         self.assertTrue(
             any(rx.search(planted) for rx, _ in self.FORBIDDEN),
             "the scan did not fire on the exact sentence korus's cards carry, so it guards nothing",
+        )
+
+    def test_the_scan_fires_on_the_seat_declaration_line_this_card_shipped(self):
+        """The second positive control, for the shape this screen missed for its whole life.
+
+        A screen built from one case finds one shape. This exact sentence sat in
+        `builder.card.md` while every test in this class was green.
+        """
+        planted = "- **Declare its own seat.** Your Manager does that."
+        self.assertTrue(
+            any(rx.search(planted) for rx, _ in self.FORBIDDEN),
+            "the scan did not fire on the seat-declaration line builder.card.md actually carried",
         )
 
     def test_the_scan_accepts_the_wording_this_repository_uses(self):
