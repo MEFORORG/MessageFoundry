@@ -112,6 +112,25 @@ regexes = [
   '''pk-Sm4rt_Key-11''',
   # Family "intake_api_key_rotation_partner" -- `intake_api_key_next=`, the ADR 0154 rotation partner.
   '''nk-N3xt_Key-22''',
+  # --- BACKLOG #1716 -- support-BUNDLE log-tail sentinels -----------------------------------------
+  # SYNTHETIC needles invented for tests/test_support_bundle.py. Same construction and same reason as
+  # the three blocks above: each is a value a redaction test asserts does NOT survive the bundle's
+  # app-log tail, so each is published in test source by necessity, and each carries a hyphen AND an
+  # underscore on purpose. Before #1716 these fixtures used pure-base64 values, which the redactor's
+  # `_LONG_B64` backstop covered on its own -- so every assertion passed with the rule in its own
+  # name deleted. The entropy that trips this scanner is the fix.
+  #
+  # They share the shape of the #1183 block and NONE of its values. That file covers the redactor in
+  # isolation; this one covers the same redactor reached END TO END through `build_bundle`, so
+  # distinct sentinels keep each file's needles its own.
+  #
+  # ONLY THE ONES THAT ACTUALLY TRIP ARE LISTED, which is the practice the #1183 block sets: #1716
+  # added four sentinels and gitleaks flagged this one on entropy. Allowlisting the other three
+  # pre-emptively would widen the scanner's blind spot to buy nothing.
+  #
+  # The `MEFOR_STORE_ENCRYPTION_KEY=` line of the leaky log fixture; patterns _MEFOR_SECRET +
+  # _KEY_MATERIAL, which is the pair that reaches this label.
+  '''ek-Bndl_Enc-41''',
 ]
 
 # BACKLOG #1091's `mefor-defaulted-credential` RULE LIVED HERE AND WAS DELIBERATELY REMOVED, not
