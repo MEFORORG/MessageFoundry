@@ -94,6 +94,7 @@ __all__ = [
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
     "refuse_unrevoked_verified_hop",
+    "refuse_url_credentials",
     "refuse_verify_off",
 ]
 
@@ -399,10 +400,60 @@ def _expiry_relaxed_opener(
 
 def _redact_url(url: str) -> str:
     """``scheme://host[:port]/path`` only — drops query/userinfo so a token or PHI in the query
-    string never reaches a log line."""
+    string never reaches a log line.
+
+    A port that is not a number is DROPPED, never echoed, and never raised (BACKLOG #1793). A password
+    holding an unencoded ``/`` makes ``urlsplit`` read its head as the port, and ``SplitResult.port``
+    raises a ``ValueError`` that quotes it. Every classified ``except`` arm calls this, so a raise here
+    would escape that arm unclassified, carrying the password head with it."""
     p = urllib.parse.urlsplit(url)
-    port = f":{p.port}" if p.port else ""
+    try:
+        port = f":{p.port}" if p.port else ""
+    except ValueError:
+        port = ""
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
+
+
+def refuse_url_credentials(
+    url: str,
+    setting: str,
+    *,
+    use: str = "basic_user/basic_password or bearer_token",
+    error: type[ValueError] = ValueError,
+) -> None:
+    """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
+
+    WHY IT IS REFUSED RATHER THAN SUPPORTED. urllib never turns URL userinfo into an ``Authorization``
+    header. It hands ``user:pw@host`` to ``http.client`` as the HOST, which reads ``pw@host`` as the
+    port and raises ``InvalidURL("nonnumeric port: 'pw@host'")``. With an explicit port the lookup fails
+    on a host that still holds the password, and through a plain-http forward proxy the password goes
+    out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
+    error text carried the password into ``queue.last_error`` and the test-connection reply.
+
+    TWO CHECKS, because ``urlsplit`` misses one shape. An ``@`` in the authority is userinfo; it is
+    tested after unquoting because urllib unquotes the host, so ``%40`` leaks exactly like ``@``. A port
+    that is not a number is what a password holding an unencoded ``/``, ``?`` or ``#`` looks like: the
+    authority stops there, no ``@`` is seen, and the password's head becomes the port. An EMPTY port
+    (``host:/``) passes, because ``urlsplit`` reads it as no port and ``http.client`` as the default.
+
+    ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
+    credentials, and #1207 masks them for display.
+
+    PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
+    seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
+    p = urllib.parse.urlsplit(url)
+    if "@" in urllib.parse.unquote(p.netloc):
+        raise error(
+            f"{setting} must not carry credentials in the URL (the user:password@ part); "
+            f"set them in {use} instead"
+        )
+    try:
+        p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
+    except ValueError:
+        raise error(
+            f"{setting} has a port that is not a number from 0 to 65535. A password written "
+            f"into the URL can cause this; set credentials in {use} instead"
+        ) from None
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -1325,6 +1376,7 @@ class RestDestination(DestinationConnector):
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
+        refuse_url_credentials(url, "REST destination 'url'")
         self.url = url
         self.method: str = str(s.get("method", "POST")).upper()
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
@@ -1622,6 +1674,11 @@ class RestDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
+            raise DeliveryError(
+                f"REST {_redact_url(self.url)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 
