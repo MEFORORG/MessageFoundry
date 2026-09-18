@@ -52,6 +52,33 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-RosterMapKeys {
+    <#
+      .SYNOPSIS
+        Key names of a seats.json map. An EMPTY ARRAY for a map that is empty, null, or absent.
+
+      .DESCRIPTION
+        WHY THIS EXISTS, MEASURED 2026-09-16. Under `Set-StrictMode -Version Latest`,
+        `$map.PSObject.Properties.Name` THROWS on a map with no members -- "The property 'Name'
+        cannot be found on this object" -- because projecting `.Name` over an empty property
+        collection has nothing to project from. A non-empty map of the same shape works, so the
+        expression reads as correct until the day a map empties.
+
+        WHAT THAT COST. The roster resolver wraps its whole read in one catch, and that catch
+        cannot tell "this JSON is unreadable" from "this JSON is readable and one map is empty".
+        So emptying a single map demoted EVERY verdict to `roster-unreadable` and the warning
+        this script exists to print vanished -- silently, with a zero exit and an empty stderr.
+        A declaration of a nonsense seat looked exactly like a declaration of a good one.
+
+        The rule that follows: never project a member over a ConvertFrom-Json map directly. Ask
+        this function, which answers the same question for an empty map as for a full one.
+    #>
+    param($Map)
+    if ($null -eq $Map) { return @() }
+    return @($Map.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+
 # The hook reads stdin because the harness sends a JSON payload. Nothing here needs it, but a hook
 # that leaves stdin unread can make the caller block on the write.
 try { $null = [Console]::In.ReadToEnd() } catch { }
@@ -125,12 +152,12 @@ Live seats: $($seats.live -join ', ').
     if ($seats.live -contains $label) {
         $canonical = $label
     }
-    elseif ($seats.aliases.PSObject.Properties.Name -contains $label) {
+    elseif ((Get-RosterMapKeys $seats.aliases) -contains $label) {
         $canonical = $seats.aliases.$label
     }
 
     # ------------------------------------------------------------- a retired seat says so, loudly
-    if (-not $canonical -and ($seats.retired.PSObject.Properties.Name -contains $label)) {
+    if (-not $canonical -and ((Get-RosterMapKeys $seats.retired) -contains $label)) {
         Write-Note @"
 [role-card] '$label' IS A RETIRED SEAT. No card was injected.
 
@@ -148,8 +175,8 @@ Live seats: $($seats.live -join ', ').
 
     # ------------------------------------------- a seat that is live in korus but not in this table
     $elsewhere = $null
-    if ($seats.PSObject.Properties.Name -contains 'elsewhere') {
-        if ($seats.elsewhere.PSObject.Properties.Name -contains $label) {
+    if ((Get-RosterMapKeys $seats) -contains 'elsewhere') {
+        if ((Get-RosterMapKeys $seats.elsewhere) -contains $label) {
             $elsewhere = $seats.elsewhere.$label
         }
     }

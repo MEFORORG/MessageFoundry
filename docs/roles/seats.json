@@ -3,9 +3,10 @@
     "The seat roster, the alias map, and the retired seats with the reason each was retired.",
     "CLAUDE.md's seat table (section 5) GOVERNS. This file must agree with it, and",
     "tests/test_role_cards.py fails if the two drift apart.",
-    "FIVE SEATS HERE. korus runs SIX -- these five plus a Special seat the owner added 2026-09-16",
-    "-- so a korus-only seat resolves to no card here. An unmapped label resolves to NOTHING.",
-    "The hook never guesses. Do not write korus's roster count into this comment: it moves.",
+    "SIX SEATS. SPECIAL joined 2026-09-16 by owner decision, for work that falls outside the five",
+    "standing seats. It is an ADDITION -- nothing retired to make room for it -- and it is the one",
+    "seat whose work comes from the owner directly rather than from a brief or a red.",
+    "An unmapped label resolves to NOTHING. The hook never guesses.",
     "THE MANAGER IS LIVE HERE, and it is the seat the owner talks to. The Console was RETIRED",
     "2026-09-10 and is NOT a synonym for it: a Manager's workers are subagents in its own",
     "process, on one account, and several Managers run at once. Read its card, not a Console's."
@@ -15,7 +16,8 @@
     "builder",
     "regulator",
     "steward",
-    "lander"
+    "lander",
+    "special"
   ],
   "_aliases_comment": [
     "Observed and near-miss spellings, collapsed onto the canonical seat. A canonical name is",
@@ -47,7 +49,14 @@
     "reg": "regulator",
     "steward1": "steward",
     "steward-1": "steward",
-    "stewart": "steward"
+    "stewart": "steward",
+    "special1": "special",
+    "special2": "special",
+    "special-1": "special",
+    "special-2": "special",
+    "specials": "special",
+    "adhoc": "special",
+    "ad-hoc": "special"
   },
   "_retired_comment": [
     "A retired label resolves to NO CARD, and the hook says it was retired rather than",
@@ -57,12 +66,9 @@
     "live seat, so a spelling left out of this map would resolve to 'MATCHES NO SEAT' and read as a",
     "typo. The retirement has to be the loud answer, because substituting the Manager for the",
     "Console is the exact error this retirement was written to stop.",
-    "THE REVIEWER WAS A SEAT HERE AND THIS FILE USED TO DENY IT. The denial read 'it was never a",
-    "seat in this repository'. Measured 2026-09-18: f0e1365bc:CLAUDE.md line 276 is a full",
-    "'| **Reviewer** |' row inside section 5's roster, and 12063c91e ('feat(method)!: retire the",
-    "reviewed label, the review gate and the Reviewer seat', 2026-09-05) is what ended it. So it",
-    "belongs under 'retired', not 'elsewhere' -- a label that resolves to 'not a seat here' sends",
-    "a reader looking for a seat that did exist and was deliberately ended."
+    "One label was removed from this file entirely on 2026-09-16 by owner instruction, rather than",
+    "retired into the map above: a seat retired in korus on 2026-09-12 that was never a seat here.",
+    "It is not named, here or anywhere else in this repository. Do not re-add it from git history."
   ],
   "retired": {
     "console": "Retired 2026-09-10 by owner decision. The MANAGER replaces it, and is NOT a renamed Console: a Manager's workers are subagents inside its own process on its own account, several Managers run at once, and it needs no spawn grant. It also does not enqueue -- that moved to the Lander. Read docs/roles/manager.card.md and korus roles/MANAGER.md; do not carry a Console rule across.",
@@ -77,19 +83,17 @@
     "role-manager": "Retired 2026-09-01 by owner decision. Nothing replaced it. It is NOT a spelling of the live 'manager' seat.",
     "process-improvement": "Retired 2026-09-01 by owner decision. Nothing replaced it.",
     "asvs-tracker": "Retired 2026-09-01 by owner decision, one of section 5's seven. Nothing replaced it: the ASVS record is the vault's scorecard and the Lander re-scores it. Added to this map 2026-09-18, having been the one of the seven that was missing -- 12 records carried the label and every one of them resolved to the 'MATCHES NO SEAT' typo branch instead of to a retirement.",
-    "asvs": "Retired 2026-09-01, a spelling of 'asvs-tracker'. See that entry.",
-    "reviewer": "Retired 2026-09-05 by 12063c91e, 'feat(method)!: retire the reviewed label, the review gate and the Reviewer seat'. It WAS a seat here -- f0e1365bc:CLAUDE.md line 276 carried its row in section 5's roster -- and this map used to deny that under 'elsewhere'. Nothing replaced it: no seat here reviews as its own job, and the review gate left branch protection on 2026-09-04. korus kept its own Reviewer until 2026-09-12."
+    "asvs": "Retired 2026-09-01, a spelling of 'asvs-tracker'. See that entry."
   },
   "_elsewhere_comment": [
-    "Live in korus, absent from this repository's table, and therefore resolving to nothing",
-    "here. Named so a session that holds one of these seats in korus and opens a worktree",
-    "here learns why no card arrived, rather than reading silence as a missing file.",
-    "The Manager LEFT this map on 2026-09-10: it is live here now, so it resolves to a card.",
-    "The REVIEWER left it 2026-09-18 for 'retired', because it was a seat here and this map denied",
-    "it. A seat that existed here and was ended is a retirement, not a roster difference.",
-    "So this map is for a seat that was NEVER here, which today is korus's Special seat alone."
+    "Seats a session may hold in korus that this table does not run. A label here resolves to no",
+    "card AND to a stated reason, so the session learns it is a roster difference rather than",
+    "reading silence as a missing file or the warning as a typo.",
+    "THIS MAP IS EMPTY, AND EMPTY IS THE CORRECT CURRENT STATE, not an unfinished edit. Its one",
+    "occupant was removed 2026-09-16 by owner instruction. The MECHANISM stays: seat.ps1 and",
+    "role-card-inject.ps1 both keep their elsewhere branch, and tests exercise it against an",
+    "injected roster so the path is covered with no occupant here to name.",
+    "The Manager LEFT this map on 2026-09-10: it is live here now, so it resolves to a card."
   ],
-  "elsewhere": {
-    "special": "A korus seat, added there by the owner 2026-09-16, and never a seat in this repository. It has no card here and no rules here. Read korus roles/ at origin/main for what it does there."
-  }
+  "elsewhere": {}
 }

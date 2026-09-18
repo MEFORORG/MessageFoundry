@@ -140,16 +140,23 @@ worktree -- see section 6, where that turns out to be the whole problem.
 
 ### 2.2 The cards: `docs/roles/<seat>.card.md`
 
-One tracked file per live seat. Five of them: Manager, Builder, Regulator, Steward, Lander. (At the
-time of writing the first name was Console; the owner retired that seat on 2026-09-10 and the
-Manager replaced it, BACKLOG #1529.)
+One tracked file per live seat. Six of them: Manager, Builder, Regulator, Steward,
+Lander, Special. (At the time of writing the first name was Console; the owner retired that seat on
+2026-09-10 and the Manager replaced it, BACKLOG #1529. One further seat was retired on 2026-09-05
+and is deliberately not named, here or anywhere else in this repository -- owner instruction
+2026-09-16.)
 
 Each card is capped at **150 lines and 6 KB**. One card is selected per session and the hook must be
 wired exactly once, so a session pays for one card: roughly 700 tokens for the smallest and 1,250
 for the largest, plus about 70 for the hook's own banner, against the 72 KB `CLAUDE.md` already
 loaded. The 6 KB cap bounds it at about 1,540. (No tokenizer is installed here, so those are
-characters-over-four estimates, not measurements.) Sizes at 2026-09-18: manager 103 lines and 4,970
-bytes, builder 86 and 4,085, lander 78 and 3,370, regulator 72 and 2,955, steward 68 and 2,801.
+characters-over-four estimates, not measurements.) Sizes at 2026-09-18: special 116 lines and
+5,992 bytes, manager 103 and 4,970, builder 91 and 4,649, lander 78 and 3,370, regulator 72 and
+2,955, steward 68 and 2,801.
+
+**Measure the cap the way the checkout will.** `core.autocrlf=true` here, so a card authored at
+6,120 LF bytes arrives as 6,241 and reds the Windows leg alone. `special.card.md` hit exactly that.
+At 116 lines it has 116 bytes of headroom spent on line endings, leaving it 36 under the cap.
 
 Every card carries the same seven sections, and the Manager's carries an eighth. Six are pinned by
 `tests/test_role_cards.py`, and pinned now means **as a heading**:
@@ -241,8 +248,10 @@ A retired seat resolves to no card and prints the date and reason stored in `sea
 no governing section** -- no retirement reason contains one, and only the `elsewhere` branch cites
 `CLAUDE.md` section 5.
 
-`elsewhere` is for a seat that was **never** here, which today is korus's `special` seat alone. The
-Reviewer sat there until 2026-09-18 and did not belong; see section 4.
+`elsewhere` is for a seat a session may hold in korus that this table does not run. **It is empty
+today, and empty is the correct state**, not an unfinished edit -- its one occupant was removed on
+2026-09-16 by owner instruction. The branch stays in both scripts, exercised against an injected
+roster, so refilling the bucket is not a silent no-op.
 
 ---
 
@@ -287,27 +296,26 @@ Set-Content .claude/seat.local.txt 'builder'
 
 ## 4. The roster, and which document governs it
 
-Five seats: **Manager, Builder, Regulator, Steward, Lander.** That list comes from section 5 of
-`CLAUDE.md`. The **Console** held the Manager's place until 2026-09-10, when the owner retired it;
-the Manager is its replacement and **not a rename of it**, so a Console rule does not carry across
-(BACKLOG #1529).
+Six seats: **Manager, Builder, Regulator, Steward, Lander, Special.** That list comes from
+section 5 of `CLAUDE.md`. The **Special** seat joined 2026-09-16 by owner decision, for work
+outside the other five; it is an addition, and nothing retired to make room for it. A different
+sixth seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
+the review gate; it is deliberately unnamed. The **Console** held the Manager's place until 2026-09-10,
+when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
+rule does not carry across (BACKLOG #1529).
 
-**The Reviewer was a seat here, and it was retired here on 2026-09-05.** `12063c91e`,
-"feat(method)!: retire the reviewed label, the review gate and the Reviewer seat", is what ended it,
-and `acc2a8c5e` stripped its row from `CLAUDE.md`. Before that, `f0e1365bc:CLAUDE.md` line 276 is a
-full `| **Reviewer** |` row inside section 5's roster table, between the Builder and the Regulator.
-korus kept its own Reviewer until 2026-09-12. The engine's review **gate** is a separate thing and
-left branch protection on 2026-09-04.
-
-*Both this document and `docs/roles/seats.json` asserted the opposite -- "it was never a seat in
-this repository" -- and routed the label to the korus-only `elsewhere` map. That told a reader
-looking for a retired seat that no such seat had existed. The label is in `retired` now.*
+*Section 4 above states that the retired sixth seat is deliberately unnamed. An earlier draft of
+this document named it while correcting a related error, and `docs/roles/seats.json` carried the
+name in a retirement entry. Both are removed: owner instruction 2026-09-16 is that the seat is not
+named anywhere in this repository, and `seats.json` adds "do not re-add it from git history". The
+fact the correction was for -- that the seat existed HERE and was retired HERE, rather than being a
+roster difference with korus -- survives in section 4 without it.*
 
 **korus `roles/README.md` names the seven seats retired on 2026-09-01 in prose, and its live table
 is current.** That table runs six seats: the five here plus a **Special** seat the owner added on
 2026-09-16 as an addition, not a replacement. Section 5 still settles the roster for this
 repository: it is the **naming** of a retired seat that goes stale, not the whole document that
-names one on purpose, so the cards follow section 5's five.
+names one on purpose, so the cards follow section 5's six.
 
 *The 2026-09-18 pass claimed that README "opens with a STOP banner", puts the seven in "one row
 marked RETIRED", and that "the whole table is superseded". All three were false. Checked with the
@@ -322,9 +330,10 @@ also added `roles/README.md`; korus itself was initialised 35 minutes earlier). 
 separate, later owner ruling that they are READ at `origin/main` -- conflating the two dates the
 move two days late, which this document and a test docstring both did.
 
-**Every live seat has a korus playbook, and all five cards cite one.** Measured at korus
-`origin/main`, tip `ff11047`, 2026-09-18: `roles/MANAGER.md` 276 lines, `roles/REGULATOR.md` 451,
-`roles/BUILDER.md` 964, `roles/LANDER.md` 1,239, `roles/STEWARD.md` 1,521.
+**Every live seat has a korus playbook, and all six cards cite one.** Measured at korus
+`origin/main`, tip `ff11047`, 2026-09-18: `roles/SPECIAL.md` 248 lines, `roles/MANAGER.md` 276,
+`roles/REGULATOR.md` 451, `roles/BUILDER.md` 964, `roles/LANDER.md` 1,239, `roles/STEWARD.md`
+1,521.
 
 *A silent 2026-09-11 rewrite claimed "One live seat has no playbook at all. The Regulator has no
 file in korus `roles/`", and that its card said so rather than sending anyone looking for a longer
@@ -512,7 +521,7 @@ Test-driven: the tests were written first and watched fail before any of the cod
 | `docs/ROLE-CARDS.md` | This document |
 | `docs/roles/seats.json` | The roster, the alias map, and the retired seats with reasons |
 | `docs/roles/console.card.md` | Role card. Renamed to `manager.card.md` and rewritten on 2026-09-11 (`cbb63ad28`) when the owner retired the Console. Its playbook is korus `roles/retired/CONSOLE.md`. |
-| `docs/roles/reviewer.card.md` | Role card. The seat was retired the same day (`12063c91e`); the label now resolves to a retirement. |
+| A sixth role card | For the seat the owner retired the same day (`12063c91e`), deliberately unnamed here per owner instruction 2026-09-16. |
 | `docs/roles/builder.card.md` | Role card |
 | `docs/roles/regulator.card.md` | Role card. Its playbook is korus `roles/REGULATOR.md`, which existed on 2026-09-02 and which the card cites. |
 | `docs/roles/steward.card.md` | Role card |

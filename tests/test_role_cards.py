@@ -9,8 +9,11 @@ the working agreement does not lose the argument -- it wins it, silently, for th
 THE CARDS CAME FROM KORUS AND WERE NOT COPIED. Three ways a straight copy would have been wrong,
 each measured 2026-09-06 and each guarded below:
 
-  1. ROSTER. korus runs seven seats. Section 5's table here runs five: no Reviewer. The MANAGER
-     joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529).
+  1. ROSTER. korus and this table have never matched, and neither leads the other. The MANAGER
+     joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
+     SPECIAL seat joined on 2026-09-16, taking the table to six. The `elsewhere` bucket emptied
+     the same day by owner instruction, so the tests below guard its MECHANISM rather than an
+     occupant.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -33,6 +36,7 @@ CARD_DIR = _REPO / "docs" / "roles"
 SEATS_PATH = CARD_DIR / "seats.json"
 AGREEMENT = _REPO / "CLAUDE.md"
 HOOK = _REPO / "scripts" / "hooks" / "role-card-inject.ps1"
+SEAT_SCRIPT = _REPO / "scripts" / "coord" / "seat.ps1"
 SETTINGS = _REPO / ".claude" / "settings.json"
 
 #: The marker and the injected copy. BOTH MUST STAY GIT-IGNORED, and the ignore rule here is the
@@ -40,14 +44,15 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. FIVE seats, not korus's seven.
-EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander"})
+#: Section 5's table governs. SIX seats since 2026-09-16, when the owner added SPECIAL.
+EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander", "special"})
 
-#: Live in korus and NEVER a seat here. They must resolve to a card-less explanation, never to
-#: silence. The Reviewer was in this set until 2026-09-18 and did not belong: it WAS a seat here
-#: (`f0e1365bc:CLAUDE.md` line 276 carried its roster row) and `12063c91e` retired it on
-#: 2026-09-05, so it moved to `retired`. "Not a seat here" and "ended here" are different answers.
-EXPECTED_ELSEWHERE = frozenset({"special"})
+#: Seats live in korus and absent here. They must resolve to a card-less explanation, never to
+#: silence. EMPTY SINCE 2026-09-16 by owner instruction, and empty is the correct state -- so any
+#: assertion that LOOPS over it now examines nothing. The class below asserts the emptiness
+#: directly and guards the two scripts by reading their source, instead of iterating a container
+#: that cannot fail.
+EXPECTED_ELSEWHERE: frozenset[str] = frozenset()
 
 #: The seven seats CLAUDE.md section 5 retired on 2026-09-01. PINNED AS A SET, the way
 #: CONSOLE_SPELLINGS is, because iterating whatever the file happens to contain cannot notice an
@@ -218,25 +223,32 @@ class TheRosterIsGovernedByTheWorkingAgreement(unittest.TestCase):
             "The table governs, so either the table gained a seat or the roster invented one.",
         )
 
-    def test_a_korus_seat_is_not_quietly_live_here(self):
-        """The specific error this port nearly shipped: seven seats where the table names five."""
-        overreach = sorted(EXPECTED_ELSEWHERE & set(seats()["live"]))
+    def test_no_seat_is_both_live_and_filed_elsewhere(self):
+        """The error this port nearly shipped: a korus seat live where the table omits it.
+
+        Reads the SHIPPED roster, not `EXPECTED_ELSEWHERE`. That matters now the constant is empty:
+        intersecting two empty sets passes while examining nothing, whereas this goes red the moment
+        a future occupant is also declared live.
+        """
+        both = sorted(set(seats().get("elsewhere", {})) & set(seats()["live"]))
         self.assertEqual(
             [],
-            overreach,
-            f"{overreach} are korus seats and are not in this repository's table. A card for one "
-            "would hand a session a seat the working agreement does not run.",
+            both,
+            f"{both} are filed as korus-only AND declared live here. A card for one would hand a "
+            "session a seat the working agreement does not run.",
         )
 
 
 class ASeatThatIsNotRunHereSaysSoRatherThanGoingSilent(unittest.TestCase):
-    """Silence reads as a missing file. A roster difference is not a missing file."""
+    """Silence reads as a missing file. A roster difference is not a missing file.
 
-    def test_every_korus_only_seat_is_named_with_its_reason(self):
-        elsewhere = seats().get("elsewhere", {})
-        self.assertEqual(EXPECTED_ELSEWHERE, set(elsewhere))
-        for label, why in elsewhere.items():
-            self.assertTrue(why.strip(), f"{label} is listed with no reason")
+    THE BUCKET IS EMPTY AND EMPTY IS CORRECT. Its one occupant was removed on 2026-09-16 by owner
+    instruction. Every loop over it therefore passes while examining nothing -- the gate-that-
+    examined-nothing shape this repository names more than any other. So the emptiness is asserted
+    DIRECTLY, the two scripts are guarded by reading their source, and the verdict's own behaviour
+    is exercised against an INJECTED occupant in `tests/test_coord_seat_roster_verdict.py`, which is
+    the only place it can still be run.
+    """
 
     def test_every_seat_section_5_retired_resolves_to_a_retirement(self):
         """AS A SET, because iterating the file cannot notice what the file omits.
@@ -259,13 +271,34 @@ class ASeatThatIsNotRunHereSaysSoRatherThanGoingSilent(unittest.TestCase):
         )
         self.assertEqual([], reachable, f"these retired seats are still reachable: {reachable}")
 
-    def test_a_korus_only_seat_resolves_to_no_card(self):
-        for label in EXPECTED_ELSEWHERE:
+    def test_the_bucket_is_empty_and_the_file_says_that_is_deliberate(self):
+        """Without this, an empty bucket cannot be told from a half-finished edit."""
+        self.assertEqual(EXPECTED_ELSEWHERE, set(seats().get("elsewhere", {})))
+        self.assertEqual({}, seats().get("elsewhere", {}))
+        blob = " ".join(seats()["_elsewhere_comment"]).lower()
+        self.assertIn(
+            "empty is the correct current state",
+            blob,
+            "the file does not say the empty bucket is deliberate, so the next reader takes it for "
+            "an unfinished edit and refills it",
+        )
+
+    def test_any_future_occupant_carries_a_reason_and_no_card(self):
+        """Vacuous today ON PURPOSE, and it stays: this is the arm that fires the moment someone
+        refills the bucket, which is the only moment it can have anything to say."""
+        for label, why in seats().get("elsewhere", {}).items():
             with self.subTest(seat=label):
+                self.assertTrue(why.strip(), f"{label} is listed with no reason")
                 self.assertFalse(
                     (CARD_DIR / f"{label}.card.md").exists(),
                     f"{label} has a card here, which contradicts the roster",
                 )
+
+    def test_the_declaration_script_keeps_the_branch_no_occupant_can_reach(self):
+        """The mechanism must outlive its last occupant, or refilling the bucket is a silent no-op."""
+        source = read(SEAT_SCRIPT)
+        self.assertIn("NOT A SEAT IN THIS REPOSITORY", source)
+        self.assertIn("not a typo and not a retirement", source)
 
     def test_the_hook_distinguishes_it_from_a_typo(self):
         source = read(HOOK)
@@ -304,7 +337,14 @@ class TheAliasMapCollapsesDrift(unittest.TestCase):
 
 
 class EveryCardStaysWithinItsBudget(unittest.TestCase):
-    """Only one card is ever injected, so the cost is one card. The cap keeps that true."""
+    """Only one card is ever injected, so the cost is one card. The cap keeps that true.
+
+    MEASURE THE BYTE CAP THE WAY THE CHECKOUT WILL. `core.autocrlf=true` here, so every card lands
+    CRLF in a Windows working tree and one byte per line is invisible on a LF-authored draft. A card
+    written at 6120 LF bytes passes the author's own reading and arrives at 6241 on checkout, over
+    the cap, red on the Windows leg only. `stat().st_size` below reads the checked-out file, which
+    is the question; a length taken off LF source is the adjacent one.
+    """
 
     def test_no_card_exceeds_the_line_cap(self):
         over = [

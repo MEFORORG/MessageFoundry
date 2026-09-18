@@ -42,6 +42,39 @@
 # legs can hold is the property those jobs lose SILENTLY: an enforcement flag removed, a severity floor
 # added, an allowlist widened until it swallows the class, a scan re-narrowed to an allow-list. Those
 # are the controls registered below, and the distinction is recorded rather than blurred.
+#
+# NINE CONTROLS WERE RE-POINTED FROM A SCAN'S OWN CONTEXT TO THE COMPOSITE THAT NOW GATES IT, on
+# 2026-09-16, and this is the one place the reason is written out. The owner removed the seven original
+# `security.yml` scan contexts from branch protection that day (consolidation step 4, docs/CI.md), so
+# `bandit (Python SAST)`, `pip-audit (dependency vulnerabilities)`,
+# `npm-audit (ide dependency vulnerabilities)`, `gitleaks (secret scan)` (three entries),
+# `semgrep (project SAST rules)`, `crypto-inventory (ASVS 11.1.3 discovery gate)` and
+# `forbidden-content (customer/PHI leak guard)` all stopped being required. This file's rule is
+# two-directional -- every required context has a control, and every registered context is required --
+# so those nine had to move or go.
+#
+# THEY WERE RE-POINTED, NOT DELETED, AND THE JUSTIFICATION IS A CHECKED CLAIM RATHER THAN A JUDGEMENT.
+# `tests/test_security_composite_parity.py` asserts each composite's copy of a scan body is
+# BYTE-IDENTICAL to the original's. Every one of these controls is an assertion about a string -- a
+# severity floor absent from an invocation, a scan corpus not narrowed to an allow-list, an allowlist
+# not widened past its class -- and byte-identical parity means that string is now also the required
+# composite's. So the property each control was written to hold is still held, on the merge path, by the
+# context it now names. Deleting them would have dropped nine live coverage claims for a bookkeeping
+# reason.
+#
+# WHAT RE-POINTING DOES NOT CLAIM, said plainly because the `observed` fields would otherwise overstate
+# it. NO PLANT WAS RE-RUN AGAINST A COMPOSITE FOR THIS MOVE. Every `observed` block below records what
+# was seen when the plant was applied to the ORIGINAL job, and each is left exactly as it was written.
+# The chain from that observation to the composite is parity, and parity is a separate assertion with
+# its own control (the two composite entries further down). A reader who wants "this plant reddened a
+# test that reads the composite's own YAML" should read those two entries, not these nine.
+#
+# THE RE-POINTED ENTRIES ALSO STOPPED BEING ONE-PER-CONTEXT. `repo-scan` now carries FIVE controls and
+# `dependency-and-secret-scan` SIX, where the format note below says only "a context may have several".
+# That was always allowed; it had just never happened at this scale, and it costs something worth
+# naming: a red among six no longer identifies which scan lost its property. The node ids do, which is
+# why every entry keeps its own. Consolidation step 3 deletes the seven original jobs; these nine
+# entries and their provenance notes are reviewed then.
 
 # --- ci.yml ----------------------------------------------------------------------------------------
 
@@ -133,7 +166,11 @@ observed = "Run on this Windows worktree; exit codes as above, unchanged under a
 # --- security.yml ----------------------------------------------------------------------------------
 
 [[control]]
-context = "bandit (Python SAST)"
+# RE-POINTED 2026-09-16 from `bandit (Python SAST)`, which branch protection no longer
+# requires. The scan itself did not move: `bandit` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
 plants = """
 `bandit -ll` against the shipped invocation's muting detector. A severity floor keeps the scanner
 running and the exit code intact while discarding a whole severity band -- so the required context goes
@@ -164,7 +201,11 @@ RUN AGAINST A NEUTERED GATE, 2026-08-10: adding `-ll` to security.yml's real ban
 """
 
 [[control]]
-context = "pip-audit (dependency vulnerabilities)"
+# RE-POINTED 2026-09-16 from `pip-audit (dependency vulnerabilities)`, which branch protection no longer
+# requires. The scan itself did not move: `pip-audit` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
 plants = """
 A hallucinated distribution name, a registered-but-empty project, and a freshly registered one, fed to
 `scripts/security/new_dependency_check.py` -- the step in this job that answers what pip-audit
@@ -192,7 +233,11 @@ its documented blind spot -- a real package that is not the INTENDED one -- is r
 """
 
 [[control]]
-context = "npm-audit (ide dependency vulnerabilities)"
+# RE-POINTED 2026-09-16 from `npm-audit (ide dependency vulnerabilities)`, which branch protection no longer
+# requires. The scan itself did not move: `npm-audit` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
 plants = """
 `npm audit --audit-level=high` against the shipped invocation's muting detector. That flag exits 0 on
 moderate advisories, which silently contradicts the job's own comment that the default level "fails on
@@ -215,7 +260,11 @@ resolves from the declared working-directory. Detection by npm itself runs in it
 """
 
 [[control]]
-context = "gitleaks (secret scan)"
+# RE-POINTED 2026-09-16 from `gitleaks (secret scan)`, which branch protection no longer
+# requires. The scan itself did not move: `gitleaks` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
 plants = """
 Six credential shapes the default ruleset exists to catch -- an AWS access key id, a GitHub PAT, a Slack
 bot token, a PEM private-key header, a 40-hex token and a URL with an inline database password -- all
@@ -248,7 +297,11 @@ RUN AGAINST A NEUTERED GATE, 2026-08-10: replacing one literal allowlist entry i
 """
 
 [[control]]
-context = "gitleaks (secret scan)"
+# RE-POINTED 2026-09-16 from `gitleaks (secret scan)`, which branch protection no longer
+# requires. The scan itself did not move: `gitleaks` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
 plants = """
 A commit on an unmerged branch, and a second on the ref under test, walked with real `git` -- the
 mechanism the scanner delegates to, since this suite does not install the binary. Plus the EXACT
@@ -320,7 +373,11 @@ still inside '--all'".
 """
 
 [[control]]
-context = "gitleaks (secret scan)"
+# RE-POINTED 2026-09-16 from `gitleaks (secret scan)`, which branch protection no longer
+# requires. The scan itself did not move: `gitleaks` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)"
 plants = """
 An EMPTY commit range -- the one input on which this scanner reports success having read nothing --
 and the scanner's own two reports, `0 commits scanned` and `3 commits scanned`, run against whatever
@@ -407,7 +464,11 @@ never acquire by accident.
 """
 
 [[control]]
-context = "semgrep (project SAST rules)"
+# RE-POINTED 2026-09-16 from `semgrep (project SAST rules)`, which branch protection no longer
+# requires. The scan itself did not move: `semgrep` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
 plants = """
 Annotated handler fixtures carrying inter-statement PHI taint, an aliased import, an ambient subprocess
 call, ambient deserialization, ambient eval/exec, an unparameterized db_lookup and a PHI-to-file write.
@@ -434,7 +495,11 @@ the narrow scope it replaced.
 """
 
 [[control]]
-context = "crypto-inventory (ASVS 11.1.3 discovery gate)"
+# RE-POINTED 2026-09-16 from `crypto-inventory (ASVS 11.1.3 discovery gate)`, which branch protection no longer
+# requires. The scan itself did not move: `crypto-inventory` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
 plants = """
 A seam-only delegator with no inventory row, a Python file planted under the ide/ TypeScript tree, and
 a provider row deleted from the documented inventory. Each must be reported.
@@ -456,7 +521,11 @@ green = [
 observed = "Each planted shape is reported and the real tree is clean, in this suite."
 
 [[control]]
-context = "forbidden-content (customer/PHI leak guard)"
+# RE-POINTED 2026-09-16 from `forbidden-content (customer/PHI leak guard)`, which branch protection no longer
+# requires. The scan itself did not move: `forbidden-content` still runs in security.yml AND as a
+# byte-identical copy inside this composite, which is the required context now. The `observed`
+# block below is the original measurement, unchanged and not re-run. See this file's header.
+context = "repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)"
 plants = """
 A customer name, a case-sensitive site code, a routable host IP, and a file under docs/security/ caught
 by its PATH alone; plus a run that examines zero files, which must refuse rather than report clean. And
