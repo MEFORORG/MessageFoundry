@@ -6,6 +6,7 @@ or secret reaches the bundle."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import zipfile
 from pathlib import Path
@@ -21,6 +22,19 @@ from messagefoundry.support.redact import REDACTION_PLACEHOLDER
 def _members(zip_path: Path) -> dict[str, str]:
     with zipfile.ZipFile(zip_path) as zf:
         return {name: zf.read(name).decode("utf-8") for name in zf.namelist()}
+
+
+def _provision_store(db: Path) -> None:
+    """Create the SQLite store at ``db`` the way serve's first run does. The bundle reports on a store
+    and no longer creates the one it is pointed at (BACKLOG #1780), so a test that wants DbInfo makes
+    the store first."""
+    from messagefoundry.store.base import open_store, sqlite_settings
+
+    async def _make() -> None:
+        store = await open_store(sqlite_settings(db), create=True)
+        await store.close()
+
+    asyncio.run(_make())
 
 
 def test_bundle_writes_expected_members(tmp_path: Path) -> None:
@@ -158,6 +172,7 @@ def test_bundle_status_with_settings_db(tmp_path: Path) -> None:
     from messagefoundry.config.settings import load_settings
 
     db = tmp_path / "store.db"
+    _provision_store(db)
     toml = tmp_path / "messagefoundry.toml"
     toml.write_text(f'[store]\npath = "{db.as_posix()}"\n', encoding="utf-8")
     settings = load_settings(config_path=toml)
@@ -203,6 +218,7 @@ def test_bundle_sqlite_status_path_is_basename_only(tmp_path: Path) -> None:
 
     db = tmp_path / "secret-deploy-dir" / "store.db"
     db.parent.mkdir()
+    _provision_store(db)
     toml = tmp_path / "messagefoundry.toml"
     toml.write_text(f'[store]\npath = "{db.as_posix()}"\n', encoding="utf-8")
     settings = load_settings(config_path=toml)

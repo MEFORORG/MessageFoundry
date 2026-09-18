@@ -262,7 +262,7 @@ async def test_drift_alerts_and_records_by_default(
     (tmp_path / f"{pkg}/core.py").write_bytes(b"def go():\n    return 999  # backdoor\n")
     assert attest_engine().drift  # the tamper is detected
 
-    store = await open_store(sqlite_settings(str(tmp_path / "attest.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "attest.db")), create=True)
     sink = _RecordingSink()
     try:
         # Default posture (alert-only): records + alerts, but DOES NOT raise (engine starts).
@@ -297,7 +297,7 @@ async def test_drift_fails_closed_when_opted_in(
     _patch(monkeypatch, dist, loaded, pkg)
     (tmp_path / f"{pkg}/core.py").write_bytes(b"SAFE = False  # neutered\n")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "fc.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "fc.db")), create=True)
     sink = _RecordingSink()
     try:
         # Opt-in fail-closed: it STILL records + alerts, THEN raises so no listener binds.
@@ -341,7 +341,7 @@ async def test_editable_install_is_noop(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.declared_editable is True
     assert result.unattested_reason == "declared_editable"
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "ed.db")), create=True)
     sink = _RecordingSink()
     try:
         # fail_closed_on_drift=True must STILL not brick a dev editable install.
@@ -470,7 +470,7 @@ async def test_asset_drift_alerts_and_records(
     asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
     asset.write_bytes(b"")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "asset.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "asset.db")), create=True)
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError):
@@ -705,7 +705,7 @@ async def test_attested_nothing_fails_closed_when_opted_in(
 
     _build_install_that_attests_nothing(tmp_path, monkeypatch, shape)
 
-    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError):
@@ -741,7 +741,7 @@ async def test_attested_nothing_warns_records_and_alerts_under_alert_only(
 
     _build_install_that_attests_nothing(tmp_path, monkeypatch, "record_deleted")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "alert_only.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "alert_only.db")), create=True)
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -774,7 +774,7 @@ async def test_a_verified_clean_install_still_starts_silently(
     dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files)
     _patch(monkeypatch, dist, loaded, pkg)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")), create=True)
     sink = _RecordingSink()
     try:
         result = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
@@ -817,7 +817,7 @@ async def test_declared_editable_under_fail_closed_warns_and_names_the_reason(
 
     _editable_install(tmp_path, monkeypatch)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed_fc.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_fc.db")), create=True)
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -848,7 +848,7 @@ async def test_declared_editable_under_the_default_posture_stays_silent(
 
     _editable_install(tmp_path, monkeypatch)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed_default.db")))
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_default.db")), create=True)
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
