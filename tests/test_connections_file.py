@@ -16,7 +16,12 @@ from messagefoundry.config.connections_edit import (
     list_connections,
     upsert_connection,
 )
-from messagefoundry.config.connections_file import _INBOUND_KEYS, _OUTBOUND_KEYS
+from messagefoundry.config.connections_file import (
+    _INBOUND_KEYS,
+    _OUTBOUND_KEYS,
+    _check_setting_types,
+    _factory_signature,
+)
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, OrderingMode
 from messagefoundry.config.wiring import (
     EnvRef,
@@ -683,6 +688,219 @@ def test_write_schema_matches_read_schema_per_direction() -> None:
     assert "direction" not in write_union
     # No duplicates within, and no overlap between, the scalar and sub-table emission passes.
     assert len(_SCALAR_FIELDS) + len(_SUB_TABLES) == len(write_union)
+
+
+# --- BACKLOG #1650: a [settings] scalar is held to the factory's annotation ---
+#
+# The factories are plain functions, so a code-first author is held to `port: int | EnvRef` by mypy
+# and a connections.toml author was held to nothing. These pin the refusal and, just as importantly,
+# the five things that must still be ACCEPTED -- a gate that refuses valid config is worse than the
+# hole it closes.
+
+_INBOUND_SETTINGS_TEMPLATE = """
+[[inbound]]
+name = "IB"
+transport = "mllp"
+router = "r"
+  [inbound.settings]
+{settings}
+
+[[outbound]]
+name = "OB"
+transport = "mllp"
+  [outbound.settings]
+  host = "epic.example"
+  port = 2700
+"""
+
+_OUTBOUND_SETTINGS_TEMPLATE = """
+[[inbound]]
+name = "IB"
+transport = "mllp"
+router = "r"
+  [inbound.settings]
+  port = 2600
+
+[[outbound]]
+name = "OB"
+transport = "mllp"
+  [outbound.settings]
+  host = "epic.example"
+  port = 2700
+{settings}
+"""
+
+
+def _inbound_settings(tmp_path: Path, settings: str) -> Path:
+    """A valid two-connection config whose only variable is the INBOUND [settings] body."""
+    return _config(tmp_path, _INBOUND_SETTINGS_TEMPLATE.format(settings=settings))
+
+
+def _outbound_settings(tmp_path: Path, settings: str) -> Path:
+    """A valid two-connection config with extra OUTBOUND [settings] lines appended."""
+    return _config(tmp_path, _OUTBOUND_SETTINGS_TEMPLATE.format(settings=settings))
+
+
+def test_quoted_port_is_refused(tmp_path: Path) -> None:
+    """A quoted port is refused at the SETTING, naming the type it should have been. What each of
+    these three shapes cost before the check: the header comment over ``_check_setting_types`` in
+    connections_file.py, which also records that a quoted port dodges ``Registry.port_collisions()``
+    and NOT ``build_check_registry``."""
+    with pytest.raises(WiringError) as excinfo:
+        load_config(_inbound_settings(tmp_path, '  port = "2575"'))
+    assert "'port' must be an integer" in str(excinfo.value)
+    # The VALUE never appears: a [settings] value can be a credential, and this string reaches the
+    # operator log and the support bundle (the BACKLOG #1183 rule, applied at this seam).
+    assert "2575" not in str(excinfo.value)
+
+
+def test_quoted_frame_cap_is_refused(tmp_path: Path) -> None:
+    """The shape no gate anywhere used to catch; see the header comment for what it cost."""
+    with pytest.raises(WiringError, match="'max_frame_bytes' must be an integer"):
+        load_config(_inbound_settings(tmp_path, '  port = 2575\n  max_frame_bytes = "16"'))
+
+
+def test_quoted_timeout_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(WiringError, match="'receive_timeout' must be a number"):
+        load_config(_inbound_settings(tmp_path, '  port = 2575\n  receive_timeout = "60"'))
+
+
+def test_string_boolean_is_refused(tmp_path: Path) -> None:
+    """The worst of the three, because nothing ever errored (header comment). Refuse it rather than
+    coerce: a spelling table lives in ``_cast_bool`` for ``cast = "bool"``, and reaching for it here
+    would make ``validate`` green on a file whose author wrote the wrong kind of value."""
+    with pytest.raises(WiringError, match="'persistent' must be true or false"):
+        load_config(_outbound_settings(tmp_path, '  persistent = "yes"'))
+
+
+def test_true_is_refused_for_an_int_setting(tmp_path: Path) -> None:
+    """``bool`` subclasses ``int``, so a bare ``isinstance(value, int)`` would accept TOML ``true``
+    for ``port`` -- the mirror of the string-boolean bug, and the one a naive fix ships."""
+    with pytest.raises(WiringError, match="'port' must be an integer"):
+        load_config(_inbound_settings(tmp_path, "  port = true"))
+
+
+def test_table_is_refused_for_a_scalar_setting(tmp_path: Path) -> None:
+    """A table that is not an env() marker is a value, not a reference, and ``port`` takes neither."""
+    with pytest.raises(WiringError, match="'port' must be an integer"):
+        load_config(_inbound_settings(tmp_path, "  port = { a = 1 }"))
+
+
+def test_int_is_accepted_for_a_float_setting(tmp_path: Path) -> None:
+    """TOML ``60`` and ``60.0`` are the same number of seconds. Refusing the first would break valid
+    files, so an int widens to a float -- the one direction this check deliberately does not police."""
+    reg = load_config(_inbound_settings(tmp_path, "  port = 2575\n  receive_timeout = 60"))
+    assert reg.inbound["IB"].spec.settings["receive_timeout"] == 60
+
+
+def test_env_ref_is_accepted_for_a_typed_setting(tmp_path: Path) -> None:
+    """An env() reference is legal where the annotation names EnvRef; the VALUE is checked later, by
+    the ref's own ``cast``, against the running instance's environment."""
+    reg = load_config(_inbound_settings(tmp_path, '  port = { env = "acme_port", cast = "int" }'))
+    assert isinstance(reg.inbound["IB"].spec.settings["port"], EnvRef)
+
+
+def test_env_ref_is_accepted_where_the_annotation_omits_envref(tmp_path: Path) -> None:
+    """Deliberately WIDER than the annotation: ``encoding`` is annotated plain ``str``, yet
+    ``resolve_env_settings`` resolves every ref in the settings table regardless of annotation. The
+    annotation is therefore not the authority on where a ref may be WRITTEN, and refusing one here
+    would reject a file that works today."""
+    reg = load_config(_inbound_settings(tmp_path, '  port = 2575\n  encoding = { env = "enc" }'))
+    assert isinstance(reg.inbound["IB"].spec.settings["encoding"], EnvRef)
+
+
+def test_literal_choice_setting_takes_its_own_type(tmp_path: Path) -> None:
+    """``after_read: Literal["move", "delete", "leave"]`` carries no bare ``str`` member. Its values
+    carry the real type, so a string passes here and the CHOICE stays the factory's to validate."""
+    cfg = _config(
+        tmp_path,
+        """
+        [[inbound]]
+        name = "IB"
+        transport = "file"
+        router = "r"
+          [inbound.settings]
+          directory = "drop"
+          after_read = "delete"
+
+        [[outbound]]
+        name = "OB"
+        transport = "mllp"
+          [outbound.settings]
+          host = "epic.example"
+          port = 2700
+        """,
+    )
+    assert load_config(cfg).inbound["IB"].spec.settings["after_read"] == "delete"
+    (tmp_path / "connections.toml").write_text(
+        (tmp_path / "connections.toml").read_text(encoding="utf-8").replace('"delete"', "1"),
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="'after_read' must be a string"):
+        load_config(cfg)
+
+
+def test_duplicate_quoted_ports_fail_at_load(tmp_path: Path) -> None:
+    """The registry-level witness for the row: two inbounds at ``port = "2575"`` used to load clean
+    and report no collision, because ``Registry.port_collisions()`` keeps only ``int`` ports. Now
+    neither connection is built at all, and the message names the setting rather than the conflict."""
+    cfg = _config(
+        tmp_path,
+        """
+        [[inbound]]
+        name = "IB"
+        transport = "mllp"
+        router = "r"
+          [inbound.settings]
+          port = "2575"
+
+        [[inbound]]
+        name = "IB2"
+        transport = "mllp"
+        router = "r"
+          [inbound.settings]
+          port = "2575"
+
+        [[outbound]]
+        name = "OB"
+        transport = "mllp"
+          [outbound.settings]
+          host = "epic.example"
+          port = 2700
+        """,
+    )
+    with pytest.raises(WiringError, match="'port' must be an integer"):
+        load_config(cfg)
+    assert validate_config(cfg)  # and `validate` no longer reports the file clean
+
+
+def test_unknown_setting_still_reports_the_factory_message(tmp_path: Path) -> None:
+    """A key the factory does not declare is skipped by the type check, so the factory's own
+    ``unexpected keyword argument`` stays the message -- the better one for a typo."""
+    with pytest.raises(WiringError, match="unexpected keyword argument"):
+        load_config(_inbound_settings(tmp_path, "  port = 2575\n  nonsense = 1"))
+
+
+def _unresolvable_factory(*, port: int) -> None:
+    """A stand-in for a factory whose annotations will not resolve under ``eval_str=True``."""
+
+
+_unresolvable_factory.__annotations__["port"] = "NoSuchTypeAnywhere"
+
+
+def test_unresolvable_annotations_skip_the_check_rather_than_accepting() -> None:
+    """The degradation path, pinned because it is how this gate would become the false green it was
+    built to remove. ``_describe_transport`` in connection_schema.py falls back to STRING annotations
+    when ``eval_str=True`` cannot resolve them; a type check must not do that -- matching a value
+    against the string ``"int | EnvRef"`` reports OK having examined nothing. Skip the factory whole."""
+    assert _factory_signature(_unresolvable_factory) is None
+    # A skip, not a crash: a bad value passes through to the factory's own guards.
+    _check_setting_types(
+        _unresolvable_factory,  # type: ignore[arg-type]
+        {"port": "2575"},
+        "fake",
+        "inbound connection 'IB'",
+    )
 
 
 def test_streaming_threshold_hl7_only_toml(tmp_path: Path) -> None:
