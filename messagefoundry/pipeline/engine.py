@@ -1653,6 +1653,14 @@ class Engine:
                     "requires a coordinated full-fleet restart (stop supervise, apply the config, "
                     "start), not a per-shard reload"
                 )
+        # KEPT, and NOT redundant with the load-time rule (BACKLOG #1648). `load_config` above now
+        # refuses an empty graph inside `Registry.validate`, but that fires BEFORE
+        # `self._registry_filter` — so on a `serve --shard X` process the filter can empty a graph the
+        # load-time rule has already passed. The reachable shape is a config declaring inbounds on
+        # other shards and no outbound at all (the filter keeps outbound connections, so it can only
+        # empty a graph that had none). Deleting this copy would let such a reload swap in an empty
+        # graph with no refusal; tests/test_config_reload_outcome.py pins that. Same predicate as the
+        # load-time rule, deliberately; this one can name the directory, which that one cannot.
         if not registry.inbound and not registry.outbound:
             raise WiringError(
                 f"config directory {config_dir!r} declares no connections — "

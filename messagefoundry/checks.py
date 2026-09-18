@@ -147,6 +147,7 @@ def run_checks(
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
     project_root: str | Path | None = None,
+    allow_empty_config: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -168,9 +169,14 @@ def run_checks(
     ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
     ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
     the process directory, so the documented ``check --config config`` invocation is untouched.
+
+    ``allow_empty_config`` (``--allow-empty-config``, BACKLOG #1648) drops the empty-graph rule from
+    the blocking validate leg only. The other legs load the config with the rule in force, so an empty
+    dir still reads as "config did not load" on their (non-blocking) skip lines — they report on a
+    graph, and there is no graph to report on.
     """
     results = [
-        _check_validate(config_dir),
+        _check_validate(config_dir, allow_empty=allow_empty_config),
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -1078,10 +1084,16 @@ def _check_handler_security(
     return CheckResult("handler-security", ok=not strict, required=strict, detail=detail)
 
 
-def _check_validate(config_dir: str | Path) -> CheckResult:
+def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> CheckResult:
+    """The blocking validate leg. ``allow_empty`` (``--allow-empty-config``, BACKLOG #1648) drops the
+    empty-graph rule so a config dir that legitimately declares no connections — a scaffold, a
+    helper-only bundle — can still pass the gate. It is scoped to ``check``: ``serve`` refuses an
+    empty graph by design and has no opt-out."""
     from messagefoundry.config.wiring import load_config, validate_config
 
-    errors = [d for d in validate_config(config_dir) if d.severity == "error"]
+    errors = [
+        d for d in validate_config(config_dir, allow_empty=allow_empty) if d.severity == "error"
+    ]
     if errors:
         detail = f"{len(errors)} problem(s): " + "; ".join(
             f"{d.file or '-'}: {d.message}" for d in errors[:5]
@@ -1093,7 +1105,7 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
     # "unchecked" — see Registry.encoding_problems for where the resolved pass would belong.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.
-    checked, unchecked = load_config(config_dir).encoding_census()
+    checked, unchecked = load_config(config_dir, allow_empty=allow_empty).encoding_census()
     census = f"encodings checked: {checked}, unchecked env() refs: {unchecked}"
     return CheckResult("validate", ok=True, required=True, detail=f"no problems ({census})")
 

@@ -218,6 +218,13 @@ def main(argv: list[str] | None = None) -> int:
         help="promote the ADR 0144 handler-security lint to a blocking (required) check",
     )
     check.add_argument(
+        "--allow-empty-config",
+        action="store_true",
+        help="accept a config directory that declares no connections (BACKLOG #1648). Without it "
+        "the validate check fails on one, the way serve and reload refuse it. Scoped to `check` — "
+        "serve has no opt-out",
+    )
+    check.add_argument(
         "--handler-security-allow",
         action="append",
         default=None,
@@ -5260,6 +5267,7 @@ def _check(args: argparse.Namespace) -> int:
         # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
+        allow_empty_config=args.allow_empty_config,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -5355,7 +5363,12 @@ def _connection(args: argparse.Namespace) -> int:
     )
 
     def validate(config_dir: Path) -> None:
-        registry = load_config(config_dir)
+        # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate
+        # editing step, not an invalid edit (BACKLOG #1648). Refusing here would leave an operator
+        # unable to clear connections.toml through the CLI/GUI at all — they would have to hand-edit
+        # the file the tool exists to own. The empty-graph refusal stays where the graph is RUN or
+        # GATED: load_config's default, the engine reload, and `messagefoundry check`.
+        registry = load_config(config_dir, allow_empty=True)
         build_check_registry(
             registry,
             inbound_bind_host=settings.inbound.bind_host,
