@@ -266,9 +266,27 @@ the next reader does not re-derive the wrong precedent from the same comment.
   and on a clean exit checks `db.in_transaction` — rolling back and raising if the block wrote without
   committing. It leaves the auto-begin semantics alone, so a read-only early exit stays free, and it
   needs no sentinel: `in_transaction` already reports precisely what a sentinel would have to encode.
-  This is unfiled work, named by subject here rather than by a number, because none is allocated for
-  it. **So do not cite this ADR as evidence that a given SQLite writer unwinds on cancellation; check
-  whether that writer goes through `_writer_txn`.**
+  **Amended 2026-09-18 -- this work is now filed, and the framing below was too narrow.**
+
+  *Filed.* The guard described above is **BACKLOG #1803** ("census every bare-lock store writer whose
+  failure is an EXPECTED error, and convert or ratify each"). At the time of writing #1803 is on the
+  Lander's ledger-drain branch and **not yet on the vault's `main`**, so the citation is recorded here
+  with that caveat rather than left unfiled.
+
+  *The framing widens from cancellation to any exception.* This ADR reaches the residual through
+  **cancellation**, and that understates how reachable it is. The same mechanism fires on an **ordinary,
+  expected error** that a caller catches as a normal outcome -- strictly more reachable than a
+  cancellation, because nothing unusual has to happen. Two measured instances, both 2026-09-18:
+  `add_webauthn_credential` (BACKLOG #1804) and `set_user_federated_subject` (BACKLOG #1801). The first
+  is the clearest statement of the shape, because **its own docstring names the failure as expected**:
+  it holds `self._lock`, issues an `INSERT`, and documents that "a duplicate `(user_id, label)` raises
+  the backend's IntegrityError -- the caller renders it as the same 'label already in use' error as its
+  pre-check". There is no `try`, so that expected exception leaves the `async with self._lock` block
+  with the auto-begun transaction **still open**, and the next writer on the connection inherits it.
+
+  **So do not cite this ADR as evidence that a given SQLite writer unwinds on cancellation; check
+  whether that writer goes through `_writer_txn`** -- and do not read "cancellation" as the bound on
+  when the residual bites.
 
   One property the whole residual rests on is worth stating once: **`isolation_level` is never set
   anywhere in the package.** `MessageStore.open` calls `aiosqlite.connect(str(path))` with no such
