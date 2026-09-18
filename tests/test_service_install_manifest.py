@@ -568,3 +568,166 @@ def test_the_two_copies_of_the_helper_have_not_drifted(tmp_path: Path) -> None:
         f"the two copies of {_STOP_FN} have drifted; the behavioural arms above only ever run the "
         "install-service.ps1 copy, so a divergent uninstall copy would be untested"
     )
+
+
+# --- every path baked into the registration is absolute, and made so IN TIME (BACKLOG #1554) ------
+# A service resolves a relative path against its own working directory. Only -Config was normalized,
+# and it was normalized after Resolve-Nssm had already joined a possibly-relative -DataDir and after
+# Test-Path had validated a relative -DbPath against the operator's shell location rather than the
+# AppDirectory the service would use.
+#
+# ORDER IS THE DEFECT, so the guards below are about WHERE the normalization happens, not merely that
+# it happens. Three assertions of shape and one of behaviour.
+
+_PATH_PARAMS = ["DataDir", "AppExe", "Config", "DbPath"]
+
+
+def _preflight_facts(tmp_path: Path) -> dict:
+    """Assignments and command calls of install-service.ps1, with source offsets, by AST."""
+    assert _SCRIPT is not None
+    body = """
+  $assigns = @(foreach ($a in $ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+    $lhs = $null
+    if ($a.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+      $lhs = $a.Left.VariablePath.UserPath
+    }
+    $cmd = $null
+    $firstCmd = $a.Right.Find({ $args[0] -is
+        [System.Management.Automation.Language.CommandAst] }, $true)
+    if ($firstCmd) { $cmd = $firstCmd.GetCommandName() }
+    [pscustomobject]@{
+      lhs     = $lhs
+      start   = $a.Extent.StartOffset
+      line    = $a.Extent.StartLineNumber
+      rhsCmd  = $cmd
+      rhsText = $a.Right.Extent.Text
+    }
+  })
+  $cmds = @(foreach ($c in $ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.CommandAst] }, $true)) {
+    [pscustomobject]@{
+      name  = $c.GetCommandName()
+      start = $c.Extent.StartOffset
+      line  = $c.Extent.StartLineNumber
+      text  = $c.Extent.Text
+    }
+  })
+  [pscustomobject]@{ assignments = @($assigns); commands = @($cmds) } |
+      ConvertTo-Json -Depth 6 -Compress
+"""
+    parsed: dict = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    return parsed
+
+
+def _sole_call(facts: dict, name: str) -> dict:
+    hits = [c for c in facts["commands"] if c["name"] == name]
+    assert len(hits) == 1, f"expected exactly one {name} call, found {len(hits)}"
+    return hits[0]
+
+
+def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: Path) -> None:
+    """Each of -DataDir, -AppExe, -Config, -DbPath is finalised BEFORE the Resolve-Nssm call.
+
+    Resolve-Nssm joins ``bin`` onto -DataDir and caches nssm.exe there; every later consumer
+    (Test-Path, the ACL grants, AppParameters) inherits whatever these hold. A normalization that
+    runs after any of them is the #1554 defect in a new position.
+    """
+    facts = _preflight_facts(tmp_path)
+    nssm_at = _sole_call(facts, "Resolve-Nssm")["start"]
+    for var in _PATH_PARAMS:
+        writes = [a for a in facts["assignments"] if a["lhs"] == var]
+        assert writes, f"nothing assigns ${var} in the preflight"
+        late = [a for a in writes if a["start"] > nssm_at]
+        assert not late, (
+            f"${var} is still being written at line(s) {[a['line'] for a in late]}, AFTER "
+            f"Resolve-Nssm (line {_sole_call(facts, 'Resolve-Nssm')['line']}) has already consumed "
+            "the preflight values -- BACKLOG #1554 is about exactly this ordering"
+        )
+
+
+def test_the_repo_root_is_computed_before_the_defaults_that_need_it(tmp_path: Path) -> None:
+    """$AppExe and $Config default from $RepoRoot, so $RepoRoot has to exist first.
+
+    This is the second half of the reorder: moving the normalization up is wrong if it lands above
+    the value two of the four defaults are built from.
+    """
+    facts = _preflight_facts(tmp_path)
+    root = [a for a in facts["assignments"] if a["lhs"] == "RepoRoot"]
+    assert len(root) == 1, f"expected one $RepoRoot assignment, found {len(root)}"
+    for var in ("AppExe", "Config"):
+        first = min(a["start"] for a in facts["assignments"] if a["lhs"] == var)
+        assert root[0]["start"] < first, (
+            f"$RepoRoot (line {root[0]['line']}) is computed after the first write to ${var}, "
+            "whose default is built from it"
+        )
+
+
+def test_no_path_parameter_is_normalized_with_resolve_path(tmp_path: Path) -> None:
+    """Resolve-Path THROWS on a path that does not exist, and a first install has no database file.
+
+    This is the trap the obvious fix falls into: Resolve-Path looks like the normalizer and turns a
+    fresh install into a hard failure on -DbPath.
+    """
+    facts = _preflight_facts(tmp_path)
+    for var in _PATH_PARAMS:
+        bad = [
+            a
+            for a in facts["assignments"]
+            if a["lhs"] == var and "Resolve-Path" in (a["rhsText"] or "")
+        ]
+        assert not bad, (
+            f"${var} is normalized with Resolve-Path at line(s) {[a['line'] for a in bad]}; it "
+            "throws when the path does not exist yet -- use "
+            "GetUnresolvedProviderPathFromPSPath instead"
+        )
+
+
+def test_resolve_absolutepath_anchors_to_the_invocation_directory(tmp_path: Path) -> None:
+    """BEHAVIOUR. A relative path resolves against where the OPERATOR stood, not the script's home,
+    and a path that does not exist is normalized rather than refused."""
+    assert _SCRIPT is not None
+    anchor = tmp_path / "anchor"
+    (anchor / "sub").mkdir(parents=True)
+    body = rf"""
+  Set-Location {_psq(str(anchor))}
+  [pscustomobject]@{{
+    relative   = (Resolve-AbsolutePath 'sub\mefor.db')
+    missing    = (Resolve-AbsolutePath 'no-such-dir\not-created-yet.db')
+    absolute   = (Resolve-AbsolutePath {_psq(str(anchor / "sub"))})
+    dotdot     = (Resolve-AbsolutePath 'sub\..\other.db')
+  }} | ConvertTo-Json -Depth 3 -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Resolve-AbsolutePath"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["relative"] == str(anchor / "sub" / "mefor.db"), (
+        "a relative path must resolve against the directory the installer was RUN from; anchoring "
+        f"it to $PSScriptRoot or $RepoRoot silently relocates it (got {got['relative']!r})"
+    )
+    assert got["missing"] == str(anchor / "no-such-dir" / "not-created-yet.db"), (
+        "a path that does not exist yet must still normalize -- a first install has no database "
+        f"file (got {got['missing']!r})"
+    )
+    assert got["absolute"] == str(anchor / "sub"), "an absolute path must come back unchanged"
+    assert got["dotdot"] == str(anchor / "other.db"), "'..' segments must be collapsed"
+
+
+def test_the_troubleshooting_step_no_longer_promises_what_the_script_cannot_do() -> None:
+    """docs/SERVICE.md told an operator whose service will not start to re-run the installer
+    "which resolves all paths to absolute". It did not; only -Config was normalized. A repair step
+    resting on a false premise is what CLAUDE.md section 11 (SDS-3.7) forbids.
+
+    The sentence WRAPPED, so the phrase is matched with whitespace collapsed -- a one-line grep for
+    it returns zero and reads as already fixed.
+    """
+    root = Path(__file__).resolve().parents[1]
+    doc = (root / "docs" / "SERVICE.md").read_text(encoding="utf-8")
+    flat = " ".join(doc.split())
+    assert "resolves all paths to absolute" not in flat, (
+        "docs/SERVICE.md still tells an operator that re-running the install script resolves ALL "
+        "paths to absolute"
+    )
+    assert "re-run the install script" not in flat.lower() or "anchored to the directory" in flat, (
+        "the troubleshooting step must say what the installer actually anchors relative paths to"
+    )

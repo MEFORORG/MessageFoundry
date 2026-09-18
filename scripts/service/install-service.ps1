@@ -396,22 +396,48 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Installing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
-
-# Repo root is two levels up from this script (scripts\service\).
+# Repo root is two levels up from this script (scripts\service\). Computed FIRST: -AppExe and
+# -Config default from it, and the normalization below has to run before anything CONSUMES a path.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
+# --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
+# A service resolves a relative path against its own working directory, so every path baked into the
+# registration must be absolute. Only -Config was normalized, and it was normalized LATE - after
+# Resolve-Nssm had already joined a possibly-relative -DataDir, and after Test-Path had validated a
+# relative -DbPath against a DIFFERENT directory from the one the service would resolve it against.
+# That is the whole defect: one path, validated here against the operator's shell location, resolved
+# there against AppDirectory ($RepoRoot).
+#
+# NOT Resolve-Path: it THROWS on a path that does not exist, and a first install legitimately has no
+# database file yet. GetUnresolvedProviderPathFromPSPath normalizes without requiring existence.
+#
+# THE ANCHOR IS $PWD, THE DIRECTORY THE OPERATOR RAN THIS FROM - not $PSScriptRoot and not $RepoRoot.
+# A relative path an operator types means "from where I am standing"; anchoring it to the script's own
+# location would silently relocate it, which is a quieter version of the same bug.
+function Resolve-AbsolutePath {
+    param([Parameter(Mandatory)][string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+$DataDir = Resolve-AbsolutePath $DataDir
 if (-not $AppExe) { $AppExe = Join-Path $RepoRoot ".venv\Scripts\messagefoundry.exe" }
+else { $AppExe = Resolve-AbsolutePath $AppExe }
 if (-not $Config) { $Config = Join-Path $RepoRoot "samples\config" }
+else { $Config = Resolve-AbsolutePath $Config }
+# Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
+else { $DbPath = Resolve-AbsolutePath $DbPath }
+
+# AFTER the normalization: Resolve-Nssm joins "bin" onto -DataDir and caches nssm.exe there, so a
+# relative -DataDir here would download the binary to one directory and register a service pointing at
+# another.
+$NssmPath = Resolve-Nssm -Provided $NssmPath -DataDir $DataDir
 
 if (-not (Test-Path $AppExe)) {
     throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
 }
 if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
 
-# Absolute paths only: a service's relative paths resolve to the system directory.
-$Config   = (Resolve-Path $Config).Path
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null

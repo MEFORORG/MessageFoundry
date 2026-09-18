@@ -511,9 +511,13 @@ are left in place.
 ## Troubleshooting
 
 - **Service won't start / exits immediately.** Read `service.err.log`. The most common
-  cause is a bad path baked into the service (relative paths resolve to the *system*
-  directory for a service account); re-run the install script, which resolves all paths
-  to absolute.
+  cause is a bad path baked into the service: a service resolves a relative path against
+  its own working directory, not against yours. Read what is actually registered —
+  `nssm get MessageFoundry AppParameters` and `nssm get MessageFoundry AppDirectory` — and
+  compare it against where the files really are. The installer makes `-Config`, `-DbPath`,
+  `-DataDir` and `-AppExe` absolute, anchored to the directory you ran it from, so
+  re-running it from a *different* directory changes what a relative argument meant. Pass
+  absolute paths if you want to be certain.
 - **Port already in use (e.g. 2575).** The sample config's inbound connection binds MLLP
   port `2575`. If a stray `messagefoundry serve` (or a second copy of the service) is already
   running, the listener fails to bind. Make sure only one instance runs:
