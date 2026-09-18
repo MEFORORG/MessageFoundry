@@ -361,3 +361,210 @@ def test_the_password_call_site_passes_the_secret_by_name(tmp_path: Path) -> Non
         f"-Secret; a second (positional) occurrence is joined into the failure message:\n"
         f"{secret_calls[0]['text']}"
     )
+
+
+# --- a stop must be checked AND confirmed before the next step runs (BACKLOG #1558) ---------------
+# Three stop sites existed, all unchecked: the reconfigure branch of install-service.ps1, and BOTH
+# branches of uninstall-service.ps1 (nssm, and the SCM fallback when nssm is absent).
+#
+# THE ROW BLAMED THE EMPTY ``catch { }`` AND THAT IS NOT WHERE THE SWALLOW WAS. Measured on both
+# hosts against a stub that writes to stderr and exits 3:
+#   * PowerShell 7.6.6              -- nothing raised, catch never fired, $LASTEXITCODE == 3.
+#   * Windows PowerShell 5.1.26100  -- the ``2>&1`` MERGE raised a terminating RemoteException that
+#     the empty catch swallowed, and $LASTEXITCODE came back -1 because the pipeline aborted before
+#     nssm's real exit code was recorded.
+# 5.1 is the host CI runs these scripts on (``shell: powershell``), so an exit-code check written
+# after a merged capture would have been UNREACHABLE there. The fix calls nssm bare.
+#
+# And an exit code alone is still not the question: ``nssm stop`` can exit 0 while the process is
+# still draining, which is why the status is polled back. The arms below separate those two.
+
+_STOP_FN = "Stop-ServiceAndConfirm"
+
+
+def _stop_arms(
+    tmp_path: Path, *, nssm_exit: int | None, states: list[str], timeout: int = 1
+) -> dict:
+    """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
+
+    ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
+    an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
+    is uninstall-service.ps1's third stop site.
+    """
+    assert _SCRIPT is not None
+    stub = tmp_path / f"nssm-stop-{uuid.uuid4().hex}.cmd"
+    stub.write_text(
+        "@echo off\r\necho nssm: stop reported a problem 1>&2\r\n"
+        f"exit /b {nssm_exit if nssm_exit is not None else 0}\r\n",
+        encoding="ascii",
+    )
+    nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
+    states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
+    body = rf"""
+  $script:StopServiceCalls = 0
+  $script:GetServiceCalls = 0
+  $script:States = {states_ps}
+  function Get-Service {{
+    param([string]$Name, $ErrorAction)
+    $script:GetServiceCalls++
+    if ($script:States.Count -eq 0) {{ return $null }}
+    $i = [Math]::Min($script:GetServiceCalls - 1, $script:States.Count - 1)
+    return [pscustomobject]@{{ Status = $script:States[$i] }}
+  }}
+  function Stop-Service {{
+    param([string]$Name, [switch]$Force, $ErrorAction)
+    $script:StopServiceCalls++
+  }}
+  $warnings = @()
+  $result = $null
+  $emitted = & {{
+    {_STOP_FN} -ServiceName 'MessageFoundry' -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
+  }} 3>&1
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+    else {{ $result = $o }}
+  }}
+  [pscustomobject]@{{
+    result           = [bool]$result
+    warnings         = @($warnings)
+    stopServiceCalls = $script:StopServiceCalls
+    getServiceCalls  = $script:GetServiceCalls
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    raw = _ok(_extract(_SCRIPT, [_STOP_FN], body), tmp_path)
+    parsed: dict = json.loads(raw.strip().splitlines()[-1])
+    parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    return parsed
+
+
+def test_a_clean_stop_is_reported_clean(tmp_path: Path) -> None:
+    """POSITIVE CONTROL. nssm exits 0 and the service reads Stopped: True, and no warning.
+
+    Without this, a helper that warned unconditionally, or always returned False, would satisfy
+    every failure arm below.
+    """
+    arms = _stop_arms(tmp_path, nssm_exit=0, states=["Stopped"])
+    assert arms["result"] is True, "a clean stop must report success"
+    assert arms["warnings"] == [], f"a clean stop must warn about nothing; got {arms['warnings']}"
+
+
+def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:
+    """The exit code is TESTED. The old call discarded it (and nssm's message) into Out-Null."""
+    arms = _stop_arms(tmp_path, nssm_exit=3, states=["Stopped"])
+    joined = " ".join(arms["warnings"])
+    assert "3" in joined and "nssm stop" in joined, (
+        f"a non-zero `nssm stop` exit must be surfaced, not swallowed; warnings were {arms['warnings']}"
+    )
+
+
+def test_a_lingering_service_is_caught_by_the_status_reread(tmp_path: Path) -> None:
+    """THE ARM THE EXIT CODE CANNOT REACH. nssm exits 0 while the service stays Running.
+
+    This is the case BACKLOG #1558 asks for by name: the next step (reconfigure, or remove) must not
+    run believing the service stopped.
+    """
+    arms = _stop_arms(tmp_path, nssm_exit=0, states=["Running"])
+    assert arms["result"] is False, (
+        "a service still Running after a clean `nssm stop` must be reported as NOT stopped -- an "
+        "exit-code check alone returns True here"
+    )
+    assert arms["getServiceCalls"] >= 2, (
+        "the status must be POLLED, not read once; a single read cannot distinguish a slow drain "
+        f"from a stuck service (got {arms['getServiceCalls']} reads)"
+    )
+    assert any("Running" in w for w in arms["warnings"]), (
+        f"the warning must name the state the service is actually in; got {arms['warnings']}"
+    )
+
+
+def test_a_slow_drain_is_waited_out_rather_than_failed(tmp_path: Path) -> None:
+    """Still Running on the first reads, Stopped later: True. A drain is not a failure."""
+    arms = _stop_arms(tmp_path, nssm_exit=0, states=["Running", "Running", "Stopped"], timeout=10)
+    assert arms["result"] is True, "a service that stops within the timeout must report success"
+    assert arms["warnings"] == [], f"a normal drain must not warn; got {arms['warnings']}"
+
+
+def test_the_scm_fallback_stop_is_confirmed_too(tmp_path: Path) -> None:
+    """THE THIRD STOP SITE. uninstall-service.ps1 falls back to Stop-Service when nssm is absent,
+    and that branch was as unchecked as the other two."""
+    arms = _stop_arms(tmp_path, nssm_exit=None, states=["Running"])
+    assert arms["stopServiceCalls"] == 1, (
+        f"the no-nssm branch must still stop the service via the SCM (got {arms['stopServiceCalls']})"
+    )
+    assert arms["result"] is False, "the SCM fallback must confirm the stop, not assume it"
+
+
+def test_no_unchecked_stop_site_survives_in_either_script(tmp_path: Path) -> None:
+    """CALL-SITE guard. A correct helper is worth nothing if a raw stop is still there.
+
+    Read from the TOKEN stream with comments removed, not from the file text. The helper's own
+    docstring quotes the defective line verbatim, so a text scan matches the explanation of the
+    defect and reports the defect -- the sentence and its own negation are the same string.
+    """
+    assert _UNINSTALL is not None
+    for path in (_SCRIPT, _UNINSTALL):
+        assert path is not None
+        body = """
+  $tokens = $null
+  [void][System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$tokens, [ref]$null)
+  (@($tokens | Where-Object { $_.Kind -ne 'Comment' } |
+      ForEach-Object { $_.Text }) -join ' ')
+"""
+        code = _ok(_extract(path, [], body), tmp_path)
+        assert "2>&1" not in code, (
+            f"{path.name} still merges a native command's stderr into the success stream -- on "
+            "Windows PowerShell 5.1 that turns nssm's stderr into a terminating error and loses "
+            "its exit code (BACKLOG #1558)"
+        )
+        assert _STOP_FN in code, f"{path.name} must route its stop through {_STOP_FN}"
+
+
+def test_every_stop_service_call_lives_inside_the_helper(tmp_path: Path) -> None:
+    """``Stop-Service`` must not be called anywhere but inside the confirming helper, in either
+    script -- that is what makes 'every stop is confirmed' true rather than merely typical."""
+    assert _UNINSTALL is not None
+    for path in (_SCRIPT, _UNINSTALL):
+        assert path is not None
+        body = f"""
+  $fn = $ast.Find({{ $args[0] -is
+      [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq {_psq(_STOP_FN)} }}, $true)
+  $calls = @($ast.FindAll({{ $args[0] -is
+      [System.Management.Automation.Language.CommandAst] }}, $true) | Where-Object {{
+      $_.GetCommandName() -eq 'Stop-Service' }})
+  [pscustomobject]@{{
+    hasFn   = [bool]$fn
+    fnStart = $(if ($fn) {{ $fn.Extent.StartOffset }} else {{ -1 }})
+    fnEnd   = $(if ($fn) {{ $fn.Extent.EndOffset }} else {{ -1 }})
+    calls   = @($calls | ForEach-Object {{
+      [pscustomobject]@{{ start = $_.Extent.StartOffset; line = $_.Extent.StartLineNumber }} }})
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+        facts = json.loads(_ok(_extract(path, [], body), tmp_path).strip().splitlines()[-1])
+        assert facts["hasFn"], f"{path.name} does not define {_STOP_FN}"
+        stray = [c for c in facts["calls"] if not (facts["fnStart"] <= c["start"] < facts["fnEnd"])]
+        assert not stray, (
+            f"{path.name} calls Stop-Service outside {_STOP_FN} at line(s) "
+            f"{[c['line'] for c in stray]} -- that stop is neither checked nor confirmed"
+        )
+
+
+def test_the_two_copies_of_the_helper_have_not_drifted(tmp_path: Path) -> None:
+    """The scripts are standalone (an operator runs either one directly), so the helper is
+    duplicated rather than imported. Duplication is only safe while the copies agree."""
+    assert _UNINSTALL is not None
+    body = f"""
+  $fn = $ast.Find({{ $args[0] -is
+      [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq {_psq(_STOP_FN)} }}, $true)
+  if (-not $fn) {{ throw "not defined" }}
+  $fn.Extent.Text
+"""
+    texts = []
+    for path in (_SCRIPT, _UNINSTALL):
+        assert path is not None
+        texts.append(_ok(_extract(path, [], body), tmp_path).replace("\r\n", "\n").strip())
+    assert texts[0] == texts[1], (
+        f"the two copies of {_STOP_FN} have drifted; the behavioural arms above only ever run the "
+        "install-service.ps1 copy, so a divergent uninstall copy would be untested"
+    )

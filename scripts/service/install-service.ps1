@@ -462,12 +462,80 @@ function Invoke-Nssm {
     if ($LASTEXITCODE -ne 0) { throw "nssm $($shown -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
+# BEGIN Stop-ServiceAndConfirm (kept byte-identical with uninstall-service.ps1; guarded by
+# tests/test_service_install_manifest.py, which fails if the two copies drift)
+function Stop-ServiceAndConfirm {
+    <#
+      Stop the service and CONFIRM from the SCM that it actually stopped. Returns $true when the
+      service is Stopped (or gone); $false when it is still running.
+
+      Neither half of this existed before (BACKLOG #1558), and neither half is enough on its own.
+
+      THE EXIT CODE, AND WHY THE OLD try/catch WAS NOT THE GUARD IT LOOKED LIKE. The previous call
+      was `try { & $NssmPath stop $ServiceName 2>&1 | Out-Null } catch { }`. Measured on both hosts:
+      under PowerShell 7.6.6 a non-zero native exit raises nothing, so the catch never fired and the
+      failure was simply unnoticed; under Windows PowerShell 5.1.26100 - the host CI runs these
+      scripts on - the `2>&1` MERGE turned nssm's stderr into a terminating RemoteException, which
+      the empty catch then swallowed, AND left $LASTEXITCODE at -1 because the pipeline aborted
+      before nssm's real exit code was recorded. So an exit-code check written after a merged
+      capture would have been unreachable on the very host that matters. This calls nssm BARE: its
+      output goes to the operator instead of Out-Null, no redirection wraps the error stream, and
+      $LASTEXITCODE is the true exit code on both hosts.
+
+      THE RE-READ. An exit code is still not enough. `nssm stop` can exit 0 while the process is
+      still shutting down - the engine drains connections for up to AppStopMethodConsole ms - and
+      the caller's next step (rewriting the configuration, or removing the registration) then runs
+      against a service that is still running. So the status is polled back from the SCM and the
+      caller is told what it is, rather than assuming.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        # Empty when nssm is unavailable; the stop then goes through the SCM instead.
+        [string]$NssmPath,
+        [int]$TimeoutSeconds = 30
+    )
+    if ($NssmPath) {
+        $launched = $true
+        try { & $NssmPath stop $ServiceName } catch {
+            $launched = $false
+            Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
+                "($($_.Exception.Message)). Falling back to the SCM.")
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        }
+        if ($launched -and $LASTEXITCODE -ne 0) {
+            Write-Warning ("nssm stop '$ServiceName' exited $LASTEXITCODE (its message is above). " +
+                "The service may still be running; the status is checked below.")
+        }
+    } else {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) { return $true }
+        if ($svc.Status -eq "Stopped") { return $true }
+        if ((Get-Date) -ge $deadline) {
+            Write-Warning ("Service '$ServiceName' is still '$($svc.Status)' $TimeoutSeconds " +
+                "seconds after the stop was issued.")
+            return $false
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+# END Stop-ServiceAndConfirm
+
 # If the service already exists, reconfigure it in place (idempotent install).
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
 # service and would abort under ErrorActionPreference=Stop).
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
-    try { & $NssmPath stop $ServiceName 2>&1 | Out-Null } catch { }  # best-effort
+    if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {
+        Write-Warning ("Reconfiguring '$ServiceName' while it is still running. NSSM writes the new " +
+            "settings, but the RUNNING process keeps the old ones until it is restarted - so this " +
+            "install can report success over a service that is still on the previous configuration, " +
+            "including the previous run-as account and the previous paths. Stop it by hand and " +
+            "re-run, or restart it once this finishes, and confirm with 'nssm status $ServiceName'.")
+    }
 } else {
     Write-Host "Installing service '$ServiceName'..."
     Invoke-Nssm install $ServiceName $AppExe
