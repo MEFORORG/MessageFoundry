@@ -616,6 +616,10 @@ jobs:
                   f"the checkout shadowed the wheel and this step inspected the wrong tree"
               )
 
+          # BIND THE MODULE TO THIS DISTRIBUTION. find_spec above proves SOME module for PKG sits in
+          # the venv; RECORD is what says it came out of THIS wheel. Without the membership test the
+          # two questions are separate, and a venv where another distribution owns the import name
+          # answers the first one happily.
           dist = distribution(DIST)
           recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
           if not recorded:
@@ -623,12 +627,19 @@ jobs:
                   f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped around "
                   f"an empty package tree (a broken force-include builds and installs cleanly)"
               )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step resolved "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
+              )
 
           # The step name promises "the console's OWN __version__", so read it — out of the INSTALLED
           # file, not the checkout. It must agree with the metadata hatchling derived from it; a
           # disagreement means the version root and the built artifact are not the same thing any more.
+          # Both quote styles: scripts/security/sbom_finalize.py reads this same literal with the looser
+          # pattern, and a check that is stricter than its sibling finds a version the sibling ships.
           text = origin.read_text(encoding="utf-8")
-          m = re.search(r'^__version__ = "([^"]+)"', text, re.M)
+          m = re.search(r"""^__version__\s*=\s*["']([^"']+)["']""", text, re.M)
           if m is None:
               raise SystemExit(f"::error::no __version__ literal in the installed {origin}")
           if m.group(1) != dist.version:
@@ -841,12 +852,21 @@ jobs:
                   f"the checkout shadowed the wheel and this step inspected the wrong tree"
               )
 
+          # BIND THE MODULE TO THIS DISTRIBUTION. Everything above proves SOME module for PKG sits in
+          # the venv; RECORD is what says it came out of THIS wheel. Without the membership test the
+          # two questions are separate, and a venv where another distribution owns the import name
+          # answers the first one happily.
           dist = distribution(DIST)
           recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
           if not recorded:
               raise SystemExit(
                   f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped "
                   f"around an empty package tree (a broken force-include builds and installs cleanly)"
+              )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step imported "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
               )
 
           # The declared console_scripts target, resolved. `messagefoundry-harness` on a fresh install
@@ -858,9 +878,40 @@ jobs:
                   f"console script would fail on first run"
               )
 
+          # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
+          # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
+          # PEP 621 `dependencies` is STATIC, so a version bump is two edits. tests/test_packaging.py
+          # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
+          # commit the merge queue never gated. This is the last place the claim is checkable before
+          # the PyPI upload burns the version forever, and the metadata is already open.
+          # `packaging` is installed above, in this same venv, from the constraints.lock pin. Imported
+          # here rather than at the top because everything before this point is stdlib-only, and that
+          # is what lets the earlier guards report a broken wheel instead of a missing dependency.
+          from packaging.requirements import Requirement
+
+          engine = [
+              req
+              for raw in (dist.metadata.get_all("Requires-Dist") or [])
+              if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry"
+          ]
+          if len(engine) != 1:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
+                  f"expected exactly one (BACKLOG #1585)"
+              )
+          if str(engine[0].specifier) != f"=={dist.version}" or engine[0].extras != {"harness"}:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires "
+                  f"messagefoundry{sorted(engine[0].extras)}{engine[0].specifier}, not "
+                  f"messagefoundry[harness]=={dist.version} — this is a LOCKSTEP distribution and its "
+                  f"pin drifted from the version it ships at (BACKLOG #1585). Fix the dependencies "
+                  f"table in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
+
           print(
               f"harness wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
-              f"entry point {PKG}.__main__:main resolves, version {dist.version}",
+              f"entry point {PKG}.__main__:main resolves, requires "
+              f"messagefoundry[harness]{engine[0].specifier}, version {dist.version}",
               file=sys.stderr,
           )
           print(dist.version)

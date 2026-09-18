@@ -32,12 +32,15 @@ a `vX.Y.Z-rc1` pre-release tag.
 
 from __future__ import annotations
 
+import functools
 import gzip
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tomllib
 from collections.abc import Callable, Sequence
@@ -391,6 +394,7 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
 # --- the separately-versioned web console (ASVS 15.2.4) --------------------------------------------
 
 
+@functools.cache
 def _jobs() -> dict:
     import yaml
 
@@ -868,24 +872,44 @@ def test_the_leak_gate_rejects(
     )
 
 
-# --- (8) the wheel smokes INSTALL the artifact and INSPECT it (BACKLOG #1701) ------------------------
+# --- (8) the SEPARATELY-BUILT wheel smokes install the artifact and INSPECT it (BACKLOG #1701) -------
+#
+# SCOPE, STATED ONCE AND NOT RESTATED IN EVERY TEST NAME BELOW: this section covers the jobs that build
+# a wheel of their OWN distribution -- release-webconsole and release-harness. It does NOT cover the
+# ENGINE job's smoke. That exclusion is real, it is asserted explicitly by
+# `test_the_engine_smoke_is_the_gap_these_guards_do_not_close`, and BACKLOG #1583 is the row that closes
+# it. Do not read a green here as "every release smoke installs with --no-deps and inspects under -I";
+# the engine's does neither.
 
 #: The heredoc tag carrying each smoke step's inspection script. Named, not sliced by line number, so
 #: an edit above it cannot silently change what the execution tests below run.
 _SMOKE_HEREDOC = re.compile(r"<<'PYSMOKE'\n(.*?)\nPYSMOKE\n", re.S)
 
-#: The version the synthesized installs below are built at. Arbitrary, but it must not be the version
+#: The version the synthesized installs below are built at. Arbitrary, but deliberately NOT the version
 #: in the tree: a fixture that happens to match the real one cannot show the check read the fixture.
 _SMOKE_VERSION = "7.7.7"
 
 
+@functools.cache
 def _wheel_smoke_steps() -> dict[str, dict]:
-    """Every wheel-BUILDING job paired with its smoke step.
+    """Every job that builds a wheel of its own distribution, paired with its smoke step.
 
     DERIVED from ``python -m build --wheel``, never a list of job names, for the same reason
     :func:`test_both_wheel_smokes_compare_versions_not_strings` counts instead of pinning a number:
     that test read ``== 2`` and broke the day the console job arrived. A fourth distribution is
     covered here the day it lands, not the day somebody remembers this file.
+
+    The engine job builds with a bare ``python -m build`` (sdist AND wheel) and so is not selected.
+    That is the section's stated gap, not an accident of the predicate -- see the module note above.
+
+    Cached: three ``@pytest.mark.parametrize`` decorators call this at COLLECTION time and every
+    execution test calls it again, and it is a pure function of one file. Callers only read the
+    returned mapping. Uncached, one run of this module parsed the 911-line workflow 33 times.
+
+    Because those decorators call it at collection, the assertions below surface as a COLLECTION
+    ERROR for the whole module rather than as one named test failure. That is deliberate: if the
+    workflow's job shape has moved far enough that this cannot find the wheel jobs, every other test
+    in the module is asking about a file it no longer understands. The message says which.
     """
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
@@ -932,7 +956,7 @@ def test_the_extracted_smoke_scripts_are_actually_the_smokes() -> None:
     for job in _wheel_smoke_steps():
         script = _smoke_script(job)
         compile(script, f"<{job} smoke>", "exec")  # it must at least be Python
-        assert _smoke_names(script)
+        _smoke_names(script)  # and it must name what it installs
         for token in ("sys.prefix", "distribution(DIST)", "dist.version"):
             assert token in script, (
                 f"{job}'s smoke script does not contain {token!r}; the extractor is picking up the "
@@ -940,12 +964,54 @@ def test_the_extracted_smoke_scripts_are_actually_the_smokes() -> None:
             )
 
 
-def test_every_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> None:
+def test_the_engine_smoke_is_the_gap_these_guards_do_not_close() -> None:
+    """The exclusion, made a MEASUREMENT instead of a footnote (BACKLOG #1583).
+
+    The `release` job also builds a wheel and also has a step named `Smoke-check the built wheel`, and
+    everything in this section passes over it. Its smoke installs WITH dependencies -- resolving the
+    engine's whole tree from PyPI inside a job holding `id-token: write` -- and runs
+    `python -c "import messagefoundry; ..."` from the checkout root with no isolation flag, so the
+    CHECKOUT answers the version question and the installed wheel is never read.
+
+    Both are #1583's, deliberately untouched here. This test exists so the boundary is visible from
+    inside the file rather than only from a pull request description, and so a FOURTH job cannot slip
+    into the same gap unnoticed: it pins the excluded set to exactly one job, by name.
+
+    When #1583 lands, this test is what tells you to fold the engine job into `_wheel_smoke_steps`.
+    """
+    smoked = {
+        name
+        for name, job in _jobs().items()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
+    }
+    uncovered = smoked - set(_wheel_smoke_steps())
+    assert uncovered == {"release"}, (
+        f"the set of release smokes these guards do NOT cover is {sorted(uncovered)}, expected exactly "
+        f"['release']. A new job with a smoke step is escaping section (8) -- either bring it into "
+        f"_wheel_smoke_steps (it should build with `python -m build --wheel`) or record why not."
+    )
+
+    engine = _executed_shell(
+        str(
+            next(
+                s for s in _jobs()["release"]["steps"] if "Smoke-check" in str(s.get("name") or "")
+            )["run"]
+        )
+    )
+    assert "--no-deps" not in engine and "python -I" not in engine, (
+        "the engine smoke has gained --no-deps or isolated mode, so BACKLOG #1583 is (at least partly) "
+        "fixed -- fold the engine job into _wheel_smoke_steps() and delete this test rather than "
+        "leaving the stronger guards pointed away from it"
+    )
+
+
+def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> None:
     """The defect BACKLOG #1701 names: both steps parsed the wheel FILENAME and never opened the file.
 
     A filename proves the artifact is NAMED right. It says nothing about whether the force-include
-    that pulls each package tree in from two directories up produced anything at all, and a wheel
-    carrying no package tree is named exactly like a good one.
+    that pulls each package tree in from two directories up produced anything, and a wheel carrying
+    no package tree is named exactly like a good one.
 
     The venv must be a throwaway rather than the job's own interpreter (ADR 0034): both jobs hold
     ``contents: write`` + ``id-token: write``, and the steps after the smoke attach the wheel to a
@@ -964,22 +1030,24 @@ def test_every_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> N
         )
 
 
-def test_every_wheel_smoke_reads_the_version_from_the_installed_distribution() -> None:
-    """The version under test must come out of the installed METADATA, and the module out of the venv.
+def test_each_wheel_smoke_inspects_the_wheel_in_isolated_mode() -> None:
+    """``-I`` is the half most easily lost, and the only one no execution test below can pin.
 
-    Mutation: put ``glob.glob`` back, or drop ``-I``. Red here. ``-I`` is the half most easily lost:
-    both steps run from the repo root, which carries a source copy of each package, so without
+    Both steps run from the repo root, which carries a source copy of each package, so without
     isolated mode the CHECKOUT answers every question and the wheel is never touched. (``-P`` or
-    ``PYTHONSAFEPATH`` would serve; ``-E`` alone is a silent no-op.)
+    ``PYTHONSAFEPATH`` would serve; ``-E`` alone is a silent no-op.) The checkout-shadow test below
+    deliberately runs WITHOUT ``-I`` -- it drives the script's own in-venv assertion -- so nothing
+    else in this file would notice the flag going missing from the workflow.
+
+    The filename read is pinned here too, because it names the defect and gives a targeted message.
+    (`test_a_wheel_smoke_accepts_a_correctly_built_wheel` would also catch its return: that fixture
+    puts no wheel file on disk at all, so a `glob.glob(...)[0]` raises IndexError.)
     """
     for job, step in _wheel_smoke_steps().items():
         shell = _executed_shell(str(step["run"]))
         assert "glob.glob(" not in shell, (
             f"{job}'s smoke is reading the wheel FILENAME again (BACKLOG #1701) — that proves the "
             f"artifact is named right and nothing else"
-        )
-        assert "importlib.metadata" in shell, (
-            f"{job}'s smoke no longer reads the installed distribution's metadata"
         )
         # PINNED TO THE PYSMOKE INVOCATION, not to `-I` appearing anywhere in the step. Each step
         # runs TWO isolated interpreters (the inspection, then the PEP 440 compare), so a bare
@@ -1001,13 +1069,22 @@ def _write_install(
     version: str,
     *,
     package_files: dict[str, str] | None,
-    record_package: bool = True,
+    recorded_files: dict[str, str] | None = None,
+    requires: list[str] | None = None,
 ) -> None:
     """Materialise an installed distribution in ``purelib``, the way a wheel install leaves one.
 
     ``package_files`` maps a path under ``<pkg>/`` to its text; ``None`` ships no package tree at all.
-    ``record_package`` controls whether those files appear in RECORD, so the metadata-around-an-empty-
-    tree shape can be driven from either side.
+    ``recorded_files`` is written to disk as well and becomes the ONLY package content RECORD claims,
+    so an install whose recorded set and whose importable module disagree can be driven at all.
+    ``requires`` overrides ``Requires-Dist``; the default is the lockstep pin the harness smoke
+    checks (the console's script ignores it, so one default serves both).
+
+    ``recorded_files`` MUST be written to disk, and that is a measured constraint rather than tidiness:
+    ``importlib.metadata.Distribution.files`` SILENTLY DROPS every RECORD row whose file is missing
+    (CPython filters the listing through an existence check). A fixture that records a path it never
+    creates is therefore indistinguishable from one that records nothing, and the "RECORD names
+    someone else's file" case collapsed into the "RECORD names nothing" case until this was found.
     """
     written: list[str] = []
     if package_files is not None:
@@ -1016,13 +1093,30 @@ def _write_install(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
             written.append(f"{pkg}/{rel}")
-    info = purelib / f"{dist.replace('-', '_')}-{version}.dist-info"
+    if recorded_files is not None:
+        for rel, text in recorded_files.items():
+            target = purelib / pkg / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        written = [f"{pkg}/{rel}" for rel in recorded_files]
+    # PEP 427 escapes every run of separators to a single underscore; `dist.replace("-", "_")` is
+    # right only for the names in play today and wrong for one carrying a dot.
+    info = purelib / f"{re.sub(r'[-_.]+', '_', dist)}-{version}.dist-info"
     info.mkdir(parents=True, exist_ok=True)
-    (info / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n", encoding="utf-8"
+    declared = ["messagefoundry[harness]==" + version] if requires is None else requires
+    info.joinpath("METADATA").write_text(
+        "".join(
+            [
+                "Metadata-Version: 2.1\n",
+                f"Name: {dist}\n",
+                f"Version: {version}\n",
+                *(f"Requires-Dist: {req}\n" for req in declared),
+            ]
+        ),
+        encoding="utf-8",
     )
-    rows = [*(written if record_package else []), f"{info.name}/METADATA", f"{info.name}/RECORD"]
-    (info / "RECORD").write_text("".join(f"{row},,\n" for row in rows), encoding="utf-8")
+    rows = [*written, f"{info.name}/METADATA", f"{info.name}/RECORD"]
+    info.joinpath("RECORD").write_text("".join(f"{row},,\n" for row in rows), encoding="utf-8")
 
 
 def _good_package(pkg: str, version: str) -> dict[str, str]:
@@ -1034,30 +1128,60 @@ def _good_package(pkg: str, version: str) -> dict[str, str]:
     }
 
 
-def _make_venv(root: Path) -> tuple[Path, Path]:
-    """A throwaway venv at ``root``; returns ``(interpreter, purelib)``.
+@pytest.fixture(scope="session")
+def venv_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One ``--without-pip`` venv, built once and COPIED per case.
 
-    ``--without-pip`` because nothing here installs from an index: these fixtures ARE the install,
-    written by hand so shapes no real build produces (metadata wrapped around an empty package tree)
-    can be driven at all. Measured well under a second.
+    Measured on this box: creating a venv is 0.207s and copying one is 0.011s, and this section needs
+    a dozen and a half. Copy-per-case rather than a shared venv, deliberately: every rejection here
+    asserts a NON-ZERO exit, so a package tree left behind by an earlier case would defeat the next
+    one and the leak would show up as a pass. Each case gets its own physical site-packages.
+
+    ``packaging`` is planted in it because the real step installs it there first, from the
+    constraints.lock pin, and the harness script reads ``Requires-Dist`` through
+    ``packaging.requirements``. Copied rather than pip-installed: this fixture must not touch an
+    index, and the venv is deliberately ``--without-pip``.
     """
+    root = tmp_path_factory.mktemp("venv-template") / "venv"
     subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
         [sys.executable, "-m", "venv", "--without-pip", str(root)],
         check=True,
         capture_output=True,
         timeout=300,
     )
+    import packaging
+
+    purelib = Path(
+        sysconfig.get_path(
+            "purelib", vars={"base": str(root), "platbase": str(root), "installed_base": str(root)}
+        )
+    )
+    shutil.copytree(Path(packaging.__file__).parent, purelib / "packaging")
+    # Loud, not silent: without this the harness script dies on ImportError and every rejection test
+    # would pass for that reason instead of the one under test.
+    assert (purelib / "packaging" / "requirements.py").is_file(), (
+        f"packaging was not planted in the smoke venv template at {purelib}"
+    )
+    return root
+
+
+def _clone_venv(template: Path, root: Path) -> tuple[Path, Path]:
+    """A private copy of ``template`` at ``root``; returns ``(interpreter, purelib)``.
+
+    ``purelib`` is derived IN PROCESS rather than by asking the copied interpreter: the template was
+    built by ``sys.executable``, so this interpreter's own scheme is the copy's scheme, and the
+    positive control is what proves the path is right (it writes the fixture there and the script has
+    to find it). That saves a subprocess launch per case.
+    """
+    shutil.copytree(template, root)
     exe = next(
         (p for p in (root / "Scripts" / "python.exe", root / "bin" / "python") if p.exists()), None
     )
-    assert exe is not None, f"venv at {root} produced no interpreter"
-    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [str(exe), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
-        check=True,
-        capture_output=True,
-        timeout=120,
+    assert exe is not None, f"the venv copy at {root} has no interpreter"
+    purelib = sysconfig.get_path(
+        "purelib", vars={"base": str(root), "platbase": str(root), "installed_base": str(root)}
     )
-    return exe, Path(proc.stdout.decode("utf-8", "replace").strip())
+    return exe, Path(purelib)
 
 
 def _run_smoke(
@@ -1087,18 +1211,26 @@ def _run_smoke(
     )
 
 
+def _prepared(job: str, template: Path, tmp_path: Path) -> tuple[str, str, str, Path, Path]:
+    """``(script, dist, pkg, interpreter, purelib)`` — the prelude every execution test below shares."""
+    script = _smoke_script(job)
+    dist, pkg = _smoke_names(script)
+    exe, purelib = _clone_venv(template, tmp_path / "venv")
+    return script, dist, pkg, exe, purelib
+
+
 @pytest.mark.parametrize("job", sorted(_wheel_smoke_steps()))
-def test_a_wheel_smoke_accepts_a_correctly_built_wheel(job: str, tmp_path: Path) -> None:
+def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
+    job: str, venv_template: Path, tmp_path: Path
+) -> None:
     """POSITIVE CONTROL, and it is what makes every rejection below mean anything.
 
     Those all assert a NON-ZERO exit. A harness that cannot run the script at all — a venv that did
-    not build, a fixture written to the wrong directory — exits non-zero on every one of them, and
+    not copy, a fixture written to the wrong directory — exits non-zero on every one of them, and
     they all pass while measuring nothing. This is the only case here that can fail in the other
     direction, so the rejections are evidence only while it holds.
     """
-    script = _smoke_script(job)
-    dist, pkg = _smoke_names(script)
-    exe, purelib = _make_venv(tmp_path / "venv")
+    script, dist, pkg, exe, purelib = _prepared(job, venv_template, tmp_path)
     _write_install(
         purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
     )
@@ -1145,16 +1277,37 @@ def _record_lists_no_package_members(purelib: Path, dist: str, pkg: str) -> None
         pkg,
         _SMOKE_VERSION,
         package_files=_good_package(pkg, _SMOKE_VERSION),
-        record_package=False,
+        recorded_files={},
     )
 
 
-#: Each shape pairs an install builder with a fragment only that shape produces. Asserting merely
-#: "it failed" would let every case fail for one shared wrong reason and still report a full pass.
+def _record_does_not_list_the_module_it_resolved(purelib: Path, dist: str, pkg: str) -> None:
+    """RECORD is non-empty but names OTHER files: the import name is occupied by something else.
+
+    This is the shape that makes the RECORD guard more than a restatement of the import check. The
+    module resolves, it sits inside the venv, and the distribution under test never shipped it -- the
+    real-world version being a second distribution that owns the same import name.
+    """
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        recorded_files={"somethingelse.py": "# shipped by a different distribution\n"},
+    )
+
+
+#: Each shape pairs an install builder with a fragment that shape produces. NOTE the first two
+#: SHARE a message, by measurement rather than by oversight: both scripts route "no tree at all" and
+#: "a namespace directory with no module" to the same guard, and neither distinguishes them. The
+#: second shape is kept anyway because it is a DIFFERENT INPUT -- the one a bare `import harness`
+#: would have passed -- not because its message discriminates. Everything else here does.
 _SMOKE_REJECTIONS: list[tuple[Callable[[Path, str, str], None], str]] = [
     (_no_package_tree, "no package tree"),
-    (_namespace_directory_with_no_module, "::error::"),
+    (_namespace_directory_with_no_module, "no package tree"),
     (_record_lists_no_package_members, "RECORD lists no"),
+    (_record_does_not_list_the_module_it_resolved, "belongs to something else on sys.path"),
 ]
 
 
@@ -1168,16 +1321,15 @@ def test_a_wheel_smoke_rejects(
     job: str,
     build_install: Callable[[Path, str, str], None],
     must_say: str,
+    venv_template: Path,
     tmp_path: Path,
 ) -> None:
     """Every one of these installs cleanly, is named correctly, and must fail the release.
 
-    Run them against the pre-#1701 step and all three pass: it read the version out of the FILENAME,
+    Run them against the pre-#1701 step and all four pass: it read the version out of the FILENAME,
     so nothing it did could depend on the wheel's contents at all.
     """
-    script = _smoke_script(job)
-    dist, pkg = _smoke_names(script)
-    exe, purelib = _make_venv(tmp_path / "venv")
+    script, dist, pkg, exe, purelib = _prepared(job, venv_template, tmp_path)
     build_install(purelib, dist, pkg)
 
     rc, _stdout, out = _run_smoke(exe, script, tmp_path)
@@ -1194,7 +1346,7 @@ def test_a_wheel_smoke_rejects(
 
 @pytest.mark.parametrize("job", sorted(_wheel_smoke_steps()))
 def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
-    job: str, tmp_path: Path
+    job: str, venv_template: Path, tmp_path: Path
 ) -> None:
     """The checkout-shadow guard, driven rather than read.
 
@@ -1203,9 +1355,7 @@ def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
     is never opened — a smoke that then passes is reporting on the tree it was built from. The venv
     here holds a perfectly good install; the shadow is the thing that must be caught.
     """
-    script = _smoke_script(job)
-    dist, pkg = _smoke_names(script)
-    exe, purelib = _make_venv(tmp_path / "venv")
+    script, dist, pkg, exe, purelib = _prepared(job, venv_template, tmp_path)
     _write_install(
         purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
     )
@@ -1225,7 +1375,7 @@ def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
 
 
 def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
-    tmp_path: Path,
+    venv_template: Path, tmp_path: Path
 ) -> None:
     """The console step's name promises "the console's OWN __version__", so it must read it.
 
@@ -1233,9 +1383,7 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
     its own wheel (``messagefoundry_webconsole/__init__.py``). The harness reads the ENGINE's
     ``__init__.py``, which the harness wheel does not contain, so there is nothing there to read back.
     """
-    script = _smoke_script("release-webconsole")
-    dist, pkg = _smoke_names(script)
-    exe, purelib = _make_venv(tmp_path / "venv")
+    script, dist, pkg, exe, purelib = _prepared("release-webconsole", venv_template, tmp_path)
     _write_install(purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, "9.9.9"))
 
     rc, _stdout, out = _run_smoke(exe, script, tmp_path)
@@ -1245,4 +1393,47 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
     )
     assert "9.9.9" in out and _SMOKE_VERSION in out, (
         f"the console smoke rejected the mismatch without naming both versions.\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "why"),
+    [
+        (["messagefoundry[harness]==0.0.1"], "a pin at the wrong version"),
+        (["messagefoundry[harness]>=" + _SMOKE_VERSION], "a range instead of a pin"),
+        (["messagefoundry==" + _SMOKE_VERSION], "the [harness] extra dropped"),
+        ([], "no requirement on the engine at all"),
+    ],
+    ids=["wrong-version", "range", "no-extra", "absent"],
+)
+def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
+    requires: list[str], why: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #1585's invariant, checked where it becomes irreversible.
+
+    ``tests/test_packaging.py`` asserts the pin in the pyproject, and that runs in ci.yml. NOTHING in
+    release.yml runs a test suite, and a tag can be cut from a commit the merge queue never gated --
+    so the built wheel is the last place the claim is checkable before the PyPI upload burns the
+    version forever. The harness smoke already holds the metadata open, so it asks.
+
+    Job-specific: the console is deliberately NOT lockstep (its own version root, its own cadence),
+    so its dependency on the engine is correctly unpinned and its script does not look.
+    """
+    script, dist, pkg, exe, purelib = _prepared("release-harness", venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        requires=requires,
+    )
+
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, (
+        f"the harness smoke published a wheel with {why} — a lockstep distribution that does not name "
+        f"the engine it ships with drags an arbitrary engine onto the operator's box.\n{out}"
+    )
+    assert "1585" in out, (
+        f"the harness smoke rejected {why} without naming the row that explains it.\n{out}"
     )

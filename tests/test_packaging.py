@@ -22,6 +22,8 @@ import tomllib
 from importlib.resources import files
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 _REPO = Path(__file__).resolve().parents[1]
 
 #: A name, `==`, and one literal version, with nothing after it. A range, a wildcard, a second clause
@@ -106,17 +108,37 @@ _HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject
 def _version_root(pyproject: Path) -> Path:
     """The module whose ``__version__`` a hatchling project takes its version from.
 
-    Read from ``[tool.hatch.version].path`` rather than hardcoded, so repointing a distribution's
-    version root moves this check with it instead of leaving it asserting about a file nothing uses.
+    READ FROM ``[tool.hatch.version].path``, NOT HARDCODED -- but note what that buys and what it
+    does not. The caller below asserts the answer IS the engine's ``__init__.py``, so repointing the
+    version root does not silently move this check, it fails it. That is the intent: the lockstep pin
+    rests on the root being the engine's, so the premise moving must stop the test rather than let it
+    carry on asserting about whatever file the config now names.
     """
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     return (pyproject.parent / data["tool"]["hatch"]["version"]["path"]).resolve()
 
 
 def _version_literal(module: Path) -> str:
-    m = re.search(r'^__version__ = "([^"]+)"', module.read_text(encoding="utf-8"), re.M)
-    assert m, f'no `__version__ = "..."` literal in {module} - hatchling reads one from it'
+    # Both quote styles. scripts/security/sbom_finalize.py reads this same literal with the looser
+    # pattern, and a check stricter than its sibling misses a version the sibling happily ships.
+    m = re.search(
+        r"""^__version__\s*=\s*["']([^"']+)["']""", module.read_text(encoding="utf-8"), re.M
+    )
+    assert m, f"no `__version__ = ...` literal in {module} - hatchling reads one from it"
     return m.group(1)
+
+
+def _engine_requirement(dependencies: list[str]) -> Requirement | None:
+    """The parsed requirement on ``messagefoundry``, or ``None`` if the table declares none.
+
+    Returns the REQUIREMENT rather than just its version so the extras check below reads off the same
+    parse instead of re-finding it; the two asked the same question twice and could disagree.
+    """
+    for raw in dependencies:
+        req = Requirement(raw)
+        if _normalise(req.name) == "messagefoundry":
+            return req
+    return None
 
 
 def _engine_pin(dependencies: list[str]) -> str | None:
@@ -124,16 +146,20 @@ def _engine_pin(dependencies: list[str]) -> str | None:
 
     ``None`` is every loose shape: a bare name, a floor, a compatible release, a wildcard, a range.
     Each of those lets a resolver pick an engine the harness cannot run against.
-    """
-    from packaging.requirements import Requirement
 
-    for raw in dependencies:
-        req = Requirement(raw)
-        if _normalise(req.name) != "messagefoundry":
-            continue
-        specs = list(req.specifier)
-        if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
-            return specs[0].version
+    WHY NOT ``_EXACT_PIN`` / ``_unpinned`` ABOVE: that regex answers the same question for
+    ``[build-system].requires`` and CANNOT answer it here. Its name character class has no ``[``, so
+    ``messagefoundry[harness]==0.3.2`` -- a correctly pinned requirement -- does not match it and
+    would read as unpinned. Extras are the difference; ``packaging`` parses them and a regex over a
+    PEP 508 string does not. Two predicates in one file, and this note is which is authoritative
+    where.
+    """
+    req = _engine_requirement(dependencies)
+    if req is None:
+        return None
+    specs = list(req.specifier)
+    if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
+        return specs[0].version
     return None
 
 
@@ -151,6 +177,9 @@ def test_the_engine_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
     assert _engine_pin(["messagefoundry[harness]==0.3.2"]) == "0.3.2"
     # And it must find the requirement among siblings, not only when it stands alone.
     assert _engine_pin(["pytest>=8", "messagefoundry[harness]==0.3.2"]) == "0.3.2"
+    assert _engine_pin(["pytest>=8"]) is None
+    # The reason this predicate exists rather than reusing _EXACT_PIN: that one cannot see extras.
+    assert _unpinned(["messagefoundry[harness]==0.3.2"]) == ["messagefoundry[harness]==0.3.2"]
 
 
 def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
@@ -193,12 +222,10 @@ def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
     nailed down, PySide6 stops being installed, and the GUI fails to start on a fresh install while
     every version check in the release still passes.
     """
-    from packaging.requirements import Requirement
-
     deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
-    engine = [r for raw in deps if _normalise((r := Requirement(raw)).name) == "messagefoundry"]
-    assert len(engine) == 1, f"expected exactly one requirement on the engine, found {len(engine)}"
-    assert engine[0].extras == {"harness"}, (
-        f"the harness depends on messagefoundry{sorted(engine[0].extras)}, not [harness] - the extra "
+    engine = _engine_requirement(deps)
+    assert engine is not None, "the harness declares no requirement on the engine at all"
+    assert engine.extras == {"harness"}, (
+        f"the harness depends on messagefoundry{sorted(engine.extras)}, not [harness] - the extra "
         f"is what installs PySide6, so the GUI would not start on a fresh install"
     )
