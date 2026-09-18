@@ -4277,6 +4277,44 @@ class AuthService:
             ),
         )
 
+    async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
+        """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live
+        session it holds (BACKLOG #1474). Returns the number of sessions revoked.
+
+        The account keeps ``auth_provider='ad'``. A federated account is an AD row carrying an extra
+        pair, so a NULL pair is exactly the state every AD account is in before its first federated
+        login: a coherent directory account, still swept by :meth:`reconcile_directory_sessions`.
+        The next federated login for it binds whatever subject then presents, which is what an
+        operator unbinding it wants.
+
+        The store clears the pair and revokes the sessions in one transaction, so a session issued
+        under the old binding cannot outlive it. The audit row carries the prior pair and the
+        revoked count, so an operator can SEE that the unbind killed sessions rather than infer it.
+
+        Raises :class:`ValueError` for an unknown user, and for an account with no binding: an
+        unbind of nothing would still revoke sessions, and a no-op should not sign anybody out.
+        """
+        user = await self._store.get_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        if user.oidc_issuer is None and user.oidc_subject is None:
+            raise ValueError("the account has no federated binding to remove")
+        revoked = await self._store.clear_user_federated_subject(user_id)
+        await self._audit(
+            "auth.federated_subject_unbound",
+            actor=actor,
+            detail=_json(
+                {
+                    "user_id": user_id,
+                    "username": user.username,
+                    "issuer": user.oidc_issuer,
+                    "subject": user.oidc_subject,
+                    "sessions_revoked": revoked,
+                }
+            ),
+        )
+        return revoked
+
     async def set_channel_scope(
         self, user_id: str, channels: Sequence[str] | None, *, actor: str
     ) -> None:
