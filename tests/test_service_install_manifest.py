@@ -17,17 +17,35 @@ These guards read the script source (located via ``service.install_script_path()
   3. the download is TLS-hardened (Tls12) and extraction selects ``win64\\nssm.exe``.
 
 The basis is CWE-494 (download of code without integrity check) / SLSA-style artifact pinning.
+
+BEHAVIOURAL GUARDS WERE ADDED LATER, AND THEY ARE NOT STATIC (BACKLOG #1573, #1558, #1699, #1553).
+Some of what these scripts must get right cannot be witnessed by reading them: whether a failure
+message still carries a password, whether a stop is confirmed, what DACL ``icacls`` actually leaves on
+a directory. Those guards EXTRACT the named function from the .ps1 by PowerShell AST, dot-source that
+one function into an isolated scope, and RUN it -- the pattern
+``tests/test_install_gate_allowlist_merge.py`` established for ``install-gate.ps1``, skipping when
+``pwsh`` is absent the way ``tests/test_collision_gate.py`` does. Extracting one function runs no other
+line of the installer, so nothing here installs, downloads, or touches a service.
+
+The static guards are kept alongside, because an executed FUNCTION says nothing about whether the
+script still CALLS it -- which is exactly the #1699 complaint about this file.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
 
 import pytest
 
 import messagefoundry.service as svc
 
 _SCRIPT = svc.install_script_path()
+_UNINSTALL = svc.uninstall_script_path()
 
 pytestmark = pytest.mark.skipif(
     _SCRIPT is None,
@@ -38,6 +56,63 @@ pytestmark = pytest.mark.skipif(
 def _script_text() -> str:
     assert _SCRIPT is not None  # narrowed by the module-level skipif
     return _SCRIPT.read_text(encoding="utf-8")
+
+
+def _uninstall_text() -> str:
+    assert _UNINSTALL is not None
+    return _UNINSTALL.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------- the AST extract-and-run harness
+
+
+def _psq(value: str) -> str:
+    """One PowerShell single-quoted literal. Backslashes are literal inside single quotes."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _extract(path: Path, names: list[str], body: str) -> str:
+    """A script that dot-sources ``names`` out of ``path`` by AST, then runs ``body`` against them.
+
+    ``ParseFile`` parses; it never runs the file. Only the named function definitions are then
+    executed, so no preflight, download, ACL call or service registration in the source script runs.
+    """
+    lines = [
+        "& {",
+        "  $ErrorActionPreference = 'Stop'",
+        f"  $src = {_psq(str(path))}",
+        "  $ast = [System.Management.Automation.Language.Parser]::ParseFile("
+        "$src, [ref]$null, [ref]$null)",
+        "  foreach ($n in @(" + ", ".join(_psq(n) for n in names) + ")) {",
+        "    $fn = $ast.Find({ $args[0] -is "
+        "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
+        "$args[0].Name -eq $n }, $true)",
+        '    if (-not $fn) { throw "not defined in $(Split-Path -Leaf $src): $n" }',
+        "    . ([scriptblock]::Create($fn.Extent.Text))",
+        "  }",
+        body,
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+def _run(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    if shutil.which("pwsh") is None:
+        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+    f = tmp_path / f"harness-{uuid.uuid4().hex}.ps1"
+    f.write_text(script, encoding="utf-8")
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(f)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+def _ok(script: str, tmp_path: Path) -> str:
+    r = _run(script, tmp_path)
+    assert r.returncode == 0, f"harness failed:\n{(r.stderr + r.stdout)[:2000]}"
+    return r.stdout
 
 
 def _pinned_sha() -> str:
@@ -158,4 +233,131 @@ def test_gmsa_preflight_and_logon_right_are_wired(monkeypatch: pytest.MonkeyPatc
     )
     assert re.search(r"\[switch\]\$SkipGmsaPreflight", text), (
         "the -SkipGmsaPreflight opt-out is missing"
+    )
+
+
+# --- the nssm failure message must not carry the service-account password (BACKLOG #1573) ---------
+# ``Invoke-Nssm`` throws "nssm <args> failed (exit N)" on a non-zero exit. One of its 19 call sites
+# passes the service-account password, so a joined message there puts cleartext into the throw, the
+# host's error rendering, and the $Error record it leaves behind.
+#
+# THE NAIVE FIX IS THE ONE TO GUARD AGAINST: stripping the arguments from every message would pass a
+# test that only checks "the password is absent", and would also destroy the 18 messages an operator
+# actually needs. So the ordinary-call arm below is a POSITIVE CONTROL, not a bonus assertion -- it is
+# what distinguishes a redaction from an erasure.
+
+_SECRET = "hunter2-DO-NOT-LEAK-THIS"
+
+_NSSM_STUB = "@echo off\r\necho nssm: the service could not be configured 1>&2\r\nexit /b 3\r\n"
+
+
+def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
+    """Run Invoke-Nssm against a stub that always exits 3, once with a secret and once without.
+
+    Everything a leaked password could reach is collected per arm: the exception message, the error
+    record as the host renders it, the record's full property dump, and the $Error entry.
+    """
+    assert _SCRIPT is not None
+    stub = tmp_path / "nssm-stub.cmd"
+    stub.write_text(_NSSM_STUB, encoding="ascii")
+    body = rf"""
+  $NssmPath = {_psq(str(stub))}
+  $out = [ordered]@{{}}
+  foreach ($arm in 'sensitive', 'ordinary') {{
+    $Error.Clear()
+    $text = ''
+    try {{
+      if ($arm -eq 'sensitive') {{
+        Invoke-Nssm -Secret {_psq(_SECRET)} set MessageFoundry ObjectName 'DOMAIN\svc'
+      }} else {{
+        Invoke-Nssm set MessageFoundry AppStdout 'C:\ProgramData\MessageFoundry\logs\service.out.log'
+      }}
+    }} catch {{
+      $text = @(
+        $_.Exception.Message
+        ($_ | Out-String)
+        ($_ | Format-List * -Force | Out-String)
+        ($Error | Out-String)
+      ) -join "`n"
+    }}
+    $out[$arm] = $text
+  }}
+  $out | ConvertTo-Json -Depth 4 -Compress
+"""
+    raw = _ok(_extract(_SCRIPT, ["Invoke-Nssm"], body), tmp_path)
+    parsed: dict[str, str] = json.loads(raw.strip().splitlines()[-1])
+    return parsed
+
+
+def test_nssm_failure_message_redacts_the_service_account_password(tmp_path: Path) -> None:
+    """The password never reaches the throw, the rendered record, or the $Error entry."""
+    arms = _invoke_nssm_arms(tmp_path)
+    sensitive = arms["sensitive"]
+    assert sensitive, "the sensitive arm did not throw -- the stub's exit 3 was not detected"
+    assert _SECRET not in sensitive, (
+        "the service-account password reached the nssm failure message / $Error record "
+        f"(BACKLOG #1573):\n{sensitive[:1500]}"
+    )
+    assert "<redacted>" in sensitive, (
+        "the redaction placeholder is missing -- the secret must be replaced in the message, not "
+        "silently dropped, so an operator can see an argument was withheld"
+    )
+    assert "ObjectName" in sensitive, (
+        "even the redacted message must still name the failing subcommand, or the fix has traded a "
+        "leak for an unusable message"
+    )
+
+
+def test_ordinary_nssm_failures_still_name_their_arguments(tmp_path: Path) -> None:
+    """POSITIVE CONTROL. Without this, emptying every message passes the test above.
+
+    18 of the 19 call sites carry no secret and their joined arguments are the whole diagnostic
+    value of the throw.
+    """
+    arms = _invoke_nssm_arms(tmp_path)
+    ordinary = arms["ordinary"]
+    assert ordinary, "the ordinary arm did not throw -- the stub's exit 3 was not detected"
+    assert "AppStdout" in ordinary, "an ordinary nssm failure must still name its subcommand"
+    assert "service.out.log" in ordinary, (
+        "an ordinary nssm failure must still name its arguments -- a fix that strips every "
+        "argument would satisfy the redaction test while destroying 18 useful messages"
+    )
+    assert "exit 3" in ordinary, "the failure message must carry nssm's exit code"
+
+
+def test_the_password_call_site_passes_the_secret_by_name(tmp_path: Path) -> None:
+    """CALL-SITE guard: a correct Invoke-Nssm is no use if ObjectName still passes the password
+    positionally. Located by AST, so a reordering or a rename of the local does not walk past it."""
+    assert _SCRIPT is not None
+    body = """
+  $cmds = @($ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.CommandAst] }, $true) | Where-Object {
+      $_.GetCommandName() -eq 'Invoke-Nssm' })
+  @($cmds | ForEach-Object {
+    $els = @($_.CommandElements | ForEach-Object { $_.Extent.Text })
+    [pscustomobject]@{ text = $_.Extent.Text; elements = $els }
+  }) | ConvertTo-Json -Depth 4 -Compress
+"""
+    raw = _ok(_extract(_SCRIPT, [], body), tmp_path)
+    calls = json.loads(raw.strip().splitlines()[-1])
+    if isinstance(calls, dict):
+        calls = [calls]
+    objectname = [c for c in calls if "ObjectName" in c["elements"]]
+    assert objectname, "no Invoke-Nssm call sets ObjectName -- the run-as account is not configured"
+    secret_calls = [c for c in objectname if "-Secret" in c["elements"]]
+    assert len(secret_calls) == 1, (
+        "exactly one ObjectName call passes the password, and it must pass it as -Secret "
+        f"(BACKLOG #1573); found {len(secret_calls)} of {len(objectname)} ObjectName calls:\n"
+        + "\n".join(c["text"] for c in objectname)
+    )
+    # The password local must appear EXACTLY ONCE on that call, and only as -Secret's argument. A
+    # second occurrence would be a positional argument, which lands in $NssmArgs and is joined into
+    # the message -- the leak, restored beside a fix that looks applied.
+    elements = secret_calls[0]["elements"]
+    secret_at = elements.index("-Secret")
+    password_at = [i for i, e in enumerate(elements) if e == "$plain"]
+    assert password_at == [secret_at + 1], (
+        "the password local must appear exactly once on the ObjectName call, as the argument to "
+        f"-Secret; a second (positional) occurrence is joined into the failure message:\n"
+        f"{secret_calls[0]['text']}"
     )

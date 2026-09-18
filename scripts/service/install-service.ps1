@@ -428,9 +428,38 @@ $AppParams = "serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --p
 # --- install -----------------------------------------------------------------
 
 function Invoke-Nssm {
-    param([Parameter(ValueFromRemainingArguments = $true)]$NssmArgs)
-    & $NssmPath @NssmArgs
-    if ($LASTEXITCODE -ne 0) { throw "nssm $($NssmArgs -join ' ') failed (exit $LASTEXITCODE)" }
+    <#
+      Run nssm and FAIL CLOSED on a non-zero exit, naming the subcommand that failed.
+
+      The failure message joins the arguments because for 18 of the 19 call sites that is exactly what
+      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 19th passes the
+      service-account password as a positional argument, and a joined message there puts a cleartext
+      password into the thrown message, the console, and the $Error record it leaves behind (BACKLOG
+      #1573).
+
+      So the secret is a SEPARATE, NAME-ONLY parameter and the message is built from $NssmArgs, which
+      never holds it. The redaction is therefore a property of how the message is CONSTRUCTED - there
+      is no code path anywhere that assembles a string containing the password and filters it after the
+      fact, which is the version that leaks the first time somebody adds a second message.
+
+      -Secret is name-only because $NssmArgs declares Position = 0: with an explicit position on the
+      remaining-arguments parameter, PowerShell stops binding the unpositioned ones positionally, so
+      `Invoke-Nssm set $ServiceName ...` still binds every token to $NssmArgs. Measured on Windows
+      PowerShell 5.1.26100 (the host CI runs these scripts on) and on PowerShell 7.
+    #>
+    param(
+        # A trailing argument that must never reach a message, a transcript, or an $Error record.
+        # Appended to the nssm command line as the LAST argument; the failure message shows a
+        # placeholder in its place.
+        [string]$Secret,
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]$NssmArgs
+    )
+    $hasSecret = $PSBoundParameters.ContainsKey('Secret')
+    # Built BEFORE the call, from the non-secret arguments only.
+    $shown = @($NssmArgs)
+    if ($hasSecret) { $shown += '<redacted>' }
+    if ($hasSecret) { & $NssmPath @NssmArgs $Secret } else { & $NssmPath @NssmArgs }
+    if ($LASTEXITCODE -ne 0) { throw "nssm $($shown -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
 # If the service already exists, reconfigure it in place (idempotent install).
@@ -491,10 +520,12 @@ if ($ServiceAccount) {
     }
     if ($ServiceAccountPassword) {
         # Convert the SecureString to plaintext only here - NSSM's ObjectName takes a plain password.
+        # -Secret keeps it out of the failure message Invoke-Nssm throws on a non-zero exit (#1573):
+        # passed positionally it would be joined into that message, the console, and the $Error record.
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServiceAccountPassword)
         try {
             $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            Invoke-Nssm set $ServiceName ObjectName $ServiceAccount $plain
+            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $ServiceAccount
         } finally {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
