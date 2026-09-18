@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Generate and verify the provenance record for the vendored CLA action (BACKLOG #1578).
+
+WHAT THIS EXISTS FOR. ``.github/actions/cla-assistant-lite/`` carries 1.18 MB of third-party
+JavaScript that no dependency gate in this repository can see. ``uv``/``pip-audit`` audit Python,
+``npm-audit`` audits ``ide/package-lock.json``, and the SBOM generators inventory the engine, the
+extension and the container image. None of them reach a compiled bundle sitting in ``.github/``.
+So the bundle's only recorded provenance was a checksum in a ledger entry that lives in a separate
+repository, and nothing in this tree could be pointed at a tool.
+
+WHAT IT DOES NOT DO, AND THIS IS THE LOAD-BEARING SENTENCE. A clean audit of
+``upstream-package-lock.json`` proves the DECLARED dependencies of the pinned upstream commit are
+clean. It does not prove this bundle was BUILT from them: reproducing an ncc/webpack build needs a
+Node toolchain this repository does not carry, so nobody can check that here. The record says so in
+its own text (:data:`LIMITATION`) and :mod:`tests.test_cla_action_provenance` fails if that sentence
+goes missing, because a provenance record that quietly implies more than it proves is worse than
+none -- it is a compensating control resting on a false premise.
+
+WHAT IS ACTUALLY PROVEN, and it is more than the ledger checksum was. The vendored bundle is the
+upstream blob at commit ``ca4a40a7`` with a 176-byte two-line header prepended, verified byte for
+byte. So an auditor with no network can recompute the upstream digest from the file on disk:
+
+    sha256 of (dist/index.js with its first two lines removed) == UPSTREAM_BUNDLE_SHA256
+
+which is what :func:`split_vendoring_header` and the test around it check. That turns a recorded
+number into a reproducible derivation.
+
+WHY THE LOCKFILE IS NOT NAMED ``package-lock.json``. GitHub's dependency graph ingests a file with
+that name anywhere in the repository. The 2021-era tree it describes carries advisories nobody here
+can remediate -- moving a pin means rebuilding the bundle, which needs the absent toolchain -- so
+ingesting it would produce unactionable alerts, and repository-level Dependabot security updates
+would open bump PRs against a lockfile with no build behind it. The record is deliberately
+AUDIT-ONLY: readable by a tool an auditor points at it, invisible to one that scans for manifests.
+``.github/dependabot.yml`` carries no npm entry for this directory for the same reason.
+
+TWO DIGEST MODES, and mixing them up silently breaks the record on Windows:
+
+* ``dist/index.js`` is digested over RAW bytes. Its blob genuinely holds 1,297 CRLF pairs and
+  ``.gitattributes`` pins it ``-text`` so no checkout converts it. Normalizing would compute a
+  number that describes no file that exists.
+* Every other recorded file is digested over CRLF-normalized bytes, so the value does not depend on
+  the platform the checkout was made on. Their blobs hold pure LF and ``.gitattributes`` pins them
+  ``eol=lf``; normalizing additionally rescues an older checkout made before that pin landed.
+
+Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` -- runnable as a CI step, by
+hand, and from pytest. The ``--check``/``--write`` generated-record shape, and the LF-normalized
+digest, both follow ``scripts/security/build_password_corpus.py``; the two-line helpers are copied
+rather than imported, because that script pulls in ``messagefoundry.auth`` and importing it would
+drag the engine package into a script whose whole point is running without one::
+
+    python scripts/security/build_cla_action_provenance.py --check   verify the record
+    python scripts/security/build_cla_action_provenance.py --write   regenerate the record
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Literal
+
+# This file is ``<repo>/scripts/security/build_cla_action_provenance.py``, so the root is two up.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: The vendored action's directory, relative to the repository root.
+ACTION_DIR = ".github/actions/cla-assistant-lite"
+
+#: The generated record. CycloneDX because it is the format this project already publishes
+#: (ADR 0149) and because `trivy sbom` / `osv-scanner` read it without a converter.
+RECORD_PATH = f"{ACTION_DIR}/provenance.cdx.json"
+
+#: The upstream repository the bundle was taken from.
+UPSTREAM_REPO = "contributor-assistant/github-action"
+
+#: The exact upstream commit. Every digest below is a fact ABOUT THIS COMMIT and nothing else.
+UPSTREAM_COMMIT = "ca4a40a7d1004f18d9960b404b97e5f30a505a08"
+
+#: The release tag that commit carries.
+UPSTREAM_TAG = "v2.6.1"
+
+#: SHA-256 of the upstream ``dist/index.js`` blob at :data:`UPSTREAM_COMMIT`, over its raw bytes.
+#: Fetched from the GitHub contents API on 2026-09-18 and re-derived offline from the vendored copy
+#: by stripping the vendoring header -- the two agreed, which is what makes this number checkable
+#: without a network.
+UPSTREAM_BUNDLE_SHA256 = "a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb"
+
+#: Git blob id of the upstream ``package-lock.json`` at :data:`UPSTREAM_COMMIT`. Recorded beside the
+#: SHA-256 because it is what the GitHub contents API reports, so a re-fetch is comparable without
+#: downloading the file.
+UPSTREAM_LOCK_BLOB_ID = "5700fc1014797e967a7a5395c1198643634cf204"
+
+#: When the bundle was vendored -- the author date of ``4c884575435bc72a8ae21e0740772aecba999e68``,
+#: the only commit that has ever touched :data:`ACTION_DIR`.
+VENDORED_DATE = "2026-08-29"
+
+#: When this record was built and its upstream digests re-verified against the archived repository.
+RECORDED_DATE = "2026-09-18"
+
+#: ``metadata.timestamp`` is pinned to :data:`RECORDED_DATE` rather than taken from the clock. A
+#: generated file that embeds "now" is never a fixed point of its own generator, so ``--check``
+#: could not be a gate.
+RECORD_TIMESTAMP = f"{RECORDED_DATE}T00:00:00Z"
+
+#: Why the bundle is vendored at all. Stated here so the record carries it and no reader has to
+#: reconstruct the decision from a ledger they cannot open.
+VENDORING_REASON = (
+    "GitHub archived the upstream repository and no maintained fork or successor exists, so the "
+    "action cannot be consumed as a pinned remote `uses:`. Vendoring freezes a reviewed commit "
+    "instead of depending on an archived one that could be deleted or transferred."
+)
+
+#: THE HONESTY CONSTRAINT. Asserted verbatim by the test; do not soften it.
+LIMITATION = (
+    "A clean audit of upstream-package-lock.json proves the DECLARED dependencies of the pinned "
+    "upstream commit are clean. It does NOT prove this bundle was built from them. Reproducing an "
+    "ncc/webpack build needs a Node toolchain this repository does not carry, so nobody can check "
+    "that here, and no number in this record should be read as if somebody had."
+)
+
+#: Where the bundle runs, stated because the answer bounds every severity claim about it. It is a
+#: CI-only artifact: `.github/` is outside `[tool.hatch.build.targets.sdist].only-include`, so no
+#: wheel, sdist or engine deployment carries it.
+EXPOSURE = (
+    "CI only. The bundle executes in .github/workflows/cla.yml on pull_request_target, "
+    "merge_group and issue_comment -- a privileged context holding a repository token. It is not "
+    "packaged into the wheel or sdist and no engine deployment carries it."
+)
+
+#: The vendored bundle, and the lockfile it is audited against. Named once because both the keys of
+#: :data:`RECORDED_FILES` and several direct readers need them, and two spellings of one path drift.
+BUNDLE_PATH = f"{ACTION_DIR}/dist/index.js"
+LOCK_PATH = f"{ACTION_DIR}/upstream-package-lock.json"
+
+#: How a file's bytes are turned into a digest. ``raw`` means exactly the bytes on disk; ``lf``
+#: normalizes CRLF first. Which one a file takes follows its `.gitattributes` pin, not a preference
+#: -- see the two-digest note in the module docstring.
+DigestMode = Literal["raw", "lf"]
+
+#: Files whose bytes are a supply-chain fact, mapped to their digest mode. README.md is deliberately
+#: ABSENT: it is prose about the record, and digesting it would red this gate on an ordinary wording
+#: edit, which is how a gate teaches people to regenerate without reading.
+#:
+#: ``action.yml`` and ``LICENSE`` take ``lf`` because nothing pins them -- `git check-attr text`
+#: reports them unspecified, so `core.autocrlf=true` converts them on checkout and a raw digest of
+#: either would name no file that exists on Windows.
+RECORDED_FILES: dict[str, DigestMode] = {
+    BUNDLE_PATH: "raw",
+    f"{ACTION_DIR}/action.yml": "lf",
+    f"{ACTION_DIR}/LICENSE": "lf",
+    LOCK_PATH: "lf",
+}
+
+#: The vendoring header prepended to the upstream bundle, byte for byte. The vendored file is this
+#: followed by the upstream blob and nothing else, which :func:`split_vendoring_header` verifies.
+VENDORING_HEADER = (
+    b"// SPDX-License-Identifier: Apache-2.0\n"
+    b"// Vendored from contributor-assistant/github-action@"
+    b"ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1). See README.md in this directory.\n"
+)
+
+
+def read_recorded(root: Path) -> dict[str, bytes]:
+    """Read every file in :data:`RECORDED_FILES` once, raw, keyed by repository-relative path.
+
+    One read per file per run. ``dist/index.js`` alone is 1.18 MB and three separate callers want
+    it -- the digest, the header split and the upstream derivation -- so they share this instead of
+    each opening the file. Deliberately NOT cached across calls: the negative-control tests mutate
+    a tree between two checks, and a process-lifetime cache would make them pass while measuring a
+    file that no longer exists.
+    """
+    return {relative: (root / relative).read_bytes() for relative in sorted(RECORDED_FILES)}
+
+
+def digest(data: bytes, mode: DigestMode) -> str:
+    """SHA-256 of *data* under *mode*. One definition, so every caller agrees.
+
+    An unknown mode raises rather than falling through to a default: a typo would otherwise be a
+    silently wrong digest, and the recorded value would look like any other.
+    """
+    if mode == "raw":
+        return hashlib.sha256(data).hexdigest()
+    if mode == "lf":
+        return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+    raise ValueError(f"unknown digest mode {mode!r}")
+
+
+def digest_mode_summary() -> str:
+    """The digest-mode rule as one sentence, DERIVED from :data:`RECORDED_FILES` rather than
+    restated. A hand-written summary is a fifth copy of the rule that no gate compares."""
+    raw = sorted(rel for rel, mode in RECORDED_FILES.items() if mode == "raw")
+    lf = sorted(rel for rel, mode in RECORDED_FILES.items() if mode == "lf")
+    return (
+        f"raw bytes for {', '.join(raw) or 'nothing'}; "
+        f"CRLF normalized to LF for {', '.join(lf) or 'nothing'}"
+    )
+
+
+def split_vendoring_header(bundle: bytes) -> bytes:
+    """Return *bundle* with its vendoring header removed, which is the upstream blob.
+
+    Raises :class:`ValueError` when the file does not start with :data:`VENDORING_HEADER`, because
+    then the derivation this record rests on -- body digest equals the upstream blob digest -- is
+    not the thing being measured any more.
+    """
+    if not bundle.startswith(VENDORING_HEADER):
+        raise ValueError(
+            "the vendored bundle does not start with the recorded vendoring header, so its "
+            "upstream body cannot be derived; re-check the vendoring before regenerating"
+        )
+    return bundle[len(VENDORING_HEADER) :]
+
+
+def _purl(name: str, version: str) -> str:
+    """PackageURL for an npm package. A scoped name's leading ``@`` is percent-encoded, per the
+    purl spec's npm type: ``@actions/core`` -> ``pkg:npm/%40actions/core``."""
+    encoded = "%40" + name[1:] if name.startswith("@") else name
+    return f"pkg:npm/{encoded}@{version}"
+
+
+def lock_components(lock: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every distinct package the upstream lockfile declares, as CycloneDX components.
+
+    Deduplicated by PackageURL: npm records one entry per INSTALL PATH, so the same name+version
+    appears several times when it is hoisted differently at different depths, and an inventory
+    listing it twice says nothing an auditor can use. ``scope`` carries npm's ``dev`` flag through
+    as CycloneDX ``excluded``, which is what a scanner reads to separate the upstream BUILD
+    toolchain from the closure that could have reached the bundle.
+
+    NO PER-COMPONENT HASHES, deliberately. npm's ``integrity`` digests the REGISTRY TARBALL, not
+    anything in this repository, so carrying it here would invite the exact reading
+    docs/SUPPLY-CHAIN.md warns against -- an SBOM read as an integrity check on the artifact rather
+    than as an inventory. The values stay available verbatim in the vendored lockfile beside this
+    record, where what they cover is unambiguous.
+    """
+    packages = lock.get("packages", {})
+    by_purl: dict[str, dict[str, Any]] = {}
+    for path, entry in packages.items():
+        if not path or not isinstance(entry, dict):
+            continue  # the "" key is the upstream root project, described by metadata.component
+        name = path.rsplit("node_modules/", 1)[-1]
+        version = entry.get("version")
+        if not name or not isinstance(version, str):
+            continue
+        purl = _purl(name, version)
+        dev = bool(entry.get("dev"))
+        existing = by_purl.get(purl)
+        if existing is not None:
+            # A package hoisted at one depth and dev-only at another is required overall.
+            if not dev:
+                existing["scope"] = "required"
+            continue
+        component: dict[str, Any] = {
+            "type": "library",
+            "bom-ref": purl,
+            "name": name,
+            "version": version,
+            "purl": purl,
+            "scope": "excluded" if dev else "required",
+        }
+        by_purl[purl] = component
+    return [by_purl[purl] for purl in sorted(by_purl)]
+
+
+def _properties(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
+    return [{"name": name, "value": value} for name, value in pairs]
+
+
+def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
+    """Build the whole record from already-read file *contents*. Pure: no I/O, returns a document."""
+    digests = {rel: digest(contents[rel], mode) for rel, mode in sorted(RECORDED_FILES.items())}
+
+    lock = json.loads(contents[LOCK_PATH].replace(b"\r\n", b"\n").decode("utf-8"))
+    components = lock_components(lock)
+    runtime = sum(1 for c in components if c["scope"] == "required")
+
+    # Deterministic and stable: the same upstream commit always yields the same serial number, and
+    # a different one always yields a different one. A random UUID would make every regeneration a
+    # diff, which would train a reviewer to skip reading it.
+    serial = uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/{UPSTREAM_REPO}/{UPSTREAM_COMMIT}")
+
+    metadata_properties = [
+        ("messagefoundry:provenance:limitation", LIMITATION),
+        ("messagefoundry:provenance:exposure", EXPOSURE),
+        ("messagefoundry:provenance:reason", VENDORING_REASON),
+        ("messagefoundry:provenance:vendored-date", VENDORED_DATE),
+        ("messagefoundry:provenance:recorded-date", RECORDED_DATE),
+        (
+            "messagefoundry:provenance:ledger-rows",
+            "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record)",
+        ),
+        ("messagefoundry:provenance:generator", "scripts/security/build_cla_action_provenance.py"),
+        (
+            "messagefoundry:provenance:audit-command",
+            "osv-scanner --lockfile package-lock.json:.github/actions/cla-assistant-lite/"
+            "upstream-package-lock.json",
+        ),
+        (
+            "messagefoundry:provenance:dependency-graph",
+            "The lockfile is named upstream-package-lock.json, not package-lock.json, so GitHub's "
+            "dependency graph does not ingest it as this repository's own manifest. It describes "
+            "an upstream tree nobody here can move: the record is audit-only by construction.",
+        ),
+    ]
+
+    component_properties = [
+        ("messagefoundry:vendored:path", BUNDLE_PATH),
+        ("messagefoundry:upstream:commit", UPSTREAM_COMMIT),
+        ("messagefoundry:upstream:tag", UPSTREAM_TAG),
+        ("messagefoundry:upstream:bundle-sha256", UPSTREAM_BUNDLE_SHA256),
+        (
+            "messagefoundry:upstream:bundle-derivation",
+            "The vendored file is the upstream blob with a "
+            f"{len(VENDORING_HEADER)}-byte two-line header prepended and nothing else changed. "
+            "Strip the first two lines and the SHA-256 of what remains is the upstream digest "
+            "above -- reproducible offline, no network and no Node.",
+        ),
+        ("messagefoundry:upstream:lock-blob-id", UPSTREAM_LOCK_BLOB_ID),
+        ("messagefoundry:upstream:lock-packages", str(len(components))),
+        ("messagefoundry:upstream:lock-packages-runtime", str(runtime)),
+        ("messagefoundry:recorded-files:digest-mode", digest_mode_summary()),
+    ] + [
+        (f"messagefoundry:recorded-files:sha256:{rel}", sha) for rel, sha in sorted(digests.items())
+    ]
+
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "serialNumber": f"urn:uuid:{serial}",
+        "version": 1,
+        "metadata": {
+            "timestamp": RECORD_TIMESTAMP,
+            "lifecycles": [{"phase": "build"}],
+            "tools": {
+                "components": [
+                    {
+                        "type": "application",
+                        "name": "build_cla_action_provenance.py",
+                        "group": "messagefoundry",
+                    }
+                ]
+            },
+            "component": {
+                "type": "application",
+                "bom-ref": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                "name": "cla-assistant-lite",
+                "version": UPSTREAM_TAG,
+                "description": (
+                    "Vendored compiled bundle of the archived "
+                    f"{UPSTREAM_REPO} GitHub Action, run by .github/workflows/cla.yml."
+                ),
+                "purl": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                "licenses": [{"license": {"id": "Apache-2.0"}}],
+                "hashes": [{"alg": "SHA-256", "content": digests[BUNDLE_PATH]}],
+                "externalReferences": [
+                    {
+                        "type": "vcs",
+                        "url": f"https://github.com/{UPSTREAM_REPO}/tree/{UPSTREAM_COMMIT}",
+                    },
+                    {
+                        "type": "distribution",
+                        "url": (
+                            f"https://github.com/{UPSTREAM_REPO}/blob/{UPSTREAM_COMMIT}/"
+                            "dist/index.js"
+                        ),
+                    },
+                    {
+                        "type": "license",
+                        "url": f"https://github.com/{UPSTREAM_REPO}/blob/{UPSTREAM_COMMIT}/LICENSE",
+                    },
+                ],
+                "properties": _properties(component_properties),
+            },
+            "properties": _properties(metadata_properties),
+        },
+        "components": components,
+    }
+
+
+def render(record: dict[str, Any]) -> str:
+    """Serialize *record* deterministically: two-space indent, LF, one trailing newline."""
+    return json.dumps(record, indent=2, ensure_ascii=False, sort_keys=False) + "\n"
+
+
+def verify_derivation(contents: dict[str, bytes]) -> list[str]:
+    """The checks that are facts rather than formatting. Returns human-readable problems."""
+    try:
+        body = split_vendoring_header(contents[BUNDLE_PATH])
+    except ValueError as exc:
+        return [str(exc)]
+    body_sha = hashlib.sha256(body).hexdigest()
+    if body_sha != UPSTREAM_BUNDLE_SHA256:
+        return [
+            "the vendored bundle's body does not reproduce the recorded upstream digest: "
+            f"got {body_sha}, recorded {UPSTREAM_BUNDLE_SHA256}. The bundle was changed, or it is "
+            "no longer the upstream blob at " + UPSTREAM_COMMIT
+        ]
+    return []
+
+
+def check(root: Path) -> list[str]:
+    """Every reason the record on disk fails to describe the tree at *root*. Empty means clean."""
+    contents = read_recorded(root)
+    problems = verify_derivation(contents)
+    record_path = root / RECORD_PATH
+    if not record_path.exists():
+        return problems + [f"{RECORD_PATH} does not exist; run --write"]
+    if problems:
+        # The derivation already failed, so the record cannot be rendered (a missing header raises)
+        # or would be compared against a bundle that is not the one it describes. Either way the
+        # fixed-point answer would add nothing to the problem already found.
+        return problems
+    # read_text applies universal-newline translation, so a CRLF checkout of the record compares
+    # equal to the LF form render() produces without normalizing here.
+    if record_path.read_text(encoding="utf-8") != render(build_record(contents)):
+        problems.append(
+            f"{RECORD_PATH} is not a fixed point of its generator -- it no longer describes the "
+            "vendored tree. Read what changed before regenerating: "
+            "python scripts/security/build_cla_action_provenance.py --write"
+        )
+    return problems
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true", help="verify the record describes the tree")
+    mode.add_argument("--write", action="store_true", help="regenerate the record")
+    parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository root to read")
+    args = parser.parse_args(argv)
+
+    root: Path = args.root
+    if args.write:
+        contents = read_recorded(root)
+        problems = verify_derivation(contents)
+        if problems:
+            for problem in problems:
+                print(f"REFUSED: {problem}", file=sys.stderr)
+            print(
+                "Refusing to write a record over a bundle whose provenance does not check out. "
+                "A regenerated record would launder the change into evidence.",
+                file=sys.stderr,
+            )
+            return 2
+        record = render(build_record(contents))
+        (root / RECORD_PATH).write_text(record, encoding="utf-8", newline="\n")
+        print(f"wrote {RECORD_PATH}")
+        return 0
+
+    problems = check(root)
+    for problem in problems:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    if problems:
+        return 1
+    print(f"{RECORD_PATH} describes the vendored tree")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+    raise SystemExit(main())
