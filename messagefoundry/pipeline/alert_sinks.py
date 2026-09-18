@@ -325,8 +325,8 @@ class WebhookTransport:
         # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
         # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
         # runs first so no later message can reach one. This sink is built outside the connector gate,
-        # so the transports' own construction refusal never saw this URL. Imported lazily, like the
-        # length gate below, to keep this module's import cost unchanged for the non-webhook sinks.
+        # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
+        # module's import cost unchanged for the far commoner non-webhook sinks.
         from messagefoundry.transports.rest import (
             enforce_outbound_length_limits,
             refuse_url_credentials,

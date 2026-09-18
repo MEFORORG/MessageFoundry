@@ -10,7 +10,7 @@ turns URL userinfo into an ``Authorization`` header. But the ``InvalidURL`` text
 ``safe_exc`` kept the text, so it reached ``queue.last_error``/``messages.error`` and the
 test-connection reply (gated only by ``connections:test``).
 
-THREE LAYERS, each tested here:
+THREE LAYERS, each tested here, then two sites the construction refusal does not reach first:
 
 1. Construction refuses userinfo (and a port that is not a number, which is what a password holding
    an unencoded ``/`` looks like to ``urlsplit``) in every endpoint URL at least these sites read:
@@ -19,6 +19,10 @@ THREE LAYERS, each tested here:
 2. ``redaction.redact`` drops the userinfo from the ``nonnumeric port`` shape, so ``safe_exc``,
    ``safe_text``, the installed log filter chain and the support-bundle redactor all lose it.
 3. DICOMweb and SOAP classify an ``InvalidURL`` (send and probe) instead of letting it escape.
+4. The ``[alerts].webhook_url`` sink, built in the app lifespan, gets the same refusal, and no refusal
+   there prints the URL.
+5. The ``[egress]`` allowlist, which runs BEFORE connector construction, neither raises with nor
+   echoes a credential.
 
 Synthetic values only. Nothing here opens a socket: ``http.client`` raises ``InvalidURL`` before it
 connects.
@@ -37,6 +41,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
+from messagefoundry.pipeline.alert_sinks import WebhookTransport
 from messagefoundry.pipeline.wiring_runner import (
     _http_egress_allowed,
     build_check_registry,
@@ -355,30 +360,19 @@ async def test_fhir_lookup_read_and_probe_classify_a_real_invalid_url() -> None:
 
 @pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
 def test_the_alert_webhook_refuses_a_credential_in_its_url(shape: str) -> None:
-    from messagefoundry.pipeline.alert_sinks import WebhookTransport
-
     with pytest.raises(ValueError) as exc:
         WebhookTransport(_USERINFO_SHAPES[shape])
     assert SECRET not in str(exc.value), str(exc.value)
     assert "[alerts].webhook_url" in str(exc.value)
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        f"http://svc:{SECRET}@hooks.example.invalid/x",  # the userinfo shape, over cleartext
-        f"http://hooks.example.invalid/services/{SECRET}",  # a path token, which IS the credential
-    ],
-    ids=["userinfo", "path_token"],
-)
 def test_the_cleartext_webhook_refusal_never_echoes_the_url(
-    url: str, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from messagefoundry.pipeline.alert_sinks import WebhookTransport
-
+    """A Slack-style path token IS the credential, so the cleartext refusal must not print the URL."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with pytest.raises(ValueError) as exc:
-        WebhookTransport(url)
+        WebhookTransport(f"http://hooks.example.invalid/services/{SECRET}")
     assert SECRET not in str(exc.value), str(exc.value)
     assert "[alerts].webhook_url" in str(exc.value)
 
@@ -386,8 +380,6 @@ def test_the_cleartext_webhook_refusal_never_echoes_the_url(
 def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None:
     """Neither of these echoed a credential before, since a scheme cannot hold one and the host is
     screened at construction. They name the setting so every refusal in the sink reads the same way."""
-    from messagefoundry.pipeline.alert_sinks import WebhookTransport
-
     with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be http or https"):
         WebhookTransport(f"ftp://hooks.example.invalid/{SECRET}")
     sink = WebhookTransport(
@@ -402,8 +394,6 @@ def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None
 def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
     """The control half: a secret PATH token is how Slack and Teams hooks authenticate, so it must
     still construct. So must an ``@`` in the path or query."""
-    from messagefoundry.pipeline.alert_sinks import WebhookTransport
-
     for url in (
         f"https://hooks.example.invalid/services/{SECRET}",
         "https://hooks.example.invalid:8443/x",
