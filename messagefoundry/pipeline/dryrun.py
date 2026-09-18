@@ -73,6 +73,9 @@ __all__ = [
     "disposition_for",
     "dry_run",
     "select_inbound",
+    "AmbiguousInboundError",
+    "NoInboundError",
+    "UnknownInboundError",
     "read_messages",
     "read_message_sets",
     "split_messages",
@@ -707,16 +710,40 @@ class DryRunResult:
     error: str | None = None
 
 
+class NoInboundError(ValueError):
+    """:func:`select_inbound` found no inbound connection at all, so there is nothing to simulate."""
+
+
+class UnknownInboundError(ValueError):
+    """:func:`select_inbound` was given a name the config does not declare (a typo, or a rename)."""
+
+
+class AmbiguousInboundError(ValueError):
+    """:func:`select_inbound` found several inbound connections and was not told which to use."""
+
+
 def select_inbound(registry: Registry, name: str | None = None) -> InboundConnection:
-    """Pick which inbound connection (Router) to simulate; defaults to the sole one."""
+    """Pick which inbound connection (Router) to simulate; defaults to the sole one.
+
+    **Three failures, three types (BACKLOG #1707),** so a caller can tell an operator's open choice
+    (:class:`AmbiguousInboundError`) from a defect (:class:`UnknownInboundError`,
+    :class:`NoInboundError`). Each is a ``ValueError``, so a caller catching that still works.
+
+    The empty check runs first, even when a name is given: the missing name is a symptom there, and
+    the empty config is the cause. Refusing an empty graph at load time is BACKLOG #1648."""
+    if not registry.inbound:
+        raise NoInboundError("config loaded no inbound connection, so there is nothing to simulate")
     if name is not None:
         try:
             return registry.inbound[name]
         except KeyError:
-            raise ValueError(f"no such inbound connection: {name!r}") from None
+            raise UnknownInboundError(
+                f"no such inbound connection: {name!r}; the config has: "
+                + ", ".join(sorted(registry.inbound))
+            ) from None
     if len(registry.inbound) == 1:
         return next(iter(registry.inbound.values()))
-    raise ValueError(
+    raise AmbiguousInboundError(
         "config has multiple inbound connections; choose one: "
         + ", ".join(sorted(registry.inbound))
     )
