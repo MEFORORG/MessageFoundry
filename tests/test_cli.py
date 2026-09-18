@@ -279,6 +279,69 @@ def test_dryrun_show_phi_still_yields_the_raised_text(
     assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
 
 
+# --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
+#
+# A SetMeta key and value are both message-derived in the general case, so this fixture builds each
+# from a PID field the way an author tagging a message does. Synthetic data only (CLAUDE.md §9).
+META_WRITER_CONFIG = """\
+# SPDX-License-Identifier: AGPL-3.0-or-later
+from messagefoundry import File, SetMeta, handler, inbound, router
+
+inbound("IB_TEST", File(directory="in"), router="r")
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def h(msg):
+    return [SetMeta("patient " + str(msg["PID-5"]), "mrn " + str(msg["PID-3"]))]
+"""
+
+
+def _meta_writer(tmp_path: Path) -> tuple[str, str]:
+    """A config dir whose handler declares one ``SetMeta``, plus the message file ``dryrun`` wants."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(META_WRITER_CONFIG, encoding="utf-8")
+    fixtures = tmp_path / "messages" / "IB_TEST"
+    fixtures.mkdir(parents=True)
+    message = fixtures / "a.hl7"
+    message.write_bytes(PHI_RAISER_MESSAGE.encode("utf-8"))
+    return str(cfg), str(message)
+
+
+def test_dryrun_prints_meta_ops_redacted_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI emits a ``meta_ops`` key, and redacts both members without ``--show-phi``.
+
+    Before BACKLOG #1692 the output dict had no ``meta_ops`` key at all, and the field behind it was
+    never populated, so a Handler's ``SetMeta`` was invisible on this surface.
+    """
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json"]) == 0
+    out = capsys.readouterr().out
+    ops = json.loads(out)[0]["meta_ops"]
+    # The instrument has to have observed a SetMeta at all, or the absences below prove nothing.
+    assert len(ops) == 1, f"the fixture handler declared no SetMeta: {ops!r}"
+    assert "redacted" in ops[0]["key"] and "redacted" in ops[0]["value"]
+    for token in PHI_TOKENS:
+        assert token not in out, f"{token!r} reached dryrun stdout"
+
+
+def test_dryrun_show_phi_yields_the_declared_meta_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The opt-in arm: ``--show-phi`` returns the key and value the Handler actually declared."""
+    cfg, message = _meta_writer(tmp_path)
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", "--show-phi"]) == 0
+    ops = json.loads(capsys.readouterr().out)[0]["meta_ops"]
+    assert ops == [{"key": "patient DOE^JANE^Q", "value": "mrn 900123456^^^H^MR"}]
+
+
 def test_check_redacts_a_raised_exception_and_offers_no_opt_in(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

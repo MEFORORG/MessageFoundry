@@ -27,13 +27,26 @@
     on Available, print the receipt, and refuse when it is false. Count what you EXAMINED, not what you
     found.
 
-    AN UNPLACEABLE RECORD MAKES THE WHOLE FENCE UNAVAILABLE. Two shapes qualify -- a file that will not
-    parse, and a record that parses but carries no cwd -- and BOTH used to be dropped on the floor by a
-    silent `continue`, so they appeared in no count at all. Neither can be attributed to, or cleared
+    AN UNPLACEABLE RECORD MAKES THE WHOLE FENCE UNAVAILABLE. Three shapes qualify -- a file that will
+    not parse, a record that parses but carries no cwd, and a record whose cwd is a checkout of THIS
+    repo that `git worktree list` no longer carries. Each one reached this file as a silent `continue`
+    and so appeared in no count at all, and the third was still being dropped for as long as it took
+    anyone to notice that fixing the first two had not fixed it. None can be attributed to, or cleared
     from, any particular worktree: it could be a session sitting in the very tree the caller is about to
     delete. A file caught HALF-WRITTEN is exactly this shape, which makes it the signature of a session
     that launched seconds ago. Refusing the whole run is the only answer that cannot destroy one; the
     remedy is to look at the named file and re-run.
+
+    THE THIRD SHAPE IS THE STATE THE INCIDENT PRODUCED. prune-merged.ps1's header records a run that
+    deregistered an occupied worktree and then failed to delete the directory, leaving a session whose
+    every git command failed. From that moment its record's cwd names a checkout git does not list, and
+    a bare `continue` here made that session INVISIBLE rather than UNPLACEABLE -- so RecordsUnplaceable
+    could not rise, Available could not go false, and a fence that cannot fail measures nothing.
+
+    IT IS A NARROW SHAPE ON PURPOSE. Most records on this host name OTHER repositories, and faulting
+    those would leave the fence permanently unavailable -- which disarms every caller as thoroughly as
+    never refusing at all. Get-UnplaceableCwdReason below holds the whole boundary and says what
+    evidence each side of it rests on.
 
     RecordsExamined and RecordsUnplaceable deliberately OVERLAP: the first counts what parsed, the
     second counts what cannot be placed, and a cwd-less record is both.
@@ -129,6 +142,90 @@ function Get-RepoWorktrees([string]$RepoHint) {
     return $out
 }
 
+# This repo's SHARED git directory, absolute and normalised, or '' when git cannot say. Every worktree
+# of one repo reports the same value and a different clone never does, so it is the identity a stray
+# checkout is matched against below.
+function Get-RepoCommonDir([string]$RepoHint) {
+    $gitArgs = @()
+    if ($RepoHint) { $gitArgs = @("-C", $RepoHint) }
+    $cd = & git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $cd) { return '' }
+    return (ConvertTo-Norm ([string]$cd).Trim())
+}
+
+# The git directory a path belongs to, found by walking UP from it the way git does, normalised. '' when
+# nothing up the chain is a checkout.
+#
+# PURE FILESYSTEM, AND THAT IS THE POINT. `git -C <path> rev-parse` fails outright once a worktree's
+# admin entry under <common-dir>/worktrees/ has been pruned -- which is exactly the state this gets
+# asked about -- so git would answer "not a repository" for a checkout whose own .git file still names
+# this repo. Reading the pointer ourselves survives deregistration, and it is the same evidence
+# prune-merged.ps1 uses to recognise an orphan it left behind.
+function Get-OwningGitCommonDir([string]$Path) {
+    $cur = $Path
+    # Bounded: a path that never resolves to a drive root must not spin a SessionStart hook.
+    for ($i = 0; $i -lt 64 -and $cur; $i++) {
+        $dot = Join-Path $cur '.git'
+        # The primary checkout carries the common dir itself as a DIRECTORY.
+        if (Test-Path -LiteralPath $dot -PathType Container) { return (ConvertTo-Norm $dot) }
+        if (Test-Path -LiteralPath $dot -PathType Leaf) {
+            $txt = ''
+            try { $txt = Get-Content -LiteralPath $dot -Raw -EA Stop } catch { return '' }
+            if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return '' }
+            $gitdir = ConvertTo-Norm ($Matches[1].Trim())
+            # A LINKED worktree's pointer names <common-dir>/worktrees/<name>. Fold it onto the common
+            # dir so both spellings compare as the one identity.
+            if ($gitdir -match '^(.+)/worktrees/[^/]+$') { return $Matches[1] }
+            return $gitdir
+        }
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    return ''
+}
+
+# Why a record that matched no worktree is a FAULT rather than simply somebody else's session. Returns
+# '' when it is not this fence's business.
+#
+# THE BOUNDARY IS THE WHOLE OF THIS FUNCTION, and it cuts both ways. Under-flagging is the defect this
+# was written for: a session in a deregistered checkout vanished, so the fence cleared worktrees it had
+# never accounted for. Over-flagging costs exactly as much in the other direction -- most records on
+# this host name other repositories, and faulting those leaves the fence permanently unavailable, which
+# a caller stops reading. So a fault needs EVIDENCE that the cwd is a checkout of THIS repo, and the two
+# ways of getting it differ because the two states differ:
+#
+#   * THE DIRECTORY IS STILL THERE. Read its own .git pointer and compare git directories. That is
+#     positive proof, it survives deregistration, and a directory that merely shares the `<primary>-`
+#     name prefix -- an unrelated clone, or a plain folder -- fails it and is left alone. presence.ps1
+#     is already pinned against that prefix trap for attribution; this must not reintroduce it.
+#   * THE DIRECTORY IS GONE. Nothing on disk can say whose it was, so the only evidence left is the
+#     name, and `<primary>-<slug>` is what scripts/worktree/new.ps1 builds. A cwd under that naming
+#     which no longer exists is a worktree of this repo that was removed from under a session. The name
+#     test is admitted ONLY on this branch, never on a path that exists.
+#
+# A cwd inside a registered worktree never reaches here, so both branches are about checkouts git has
+# stopped listing.
+function Get-UnplaceableCwdReason {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Cwd,
+        [string]$PrimaryNorm,
+        [string]$RepoCommonNorm
+    )
+    if (-not $Cwd) { return '' }
+    if (Test-Path -LiteralPath $Cwd) {
+        if (-not $RepoCommonNorm) { return '' }
+        if ((Get-OwningGitCommonDir $Cwd) -ne $RepoCommonNorm) { return '' }
+        return 'cwd is a checkout of this repository that `git worktree list` no longer carries, so it can be attributed to no worktree and clears none'
+    }
+    $norm = ConvertTo-Norm $Cwd
+    if ($PrimaryNorm -and $norm.StartsWith("$PrimaryNorm-")) {
+        return 'cwd no longer exists and is named as a worktree of this repository, so the session in it can be attributed to no worktree and clears none'
+    }
+    return ''
+}
+
 <#
 Map every session record onto the worktree it was launched in, fenced for liveness, with a receipt.
 
@@ -138,7 +235,8 @@ Returns a pscustomobject:
     Detail           [string] why it is unavailable, '' when it is available
     RootsExamined     [int]    config roots holding a sessions registry
     RecordsExamined   [int]    records that PARSED across those roots
-    RecordsUnplaceable[int]    records that will not parse or carry no cwd -- any at all => Available false
+    RecordsUnplaceable[int]    records that will not parse, carry no cwd, or name a checkout of this repo
+                               that git no longer lists -- any at all => Available false
     UnplaceableFiles  [array]  each one's path and why, so the operator can go and look
     Worktrees         [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...)
     PrimaryPath       [string] the trunk checkout (git reports it first)
@@ -192,12 +290,42 @@ function Get-WorktreeOccupancy {
     # RecordsUnplaceable counts what cannot be PLACED, and a cwd-less record is both.
     $faults = @($all | Where-Object { $_.Unreadable } |
             ForEach-Object { [pscustomobject]@{ File = $_.File; Why = "unparseable: $($_.Error)" } })
-    $placeable = @()
+
+    $repoCommonNorm = Get-RepoCommonDir $Repo
+
+    # PLACEMENT HAPPENS HERE, BEFORE THE AVAILABILITY VERDICT, and that ordering is the fix rather than
+    # a tidy-up. The third fault shape is only visible once you have TRIED to place a record. While the
+    # verdict was computed first, placement ran after it in a loop of its own and a failed placement had
+    # nowhere to go -- which is how a silent `continue` there stayed invisible for as long as it did.
+    $placed = @()
     foreach ($e in $records) {
         if (-not $e.Record.cwd) {
             $faults += [pscustomobject]@{ File = $e.File; Why = 'no cwd in the record, so it cannot be placed in any worktree' }
+            continue
         }
-        else { $placeable += $e }
+
+        # Scope: cwd inside one of this repo's worktrees. Exact match on the worktree root, or a
+        # descendant of it -- a session cd'd into a subdirectory is still that worktree's session.
+        # LONGEST match wins, or a nested worktree (.claude/worktrees/x) folds into the primary and
+        # gets reported as colliding in a checkout it is nowhere near.
+        $cwdNorm = ConvertTo-Norm $e.Record.cwd
+        $match = $null
+        foreach ($k in $wtIndex.Keys) {
+            if ($cwdNorm -eq $k -or $cwdNorm.StartsWith("$k/")) {
+                if (-not $match -or $k.Length -gt (ConvertTo-Norm $match.Path).Length) { $match = $wtIndex[$k] }
+            }
+        }
+        if ($match) {
+            $placed += [pscustomobject]@{ Entry = $e; Match = $match }
+            continue
+        }
+
+        # NOT MATCHING IS TWO DIFFERENT ANSWERS, and they used to share one silent `continue`. Another
+        # repo's session is none of this fence's business and must not cost a refusal. A checkout of
+        # THIS repo that git has stopped listing is a session the fence cannot see, and every worktree
+        # it then clears is cleared on an incomplete roster.
+        $why = Get-UnplaceableCwdReason -Cwd ([string]$e.Record.cwd) -PrimaryNorm $primaryNorm -RepoCommonNorm $repoCommonNorm
+        if ($why) { $faults += [pscustomobject]@{ File = $e.File; Why = $why } }
     }
 
     $available = $false
@@ -216,21 +344,10 @@ function Get-WorktreeOccupancy {
     else { $available = $true }
 
     $sessions = @()
-    foreach ($entry in $placeable) {
+    foreach ($p in $placed) {
+        $entry = $p.Entry
         $rec = $entry.Record
-
-        # Scope: cwd inside one of this repo's worktrees. Exact match on the worktree root, or a
-        # descendant of it -- a session cd'd into a subdirectory is still that worktree's session.
-        # LONGEST match wins, or a nested worktree (.claude/worktrees/x) folds into the primary and
-        # gets reported as colliding in a checkout it is nowhere near.
-        $cwdNorm = ConvertTo-Norm $rec.cwd
-        $match = $null
-        foreach ($k in $wtIndex.Keys) {
-            if ($cwdNorm -eq $k -or $cwdNorm.StartsWith("$k/")) {
-                if (-not $match -or $k.Length -gt (ConvertTo-Norm $match.Path).Length) { $match = $wtIndex[$k] }
-            }
-        }
-        if (-not $match) { continue }
+        $match = $p.Match
 
         # A record we cannot even evaluate (e.g. a non-numeric pid, which throws in the fence) must
         # VETO, not vanish and not crash the caller. UNREADABLE is in the veto set for that reason.

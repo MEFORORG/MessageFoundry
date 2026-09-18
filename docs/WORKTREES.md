@@ -195,7 +195,41 @@ scripts\worktree\prune-merged.ps1                   # dry run: the decision tabl
 scripts\worktree\prune-merged.ps1 -Apply            # remove the ones that pass every check
 scripts\worktree\prune-merged.ps1 -Apply -Name pins # also confirm that one past the activity veto
 scripts\worktree\prune-merged.ps1 -Json             # machine-readable decisions + the fence receipt
+scripts\worktree\prune-merged.ps1 -ReapVenvs        # ALSO report reapable .venv dirs. Deletes nothing.
 ```
+
+### `-ReapVenvs` reports virtualenvs and removes none of them
+
+A `.venv` is **rebuildable** state — `.venv/` is gitignored, `constraints.lock` is tracked, and
+[`new.ps1`](../scripts/worktree/new.ps1) rebuilds with `pip install --constraint constraints.lock`.
+Deleting one costs a rebuild; deleting a worktree costs work. Different blast radii, so different
+gates — and **there is no venv deletion path in this script at all**, not behind `-Apply`, not behind
+a confirmation. An adversarial review returned `NEEDS_A_GUARD` on every reaper proposed, so the dry
+run ships first and is meant to run for a week before anything destructive is written.
+
+A venv is reported **reapable** only when nine conjuncts hold. `C1` venv-present, `C2` rebuildable
+(`constraints.lock` — **not** `uv.lock`, which sits beside it, is also a real lockfile, and is read
+by no install here), `C3` fence-available, `C4` unlocked, `C5` unoccupied, `C6` clean, `C7` idle,
+`C8` merged, `C9` **unowned**. `C1`–`C8` are the worktree rule above, reused rather than re-derived —
+with one deliberate drop, recorded here because nothing else records it: the worktree pass also
+vetoes a tree that *contains* another registered worktree, and the venv pass does not, because
+removing a parent orphans its children and deleting only `.venv` cannot.
+
+`C9` is new and it is the one the other eight miss. The owning session id is the six-hex token a
+Claude-managed slug carries; the conjunct looks for `<config-root>/projects/*<id>*/*.jsonl` across
+every `.claude*` root and holds the venv unless the newest write is older than `-IdleHours`. **No id
+parsed and no transcript found both mean SKIP** — absence of a transcript is the absence of evidence,
+not proof of death. Measured: nine idle venvs of about 8.0 GB belonged to a session that had written
+a transcript 4.4 hours before the sweep, and `C1`–`C8` cleared every one of them.
+
+The pass reaches trees `-Apply` never will, including the `.claude/worktrees` population, which is
+where most of the bytes are. That is safe **only** because it removes nothing; arming a removal would
+have to answer the population question again from scratch.
+
+Every count it prints carries its denominator, and "nobody was reapable" and "the check could not
+run" print different things — the second refuses the whole pass, because an empty list from a check
+that could not look is not a clean result. That refusal exits **2**, or **1** when the same run also
+removed a worktree — a refusal code must never read as a run that did nothing.
 
 ### The rule is `merged AND clean AND NOT occupied`
 
@@ -212,9 +246,15 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
 1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
-2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
+2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
    git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
    **not** depend on a recorded cwd.
+
+**The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
+largest idle reading ever taken on a worktree somebody was demonstrably in was **34.4h**, against a
+36h window — 1.6h of margin on the only signal that sees a session writing in by absolute path. That
+is a coincidence, not a margin. 72h is that worst measured reading doubled, and it outlives a
+weekend, which 36 did not. The cost is fewer removals, which is the cheap direction here.
 
 Both are re-read **immediately before each removal**, not just when the table was built — a gh round
 trip per candidate plus every prior removal is a real window, and it is the window the incident
@@ -225,11 +265,14 @@ can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence
 permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
-That last one matters more than it sounds. Two shapes qualify — a file that will not parse, and one
-that parses but carries no `cwd` — and both used to be dropped by a silent `continue`, appearing in no
-count at all. Neither can be placed in *or* cleared from any candidate, and a file caught
-*half-written* is exactly what a session that launched a second ago looks like. An unavailable fence
-turns every candidate into a SKIP and exits **2**. There is deliberately no override flag.
+That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a
+record that parses but carries no `cwd`, and a record whose `cwd` is a checkout of *this* repo that
+`git worktree list` no longer carries, whether that directory is still on disk or gone. Each used to
+be dropped by a silent `continue`, appearing in no count at all, and the third went on being dropped
+after the fix for the first two. The incident above produced that shape in its still-on-disk form.
+None can be placed in *or* cleared from any candidate, and a file caught *half-written* is exactly
+what a session that launched a second ago looks like. An unavailable fence turns every candidate
+into a SKIP and exits **2**. There is deliberately no override flag.
 
 ### The candidate set is siblings only — and "sibling" is not a prefix match
 
@@ -286,11 +329,58 @@ the directory is gone or re-registered — as is any unregistered `<repo>-*` dir
 pointer still names this repo.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — nothing was attempted because safety could not be
-established (wrong cwd, unavailable fence, a `-Name` that matched nothing); `3` **orphaned** — a
-directory is broken on disk right now. `3` outranks `2` because damage on disk outranks a refusal to
-act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
-spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
+without destroying anything; `2` **refused** — something you asked for was not attempted, because
+safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
+is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
+skipped` covers every candidate exactly once.
+
+**`2` is per-request, and its causes are not a closed list.** The line above read *"nothing was
+attempted (wrong cwd, unavailable fence, a `-Name` that matched nothing)"*. The list went stale
+silently: `-ReapVenvs` added four refusal causes of its own — the fence down, transcript roots
+unreadable, no config root carrying a `projects/` directory, and `-IdleHours 0` emptying both idle
+windows — and it did not move. Read `2` as "some request of yours was refused", and read
+`counts.removed` for what the run did.
+
+**A tail line names the outcome it is reporting, never the run's code.** Each explanation at the
+foot of the report opens `REFUSED:`, `FAILED:` or `ORPHANED:` — the same words the preamble
+refusals and the per-candidate failures already use. They used to open `Exit 2:`, which was true
+only while all of them were nested inside "if the run exited 2". Prefixing the run's actual code
+instead would attribute it: on a run with the fence down **and** a broken directory, `Exit 3: the
+occupancy fence was unavailable` sends you to fix a fence that was only ever worth `2`. The run's
+code is in the `Done.` summary and in `$LASTEXITCODE`, which are the only places that ever knew it.
+
+**`2` does still mean nothing was removed, and this page said otherwise for one commit.** The
+paragraph above read *"The universal is false on its own terms too: a fence that dies part way
+through the apply loop sets `2` over removals that already landed ... the mid-run fence death does
+not [report `1`]"*. No such run exists. Seven sites can produce `2`, and not one of them can
+co-occur with a removal:
+
+| Site | Why a removal cannot have happened |
+|---|---|
+| three bare exits in the preamble | a negative `-IdleHours`, not a repository, not the primary checkout — all before a candidate set exists |
+| the decision-pass fence check | an unavailable fence adds a SKIP reason to **every** candidate, so the prunable set is empty and the apply loop never runs |
+| the mid-loop fence check | the fence is read **once**, on the line above the loop, and nothing inside re-reads it — so a fence that is down skips the first candidate and every later one |
+| the `-Name` and `-ReapVenvs` guards | both explicitly conditioned on something having been removed, and both report `1` when it has |
+
+Measured over the parsed script rather than by grep, because a grep for `^\s*exit` misses four
+keywords and any wrapper that reads the exit variable. Classifying every `Exit`, `Return`, `Throw`,
+`Break` and `Continue` statement by whether an ancestor is a `FunctionDefinitionAst` gives 89 —
+outside a function 5 `Exit`, 1 `Throw`, 20 `Continue` and 2 `Return`; inside one 47 `Return`, 13
+`Continue` and 1 `Break`.
+
+The 2 `Return`s outside a function are not script-level either, and the distinction is worth the
+sentence because anyone re-running that predicate will meet them: they are the `return $true` /
+`return $false` of the `$matchesName` scriptblock literal, returning from that scriptblock.
+Counting a `ScriptBlockExpressionAst` as a nesting level too moves exactly those two rows and
+nothing else. This paragraph published that broader reading — *"49 `Return` ... nested"* — while
+naming the narrower predicate, so a reader who followed the stated method got a different table.
+
+What the argument rests on survives both readings: **0 `Exit` sits inside a function** under
+either, so no `exit` in the file is scoped to anything narrower than the process, and the two that
+end an ordinary run are both `exit $exit`. The standing pin is
+`test_a_fence_that_dies_mid_run_refuses_and_says_so`, which kills the fence between the decision
+pass and the removal pass and asserts `counts.removed == 0` beside the `2`.
 
 **A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
 lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the
