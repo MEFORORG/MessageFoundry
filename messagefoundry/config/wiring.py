@@ -641,8 +641,10 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming setting/key/value) — so
-    the failure is loud and actionable, not a raw ``ValueError`` traceback that names nothing and
-    aborts on the first bad value (fail loud, never blank; review M-22)."""
+    the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
+    first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
+    **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
+    (BACKLOG #1656; see the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -655,7 +657,17 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 else:
                     try:
                         resolved[name] = value.cast(raw)
-                    except (ValueError, TypeError) as exc:
+                    except Exception as exc:
+                        # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
+                        # an arbitrary callable, so it can raise anything -- a `KeyError` from a
+                        # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
+                        # escaped this handler RAW, carrying the secret value in its own exception
+                        # text. That re-opened, for every other exception type, exactly the leak
+                        # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
+                        # whole point of catching it, so it has to cover every way a cast can fail.
+                        # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
+                        # failure and must keep propagating.
+                        #
                         # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                         # and connector keys, and this string is raised at startup into the operator
                         # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to

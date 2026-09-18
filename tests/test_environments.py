@@ -90,6 +90,50 @@ def test_resolve_env_settings_cast_failure_never_echoes_the_value() -> None:
     assert "value withheld" in msg, f"a silent redaction reads as a truncated error: {msg!r}"
 
 
+def test_resolve_env_settings_redacts_a_cast_that_raises_a_non_value_error() -> None:
+    # BACKLOG #1656 limb 2, and it is a LEAK, not ergonomics. A cast is an arbitrary callable, so it
+    # can raise anything; `except (ValueError, TypeError)` let every other type out of
+    # `resolve_env_settings` RAW, and an exception's own text routinely carries the value that
+    # provoked it -- a KeyError's text IS the key it was given, which is the measured case below.
+    # That re-opened, for every arm but ValueError/TypeError, exactly the leak BACKLOG #1183 closed.
+    # `except Exception` puts them all through the one redaction. NEVER BaseException: a
+    # KeyboardInterrupt or SystemExit is not a cast failure and must keep propagating.
+    secret = "pw-K3yErr_Val-88"
+
+    def _table_cast(raw: object) -> int:
+        return {"6661": 6661}[str(raw)]  # a KeyError whose text is the value it was handed
+
+    # Mirrors the production `_cast_bool.__name__ = "bool"` idiom: the diagnostic names the cast the
+    # operator wrote, not the helper implementing it.
+    _table_cast.__name__ = "int"
+    settings = {"store_password": env("store_password", cast=_table_cast)}
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings(settings, {"store_password": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the raw env value survived into the error text: {msg!r}"
+    # Positive controls for what the widened arm contributes: the operator's fix-it (setting, key,
+    # expected type) and a STATED redaction, exactly as the ValueError arm above is held.
+    assert "store_password" in msg
+    assert "not a valid int" in msg, f"the expected type is the whole diagnostic: {msg!r}"
+    assert "value withheld" in msg, f"a silent redaction reads as a truncated error: {msg!r}"
+    assert "KeyError" in msg, f"the exception TYPE is named; only its text is withheld: {msg!r}"
+
+
+def test_resolve_env_settings_batches_a_non_value_error_cast_with_other_failures() -> None:
+    # The widened arm must also keep the BATCHING promise: an escaping exception aborted on the
+    # first bad value and hid every other problem. One report naming all of them is what
+    # distinguishes catching from merely not-crashing.
+    def _table_cast(raw: object) -> int:
+        return {"6661": 6661}[str(raw)]
+
+    _table_cast.__name__ = "int"
+    settings = {"host": env("a_host"), "port": env("b_port", cast=_table_cast)}
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings(settings, {"b_port": "notaport"})  # a_host missing + b_port KeyError
+    msg = str(ei.value)
+    assert "missing: a_host" in msg and "b_port" in msg
+
+
 def test_resolve_env_settings_reports_missing_and_uncastable_together() -> None:
     settings = {"host": env("a_host"), "port": env("b_port", cast=int)}
     with pytest.raises(WiringError) as ei:
