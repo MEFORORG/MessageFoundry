@@ -3723,6 +3723,67 @@ def _is_text_codec(value: str) -> bool:
     return True
 
 
+def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
+    """``ref``'s value for this instance, or :data:`_UNSET` when it has none here.
+
+    :func:`resolve_env_settings`' resolution order — the environment value (cast if a ``cast`` was
+    given), else the ``default`` — narrowed to a single ref and made **non-raising**, so a caller that
+    only wants to *probe* a value can skip what it cannot resolve instead of pre-empting that
+    function's own loud, all-problems-at-once report."""
+    if ref.key in values:
+        raw = values[ref.key]
+        if ref.cast is None:
+            return raw
+        try:
+            return ref.cast(raw)
+        except (ValueError, TypeError):
+            return _UNSET
+    if ref.default is not _UNSET:
+        return ref.default
+    return _UNSET
+
+
+def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, Any]) -> list[str]:
+    """Human-readable messages for ``env()``-supplied ``encoding`` values that resolve, in THIS
+    environment, to no usable text codec — the resolved half of :meth:`Registry.encoding_problems`
+    (BACKLOG #1767).
+
+    The relationship is exactly :func:`inbound_binding_conflicts` to :meth:`Registry.port_collisions`:
+    the registry-only pass probes what the graph alone can answer, and this one re-probes what only the
+    instance's environment values can. Run from ``build_check_registry``, so it fires at
+    ``messagefoundry check``, at every reload and promote, and at every ``connection upsert``.
+
+    **A ``deployed=False`` connection is SKIPPED (#233, ADR 0111), and the skip IS the design.** That
+    ADR's bright line is that a not-deployed connection's ``env()`` values are never resolved on any
+    path; reading one here to probe it would cross that line just as surely as building the connector
+    would. So an ``env()``-named encoding on a not-deployed connection stays unchecked until the
+    connection is deployed — the accepted cost of the owner ruling that chose this over amending
+    ADR 0111, counted by :meth:`Registry.encoding_census` rather than hidden.
+
+    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` rejects — is skipped
+    rather than reported: :func:`resolve_env_settings` raises on it loudly moments later when the
+    connector is built, and a second message here would only make the first read as the failure.
+    :func:`_resolve_port` skips an unresolved port for the same reason."""
+    problems: list[str] = []
+    for kind, name, value, deployed in registry._declared_encodings():
+        if not isinstance(value, EnvRef):
+            continue  # a literal — Registry.encoding_problems owns it and has already probed it
+        if not deployed:
+            continue  # ADR 0111: never resolve a not-deployed connection's env() values
+        resolved = _resolve_one_env_value(value, env_values)
+        if resolved is _UNSET:
+            continue  # no value here — reported loud by resolve_env_settings at connector build
+        if isinstance(resolved, str) and _is_text_codec(resolved):
+            continue
+        problems.append(
+            f"{kind} {name!r}: encoding from environment value {value.key!r} is {resolved!r}, which "
+            f"is not a Python text codec — every message would fail at decode/encode; set it to a "
+            f"codec name such as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
+            f"(environments/<env>.toml or MEFOR_VALUE_*)"
+        )
+    return problems
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -3884,17 +3945,25 @@ class Registry:
         **Literal names only**, exactly like :meth:`port_collisions`. An :func:`env` reference is
         skipped **deliberately, not by oversight**: it carries no value here (``resolve_env_settings``
         needs the instance's environment values and :func:`validate_config` is handed only a
-        directory). Nothing checks it later either — the resolved counterpart is unbuilt, and would
-        belong in ``build_check_registry`` alongside :func:`inbound_binding_conflicts`, which is where
-        the same second pass already happens for ``env()`` ports. So the skip is *unchecked*, not
-        deferred, and :meth:`encoding_census` is what keeps it from being silent.
+        directory). It is now **deferred rather than unchecked** (BACKLOG #1767):
+        :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, where the
+        environment values exist, beside the second pass :func:`inbound_binding_conflicts` already runs
+        for ``env()`` ports. :meth:`encoding_census` keeps deferred and unchecked apart, because they
+        are not the same promise.
 
-        A ``deployed=False`` connection IS checked: parking a feed does not make a typo'd codec name
-        correct, and the ``inbound -> router`` check above treats a parked connection the same way.
-        (``port_collisions`` excludes it for a reason that does not apply here — it never binds, so it
-        genuinely cannot collide.)"""
+        **A ``deployed=False`` connection is checked HERE and nowhere else — the split is deliberate
+        (BACKLOG #1767, owner ruling 2026-09-18), and the old blanket claim above it no longer holds.**
+        A literal is read straight off the graph, so a not-deployed connection's typo'd codec name is
+        still caught: declaring a feed not-deployed does not make a typo'd codec name correct, and the
+        ``inbound -> router`` check above treats a not-deployed connection the same way. **The resolved
+        pass cannot follow it there.** Resolving an ``env()`` value on a not-deployed connection is what
+        ADR 0111 forbids on every path, ``messagefoundry check`` included, so that stance now holds of
+        a LITERAL encoding name and NOT of an ``env()`` reference. A reader who takes the literal half
+        as covering both will read the resolved pass as a bug; it is the accepted cost of the ruling.
+        (``port_collisions`` excludes a not-deployed connection for a reason that does not apply
+        here — it never binds, so it genuinely cannot collide.)"""
         problems: list[str] = []
-        for kind, name, value in self._declared_encodings():
+        for kind, name, value, _deployed in self._declared_encodings():
             if isinstance(value, EnvRef):
                 # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
                 # try/except wide enough to catch that could not tell it from a real failure.
@@ -3909,37 +3978,66 @@ class Registry:
                 )
         return problems
 
-    def encoding_census(self) -> tuple[int, int]:
-        """Declared ``encoding`` values, as ``(checked, unchecked)``.
+    def encoding_census(self) -> tuple[int, int, int]:
+        """Declared ``encoding`` values, as ``(checked, deferred, unchecked)``.
 
         A pass that examined **nothing** and one that examined everything and found it good both
-        return no problems, so this count is what tells them apart. ``unchecked`` is the ``env()``
-        refs :meth:`encoding_problems` skips; it is derived from the total, so no entry can fall into
-        a silent third bucket. Only a connector type with no ``encoding`` argument at all is in
-        neither number — every other factory writes its ``utf-8`` default into ``settings``, so
-        leaving the argument off still counts as checked."""
-        declared = list(self._declared_encodings())
-        checked = sum(1 for *_, value in declared if isinstance(value, str))
-        return checked, len(declared) - checked
+        return no problems, so these counts are what tell them apart. Three populations, held apart
+        because they carry three different promises (BACKLOG #1767) and collapsing the last two is
+        the exact false-green BACKLOG #1613 built this census against:
 
-    def _declared_encodings(self) -> Iterator[tuple[str, str, Any]]:
-        """``(kind, name, value)`` for every registry entry whose settings carry an ``encoding``.
+        * ``checked`` — a literal codec name, probed right here by :meth:`encoding_problems`.
+        * ``deferred`` — an :func:`env` ref on a DEPLOYED entry. Not probed here;
+          :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, which has the
+          environment values. The word is *deferred* and not *checked* because that pass can be
+          absent: ``messagefoundry check`` SKIPs its ``build-check`` line on a bare config dir with no
+          ``messagefoundry.toml``, and that line says so itself.
+        * ``unchecked`` — nothing probes it on any path. The population this bucket exists for is an
+          :func:`env` ref on a ``deployed=False`` connection, whose values ADR 0111 forbids resolving.
+          A value that is neither a literal string nor an ``env()`` ref falls here too — unreachable
+          from the factories, which all declare ``encoding: str``, and nothing probes it either.
+
+        The three are derived from the total, so no entry can fall into a silent fourth bucket. Only a
+        connector type with no ``encoding`` argument at all is in none of them — every other factory
+        writes its ``utf-8`` default into ``settings``, so leaving the argument off still counts as
+        checked."""
+        declared = list(self._declared_encodings())
+        checked = sum(1 for _k, _n, value, _d in declared if isinstance(value, str))
+        deferred = sum(
+            1 for _k, _n, value, deployed in declared if isinstance(value, EnvRef) and deployed
+        )
+        return checked, deferred, len(declared) - checked - deferred
+
+    def _declared_encodings(self) -> Iterator[tuple[str, str, Any, bool]]:
+        """``(kind, name, value, deployed)`` for every registry entry whose settings carry an
+        ``encoding``.
 
         Every settings-bearing table, because an unusable codec name is a property of the setting and
         not of the direction it is read in. The table list is the same one
         ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
-        together, since a sixth settings-bearing table added to one and missed here reads as clean."""
-        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any]]]]] = [
-            ("inbound connection", ((n, c.spec.settings) for n, c in self.inbound.items())),
-            ("outbound connection", ((n, c.spec.settings) for n, c in self.outbound.items())),
-            ("database lookup", ((n, s.settings) for n, s in self.lookups.items())),
-            ("fhir lookup", ((n, s.settings) for n, s in self.fhir_lookups.items())),
-            ("reference set", ((n, r.source.settings) for n, r in self.references.items())),
+        together, since a sixth settings-bearing table added to one and missed here reads as clean.
+
+        ``deployed`` is the #233 / ADR 0111 flag, carried so :func:`resolved_encoding_problems` can
+        honour it without re-deriving it per table. Only a connection has one; a lookup, a FHIR lookup
+        and a reference set are always ``True``, there being no declared-but-not-deployed state for
+        them."""
+        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
+            (
+                "inbound connection",
+                ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
+            ),
+            (
+                "outbound connection",
+                ((n, c.spec.settings, c.deployed) for n, c in self.outbound.items()),
+            ),
+            ("database lookup", ((n, s.settings, True) for n, s in self.lookups.items())),
+            ("fhir lookup", ((n, s.settings, True) for n, s in self.fhir_lookups.items())),
+            ("reference set", ((n, r.source.settings, True) for n, r in self.references.items())),
         ]
         for kind, entries in tables:
-            for name, settings in entries:
+            for name, settings, deployed in entries:
                 if "encoding" in settings:
-                    yield kind, name, settings["encoding"]
+                    yield kind, name, settings["encoding"], deployed
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
