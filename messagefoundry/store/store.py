@@ -139,8 +139,8 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
     """Roll the open writer transaction back while the caller unwinds. Returns ``True`` if a further
     cancellation was swallowed to finish the job.
 
-    Called from :func:`_writer_txn` with the writer lock STILL HELD, so no other writer can take the
-    connection mid-rollback.
+    Called from :func:`_writer_txn` and :func:`_writer_guard` with the writer lock STILL HELD, so no
+    other writer can take the connection mid-rollback.
 
     The rollback is **shielded** because a cancellation is the common reason we are here, and an
     unshielded ``await`` on the cancelled task's own stack is cancelled at once — leaving exactly the
@@ -179,16 +179,86 @@ async def _unwind_writer_txn(db: aiosqlite.Connection) -> bool:
         return swallowed_cancel
 
 
+async def _unwind_writer_failure(db: aiosqlite.Connection, exc: BaseException) -> None:
+    """Roll the writer transaction back because ``exc`` is leaving the block; the caller re-raises.
+
+    If a cancellation landed while the rollback ran, this raises :class:`asyncio.CancelledError`
+    from ``exc`` instead. Re-raising only ``exc`` would drop that cancellation and leave the task
+    running through a shutdown, so the cancellation wins and carries ``exc`` as its cause. Shared by
+    :func:`_writer_txn` and :func:`_writer_guard` so the two writer shapes unwind identically."""
+    if await _unwind_writer_txn(db) and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+
+
+class UncommittedWriteError(RuntimeError):
+    """A :func:`_writer_guard` block exited cleanly with its implicit transaction still open.
+
+    The block wrote and never committed. The guard has already rolled that write back; it raises
+    rather than returning because the write did not happen, and a caller must not read the return as
+    success (BACKLOG #1803)."""
+
+
+@asynccontextmanager
+async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+    """Hold ``lock`` over a SHORT writer and never let the block leave a transaction open.
+
+    A short writer issues its DML with no ``BEGIN`` of its own and calls ``_commit()``, and sqlite3's
+    ``isolation_level=''`` auto-begins before the first DML. So anything raised between that DML and
+    the commit used to leave the implicit transaction open on the ONE writer connection: a constraint
+    the statement hits, a cipher failing between two statements, a cancellation. The next
+    :func:`_writer_txn` writer then failed its own ``BEGIN``. The next short writer instead joined the
+    stranger's transaction, and its ``COMMIT`` made that partial work durable (BACKLOG #1803).
+
+    It sits beside :func:`_writer_txn` rather than reusing it because ``_writer_txn`` BEGINs
+    unconditionally, which would turn a read-only early exit into an open, empty transaction (ADR 0159,
+    the amendment on the short writers). This issues NO ``BEGIN`` and NO ``COMMIT``, so auto-begin is
+    left alone and a block that only read exits for free. It needs no sentinel either:
+    ``db.in_transaction`` already reports whether the block wrote without committing.
+
+    * An exception, cancellation included, unwinds exactly as ``_writer_txn`` does and is re-raised.
+    * A clean exit with ``in_transaction`` still True rolls back and raises
+      :class:`UncommittedWriteError`. Returning would hand the write to the next writer's ``COMMIT``.
+    * Any other clean exit passes untouched.
+
+    ON ENTRY, a transaction already open is logged at ERROR and rolled back, not raised. The lock is
+    held over every writer's whole span, so a transaction still open when this takes it was left by a
+    block that has already let go: it is abandoned work. Raising would fail this innocent writer for a
+    stranger's leak, which is the defect itself. Doing nothing is worse: this writer's ``COMMIT`` would
+    make the stranger's partial write durable, and a read-only exit would raise
+    :class:`UncommittedWriteError` on the stranger's behalf. With every short writer routed through
+    here, the one known source left is a writer rollback that outran ``_WRITER_ROLLBACK_TIMEOUT``."""
+    async with lock:
+        if db.in_transaction:
+            log.error(
+                "sqlite: writer lock taken with a transaction already open, left by a block that let"
+                " go of the lock without closing it; rolling it back so this writer neither commits"
+                " it nor fails for it (BACKLOG #1803)"
+            )
+            if await _unwind_writer_txn(db):
+                raise asyncio.CancelledError
+        try:
+            yield
+        except BaseException as exc:
+            await _unwind_writer_failure(db, exc)
+            raise
+        if db.in_transaction:
+            leak = UncommittedWriteError(
+                "a writer block wrote without committing; its write was rolled back rather than left"
+                " open for the next writer's COMMIT (BACKLOG #1803)"
+            )
+            await _unwind_writer_failure(db, leak)
+            raise leak
+
+
 @asynccontextmanager
 async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
-    that way. It is NOT yet the store's only writer shape: most short writers take the lock, issue
-    one statement and ``_commit()``, and sqlite3's ``isolation_level=''`` auto-begins for them, so
-    they hold an implicit transaction with the same exposure. Converting those is deferred work
-    (ADR 0159) — do not read this helper's existence as covering them.
+    that way. The short writers — take the lock, issue their DML, ``_commit()``, relying on sqlite3's
+    ``isolation_level=''`` to auto-begin — go through :func:`_writer_guard` instead, and
+    ``tests/test_writer_guard_covers_every_short_writer.py`` keeps THAT so (BACKLOG #1803).
 
     The handler is ``BaseException`` and not ``Exception`` on purpose:
     :class:`asyncio.CancelledError` derives from ``BaseException``, so an ``except Exception``
@@ -213,12 +283,7 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
             await db.execute("BEGIN")
             yield
         except BaseException as exc:
-            swallowed_cancel = await _unwind_writer_txn(db)
-            if swallowed_cancel and not isinstance(exc, asyncio.CancelledError):
-                # A cancellation landed while we were rolling an ORDINARY failure back. Re-raising
-                # only that failure would drop the cancellation and leave the task running through a
-                # shutdown, so the cancellation wins and carries the original failure as its cause.
-                raise asyncio.CancelledError from exc
+            await _unwind_writer_failure(db, exc)
             raise
 
 
