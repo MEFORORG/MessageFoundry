@@ -290,6 +290,14 @@ class _FakeRemoteClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self.files.pop(path, None)
 
+    def dispose_unless_changed(self, path: str, expected_size: int, dest: str | None) -> int | None:
+        # #116: nothing here writes behind the poll, so there is never a size change to report.
+        if dest is None:
+            self.remove(path)
+        else:
+            self.rename(path, dest)
+        return None
+
     def ensure_dir(self, remote_dir: str) -> bool:
         return False
 
