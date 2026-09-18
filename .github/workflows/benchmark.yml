@@ -182,6 +182,13 @@ jobs:
         # would kill real work. Recorded as a direction, not applied as a guess.
         timeout-minutes: 10
         run: |
+          # PIPEFAIL: both curls below pipe into `sudo tee`, which writes whatever it is handed --
+          # including nothing -- and returns 0, so an unguarded pipeline leaves an EMPTY apt source
+          # and the retry loop underneath then blames the Ubuntu runner mirror for a Microsoft fetch
+          # that failed two lines up. `tee` drains stdin, so no SIGPIPE arrives here for pipefail to
+          # turn into a false failure. Mechanism, and the job deliberately left OFF pipefail:
+          # tests/test_ci_odbc_installer_pipefail.py.
+          set -o pipefail
           curl -fsSL --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
             | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
           curl -fsSL --max-time 60 "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
