@@ -2091,16 +2091,28 @@ def create_app(
             # not-deployed lane is invisible (or worse, indistinguishable from a lane that SHOULD be
             # running). Checked FIRST so deployed=False wins over the live state.
             #
-            # #1568: the status recorded here is WHATEVER outbound_status returns, never a list of the
-            # states judged worth a row. An earlier form listed only the paused ones, so STARTING an idle
+            # #1568: the status recorded here is the lane's CURRENT state, never a list of the states
+            # judged worth a row. An earlier form listed only the paused ones, so STARTING an idle
             # outbound deleted its row — and that row carries the selection a browser client reads its
             # Start/Stop/Restart target from, so on a deploying site the control would vanish at exactly
             # the moment an operator reached for it and recovery would mean the JSON API. Recording the
             # state unconditionally also means a state added later surfaces here with no edit.
+            #
+            # `rr.running` gates the tri-state because `outbound_status` reports "running" for any lane
+            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
+            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
+            # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
+            # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
+            # that node, so the contradiction would ship WITH this fix if the gate were left out.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
-                status = "not_deployed" if not oc.deployed else rr.outbound_status(oname)
+                status = (
+                    "not_deployed"
+                    if not oc.deployed
+                    else (rr.outbound_status(oname) if rr.running else "stopped")
+                )
                 standalone[oname] = (status, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:

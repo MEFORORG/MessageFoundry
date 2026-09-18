@@ -1102,6 +1102,42 @@ async def test_connections_one_outbound_with_two_inbound_edges_is_not_also_stand
     assert all(r["role"] == "destination" for r in rows)
 
 
+async def test_connections_standalone_row_reads_stopped_when_the_graph_is_down(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A standalone row must not say "running" on a node whose graph has been torn down.
+
+    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` — it
+    never consults the runner's own ``running`` flag (``/status`` documents the same trap at its KPI
+    split, which is why that block uses ``outbound_running``). The shape that reaches the API is the
+    ADR 0157 demoted follower: ``Engine._stop_graph`` stops ONLY the runner and the node keeps serving
+    as standby. Before #1568 an edge-less outbound produced no row at all there, so the contradiction
+    below is one this fix would have INTRODUCED had the ``rr.running`` gate been left out.
+
+    The discriminating assertion is the last one: it reads BOTH halves of a single payload, so a
+    regression cannot pass by agreeing with itself. Drop the gate in ``list_connections`` and the
+    source row still reads "stopped" while the destination row flips to "running"."""
+    await _started_outbound_engine(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    assert (await _out1_rows(client))[0]["status"] == "running"
+
+    await rr.stop()  # the demote shape: graph down, store + API still serving
+    assert rr.running is False
+    assert rr.outbound_status("out1") == "running"  # the raw tri-state, ungated — the trap itself
+    assert rr.outbound_running("out1") is False  # what the lane is ACTUALLY doing
+
+    # The row SURVIVES the teardown (that is #1568's whole point) and reports the lane honestly.
+    down = await _out1_rows(client)
+    assert len(down) == 1
+    assert down[0]["status"] == "stopped"
+    assert down[0]["paused"] is False  # never operator-paused, so still NOT purge-eligible
+
+    # One payload, both roles, no contradiction: nothing on this node is running.
+    rows = (await client.get("/connections")).json()
+    assert {r["role"]: r["status"] for r in rows} == {"source": "stopped", "destination": "stopped"}
+
+
 async def test_engine_not_started_returns_503(tmp_path: Path) -> None:
     # App with no engine bound (and no lifespan to set one) → 503 on engine routes.
     transport = httpx.ASGITransport(app=create_app(allow_no_auth=True))
