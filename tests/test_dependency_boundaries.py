@@ -8,7 +8,11 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
+
+import pytest
 
 # CLAUDE.md §4: the engine packages never import the API, the console, or their frameworks.
 _ENGINE_PACKAGES = ["pipeline", "transports", "parsing", "store", "config"]
@@ -27,6 +31,27 @@ _FORBIDDEN = ("fastapi", "pyside6", "messagefoundry.api", "messagefoundry_webcon
 _PACKAGE_FORBIDDEN: dict[str, tuple[str, ...]] = {
     "transports": ("messagefoundry.store", "messagefoundry.pipeline"),
 }
+
+_ENGINE_ROOT = Path(__file__).resolve().parents[1] / "messagefoundry"
+
+# BACKLOG #1747 walk floor: the fewest `*.py` files the walk must reach in each engine package
+# before a clean verdict over that package means anything. Pinned WELL UNDER the census taken at
+# 909a38549 (pipeline 33, transports 26, parsing 43, store 17, config 33) — roughly half — so
+# deleting or merging modules never reds this, while a walk collapsing toward empty does.
+_MIN_FILES_WALKED: dict[str, int] = {
+    "pipeline": 15,
+    "transports": 12,
+    "parsing": 20,
+    "store": 8,
+    "config": 15,
+}
+
+
+class _Scan(NamedTuple):
+    """What one boundary walk found: the violations, and how many files it actually opened."""
+
+    violations: list[str]
+    walked: dict[str, int]
 
 
 def _package_of(path: Path, root: Path) -> str:
@@ -102,18 +127,87 @@ def test_the_forbidden_matcher_can_actually_fail() -> None:
     assert not _is_forbidden("messagefoundry.store", _FORBIDDEN)
 
 
-def test_engine_packages_never_import_api_console_or_gui() -> None:
-    # low-30: automated enforcement of the one-way dependency rule (the governing invariant for
-    # parallel agent work) — a `from fastapi import ...` slipping into transports/ would be caught.
-    root = Path(__file__).resolve().parents[1] / "messagefoundry"
+def _scan(root: Path, packages: Sequence[str]) -> _Scan:
+    """Walk `packages` under `root` for forbidden imports, counting the files reached.
+
+    Extracted from the boundary test so the guards below can drive the SAME walk over a planted
+    tree (BACKLOG #1747). A guard that re-implements the walk proves nothing about the walk that
+    actually grades the engine. The per-package file count rides along for the same reason the
+    violations do: an empty walk is otherwise indistinguishable from a clean one.
+    """
     violations: list[str] = []
-    for package in _ENGINE_PACKAGES:
+    walked: dict[str, int] = {}
+    for package in packages:
         forbidden = _FORBIDDEN + _PACKAGE_FORBIDDEN.get(package, ())
-        for py in (root / package).rglob("*.py"):
+        seen = 0
+        for py in sorted((root / package).rglob("*.py")):
+            seen += 1
             for module in _imported_modules(py, root):
                 if _is_forbidden(module, forbidden):
                     violations.append(f"{py.relative_to(root)} imports {module}")
+        walked[package] = seen
+    return _Scan(violations, walked)
+
+
+def test_engine_packages_never_import_api_console_or_gui() -> None:
+    # low-30: automated enforcement of the one-way dependency rule (the governing invariant for
+    # parallel agent work) — a `from fastapi import ...` slipping into transports/ would be caught.
+    violations = _scan(_ENGINE_ROOT, _ENGINE_PACKAGES).violations
     assert not violations, violations
+
+
+def test_the_boundary_walk_reaches_every_engine_package() -> None:
+    # BACKLOG #1747: `Path.rglob` over a directory that is not there raises nothing and yields
+    # nothing, so the walk above would return a clean verdict having opened no file at all. A
+    # renamed package, a typo in `_ENGINE_PACKAGES`, or a root resolved one level off would each
+    # leave the guard green while it graded nothing — measured on this file at 909a38549, with all
+    # five names misspelled, it still passed. Two assertions close that, because either alone has
+    # a hole: `is_dir` catches a name resolving nowhere, and the floor catches a directory that
+    # exists but has gone all but empty under the walk.
+    missing = [p for p in _ENGINE_PACKAGES if not (_ENGINE_ROOT / p).is_dir()]
+    assert not missing, f"engine packages not found under {_ENGINE_ROOT}: {missing}"
+
+    walked = _scan(_ENGINE_ROOT, _ENGINE_PACKAGES).walked
+    assert sorted(walked) == sorted(_MIN_FILES_WALKED), (walked, _MIN_FILES_WALKED)
+    short = {p: n for p, n in walked.items() if n < _MIN_FILES_WALKED[p]}
+    assert not short, f"boundary walk fell under its floor: {short} (floors {_MIN_FILES_WALKED})"
+
+
+@pytest.mark.parametrize(
+    ("package", "line", "flagged"),
+    [
+        # Every entry in `_FORBIDDEN`, planted one at a time, in an engine package.
+        ("pipeline", "from fastapi import FastAPI\n", True),
+        ("pipeline", "import PySide6.QtWidgets\n", True),
+        ("pipeline", "from messagefoundry.api import models\n", True),
+        ("pipeline", "import messagefoundry_webconsole.mount\n", True),
+        # The `_PACKAGE_FORBIDDEN` inward rules, which bind transports/ only.
+        ("transports", "from messagefoundry.store import base\n", True),
+        ("transports", "from messagefoundry.pipeline import engine\n", True),
+        # ...and the negative arm: that same import is legitimate outside transports/, so a guard
+        # flagging it here would be reporting the rule as broader than it is.
+        ("store", "from messagefoundry.pipeline import engine\n", False),
+    ],
+)
+def test_the_walk_sees_a_planted_forbidden_import(
+    tmp_path: Path, package: str, line: str, flagged: bool
+) -> None:
+    # BACKLOG #1747: prove the walk can SEE the thing it is written to catch. Without this, the
+    # boundary test's green says only that nothing was reported — which is also what a walk with a
+    # broken matcher, an unreadable tree, or an empty glob reports.
+    root = tmp_path / "messagefoundry"
+    (root / package).mkdir(parents=True)
+    (root / package / "clean.py").write_text("import json\n", encoding="utf-8")
+    (root / package / "planted.py").write_text(line, encoding="utf-8")
+
+    scan = _scan(root, [package])
+    assert scan.walked == {package: 2}, scan.walked
+    if not flagged:
+        assert scan.violations == [], scan.violations
+        return
+    assert len(scan.violations) == 1, scan.violations
+    # `clean.py` must not be the file reported: a matcher that flags everything sees nothing.
+    assert "planted.py imports " in scan.violations[0], scan.violations
 
 
 def test_relative_imports_are_resolved_not_skipped(tmp_path: Path) -> None:
