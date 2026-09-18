@@ -1023,15 +1023,37 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
         )
 
 
+def _console_calls(function_name: str) -> bool:
+    """Whether any module under ``messagefoundry_webconsole/`` CALLS ``function_name``.
+
+    An AST call walk, deliberately not a substring scan over the source. A text probe CANNOT FAIL in
+    the direction that matters here: BACKLOG #1738 put ``enforce_phi_read_hop`` into two ``_auth.py``
+    docstrings as well as into the gate, so a later refactor that deleted the call and left the prose
+    would keep a substring probe True, let the caller below take the parity branch, and stop requiring
+    ``docs/SECURITY.md`` to re-disclose a gap that had reopened.
+    """
+    for module in (_ROOT / "messagefoundry_webconsole").rglob("*.py"):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == function_name:
+                return True
+            if isinstance(func, ast.Attribute) and func.attr == function_name:
+                return True
+    return False
+
+
 def test_ui_plane_states_the_phi_read_hop_gap() -> None:
-    """``enforce_phi_read_hop`` has no console call site, so the ADR 0092 refusal does not apply to
-    the ``/ui`` browse routes. Asserted both ways, so the disclosure is removed when parity lands."""
+    """``require_ui``'s ``phi`` arm calls ``enforce_phi_read_hop``, so the ADR 0092 refusal DOES apply
+    to the ``/ui`` PHI routes (BACKLOG #1738). Asserted both ways, so the disclosure comes back if the
+    call is ever removed.
+
+    It pins the DISCLOSURE only. It issues no request and cannot observe WHERE in the gate the refusal
+    lands; the console suite's
+    ``test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page`` pins that."""
     pytest.importorskip("messagefoundry_webconsole")
-    console = _ROOT / "messagefoundry_webconsole"
-    charges = any(
-        "enforce_phi_read_hop" in module.read_text(encoding="utf-8")
-        for module in console.rglob("*.py")
-    )
+    charges = _console_calls("enforce_phi_read_hop")
     block = _section(_doc_text(), _H_UI_ROUTE_MAP)
     stated = "does not apply on the `/ui` browse routes" in block
     if charges:
@@ -1040,7 +1062,7 @@ def test_ui_plane_states_the_phi_read_hop_gap() -> None:
         )
     else:
         assert stated, (
-            "enforce_phi_read_hop appears nowhere in messagefoundry_webconsole, so the /ui PHI browse "
+            "no module in messagefoundry_webconsole CALLS enforce_phi_read_hop, so the /ui PHI browse "
             "routes get the per-actor budget but not the posture-keyed refusal. Say so."
         )
 
