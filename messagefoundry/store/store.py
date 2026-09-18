@@ -5869,7 +5869,7 @@ class MessageStore:
                 "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
             )
             if cur.rowcount == 0:
-                await self._db.rollback()
+                # The guard rolls back the implicit transaction this no-op UPDATE opened.
                 raise KeyError(f"attachment {ref!r} not found")
             await self._commit()
 
@@ -10854,9 +10854,8 @@ class MessageStore:
         """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
         administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
-        # _writer_txn: ux_users_federated_subject refusing this UPDATE is EXPECTED
-        # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
-        # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
+        # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
+        # unwind rolls it back (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
             if expect_unbound:
                 cur = await self._db.execute(

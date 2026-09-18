@@ -166,16 +166,10 @@ async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
     Order matters. `in_transaction` is asserted FIRST because the probe below closes whatever is
     open, which would mask the failure at the `begin` cancel point.
 
-    The probe is load-bearing for a specific reason: `record_connection_event` takes the write lock
-    and issues its INSERT with NO `BEGIN` of its own. If the failed writer's transaction were still
-    open, this INSERT would join it and its commit would make the abandoned work durable -- which is
-    exactly the inheritance this unwind exists to prevent. Should that method ever grow a
-    transaction of its own, this stops proving anything and needs replacing with another short
-    writer.
-
-    Since BACKLOG #1803 that writer runs under `_writer_guard`, which rolls an inherited transaction
-    back on entry and logs at ERROR rather than joining it. So the `in_transaction` assertion is now
-    what detects a failed unwind, and the probe shows the connection is usable afterwards."""
+    The probe is `record_connection_event`, a short writer with NO `BEGIN` of its own. It runs under
+    `_writer_guard` (BACKLOG #1803), which rolls an inherited transaction back on entry and logs at
+    ERROR rather than joining it. So the `in_transaction` assertion is what detects a failed unwind,
+    and the probe shows the connection is usable afterwards."""
     assert not store._db.in_transaction, "the failed writer left its transaction open"
     await store.record_connection_event(
         connection=probe, transport="mllp", direction="inbound", kind="probe"
