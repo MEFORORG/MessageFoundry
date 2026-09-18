@@ -185,11 +185,29 @@ async def test_scoped_operator_topology_and_events_are_filtered(engine: Engine) 
         chans = (await c.get("/channels", headers=h)).json()
         assert [ch["id"] for ch in chans] == ["IB_A"]
 
-        # /connections: only IB_A's source row, and NO shared-outbound (OB_X) destination/peer row
+        # /connections: only IB_A's source row, and NO shared-outbound (OB_X) destination/peer row.
+        #
+        # OB_X here is RUNNING with no traffic edge, which since BACKLOG #1568 is precisely the case
+        # that earns a standalone destination row. So this is a live grade of the scope guard rather
+        # than a vacuous one: the row IS built for an unscoped caller (the control below) and only the
+        # scoped suppression keeps it out of this payload. Before #1568 a running edge-less outbound
+        # produced no row at all, and these three assertions would have held for the wrong reason.
         conns = (await c.get("/connections", headers=h)).json()
         assert {row["channel_id"] for row in conns} == {"IB_A"}
         assert all(row["role"] == "source" for row in conns)
         assert all(row["destination"] is None for row in conns)
+
+        # The positive control, in the same run and on the same engine: an all-channels operator DOES
+        # see OB_X's standalone row. Without it, a change that stopped emitting the row anywhere would
+        # leave the scoped assertions green while measuring nothing. Same role as the scoped caller, so
+        # the one variable between the two is the scope.
+        wide_id = await _add(service, "wide", Role.OPERATOR)
+        await service.set_channel_scope(wide_id, [ALL_CHANNELS], actor="admin")
+        wh = await _login(c, "wide")
+        wide_conns = (await c.get("/connections", headers=wh)).json()
+        assert {row["destination"] for row in wide_conns if row["role"] == "destination"} == {
+            "OB_X"
+        }
 
         # /events: only IB_A's inbound events (no IB_B, no outbound OB_X)
         events = (await c.get("/events", headers=h)).json()

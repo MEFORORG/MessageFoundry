@@ -2082,23 +2082,26 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
-            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
-            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
-            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
-            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
-            # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
-            # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
-            # deployed=False wins over the tri-state.
+            # Also surface EVERY configured outbound with no failed/filtered/edge row yet, so an
+            # idle/no-edge lane stays visible + selectable whatever it is currently doing (its
+            # purge-eligibility is the `paused` field below; the status is the live per-outbound state,
+            # reason None — no failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced)
+            # just like a start-disabled one, so outbound_status reports "stopped" for it too — but it
+            # must surface as "not_deployed", never a silent "stopped", or a never-trafficked
+            # not-deployed lane is invisible (or worse, indistinguishable from a lane that SHOULD be
+            # running). Checked FIRST so deployed=False wins over the live state.
+            #
+            # #1568: the status recorded here is WHATEVER outbound_status returns, never a list of the
+            # states judged worth a row. An earlier form listed only the paused ones, so STARTING an idle
+            # outbound deleted its row — and that row carries the selection a browser client reads its
+            # Start/Stop/Restart target from, so on a deploying site the control would vanish at exactly
+            # the moment an operator reached for it and recovery would mean the JSON API. Recording the
+            # state unconditionally also means a state added later surfaces here with no edit.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
-                if not oc.deployed:
-                    standalone[oname] = ("not_deployed", None)
-                    continue
-                ostatus = rr.outbound_status(oname)
-                if ostatus in ("stopping", "stopped"):
-                    standalone[oname] = (ostatus, None)
+                status = "not_deployed" if not oc.deployed else rr.outbound_status(oname)
+                standalone[oname] = (status, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
