@@ -6,6 +6,8 @@ importing the api package's pure models must not drag the server into a GUI proc
 from __future__ import annotations
 
 import ast
+import json
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -239,3 +241,89 @@ def test_importing_api_does_not_eagerly_pull_fastapi() -> None:
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# --- BACKLOG #1716: the tray's layering claim, checked in a FRESH interpreter -----------------------
+#
+# `messagefoundry/tray/__init__.py` states the ADR 0113 §1 rule in prose: the package may import only
+# `messagefoundry.apiclient` and the stdlib-only NSSM helpers, and never PySide6, FastAPI, or the
+# api/store/pipeline/transports packages. Nothing enforced it. `test_tray_windows_modules_import_and
+# _build_structs` in `tests/test_tray_shell.py` does import the tray shell, but INSIDE the pytest
+# process, where a sibling test may already have imported fastapi or PySide6 — so it certifies that
+# the ctypes structs load and says nothing at all about what the tray drags in behind them.
+#
+# THIS IS AN ABSENCE LIST, NOT AN ALLOWLIST, and the difference is load-bearing. Importing
+# `messagefoundry.tray.app` also loads `messagefoundry.config` and ALL of `messagefoundry.parsing`
+# (and so `hl7` and `pydantic`) — from the PACKAGE ROOT, not from tray code: `messagefoundry/
+# __init__.py` imports `actions`, which imports `parsing.message`. Measured at baf53b3ae: config 14
+# modules, parsing 41, hl7 8, pydantic 42, against zero for every name below. An allowlist would
+# therefore red on arrival over a pull-in no tray module causes; whether the package root should be
+# that eager is a separate question with its own cost, and not one this guard may decide by failing.
+_TRAY_FORBIDDEN = (
+    "PySide6",
+    "fastapi",
+    "messagefoundry.api",
+    "messagefoundry.store",
+    "messagefoundry.pipeline",
+    "messagefoundry.transports",
+)
+
+
+def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> set[str]:
+    """Import the tray shell in a fresh interpreter; return which `_TRAY_FORBIDDEN` names landed.
+
+    Fresh, because `sys.modules` inside the pytest process already carries most of this tree — the
+    same reason `test_importing_api_does_not_eagerly_pull_fastapi` above spawns one.
+
+    `plant` is executed BEFORE the tray import, which is how the positive control below stands in for
+    a tray module reaching for a forbidden package. `path_head` is prepended to `PYTHONPATH` so that
+    control can supply a name this environment may not have installed.
+    """
+    code = (
+        "import json, sys\n"
+        f"{plant}\n"
+        "import messagefoundry.tray.app\n"
+        f"forbidden = {_TRAY_FORBIDDEN!r}\n"
+        "found = {f for f in forbidden for m in sys.modules\n"
+        "         if m.lower() == f.lower() or m.lower().startswith(f.lower() + '.')}\n"
+        "print(json.dumps(sorted(found)))\n"
+    )
+    env = dict(os.environ)
+    if path_head is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    return set(json.loads(result.stdout))
+
+
+def test_the_tray_pulls_in_no_gui_toolkit_web_framework_or_engine_runtime() -> None:
+    # All six are absent today, so this is a regression guard rather than a fix: it fails the day a
+    # tray module reaches for the server, the store, the pipeline, a connector or a GUI toolkit.
+    found = _tray_import_probe()
+    assert found == set(), f"importing messagefoundry.tray.app pulled in {sorted(found)}"
+
+
+@pytest.mark.parametrize("name", _TRAY_FORBIDDEN)
+def test_the_tray_probe_sees_a_planted_forbidden_import(tmp_path: Path, name: str) -> None:
+    # Prove the probe can SEE what it is looking for. A fresh-interpreter check that cannot detect
+    # the import it names returns the same clean answer as a tray that is genuinely clean, and the
+    # two are indistinguishable from the green alone.
+    path_head = None
+    if "." not in name:
+        # A third-party name may not be installed on every leg, and a control that SKIPS is a control
+        # that did not run. Plant an importable stub on the path instead: what is under test is that
+        # the probe sees the name arrive in `sys.modules`, and a stub arrives there through the same
+        # import machinery the real package would use.
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "__init__.py").write_text("", encoding="utf-8")
+        path_head = tmp_path
+
+    found = _tray_import_probe(f"import {name}", path_head=path_head)
+    assert name in found, f"planted `import {name}` and the probe reported {sorted(found)}"
+    # ...and it must not be reporting everything: only names the plant actually reached may appear.
+    # `messagefoundry.pipeline` legitimately brings the store and transports with it; nothing brings
+    # a GUI toolkit, so PySide6 stays out unless it IS the planted name.
+    assert found <= set(_TRAY_FORBIDDEN), sorted(found)
+    if name != "PySide6":
+        assert "PySide6" not in found, sorted(found)
