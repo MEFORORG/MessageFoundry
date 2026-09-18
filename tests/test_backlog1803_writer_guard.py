@@ -2,11 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1803: the SQLite short-writer guard, and what it closes.
 
-A short writer takes the writer lock, issues its DML with no ``BEGIN`` of its own and calls
-``_commit()``. sqlite3's ``isolation_level=''`` auto-begins before the first DML, so anything raised
-between that DML and the commit used to leave the implicit transaction open on the ONE writer
-connection. The next ``_writer_txn`` writer then failed its own ``BEGIN``; the next short writer
-joined the stranger's transaction and its ``COMMIT`` made the partial work durable.
+The defect and the guard's three exits are described once, in
+``messagefoundry.store.store._writer_guard``'s docstring.
 
 The CONTRACT tests drive :func:`_writer_guard` on a bare connection, so they prove the helper itself
 and not whichever writer happens to use it. The STORE tests drive the real writers the census found
@@ -148,10 +145,11 @@ async def test_a_cancel_during_the_clean_exit_rollback_wins(tmp_path: Path) -> N
     lock = asyncio.Lock()
     real_rollback = db.rollback
     rollback_started = asyncio.Event()
+    release = asyncio.Event()
 
     async def slow_rollback() -> None:
         rollback_started.set()
-        await asyncio.sleep(0.2)
+        await release.wait()  # held open until the test has delivered its cancel
         await real_rollback()
 
     db.rollback = slow_rollback  # type: ignore[method-assign]
@@ -164,6 +162,7 @@ async def test_a_cancel_during_the_clean_exit_rollback_wins(tmp_path: Path) -> N
         task = asyncio.create_task(writer())
         await asyncio.wait_for(rollback_started.wait(), WAIT)
         task.cancel()
+        release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
             await asyncio.wait_for(task, WAIT)
         assert isinstance(caught.value.__cause__, UncommittedWriteError)
@@ -191,7 +190,7 @@ async def test_a_transaction_left_open_by_another_block_is_rolled_back_on_entry(
                 await db.execute("INSERT INTO t VALUES ('mine')")
                 await db.commit()
         assert await _keys(db) == ["mine"], "the stranger's write rode out on this writer's COMMIT"
-        assert any("already open" in r.getMessage() for r in caplog.records), caplog.text
+        assert any("still open" in r.getMessage() for r in caplog.records), caplog.text
 
         # A read-only exit after a leak must not raise on the stranger's behalf either.
         await db.execute("INSERT INTO t VALUES ('stranger-2')")
@@ -278,9 +277,7 @@ class _FlakyTransit(IdentityCipher):
         return super().encrypt(plaintext, aad=aad)
 
 
-async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(tmp_path: Path) -> None:
     """``claim_next_fifo``'s already-delivered skip path writes two UPDATEs, then encrypts the
     delivered event. A Transit failure there used to leave both UPDATEs open, and the next unrelated
     short writer committed them: queue row DONE, no delivered event, message stuck ROUTED."""
@@ -327,10 +324,7 @@ async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(
         assert not db.in_transaction, "the failed claim left its partial write open"
 
         # An unrelated SHORT writer takes the lock next and commits.
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
-            await store.record_login_success("bystander")
-        leaked = [r for r in caplog.records if "already open" in r.getMessage()]
-        assert not leaked, "the next writer found the failed claim's transaction still open"
+        await store.record_login_success("bystander")
 
         async def state() -> tuple[str, int, int, str]:
             cur = await db.execute("SELECT status, attempts FROM queue WHERE id='q1'")

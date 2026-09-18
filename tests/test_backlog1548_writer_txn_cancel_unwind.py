@@ -171,7 +171,11 @@ async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
     open, this INSERT would join it and its commit would make the abandoned work durable -- which is
     exactly the inheritance this unwind exists to prevent. Should that method ever grow a
     transaction of its own, this stops proving anything and needs replacing with another short
-    writer."""
+    writer.
+
+    Since BACKLOG #1803 that writer runs under `_writer_guard`, which rolls an inherited transaction
+    back on entry and logs at ERROR rather than joining it. So the `in_transaction` assertion is now
+    what detects a failed unwind, and the probe shows the connection is usable afterwards."""
     assert not store._db.in_transaction, "the failed writer left its transaction open"
     await store.record_connection_event(
         connection=probe, transport="mllp", direction="inbound", kind="probe"
