@@ -28,7 +28,6 @@ from messagefoundry.store.store import (
     MessageStatus,
     MessageStore,
     OutboxStatus,
-    Stage,
     UncommittedWriteError,
     _writer_guard,
 )
@@ -279,70 +278,69 @@ class _FlakyTransit(IdentityCipher):
 
 async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(tmp_path: Path) -> None:
     """``claim_next_fifo``'s already-delivered skip path writes two UPDATEs, then encrypts the
-    delivered event. A Transit failure there used to leave both UPDATEs open, and the next unrelated
-    short writer committed them: queue row DONE, no delivered event, message stuck ROUTED."""
+    delivered event. A Transit failure there used to leave both UPDATEs open for the next unrelated
+    short writer to commit: a queue row DONE with no event recording the skip."""
     cipher = _FlakyTransit()
     store = await _store(tmp_path, cipher)
     db = store._db
     try:
-        now = 1_000.0
-        await db.execute(
-            "INSERT INTO messages (id, channel_id, received_at, raw, status) VALUES (?,?,?,?,?)",
-            ("m1", "IB", now, "MSH|x", MessageStatus.ROUTED.value),
+        # Seeded through the public API, the shape tests/test_store.py uses for this path: deliver
+        # the row, then re-pend it WITHOUT clearing its ledger entry, as a failover re-claim would.
+        mid = await store.enqueue_message(
+            channel_id="IB", raw="MSH|x", deliveries=[("OB", "body")], now=100.0
         )
+        item = await store.claim_next_fifo("OB", now=100.0)
+        assert item is not None
+        await store.mark_done(item.id, now=101.0)
         await db.execute(
-            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, payload,"
-            " status, attempts, next_attempt_at, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "q1",
-                "m1",
-                Stage.OUTBOUND.value,
-                "IB",
-                "OB",
-                "body",
-                OutboxStatus.PENDING.value,
-                0,
-                now - 1,
-                now,
-                now,
-            ),
-        )
-        # The ledger row that sends the claim down the skip path: this row was already delivered.
-        await db.execute(
-            "INSERT INTO delivered_keys (delivery_key, outbox_id, message_id, destination_name,"
-            " delivery_seq, delivered_at) VALUES (?,?,?,?,?,?)",
-            ("dk1", "q1", "m1", "OB", 1, now),
+            "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, item.id)
         )
         await db.commit()
         await store.create_user(user_id="bystander", username="b", auth_provider="local")
 
+        async def state() -> tuple[str, int, int]:
+            cur = await db.execute("SELECT status, attempts FROM queue WHERE id=?", (item.id,))
+            queue = await cur.fetchone()
+            cur = await db.execute("SELECT COUNT(*) FROM message_events WHERE message_id=?", (mid,))
+            events = await cur.fetchone()
+            assert queue is not None and events is not None
+            return queue[0], queue[1], events[0]
+
+        before = await state()
+        assert before[0] == OutboxStatus.PENDING.value
+
         cipher.fail = True
         with pytest.raises(CipherError):
-            await store.claim_next_fifo("OB", stage="outbound", now=now)
+            await store.claim_next_fifo("OB", now=200.0)
         cipher.fail = False
         assert not db.in_transaction, "the failed claim left its partial write open"
 
         # An unrelated SHORT writer takes the lock next and commits.
         await store.record_login_success("bystander")
-
-        async def state() -> tuple[str, int, int, str]:
-            cur = await db.execute("SELECT status, attempts FROM queue WHERE id='q1'")
-            queue = await cur.fetchone()
-            cur = await db.execute("SELECT COUNT(*) FROM message_events WHERE message_id='m1'")
-            events = await cur.fetchone()
-            cur = await db.execute("SELECT status FROM messages WHERE id='m1'")
-            message = await cur.fetchone()
-            assert queue is not None and events is not None and message is not None
-            return queue[0], queue[1], events[0], message[0]
-
-        # Nothing of the failed claim became durable: the row is still pending and unclaimed.
-        assert await state() == (OutboxStatus.PENDING.value, 0, 0, MessageStatus.ROUTED.value)
+        # Nothing of the failed claim became durable: same status, attempts and events as before.
+        assert await state() == before
 
         # And the claim re-runs to the complete, consistent outcome (at-least-once).
-        assert await store.claim_next_fifo("OB", stage="outbound", now=now) is None
-        status, attempts, events, message_status = await state()
-        assert (status, attempts, events) == (OutboxStatus.DONE.value, 1, 1)
-        assert message_status == MessageStatus.PROCESSED.value, message_status
+        assert await store.claim_next_fifo("OB", now=200.0) is None
+        assert await state() == (OutboxStatus.DONE.value, before[1] + 1, before[2] + 1)
+        message = await store.get_message(mid)
+        assert message is not None and message["status"] == MessageStatus.PROCESSED.value
+    finally:
+        await store.close()
+
+
+async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
+    tmp_path: Path,
+) -> None:
+    """The not-found path raises with no rollback of its own. The guard's exception arm closes the
+    implicit transaction that the no-op UPDATE opened."""
+    store = await _store(tmp_path)
+    try:
+        await store.create_user(
+            user_id="bystander", username="bystander", auth_provider="local", now=1_000.0
+        )
+        with pytest.raises(KeyError):
+            await store.attachment_incref("f" * 64)
+        await _assert_writer_clean(store, "bystander")
     finally:
         await store.close()

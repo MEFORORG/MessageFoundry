@@ -4212,7 +4212,7 @@ class MessageStore:
                 "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
             )
             if cur.rowcount == 0:
-                await self._db.rollback()
+                # The guard rolls back the implicit transaction this no-op UPDATE opened.
                 raise KeyError(f"attachment {ref!r} not found")
             await self._commit()
 
@@ -9187,9 +9187,8 @@ class MessageStore:
         federated login so a later login carrying a different ``sub`` for a reassigned username is
         refused rather than handed the prior subject's account."""
         now = time.time() if now is None else now
-        # _writer_txn: ux_users_federated_subject refusing this UPDATE is EXPECTED
-        # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
-        # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
+        # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
+        # unwind rolls it back (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
