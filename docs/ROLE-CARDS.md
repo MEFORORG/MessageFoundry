@@ -391,10 +391,25 @@ itself doubled: worktree `manager-112d2a` holds two injection records 17 millise
 the table above. The reading was right and the sentence was not: "ever" is a claim about nine days
 of history that a present-tense file count cannot make, and the justification offered -- that the
 hook writes the copy on every successful injection -- is false in the source (section 2.3). Both
-files are git-ignored and decay. Scanning the transcript corpus found 34 injections across 5
-worktrees, three of them still registered -- `manager-112d2a`, `manager-a6370e`, `manager-c07f6b`,
-between 2026-09-15 and 2026-09-17, every one resolved from `.claude/seat.local.txt`. The control
-that the scan was not blind: 72 other worktrees produced the hook's silent no-seat path.*
+files are git-ignored and decay.
+
+Scanning the transcript corpus refutes it. Instrument: every `*.jsonl` under `projects/` in each of
+the machine's six Claude config roots -- glob `$HOME/.claude*/projects` -- 26,531 files, searched
+for the banner `[role-card] SEAT:`, **excluding this session's own transcripts**. Measured
+2026-09-18:
+**84 injections across 20 distinct worktrees.** Three are still registered -- `manager-112d2a`,
+`manager-a6370e`, `manager-c07f6b`, two records each, between 2026-09-15 and 2026-09-17 -- and
+every injection resolved from `.claude/seat.local.txt`. Positive control: 243 files carry
+`[role-card]` in some form, so the search reaches the corpus.
+
+**The exclusion is not tidiness, and the negative control is why.** A decoy needle that nothing
+emits came back with ONE hit, and that hit was this session's own transcript -- written by the act
+of running the search. A grep for a string puts that string in the transcript of the session
+grepping. Excluding the searching session takes the decoy to 0 and is the only way this
+instrument's negative arm means anything.
+
+A first pass reported 34 injections across 5 worktrees. That was an undercount from a narrower
+sweep, corrected here; the direction was never in doubt and the magnitude was understated.*
 
 **So the no-backfill position rests on a mechanism that runs backwards, and one of two things has to
 happen.** Either `seat.ps1 -Declare -Seat` writes the marker -- the collapse section 2.3 filed and
