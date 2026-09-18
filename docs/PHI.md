@@ -904,8 +904,9 @@ heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are sc
 delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
 or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
 Reinforcing that convention, `messagefoundry check` ships an **advisory `raise-fstring` lint** that
-AST-scans the config-dir Router/Handler modules and flags `raise <Exc>(f"...{var}...")` (an f-string
-raise interpolating a variable — the pattern that can carry free-text PHI past redaction); it prints a
+AST-scans the config-dir Router/Handler modules and flags a `raise` whose message is built from a
+variable — an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format or a
+`.format(...)` call, all four carrying the same free-text payload past redaction; it prints a
 heuristic reminder and never blocks the gate. The existing controls — never log full bodies at
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The advisory ``raise-fstring`` lint (SEC-023): an AST scan of the config-dir Router/Handler modules
-that flags ``raise <Exc>(f"...{var}...")`` — the pattern that can carry free-text PHI past the
+that flags a ``raise`` whose message is built from a variable — an f-string, ``+`` concatenation,
+``%`` formatting or ``.format(...)``, all four carrying the same free-text payload past the
 exception-path redaction. It only ever prints a heuristic reminder; it never blocks the gate."""
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def test_raise_fstring_ignores_plain_and_constant_raise(tmp_path: Path) -> None:
     )
     result = _check_raise_fstring(tmp_path)
     assert result.ok is True and result.skipped is True
-    assert "no f-string raises" in result.detail
+    assert "no interpolated raises" in result.detail
 
 
 def test_raise_fstring_skips_malformed_module(tmp_path: Path) -> None:
@@ -64,3 +65,49 @@ def test_raise_fstring_empty_dir(tmp_path: Path) -> None:
     result = _check_raise_fstring(tmp_path)
     assert result.ok is True and result.skipped is True
     assert result.required is False
+
+
+def test_raise_fstring_flags_concatenated_raise(tmp_path: Path) -> None:
+    """``raise ValueError("bad " + x)`` carries the same free-text payload as the f-string form."""
+    _write(
+        tmp_path / "concat.py",
+        "def f(x):\n    raise ValueError('bad ' + x)\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is False
+    assert "concat.py:2" in result.detail
+
+
+def test_raise_fstring_flags_percent_formatted_raise(tmp_path: Path) -> None:
+    """``raise ValueError("bad %s" % x)`` is the percent spelling of the same interpolation."""
+    _write(
+        tmp_path / "percent.py",
+        "def f(x):\n    raise ValueError('bad %s' % x)\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is False
+    assert "percent.py:2" in result.detail
+
+
+def test_raise_fstring_flags_format_call_raise(tmp_path: Path) -> None:
+    """``raise ValueError("bad {}".format(x))`` is the ``str.format`` spelling of the same shape."""
+    _write(
+        tmp_path / "fmt.py",
+        "def f(x):\n    raise ValueError('bad {}'.format(x))\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is False
+    assert "fmt.py:2" in result.detail
+
+
+def test_raise_fstring_ignores_literal_only_concatenation(tmp_path: Path) -> None:
+    """A concat/percent of literals folds to a constant — no variable reaches the message."""
+    _write(
+        tmp_path / "literal.py",
+        "def f():\n"
+        "    raise ValueError('a' + 'b')\n"
+        "    raise RuntimeError('a %s' % 'b')\n"
+        "    raise KeyError('a {}'.format())\n",
+    )
+    result = _check_raise_fstring(tmp_path)
+    assert result.ok is True and result.skipped is True

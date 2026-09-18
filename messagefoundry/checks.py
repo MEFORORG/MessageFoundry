@@ -56,9 +56,11 @@ settings/config that won't load).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
-config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
-carry free-text PHI past the exception-path redaction (``redaction.py``); it only ever **prints** a
-heuristic reminder of the "never put PHI in an exception message" convention, never blocks the gate.
+config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable in any
+of its four spellings (f-string, ``+`` concatenation, ``%`` formatting, ``.format(...)``), the exact
+pattern that can carry free-text PHI past the exception-path redaction (``redaction.py``); it only
+ever **prints** a heuristic reminder of the "never put PHI in an exception message" convention,
+never blocks the gate.
 So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
 (``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
 where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
@@ -330,10 +332,13 @@ def _check_send_target(config_dir: str | Path) -> CheckResult:
 
 
 def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
-    """Advisory: flag ``raise <Exc>(f"...{var}...")`` in the config-dir Router/Handler modules — an
-    f-string ``raise`` that interpolates a variable, the one pattern that can carry **free-text PHI**
+    """Advisory: flag an interpolated ``raise`` message in the config-dir Router/Handler modules — a
+    ``raise`` whose message is built from a variable, the one pattern that can carry **free-text PHI**
     past the exception-path redaction (``redaction.py``) into the stored ``last_error``/``detail`` and
-    the log. It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
+    the log. All four spellings count, because they carry the same payload: an f-string
+    (``f"bad {x}"``), ``+`` concatenation (``"bad " + x``), ``%`` formatting (``"bad %s" % x``) and
+    ``.format(...)``. A message built only from literals folds to a constant and is not flagged.
+    It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
     hard rule: a benign interpolation (``raise ValueError(f"port {p} in use")``) trips it too, so the
     check is **advisory** (prints, never blocks).
 
@@ -358,20 +363,21 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
                 continue
             args = node.exc.args
             first = args[0] if args else None
-            # An f-string with at least one ``{var}`` (FormattedValue); a constant-only f-string or a
-            # plain string literal is fine and not flagged.
-            if isinstance(first, ast.JoinedStr) and any(
-                isinstance(part, ast.FormattedValue) for part in first.values
-            ):
+            # Any message built by interpolating a non-constant value, in all four spellings
+            # (f-string / ``+`` / ``%`` / ``.format``) — :func:`_is_dynamic_string` is the shared
+            # predicate. A literal-only message (including a literal-only concat) folds to a
+            # constant and is not flagged. Called with the node alone, so a bare
+            # ``raise ValueError(msg)`` — a Name, resolved nowhere — stays unflagged.
+            if first is not None and _is_dynamic_string(first):
                 hits.append(f"{path.name}:{node.lineno}")
     if not hits:
         return CheckResult(
-            "raise-fstring", ok=True, required=False, skipped=True, detail="no f-string raises"
+            "raise-fstring", ok=True, required=False, skipped=True, detail="no interpolated raises"
         )
     shown = ", ".join(hits[:5])
     more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
     detail = (
-        f"{len(hits)} f-string raise(s) interpolate a variable (heuristic PHI reminder — keep "
+        f"{len(hits)} raise(s) build the message from a variable (heuristic PHI reminder — keep "
         f"identifiers out of exception messages): {shown}{more}"
     )
     return CheckResult("raise-fstring", ok=True, required=False, detail=detail)
