@@ -92,6 +92,50 @@ def test_config_summary_broken_config_reports_error(tmp_path: Path) -> None:
     assert "error" in summary
 
 
+# --- BACKLOG #1716: every log-tail sentinel must be redacted BY THE RULE IT IS NAMED FOR ------------
+#
+# These four values were 32, 32, 28 and 25 characters of pure base64 alphabet, which ``_LONG_B64`` --
+# the redactor's catch-everything backstop, which is nobody's named rule here -- reaches on its own.
+# Measured at baf53b3ae by disabling each fixture's OWN patterns and re-running it: all four
+# assertions still passed, so not one of them was evidence about the rule in its own name. Deleting
+# ``_MEFOR_SECRET``, ``_BEARER`` or ``_MFB64`` outright would have left this file green.
+#
+# That is the same false green ``tests/test_log_redaction_secret_domain.py`` was built over one
+# surface along (BACKLOG #1183), so the sentinels copy its shape: a hyphen AND an underscore, or --
+# for a base64 body, which cannot carry either -- short enough to miss the 24-character sweep.
+# ``test_no_bundle_log_sentinel_is_reachable_by_the_long_base64_backstop`` pins that property, so a
+# later edit cannot quietly pick a sweepable token again.
+#
+# Invented here. No real credential.
+_STORE_KEY_SENTINEL = "ek-Bndl_Enc-41"
+_BEARER_SENTINEL = "sk-Bndl_Bear-42"
+_MFB64_SENTINEL = "SGVsbG9Xb3JsZA=="
+_MEFOR_NAME_SENTINEL = "dek-Bndl_Wrp-12"
+
+
+def test_no_bundle_log_sentinel_is_reachable_by_the_long_base64_backstop() -> None:
+    """The control that makes the two redaction tests below mean something (BACKLOG #1716).
+
+    ``_LONG_B64`` sweeps any run of 24+ base64 characters, so a sentinel of that shape is redacted
+    whatever its own rule does. It is the only pattern in the module that can reach a VALUE without
+    matching a label first, which makes it the one accidental cover these fixtures have to be held
+    clear of -- and the reason a sentinel's own green would otherwise prove nothing.
+    """
+    from messagefoundry.support import redact as redact_mod
+
+    for sentinel in (
+        _STORE_KEY_SENTINEL,
+        _BEARER_SENTINEL,
+        _MFB64_SENTINEL,
+        _MEFOR_NAME_SENTINEL,
+    ):
+        assert not redact_mod._LONG_B64.search(sentinel), (
+            f"{sentinel!r} is reachable by the long-base64 backstop, so a green on the fixture "
+            "using it would prove nothing about the rule it is named for -- give it a hyphen and "
+            "an underscore, or keep it under 24 base64 characters"
+        )
+
+
 def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     # Build a fake settings object pointing at a log dir holding a line with PHI + a secret.
     from messagefoundry.config.settings import load_settings
@@ -101,9 +145,9 @@ def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     leaky = (
         "2026-06-27 INFO routing message\n"
         "PID|1||123456^^^MR||DOE^JANE^Q||19800101|F\n"
-        "MEFOR_STORE_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
-        "Authorization: Bearer abcdef0123456789abcdef0123456789\n"
-        "blob mfb64:v1:SGVsbG9Xb3JsZEhlbGxvV29ybGQ=\n"
+        f"MEFOR_STORE_ENCRYPTION_KEY={_STORE_KEY_SENTINEL}\n"
+        f"Authorization: Bearer {_BEARER_SENTINEL}\n"
+        f"blob mfb64:v1:{_MFB64_SENTINEL}\n"
     )
     (log_dir / "engine.log").write_text(leaky, encoding="utf-8")
 
@@ -116,15 +160,21 @@ def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     members = _members(out)
     assert "app-log.txt" in members
     tail = members["app-log.txt"]
-    # PHI patient name + MRN must be gone (HL7 PID segment collapsed).
+    # PHI patient name + MRN must be gone (HL7 PID segment collapsed) -- the shared engine PHI pass
+    # earns both of these: with it stubbed out, both values survive the whole chain verbatim.
     assert "DOE^JANE" not in tail
     assert "123456" not in tail
-    # The secret VALUE is gone (the var NAME may remain so a reviewer sees which leaked).
-    assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in tail
-    # The bearer token value is gone.
-    assert "abcdef0123456789abcdef0123456789" not in tail
-    # The embedded base64 body is gone.
-    assert "SGVsbG9Xb3JsZEhlbGxvV29ybGQ=" not in tail
+    # The secret VALUE is gone (the var NAME may remain so a reviewer sees which leaked). TWO rules
+    # reach this label -- ``_MEFOR_SECRET`` on the MEFOR_ prefix, ``_KEY_MATERIAL`` on the
+    # ``encryption_key`` tail -- which is the pair the domain file's ``mefor_env_value`` family
+    # declares for the same reason.
+    assert _STORE_KEY_SENTINEL not in tail
+    # The bearer token value is gone: ``_BEARER`` on the header label, ``_AUTH_SCHEME`` on the bare
+    # scheme word. Disabling both makes it leak; disabling either alone does not.
+    assert _BEARER_SENTINEL not in tail
+    # The embedded base64 body is gone. ``_MFB64`` is now the ONLY rule that reaches it -- the old
+    # 28-character blob was swept by ``_LONG_B64`` as well.
+    assert _MFB64_SENTINEL not in tail
     assert REDACTION_PLACEHOLDER in tail
 
 
@@ -137,9 +187,14 @@ def test_redact_hl7_segment() -> None:
 
 
 def test_redact_mefor_secret_keeps_name() -> None:
-    out = redact_log_line("env MEFOR_API_TOKEN=supersecretvalue123456789 loaded")
-    assert "supersecretvalue123456789" not in out
-    assert "MEFOR_API_TOKEN" in out  # the NAME is preserved for triage
+    # BACKLOG #1716: a MEFOR_ name whose tail is NOT a credential word, so ``_MEFOR_SECRET`` -- the
+    # rule this test is named for -- is the only one that reaches it. The previous fixture used
+    # ``MEFOR_API_TOKEN``, which ``_BEARER`` also covers through its ``token`` alternate, with a
+    # 25-character alphanumeric value the backstop covered on top: two accidental covers under a
+    # name claiming to test a third rule.
+    out = redact_log_line(f"env MEFOR_STORE_VAULT_WRAPPED_DEK={_MEFOR_NAME_SENTINEL} loaded")
+    assert _MEFOR_NAME_SENTINEL not in out
+    assert "MEFOR_STORE_VAULT_WRAPPED_DEK" in out  # the NAME is preserved for triage
 
 
 def test_redact_text_preserves_line_count() -> None:
