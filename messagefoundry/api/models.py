@@ -703,9 +703,15 @@ class Health(BaseModel):
 class EngineInfo(BaseModel):
     """Inbound-only engine counters (vs :class:`EngineKpis`, which combines inbound + outbound).
 
-    ``uptime_seconds`` is ``0.0`` until the engine has STARTED (``Engine.started_at`` is unset), and
-    a started engine's uptime only grows — so ``uptime_seconds > 0`` is the supported "this engine
-    has started" test. The console's health rollup keys its empty-graph warn on exactly that.
+    ``uptime_seconds`` is ``0.0`` until the engine has STARTED (``Engine.started_at`` is unset), so
+    ``uptime_seconds > 0`` is the supported "this engine has started" test, and the console's health
+    rollup keys its empty-graph warn on exactly that. It is NOT monotonic: ``/status`` derives it as
+    ``max(0.0, time.time() - started_at)`` off the WALL clock, so a backwards step (an NTP
+    correction on a long-running box) reads ``0.0`` on an engine that HAS started, until the clock
+    catches up. A gate written as ``> 0`` therefore stays silent for that window rather than firing
+    wrongly, which is the safe direction for one. Do not restate this as "uptime only grows": that
+    reading invites the next gate to be built on it the other way round, where the same clock step
+    produces a false alarm instead of a held one.
 
     ``channels_failed`` counts the DEPLOYED inbound connections that failed to build or bind at start
     (ADR 0031 isolation — the engine came up and serves the rest of the graph). It is an estate-wide
