@@ -336,3 +336,69 @@ async def test_fhir_lookup_read_and_probe_classify_a_real_invalid_url() -> None:
     with pytest.raises(FhirLookupError) as exc:
         executor._probe("FL_1793")
     assert "rejected an invalid request value" in str(exc.value)
+
+
+# --- 4. the alert webhook screens its URL and never echoes it -----------------------------------------
+#
+# ``[alerts].webhook_url`` is built in the app lifespan, outside the connector gate, so layer 1 never
+# saw it. Its cleartext-http refusal also printed ``{url!r}``: the whole password for the userinfo
+# shapes, and a Slack-style secret path token for an ordinary hook. ``redact()`` keeps both.
+
+
+@pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
+def test_the_alert_webhook_refuses_a_credential_in_its_url(shape: str) -> None:
+    from messagefoundry.pipeline.alert_sinks import WebhookTransport
+
+    with pytest.raises(ValueError) as exc:
+        WebhookTransport(_USERINFO_SHAPES[shape])
+    assert SECRET not in str(exc.value), str(exc.value)
+    assert "[alerts].webhook_url" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"http://svc:{SECRET}@hooks.example.invalid/x",  # the userinfo shape, over cleartext
+        f"http://hooks.example.invalid/services/{SECRET}",  # a path token, which IS the credential
+    ],
+    ids=["userinfo", "path_token"],
+)
+def test_the_cleartext_webhook_refusal_never_echoes_the_url(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.pipeline.alert_sinks import WebhookTransport
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError) as exc:
+        WebhookTransport(url)
+    assert SECRET not in str(exc.value), str(exc.value)
+    assert "[alerts].webhook_url" in str(exc.value)
+
+
+def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None:
+    """Neither of these echoed a credential before, since a scheme cannot hold one and the host is
+    screened at construction. They name the setting so every refusal in the sink reads the same way."""
+    from messagefoundry.pipeline.alert_sinks import WebhookTransport
+
+    with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be http or https"):
+        WebhookTransport(f"ftp://hooks.example.invalid/{SECRET}")
+    sink = WebhookTransport(
+        f"https://hooks.example.invalid/services/{SECRET}", allowed_hosts=("ok.example",)
+    )
+    with pytest.raises(ValueError) as exc:
+        sink._post({"type": "t", "connection": "c"})
+    assert SECRET not in str(exc.value)
+    assert "[alerts].webhook_allowed_hosts" in str(exc.value)
+
+
+def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
+    """The control half: a secret PATH token is how Slack and Teams hooks authenticate, so it must
+    still construct. So must an ``@`` in the path or query."""
+    from messagefoundry.pipeline.alert_sinks import WebhookTransport
+
+    for url in (
+        f"https://hooks.example.invalid/services/{SECRET}",
+        "https://hooks.example.invalid:8443/x",
+        "https://hooks.example.invalid/users/@me?who=a@b",
+    ):
+        assert WebhookTransport(url).url == url
