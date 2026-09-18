@@ -731,12 +731,14 @@ plus one file per fact. Every session on the **same** root shares it with no loc
 Reads are fine.
 
 **There is no single store, and the filenames are not `mf-*` everywhere.** Measured 2026-09-18:
-`.claude` holds 192 note files of which 184 are `mf-*`; `.claude-account-4` holds 266 of which 191
+`.claude` holds 192 note files of which 184 are `mf-*`; `.claude-account-4` holds 266 of which 190
 are `mf-*`; `.claude-account-1` holds 110 and **zero** `mf-*`. A note written on one root is
 invisible to sessions on the others: `.claude` and `.claude-account-1` share **one** filename, and so
 do `.claude-account-1` and `.claude-account-4`. **`.claude` and `.claude-account-4` are near-clones**
 — 160 shared filenames, 134 of them byte-identical — which is duplication across roots, not sharing,
-and a repair to one leaves its twin stale.
+and a repair to one leaves its twin stale. Count notes as `*.md` excluding the index: these
+directories also hold `.bak` files, and a bare `mf-*` glob counts
+`mf-reviewer-seat-suspended.md.bak-console-retired-20260910` as a note.
 
 *This paragraph previously said the store was `~/.claude/.../memory/`, that it held `mf-*.md` files,
 and that it was shared by all sessions. All three are false for a session on `.claude-account-1`.*
