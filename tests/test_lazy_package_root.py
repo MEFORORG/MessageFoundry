@@ -165,6 +165,20 @@ def test_submodule_names_are_not_shadowed_by_the_lazy_map() -> None:
     assert not collisions, f"lazy exports shadow these submodules: {collisions}"
 
 
+def test_star_import_still_binds_the_whole_surface() -> None:
+    """`from messagefoundry import *` is a real generated-config shape (lens.py emits config that
+    uses it, and test_lens_rewrite_v2 exercises it), and under PEP 562 it works ONLY because
+    `__all__` is still declared -- a star-import consults `__all__` and pulls each name through
+    `__getattr__`. Drop `__all__` on the theory that `_LAZY_EXPORTS` supersedes it and star-import
+    silently binds nothing, with no other test in this file noticing."""
+    namespace: dict[str, object] = {}
+    exec("from messagefoundry import *", namespace)  # noqa: S102
+    bound = {name for name in namespace if not name.startswith("__")}
+    missing = sorted(set(messagefoundry.__all__) - {"__version__"} - bound)
+    assert not missing, f"star-import bound nothing for: {missing}"
+    assert namespace["Send"] is messagefoundry.Send
+
+
 def test_dir_still_advertises_the_surface() -> None:
     """`dir()` drives tab-completion and help(); PEP 562 laziness must not empty it."""
     listed = dir(messagefoundry)
