@@ -2,12 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every SQLite writer holds the writer lock through `_writer_guard` or `_writer_txn`, never bare.
 
-A short writer takes the lock, issues its DML with no `BEGIN` of its own and commits; sqlite3's
-`isolation_level=''` auto-begins before the first DML. Taken BARE, that lock unwinds nothing, so a
-constraint refusal, a cipher failure between two statements or a cancellation left the implicit
-transaction open on the one writer connection. The next writer then failed its `BEGIN`, or committed
-the stranger's partial work with its own (BACKLOG #1803). Every writer was routed through
-`_writer_guard`, which rolls back on any exit that leaves a transaction open.
+Taken bare, the lock unwinds nothing, so a failure after a short writer's first DML leaves the
+implicit transaction open for the next writer (BACKLOG #1803; the mechanism is in
+`messagefoundry.store.store._writer_guard`'s docstring). Every writer was routed through the guard.
 
 Nothing stops the next writer from taking the lock bare again, and no existing test would notice: a
 new bare writer breaks nothing until something raises inside it. This pins the PROPERTY, not a
@@ -29,6 +26,8 @@ import re
 from typing import NamedTuple
 
 from _ast_sites import callee_name
+
+from tests.test_writer_txn_is_the_only_begin import _module_strings, _sql_text
 
 STORE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store" / "store.py"
 
@@ -84,23 +83,19 @@ def _owners(tree: ast.Module) -> dict[int, str]:
     return found
 
 
-def _dml_in(node: ast.AST) -> tuple[str, ...]:
-    """The first word of every DML statement passed as literal SQL to a call inside `node`."""
+def _dml_in(node: ast.AST, names: dict[str, str]) -> tuple[str, ...]:
+    """The first word of every DML statement a call inside `node` passes as readable SQL text.
+
+    Reads the text with the sibling guard's `_sql_text`, so f-strings, `+` concatenation and
+    module-level constants passed by name (`names`) are all seen."""
     heads: list[str] = []
     for call in ast.walk(node):
         if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
             continue
         if call.func.attr not in ("execute", "executemany", "executescript") or not call.args:
             continue
-        first = call.args[0]
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            text = first.value
-        elif isinstance(first, ast.JoinedStr):
-            text = "".join(
-                v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "{}"
-                for v in first.values
-            )
-        else:
+        text = _sql_text(call.args[0], names)
+        if text is None:
             continue
         match = _DML.match(text)
         if match:
@@ -112,6 +107,7 @@ def _lock_blocks(src: str) -> list[_Block]:
     """Every `async with` over a writer lock in `src`: bare `<x>._lock`, or a safe helper call."""
     tree = ast.parse(src)
     owners = _owners(tree)
+    names = _module_strings(tree)
     blocks: list[_Block] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.AsyncWith):
@@ -124,7 +120,7 @@ def _lock_blocks(src: str) -> list[_Block]:
                 kind, args = ast.unparse(expr.func), ", ".join(ast.unparse(a) for a in expr.args)
             else:
                 continue
-            blocks.append(_Block(owners[id(node)], node.lineno, kind, args, _dml_in(node)))
+            blocks.append(_Block(owners[id(node)], node.lineno, kind, args, _dml_in(node, names)))
     return blocks
 
 
@@ -150,7 +146,7 @@ def test_every_writer_lock_block_is_guarded() -> None:
     blocks = _lock_blocks(STORE.read_text(encoding="utf-8"))
 
     # Receipts: a walker that found nothing would pass vacuously. Measured on the #1803 branch:
-    # 75 guard blocks (69 with DML this reader can see), 24 _writer_txn blocks, 5 bare.
+    # 75 guard blocks (70 with DML this reader can see), 24 _writer_txn blocks, 5 bare.
     guards = [b for b in blocks if b.kind == "_writer_guard"]
     txns = [b for b in blocks if b.kind == "_writer_txn"]
     assert len(guards) > 60, f"liveness: only {len(guards)} _writer_guard blocks seen"

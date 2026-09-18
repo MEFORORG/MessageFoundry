@@ -226,28 +226,28 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
     stranger's leak, which is the defect itself. Doing nothing is worse: this writer's ``COMMIT`` would
     make the stranger's partial write durable, and a read-only exit would raise
     :class:`UncommittedWriteError` on the stranger's behalf. With every short writer routed through
-    here, the one known source left is a writer rollback that outran ``_WRITER_ROLLBACK_TIMEOUT``."""
+    here, the one known source left is a writer rollback that outran ``_WRITER_ROLLBACK_TIMEOUT`` and
+    is still pending. This writer's statements would queue behind that rollback on aiosqlite's one
+    worker thread anyway, so the extra rollback costs no extra wait beyond it."""
     async with lock:
         if db.in_transaction:
             log.error(
-                "sqlite: writer lock taken with a transaction already open, left by a block that let"
-                " go of the lock without closing it; rolling it back so this writer neither commits"
-                " it nor fails for it (BACKLOG #1803)"
+                "sqlite: writer lock taken with a transaction still open (a block let go of the lock"
+                " without closing it, or its rollback is still pending); rolling it back so this"
+                " writer neither commits it nor fails for it (BACKLOG #1803)"
             )
             if await _unwind_writer_txn(db):
                 raise asyncio.CancelledError
         try:
             yield
+            if db.in_transaction:
+                raise UncommittedWriteError(
+                    "a writer block wrote without committing; its write was rolled back rather than"
+                    " left open for the next writer's COMMIT (BACKLOG #1803)"
+                )
         except BaseException as exc:
             await _unwind_writer_failure(db, exc)
             raise
-        if db.in_transaction:
-            leak = UncommittedWriteError(
-                "a writer block wrote without committing; its write was rolled back rather than left"
-                " open for the next writer's COMMIT (BACKLOG #1803)"
-            )
-            await _unwind_writer_failure(db, leak)
-            raise leak
 
 
 @asynccontextmanager
@@ -7290,9 +7290,7 @@ class MessageStore:
             message_ids = [r["message_id"] for r in await cur.fetchall()]
             if not message_ids:
                 return 0
-            # All-or-nothing: a mid-loop failure unwinds through the writer guard, so no partial
-            # replay commits and no transaction is left open for the next write — matching the SQL
-            # Server backend's atomicity.
+            # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
                 f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
                 f" updated_at=? WHERE {clause}",
@@ -7693,7 +7691,7 @@ class MessageStore:
         # queue row, no finalizer call (connection_event is invisible to _maybe_finalize_message, which
         # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
         # writer as their probe for an inherited open transaction
-        # (tests/test_backlog1548_writer_txn_cancel_unwind.py).
+        # (tests/test_backlog1548_writer_txn_cancel_unwind.py). Its guard rolls one back on entry.
         params = self._connection_event_params(
             ConnectionEventWrite(
                 connection=connection,
@@ -7713,8 +7711,7 @@ class MessageStore:
     async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
-        # _writer_txn, one explicit transaction for the whole burst: teardown cancels the drainer, and
-        # a multi-row write cancelled mid-flight must not leave its transaction open (ADR 0159).
+        # _writer_txn: the whole burst is one explicit transaction, so it commits or unwinds whole.
         rows = [self._connection_event_params(ev) for ev in events]
         if not rows:
             return
@@ -9190,7 +9187,7 @@ class MessageStore:
         federated login so a later login carrying a different ``sub`` for a reassigned username is
         refused rather than handed the prior subject's account."""
         now = time.time() if now is None else now
-        # _writer_txn, not a bare lock: ux_users_federated_subject refusing this UPDATE is EXPECTED
+        # _writer_txn: ux_users_federated_subject refusing this UPDATE is EXPECTED
         # (the #1256 race loser), and the unwind rolls back the transaction the refusal would
         # otherwise leave open for the next writer's BEGIN to fail on (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
