@@ -60,6 +60,8 @@ def _diagnostic(code: str, exc: BaseException) -> str:
     * ``MF-BUNDLE-CFG-001`` -- the config did not wire up (``WiringError``).
     * ``MF-BUNDLE-CFG-002`` -- loading the config raised something else.
     * ``MF-BUNDLE-DB-001`` -- the store could not be opened or queried.
+    * ``MF-BUNDLE-DB-002`` -- no store exists at the configured path, and the bundle did not create
+      one (BACKLOG #1780).
     * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed.
     * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read.
 
@@ -122,10 +124,15 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
     PHI-free — the status models are metadata/counts/sizes only. Returns an ``error`` member instead of
-    raising if the store can't be opened (e.g. the DB is missing or in use), so the bundle still builds."""
+    raising if the store can't be opened (e.g. the DB is missing or in use), so the bundle still builds.
+
+    A missing SQLite store is REPORTED, never created (BACKLOG #1780). ``_db_info`` opens without
+    ``create=True``, so a bundle collected against a mistyped path says the store is absent instead of
+    building an empty one and describing it as healthy."""
     import os
 
     from messagefoundry.api.models import EngineInfo, SystemStatus
+    from messagefoundry.store.base import StoreNotFoundError
 
     engine = EngineInfo(
         version=__version__,
@@ -143,10 +150,12 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
         db_info = asyncio.run(_db_info(settings))
     except Exception as exc:  # a missing/locked DB must not abort the bundle
         # No driver text: a store failure routinely quotes the whole DSN, host and login (#1571).
+        # An absent store gets its own code, because "check the path" is a different fix (#1780).
+        code = "MF-BUNDLE-DB-002" if isinstance(exc, StoreNotFoundError) else "MF-BUNDLE-DB-001"
         return {
             "engine": engine.model_dump(),
             "db": None,
-            "db_error": _diagnostic("MF-BUNDLE-DB-001", exc),
+            "db_error": _diagnostic(code, exc),
         }
     status = SystemStatus(engine=engine, db=db_info, logs=None)
     return status.model_dump()

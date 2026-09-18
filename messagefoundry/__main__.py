@@ -4565,7 +4565,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        store = await open_store(settings.store)
+        # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
+        store = await open_store(settings.store, create=True)
         try:
             outcome = await AuthService(store, settings.auth).provision_first_administrator(
                 username=args.username,
@@ -5024,7 +5025,7 @@ def _backup(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
     from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
-    from messagefoundry.store.base import open_store
+    from messagefoundry.store.base import StoreNotFoundError, open_store
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -5070,6 +5071,8 @@ def _backup(args: argparse.Namespace) -> int:
         result = asyncio.run(run())
     except BackupError as exc:
         return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
+    except StoreNotFoundError as exc:  # #1780: open_store no longer creates the store it backs up
+        return _emit_error(str(exc), as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if result is None:  # leader-gated no-op (never on the single-node CLI path) — defensive
