@@ -34,7 +34,15 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
+from messagefoundry.pipeline.wiring_runner import (
+    _http_egress_allowed,
+    build_check_registry,
+    check_egress_allowed,
+    check_fhir_lookup_allowed,
+)
 from messagefoundry.redaction import redact, safe_exc, safe_text
 from messagefoundry.support.redact import redact_log_line
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
@@ -402,3 +410,121 @@ def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
         "https://hooks.example.invalid/users/@me?who=a@b",
     ):
         assert WebhookTransport(url).url == url
+
+
+# --- 5. the [egress] allowlist neither raises with nor echoes a credential ----------------------------
+#
+# ``check_egress_allowed`` runs BEFORE ``build_destination`` on every path that builds a connector:
+# build-check (``check``, reload, connection upsert), test-connection, start and resume. So the
+# construction refusal above never got the chance. Two leaks sat in front of it:
+#
+# * ``_http_egress_allowed`` read ``urlsplit(url).port``, which raises ``Port could not be cast to
+#   integer value as '<head>'`` for the ``slash_in_pw`` shape once an allow entry pins a port and names
+#   the parsed host. ``redact()`` does not match that text.
+# * every arm echoed ``urlsplit(url).hostname`` in its refusal, and for ``encoded_at`` that hostname
+#   holds the whole password.
+#
+# Every allowlist below lists the real host AND ``svc:443``. The pinned-port entry naming ``svc`` is
+# what drove the ``slash_in_pw`` shape into the port read before the fix; it keeps these tests able to
+# reproduce that leak if the screen in front of the match is ever removed.
+
+_EGRESS_HOSTS = ["endpoint.example.invalid", "svc:443"]
+
+
+def test_the_http_egress_match_never_raises_on_a_port_that_is_not_a_number() -> None:
+    assert _http_egress_allowed(_USERINFO_SHAPES["slash_in_pw"], _EGRESS_HOSTS) is False
+    # The control half: an ordinary URL still matches, with or without a pinned port.
+    assert _http_egress_allowed("https://endpoint.example.invalid/x", _EGRESS_HOSTS) is True
+    assert _http_egress_allowed("https://svc:443/x", _EGRESS_HOSTS) is True
+
+
+@pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
+def test_the_egress_gate_refuses_a_credential_in_the_data_url(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    egress = EgressSettings(allowed_http=_EGRESS_HOSTS)
+    with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+        check_egress_allowed(_dest(ConnectorType.REST, _USERINFO_SHAPES[shape]), egress)
+    assert SECRET not in str(exc.value), str(exc.value)
+    assert "'url'" in str(exc.value)
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("key", ["oauth2_token_url", "smart_token_url"])
+@pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
+def test_the_egress_gate_refuses_a_credential_in_a_token_url(
+    shape: str, key: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    egress = EgressSettings(allowed_http=_EGRESS_HOSTS)
+    dest = _dest(
+        ConnectorType.REST, "https://endpoint.example.invalid/v1", **{key: _USERINFO_SHAPES[shape]}
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+        check_egress_allowed(dest, egress)
+    assert SECRET not in str(exc.value), str(exc.value)
+    assert key in str(exc.value)
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
+def test_the_fhir_lookup_egress_gate_refuses_a_credential(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    egress = EgressSettings(allowed_http=_EGRESS_HOSTS)
+    with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+        check_fhir_lookup_allowed("FL_1793", {"url": _USERINFO_SHAPES[shape]}, egress)
+    assert SECRET not in str(exc.value), str(exc.value)
+    assert "'url'" in str(exc.value)
+    assert SECRET not in caplog.text
+
+
+def test_the_proxy_egress_refusal_never_echoes_a_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``proxy_url`` is deliberately NOT screened for userinfo: a forward proxy legitimately carries
+    its own. So it gets only the two leak fixes: an unreadable port is not allowed, and a host holding
+    an ``@`` once unquoted is withheld from the message instead of printed."""
+    egress = EgressSettings(
+        allowed_http=["endpoint.example.invalid"],
+        allowed_proxy=["proxy.example.invalid:3128", "svc:3128"],
+    )
+    for proxy in (
+        f"http://svc%3A{SECRET}%40proxy.example.invalid:3128",  # encoded_at: hostname holds it
+        f"http://svc:{SECRET}/tail@proxy.example.invalid:3128",  # slash: head read as the port
+    ):
+        dest = _dest(ConnectorType.REST, "https://endpoint.example.invalid/x", proxy_url=proxy)
+        with caplog.at_level(logging.DEBUG), pytest.raises(WiringError) as exc:
+            check_egress_allowed(dest, egress)
+        assert SECRET not in str(exc.value), str(exc.value)
+        assert "allowed_proxy" in str(exc.value)
+    assert SECRET not in caplog.text
+    # The control half: the ordinary credentialed proxy shape is still accepted.
+    check_egress_allowed(
+        _dest(
+            ConnectorType.REST,
+            "https://endpoint.example.invalid/x",
+            proxy_url=f"http://svc:{SECRET}@proxy.example.invalid:3128",
+        ),
+        egress,
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))
+def test_build_check_never_carries_the_password(shape: str) -> None:
+    """End to end on the ``messagefoundry check`` / reload path. Before the fix, ``slash_in_pw`` came
+    back as ``connector build failed: Port could not be cast to integer value as 'S3CRETPW'``, and
+    ``encoded_at`` as ``rest host 'svc%3AS3CRETPW%40endpoint.example.invalid' is not in ...``."""
+    registry = Registry()
+    registry.add_outbound(
+        OutboundConnection(
+            "OB_1793", ConnectionSpec(ConnectorType.REST, {"url": _USERINFO_SHAPES[shape]})
+        )
+    )
+    with pytest.raises(WiringError) as exc:
+        build_check_registry(
+            registry,
+            inbound_bind_host="127.0.0.1",
+            env_values={},
+            egress=EgressSettings(allowed_http=_EGRESS_HOSTS),
+        )
+    assert SECRET not in str(exc.value), str(exc.value)
