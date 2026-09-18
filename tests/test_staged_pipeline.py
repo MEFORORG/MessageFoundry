@@ -1068,7 +1068,7 @@ async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Pa
         try:
             assert runner.running
             assert not runner.inbound_running("IB")
-            reason = runner.connection_failed("IB")
+            reason = runner.inbound_failed("IB")
             assert reason and "not yet implemented" in reason
             # the guard is still the sole defense and still fires loud for a direct caller:
             with pytest.raises(WiringError, match="not yet implemented"):
