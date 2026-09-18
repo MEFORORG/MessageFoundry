@@ -25,6 +25,8 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     build_outbound_connection,
+    env,
+    validate_config,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _resolve_send_pace
 from messagefoundry.store import MessageStore
@@ -95,6 +97,100 @@ def test_positive_send_pace_carried() -> None:
         ConnectionSpec(ConnectorType.FILE, {"directory": "/tmp", "filename": "{MSH-10}.hl7"}),
     )
     assert _resolve_send_pace(file_oc.spec.settings) == 0.0
+
+
+# --- BACKLOG #1653: an env() ref is refused at the shared choke point, identically on both --------
+# authoring surfaces. It used to reach the `send_pace < 0` comparison and raise a raw
+# `TypeError: '<' not supported between instances of 'EnvRef' and 'int'`, which escaped `validate`
+# and `load` on the connections.toml surface (`_build_spec` wraps only the factory call) while the
+# code-first surface got an opaque `_exec_module` wrap naming no field.
+
+_ENV_PACE_REFUSAL = "send_min_interval_seconds may not use env"
+
+
+def test_env_ref_send_pace_refused_at_build() -> None:
+    """The refusal fires at ``build_outbound_connection`` and names the field and the env key.
+
+    Refusal, not a skipped sign check: ``_resolve_send_pace`` reads ``oc.spec.settings``
+    **unresolved** at both of its call sites and calls ``float(raw)``, so accepting the ref here
+    would only move the ``TypeError`` into outbound start -- a dead lane after the sender's ACK.
+    """
+    with pytest.raises(WiringError, match=_ENV_PACE_REFUSAL) as caught:
+        build_outbound_connection(
+            "OB", MLLP(host="127.0.0.1", port=1234, send_min_interval_seconds=env("pace"))
+        )
+    assert "'pace'" in str(caught.value)  # names the key the operator has to go remove
+
+
+def _code_first_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "codefirst"
+    d.mkdir()
+    (d / "feed.py").write_text(
+        "from messagefoundry import MLLP, outbound\n"
+        "from messagefoundry.config.wiring import env\n"
+        "outbound('OB_X', MLLP(host='h', port=1, send_min_interval_seconds=env('pace')))\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+def _toml_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "tomlsurface"
+    d.mkdir()
+    (d / "connections.toml").write_text(
+        '[[outbound]]\nname = "OB_X"\ntransport = "mllp"\n'
+        '[outbound.settings]\nhost = "h"\nport = 1\n'
+        'send_min_interval_seconds = { env = "pace", cast = "float" }\n',
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_env_ref_send_pace_diagnosed_identically_on_both_surfaces(tmp_path: Path) -> None:
+    """``validate_config`` RETURNS the same diagnostic for both surfaces instead of raising.
+
+    The identical string is the point: the divergence this closes was one surface raising a raw
+    ``TypeError`` out of ``validate`` while the other reported a message naming no field.
+    """
+    code_first = [d.message for d in validate_config(_code_first_dir(tmp_path))]
+    from_toml = [d.message for d in validate_config(_toml_dir(tmp_path))]
+    assert len(code_first) == 1 and len(from_toml) == 1
+    assert code_first == from_toml  # byte-identical, not merely both-non-empty
+    assert _ENV_PACE_REFUSAL in code_first[0]
+    assert "TypeError" not in code_first[0]
+
+
+def test_env_ref_send_pace_refused_at_load_on_the_toml_surface(tmp_path: Path) -> None:
+    """``load_config`` refuses it too -- as a ``WiringError``, not the raw ``TypeError`` it was."""
+    from messagefoundry.config.wiring import load_config
+
+    with pytest.raises(WiringError, match=_ENV_PACE_REFUSAL):
+        load_config(_toml_dir(tmp_path))
+
+
+def test_validate_config_reports_an_unexpected_toml_loader_failure_as_a_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1653 step 2: whatever the TOML loader fails to wrap becomes a diagnostic.
+
+    ``validate_config``'s contract is to return ALL problems and raise none; the ``*.py`` arm cannot
+    break it (``_exec_module`` wraps whatever a module raises) but the TOML arm could, and an escape
+    took the other diagnostics with it. Monkeypatched rather than driven through a real bad file so
+    the test pins the ARM, not whichever loader gap happens to be open today.
+    """
+    from messagefoundry.config import connections_file as cf
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("loader fell over")
+
+    monkeypatch.setattr(cf, "load_connections_file", _boom)
+    d = tmp_path / "unexpected"
+    d.mkdir()
+    (d / "connections.toml").write_text("", encoding="utf-8")
+    messages = [x.message for x in validate_config(d)]
+    assert len(messages) == 1
+    assert "unexpected RuntimeError" in messages[0]
+    assert "loader fell over" in messages[0]
 
 
 # --- _pace_outbound: (a) a single lane's second send is held >= the interval ----------------------

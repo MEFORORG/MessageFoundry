@@ -4752,6 +4752,27 @@ def build_outbound_connection(
             "(0 = show 'waiting for reply' immediately)"
         )
     send_pace = spec.settings.get("send_min_interval_seconds")
+    if isinstance(send_pace, EnvRef):
+        # BACKLOG #1653. `send_min_interval_seconds: float | None` carries no `EnvRef` member and
+        # `build_schema()` reports `"env": false` for it, so an env() ref here is not a supported
+        # spelling and never was -- it is a pacing number, not a per-environment or secret value.
+        # Refuse it rather than skip the sign check below: NOTHING downstream would resolve it.
+        # `_resolve_send_pace` (pipeline/wiring_runner.py) reads `oc.spec.settings` UNRESOLVED at both
+        # of its call sites and calls `float(raw)`, so accepting the ref at wiring only MOVES the
+        # TypeError into outbound start -- a dead lane AFTER the sender has been ACKed, which is
+        # strictly worse than a load-time error.
+        #
+        # Refused HERE because this is the one choke point both authoring surfaces pass through, so
+        # code-first and connections.toml now give the identical error. They used to diverge: a raw
+        # TypeError escaping `validate`/`load` on the TOML surface (`_build_spec` wraps only the
+        # factory call), versus an opaque `_exec_module` WiringError naming no field on the
+        # code-first one.
+        raise WiringError(
+            f"outbound connection {name!r}: send_min_interval_seconds may not use env() "
+            f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
+            "per-environment or secret value. Write it literally "
+            "(send_min_interval_seconds=0.5), or omit it for no pacing."
+        )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
         # negative interval is meaningless (None/0 = no pacing). Fail loud at wiring (dry-run / check).
@@ -5601,6 +5622,22 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
             load_connections_file(conn_file, registry)
         except WiringError as exc:
             diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
+        except Exception as exc:
+            # BACKLOG #1653: the *.py arm above cannot leak an unexpected exception (`_exec_module`
+            # wraps whatever a module raises), but this one could -- the TOML loader converts only
+            # what it anticipates, so anything else escaped `validate_config` as a raw traceback and
+            # took the OTHER diagnostics with it. That breaks this function's contract (return ALL
+            # problems, raise none) and leaves the IDE with nothing to render. A loader gap is still
+            # a bug to fix at its source; reporting it as a diagnostic is what keeps the contract
+            # while it exists. `Exception`, never `BaseException`: a KeyboardInterrupt or SystemExit
+            # is not a config problem and must keep propagating.
+            diagnostics.append(
+                Diagnostic(
+                    message=f"{CONNECTIONS_FILE_NAME}: unexpected {type(exc).__name__} while "
+                    f"loading connections — {exc}",
+                    file=str(conn_file),
+                )
+            )
     for conn in registry.inbound.values():
         if conn.router not in registry.routers:
             diagnostics.append(
