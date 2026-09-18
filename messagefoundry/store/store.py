@@ -2566,7 +2566,7 @@ class MessageStore:
     ) -> None:
         """Insert or replace one NON-SECRET watch record. Idempotent (INSERT OR REPLACE on the PK), so a
         re-run — or a second cluster node — writing an identical fingerprint/date is a no-op."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT OR REPLACE INTO secret_rotation_meta"
                 " (secret_key, fingerprint, tracked_since, last_rotated) VALUES (?, ?, ?, ?)",
@@ -2874,7 +2874,7 @@ class MessageStore:
         cur = await self._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         cnt = await cur.fetchone()
         if cnt is not None and int(cnt["n"]) == 0:
-            async with self._lock:
+            async with _writer_guard(self._db, self._lock):
                 await self._db.execute(
                     "INSERT OR REPLACE INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1)"
                 )
@@ -2923,7 +2923,7 @@ class MessageStore:
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
             row = await cur.fetchone()
             watermark = (int(row["m"]) if row is not None else 0) + 1
@@ -2986,7 +2986,7 @@ class MessageStore:
         # specific prefix would miss the other version's rows.
         like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
                 while True:
                     # NOT LIKE / <> '' are both NULL (excluded) for NULL columns, so only non-null,
@@ -3318,7 +3318,7 @@ class MessageStore:
         # Built off the cipher (not a baked-in v1 prefix+keyid) so a v2-active rotation matches v2 rows.
         active_like = f"{cipher.active_marker_prefix}%"
         total = 0
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
                 while True:
                     # Anything not already under the active key (plaintext or a retired-key blob),
@@ -4144,27 +4144,23 @@ class MessageStore:
             for seq, c in enumerate(plaintext_chunks)
         ]
         now = time.time()
-        async with self._lock:
-            try:
-                cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-                if await cur.fetchone() is not None:
-                    # Dedup: identical content already stored — reuse the single copy, write nothing. The
-                    # SELECT opened no write transaction (SQLite reads don't), so there is nothing to commit.
-                    return ref
-                await self._db.execute(
-                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                    " VALUES (?,?,?,0,?)",
-                    (ref, content_type, total, now),
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+            if await cur.fetchone() is not None:
+                # Dedup: identical content already stored — reuse the single copy, write nothing. The
+                # SELECT opened no write transaction (SQLite reads don't), so there is nothing to commit.
+                return ref
+            await self._db.execute(
+                "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
+                " VALUES (?,?,?,0,?)",
+                (ref, content_type, total, now),
+            )
+            if sealed:
+                await self._db.executemany(
+                    "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
+                    [(ref, seq, ct) for seq, ct in enumerate(sealed)],
                 )
-                if sealed:
-                    await self._db.executemany(
-                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
-                        [(ref, seq, ct) for seq, ct in enumerate(sealed)],
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+            await self._commit()
         return ref
 
     async def read_attachment(self, ref: str) -> AsyncIterator[str]:
@@ -4211,18 +4207,14 @@ class MessageStore:
         """Add one live reference to an attachment (store-once refcount; mirrors ``shared_body``). Raises
         :class:`KeyError` if the attachment does not exist — an incref must name a real stored document."""
         self._require_streaming_attachments()
-        async with self._lock:
-            try:
-                cur = await self._db.execute(
-                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
-                )
-                if cur.rowcount == 0:
-                    await self._db.rollback()
-                    raise KeyError(f"attachment {ref!r} not found")
-                await self._commit()
-            except Exception:
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+            )
+            if cur.rowcount == 0:
                 await self._db.rollback()
-                raise
+                raise KeyError(f"attachment {ref!r} not found")
+            await self._commit()
 
     async def _decref_attachment(self, ref: str, count: int = 1) -> None:
         """Drop ``count`` references to an attachment and **GC the attachment + all its chunks at
@@ -4247,13 +4239,9 @@ class MessageStore:
         (store-once retention; mirrors :meth:`_release_shared_body`). Clamped at 0 (a double-decref can't
         go negative); tolerant of a missing ref (a no-op), so a re-run of a purge is idempotent."""
         self._require_streaming_attachments()
-        async with self._lock:
-            try:
-                await self._decref_attachment(ref, 1)
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_guard(self._db, self._lock):
+            await self._decref_attachment(ref, 1)
+            await self._commit()
 
     async def _release_message_attachments(self, where: str, params: tuple[object, ...]) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 3a — the
@@ -4333,31 +4321,27 @@ class MessageStore:
         Returns the number of attachments reclaimed (refcount-0 headers + distinct header-less chunk
         groups). Idempotent: a second run finds nothing."""
         self._require_streaming_attachments()
-        async with self._lock:
-            try:
-                # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
-                # so their chunks don't miscount as orphans — those are reclaimed as the refcount-0 class).
-                cur = await self._db.execute(
-                    "SELECT COUNT(DISTINCT attachment_id) AS n FROM attachment_chunk"
-                    " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
-                )
-                row = await cur.fetchone()
-                incomplete = int(row["n"]) if row is not None else 0
-                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
-                await self._db.execute(
-                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
-                    " (SELECT id FROM attachment WHERE refcount<=0)"
-                )
-                cur = await self._db.execute("DELETE FROM attachment WHERE refcount<=0")
-                headers = cur.rowcount
-                # Reclaim any header-less orphan chunks (incomplete writes).
-                await self._db.execute(
-                    "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
-                )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_guard(self._db, self._lock):
+            # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
+            # so their chunks don't miscount as orphans — those are reclaimed as the refcount-0 class).
+            cur = await self._db.execute(
+                "SELECT COUNT(DISTINCT attachment_id) AS n FROM attachment_chunk"
+                " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+            )
+            row = await cur.fetchone()
+            incomplete = int(row["n"]) if row is not None else 0
+            # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
+            await self._db.execute(
+                "DELETE FROM attachment_chunk WHERE attachment_id IN"
+                " (SELECT id FROM attachment WHERE refcount<=0)"
+            )
+            cur = await self._db.execute("DELETE FROM attachment WHERE refcount<=0")
+            headers = cur.rowcount
+            # Reclaim any header-less orphan chunks (incomplete writes).
+            await self._db.execute(
+                "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+            )
+            await self._commit()
             reclaimed = headers + incomplete
             if reclaimed:
                 log.info(
@@ -5067,7 +5051,7 @@ class MessageStore:
         if destination_name is not None:
             where.append("destination_name=?")
             params.append(destination_name)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT id FROM queue WHERE {' AND '.join(where)}"
                 " ORDER BY next_attempt_at LIMIT ?",
@@ -5211,7 +5195,7 @@ class MessageStore:
             if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
             else "destination_name"
         )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
                 " ORDER BY rowid LIMIT 1",
@@ -5304,7 +5288,7 @@ class MessageStore:
             if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
             else "destination_name"
         )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
                 " ORDER BY rowid LIMIT ?",
@@ -5395,75 +5379,69 @@ class MessageStore:
             return ClaimedHeads(by_lane={}, rearm=frozenset())
         rearm: set[str] = set()
         claimed_by_lane: dict[str, list[aiosqlite.Row]] = {}
-        async with self._lock:
-            try:
-                for lane in lane_list:
-                    cur = await self._db.execute(
-                        f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
-                        " ORDER BY rowid LIMIT ?",
-                        (stage, lane, OutboxStatus.PENDING.value, per_lane_limit),
-                    )
-                    rows = await cur.fetchall()
-                    due_ids: list[str] = []
-                    for row in rows:
-                        # Contiguous-due truncation: STOP at the first not-due row, never skip past it
-                        # (a not-due HEAD empties the lane — strict per-lane FIFO, == the single
-                        # claim's None). Rows past the cutoff are never touched.
-                        if row["next_attempt_at"] > now:
-                            break
-                        due_ids.append(row["id"])
-                    if not due_ids:
-                        continue  # lane EMPTY — head not due / nothing pending; tail rows untouched
-                    placeholders = ",".join("?" * len(due_ids))
-                    await self._db.execute(
-                        f"UPDATE queue SET status=?, attempts=attempts+1, updated_at=?"
-                        f" WHERE id IN ({placeholders})",
-                        (OutboxStatus.INFLIGHT.value, now, *due_ids),
-                    )
-                    # RE-SELECT so OutboxItem.attempts is the POST-increment value (the G6 poison
-                    # ceiling reads it), re-ordered by the lane total order — the shipped
-                    # claim_next_fifo_batch pattern.
-                    cur = await self._db.execute(
-                        f"SELECT * FROM queue WHERE id IN ({placeholders}) ORDER BY rowid",
-                        due_ids,
-                    )
-                    kept: list[aiosqlite.Row] = []
-                    for claimed in await cur.fetchall():
-                        # H2 SKIP-AND-COMPLETE in the SAME claim txn — code-identical to
-                        # claim_next_fifo's (the only _maybe_finalize call site in this primitive; the
-                        # same caller class and txn discipline as the single claim). The consumed head
-                        # is completed DONE in place (NO reorder), dropped from the results, and its
-                        # lane re-armed so the dispatcher advances to the next head immediately.
-                        if claimed["destination_name"] is not None:
-                            dk = await self._db.execute(
-                                "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1",
-                                (claimed["id"],),
+        async with _writer_guard(self._db, self._lock):
+            for lane in lane_list:
+                cur = await self._db.execute(
+                    f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
+                    " ORDER BY rowid LIMIT ?",
+                    (stage, lane, OutboxStatus.PENDING.value, per_lane_limit),
+                )
+                rows = await cur.fetchall()
+                due_ids: list[str] = []
+                for row in rows:
+                    # Contiguous-due truncation: STOP at the first not-due row, never skip past it
+                    # (a not-due HEAD empties the lane — strict per-lane FIFO, == the single
+                    # claim's None). Rows past the cutoff are never touched.
+                    if row["next_attempt_at"] > now:
+                        break
+                    due_ids.append(row["id"])
+                if not due_ids:
+                    continue  # lane EMPTY — head not due / nothing pending; tail rows untouched
+                placeholders = ",".join("?" * len(due_ids))
+                await self._db.execute(
+                    f"UPDATE queue SET status=?, attempts=attempts+1, updated_at=?"
+                    f" WHERE id IN ({placeholders})",
+                    (OutboxStatus.INFLIGHT.value, now, *due_ids),
+                )
+                # RE-SELECT so OutboxItem.attempts is the POST-increment value (the G6 poison
+                # ceiling reads it), re-ordered by the lane total order — the shipped
+                # claim_next_fifo_batch pattern.
+                cur = await self._db.execute(
+                    f"SELECT * FROM queue WHERE id IN ({placeholders}) ORDER BY rowid",
+                    due_ids,
+                )
+                kept: list[aiosqlite.Row] = []
+                for claimed in await cur.fetchall():
+                    # H2 SKIP-AND-COMPLETE in the SAME claim txn — code-identical to
+                    # claim_next_fifo's (the only _maybe_finalize call site in this primitive; the
+                    # same caller class and txn discipline as the single claim). The consumed head
+                    # is completed DONE in place (NO reorder), dropped from the results, and its
+                    # lane re-armed so the dispatcher advances to the next head immediately.
+                    if claimed["destination_name"] is not None:
+                        dk = await self._db.execute(
+                            "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1",
+                            (claimed["id"],),
+                        )
+                        if await dk.fetchone() is not None:
+                            await self._db.execute(
+                                "UPDATE queue SET status=?, last_error=NULL, updated_at=?"
+                                " WHERE id=?",
+                                (OutboxStatus.DONE.value, now, claimed["id"]),
                             )
-                            if await dk.fetchone() is not None:
-                                await self._db.execute(
-                                    "UPDATE queue SET status=?, last_error=NULL, updated_at=?"
-                                    " WHERE id=?",
-                                    (OutboxStatus.DONE.value, now, claimed["id"]),
-                                )
-                                await self._event(
-                                    claimed["message_id"],
-                                    "delivered",
-                                    claimed["destination_name"],
-                                    "idempotent skip (already delivered)",
-                                    now,
-                                )
-                                await self._maybe_finalize_message(claimed["message_id"], now)
-                                rearm.add(lane)
-                                continue
-                        kept.append(claimed)
-                    if kept:
-                        claimed_by_lane[lane] = kept
-                await self._commit()
-            except Exception:
-                # Multi-lane claim: roll the whole call back so a mid-loop failure can't leave a
-                # partial claim riding an unrelated later commit.
-                await self._db.rollback()
-                raise
+                            await self._event(
+                                claimed["message_id"],
+                                "delivered",
+                                claimed["destination_name"],
+                                "idempotent skip (already delivered)",
+                                now,
+                            )
+                            await self._maybe_finalize_message(claimed["message_id"], now)
+                            rearm.add(lane)
+                            continue
+                    kept.append(claimed)
+                if kept:
+                    claimed_by_lane[lane] = kept
+            await self._commit()
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload must not blow up the whole
         # claim — dead-letter the bad row STANDALONE and deliver the rest (mirrors the batch claim).
         by_lane: dict[str, list[OutboxItem]] = {}
@@ -5535,20 +5513,16 @@ class MessageStore:
         id_list = list(dict.fromkeys(ids))
         if not id_list:
             return
-        async with self._lock:
-            try:
-                for i in range(0, len(id_list), _RELEASE_CHUNK):
-                    chunk = id_list[i : i + _RELEASE_CHUNK]
-                    placeholders = ",".join("?" * len(chunk))
-                    await self._db.execute(
-                        f"UPDATE queue SET status=?, attempts=MAX(attempts-1, 0), updated_at=?"
-                        f" WHERE id IN ({placeholders}) AND status=?",
-                        (OutboxStatus.PENDING.value, now, *chunk, OutboxStatus.INFLIGHT.value),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_guard(self._db, self._lock):
+            for i in range(0, len(id_list), _RELEASE_CHUNK):
+                chunk = id_list[i : i + _RELEASE_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await self._db.execute(
+                    f"UPDATE queue SET status=?, attempts=MAX(attempts-1, 0), updated_at=?"
+                    f" WHERE id IN ({placeholders}) AND status=?",
+                    (OutboxStatus.PENDING.value, now, *chunk, OutboxStatus.INFLIGHT.value),
+                )
+            await self._commit()
 
     async def reschedule_claimed(
         self, ids: Sequence[str], next_attempt_at: float, now: float | None = None
@@ -5563,26 +5537,22 @@ class MessageStore:
         id_list = list(dict.fromkeys(ids))
         if not id_list:
             return
-        async with self._lock:
-            try:
-                for i in range(0, len(id_list), _RELEASE_CHUNK):
-                    chunk = id_list[i : i + _RELEASE_CHUNK]
-                    placeholders = ",".join("?" * len(chunk))
-                    await self._db.execute(
-                        f"UPDATE queue SET status=?, attempts=MAX(attempts-1, 0),"
-                        f" next_attempt_at=?, updated_at=? WHERE id IN ({placeholders}) AND status=?",
-                        (
-                            OutboxStatus.PENDING.value,
-                            next_attempt_at,
-                            now,
-                            *chunk,
-                            OutboxStatus.INFLIGHT.value,
-                        ),
-                    )
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+        async with _writer_guard(self._db, self._lock):
+            for i in range(0, len(id_list), _RELEASE_CHUNK):
+                chunk = id_list[i : i + _RELEASE_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await self._db.execute(
+                    f"UPDATE queue SET status=?, attempts=MAX(attempts-1, 0),"
+                    f" next_attempt_at=?, updated_at=? WHERE id IN ({placeholders}) AND status=?",
+                    (
+                        OutboxStatus.PENDING.value,
+                        next_attempt_at,
+                        now,
+                        *chunk,
+                        OutboxStatus.INFLIGHT.value,
+                    ),
+                )
+            await self._commit()
 
     async def dead_letter_now(
         self,
@@ -6625,42 +6595,35 @@ class MessageStore:
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         recovered = 0
-        async with self._lock:
-            try:
-                for st in stages:
-                    if owned is None:
-                        cur = await self._db.execute(
-                            "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
-                            " WHERE status=? AND stage=?",
-                            (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
-                        )
-                        recovered += cur.rowcount
-                        continue
-                    lane_col, names = owned_lane_scope(st, owned)
-                    ordered = sorted(names)
-                    for i in range(0, len(ordered), _RESET_LANE_CHUNK):
-                        chunk = ordered[i : i + _RESET_LANE_CHUNK]
-                        marks = ",".join("?" * len(chunk))
-                        cur = await self._db.execute(
-                            f"UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
-                            f" WHERE status=? AND stage=? AND {lane_col} IN ({marks})",
-                            (
-                                OutboxStatus.PENDING.value,
-                                now,
-                                now,
-                                OutboxStatus.INFLIGHT.value,
-                                st,
-                                *chunk,
-                            ),
-                        )
-                        recovered += cur.rowcount
-                await self._commit()
-            except Exception:
-                # A mid-loop failure must not leave the implicit txn open (the earlier stages'
-                # resets would silently ride out on the NEXT writer's commit) — roll back so the
-                # pass stays all-or-nothing, matching the server twins and this file's convention.
-                await self._db.rollback()
-                raise
+        async with _writer_guard(self._db, self._lock):
+            for st in stages:
+                if owned is None:
+                    cur = await self._db.execute(
+                        "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
+                        " WHERE status=? AND stage=?",
+                        (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
+                    )
+                    recovered += cur.rowcount
+                    continue
+                lane_col, names = owned_lane_scope(st, owned)
+                ordered = sorted(names)
+                for i in range(0, len(ordered), _RESET_LANE_CHUNK):
+                    chunk = ordered[i : i + _RESET_LANE_CHUNK]
+                    marks = ",".join("?" * len(chunk))
+                    cur = await self._db.execute(
+                        f"UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
+                        f" WHERE status=? AND stage=? AND {lane_col} IN ({marks})",
+                        (
+                            OutboxStatus.PENDING.value,
+                            now,
+                            now,
+                            OutboxStatus.INFLIGHT.value,
+                            st,
+                            *chunk,
+                        ),
+                    )
+                    recovered += cur.rowcount
+            await self._commit()
             return recovered
 
     async def dead_letter_missing_destinations(
@@ -6675,7 +6638,7 @@ class MessageStore:
         swept up as orphans. Returns the rows killed; an operator can replay them via the dead-letter
         API once the outbound is restored."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT id, message_id, destination_name FROM queue"
                 " WHERE stage=? AND status IN (?, ?)",
@@ -6722,7 +6685,7 @@ class MessageStore:
         once the handler is restored (a dead routed row, like a dead ingress row, is recovered there,
         not via the outbound-only dead-letter API)."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT id, message_id, handler_name FROM queue WHERE stage=? AND status IN (?, ?)",
                 (Stage.ROUTED.value, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
@@ -6781,7 +6744,7 @@ class MessageStore:
         .inbound_names()`` is the pinned whole-config set; the caller passes it."""
         now = time.time() if now is None else now
         channel_keyed = (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT id, message_id, channel_id FROM queue"
                 " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
@@ -6848,7 +6811,7 @@ class MessageStore:
         Excluding it would fall through to RE-SEND and re-transmit the message's *delivered* siblings,
         which the operator did not ask for — a worse outcome than doing nothing."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND status IN (?, ?)",
                 (message_id, OutboxStatus.DEAD.value, OutboxStatus.PENDING.value),
@@ -7320,33 +7283,29 @@ class MessageStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
             )
             message_ids = [r["message_id"] for r in await cur.fetchall()]
             if not message_ids:
                 return 0
-            # Roll back the whole batch on any mid-loop failure so we never commit a partial replay
-            # or leave the shared connection in an open transaction (which would break the next
-            # write) — matching the SQL Server backend's atomicity.
-            try:
-                upd = await self._db.execute(
-                    f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                    f" updated_at=? WHERE {clause}",
-                    (OutboxStatus.PENDING.value, now, now, *params),
+            # All-or-nothing: a mid-loop failure unwinds through the writer guard, so no partial
+            # replay commits and no transaction is left open for the next write — matching the SQL
+            # Server backend's atomicity.
+            upd = await self._db.execute(
+                f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
+                f" updated_at=? WHERE {clause}",
+                (OutboxStatus.PENDING.value, now, now, *params),
+            )
+            for message_id in message_ids:
+                # Outbound-only replay → the message is routed again, awaiting delivery (ROUTED).
+                await self._db.execute(
+                    "UPDATE messages SET status=?, error=NULL WHERE id=? AND status=?",
+                    (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
                 )
-                for message_id in message_ids:
-                    # Outbound-only replay → the message is routed again, awaiting delivery (ROUTED).
-                    await self._db.execute(
-                        "UPDATE messages SET status=?, error=NULL WHERE id=? AND status=?",
-                        (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
-                    )
-                    await self._event(message_id, "replayed", None, "dead-letter replay", now)
-                await self._commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+                await self._event(message_id, "replayed", None, "dead-letter replay", now)
+            await self._commit()
             return upd.rowcount
 
     async def cancel_queued(
@@ -7364,7 +7323,7 @@ class MessageStore:
         the head of the queue (next due). Inflight/dead rows are left untouched (dead uses
         :meth:`replay`). Returns the number cancelled."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             where = ["destination_name=?", "status=?"]
             params: list[object] = [destination_name, OutboxStatus.PENDING.value]
             if channel_id is not None:
@@ -7747,15 +7706,15 @@ class MessageStore:
                 now=now,
             )
         )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(_CONNECTION_EVENT_INSERT, params)
             await self._commit()
 
     async def record_connection_events(self, events: Sequence[ConnectionEventWrite]) -> None:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
-        # _writer_txn rather than the bare lock the singular takes: teardown cancels the drainer, and a
-        # multi-row write cancelled mid-flight must not leave its transaction open (ADR 0159).
+        # _writer_txn, one explicit transaction for the whole burst: teardown cancels the drainer, and
+        # a multi-row write cancelled mid-flight must not leave its transaction open (ADR 0159).
         rows = [self._connection_event_params(ev) for ev in events]
         if not rows:
             return
@@ -7881,7 +7840,7 @@ class MessageStore:
             if reason
             else None
         )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?,"
                 " escalation_tier=MAX(escalation_tier, ?)"
@@ -7973,7 +7932,7 @@ class MessageStore:
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Ack'ing a resolved instance is refused (no-op → False).
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
                 " WHERE id=? AND status!='resolved'",
@@ -7986,7 +7945,7 @@ class MessageStore:
         # Operator resolve: open|acknowledged → resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE id=? AND status!='resolved'",
@@ -8001,7 +7960,7 @@ class MessageStore:
         # Auto-resolution (ADR 0044 D2): an inverse lifecycle signal (e.g. connection_restored) resolves
         # the matching live instance(s) for a (event_type, connection) key. Returns the count resolved.
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
@@ -8018,7 +7977,7 @@ class MessageStore:
         # untouched — only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
         # instance (a resolved condition has nothing to mute). Returns the updated row (for the API echo +
         # so the caller can seed the running sink's suspend cache), or None if unknown/already resolved.
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
@@ -8033,7 +7992,7 @@ class MessageStore:
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
@@ -8057,7 +8016,7 @@ class MessageStore:
         # Retention (ADR 0044 D5): age-DELETE RESOLVED instances whose resolved_at predates older_than —
         # metadata-only, on their own window, driven by the RetentionRunner. NEVER touches an
         # open/acknowledged instance. A single short transaction.
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM alert_instance WHERE status='resolved' AND resolved_at IS NOT NULL"
                 " AND resolved_at < ?",
@@ -8074,7 +8033,7 @@ class MessageStore:
         """Append a ``viewed`` audit event. Called whenever a message body (PHI) is
         opened, satisfying the audit-log requirement for message views."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._event(message_id, "viewed", None, actor or "", now)
             await self._commit()
 
@@ -8108,7 +8067,7 @@ class MessageStore:
                 "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
             )
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._event(message_id, event, destination, detail or "", now)
             await self._commit()
 
@@ -8136,7 +8095,7 @@ class MessageStore:
         :func:`~messagefoundry.store.audit_tee.emit_audit_tee` (sec-offbox-log) so the audit trail
         survives a host/DB compromise — the same shared redaction path used by every backend."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             last = await cur.fetchone()
             prev = last["row_hash"] if last and last["row_hash"] else ""
@@ -8238,7 +8197,7 @@ class MessageStore:
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO pending_approvals "
                 "(id, operation, params, requester, requester_user_id, requested_at, status,"
@@ -8294,7 +8253,7 @@ class MessageStore:
         The approval gate also uses it for the ASVS 2.3.3 compensating transition ``approved`` ->
         ``failed``, which must NOT be able to move a row some other caller already rejected or
         expired — hence the guard is a parameter rather than a hardcoded literal."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
                 " WHERE id = ? AND status = ?",
@@ -8312,7 +8271,7 @@ class MessageStore:
         pass a NEGATIVE count to refund an unspent reserve), and the DR backup codec's post-run aggregate
         all funnel through it. Atomic, so N processes sharing this one store aggregate onto the same row
         (see :mod:`messagefoundry.store.gcm_bound`)."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             return await self._add_cipher_invocations_locked(key_id, count)
 
     async def _add_cipher_invocations_locked(self, key_id: str, count: int) -> int:
@@ -8384,7 +8343,7 @@ class MessageStore:
         if files <= 0:
             # RELEASE — always applies, clamped at zero so a double release cannot mint budget. Never
             # conditional: refusing a release would strand the reservation it is paying back.
-            async with self._lock:
+            async with _writer_guard(self._db, self._lock):
                 await self._db.execute(
                     "UPDATE upload_quota SET"
                     " inflight_files = MAX(0, inflight_files + ?),"
@@ -8400,7 +8359,7 @@ class MessageStore:
             # unconditionally, so an empty uploader with zero headroom must be refused here.
             return False
         stale = now - max(0.0, stale_after)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
                 " VALUES (?,?,?,?)"
@@ -8581,7 +8540,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
                 " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
@@ -8664,7 +8623,7 @@ class MessageStore:
         # The residual is still absorbed at the call site (`_refresh_cached_username`) for every
         # backend alike -- this store must not be the reason that handler looks unnecessary.
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
                 "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
@@ -8692,7 +8651,7 @@ class MessageStore:
         now = time.time() if now is None else now
         claim_set = password_claim_set(must_change_password, "?")
         claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
                 f"{claim_set}"
@@ -8705,7 +8664,7 @@ class MessageStore:
         self, user_id: str, *, disabled: bool, now: float | None = None
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET disabled=?, updated_at=? WHERE id=?",
                 (1 if disabled else 0, now, user_id),
@@ -8725,7 +8684,7 @@ class MessageStore:
         #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
@@ -8743,7 +8702,7 @@ class MessageStore:
         """
         cleaned = require_notify_email(email)
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET notify_email=?, updated_at=? WHERE id=?",
                 (cleaned, now, user_id),
@@ -8759,7 +8718,7 @@ class MessageStore:
         enable MFA — enrollment is confirmed by :meth:`enable_totp` after the user proves a live code.
         ``secret=None`` clears the staged secret."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET totp_secret=?, updated_at=? WHERE id=?",
                 (self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)), now, user_id),
@@ -8783,7 +8742,7 @@ class MessageStore:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
         recovery codes."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
                 " updated_at=? WHERE id=?",
@@ -8794,7 +8753,7 @@ class MessageStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
                 " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
@@ -8818,7 +8777,7 @@ class MessageStore:
         the race). The re-read + membership check + write all happen under one ``self._lock``, so two
         concurrent verifications can't double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,)
             )
@@ -8843,7 +8802,7 @@ class MessageStore:
         than the stored ``last_totp_step``, so this returns ``False`` — making each code single-use
         (ASVS 6.5.1). The re-read + compare + write run under one ``self._lock``, so two concurrent
         verifications of the same code can't both win."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT last_totp_step FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
             if row is None:
@@ -8862,7 +8821,7 @@ class MessageStore:
         ``_CIPHER_COLUMNS`` note). A duplicate ``(user_id, label)`` raises the backend's
         IntegrityError — the caller renders it as the same "label already in use" error as its
         pre-check (the concurrent-enroll race, ADR 0068 §4)."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
                 " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
@@ -8925,7 +8884,7 @@ class MessageStore:
     async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted)."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?",
                 (user_id, credential_id_hash),
@@ -8935,7 +8894,7 @@ class MessageStore:
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int:
         """Remove every credential for a user (``admin_reset_mfa``); returns the count removed."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
             )
@@ -8949,7 +8908,7 @@ class MessageStore:
         precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
         concurrent assertion consumed the same counter — the caller treats it as a clone signal
         (ADR 0068 §4). Runs as one guarded UPDATE under the writer lock."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
                 " WHERE credential_id_hash=? AND sign_count=?",
@@ -8974,7 +8933,7 @@ class MessageStore:
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL,"
                 " updated_at=? WHERE id=?",
@@ -8991,7 +8950,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
                 (failed_attempts, locked_until, now, user_id),
@@ -9017,7 +8976,7 @@ class MessageStore:
         Returns ``(0, False)`` for an unknown user -- there is no row to count against, and a caller
         that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT failed_attempts, locked_until FROM users WHERE id=?", (user_id,)
             )
@@ -9047,7 +9006,7 @@ class MessageStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO roles (id, display_name, description, builtin, permissions)"
                 " VALUES (?,?,?,?,?)"
@@ -9174,7 +9133,7 @@ class MessageStore:
         """Best-effort ``last_used_at`` stamp for a recalled preset (#306). Never raises."""
         stamp = time.time() if now is None else now
         try:
-            async with self._lock:
+            async with _writer_guard(self._db, self._lock):
                 await self._db.execute(
                     "UPDATE search_presets SET last_used_at=? WHERE id=?", (stamp, preset_id)
                 )
@@ -9184,7 +9143,7 @@ class MessageStore:
 
     async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         """Delete an owner_user_id-scoped preset. Returns ``True`` if a row was removed. Idempotent."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
                 (preset_id, owner_user_id),
@@ -9217,7 +9176,7 @@ class MessageStore:
         """Set a user's per-channel scope. ``scope_json`` is a JSON list of granted connection names
         (``'["*"]'`` for every channel), or ``None`` to clear it — which denies (BACKLOG #1152)."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
                 (scope_json, now, user_id),
@@ -9333,7 +9292,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
                 " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)",
@@ -9364,7 +9323,7 @@ class MessageStore:
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET last_used_at=? WHERE token_hash=?", (now, token_hash)
             )
@@ -9374,7 +9333,7 @@ class MessageStore:
         self, token_hash: str, *, now: float | None = None, client: str | None = None
     ) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
             # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
             await self._db.execute(
@@ -9387,7 +9346,7 @@ class MessageStore:
         """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
         issuance for an MFA-delegated AD/Kerberos login."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET mfa_verified_at=? WHERE token_hash=?", (now, token_hash)
             )
@@ -9399,7 +9358,7 @@ class MessageStore:
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. Reports its rowcount so the caller can fail
         closed when the session was revoked out from under it."""
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
                 (new_token_hash, token_hash),
@@ -9409,7 +9368,7 @@ class MessageStore:
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
@@ -9427,7 +9386,7 @@ class MessageStore:
         if except_token_hash is not None:
             sql += " AND token_hash != ?"
             params.append(except_token_hash)
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(sql, params)
             await self._commit()
             return int(cur.rowcount)
@@ -9439,7 +9398,7 @@ class MessageStore:
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
                 " AND token_hash NOT IN ("
@@ -9452,7 +9411,7 @@ class MessageStore:
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
             await self._commit()
             return cur.rowcount if cur.rowcount is not None else 0
@@ -9761,7 +9720,7 @@ class MessageStore:
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: connection events are metadata-only (no body to null, no FK), so they are age-DELETEd on
         # their own window (driven by the RetentionRunner). A single short transaction.
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("DELETE FROM connection_event WHERE ts < ?", (older_than,))
             await self._commit()
             return int(cur.rowcount)
@@ -9774,7 +9733,7 @@ class MessageStore:
         # SQLite's 2-arg scalar max() returns NULL if ANY argument is NULL, so the COALESCE is what
         # makes it null-safe: a pre-#306 row (last_used_at NULL) still purges on `updated_at` alone.
         # A single short transaction.
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM search_presets"
                 " WHERE max(updated_at, coalesce(last_used_at, updated_at)) < ?",
@@ -9802,7 +9761,7 @@ class MessageStore:
                 "purge every snapshot in the store. A registry declaring zero reference sets cannot "
                 "authorize purging any — the caller must skip the phase instead."
             )
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT name FROM reference_version WHERE synced_at < ?", (older_than,)
             )
@@ -9942,7 +9901,7 @@ class MessageStore:
         ``set_at``); per-namespace policy is a documented follow-up. Returns the number of entries
         purged. Off by default — the RetentionRunner calls it only when ``state_max_age_days`` is set."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT namespace, key FROM state WHERE set_at < ?", (older_than,)
             )
@@ -10283,7 +10242,7 @@ class MessageStore:
         (``INSERT OR IGNORE`` on the ``(channel_id, file_key)`` PK), so a crash-re-run is a no-op. HASHES
         + IDS ONLY — no body/PHI, never logged at INFO+."""
         now = time.time() if now is None else now
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT OR IGNORE INTO processed_files (channel_id, file_key, processed_at)"
                 " VALUES (?,?,?)",
@@ -10306,7 +10265,7 @@ class MessageStore:
         del (
             now
         )  # signature parity with the other writers; pruning is age/count-driven, not clock-arg
-        async with self._lock:
+        async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "DELETE FROM processed_files WHERE channel_id=? AND processed_at < ?",
                 (channel_id, older_than),
