@@ -96,3 +96,109 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
         f"the [build-system] tables disagree: {tables}. The release builds all of them from one tag, "
         "so bump them together."
     )
+
+
+# --- the harness pins the engine it ships with (BACKLOG #1585) --------------------------------------
+
+_HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
+
+
+def _version_root(pyproject: Path) -> Path:
+    """The module whose ``__version__`` a hatchling project takes its version from.
+
+    Read from ``[tool.hatch.version].path`` rather than hardcoded, so repointing a distribution's
+    version root moves this check with it instead of leaving it asserting about a file nothing uses.
+    """
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    return (pyproject.parent / data["tool"]["hatch"]["version"]["path"]).resolve()
+
+
+def _version_literal(module: Path) -> str:
+    m = re.search(r'^__version__ = "([^"]+)"', module.read_text(encoding="utf-8"), re.M)
+    assert m, f'no `__version__ = "..."` literal in {module} - hatchling reads one from it'
+    return m.group(1)
+
+
+def _engine_pin(dependencies: list[str]) -> str | None:
+    """The exact version the requirement on ``messagefoundry`` pins, or ``None`` if it pins none.
+
+    ``None`` is every loose shape: a bare name, a floor, a compatible release, a wildcard, a range.
+    Each of those lets a resolver pick an engine the harness cannot run against.
+    """
+    from packaging.requirements import Requirement
+
+    for raw in dependencies:
+        req = Requirement(raw)
+        if _normalise(req.name) != "messagefoundry":
+            continue
+        specs = list(req.specifier)
+        if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
+            return specs[0].version
+    return None
+
+
+def test_the_engine_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
+    # A check never seen to fire proves nothing by passing. The bare name is what this table carried
+    # before #1585; the rest are the near-misses a later edit reaches for.
+    for loose in (
+        "messagefoundry[harness]",
+        "messagefoundry[harness]>=0.3.2",
+        "messagefoundry[harness]~=0.3.2",
+        "messagefoundry[harness]==0.3.*",
+        "messagefoundry[harness]>=0.3.2,<0.4",
+    ):
+        assert _engine_pin([loose]) is None, loose
+    assert _engine_pin(["messagefoundry[harness]==0.3.2"]) == "0.3.2"
+    # And it must find the requirement among siblings, not only when it stands alone.
+    assert _engine_pin(["pytest>=8", "messagefoundry[harness]==0.3.2"]) == "0.3.2"
+
+
+def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
+    """``messagefoundry-harness`` is a LOCKSTEP distribution, and its dependency must say so.
+
+    Its ``[tool.hatch.version].path`` is the ENGINE's ``__init__.py``, so the harness wheel and the
+    engine it depends on carry the same version by construction. A bare ``messagefoundry[harness]``
+    did not express "any engine works", it expressed nothing, while the truth available at build time
+    was an exact version. harness/monitor.py and harness/scenarios.py import
+    ``messagefoundry.apiclient`` at module level, so an engine without it installs cleanly and then
+    fails on the operator's first command.
+
+    WHAT THIS DOES NOT ESTABLISH: that a mismatched engine is refused at install time. That needs an
+    index carrying an older release and cannot run here. What is checked is the specifier the build
+    will emit as ``Requires-Dist``.
+    """
+    harness = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))
+    root = _version_root(_HARNESS_PYPROJECT)
+    assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
+        f"the harness takes its version from {root}, which is not the engine's __init__.py - the "
+        f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
+    )
+
+    shipped = _version_literal(root)
+    pinned = _engine_pin(harness["project"]["dependencies"])
+    assert pinned == shipped, (
+        f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
+        f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
+        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
+        f"A VERSION BUMP IS TWO EDITS. PEP 621 `dependencies` is static and nothing in this repository "
+        f"generates it, so set that table to `messagefoundry[harness]=={shipped}` in the same commit "
+        f"that moves __version__."
+    )
+
+
+def test_the_harness_pin_keeps_the_extra_the_harness_actually_needs() -> None:
+    """The pin must not quietly drop ``[harness]`` while adding ``==``.
+
+    Dropping it is the easiest way to make this table look stricter and be weaker: the version is
+    nailed down, PySide6 stops being installed, and the GUI fails to start on a fresh install while
+    every version check in the release still passes.
+    """
+    from packaging.requirements import Requirement
+
+    deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    engine = [r for raw in deps if _normalise((r := Requirement(raw)).name) == "messagefoundry"]
+    assert len(engine) == 1, f"expected exactly one requirement on the engine, found {len(engine)}"
+    assert engine[0].extras == {"harness"}, (
+        f"the harness depends on messagefoundry{sorted(engine[0].extras)}, not [harness] - the extra "
+        f"is what installs PySide6, so the GUI would not start on a fresh install"
+    )

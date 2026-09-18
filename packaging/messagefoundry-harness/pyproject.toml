@@ -39,8 +39,25 @@ classifiers = [
 ]
 dependencies = [
     # The engine + its localhost API client (messagefoundry.apiclient) + PySide6 (the harness GUI).
-    # Lockstep release: install messagefoundry-harness==X.Y.Z alongside messagefoundry==X.Y.Z.
-    "messagefoundry[harness]",
+    #
+    # PINNED EXACTLY, AND THE VERSION IS NOT FREE (BACKLOG #1585). This table used to read a bare
+    # `messagefoundry[harness]`, which lets a resolver satisfy the harness with ANY engine on the index.
+    # harness/monitor.py and harness/scenarios.py import `messagefoundry.apiclient` (the Qt-free engine
+    # client extracted under ADR 0088) at MODULE level, so an install resolved against an engine without
+    # that module succeeds and then dies on ImportError at the operator's first command -- a resolution
+    # question answered at run time.
+    #
+    # The pin is the ENGINE'S OWN VERSION because this distribution is deliberately lockstep: its
+    # `[tool.hatch.version].path` above reads ../../messagefoundry/__init__.py, so the harness wheel and
+    # the engine it names carry the same string BY CONSTRUCTION. A range would be a claim about which
+    # engines work; `==` is the fact that they ship together.
+    #
+    # SO A VERSION BUMP IS TWO EDITS: messagefoundry/__init__.py, and this line. PEP 621 `dependencies`
+    # is static (there is no metadata hook in this repository, and adding a build backend surface just
+    # for one string is not worth it), so nothing derives this for you. `tests/test_packaging.py`
+    # ::test_the_harness_pins_the_engine_at_the_version_it_ships_with is the gate, and it names both
+    # files in its failure.
+    "messagefoundry[harness]==0.3.2",
 ]
 
 [project.scripts]
