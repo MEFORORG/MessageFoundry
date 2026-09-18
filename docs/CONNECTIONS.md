@@ -830,7 +830,11 @@ its own policy block below):
   as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
   (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
   place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
-  written.
+  written. As a backstop, the source compares a file's size and modification time on each side of the
+  read (BACKLOG #116). A file that changes **during** the read is not emitted that scan. One that
+  changes **after** it is not moved or deleted, so the next scan reads it whole, and a WARNING says the
+  message already handed off may be cut short. SFTP/FTP sources compare sizes the same way when the
+  server reports one; a remote `leave` source relies on its size-keyed dedup instead.
 - **Traversal-safe output naming.** The destination resolves `{HL7-path}` placeholders to a **single safe
   filename** (path separators / unsafe chars stripped, leading dots removed, `.`/`..`/reserved device
   names fall back), so an attacker-controlled field can't write outside the target dir or shadow
