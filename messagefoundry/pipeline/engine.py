@@ -1615,9 +1615,10 @@ class Engine:
         version right after bumping, so its convergence loop sees no change and does not re-reload.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value) — the
-        caller maps these to HTTP errors. Every one of them is raised BEFORE the swap, so a raise
-        from this method always means the live graph is the one that was already running.
+        (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value / an
+        environment value file this reload could not read) — the caller maps these to HTTP errors.
+        Every one of them is raised BEFORE the swap, so a raise from this method always means the
+        live graph is the one that was already running.
         """
         failures: list[ReloadStepFailure] = []
         path = self._resolve_reload_target(config_dir)
@@ -1628,7 +1629,26 @@ class Engine:
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
         if self._env_values_provider is not None:
-            self._env_values = dict(self._env_values_provider())
+            # Guard the provider. On the CLI path it is tomllib.load over environments/<env>.toml, and
+            # for an embedder it is arbitrary caller code, so an unreadable value file raised straight
+            # out of the reload: TOMLDecodeError is a ValueError, not a WiringError, so POST
+            # /config/reload answered 500 with NO config_reload_failed audit row (BACKLOG #1652).
+            # Re-raise as WiringError, which puts it in the same audited 422 arm as every other bad
+            # config. This runs BEFORE the swap either way, so the live graph is untouched. The CLI
+            # provider wraps its own read and names the value file; this covers an embedder-supplied
+            # provider, and it covers every caller that reaches reload_detail (the route, the
+            # dual-control release executor, the cluster convergence loop, the DR-threshold re-apply).
+            try:
+                self._env_values = dict(self._env_values_provider())
+            except WiringError:
+                # Already a wiring failure that names its own source. Re-raise unwrapped rather than
+                # nesting the same sentence twice.
+                raise
+            except (ValueError, OSError) as exc:  # tomllib.TOMLDecodeError is a ValueError
+                raise WiringError(
+                    "could not re-read this environment's values for the reload, so the live graph "
+                    f"is unchanged: {safe_exc(exc)}"
+                ) from exc
             if self._registry_runner is not None:
                 self._registry_runner.set_env_values(self._env_values)
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy

@@ -3077,29 +3077,44 @@ def _serve(args: argparse.Namespace) -> int:
     import os
 
     from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.redaction import safe_exc
 
     def env_values() -> dict[str, Any]:
-        return load_environment_values(
-            base_dir=env_base,
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
-        )
+        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+        # WiringError is the type both the serve gate below and that route already understand, so
+        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+        # The file's PATH is named; its CONTENTS never leave this site. safe_exc keeps the exception
+        # type and a redacted, length-bounded message (tomllib reports a line/column, not the text).
+        try:
+            return load_environment_values(
+                base_dir=env_base,
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+        except (ValueError, OSError) as exc:  # tomllib.TOMLDecodeError is a ValueError
+            raise WiringError(
+                f"could not read environment values from {env_file}: {safe_exc(exc)}"
+            ) from exc
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
     # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
     # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
-    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise inside env_values() —
     # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
-    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    # a clean error like every other serve gate. env_values() now wraps that as a WiringError which
+    # already names the value file (path only, PHI-safe), so print it rather than re-stating the path.
     try:
         env_values_empty = not env_values()
-    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
-        print(
-            f"error: could not read environment values from {env_file}: {exc}",
-            file=sys.stderr,
-        )
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
     # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
@@ -3349,8 +3364,8 @@ def _serve(args: argparse.Namespace) -> int:
 
             run_kwargs["http"] = client_cert_http_protocol_class()
     from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
-    from messagefoundry.redaction import safe_exc
 
+    # safe_exc is already imported in this scope, beside the env_values provider above.
     install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
     # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
     # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox

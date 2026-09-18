@@ -494,7 +494,12 @@ def test_malformed_env_file_fails_cleanly_not_traceback(
     cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
     envdir = tmp_path / "environments"
     envdir.mkdir()
-    (envdir / "dev.toml").write_text("this is = = not valid toml\n", encoding="utf-8")
+    # A distinctive value on the malformed line. The value file is where configured secrets live, so
+    # the PATH may be printed and the CONTENTS may not (BACKLOG #1652), and the two assertions below
+    # pin that. Without a value here they would pass even for a message that printed the whole file.
+    # The token is deliberately not credential-shaped: a real-looking one would trip the gitleaks
+    # gate and buy an allowlist entry for nothing this test needs.
+    (envdir / "dev.toml").write_text('peer_host = "never-print-this-value\n', encoding="utf-8")
     rc = _run_serve_stubbed(
         monkeypatch,
         ["serve", "--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"],
@@ -503,6 +508,8 @@ def test_malformed_env_file_fails_cleanly_not_traceback(
     err = capsys.readouterr().err
     assert "could not read environment values" in err
     assert "dev.toml" in err
+    assert "never-print-this-value" not in err
+    assert "peer_host" not in err
 
 
 # --- AC-6 / BACKLOG #1062: the build check must READ values from the root it VALIDATED -------------

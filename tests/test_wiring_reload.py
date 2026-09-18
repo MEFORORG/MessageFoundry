@@ -9,10 +9,13 @@ in-flight outbox deliveries, and rejecting a bad/empty config without disturbing
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -585,3 +588,91 @@ async def test_reload_and_dr_notify_do_not_resume_paused_outbound(
         assert rec.delivered == [f"p{i}" for i in range(4)]
     finally:
         await runner.stop()
+
+
+# --- BACKLOG #1652: an unreadable environments/<env>.toml at reload is a WiringError ---------------
+
+
+def _raw_values_provider(root: Path, environment: str = "dev") -> Callable[[], dict[str, Any]]:
+    """An ``env_values_provider`` shaped exactly like the CLI's: a RAW ``tomllib`` read.
+
+    Deliberately NOT pre-wrapped. The CLI closure wraps its own read (it is the site that knows the
+    file's path), so a provider that already raised ``WiringError`` would exercise the pass-through
+    arm instead of the guard, and would pass even with the engine-side guard deleted. This is the
+    shape that produced the raw ``TOMLDecodeError``.
+    """
+
+    def _provider() -> dict[str, Any]:
+        return load_environment_values(
+            base_dir=root, dir_name="environments", environment=environment, environ={}
+        )
+
+    return _provider
+
+
+async def test_reload_wraps_an_unreadable_env_value_file_as_a_wiring_error(tmp_path: Path) -> None:
+    """BACKLOG #1652. ``reload`` re-reads the value file through the provider, and that call was
+    unguarded: a malformed ``environments/<env>.toml`` raised ``TOMLDecodeError`` -- a ``ValueError``,
+    NOT a ``WiringError`` -- straight out of the reload, which the API answers as a 500 with no audit
+    row. It must arrive as ``WiringError``, carrying no file CONTENT, with the live graph untouched.
+
+    RED when: the guard in ``reload_detail`` is removed (``pytest.raises(WiringError)`` sees a bare
+    ``TOMLDecodeError``). The first reload is the negative control -- a guard that raised
+    unconditionally would satisfy the second assertion and fail that one.
+    """
+    inbox, outdir, live = tmp_path / "in", tmp_path / "out", tmp_path / "live"
+    _write_valid_config(live, inbox, outdir)
+    envdir = tmp_path / "environments"
+    envdir.mkdir()
+    env_file = envdir / "dev.toml"
+    env_file.write_text('peer_host = "10.0.0.1"\n', encoding="utf-8")
+
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, env_values_provider=_raw_values_provider(tmp_path)
+    )
+    eng.add_registry(load_config(live))
+    await eng.start()
+    try:
+        await eng.reload(live)  # control: clean while the value file parses
+        env_file.write_text('peer_host = "never-print-this-value\n', encoding="utf-8")
+        with pytest.raises(WiringError) as excinfo:
+            await eng.reload(live)
+        # The value file is where configured secrets live, so only its diagnosis travels, never its
+        # bytes. The token is deliberately not credential-shaped (it would trip the gitleaks gate).
+        assert "never-print-this-value" not in str(excinfo.value)
+        assert "peer_host" not in str(excinfo.value)
+        # Raised BEFORE the swap, so the running graph is exactly the one that was already live.
+        assert eng.registry_runner is not None
+        assert set(eng.registry_runner.registry.inbound) == {"IB_T_ADT"}
+    finally:
+        await eng.stop()
+
+
+async def test_reload_passes_a_providers_own_wiring_error_through_unwrapped(tmp_path: Path) -> None:
+    """The CLI provider wraps its OWN read and names the value file, so ``reload`` must re-raise that
+    unchanged. Nesting a second sentence around it would make the operator read the same diagnosis
+    twice, and the path is the part they act on."""
+    inbox, outdir, live = tmp_path / "in", tmp_path / "out", tmp_path / "live"
+    _write_valid_config(live, inbox, outdir)
+    message = (
+        "could not read environment values from /cfg/environments/dev.toml: TOMLDecodeError: x"
+    )
+    armed = False
+
+    def provider() -> dict[str, Any]:
+        # Engine.create() calls the provider once to seed the initial values, so it must succeed
+        # there; only the reload's re-read fails.
+        if armed:
+            raise WiringError(message)
+        return {"peer_host": "10.0.0.1"}
+
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, env_values_provider=provider)
+    eng.add_registry(load_config(live))
+    await eng.start()
+    try:
+        armed = True
+        with pytest.raises(WiringError) as excinfo:
+            await eng.reload(live)
+        assert str(excinfo.value) == message
+    finally:
+        await eng.stop()
