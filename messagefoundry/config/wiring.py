@@ -2520,18 +2520,38 @@ def _is_db_proc_call(statement_lower: str) -> bool:
 
 
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
-    """Refuse an ``env()`` ref inside ``odbc_params`` (#66). Nested settings are NOT env-resolved (only
-    top-level ones are — see :func:`resolve_env_settings`), so an ``EnvRef`` here would stringify to a
-    broken literal at connect. Fail loud at authoring, pointing to the top-level ``username``/``password``
-    fields (which ARE env-resolved + secret-redacted) for a per-environment/secret value."""
+    """Refuse an ``env()`` ref inside ``odbc_params`` (#66), in **both** spellings. Nested settings are
+    NOT env-resolved (only top-level ones are — see :func:`resolve_env_settings`), so an env ref here
+    would stringify to a broken literal at connect. Fail loud at authoring, pointing to the top-level
+    ``username``/``password`` fields (which ARE env-resolved + secret-redacted) for a
+    per-environment/secret value.
+
+    The two spellings reach this function as **different objects**, and testing only the first let the
+    second through (BACKLOG #1806). Code-first ``odbc_params={"PWD": env("acme_pw")}`` arrives as an
+    :class:`EnvRef`. A ``connections.toml`` ``[settings.odbc_params]`` inline table arrives as a **raw
+    dict** — :func:`parse_env_setting` decodes only *top-level* settings values and does not descend, so
+    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Since ``"database"`` and
+    ``"database_poll"`` are both live in ``connections_file._TRANSPORTS``, that raw dict used to pass
+    unrefused and stringify into the DSN with its fallback value attached.
+
+    Offenders are reported as **keys only**; the refusal must never echo the value, which may be a
+    fallback secret."""
     if not odbc_params:
         return
-    offenders = sorted(k for k, v in odbc_params.items() if isinstance(v, EnvRef))
+    offenders = sorted(
+        k
+        for k, v in odbc_params.items()
+        # Mirrors parse_env_setting's own env-marker test, against the shared _ENVREF_KEYS. Collapse
+        # both arms to _is_env_marker(v) once PR 1257 (BACKLOG #1649) factors that helper out.
+        if isinstance(v, EnvRef) or (isinstance(v, dict) and "env" in v and set(v) <= _ENVREF_KEYS)
+    )
     if offenders:
         raise WiringError(
             f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
-            "not env-resolved. Put a credential/password in the top-level username/password fields "
-            "(env-resolved + redacted); odbc_params carries only static driver keywords."
+            "not env-resolved, in either spelling (a code-first env() ref, or a connections.toml "
+            'inline table like PWD = { env = "acme_pw" }). Put a credential/password in the top-level '
+            "username/password fields (env-resolved + redacted); odbc_params carries only static "
+            "driver keywords."
         )
 
 
