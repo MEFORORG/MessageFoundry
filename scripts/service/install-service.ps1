@@ -120,11 +120,28 @@ function Resolve-Nssm {
 
 function Set-SecureDataDirAcl {
     <#
-      Lock the data/log directory down to SYSTEM + Administrators (+ the service account), removing
-      ProgramData's inherited BUILTIN\Users:(RX). NSSM captures the engine's stdout/stderr under here,
-      and those logs are a PHI sink (parallel to the DB), so they must not be world-readable - this
-      mirrors the runtime DB lockdown (_secure_file / STORE-2). Review finding H-13. Best-effort: a
-      failure warns but never aborts the install. Well-known SIDs so it works on non-English Windows.
+      Lock the data/log directory down to SYSTEM + Administrators (+ the service account). NSSM
+      captures the engine's stdout/stderr under here, and those logs are a PHI sink (parallel to the
+      DB), so they must not be world-readable - this mirrors the runtime DB lockdown (_secure_file /
+      STORE-2). Review finding H-13. Best-effort: a failure warns but never aborts the install.
+      Well-known SIDs so it works on non-English Windows.
+
+      `/inheritance:r /grant:r` IS NOT A LOCKDOWN ON ITS OWN, and that was the shape here until
+      BACKLOG #1699 built the first test that read the DACL back. /inheritance:r removes INHERITED
+      ACEs; /grant:r replaces the permissions of the principals it NAMES. An EXPLICIT ACE for any
+      other principal survives both. Measured: an explicit BUILTIN\Users:(OI)(CI)RX on the data dir
+      came through the old call untouched, propagated to the logs directory beneath it, and icacls
+      exited 0 - so the installer reported a hardened PHI sink over a world-readable one.
+
+      ProgramData's own BUILTIN\Users ACE is inherited, which is why the default path looked correct
+      and the gap stayed invisible. It bites wherever the data dir is NOT freshly created under
+      ProgramData: an operator pointing -DataDir at an existing directory or share, a dir made by
+      another tool, or a reinstall after somebody granted access by hand.
+
+      So the explicit broad ACEs are removed as well, and then the resulting DACL is READ BACK. The
+      named removals cover every well-known broad principal; the read-back catches anything else -
+      a local group, say - and names it, rather than leaving the caller to believe a lockdown that
+      did not happen.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
     # *S-1-5-18 = NT AUTHORITY\SYSTEM, *S-1-5-32-544 = BUILTIN\Administrators. (OI)(CI)F is inherited
@@ -135,7 +152,71 @@ function Set-SecureDataDirAcl {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("Could not restrict ACLs on '$Path' (icacls exit $LASTEXITCODE); ensure it is " +
             "not world-readable - the captured logs can contain operational/PHI detail (docs/PHI.md).")
+        return
     }
+    # Drop any EXPLICIT broad ACE the grant above left standing. Removing a SID that is not present
+    # is a no-op and still exits 0, so the whole set goes in one call. Well-known SIDs, so this works
+    # on non-English Windows (an English host prints "BUILTIN\Users"; a German one does not).
+    $broad = @(
+        "*S-1-1-0",       # Everyone
+        "*S-1-5-32-545",  # BUILTIN\Users
+        "*S-1-5-11",      # Authenticated Users
+        "*S-1-5-4",       # INTERACTIVE
+        "*S-1-3-0",       # CREATOR OWNER
+        "*S-1-5-32-546",  # Guests
+        "*S-1-5-7"        # ANONYMOUS LOGON
+    )
+    & icacls $Path /remove:g @broad | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not remove broad-principal ACEs from '$Path' (icacls exit " +
+            "$LASTEXITCODE); check it by hand with 'icacls $Path' - the captured logs are a PHI sink " +
+            "(docs/PHI.md).")
+        return
+    }
+    $residue = Get-BroadAclResidue -Path $Path -Account $Account
+    if ($residue) {
+        Write-Warning ("'$Path' still grants access to: $($residue -join ', '). The engine's logs " +
+            "under it can contain operational/PHI detail (docs/PHI.md); remove those grants by hand " +
+            "or point -DataDir at a directory only SYSTEM and Administrators can reach.")
+    }
+}
+
+function Get-BroadAclResidue {
+    <#
+      READ THE DACL BACK and return the names of any principals holding Allow access beyond SYSTEM,
+      Administrators and the service account. Returns an empty array when the directory is locked
+      down, which is what makes "the lockdown worked" a reading rather than an assumption.
+
+      An unresolvable identity is reported rather than skipped: a SID nobody can translate is still
+      a grant, and dropping it here would turn a residue into a clean result.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    $allowed = @("S-1-5-18", "S-1-5-32-544")
+    if ($Account) {
+        try {
+            $allowed += ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            # A virtual account's SID may not resolve before the service exists; fall back to the name.
+            $allowed += $Account
+        }
+    }
+    $found = @()
+    try { $acl = Get-Acl -Path $Path } catch {
+        Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
+        return @()
+    }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $name = "$($rule.IdentityReference)"
+        $sid = $name
+        try {
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if (($allowed -notcontains $sid) -and ($allowed -notcontains $name)) { $found += $name }
+    }
+    return ($found | Select-Object -Unique)
 }
 
 function Set-ConfigReadAcl {

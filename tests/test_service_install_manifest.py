@@ -37,6 +37,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -731,3 +732,210 @@ def test_the_troubleshooting_step_no_longer_promises_what_the_script_cannot_do()
     assert "re-run the install script" not in flat.lower() or "anchored to the directory" in flat, (
         "the troubleshooting step must say what the installer actually anchors relative paths to"
     )
+
+
+# --- the H-13 log-directory ACL is READ BACK, not assumed (BACKLOG #1699) --------------------------
+# Nothing witnessed Set-SecureDataDirAcl. Re-measured repo-wide on origin/main before writing these:
+# `git grep -n 'Set-SecureDataDirAcl'` returns six hits and NOT ONE is a test -- the definition and
+# call site in install-service.ps1, a comment in .github/workflows/ci.yml, and two docs. The
+# instrument returned six, so the zero-tests result is a real zero and not a broken search.
+#
+# NOT BUILT ON ``owner_only_from_icacls`` (messagefoundry/auth/trust_anchors.py), which looks exactly
+# right and is not. It flags only WRITE-shaped access -- its own test asserts that BUILTIN\Users:(RX)
+# returns True -- and Users:(RX) on the log directory is the precise ACE this row exists to catch. A
+# witness built on it passes with the defect fully live.
+#
+# BOTH SPELLINGS ARE CHECKED. On an English host icacls prints ``BUILTIN\Users``, not
+# ``S-1-5-32-545``, so a SID-only search returns a false clean.
+
+_BROAD = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-32-545": "BUILTIN\\Users",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-32-546": "Guests",
+}
+
+_ACL_FNS = ["Set-SecureDataDirAcl", "Get-BroadAclResidue"]
+
+_windows_only = pytest.mark.skipif(
+    not sys.platform.startswith("win"), reason="icacls / Windows DACLs"
+)
+
+
+def _lockdown(tmp_path: Path, *, broad_ace: str | None, inherited: bool) -> dict:
+    """Apply Set-SecureDataDirAcl to a real directory and read the resulting DACL back.
+
+    ``broad_ace`` is a well-known SID granted before the lockdown. ``inherited`` puts it on the
+    PARENT (the ProgramData shape, which /inheritance:r removes) instead of on the data dir itself
+    (the shape that survived, which is why this is measured both ways).
+
+    The control read is taken BEFORE the lockdown: an "absent afterwards" assertion means nothing
+    unless the search can be shown to find the thing when it IS there.
+    """
+    assert _SCRIPT is not None
+    parent = tmp_path / f"dd-{uuid.uuid4().hex[:8]}"
+    data = parent / "MessageFoundry"
+    (data / "logs").mkdir(parents=True)
+    grant_target = str(parent) if inherited else str(data)
+    pre = (
+        f"  & icacls {_psq(grant_target)} /grant '{broad_ace}:(OI)(CI)RX' | Out-Null\n"
+        if broad_ace
+        else ""
+    )
+    body = rf"""
+{pre}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $data = {_psq(str(data))}
+  $before = (& icacls $data | Out-String)
+  $beforeSids = @((Get-Acl $data).Access | ForEach-Object {{
+    try {{ $_.IdentityReference.Translate(
+      [Security.Principal.SecurityIdentifier]).Value }} catch {{ "$($_.IdentityReference)" }} }})
+  $warnings = @()
+  $emitted = & {{ Set-SecureDataDirAcl -Path $data -Account $me }} 3>&1
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+  }}
+  $after = (& icacls $data | Out-String)
+  $afterLogs = (& icacls (Join-Path $data 'logs') | Out-String)
+  $sids = @((Get-Acl $data).Access | ForEach-Object {{
+    try {{ $_.IdentityReference.Translate(
+      [Security.Principal.SecurityIdentifier]).Value }} catch {{ "$($_.IdentityReference)" }} }})
+  $logSids = @((Get-Acl (Join-Path $data 'logs')).Access | ForEach-Object {{
+    try {{ $_.IdentityReference.Translate(
+      [Security.Principal.SecurityIdentifier]).Value }} catch {{ "$($_.IdentityReference)" }} }})
+  # Put the tree back in reach so pytest can clean it up.
+  & icacls {_psq(str(parent))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+  & icacls $data /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+  [pscustomobject]@{{
+    before = $before; after = $after; afterLogs = $afterLogs
+    beforeSids = @($beforeSids); sids = @($sids); logSids = @($logSids)
+    warnings = @($warnings); account = $me
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    out: dict = json.loads(
+        _ok(_extract(_SCRIPT, _ACL_FNS, body), tmp_path).strip().splitlines()[-1]
+    )
+    out["warnings"] = [w for w in (out.get("warnings") or []) if w]
+    return out
+
+
+@_windows_only
+@pytest.mark.parametrize("sid", sorted(_BROAD))
+def test_a_broad_inherited_ace_is_stripped_from_the_data_dir_and_its_logs(
+    tmp_path: Path, sid: str
+) -> None:
+    """THE PROGRAMDATA SHAPE. ProgramData grants BUILTIN\\Users (RX) and the data dir inherits it;
+    the engine's stdout/stderr logs live beneath, so that ACE makes a PHI sink world-readable."""
+    got = _lockdown(tmp_path, broad_ace=f"*{sid}", inherited=True)
+    name = _BROAD[sid]
+    assert sid in got["beforeSids"], (
+        f"CONTROL FAILED: {name} ({sid}) was not on the directory BEFORE the lockdown ran, so its "
+        f"absence afterwards proves nothing about the lockdown:\n{got['before']}"
+    )
+    assert sid not in got["sids"], (
+        f"{name} ({sid}) still holds access to the data dir after Set-SecureDataDirAcl "
+        f"(BACKLOG #1699):\n{got['after']}"
+    )
+    assert sid not in got["logSids"], (
+        f"{name} ({sid}) still reaches the LOG directory, which is the PHI sink review finding "
+        f"H-13 is about:\n{got['afterLogs']}"
+    )
+    assert name.lower() not in got["after"].lower(), (
+        f"the NAME spelling of {name} survives in the icacls output; on an English host icacls "
+        "prints the name, not the SID, so a SID-only check would read this as clean"
+    )
+
+
+@_windows_only
+@pytest.mark.parametrize("sid", sorted(_BROAD))
+def test_a_broad_explicit_ace_is_stripped_too(tmp_path: Path, sid: str) -> None:
+    """THE SHAPE THAT SURVIVED. ``/inheritance:r`` removes INHERITED ACEs and ``/grant:r`` replaces
+    only the principals it NAMES, so an EXPLICIT broad ACE came through the old lockdown untouched,
+    propagated to the logs beneath it, and icacls exited 0.
+
+    Reached whenever the data dir is not a fresh ProgramData child: an operator pointing -DataDir at
+    an existing directory or share, a dir created by another tool, or a reinstall after somebody
+    granted access by hand.
+    """
+    got = _lockdown(tmp_path, broad_ace=f"*{sid}", inherited=False)
+    name = _BROAD[sid]
+    assert sid in got["beforeSids"], (
+        f"CONTROL FAILED: the explicit {name} ({sid}) ACE was not on the directory before the "
+        f"lockdown ran:\n{got['before']}"
+    )
+    assert sid not in got["sids"], (
+        f"an EXPLICIT {name} ({sid}) ACE survived Set-SecureDataDirAcl:\n{got['after']}"
+    )
+    assert sid not in got["logSids"], (
+        f"an EXPLICIT {name} ({sid}) ACE reached the log directory:\n{got['afterLogs']}"
+    )
+
+
+@_windows_only
+def test_the_lockdown_keeps_what_the_service_actually_needs(tmp_path: Path) -> None:
+    """POSITIVE CONTROL. A lockdown that removed everything would pass every assertion above and
+    leave a service that cannot start: SYSTEM, Administrators and the run-as account must remain."""
+    got = _lockdown(tmp_path, broad_ace=None, inherited=False)
+    assert "S-1-5-18" in got["sids"], f"SYSTEM lost access to the data dir:\n{got['after']}"
+    assert "S-1-5-32-544" in got["sids"], (
+        f"Administrators lost access to the data dir:\n{got['after']}"
+    )
+    assert got["account"].split("\\")[-1].lower() in got["after"].lower(), (
+        f"the run-as account lost read/write on its own data dir:\n{got['after']}"
+    )
+    assert "S-1-5-18" in got["logSids"] and "S-1-5-32-544" in got["logSids"], (
+        f"the grants did not inherit down to the log directory:\n{got['afterLogs']}"
+    )
+    assert got["warnings"] == [], f"a clean lockdown must report no residue; got {got['warnings']}"
+
+
+@_windows_only
+def test_residue_outside_the_well_known_set_is_reported_not_hidden(tmp_path: Path) -> None:
+    """The named removals cover the well-known broad principals. Anything else -- a local group, a
+    stale SID -- is READ BACK and named, so the caller is never told a lockdown happened that did
+    not. Uses a well-known SID outside the removal list to stand in for that case."""
+    # S-1-5-32-547 = BUILTIN\Power Users: a real, resolvable group that is NOT in the removal set.
+    got = _lockdown(tmp_path, broad_ace="*S-1-5-32-547", inherited=False)
+    assert got["warnings"], (
+        "a principal outside the removal set survived and nothing said so -- the caller would "
+        f"believe the directory was locked down:\n{got['after']}"
+    )
+    assert any("Power Users" in w or "S-1-5-32-547" in w for w in got["warnings"]), (
+        f"the warning must NAME the principal that still has access; got {got['warnings']}"
+    )
+
+
+def test_the_installer_still_calls_the_lockdown_on_the_data_dir(tmp_path: Path) -> None:
+    """CALL-SITE guard, and the literal complaint of BACKLOG #1699: deleting the call left every
+    test green. The behavioural arms above run the FUNCTION and say nothing about whether the
+    script invokes it."""
+    facts = _preflight_facts(tmp_path)
+    calls = [c for c in facts["commands"] if c["name"] == "Set-SecureDataDirAcl"]
+    assert len(calls) == 1, (
+        f"expected exactly one Set-SecureDataDirAcl call in install-service.ps1, found {len(calls)}"
+    )
+    assert "-Path $DataDir" in calls[0]["text"], (
+        f"the lockdown must be applied to the data dir (the logs inherit from it): {calls[0]['text']}"
+    )
+
+
+def test_the_smoke_leg_reads_the_dacl_it_produced() -> None:
+    """The other half of #1699: windows-service-smoke installs the service and never looked at the
+    ACL the installer left behind.
+
+    THIS CANNOT BE DEMONSTRATED FROM A PULL REQUEST. That job is
+    ``if: schedule || workflow_dispatch || merge_group``, so a pull_request event SKIPS it. This
+    asserts the step EXISTS and checks both spellings; somebody has to read the leg's own result
+    after a nightly or a merge-queue run.
+    """
+    root = Path(__file__).resolve().parents[1]
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "Verify the data-directory DACL" in ci, (
+        "windows-service-smoke has no step reading back the DACL the installer produced "
+        "(BACKLOG #1699)"
+    )
+    for needle in ("S-1-5-32-545", "BUILTIN", "icacls"):
+        assert needle in ci, (
+            f"the smoke DACL check must look for {needle!r}: on an English runner icacls prints "
+            "the NAME and a SID-only grep returns a false clean"
+        )
