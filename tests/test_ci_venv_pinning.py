@@ -966,7 +966,16 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     it is dependency intake no lockfile in this repo covers — the same class the pip rules above
     address, arriving by a different route. The sbomqs step in this same workflow already verifies
     against the release's own checksums file, so this was unfinished scope rather than an accepted
-    risk, and that step is the template any download here must follow.
+    risk, and that step is the template any download IN THIS WORKFLOW must follow.
+
+    THE TEMPLATE STOPS AT THIS FILE'S DOOR (BACKLOG #1698). A checksums file fetched from the SAME
+    origin as the asset is signed by nothing and moves with it: whoever can replace the tarball can
+    replace the line attesting it, so a same-origin check establishes that the bytes are
+    self-consistent, never that they are the bytes anyone reviewed. That is adequate here, where the
+    jobs hold `contents: read`. It is NOT adequate inside a job holding `id-token: write`, where the
+    download executes beside the identity that signs and publishes the release. `release.yml`'s copy
+    of this same sbomqs step is therefore pinned to an in-repo SHA-256 literal instead, and
+    `test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo` below holds that stronger line.
 
     Scoped to BLOCKING jobs. An advisory job cannot turn a required context green while compromised,
     so `trivy` (`continue-on-error: true`, schedule/dispatch-gated) is deliberately out — worth
@@ -1008,6 +1017,95 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     )
     assert not offenders, "unverified release-asset download in a blocking job:\n  " + "\n  ".join(
         offenders
+    )
+
+
+#: A bare lowercase 64-hex token — the shape of an in-repo SHA-256 pin, as `sha256sum -c` wants it.
+_SHA256_LITERAL = re.compile(r"\b[0-9a-f]{64}\b")
+
+#: Fetching one of these next to the signing identity is the defect, not the remedy: a checksums file
+#: served from the asset's own origin is replaced by whoever replaces the asset.
+_SAME_ORIGIN_CHECKSUM_FETCH = re.compile(r"curl[^\n]*checksums?[\w.-]*\.txt", re.I)
+
+
+def test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo() -> None:
+    """A download inside `id-token: write` must be pinned IN REPO, not against its own origin.
+
+    `security.yml`'s rule above accepts a same-origin `checksums.txt`, and that is adequate for a job
+    holding `contents: read`. This is the stronger line for the privileged case, and the difference is
+    the JOB, not the tool: a step running under `id-token: write` shares the identity that
+    Sigstore-signs the artifacts and publishes to PyPI, and in `release.yml` the sbomqs step runs
+    BEFORE the signing step. Anything executing there is in position ahead of every control standing
+    after it, so a backdoored binary would carry a VALID signature and VALID provenance downstream.
+
+    A same-origin checksums file does not close that: it is signed by nothing and moves with the asset
+    it attests, so it proves self-consistency rather than provenance. An in-repo literal changes only
+    in a reviewed commit, so a re-tagged or substituted asset fails the check instead.
+
+    KEYED ON `permissions.id-token: write`, and deliberately NOT on `continue-on-error`. The sibling
+    rule above skips JOB-level `continue-on-error: true` because an advisory job cannot green a
+    required context. That reasoning does not transfer one level down: the sbomqs step carries
+    `continue-on-error` at STEP level, and a step-level skip here would skip the exact step this rule
+    exists to catch — advisory about its SCORE says nothing about the credential it runs beside.
+
+    Mutation: restore the `curl … checksums.txt | sha256sum -c -` pair in release.yml's sbomqs step,
+    or drop the `SBOMQS_SHA256=` literal. Red here.
+    """
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((_WORKFLOWS / "release.yml").read_text(encoding="utf-8")) or {}
+    jobs = wf.get("jobs") or {}
+    assert jobs, "release.yml declares no jobs — the workflow shape moved"
+
+    checked = 0
+    privileged = 0
+    offenders: list[str] = []
+    for job_key, raw_job in jobs.items():
+        job = raw_job or {}
+        perms = job.get("permissions")
+        if not isinstance(perms, dict) or perms.get("id-token") != "write":
+            continue
+        privileged += 1
+        for raw_step in job.get("steps") or []:
+            step = raw_step or {}
+            # NO step-level continue-on-error skip here — see the docstring.
+            raw = str(step.get("run") or "")
+            # Comments OUT before matching, the same reason the sibling rule strips them: the
+            # rationale comment on this very step NAMES checksums.txt while explaining why it is not
+            # used, so a whole-body match would report the explanation as the offence.
+            body = "\n".join(ln for ln in raw.splitlines() if not ln.strip().startswith("#"))
+            if "releases/download" not in body:
+                continue
+            checked += 1
+            name = step.get("name") or "<unnamed step>"
+            if not _SHA256_LITERAL.search(body):
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} downloads a release asset with no in-repo "
+                    f"SHA-256 literal, inside `id-token: write`"
+                )
+            if _SAME_ORIGIN_CHECKSUM_FETCH.search(body):
+                offenders.append(
+                    f"release.yml:{job_key} — step {name!r} fetches a checksums file from the asset's "
+                    f"own origin; that is replaced by whoever replaces the asset"
+                )
+
+    # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
+    # the same green, and both halves of this walk (the permission key and the download marker) are
+    # things a refactor can move without anyone noticing the rule went blind.
+    print(
+        f"[ci-venv-pinning] examined {checked} release-asset download step(s) "
+        f"across {privileged} job(s) holding id-token: write"
+    )
+    assert privileged > 0, (
+        "no job in release.yml holds `id-token: write` — if that is now true this guard is obsolete, "
+        "but an empty scan must not read as a pass"
+    )
+    assert checked > 0, (
+        "no job holding `id-token: write` in release.yml downloads a release asset — if that is now "
+        "true this guard is obsolete, but an empty scan must not read as a pass"
+    )
+    assert not offenders, (
+        "a release-asset download runs beside the signing identity without an in-repo pin "
+        "(BACKLOG #1698):\n  " + "\n  ".join(offenders)
     )
 
 
