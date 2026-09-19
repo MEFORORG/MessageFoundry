@@ -99,6 +99,61 @@ Python engine and npm extension SBOMs are additionally quality-scored by **sbomq
 container-image SBOM is retained unscored; run `sbomqs score -b` against it on demand). Our format choice
 is **CycloneDX** (native VEX support); an SPDX rendering can be produced on request.
 
+## The one vendored third-party binary, and what its record does not claim
+
+`.github/actions/cla-assistant-lite/` carries 1.18 MB of compiled JavaScript — the archived
+`contributor-assistant/github-action`, vendored on 2026-08-29 because GitHub archived the upstream
+repository and no maintained fork exists. It is **not a released artifact**: `.github/` is outside
+the sdist's `only-include`, so no wheel, sdist or engine deployment carries it. It runs in CI, on
+`pull_request_target` and on an `issue_comment` whose body is exactly `recheck` or the sign-off
+sentence. `cla.yml` is also triggered by `merge_group`, where the step's `if:` skips the bundle
+rather than running it.
+
+Every audit lane above is ecosystem-scoped — `pip-audit` reads Python locks, `npm-audit` reads
+`ide/package-lock.json` — so none of them could see a bundle sitting in `.github/`. Its provenance
+is recorded instead, in the same format the release SBOMs use (BACKLOG #1578):
+
+| File | What it is |
+|---|---|
+| [`provenance.cdx.json`](../.github/actions/cla-assistant-lite/provenance.cdx.json) | CycloneDX 1.6: the pinned upstream commit, the bundle's SHA-256 as vendored, the vendoring date and reason, and an inventory of the 403 distinct packages the upstream lockfile declares |
+| [`upstream-package-lock.json`](../.github/actions/cla-assistant-lite/upstream-package-lock.json) | that lockfile, verbatim from the pinned commit |
+
+`scripts/security/build_cla_action_provenance.py --check` verifies the record describes the tree,
+and `tests/test_cla_action_provenance.py` is the gate. It sits in the repo-harness tier
+(`tests/tooling_manifest.txt`), which runs on a pull request touching at least `.github/`,
+`scripts/` or `docs/` — the live list is the path filter in `ci.yml`, not this sentence. Those cover
+every input the gate reads, and nothing under `messagefoundry/` is one. So the bundle cannot move
+without the record moving with it.
+
+That gate detects **change**, not vulnerabilities. Nothing in CI scans this closure for advisories:
+the audit commands below are run by hand or not at all. The exposure is bounded by where the bundle
+runs — CI only, never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no
+automated remediation lane exists for it.
+
+Two things are worth stating precisely, because a supply-chain record that implies more than it
+proves is worse than none:
+
+1. **What is proven.** The vendored bundle is the upstream blob at the pinned commit with a
+   176-byte two-line header prepended, and nothing else changed. An auditor strips the first two
+   lines, takes the SHA-256, and compares it with the upstream digest in the record — no network,
+   no Node. The lockfile is derived the same way: `git hash-object` on it reproduces the blob id
+   the record names, so neither vendored artifact rests on a number somebody merely wrote down.
+2. **What is not.** A clean audit of the lockfile proves the *declared* dependencies of that
+   upstream commit are clean. It does **not** prove the bundle was built from them. Reproducing an
+   ncc/webpack build needs a Node toolchain this repository does not carry, so nobody can check
+   that here.
+
+Like the SBOMs above, this record is an inventory rather than an integrity check on the components
+it lists: it carries no per-component hashes. npm's `integrity` values digest the registry tarball,
+not anything in this repository, and they stay available verbatim in the lockfile beside the record
+where their scope is unambiguous. The bundle's *own* SHA-256 is a different thing and is recorded.
+
+The lockfile is deliberately named `upstream-package-lock.json`. Under the stock name GitHub's
+dependency graph would ingest it as this repository's own manifest and raise alerts against a
+2021-era tree nobody here can move — remediating one means rebuilding the bundle, which needs the
+absent toolchain. The record is audit-only by construction, and `.github/dependabot.yml` carries no
+npm entry for this directory for the same reason.
+
 ## Related
 
 - [`SECURITY.md`](SECURITY.md) — authn/RBAC, PHI handling, reporting.
