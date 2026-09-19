@@ -74,6 +74,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
+from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
     "ConnectionSpec",
@@ -776,9 +777,12 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
-    at once — both missing keys and values that fail their ``cast`` (naming setting/key/value) — so
-    the failure is loud and actionable, not a raw ``ValueError`` traceback that names nothing and
-    aborts on the first bad value (fail loud, never blank; review M-22)."""
+    at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
+    NEVER the value — BACKLOG #1183) — so
+    the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
+    first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
+    **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
+    (BACKLOG #1656; see the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -791,7 +795,17 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 else:
                     try:
                         resolved[name] = value.cast(raw)
-                    except (ValueError, TypeError) as exc:
+                    except Exception as exc:
+                        # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
+                        # an arbitrary callable, so it can raise anything -- a `KeyError` from a
+                        # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
+                        # escaped this handler RAW, carrying the secret value in its own exception
+                        # text. That re-opened, for every other exception type, exactly the leak
+                        # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
+                        # whole point of catching it, so it has to cover every way a cast can fail.
+                        # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
+                        # failure and must keep propagating.
+                        #
                         # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                         # and connector keys, and this string is raised at startup into the operator
                         # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
@@ -800,6 +814,14 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                         # dropping only the f-string half would still have leaked it. Name the setting,
                         # the key and the expected TYPE, which is the whole diagnostic an operator
                         # needs to go fix the value they already hold.
+                        #
+                        # The WiringError below is raised OUTSIDE this block ON PURPOSE, so it
+                        # carries neither `__cause__` nor `__context__`. Chaining it (`raise ... from
+                        # exc`) would put the redacted-away text back within reach: a rendered
+                        # traceback prints the chained exception in full, and that traceback goes to
+                        # the same operator log, support bundle and GET /logs/tail this handler
+                        # exists to keep the value out of. Do not "improve" the diagnostic by
+                        # chaining -- it re-opens BACKLOG #1183 through the traceback.
                         want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
                         bad.append(
                             f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
@@ -5078,6 +5100,31 @@ def build_outbound_connection(
             "(0 = show 'waiting for reply' immediately)"
         )
     send_pace = spec.settings.get("send_min_interval_seconds")
+    if isinstance(send_pace, EnvRef):
+        # BACKLOG #1653. `send_min_interval_seconds: float | None` carries no `EnvRef` member and
+        # `build_schema()` reports `"env": false` for it, so an env() ref here is not a supported
+        # spelling and never was -- it is a pacing number, not a per-environment or secret value.
+        # Refuse it rather than skip the sign check below: NOTHING downstream would resolve it.
+        # `_resolve_send_pace` (pipeline/wiring_runner.py) reads `oc.spec.settings` UNRESOLVED at both
+        # of its call sites and calls `float(raw)`, so accepting the ref at wiring only MOVES the
+        # TypeError into outbound start -- a dead lane AFTER the sender has been ACKed, which is
+        # strictly worse than a load-time error.
+        #
+        # Refused HERE because this is the one choke point both authoring surfaces pass through, so
+        # code-first and connections.toml now give the identical error. They used to diverge: a raw
+        # TypeError escaping `validate`/`load` on the TOML surface (`_build_spec` wraps only the
+        # factory call), versus an opaque `_exec_module` WiringError naming no field on the
+        # code-first one.
+        raise WiringError(
+            # Keep the remedy SURFACE-NEUTRAL. This message is the one string both authoring
+            # surfaces share, so naming a Python spelling (`send_min_interval_seconds=0.5`) would
+            # hand a connections.toml author the wrong syntax and half-undo the point of refusing at
+            # this shared choke point.
+            f"outbound connection {name!r}: send_min_interval_seconds may not use env() "
+            f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
+            "per-environment or secret value. Give it a plain number (0.5), or omit it "
+            "for no pacing."
+        )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
         # negative interval is meaningless (None/0 = no pacing). Fail loud at wiring (dry-run / check).
@@ -6228,7 +6275,47 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         try:
             load_connections_file(conn_file, registry)
         except WiringError as exc:
-            diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
+            # Scrubbed like the arm below, and for the SAME reason: a WiringError out of the TOML
+            # loader is a project-authored TEMPLATE wrapped around somebody else's exception text.
+            # MEASURED: `[outbound.retry] max_attempts = "<value>"` reaches `_policy`
+            # (connections_file.py), which raises `WiringError(f"{where}: invalid {key} — {exc}")`
+            # around a pydantic ValidationError, and pydantic prints `input_value='<value>'`
+            # verbatim. So "this arm is ours, therefore it withholds the value" is FALSE -- only the
+            # template is ours. Both arms get the same treatment because both carry the same kind of
+            # text.
+            diagnostics.append(Diagnostic(message=scrub_credentials(str(exc)), file=str(conn_file)))
+        except Exception as exc:
+            # BACKLOG #1653: the *.py arm above cannot leak an unexpected exception (`_exec_module`
+            # wraps whatever a module raises), but this one could -- the TOML loader converts only
+            # what it anticipates, so anything else escaped `validate_config` as a raw traceback and
+            # took the OTHER diagnostics with it. That breaks this function's contract (return ALL
+            # problems, raise none) and leaves the IDE with nothing to render. A loader gap is still
+            # a bug to fix at its source; reporting it as a diagnostic is what keeps the contract
+            # while it exists. `Exception`, never `BaseException`: a KeyboardInterrupt or SystemExit
+            # is not a config problem and must keep propagating.
+            #
+            # `exc` IS interpolated here, and it is scrubbed on the way out -- same as the arm
+            # above. An exception the loader never anticipated was worded by somebody else and can
+            # stringify whatever it was handed, including an inline credential from
+            # connections.toml. A `Diagnostic.message` is printed verbatim by `messagefoundry
+            # validate` and carried into `messagefoundry check` output, so it reaches CI logs.
+            #
+            # STATE WHAT THE SCRUB DOES AND DOES NOT DO, so nobody reads either arm as safe.
+            # MEASURED over three shapes: it replaces a LABELLED credential value (`password=<v>`)
+            # and it does NOT see pydantic's `input_value='<v>'` spelling, nor a bare unlabelled
+            # value (`KeyError: 'hunter2'`). It is a backstop that lowers the exposure, NOT a
+            # boundary, and nothing downstream may be built on it holding. The real fix for any
+            # instance is still to convert the failure at its source in the loader, which is why the
+            # exception TYPE is named: that name is the actionable half.
+            diagnostics.append(
+                Diagnostic(
+                    message=scrub_credentials(
+                        f"{CONNECTIONS_FILE_NAME}: unexpected {type(exc).__name__} while "
+                        f"loading connections — {exc}"
+                    ),
+                    file=str(conn_file),
+                )
+            )
     for conn in registry.inbound.values():
         if conn.router not in registry.routers:
             diagnostics.append(
