@@ -394,9 +394,22 @@ class AlertSuspendRequest(RequestModel):
 
 
 class AlertInstanceList(BaseModel):
-    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044),
+    plus the store-computed aggregate over **every** such instance in the caller's scope."""
 
+    #: This page of instances — at most ``limit`` of them.
     alerts: list[AlertInstanceInfo]
+    #: Active instances in scope, counted in the store and NOT bounded by ``limit`` (BACKLOG #1564).
+    #:
+    #: **``total`` is a SECOND read, not a count of** ``alerts``, so the two are separate snapshots and
+    #: ``len(alerts) <= total`` is NOT guaranteed: a concurrent ack or resolve between them can leave a
+    #: full page beside a smaller total. Do not render "len(alerts) of total" off this pair without
+    #: clamping — the sibling listings that use that phrasing count and page in one query, and this one
+    #: does not. The nav alert bell is unaffected: it reads ``total`` alone and no rows at all.
+    total: int
+    #: The worst severity among all ``total`` of them, or ``None`` when there are none. Ranked in the
+    #: store; ``store.AlertSummary`` carries why neither field may be derived from ``alerts``.
+    worst_severity: str | None
 
 
 class DeadLetterReplayRequest(RequestModel):
@@ -704,6 +717,33 @@ class Health(BaseModel):
 
 
 class EngineInfo(BaseModel):
+    """Inbound-only engine counters (vs :class:`EngineKpis`, which combines inbound + outbound).
+
+    ``uptime_seconds`` is ``0.0`` until the engine has STARTED (``Engine.started_at`` is unset), so
+    ``uptime_seconds > 0`` is the supported "this engine has started" test, and the console's health
+    rollup keys its empty-graph warn on exactly that. It is NOT monotonic: ``/status`` derives it as
+    ``max(0.0, time.time() - started_at)`` off the WALL clock, so a backwards step (an NTP
+    correction on a long-running box) reads ``0.0`` on an engine that HAS started, until the clock
+    catches up. A gate written as ``> 0`` therefore stays silent for that window rather than firing
+    wrongly, which is the safe direction for one. Do not restate this as "uptime only grows": that
+    reading invites the next gate to be built on it the other way round, where the same clock step
+    produces a false alarm instead of a held one.
+
+    ``channels_failed`` counts the DEPLOYED inbound connections that failed to build or bind at start
+    (ADR 0031 isolation — the engine came up and serves the rest of the graph). It is an estate-wide
+    count, exactly like ``channels_total`` / ``channels_running`` beside it. It is a SUBSET of
+    ``channels_stopped``, never a fourth bucket: a connection that failed to start is not running, so
+    ``channels_stopped == channels_total - channels_running`` already counts it. Do not add the two.
+
+    ``channels_failed_names`` is the subset of those names the CALLER is authorized to see, so it can
+    be shorter than ``channels_failed`` and empty while the count is not. ``/connections`` hides an
+    out-of-scope inbound's name from a channel-scoped caller, and this field must not become a side
+    channel around that; the count itself discloses nothing ``channels_total`` does not. Names only,
+    never the failure reason — a reason is a raw exception string and this field renders into a
+    tooltip.
+
+    Both are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
+
     version: str
     uptime_seconds: float
     pid: int
@@ -711,6 +751,8 @@ class EngineInfo(BaseModel):
     channels_running: int
     channels_stopped: int
     outbox_by_status: dict[str, int]
+    channels_failed: int = 0  # deployed inbounds that failed to start (ADR 0031), estate-wide
+    channels_failed_names: list[str] = Field(default_factory=list)  # the caller-visible subset
 
 
 class EngineKpis(BaseModel):

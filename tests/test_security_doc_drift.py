@@ -233,7 +233,10 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
         "safe_exc() at the emit site and safe_text(reason)[:200] at the store, cipher-encrypted at "
         "rest. A NEW free-text field here must be scrubbed the same way or moved into PHI_FIELDS"
     ),
-    "AlertInstanceList": "envelope: alerts + total",
+    "AlertInstanceList": (
+        "envelope: alerts + total + worst_severity — a count and a severity NAME "
+        "('info'/'warning'/'critical'), both aggregated from alert metadata, no message data"
+    ),
     "AlertRuleInfo": "operator-authored rule name/type/threshold — configuration, not message data",
     "AlertTestEmailResult": (
         "POST /alerts/test-email outcome only: configured/success flags, duration_ms, "

@@ -71,7 +71,11 @@ from messagefoundry.config.models import RetryPolicy
 # may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
 # here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
 from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
-from messagefoundry.config.settings import StoreBackend, StorePrivilegeStatus
+from messagefoundry.config.settings import (
+    AlertSeverity,
+    StoreBackend,
+    StorePrivilegeStatus,
+)
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -881,6 +885,80 @@ class AlertInstance:
     # #81 — highest occurrence-driven escalation tier reached on this open instance (0 = base tier). Set by
     # the notifier's escalation logic (ADR 0133); monotonic within an open instance, resets on reopen.
     escalation_tier: int = 0
+
+
+@dataclass(frozen=True)
+class AlertSummary:
+    """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
+    #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
+
+    The bell used to count ``len(list_active_alert_instances(limit=200))`` and rank the severities of
+    that page. Both answers go wrong past 200 active instances, and they go wrong SILENTLY: 200
+    warnings plus one older critical reported ``count=200, severity=warning``, hiding the critical
+    entirely. Raising the limit only moves the threshold, so the aggregate is computed in the store
+    over every row in scope instead.
+
+    **Scoped exactly like the list it summarises.** :meth:`QueueStore.summarize_active_alert_instances`
+    takes the same ``allowed_channels`` allow-set, because a total computed outside the per-channel
+    RBAC filter would disclose the existence and severity of alerts the caller may not read — a worse
+    defect than the truncation it fixes.
+    """
+
+    #: Active instances in the caller's scope. Unbounded by any page limit.
+    total: int
+    #: The worst severity among them; ``None`` when there are none, or when none carries a severity
+    #: this build ranks (an unrecognised value is ignored rather than allowed to win).
+    worst_severity: str | None
+
+
+#: The "active" predicate, shared by every alert read so the list and its aggregate cannot disagree
+#: about what they are counting. Open OR acknowledged — an acked instance is still a live condition on
+#: the dashboard, which is why this is NOT ``count_open_alerts_by_connection``'s open-only predicate.
+_ACTIVE_ALERT_STATUS_SQL: Final[str] = "status IN ('open','acknowledged')"
+
+#: ADR 0014's severity vocabulary ranked worst-highest. The keys come from :class:`AlertSeverity` so
+#: the store cannot hold a stale copy of a vocabulary ``config`` owns; the ranks stay explicit so
+#: reordering that enum cannot silently re-rank the bell. A member added there with no rank here is a
+#: RED TEST (``test_severity_rank_covers_the_whole_vocabulary``) rather than a silent ``ELSE 0``.
+#: The RANK is what the aggregate maximises; the NAME must never be, because SQL ``MAX`` over
+#: ``'warning'``/``'critical'`` is ``'warning'`` — alphabetical order inverts the answer with no error.
+_ALERT_SEVERITY_RANK: Final[dict[str, int]] = {
+    AlertSeverity.INFO.value: 1,
+    AlertSeverity.WARNING.value: 2,
+    AlertSeverity.CRITICAL.value: 3,
+}
+
+#: That rank as a portable SQL expression (SQLite / Postgres / T-SQL all take a simple ``CASE``),
+#: DERIVED from the map above so the two cannot drift apart. Every interpolated part is a
+#: code-controlled literal out of that dict — no caller value reaches this string. ``ELSE 0`` ranks an
+#: unrecognised severity below every known one, so a stray value can never be reported as the worst.
+_ALERT_SEVERITY_RANK_SQL: Final[str] = (
+    "CASE severity"
+    + "".join(f" WHEN '{name}' THEN {rank}" for name, rank in _ALERT_SEVERITY_RANK.items())
+    + " ELSE 0 END"
+)
+
+_SEVERITY_BY_RANK: Final[dict[int, str]] = {r: n for n, r in _ALERT_SEVERITY_RANK.items()}
+
+
+def _alert_summary(row: Any) -> AlertSummary:
+    """Build an :class:`AlertSummary` from one backend's ``COUNT(*) AS n, MAX(rank) AS worst`` row.
+
+    Shared by all three backends so the rank-to-name mapping cannot drift between them. ``MAX`` over
+    zero rows is NULL and an unrecognised severity ranks 0; both land on ``worst_severity=None``.
+    """
+    if row is None:
+        # An un-grouped aggregate always returns exactly one row, so this is unreachable by design --
+        # but it must RAISE rather than fall back to an empty summary. AlertSummary(total=0) is not a
+        # safe default here: it paints a confident gray "no active alerts" bell over an estate that may
+        # be full of criticals, which is the silent-wrong class this whole item exists to remove. The
+        # nav route already degrades correctly on an exception (alerts=None HIDES the bell rather than
+        # asserting zero), so raising reaches a better answer than any value this could invent.
+        raise RuntimeError("active-alert aggregate returned no row")
+    return AlertSummary(
+        total=int(row["n"] or 0),
+        worst_severity=_SEVERITY_BY_RANK.get(int(row["worst"] or 0)),
+    )
 
 
 @dataclass(frozen=True)
@@ -7820,7 +7898,7 @@ class MessageStore:
         # scope as list_connection_events (None = unrestricted; a set restricts to instances whose
         # connection is in the allow-set). limit is clamped server-side.
         limit = max(1, min(limit, 1000))
-        where = ["status IN ('open','acknowledged')"]
+        where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
@@ -7835,6 +7913,27 @@ class MessageStore:
                 params,
             )
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
+
+    async def summarize_active_alert_instances(
+        self, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertSummary:
+        # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
+        # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
+        # deliberately NOT count_open_alerts_by_connection's, which is open-only and would silently drop
+        # the acknowledged instances the bell has always counted. Lockfree read; no row leaves the store.
+        where = [_ACTIVE_ALERT_STATUS_SQL]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) AS n, MAX({_ALERT_SEVERITY_RANK_SQL}) AS worst"
+                f" FROM alert_instance{clause}",
+                params,
+            )
+            row = await cur.fetchone()
+        return _alert_summary(row)
 
     async def get_alert_instance(
         self, alert_id: int, *, allowed_channels: Sequence[str] | None = None

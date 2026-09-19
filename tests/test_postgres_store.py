@@ -3773,6 +3773,8 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
 
 
 async def test_alert_instance_lifecycle_pg(store) -> None:
+    from messagefoundry.store.store import AlertSummary
+
     # first fire opens one `open` instance (count 1, first_seen==last_seen).
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
@@ -3800,6 +3802,18 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+    # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
+    # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
+    # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
+    assert await store.summarize_active_alert_instances() == AlertSummary(
+        total=2, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
+        total=1, worst_severity="critical"
+    )
+    assert await store.summarize_active_alert_instances(allowed_channels=[]) == AlertSummary(
+        total=0, worst_severity=None
+    )
     # an acknowledged re-fire folds in (count++) but does NOT pop back to open.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0
