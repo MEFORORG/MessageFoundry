@@ -152,10 +152,15 @@ def _alert_controls(a: AlertInstanceInfo, *, now: float) -> Markup:
     return el("div", *forms, class_="ctls") if forms else Markup("")
 
 
-def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
+def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: str = "") -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
     Metadata only — no PHI, no secrets (transports are reported present-or-not by the JSON handler).
+
+    ``error`` renders a refusal banner above the tables — the shape ``pages.message_search`` uses when a
+    write is refused rather than substituted (BACKLOG #1744). ``config`` is None for a caller that holds
+    ``monitoring:diagnose`` but not ``monitoring:read``: the rules half is read-gated, so that caller
+    gets the instance list and no Rules section rather than a refusal that widens what it can read.
     """
     now = time.time()
     inst_rows = [
@@ -195,6 +200,20 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
     )
     empty = el("p", "No active alerts.", class_="muted") if not instances.alerts else Markup("")
 
+    return page(
+        "Alerts",
+        el("h1", "Alerts"),
+        el("p", error, class_="banner") if error else Markup(""),
+        el("h2", "Active"),
+        empty,
+        inst_table,
+        *(_alert_rules_section(config) if config is not None else ()),
+        active="alerts",
+    )
+
+
+def _alert_rules_section(config: AlertsConfig) -> list[Markup]:
+    """The Rules heading, transport summary and loaded-rule table — the read-gated half of the page."""
     transports = ", ".join(
         [
             t
@@ -238,17 +257,7 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
         ],
         rule_rows,
     )
-    return page(
-        "Alerts",
-        el("h1", "Alerts"),
-        el("h2", "Active"),
-        empty,
-        inst_table,
-        el("h2", "Rules"),
-        summary,
-        rules_table,
-        active="alerts",
-    )
+    return [el("h2", "Rules"), summary, rules_table]
 
 
 #: The bounded connection-event vocabulary (mirrors the engine's emit kinds + the desktop
@@ -262,6 +271,9 @@ _EVENT_KINDS = (
     "frame_oversize",
     "peer_reset",
     "framing_error",
+    # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
+    # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
+    "row_undecodable",
     # ADR 0154 D6 — inbound HTTP intake-auth refusals. CI asserts this tuple equals the set the
     # engine actually emits, so these are not optional garnish: without them the vocabulary test
     # fails. Each also writes an audit_log row, which is the copy that survives diagnostics being off.

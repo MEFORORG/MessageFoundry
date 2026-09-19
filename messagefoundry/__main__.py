@@ -26,7 +26,7 @@ import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
-import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -41,6 +41,36 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+
+
+class _VersionAction(argparse.Action):
+    """``--version``: print the version AND the package directory that answered (BACKLOG #1677).
+
+    The working directory precedes the venv's editable ``.pth`` entry on ``sys.path``, so running from
+    a directory that holds another tracked copy of ``messagefoundry/`` resolves the import to THAT
+    copy. There is no error, and nothing in the output says which tree answered, so an instrument that
+    trusts the run reports a self-consistent wrong answer.
+
+    A CUSTOM ACTION RATHER THAN ``action="version"`` WITH AN EMBEDDED NEWLINE. argparse's own version
+    action routes its text through ``HelpFormatter._fill_text``, which re-wraps it into a single
+    width-dependent paragraph: the newline is collapsed and the path lands mid-line at whatever column
+    the terminal happens to be. Printing the two lines here keeps them apart at any width -- which is
+    also why the test for this asserts on the presence of the path token, never on a line index.
+
+    ``Path(__file__).parent`` IS the package directory -- this module lives inside it -- so answering
+    the question needs no new import and no ``importlib`` lookup.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        _safe_print(f"messagefoundry {__version__}")
+        _safe_print(f"package: {Path(__file__).resolve().parent}")
+        parser.exit()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,8 +89,38 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, OSError):
                 pass
 
+    # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
+    # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
+    # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
+    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
+    # case that could carry a field value.
+    #
+    # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
+    # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
+    # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    #
+    # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
+    # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
+    # here would bind it before they can patch it, and they would silently stop applying.
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
+
+    install_excepthook()
+    # The sibling hook for every OTHER thread (BACKLOG #1055), which had the identical serve-only gap.
+    # sys.excepthook does not cover them, and the engine runs non-asyncio threads whose except clauses
+    # are deliberately narrow -- the sandbox session's raw stdout reader catches only OSError -- so
+    # anything else would otherwise reach the stdlib default and print an unredacted traceback to the
+    # NSSM-captured stderr.
+    install_thread_excepthook()
+
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"messagefoundry {__version__}")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="print the version and the package directory that answered",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the engine + localhost API")
@@ -1746,6 +1806,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_ca_file=settings.logging.forward_tls_ca_file,
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -3077,29 +3138,61 @@ def _serve(args: argparse.Namespace) -> int:
     import os
 
     from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.redaction import safe_exc
 
     def env_values() -> dict[str, Any]:
-        return load_environment_values(
-            base_dir=env_base,
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
-        )
+        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+        # WiringError is the type both the serve gate below and that route already understand, so
+        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+        #
+        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+        # keeps the exception type and bounds the length.
+        try:
+            return load_environment_values(
+                base_dir=env_base,
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+        except (ValueError, RecursionError, OSError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
+            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+            # an embedder's arbitrary callable, while this one wraps our own call into a function that
+            # returns a dict or raises.
+            raise WiringError(
+                f"could not read environment values from {env_file}: {safe_exc(exc)}"
+            ) from exc
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
     # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
     # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
-    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise inside env_values() —
     # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
-    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    # a clean error like every other serve gate. env_values() now wraps that as a WiringError which
+    # already names the value file (path only, PHI-safe), so print it rather than re-stating the path.
     try:
         env_values_empty = not env_values()
-    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
-        print(
-            f"error: could not read environment values from {env_file}: {exc}",
-            file=sys.stderr,
-        )
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
     # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
@@ -3122,6 +3215,10 @@ def _serve(args: argparse.Namespace) -> int:
     # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
     registry_filter = None
     if args.shard is not None:
+        # WiringError is also bound above (env_values), and this local re-import is deliberate: the
+        # shard closure below raises it, so binding it here keeps this block self-contained. Relying
+        # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
+        # a NameError, on a path only `serve --shard` against a mismatched store reaches.
         from messagefoundry.config.wiring import Registry, WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
@@ -3348,15 +3445,10 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
-    from messagefoundry.redaction import safe_exc
 
-    install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
-    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
-    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
-    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
-    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
-    install_thread_excepthook()
+    # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
+    # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
+    # serving lifespan, inside the running loop.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
