@@ -2768,11 +2768,19 @@ def create_app(
     ) -> AlertInstanceList:
         """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen`` first —
         **metadata only, no PHI**. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the
-        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``."""
-        rows = await engine.store.list_active_alert_instances(
-            limit=limit, allowed_channels=_scope(identity)
+        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``.
+
+        ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
+        them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
+        to the rows and can never report an alert the caller may not read."""
+        scope = _scope(identity)
+        rows = await engine.store.list_active_alert_instances(limit=limit, allowed_channels=scope)
+        summary = await engine.store.summarize_active_alert_instances(allowed_channels=scope)
+        return AlertInstanceList(
+            alerts=[_alert_instance_info(r) for r in rows],
+            total=summary.total,
+            worst_severity=summary.worst_severity,
         )
-        return AlertInstanceList(alerts=[_alert_instance_info(r) for r in rows])
 
     @app.post("/alerts/{alert_id}/ack", response_model=AlertInstanceInfo)
     async def ack_alert(
