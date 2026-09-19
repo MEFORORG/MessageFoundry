@@ -139,7 +139,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
         # leave exactly the change that reintroduces the defect facing nothing.
         "test_username_access_key_screen.py",
-        # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` outside
+        # AST-scans messagefoundry/store/store.py and reds on any `execute("BEGIN")` -- or on the
+        # nested-transaction verbs `SAVEPOINT`, `ROLLBACK TO` and `RELEASE` -- outside
         # `_writer_txn` (ADR 0159). Same shape as sqlserver_encrypt_pass_tables below -- a guard whose
         # subject is a store module it reads rather than imports -- and it stays here for this file's
         # standard gating reason, checked against the gate rather than assumed: what it catches is an

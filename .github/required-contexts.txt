@@ -21,22 +21,47 @@
 # RETIRED the review requirement: `a reviewer has read this` was removed from protection, fourteen
 # back to thirteen. It moved AGAIN between 2026-09-13 22:41Z and 2026-09-14 06:59Z, when the owner
 # added the two `security.yml` composite roll-ups, thirteen to fifteen -- step 2 of the consolidation
-# staged below.
+# staged below. It moved ONCE MORE at about 2026-09-16 18:45Z, when the owner removed the SEVEN
+# original `security.yml` scan contexts, fifteen back to EIGHT. That is consolidation step 4, taken
+# BEFORE step 3 rather than after it -- the inversion the step-ordering note further down this file
+# asked for, and the safe direction of the pair: removing a context can wedge nothing, while deleting
+# a job protection still names wedges every pull request in the repository.
 #
-# THE LIST BELOW IS SET-EQUAL TO THE SERVER -- fifteen contexts, nothing extra on either side --
-# read at 2026-09-15 with
-# `gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'`.
+# THE LIST BELOW IS SET-EQUAL TO THE SERVER -- EIGHT contexts, nothing extra on either side --
+# read at 2026-09-17 00:23Z with
+# `gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '.required_status_checks.contexts[]'`,
+# by diffing the sorted API read against the sorted parse of this file.
 # A set-equal read is the only one worth writing down: a count alone cannot tell a matching set from
 # two offsetting errors.
 #
-# THAT LAST MOVE IS THE ONE THIS FILE FAILED TO MIRROR, AND IT IS RECORDED HERE RATHER THAN QUIETLY
+# THE 2026-09-16 MOVE WENT UNMIRRORED TOO, AND FOR ABOUT SIX HOURS THIS FILE OVERSTATED THE GATE. It
+# named fifteen over a server holding eight, so it asserted that seven security contexts block a merge
+# when nothing required them. That is the OPPOSITE error from the one below -- over-claiming rather
+# than under-claiming -- and it is the less dangerous of the two, because a reader who believes a gate
+# is blocking treats the change as more constrained than it is. It is still a false answer to the one
+# question this file exists to answer, and the seven were not idle: they still RUN on every pull
+# request and still go red on a finding, so "is this check blocking?" and "does this check report?"
+# came apart for the first time here. That distinction is why the seven are recorded below as
+# superseded rather than deleted outright.
+#
+# THE 2026-09-14 MOVE IS THE ONE THIS FILE FAILED TO MIRROR IN THE REASSURING DIRECTION, AND IT IS
+# RECORDED HERE RATHER THAN QUIETLY
 # FIXED. For roughly a day the file named thirteen over a server holding fifteen, and the two it
 # omitted were the two it explicitly described as "DELIBERATELY ABSENT ... a red one BLOCKS NOTHING
 # TODAY". So the file did not merely lag -- it asserted the opposite of the server, in the reassuring
 # direction, on the one question it exists to answer from a clone. A session counting passing checks
 # against this file would have read a pull request as fully green with two required contexts still
-# unreported. `scripts/ci/check_required_contexts_drift.py` DID detect it and reported to nobody: it
-# is not itself a required context, so its workflow failed every run in that window unread.
+# unreported. `scripts/ci/check_required_contexts_drift.py` DID detect it and reported to nobody.
+# THAT IS AN ALERTING GAP, NOT A MISSING DETECTOR, and the difference matters because a reader who
+# concludes the checker is unwired goes on to build a second one. It IS wired:
+# `.github/workflows/required-workflow-state.yml`'s `accurate` job runs it on a 07:00 UTC cron, on
+# `workflow_dispatch`, and on any pull request touching `.github/required-contexts.txt` or
+# `.github/workflows/**`. That job is deliberately NOT a required context -- it reads the server, so
+# requiring it would put every merge behind an API call -- and nothing watches its scheduled runs:
+# `failure-signal.yml` watches CI, Security and backlog-hygiene only. So the cron goes red on the
+# morning after a protection change and no pull request, label or notice carries it.
+# `tests/test_required_contexts_drift.py` pins the wiring so the job cannot be deleted silently;
+# giving its red a consumer is an alerting design over shared CI, still not done.
 #
 # Two non-context settings also moved and are recorded because they change
 # merge semantics (both re-read at 2026-09-04 19:05 CDT, `strict` and `enforce_admins` both TRUE):
@@ -126,47 +151,83 @@ test (ubuntu-latest, py3.14)
 test (windows-2022, py3.14)
 test (windows-2025, py3.14)
 
-# --- security.yml (every non-advisory job in that file; the advisory `sbom` and `trivy` jobs are
-# --- deliberately absent -- they declare `continue-on-error: true`) -------------------------------
-bandit (Python SAST)
-pip-audit (dependency vulnerabilities)
-npm-audit (ide dependency vulnerabilities)
-gitleaks (secret scan)
-semgrep (project SAST rules)
-crypto-inventory (ASVS 11.1.3 discovery gate)
-forbidden-content (customer/PHI leak guard)
+# --- security.yml (the TWO composite roll-ups, and nothing else from that file) --------------------
+#
+# THIS SECTION USED TO READ "every non-advisory job in that file", AND THAT DESCRIPTION DIED WITH THE
+# 2026-09-16 PROTECTION EDIT. It is kept here as the previous claim rather than overwritten, because
+# the shape it described is the one a reader still expects: for two months every hard-failing job in
+# security.yml was required, and `sbom` + `trivy` were absent for the single reason that they declare
+# `continue-on-error: true`. There are now THREE reasons a security.yml job is absent from this list,
+# and only the first is about the job's own posture:
+#
+#   * `sbom`, `trivy`             -- advisory BY DESIGN; they declare `continue-on-error: true`.
+#   * `released-line-audit`       -- advisory BY PLACEMENT; schedule/dispatch-only, so it can never
+#                                    report on a pull request. It still goes red on a finding.
+#   * the SEVEN original scans    -- SUPERSEDED. See the block below. They hard-fail and they report
+#                                    on every pull request; they simply no longer gate the merge.
+#
+# The seven are the new case, and they are the one a reader is most likely to get wrong, because they
+# look exactly like a required job from inside the workflow file.
 
-# THE TWO COMPOSITE ROLL-UPS. They are COMPOSITE jobs running the same seven scans above in two
-# runner slots instead of seven, staged ALONGSIDE the originals rather than replacing them, so during
-# the overlap every scan runs twice and both copies are required. docs/CI.md carries the reasoning and
-# the runner-slot measurement; tests/test_security_composite_parity.py asserts each copied body is
-# byte-identical to its original, which is what makes the duplication safe to review.
+# THE TWO COMPOSITE ROLL-UPS -- SINCE 2026-09-16, THE ONLY security.yml CONTEXTS THAT GATE A MERGE.
+# They are COMPOSITE jobs running the same seven scans in two runner slots instead of seven.
+# docs/CI.md carries the reasoning and the runner-slot measurement;
+# tests/test_security_composite_parity.py asserts each copied body is byte-identical to its original,
+# which is what makes the consolidation safe to review -- every assertion this repository already made
+# about an original step is an assertion about a string the copy shares.
+#
+# THE OVERLAP IS HALF OVER, AND SAYING WHICH HALF IS THE POINT. Until 2026-09-16 every scan ran twice
+# and BOTH copies were required, so a finding blocked the merge twice over. Now every scan still runs
+# twice -- the seven original jobs are still in the workflow -- but only the composite copy is
+# required. So the runner-slot saving is still unrealised (it arrives when the seven jobs are deleted,
+# consolidation step 3) while the merge-gating consolidation is already complete.
 #
 # THEY WERE DELIBERATELY ABSENT FROM THIS FILE UNTIL 2026-09-15, AND THAT ABSENCE OUTLIVED ITS REASON
 # BY ABOUT A DAY. The reason was sound while it held: recording a context here before protection
-# carries it is the lie this file exists to prevent. The owner then added both to protection (step 2
-# below) and nothing moved the file, so the absence flipped from true to false without a single edit.
+# carries it is the lie this file exists to prevent. The owner then added both to protection (step 2)
+# and nothing moved the file, so the absence flipped from true to false without a single edit.
 # That is the shape to watch for -- a correct note whose correctness depends on a server setting it
 # cannot see. It is recorded in this file's header rather than deleted, because the next staged
-# context will create the same window.
+# context will create the same window. It recurred on 2026-09-16 in the opposite direction, which is
+# the same shape again: seven lines that were true for two months became false with no edit to them.
 repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)
 dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)
 
-# THE SEVEN ORIGINALS ABOVE ARE STILL REQUIRED AND MUST NOT BE DELETED YET. A required context is a
-# JOB NAME, so deleting a job while protection still names it wedges every pull request in the
-# repository -- protection waits forever for a context nothing produces. The remaining steps, in
-# order, are in docs/CI.md under `Consolidating the seven security contexts`:
+# THE SEVEN ORIGINALS ARE NO LONGER REQUIRED. THEY ARE ALSO NOT GONE, AND THE GAP BETWEEN THOSE TWO
+# FACTS IS THIS ENTRY. Until 2026-09-16 this block read "THE SEVEN ORIGINALS ABOVE ARE STILL REQUIRED
+# AND MUST NOT BE DELETED YET" and listed steps 3 and 4 as outstanding. Step 4 has happened. The seven
+# lines are struck from the list above, and the previous text is quoted rather than dropped because
+# what it was warning about is what determined the order the owner then used:
 #
-#   3. A later PR deletes the seven original JOBS, and drops their seven lines from this file, the
-#      bullet list in docs/CI.md, and the classification in tests/test_security_posture.py.
-#   4. The owner removes the seven original NAMES from branch protection.
+#     bandit (Python SAST)                             pip-audit (dependency vulnerabilities)
+#     npm-audit (ide dependency vulnerabilities)        gitleaks (secret scan)
+#     semgrep (project SAST rules)                      crypto-inventory (ASVS 11.1.3 discovery gate)
+#     forbidden-content (customer/PHI leak guard)
 #
-# STEP 3 BEFORE STEP 4 OPENS THE WEDGE IT IS MEANT TO AVOID, and that is a real defect in the plan as
-# written rather than a subtlety of it. Between them the seven contexts are required and unreportable.
-# Whoever takes step 3 must confirm with the owner that step 4 lands in the same window, or invert the
-# pair -- protection first, the file and the jobs second, which is the order the `ADDING ANOTHER ONE
-# LATER` paragraph below already prescribes for the opposite direction. Named here, unresolved, so the
-# next reader does not discover it by wedging the repository.
+#   4. DONE, at about 2026-09-16 18:45Z. The owner removed the seven original NAMES from branch
+#      protection, fifteen contexts to eight. THIS WAS STEP 4 TAKEN BEFORE STEP 3, which is the
+#      inversion the previous text asked for and the safe order of the pair.
+#   3. STILL TO DO, and it is now safe in any order. A later PR deletes the seven original JOBS from
+#      .github/workflows/security.yml. Nothing requires those contexts any more, so the deletion can
+#      no longer wedge a pull request and needs no protection edit beside it. That PR also retires
+#      the `_SUPERSEDED_SECURITY_JOBS` bucket in tests/test_security_posture.py and the nine
+#      re-pointed entries' provenance notes in tests/negative_controls.toml, and this block.
+#
+# WHAT THE ORDERING DEFECT COST, AND WHAT IT BOUGHT. The previous text called steps 3-then-4 "a real
+# defect in the plan as written", because between them the seven contexts would be required and
+# unreportable -- every pull request wedged. Inverting the pair costs a window of the OPPOSITE kind:
+# between step 4 and step 3 the seven jobs run, consume seven runner slots, and gate nothing. That is
+# wasted compute and a misleading checks tab, and it is recoverable by a single pull request. The
+# other window is a wedged repository recoverable only by the owner. Recorded because the asymmetry is
+# the reason to prefer this order next time, not merely the reason it worked out this time.
+#
+# WHILE THAT WINDOW IS OPEN THE SEVEN ARE A POSTURE THIS FILE HAS NOT HELD BEFORE: hard-failing,
+# reporting on every pull request, and deliberately not required. They are not advisory BY DESIGN
+# (no `continue-on-error`) and not advisory BY PLACEMENT (no schedule-only `if:` -- they do report on
+# a PR). tests/test_security_posture.py files them under `_SUPERSEDED_SECURITY_JOBS` for exactly the
+# length of that window, and the claim that makes the posture safe is
+# tests/test_security_composite_parity.py's: each composite's copy of a scan is byte-identical to the
+# original, so the scan that stopped gating is the same string as the one that now gates.
 
 # --- cla.yml --------------------------------------------------------------------------------------
 cla

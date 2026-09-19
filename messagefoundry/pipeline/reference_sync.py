@@ -37,6 +37,7 @@ from typing import Any
 from uuid import uuid4
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
+from messagefoundry.config.models import hop_attestation_from_settings
 from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -138,7 +139,12 @@ async def _load_database_source(
     statement = str(settings.get("statement", ""))
     if not key_col or not statement:
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
-    dsn = _build_dsn(dict(settings))  # fail-loud on weakened TLS / bad auth, before dialing
+    # Per-connection insecure-hop attestation (#200), the twin of the db_lookup executor's: this sync
+    # dials the same customer DB through the same weakened-TLS gate, so dropping the attestation
+    # refused a hop the operator had attested.
+    attested = hop_attestation_from_settings(settings)
+    # fail-loud on weakened TLS / bad auth, before dialing
+    dsn = _build_dsn(dict(settings), attested=attested)
     pool = await _make_pool(dsn, int(settings.get("pool_max", 5)), autocommit=True)
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass

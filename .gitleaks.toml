@@ -87,6 +87,15 @@ regexes = [
   # tests/test_environments.py -- the needle proving a cast failure never echoes an env() value into
   # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
   '''pw-C4st_Val-66''',
+  # --- BACKLOG #1656 limb 2 -- the same needle, one arm further out ------------------------------
+  # tests/test_environments.py again. `resolve_env_settings` caught only (ValueError, TypeError), so a
+  # cast raising anything else -- a KeyError, whose text IS the value it was handed -- escaped RAW and
+  # carried the secret into the startup error. That re-opened, for every other arm, exactly what
+  # #1183 closed for ValueError. This needle is the value that test asserts does NOT survive, so it is
+  # published in test source by construction, same as its sibling above. MEASURED to trip
+  # generic-api-key on entropy (3.625) before it was listed -- not listed pre-emptively, per the
+  # #1475 block's rule below.
+  '''pw-K3yErr_Val-88''',
   # --- BACKLOG #1475 -- key-material fixtures for the same test file -----------------------------
   # Three more SYNTHETIC needles, invented for the families covering `_KEY_MATERIAL`. Same
   # construction and same reason as the #1183 block above: each is a value a redaction test asserts
