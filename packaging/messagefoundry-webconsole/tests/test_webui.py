@@ -1205,8 +1205,30 @@ def test_default_nav_renders_status_icons() -> None:
 _GIB = 1024**3
 
 
-def _sysinfo(disk_free: int, *, logs_free: int | None = None, pool_idle: int | None = None):
-    """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter."""
+def _sysinfo(
+    disk_free: int,
+    *,
+    logs_free: int | None = None,
+    pool_idle: int | None = None,
+    channels: int = 2,
+    channels_running: int | None = None,
+    failed_names: list[str] | None = None,
+    failed_count: int | None = None,
+    uptime: float = 1.0,
+):
+    """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter.
+
+    ``channels`` defaults to a NONZERO deployed-inbound count on purpose (BACKLOG #1741): zero
+    deployed inbounds on a started engine is now itself a warn, so a zero default would make every
+    test below assert against an incidentally-warning engine. The zero case gets its own tests.
+
+    ``failed_count`` defaults to ``len(failed_names)`` and is passed separately only to build the
+    channel-scoped shape, where the caller sees the COUNT of failed inbounds but not every name.
+
+    A caller passing failures usually raises ``channels`` to cover them. That keeps the fixture
+    self-consistent (channels_failed is a SUBSET of channels_stopped, never a fourth bucket) — it
+    changes no assertion, because the rollup reads only total, failed, the names, and uptime.
+    """
     from messagefoundry.api.models import (
         DbInfo,
         EngineInfo,
@@ -1216,15 +1238,20 @@ def _sysinfo(disk_free: int, *, logs_free: int | None = None, pool_idle: int | N
         SystemStatus,
     )
 
+    names = list(failed_names or [])
+    failed = failed_count if failed_count is not None else len(names)
+    running = channels_running if channels_running is not None else max(0, channels - failed)
     return SystemStatus(
         engine=EngineInfo(
             version="0",
-            uptime_seconds=1.0,
+            uptime_seconds=uptime,
             pid=1,
-            channels_total=0,
-            channels_running=0,
-            channels_stopped=0,
+            channels_total=channels,
+            channels_running=running,
+            channels_stopped=channels - running,
             outbox_by_status={},
+            channels_failed=failed,
+            channels_failed_names=names,
         ),
         db=DbInfo(
             path="db",
@@ -1315,6 +1342,114 @@ def test_derive_health_worst_issue_wins_not_composite() -> None:
     dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
     health, reason = _derive_health(_sysinfo(512 * 1024**2, pool_idle=0), dr, None, None)
     assert health == "down" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_warns_on_a_failed_inbound_and_names_it() -> None:
+    """BACKLOG #1741 act 1: a deployed inbound that failed to start is at least warn, naming it.
+
+    The heart used to read ok over exactly this — an MLLP inbound on an occupied port — while the
+    dashboard row beside it already said "failed"."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(50 * _GIB, failed_names=["IB_ACME_ADT"]), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_ACME_ADT failed to start"
+
+
+def test_derive_health_failed_inbound_reason_lists_several_then_truncates() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    _, two = _derive_health(
+        _sysinfo(50 * _GIB, channels=5, failed_names=["A", "B"]), None, None, None
+    )
+    assert two == "2 inbound connections failed to start: A, B"
+    # The reason renders into a title= attribute, so a wide outage truncates rather than listing all.
+    _, many = _derive_health(
+        _sysinfo(50 * _GIB, channels=9, failed_names=["A", "B", "C", "D", "E"]), None, None, None
+    )
+    assert many == "5 inbound connections failed to start: A, B, C, and 2 more"
+
+
+def test_derive_health_failed_inbound_warns_without_a_name_for_a_scoped_caller() -> None:
+    """A channel-scoped operator gets the COUNT but no name (/connections hides an out-of-scope
+    inbound's name, and the heart must not be a side channel around that) — and still gets the warn,
+    which is the whole point of surfacing the count separately."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(
+        _sysinfo(50 * _GIB, channels=4, failed_names=[], failed_count=2), None, None, None
+    )
+    assert health == "warn"
+    assert reason == "2 inbound connections failed to start"
+    # A SINGLE hidden failure must not read "1 inbound connections" — the plural head is shared, so
+    # the singular case needs its own text on the no-name branch too.
+    _, one = _derive_health(
+        _sysinfo(50 * _GIB, channels=4, failed_names=[], failed_count=1), None, None, None
+    )
+    assert one == "1 inbound connection failed to start"
+
+
+def test_derive_health_warns_when_no_inbound_is_deployed() -> None:
+    """BACKLOG #1741 act 2: zero deployed inbounds on a started engine is warn — the heart used to
+    read ok over an engine listening on nothing ("0/0 running")."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, channels=0), None, None, None)
+    assert health == "warn"
+    assert reason == "no inbound connections deployed"
+
+
+def test_derive_health_no_inbound_warn_keys_on_total_not_running() -> None:
+    """A cluster standby binds no listeners BY DESIGN, so channels_running == 0 is correct there.
+    Keying act 2 on running would paint every standby permanently warn; it keys on channels_total."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    standby = _sysinfo(50 * _GIB, channels=3, channels_running=0)
+    assert standby.engine.channels_running == 0 and standby.engine.channels_total == 3
+    assert _derive_health(standby, None, None, None) == ("ok", None)
+
+
+def test_derive_health_no_inbound_warn_waits_for_a_started_engine() -> None:
+    """uptime_seconds == 0 means /status has no engine.started_at yet. An engine still coming up is
+    not "listening on nothing", so act 2 holds its warn rather than flashing one on every restart."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB, channels=0, uptime=0.0), None, None, None) == (
+        "ok",
+        None,
+    )
+
+
+def test_derive_health_connection_issues_lose_to_a_worse_one() -> None:
+    """Both #1741 rules are warn, so a critical disk still wins the heart — worst issue wins,
+    unchanged. Run for each rule: a failed inbound, then a graph with no inbound at all."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    crit = 512 * 1024**2  # 0.5 GiB free
+    for sysinfo in (
+        _sysinfo(crit, channels=1, failed_names=["IB_A"]),
+        _sysinfo(crit, channels=0),
+    ):
+        health, reason = _derive_health(sysinfo, None, None, None)
+        assert health == "down" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_connection_issue_wins_the_tie_against_another_warn() -> None:
+    """At EQUAL severity the reason is the first issue appended, and the connection rules are
+    appended first on purpose — a feed that is not listening is more actionable than "on the DR
+    box". Pins the tie-break, which is encoded only in list order inside _derive_health."""
+    from messagefoundry.api.models import DrStatus
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
+    # 3 GiB free is a warn, DR-active is a warn, a failed inbound is a warn — all three fire.
+    health, reason = _derive_health(
+        _sysinfo(3 * _GIB, channels=2, failed_names=["IB_A"], pool_idle=0), dr, None, None
+    )
+    assert health == "warn"
+    assert reason == "inbound IB_A failed to start"
 
 
 def test_worst_severity_ranks_critical_highest() -> None:

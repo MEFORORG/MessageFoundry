@@ -1140,8 +1140,8 @@ async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
-    Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
-    only an unexpected bug would 500. Closes the test connector afterward.
+    Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
+    raising — only an unexpected bug would 500. Closes the test connector afterward.
 
     Every ``detail`` here is scrubbed and length-bounded, because it does not stay in the response: the
     route JSON-dumps it into ``audit_log.detail``, the one at-rest error column written **without** the
@@ -1179,6 +1179,10 @@ async def _run_connection_test(
     try:
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
+        # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
+        # WiringError; it did not always, and the escape cost more than a 500. The credential route's
+        # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
+        # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -5210,6 +5214,10 @@ def create_app(
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
+        # BACKLOG #1741: the deployed inbounds that failed to build/bind at start (ADR 0031). The
+        # console's nav heart reads these — without them it reported "ok" over an engine listening on
+        # nothing. Names are scoped to the caller (see EngineInfo); the count is not.
+        failed_in: list[str] = []
         # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
         # running/stopped breakdown (vs channels_*, which count inbound only).
         conn_total = conn_running = conn_not_deployed = 0
@@ -5226,6 +5234,10 @@ def create_app(
             out_deployed = [name for name, oc in rr.registry.outbound.items() if oc.deployed]
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
+            # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
+            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            failed_in = [name for name in in_deployed if rr.connection_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane not operator-paused — consistent with inbound_running's
             # actually-started semantics (outbound_status reports "running" for any non-paused lane even
@@ -5329,6 +5341,13 @@ def create_app(
                 channels_running=running,
                 channels_stopped=total - running,
                 outbox_by_status=await engine.store.stats(),
+                channels_failed=len(failed_in),
+                # Scoped to the caller: an unscoped identity (allowed_channels is None) sees every
+                # name, a channel-scoped one only its own. `_user` keeps its historical underscore
+                # because both console call sites pass it by keyword across the UI seam.
+                channels_failed_names=[
+                    name for name in failed_in if _user.can_access_channel(name)
+                ],
             ),
             kpis=kpis,
             db=DbInfo(

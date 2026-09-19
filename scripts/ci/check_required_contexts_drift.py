@@ -25,10 +25,19 @@ and it is NOT a required context, so nothing surfaced the failure to any pull re
 sessions counted passing checks against the file and read a pull request as fully green with two
 required contexts unreported.
 
-SO A DETECTOR THAT REPORTS TO NOBODY IS HALF A CONTROL, and that is recorded rather than fixed here:
-giving this one a consumer is an alerting design over shared CI, not a line in this file. What the
-2026-09-15 sync changed was the file, the pin, ``docs/CI.md`` and the job classification in
-``tests/test_security_posture.py`` -- the drift, not the reporting path.
+SO A DETECTOR THAT REPORTS TO NOBODY IS HALF A CONTROL. What the 2026-09-15 sync changed was the file,
+the pin, ``docs/CI.md`` and the job classification in ``tests/test_security_posture.py`` -- the drift,
+not the reporting path.
+
+THE REPORTING PATH IS NOW BUILT (BACKLOG #1450), AND IT IS NOT IN THIS FILE. That was the right call:
+the fix was an alerting design over shared CI, so it landed where the alerting lives.
+``.github/workflows/nightly-notice.yml`` watches ``Required workflow state`` and turns a SCHEDULED red
+into one deduplicated issue that closes itself when the cron goes green again.
+``tests/test_required_contexts_drift.py`` pins that route from this script's side, keyed off whichever
+workflow invokes this file rather than off a literal name, so renaming that workflow reds a test
+instead of detaching the notice in silence. It changes nothing about this job's posture -- still
+advisory, still not a required context, a red here still blocks no merge. What else that route does
+NOT carry is recorded once, in ``docs/CI.md``; do not read a green cron as more than it says.
 
 WHY THIS IS A SEPARATE SCRIPT, not a branch inside ``check_required_workflow_state.py``. That sibling
 asks REACHABILITY -- *can this context ever report?* This one asks ACCURACY -- *does our checked-in claim
