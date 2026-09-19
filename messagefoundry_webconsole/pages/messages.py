@@ -11,6 +11,7 @@ markup.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlencode
 
 from messagefoundry.api.models import (
     DeadLetterList,
@@ -28,11 +29,24 @@ __all__ = [
     "dead_letters",
     "message_detail",
     "message_edit",
+    "message_resend_confirm",
     "message_search",
     "messages",
     "parse_tree_page",
     "parse_tree_unavailable",
 ]
+
+#: The tail-placement caution ADR 0090 §3 requires the console affordance to carry, worded to the two
+#: things that ADR actually establishes and no further. It rules that a resend lands at the
+#: destination lane's TAIL and MAY be delivered after newer same-partner messages already queued to
+#: that lane, and in the same paragraph REFUSES any stronger claim: there is no sequence-key column
+#: and no sub-lane, so nothing here may say where in a historical stream the resend "belongs" or that
+#: it will be re-inserted at its original position. Kept as a module constant because the confirm page
+#: renders it and the tests assert on it — two copies of a claim this narrow is how one of them drifts.
+RESEND_TAIL_WARNING = (
+    "A resend is queued at the END of the destination lane. It may therefore be delivered after "
+    "newer messages for the same partner that are already queued to that lane."
+)
 
 
 def _msg_filters(
@@ -333,9 +347,80 @@ def _human_size(n: int) -> str:
     return f"{n} B"  # unreachable; keeps mypy happy on the loop's implicit path
 
 
-def message_detail(detail: MessageDetail) -> Markup:
+def _resend_section(detail: MessageDetail) -> list[object]:
+    """The resend-to-an-ALTERNATE-outbound affordance (ADR 0090 §§1-8, BACKLOG #123/#1500).
+
+    A GET form, so the chosen source and target land in the confirm page's own query string (see
+    ``routes/core.ui_message_resend_confirm`` for why that matters).
+
+    THE SOURCE PICKER IS NOT A CONVENIENCE. ``ResendRequest.source`` names which delivered
+    destination's stored body to copy, and the engine resolves it only when the origin has exactly
+    one delivery — a fanned-out message with ``source`` omitted raises ``ResendError`` and the
+    endpoint answers 409. Offering the message's own delivery rows as the choices makes that refusal
+    unreachable from this form. A message with NO outbound row has no transformed body at all, so it
+    gets the explanation rather than a form that can only fail.
+    """
+    sources = sorted({row.destination_name for row in detail.outbox})
+    heading = el("h2", "Resend to another outbound")
+    if not sources:
+        return [
+            heading,
+            el(
+                "p",
+                "This message has no stored delivery, so there is no transformed body to "
+                "re-transmit. A resend ships exactly the bytes that were sent before.",
+                class_="muted",
+            ),
+        ]
+    options: list[object] = []
+    if len(sources) > 1:
+        # Prepended ONLY when the choice is real. A browser selects the first option of a select by
+        # default, so on a fanned-out message a plain list would silently pick one delivery's body
+        # for the operator. A disabled placeholder plus `required` makes them choose.
+        options.append(el("option", "Choose a delivery", value="", disabled=True, selected=True))
+    options.extend(el("option", name, value=name) for name in sources)
+    return [
+        heading,
+        el(
+            "p",
+            "Re-transmits this message's stored transformed body to a connection it was not "
+            "originally routed to. The body is not re-transformed, and the resend is audited.",
+            class_="muted",
+        ),
+        el(
+            "form",
+            el(
+                "label",
+                "Source delivery",
+                el("select", *options, name="source", required=True),
+            ),
+            el(
+                "label",
+                "To outbound",
+                el(
+                    "input",
+                    type="text",
+                    name="to",
+                    maxlength="256",
+                    placeholder="OB_PARTNER_ADT",
+                    required=True,
+                ),
+            ),
+            el("button", "Resend to outbound", type="submit"),
+            # Keep this action QUERY-LESS, for the reason `uploaded_log_detail`'s resend form states.
+            method="get",
+            action=f"/ui/messages/{_seg(detail.id)}/resend-confirm",
+            class_="ctl",
+        ),
+    ]
+
+
+def message_detail(detail: MessageDetail, *, error: str = "") -> Markup:
     """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
-    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress."""
+    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress.
+
+    ``error`` is the refused-mutation banner — a resend that did NOT run. The route resolves it from
+    an allow-listed ``?e=<code>`` to fixed module text, so nothing caller-supplied is rendered here."""
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -405,10 +490,12 @@ def message_detail(detail: MessageDetail) -> Markup:
             ),
             rows_table(["Content type", "Size", ""], att_rows),
         ]
+    banner = [el("p", text(error), class_="banner")] if error else []
     return page(
         "Message",
         el("p", el("a", "← Messages", href="/ui/messages")),
         el("div", el("h1", "Message detail"), replay, edit, class_="detail-head"),
+        *banner,
         meta,
         el(
             "div",
@@ -420,8 +507,50 @@ def message_detail(detail: MessageDetail) -> Markup:
         *attachments_section,
         el("h2", "Deliveries"),
         outbox,
+        # After the deliveries table on purpose: the source picker's options ARE those rows, so the
+        # operator reads what they are choosing between immediately above the choice.
+        *_resend_section(detail),
         el("h2", "Events"),
         events,
+        active="messages",
+    )
+
+
+def message_resend_confirm(message_id: str, to: str, source: str, idempotency_key: str) -> Markup:
+    """The resend confirm step — the body-less half of the step-up gate, and where the ADR 0090 §3
+    tail-placement caution is stated.
+
+    THE POST THIS RENDERS CARRIES NOTHING IN ITS BODY: the whole selection lives in this page's own
+    URL. IT READS NO MESSAGE either — every value below arrives as an argument and is echoed back
+    through the escaping builders. Both properties are decided at the route, and
+    ``routes/core.ui_message_resend_confirm`` is where the reasoning for them lives; this builder
+    only has to not break them.
+
+    ``urlencode`` builds the POST target because these are QUERY values; ``_seg`` holds the path
+    segment, because the id reaching this page was never read back from a lookup."""
+    detail_url = f"/ui/messages/{_seg(message_id)}"
+    query = urlencode({"to": to, "source": source, "idempotency_key": idempotency_key})
+    return page(
+        "Resend message",
+        el("p", el("a", "← Message detail", href=detail_url)),
+        el("h1", "Resend this message?"),
+        el(
+            "p",
+            text(
+                f"This queues a new delivery of this message's stored body from “{source}” to the "
+                f"outbound connection “{to}”. The body is not re-transformed. The resend is audited."
+            ),
+            class_="muted",
+        ),
+        el("p", RESEND_TAIL_WARNING, class_="banner"),
+        el(
+            "form",
+            el("button", "Resend to outbound", type="submit"),
+            el("a", "Cancel", href=detail_url, class_="btn-link"),
+            method="post",
+            action=f"{detail_url}/resend?{query}",
+            class_="ctl",
+        ),
         active="messages",
     )
 

@@ -34,9 +34,10 @@ HTML, which is a question about the link, not about the route the browser then r
 separator again before matching. `_seg` genuinely holds `?` and `#`; the `/` limb is decided by the
 route table's shape. `test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer` pins the measurement.
 
-The console has SIX same-method route pairs where an absorbing sibling exists, pinned as a set by
-`test_the_console_absorb_a_segment_route_pairs_are_the_six_that_were_read`. Five carry an
-engine-minted id read back from a lookup, so nothing crafted reaches them. **One carries free text:**
+The console has several same-method route pairs where an absorbing sibling exists, pinned as a set by
+`test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read` -- read that test for what
+each one is. Most carry an engine-minted id read back from a lookup, so nothing crafted reaches them.
+**One carries free text:**
 `POST /ui/dead-letters/{channel_id}/replay` against
 `POST /ui/dead-letters/{channel_id}/{destination_name}/replay` -- the very pair the dead-letter test
 below was written to protect. Both carry the same permission and step-up gate, so this is a
@@ -295,16 +296,25 @@ def test_a_percent_encoded_slash_does_not_survive_to_the_routing_layer() -> None
     assert benign.json() == {"route": "channel", "channel_id": "IB_ACME_ADT"}
 
 
-def test_the_console_absorb_a_segment_route_pairs_are_the_six_that_were_read() -> None:
+def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() -> None:
     """GUARD THE FINDING ABOVE. The ``/`` limb is held by the ROUTE TABLE, so pin the route table.
 
     A pair is at risk when one template is another's with an extra segment spliced into a parameter
     position AND the methods match -- then a decoded ``/`` in that parameter lands on the sibling.
-    There are SIX, and they are NOT equally interesting, which is why this asserts the set and not a
-    count. Five carry a ``message_id`` or a ``file_id``: engine-minted, and read back from a lookup
-    that 404s on a miss, so no crafted value reaches them -- the same provenance argument the rest of
-    this file rests those sites on. **The dead-letter pair is the one where an UNCONSTRAINED value
-    meets an absorbing sibling**, because a connection name is free text.
+    They are NOT equally interesting, which is why this asserts the set and not a count. Most carry a
+    ``message_id`` or a ``file_id``: engine-minted, and read back from a lookup that 404s on a miss,
+    so no crafted value reaches them -- the same provenance argument the rest of this file rests
+    those sites on. **The dead-letter pair is the one where an UNCONSTRAINED value meets an absorbing
+    sibling**, because a connection name is free text.
+
+    THE RESEND-CONFIRM PAIR IS THE ONE EXCEPTION TO THE PROVENANCE ARGUMENT, and it is benign for a
+    different reason (ADR 0090, BACKLOG #1500). ``GET /ui/messages/{id}/resend-confirm`` deliberately
+    reads NO message, so its id is NOT read back from a lookup -- a crafted one does reach the render.
+    What makes it safe is that the page discloses nothing it was not handed: it echoes the operator's
+    own query back through the escaping builders and asserts nothing about whether the message exists.
+    The absorption itself is also not an escalation in either direction, because both routes run their
+    own gate: reaching the confirm page needs ``messages:resend``, reaching the detail page needs
+    ``messages:view_raw``, and neither is skipped by landing on the other.
 
     A new pair is not automatically a defect. It is a site somebody has to read, and nothing else in
     the tree would report it.
@@ -345,6 +355,7 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_six_that_were_read() -
         ("GET", "/ui/messages/{message_id}", "/ui/messages/search/layered"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/edit"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/parse-tree"),
+        ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/resend-confirm"),
         (
             "GET",
             "/ui/uploaded-logs/file/{file_id}",
