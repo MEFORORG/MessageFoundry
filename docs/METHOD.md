@@ -61,8 +61,9 @@ name pattern and prints `Roots examined: <n>` with a line per root, so enumerate
 each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
-Manager, Process Improvement and ASVS Tracker. **The Reviewer went on 2026-09-05**, with the
-`reviewed` label and `review-gate.yml`. **The CONSOLE went on 2026-09-10, and the Manager above
+Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**, with the
+`reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
+repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** If a document names one, that document is stale.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
@@ -73,7 +74,7 @@ does not. `docs/roles/seats.json` resolves every spelling of `console` to a noti
 
 Three rules went with those seats, and they are not repeated anywhere. Routing an owner question
 through the Liaison is retired. Getting owner approval before your own push is retired. Falling back
-to the Lander when no Reviewer is running is retired too.
+to the Lander for a second reading is retired too.
 
 **RETIRED 2026-09-05, and the retraction is kept because the wrong version was load-bearing.** This
 paragraph used to end "A `reviewed` label now gates the merge, and no seat can merge without it."
@@ -223,8 +224,8 @@ is yours.
 ### There is no reviewed label
 
 **RETIRED 2026-09-05.** This section used to give the protocol: `gh pr edit <N> --add-label reviewed`,
-stripped by a `synchronize` run so unread commits were unread again. The label, the workflow and the
-Reviewer seat are gone. Read a diff because it is worth reading; no machine records that you did.
+stripped by a `synchronize` run so unread commits were unread again. The label, the workflow and the seat that
+owned them are gone. Read a diff because it is worth reading; no machine records that you did.
 Labelling your own unread PR satisfies the machine and defeats the point.
 
 ### The merge queue re-checks everything
