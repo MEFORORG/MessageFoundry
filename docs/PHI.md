@@ -903,6 +903,9 @@ de-identification (§9). Beyond HL7-shaped spans, `redact()` now also applies a 
 heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are scrubbed even without HL7
 delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
 or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
+The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
+(BACKLOG #1572), so a feed declaring its own separators is covered; before that fix a custom-delimiter
+message matched nothing and a deploying site would have logged its identifiers in full.
 Reinforcing that convention, `messagefoundry check` ships an **advisory `raise-fstring` lint** that
 AST-scans the config-dir Router/Handler modules and flags a `raise` whose message is built from a
 variable — at least an f-string `raise ValueError(f"bad {x}")`, a `+` concatenation, a `%` format and
@@ -951,6 +954,11 @@ operational lines are untouched. This makes `safe_exc()` (above) the explicit ch
 filters the backstop for anything that reaches a handler un-redacted. `configure_logging` additionally
 **silences python-hl7's PHI-prone loggers** (they are named by `__file__`, so they are matched by the
 `hl7` package directory and pinned to `CRITICAL`).
+
+**A second residual, from the same honesty rule (BACKLOG #1572):** the delimiter sniff reads MSH-1 and
+MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `mrn
+MRN123$$$H$MR here` still survives. So does a message whose MSH-2 is shorter than its conformant width.
+Neither is a completeness claim; the convention above remains the control for both.
 
 **Residual, stated honestly:** `redact()` does **not** scrub a *single-token* identifier. An access line
 carrying `?content=1234567` or `?field_value=MRN12345` would survive the whole filter chain unredacted:
