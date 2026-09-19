@@ -65,6 +65,10 @@ The last is the adversarial ceiling, stated rather than hidden: log text is atta
 dotted-or-hyphenated run that names every family defeats every admission gate. It is not a NEW class of
 hazard -- :func:`messagefoundry.redaction.redact` costs **33 ms** on the same 6 KB line, before this
 module runs at all, and ``support/redact.py`` has the identical property on ``GET /logs/tail`` today.
+THE CEILING IS A ``_LABEL_PREFIX`` NUMBER AND IT IS THE WHOLE CEILING, which is a claim only since
+BACKLOG #1547: :data:`_DSN_PASSWORD`'s scheme class was unbounded over the same "." and "-", so the
+same run carrying a ``://`` cost 553 ms at 16 KB rather than 21 ms. That one is bounded now, and the
+reasoning and numbers live on the pattern rather than here.
 It was NOT bought down further: the obvious lever, a bounded lookahead requiring a separator near the
 label, would silently stop scrubbing a credential whose label is longer than the bound. Trading a
 silent security narrowing for time on a synthetic input, against a cost this module does not dominate,
@@ -315,7 +319,28 @@ _KEY_MATERIAL = re.compile(
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
 # survive so an operator can still tell which connection failed.
-_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+#
+# THE SCHEME REPETITION BOUND IS LOAD-BEARING, for the same reason :data:`_LABEL_PREFIX`'s is and on
+# the same input shape. Unbounded, ``[a-z0-9+.\-]*`` is QUADRATIC in line length: "." and "-" are both
+# in the class and neither suppresses ``\b``, so an N-segment dotted or hyphenated run offers O(N)
+# start positions and each one re-walks O(N) characters looking for a "://" it never reaches. Log text
+# is attacker-influenceable and this pass runs on EVERY record, so one long delimiter-free run would
+# hang a worker on first deployment. Measured on this interpreter, min of 5 passes over one
+# hyphen-and-dot run: unbounded 6.8 ms at 2 KB and 553 ms at 16 KB -- 81x the time for 8x the length,
+# which is the quadratic -- against 0.37 ms and 3.9 ms at ``{0,63}``, 10.7x for 8x, which is linear.
+#
+# WHAT THE BOUND COSTS, stated because it fails SILENTLY in one direction: a scheme run longer than 64
+# characters is not matched. That is STRICTLY SMALLER than the equivalent cost on ``_LABEL_PREFIX``,
+# because "." and "-" DO offer a later start position here -- measured, a 160-character dotted or
+# hyphenated scheme still redacts, from the last segment that fits the bound, so the operator loses
+# label text rather than the password. Only an UNBROKEN run of more than 64 scheme characters is lost,
+# and no scheme in the IANA URI registry is that long (the longest is 36 characters); the longest DSN
+# scheme in this tree is 18 (``postgresql+asyncpg``).
+#
+# The bound is pinned structurally, and the linear growth is pinned with a stopwatch against the
+# unbounded pattern as its control, in ``tests/test_log_redaction_secret_domain.py``. That file guards
+# BOTH copies of this vocabulary (BACKLOG #1547).
+_DSN_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,63}://[^\s:/@]+):[^\s/@]+@")
 
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:

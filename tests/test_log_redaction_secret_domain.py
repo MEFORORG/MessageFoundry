@@ -27,6 +27,18 @@ Two failures this file is built to make impossible, both measured at 4633a295:
    pattern is neither claimed by a family nor named in ``NOT_A_SECRET_PATTERN``. Adding a pattern to the
    module without a fixture reds this file; so does applying one and never declaring what it is for.
 
+3. **A COST domain narrower than the surface**, added at BACKLOG #1547 and the reason this file now
+   reads two modules rather than one. A credential pattern can be correct and still be a denial of
+   service: an unbounded repetition over a class holding "." or "-" is quadratic in line length, on
+   log text an attacker can influence. The guard against that read ONE named pattern, ``_LABEL_PREFIX``
+   -- and ``_DSN_PASSWORD`` shipped the identical defect beside it, in this module AND in the
+   write-time copy at ``messagefoundry/secretscrub.py``, for as long as the narrow guard existed. So
+   the cost guard now derives its subjects the way the coverage guard already did, over BOTH copies of
+   the vocabulary: ``test_every_applied_credential_pattern_scans_a_bounded_prefix`` for the structural
+   property and ``test_the_dsn_scan_grows_linearly_in_line_length`` for the growth a bound is bought
+   for. Only the COST guards read ``secretscrub``; the coverage and fixture guards above stay scoped to
+   ``support/redact``, which has its own suite in ``tests/test_logging_credential_scrub.py``.
+
 The sentinel values are invented HERE, never derived from the code under test. They are synthetic and
 carry no real credential, host or site.
 """
@@ -35,13 +47,22 @@ from __future__ import annotations
 
 import ast
 import inspect
+import math
 import pathlib
 import re
+import re._constants as sre_constants
+import re._parser as sre_parser
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from types import ModuleType
+from typing import Any
 
 import pytest
 from _ast_sites import named_func
 
+from messagefoundry import secretscrub as scrub_mod
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
 
@@ -384,16 +405,17 @@ EXCLUDED_FROM_REDACTION: dict[str, str] = {
 }
 
 
-def _applied_pattern_names() -> set[str]:
-    """Every module-level pattern name USED inside ``redact_log_line``, derived by AST.
+def _applied_pattern_names(module: ModuleType, applier: str) -> set[str]:
+    """Every module-level pattern name USED inside ``module.<applier>``, derived by AST.
 
     Reading the function body rather than the module namespace is what makes this a domain rather than
     a list: a pattern defined and never applied cannot silently count as coverage, and a pattern applied
-    without a fixture cannot hide."""
-    tree = ast.parse(inspect.getsource(redact_mod))
-    func = named_func(tree, "redact_log_line")
+    without a fixture cannot hide. Parameterised by module since BACKLOG #1547, because the cost guard
+    below has to read the write-time copy of this vocabulary as well as this one."""
+    tree = ast.parse(inspect.getsource(module))
+    func = named_func(tree, applier)
     module_patterns = {
-        name for name, value in vars(redact_mod).items() if isinstance(value, re.Pattern)
+        name for name, value in vars(module).items() if isinstance(value, re.Pattern)
     }
     return {
         node.id
@@ -404,7 +426,7 @@ def _applied_pattern_names() -> set[str]:
 
 def test_the_family_table_covers_every_applied_pattern() -> None:
     """Every pattern redact_log_line applies is claimed by a family or named as a non-secret."""
-    applied = _applied_pattern_names()
+    applied = _applied_pattern_names(redact_mod, "redact_log_line")
     # Positive control: the derivation must actually find patterns. A silently-empty domain would make
     # every assertion below vacuously true, which is the failure this whole file exists to prevent.
     assert len(applied) >= 5, f"AST derivation found only {sorted(applied)} -- instrument is broken"
@@ -526,8 +548,14 @@ def test_an_unclosed_brace_redacts_to_the_end_of_the_line() -> None:
 def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
     """THE READ-TIME COPY OF THE FRAGMENTS NEEDS ITS OWN BOUND GUARD, and this is it.
 
-    ``test_the_label_prefix_repetition_stays_bounded`` above pins ``_LABEL_PREFIX``'s ``{0,N}`` because
-    an unbounded version there is quadratic. The #1685 fragments reach the same property by the other
+    ``test_every_applied_credential_pattern_scans_a_bounded_prefix`` below pins ``_LABEL_PREFIX``'s
+    ``{0,N}``, and every other applied pattern's, because an unbounded repetition a fresh start
+    position can enter is quadratic. This sentence named that guard's narrow predecessor until
+    BACKLOG #1547 widened it from one pattern to the derived applied set.
+
+    THE FRAGMENTS BELOW ARE OUT OF THAT GUARD'S REACH, which is why this one is not redundant: they
+    are bare pattern-source strings rather than applied ``re.Pattern`` objects, so the derived set
+    never sees them. They reach the same property by the other
     route -- a DETERMINISTIC repetition made POSSESSIVE, which cannot re-walk at all -- so what has to
     be pinned is the ``*+``, not a bound. Without this, the read-time copy could be relaxed to a plain
     ``*`` with the whole suite green, and this is the copy that feeds the support archive and
@@ -596,27 +624,363 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
     )
 
 
-def test_the_label_prefix_repetition_stays_bounded() -> None:
-    """An UNBOUNDED label prefix is quadratic in line length, on attacker-influenceable log text.
+# --- the COST guards: one vocabulary, two copies, every applied pattern ---------------------------
+#
+# WHY A SECOND KIND OF GUARD AT ALL. Everything above asks whether a pattern REDACTS. These ask what it
+# COSTS to ask, which is a security property in its own right on a pass that runs over
+# attacker-influenceable log text. A pattern can be perfectly correct and still hand an unauthenticated
+# sender a way to hang a worker on first deployment.
 
-    ``_`` suppresses ``\\b``, but "." and "-" do not, so an N-segment dotted or hyphenated run gives the
-    regex N start positions and the group re-walks O(N) segments from each. Measured over 20 passes of
-    one ~6 KB run: 1.5 ms before the widening, **827 ms with ``*``**, 11 ms at ``{0,6}``. Base64url uses
-    "-", so a JWT echoed into a log line is exactly that shape, and both surfaces this module backstops
-    would carry the cost.
+#: The credential surfaces the cost guards read: a module, and the function that APPLIES its patterns.
+#: BOTH copies, because the defect BACKLOG #1547 fixed shipped in both and a guard reading one of them
+#: cannot see the other regress. The pattern set is derived from the applying function by AST, so
+#: neither module can grow a pattern these guards do not check.
+CREDENTIAL_SURFACES: tuple[tuple[ModuleType, str], ...] = (
+    (redact_mod, "redact_log_line"),
+    (scrub_mod, "_run"),
+)
 
-    Pinned structurally rather than by a stopwatch: a timing assertion on a shared CI runner flakes, and
-    the property that matters is that a bound EXISTS. The value is free to move.
+#: The pattern BACKLOG #1547 replaced, exactly as it shipped. It is the positive control for BOTH cost
+#: guards: an instrument that cannot see this one says nothing about the patterns it passes.
+_SHIPPED_BEFORE_DSN = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
+#: One WORD character, by the definition ``\b`` itself uses. The structural guard turns on whether a
+#: character class can end a word, so it asks ``re`` rather than hard-coding a set.
+_WORD_CHAR = re.compile(r"\w")
+
+#: Applied patterns whose scan prefix carries an unbounded repetition BY DESIGN, each with the reason
+#: it is not the shape the guard catches. Exact and asserted non-stale below, so an entry cannot outlive
+#: the pattern that needed it -- an exemption that has quietly become unnecessary is a false record.
+SCAN_UNBOUNDED_BY_DESIGN: dict[str, str] = {
+    "_LONG_B64": (
+        "the backstop sweep. Its run is >= 24 characters of [A-Za-z0-9+/] and a MATCH CONSUMES the "
+        "run, so re.sub resumes past it rather than re-entering it from each interior word boundary. "
+        "The failing case is a run SHORTER than 24, which is O(1) per start position. Measured over "
+        "four adversarial shapes -- a '+' run, a '/' run, three-letter words, and a long '+' tail that "
+        "forces the trailing word-boundary assertion to backtrack -- 6.9x to 8.7x the time for 8x the "
+        "length, which is linear. Bounding it would split one long run into several placeholders."
+    ),
+}
+
+
+def _class_reach(items: Any) -> tuple[bool, bool]:
+    """``(admits a word character, admits a non-word character)`` for one parsed character class.
+
+    Anything this cannot enumerate is reported as BOTH, which FLAGS the pattern rather than waving it
+    through. That is the only direction an instrument like this may fail in."""
+    if any(op == sre_constants.NEGATE for op, _arg in items):
+        return (True, True)  # the complement of a small set spans the boundary for every class here
+    word = nonword = False
+    for op, arg in items:
+        if op == sre_constants.LITERAL:
+            chars = chr(arg)
+        elif op == sre_constants.RANGE:
+            low, high = arg
+            if high - low > 256:
+                return (True, True)
+            chars = "".join(chr(point) for point in range(low, high + 1))
+        elif op == sre_constants.CATEGORY:
+            if arg in (sre_constants.CATEGORY_DIGIT, sre_constants.CATEGORY_WORD):
+                word = True
+                continue
+            if arg == sre_constants.CATEGORY_SPACE:
+                nonword = True
+                continue
+            return (True, True)
+        else:
+            return (True, True)
+        for char in chars:
+            if _WORD_CHAR.fullmatch(char):
+                word = True
+            else:
+                nonword = True
+    return (word, nonword)
+
+
+def _repeat_cannot_restart(body: Any, *, anchored: bool) -> bool:
+    """Whether an UNBOUNDED repetition over ``body`` is safe to leave in a scan prefix.
+
+    Safe means the engine cannot re-enter it from O(N) start positions. Two conditions, both needed.
+    The body must be a single character class that does NOT span a word boundary, so a run of it offers
+    no interior ``\\b`` to restart from -- ``[A-Za-z0-9]+`` and ``\\s*`` qualify, ``[a-z0-9+.\\-]*``
+    does not. And the pattern must be anchored at ``\\b`` or ``^``, because with no head anchor every
+    offset is a start position and even a word-only class is quadratic. A repetition over a GROUP is
+    never safe: that is the ``(?:[A-Za-z0-9]+[._-])*`` shape ``_LABEL_PREFIX``'s bound exists to stop.
     """
-    assert re.fullmatch(r"\(\?:\[A-Za-z0-9\]\+\[\._-\]\)\{0,\d+\}", redact_mod._LABEL_PREFIX), (
-        f"_LABEL_PREFIX is {redact_mod._LABEL_PREFIX!r} -- it must carry an explicit {{0,N}} bound. "
-        "With '*' or '+' the two credential patterns become quadratic in line length (827 ms on one "
-        "6 KB hyphen run, against 1.5 ms before the widening)."
+    items = list(body)
+    if len(items) != 1 or items[0][0] != sre_constants.IN:
+        return False
+    word, nonword = _class_reach(items[0][1])
+    return anchored and not (word and nonword)
+
+
+def _walk_scan_prefix(seq: Any, *, anchored: bool, seen: bool, found: list[str]) -> bool:
+    """Walk one parsed sequence in order, appending offenders to ``found``.
+
+    Returns whether the sequence REQUIRES a literal character. Once one is required, everything after
+    it has left the scan prefix: the engine can only reach it from a start position that already
+    matched that literal, so the O(N) multiplier is gone."""
+    for op, arg in seq:
+        if op == sre_constants.LITERAL:
+            seen = True
+        elif op in (
+            sre_constants.MAX_REPEAT,
+            sre_constants.MIN_REPEAT,
+            sre_constants.POSSESSIVE_REPEAT,
+        ):
+            low, high, body = arg
+            unbounded = high == sre_constants.MAXREPEAT
+            if not seen and unbounded and not _repeat_cannot_restart(body, anchored=anchored):
+                found.append(f"{{{low},}} over {list(body)}")
+            inner = _walk_scan_prefix(body, anchored=anchored, seen=seen, found=found)
+            seen = seen or (low >= 1 and inner)
+        elif op == sre_constants.SUBPATTERN:
+            seen = _walk_scan_prefix(arg[3], anchored=anchored, seen=seen, found=found)
+        elif op == sre_constants.ATOMIC_GROUP:
+            seen = _walk_scan_prefix(arg, anchored=anchored, seen=seen, found=found)
+        elif op == sre_constants.BRANCH:
+            # Every alternative, not the first that matches: a literal is REQUIRED only if all of them
+            # require one, and a branch nobody walked is a branch nobody checked.
+            required = [
+                _walk_scan_prefix(option, anchored=anchored, seen=seen, found=found)
+                for option in arg[1]
+            ]
+            seen = bool(required) and all(required)
+        elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
+            _walk_scan_prefix(arg[1], anchored=anchored, seen=seen, found=found)
+    return seen
+
+
+def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
+    """Every unbounded repetition in ``source``'s SCAN PREFIX -- the span a fresh start position can
+    enter before the pattern requires a literal character.
+
+    That span is where a quadratic lives. The engine tries it at every start position the text offers,
+    and an unbounded repetition over a class holding "." or "-" re-walks O(N) characters from each one.
+    AFTER a required literal there is no such multiplier, which is why ``_MFB64``'s ``[A-Za-z0-9+/=]+``
+    and every ``label=VALUE`` value class come back clean and need no excusing."""
+    parsed = sre_parser.parse(source)
+    head = parsed[0] if len(parsed) else (None, None)
+    anchored = head[0] == sre_constants.AT and head[1] in (
+        sre_constants.AT_BOUNDARY,
+        sre_constants.AT_BEGINNING,
+        sre_constants.AT_BEGINNING_STRING,
     )
-    # And the bound must still reach the labels it was added for -- a bound low enough to be safe and
-    # too low to be useful would pass the assertion above while silently reverting the fix.
+    found: list[str] = []
+    _walk_scan_prefix(parsed, anchored=anchored, seen=False, found=found)
+    return tuple(found)
+
+
+def test_every_applied_credential_pattern_scans_a_bounded_prefix() -> None:
+    """No applied pattern may leave an unbounded repetition where a fresh start position can enter it.
+
+    WIDENED FROM ONE NAMED PATTERN TO EVERY APPLIED ONE, IN BOTH COPIES (BACKLOG #1547). This guard
+    used to assert only that ``_LABEL_PREFIX`` carried a ``{0,N}``, and ``_DSN_PASSWORD`` sat two
+    definitions below it with ``[a-z0-9+.\\-]*`` -- the same class, the same missing bound, the same
+    quadratic -- in this module and in ``messagefoundry/secretscrub.py``, for the whole life of the
+    narrow guard. A guard over one named pattern cannot see the next one. A guard over the DERIVED
+    applied set can, and reds the day either module grows a pattern with that shape.
+
+    STRUCTURAL RATHER THAN A STOPWATCH, for the reason the narrow version already gave: a timing
+    assertion on a shared runner flakes, and the property that matters here is that a bound EXISTS.
+    The values are free to move. ``test_the_dsn_scan_grows_linearly_in_line_length`` is the separate
+    arm that measures the GROWTH a bound is bought for.
+    """
+    # POSITIVE CONTROL ON THE INSTRUMENT, one for each shape it has to catch: the scheme class this
+    # widening was written for, and the label prefix the narrow version guarded, shown unbounded. A
+    # checker that misses these proves nothing about the patterns it passes.
+    assert _unbounded_scan_repeats(_SHIPPED_BEFORE_DSN), "the checker cannot see the #1547 pattern"
+    assert _unbounded_scan_repeats(r"\b(?:[A-Za-z0-9]+[._-])*(?:password)\b['\"]?[:=]\S+"), (
+        "the checker cannot see an unbounded _LABEL_PREFIX, which the narrow guard could"
+    )
+    # NEGATIVE CONTROL: a checker that flags everything is not a checker.
+    assert not _unbounded_scan_repeats(r"(?i)\b([a-z][a-z0-9+.\-]{0,63}://[^\s:/@]+):[^\s/@]+@")
+
+    checked: list[str] = []
+    excused: set[str] = set()
+    for module, applier in CREDENTIAL_SURFACES:
+        applied = _applied_pattern_names(module, applier)
+        # Positive control on the derivation, per surface: a silently-empty set passes vacuously.
+        assert len(applied) >= 5, (
+            f"{module.__name__}.{applier}: AST derivation found only {sorted(applied)} -- the "
+            "instrument is broken, not the patterns"
+        )
+        for name in sorted(applied):
+            offenders = _unbounded_scan_repeats(getattr(module, name).pattern)
+            if name in SCAN_UNBOUNDED_BY_DESIGN:
+                if offenders:
+                    excused.add(name)
+                continue
+            assert not offenders, (
+                f"{module.__name__}.{name} leaves {offenders} unbounded in its scan prefix, which is "
+                "quadratic in line length on log text an attacker can influence. Bound the repetition, "
+                "or add the name to SCAN_UNBOUNDED_BY_DESIGN with the reason it cannot be re-entered."
+            )
+            checked.append(f"{module.__name__}.{name}")
+    assert len(checked) >= 10, f"only {checked} were checked -- both surfaces should be covered"
+
+    # The exemption table is exact AND non-stale, the two-sided shape this file uses everywhere: an
+    # entry excusing a pattern the checker no longer flags tells a reader about a hazard that is gone.
+    assert set(SCAN_UNBOUNDED_BY_DESIGN) == {"_LONG_B64"}
+    assert excused == set(SCAN_UNBOUNDED_BY_DESIGN), (
+        f"SCAN_UNBOUNDED_BY_DESIGN excuses {sorted(set(SCAN_UNBOUNDED_BY_DESIGN) - excused)}, which "
+        "the checker does not flag. Remove the entry rather than leaving a false record."
+    )
+
+
+def test_the_label_prefix_bound_still_reaches_the_labels_it_was_added_for() -> None:
+    """A bound low enough to be safe and too low to be useful passes the structural guard above while
+    silently reverting the widening it was added for.
+
+    This is the half of the old narrow guard the structural widening does NOT subsume, kept and
+    extended to both copies of the vocabulary."""
+    for module in (redact_mod, scrub_mod):
+        assert re.fullmatch(r"\(\?:\[A-Za-z0-9\]\+\[\._-\]\)\{0,\d+\}", module._LABEL_PREFIX), (
+            f"{module.__name__}._LABEL_PREFIX is {module._LABEL_PREFIX!r} -- it must carry an explicit "
+            "{0,N} bound. With '*' or '+' the credential patterns become quadratic in line length "
+            "(827 ms on one 6 KB hyphen run, against 1.5 ms before the widening)."
+        )
     for label in ("ad_bind_password", "tls_key_password", "client_secret", "bearer_token"):
         assert REDACTION_PLACEHOLDER in redact_log_line(f"{label}=pw-B0und_Chk-99")
+        assert CREDENTIAL_PLACEHOLDER in scrub_credentials(f"{label}=pw-B0und_Chk-99")
+
+
+#: DSN schemes that must still reach the password behind them. The long ones are the point: "." and "-"
+#: offer the regex a LATER start position, so a scheme longer than the bound still redacts from the
+#: last segment that fits -- the operator loses label text, never the credential.
+_DSN_SCHEMES_THAT_MUST_REDACT = (
+    "postgres",
+    "postgresql+asyncpg",
+    "mssql+pyodbc",
+    "mongodb+srv",
+    "sqlserver",
+    "POSTGRES",
+    "seg." * 40 + "postgres",
+    "seg-" * 40 + "postgres",
+)
+
+
+def test_the_dsn_scheme_bound_still_reaches_every_scheme_shape_that_matters() -> None:
+    """The scheme bound must not narrow what the scrubber catches.
+
+    ASSERT THE VALUE IS ABSENT, not merely that a placeholder appeared: a bound that clipped the match
+    could leave the password on the line beside a placeholder bought by another pattern."""
+    secret = "pw-D5n_Pass-55"
+    for scheme in _DSN_SCHEMES_THAT_MUST_REDACT:
+        line = f"store dsn {scheme}://svc:{secret}@db.invalid:5432/mefor"
+        for label, out in (
+            ("support.redact", redact_log_line(line)),
+            ("secretscrub", scrub_credentials(line)),
+        ):
+            assert secret not in out, (
+                f"{label}: {scheme[:20]}... leaked the password -- got {out!r}"
+            )
+
+    # THE RESIDUAL, pinned rather than left in a comment: an UNBROKEN scheme run longer than the bound
+    # is not reached, because nothing inside it ends a word and so offers no later start position. No
+    # scheme in the IANA URI registry is that long (the longest is 36 characters), which is why the
+    # bound was set where it was. A change that reaches this shape should DELETE this assertion.
+    unbroken = f"store dsn {'x' * 200}://svc:{secret}@db.invalid/mefor"
+    assert secret in redact_log_line(unbroken)
+    assert secret in scrub_credentials(unbroken)
+
+
+#: The length span the growth arm measures across, in characters. 8x rather than one doubling: linear
+#: predicts 8 and the pattern this replaced measured 65 to 81, so the wider span separates the two by
+#: more than the clock's noise can close, and both endpoints sit far above the timer's resolution.
+_GROWTH_LENGTHS = (2048, 16384)
+
+#: The growth allowed across that span. Measured on this interpreter: the bounded pattern 8.5x to
+#: 10.7x, the unbounded one it replaced 64.8x to 80.9x. 24 sits 2.2x above the slowest linear reading
+#: and 2.7x below the fastest quadratic one, so a loaded runner has to distort one endpoint more than
+#: twofold before this flakes, and a reverted bound cannot hide underneath it.
+_MAX_GROWTH = 24.0
+
+
+def _adversarial_run(length: int, *, marker: bool) -> str:
+    """A hyphen-and-dot run of ``length`` characters naming no credential word.
+
+    "." and "-" both END a word, so the run offers the regex O(N) word-boundary start positions -- the
+    shape an unbounded scheme class re-walks from every one of them. With ``marker`` the run ends in
+    the "://" a DSN needs and never in the "@" a DSN also needs, so the scan runs to the end of the
+    line and matches nothing, which is the worst case rather than a lucky one."""
+    body = ("a-b." * (length // 4 + 1))[:length]
+    return f"upstream error {body}{'://' if marker else '-nn-'}host"
+
+
+def _fastest(call: Callable[[str], object], text: str, rounds: int) -> float:
+    """The MINIMUM wall-clock time over ``rounds`` passes.
+
+    A minimum is the one statistic the load of a shared runner cannot inflate; a mean or a max reports
+    the box rather than the pattern."""
+    best = math.inf
+    for _ in range(rounds):
+        start = time.perf_counter()
+        call(text)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def _growth(call: Callable[[str], object], *, rounds: int = 5) -> float:
+    """Time at the long length over time at the short one, both on the adversarial run."""
+    small = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[0], marker=True), rounds)
+    large = _fastest(call, _adversarial_run(_GROWTH_LENGTHS[1], marker=True), rounds)
+    return large / small
+
+
+def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
+    """A bound is bought for a GROWTH property, and only a stopwatch can see that one.
+
+    The structural guard above proves a bound is written down. It cannot prove the bound is the one
+    that matters, and a bound in the wrong place would pass it while the scan stayed quadratic. This
+    arm measures what an unauthenticated sender would actually pay for: at 16 KB the shipped-before
+    pattern cost 553 ms against the bounded pattern's 3.9 ms, and every extra doubling widened that
+    gap fourfold, so one long delimiter-free run would have hung a worker on first deployment.
+
+    THE POSITIVE CONTROL IS THE SHIPPED-BEFORE PATTERN, MEASURED IN THIS RUN ON THIS BOX, and it is
+    the whole reason this test can fail. A timing assertion with no control passes on a fast machine
+    whatever the patterns do -- which is the "green a different pattern bought" failure of this file's
+    own docstring, one layer down and wearing a stopwatch.
+
+    THE NEGATIVE ARM IS THE NO-MARKER RUN, and it answers the other way this could go vacuously green:
+    an input that never reaches the pattern is linear for a reason that has nothing to do with the fix.
+    It works on ``scrub_credentials`` because that surface admission-gates the DSN pass on a literal
+    "://", so dropping the marker skips the pattern outright. It does NOT work on ``redact_log_line``,
+    whose copy is ungated and scans either way -- measured 429 ms with the marker against 516 ms
+    without it, at 16 KB, before the fix. Stated rather than quietly omitted, because a control that
+    cannot discriminate is worse than no control.
+    """
+    before = re.compile(_SHIPPED_BEFORE_DSN)
+    before_growth = _growth(lambda text: before.sub("x", text), rounds=2)
+    assert before_growth > _MAX_GROWTH, (
+        f"the shipped-before pattern grew only {before_growth:.1f}x across {_GROWTH_LENGTHS}, which "
+        f"is under the {_MAX_GROWTH}x threshold. This box or this input is not exercising the scan, so "
+        "the assertions below cannot fail and prove nothing -- fix the fixture, do not raise the bar."
+    )
+
+    subjects: tuple[tuple[str, Callable[[str], object]], ...] = (
+        ("support.redact._DSN_PASSWORD", lambda text: redact_mod._DSN_PASSWORD.sub("x", text)),
+        ("secretscrub._DSN_PASSWORD", lambda text: scrub_mod._DSN_PASSWORD.sub("x", text)),
+        ("secretscrub.scrub_credentials", scrub_credentials),
+        ("support.redact.redact_log_line", redact_log_line),
+    )
+    for label, call in subjects:
+        ratio = _growth(call)
+        assert ratio <= _MAX_GROWTH, (
+            f"{label} grew {ratio:.1f}x for 8x the line length, over the {_MAX_GROWTH}x threshold. "
+            f"Linear is {_GROWTH_LENGTHS[1] // _GROWTH_LENGTHS[0]}x and the unbounded pattern this "
+            f"replaced measured {before_growth:.0f}x in this same run. A repetition in a scan prefix "
+            "has lost its bound, or a new pattern brought a fresh one."
+        )
+
+    longest = _GROWTH_LENGTHS[1]
+    marked = _fastest(scrub_credentials, _adversarial_run(longest, marker=True), rounds=5)
+    unmarked = _fastest(scrub_credentials, _adversarial_run(longest, marker=False), rounds=5)
+    assert marked > unmarked * 10, (
+        f"the marked run cost {marked * 1000:.3f} ms and the unmarked one {unmarked * 1000:.3f} ms, "
+        "so the DSN pass is not what the growth measurement above is measuring. A linear reading off "
+        "an input the pattern never scans is not evidence about the pattern."
+    )
 
 
 #: Patterns whose case fold is scoped to an inline ``(?i:...)`` rather than set for the whole regex.
