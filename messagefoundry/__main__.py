@@ -278,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         help="promote the ADR 0144 handler-security lint to a blocking (required) check",
     )
     check.add_argument(
+        "--allow-empty-config",
+        action="store_true",
+        help="accept a config directory that declares no connections (BACKLOG #1648). Without it "
+        "the validate check fails on one, the way serve and reload refuse it. Scoped to `check` — "
+        "serve has no opt-out",
+    )
+    check.add_argument(
         "--handler-security-allow",
         action="append",
         default=None,
@@ -3541,7 +3548,10 @@ def _graph(args: argparse.Namespace) -> int:
         return resolved
     config_dir, _ = resolved
     try:
-        reg = load_config(config_dir)
+        # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
+        # come from Routers and Handlers, which a connection-less config still has. Refusing here
+        # would make the reporting surface go dark on the config an operator most wants to look at.
+        reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -4195,7 +4205,10 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         from messagefoundry.config.wiring import WiringError, load_config
 
         try:
-            reg = load_config(args.config)
+            # allow_empty: a read-only inventory (BACKLOG #1648). Refusing here would also drop the
+            # API / service-caller cert pairs resolved from settings just above, so an operator would
+            # lose unrelated expiry output because the graph happens to declare no connection.
+            reg = load_config(args.config, allow_empty=True)
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
         pairs.extend(
@@ -5352,6 +5365,7 @@ def _check(args: argparse.Namespace) -> int:
         # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
         # too, rather than from wherever the shell happens to be (BACKLOG #1062).
         project_root=args.project_root,
+        allow_empty_config=args.allow_empty_config,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -5447,7 +5461,12 @@ def _connection(args: argparse.Namespace) -> int:
     )
 
     def validate(config_dir: Path) -> None:
-        registry = load_config(config_dir)
+        # allow_empty: this is an AUTHORING surface, and removing the last connection is a legitimate
+        # editing step, not an invalid edit (BACKLOG #1648). Refusing here would leave an operator
+        # unable to clear connections.toml through the CLI/GUI at all — they would have to hand-edit
+        # the file the tool exists to own. The empty-graph refusal stays where the graph is RUN or
+        # GATED: load_config's default, the engine reload, and `messagefoundry check`.
+        registry = load_config(config_dir, allow_empty=True)
         build_check_registry(
             registry,
             inbound_bind_host=settings.inbound.bind_host,
@@ -5577,7 +5596,11 @@ def _impact(args: argparse.Namespace) -> int:
         return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
 
     try:
-        registry = load_config(args.config)
+        # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight
+        # `codeset_edit` runs (BACKLOG #1648), and reverse-dependency analysis over Routers,
+        # Handlers and code sets needs no connection. Exempting the pre-flight and refusing here
+        # would leave the two disagreeing about the same config.
+        registry = load_config(args.config, allow_empty=True)
     except (WiringError, FileNotFoundError, OSError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 
