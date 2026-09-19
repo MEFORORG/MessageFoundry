@@ -106,6 +106,31 @@ async def _upload(c: httpx.AsyncClient, name: str = "acme.hl7") -> str:
     return fid
 
 
+async def _upload_through_a_fresh_window(engine: Engine, tmp_path: Path, username: str) -> str:
+    """Upload BATCH as an EXISTING ``username`` through a sibling app whose step-up window is fresh.
+
+    BACKLOG #1739 gated ``POST /ui/uploaded-logs/upload`` behind ``require_ui_step_up``, so a client
+    built on a ``step_up_max_age=-1`` service can no longer stock its own fixture -- its upload 303s
+    to /ui/reauth. A test that needs a stored file AND a stale window therefore needs both windows.
+
+    A SECOND SERVICE, not a mutation of the first. ``has_recent_step_up`` reads
+    ``step_up_max_age_seconds`` off the settings object live, and ``AuthSettings`` is not frozen, so
+    flipping ``service._settings`` mid-test would also work and would be cheaper. It is deliberately
+    not done: that reaches into a private attribute to simulate a window expiring, where constructing
+    the service the shipped way states the same condition in public API. The file's existing
+    positive-control blocks already build a second service for the same reason.
+
+    The two share ``engine.store`` and ``tmp_path``, and ``username`` already exists in that store, so
+    the file this returns is owned by the SAME account the stale client signs in as (the owner axis
+    the uploads routes enforce, ASVS 8.2.2) -- a second session, not a second user.
+    """
+    service = await _service(engine)  # no users tuple: `username` is already in the shared store
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, username)
+        return await _upload(c)
+
+
 async def test_uploaded_logs_ui_flow(engine: Engine, tmp_path: Path) -> None:
     service = await _service(engine, ("op", Role.OPERATOR))
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
@@ -115,8 +140,9 @@ async def test_uploaded_logs_ui_flow(engine: Engine, tmp_path: Path) -> None:
         r = await c.get("/ui/uploaded-logs")
         assert r.status_code == 200 and "Uploaded logs" in r.text
 
-        # upload form + upload
-        assert (await c.get("/ui/uploaded-logs/upload")).status_code == 200
+        # upload form + upload. The form is its OWN path since BACKLOG #1739 -- it is the upload
+        # POST's unlock continuation, and an unlock action may not name a path that serves POST.
+        assert (await c.get("/ui/uploaded-logs/upload-form")).status_code == 200
         up = await c.post(
             "/ui/uploaded-logs/upload",
             files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
@@ -508,10 +534,10 @@ async def test_a_stale_window_strips_a_flag_aimed_at_the_detail_page(
     # step_up_max_age_seconds=-1 is the console suite's idiom for a window that is stale on arrival
     # (test_webui.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
     service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    fid = await _upload_through_a_fresh_window(engine, tmp_path, "op")
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
-        fid = await _upload(c)
 
         # The window really IS stale, and the OLD target really does lose the flag. The detail page
         # bounces to /ui/reauth and the query string does not survive — which is why a refusal aimed
@@ -848,16 +874,10 @@ async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: 
     await engine.start()
 
     service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    fid = await _upload_through_a_fresh_window(engine, tmp_path, "op")
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
-        await c.post(
-            "/ui/uploaded-logs/upload",
-            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
-        )
-        listing = await c.get("/ui/uploaded-logs")
-        marker = "/ui/uploaded-logs/file/"
-        fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
 
         # PREMISE, asserted rather than assumed: the window really IS stale in THIS session. The
         # browse GET is a route already known to be step-up-gated, so if it does not bounce, the
@@ -891,12 +911,7 @@ async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: 
     transport2 = httpx.ASGITransport(app=_app(engine, fresh, tmp_path))
     async with httpx.AsyncClient(transport=transport2, base_url="http://t") as c2:
         await _login(c2, "fresh")
-        await c2.post(
-            "/ui/uploaded-logs/upload",
-            files={"file": ("fresh.hl7", BATCH, "application/octet-stream")},
-        )
-        listing2 = await c2.get("/ui/uploaded-logs")
-        own = listing2.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        own = await _upload(c2, "fresh.hl7")
         allowed = await c2.post(
             f"/ui/uploaded-logs/file/{own}/resend?index=0&to=in1", follow_redirects=False
         )
@@ -904,6 +919,73 @@ async def test_a_stale_step_up_window_injects_nothing(engine: Engine, tmp_path: 
         assert allowed.headers["location"] == f"/ui/uploaded-logs/file/{own}"
         assert await engine.store.count_messages(channel_id="in1") == 1
         assert len(await engine.store.list_audit(action="upload.resend", limit=200)) == 1
+
+
+async def test_a_stale_step_up_window_uploads_nothing(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #1739 -- the console upload POST must be refused when the step-up window is stale.
+
+    THE SHAPE OF THE PROOF IS ``test_a_stale_step_up_window_injects_nothing``'s, for the same reason:
+    the console calls ``core.upload_file`` BY REFERENCE across the CoreHandlers seam, so the engine
+    handler's own ``require_step_up`` Depends never runs and the gate has to be re-asserted on the
+    /ui route. A test that only checks a FRESH operator can upload passes on the defective code, so
+    the assertion that carries the item is that NOTHING WAS WRITTEN -- read back from the store, not
+    inferred from the redirect. The 303 says where the browser was sent; only the listing and the
+    audit say the file never landed.
+
+    The listing GET is deliberately the instrument for "never landed": it is plain ``require_ui``
+    (no step-up), so the SAME stale session can read its OWN uploads back. A zero there is the
+    product's own owner-scoped answer, not a filesystem guess about where the bytes would have gone.
+    """
+    service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+
+        # PREMISE, asserted rather than assumed: the window really IS stale in THIS session, and the
+        # unlock FORM is itself gated. Without this the zeros below could be measuring a dead fixture.
+        form = await c.get("/ui/uploaded-logs/upload-form", follow_redirects=False)
+        assert form.status_code == 303, form.text
+        assert form.headers["location"] == "/ui/reauth?next=/ui/uploaded-logs/upload-form"
+
+        blocked = await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+            follow_redirects=False,
+        )
+        assert blocked.status_code == 303, blocked.text
+        # The continuation is the FORM page, never this POST path and never the bare listing (which
+        # is the SUCCESS shape -- answering a refusal with it would tell the operator their file was
+        # stored when it was not). Exact equality, so both wrong destinations fail here.
+        assert blocked.headers["location"] == "/ui/reauth?next=/ui/uploaded-logs/upload-form", (
+            blocked.headers["location"]
+        )
+
+        # THE ASSERTION THE ITEM ACTUALLY ASKS FOR: the two direct products of the handler this route
+        # reaches -- the stored file and its audit row -- are both absent, so the refusal happened
+        # BEFORE the write rather than after it.
+        listing = await c.get("/ui/uploaded-logs")
+        assert listing.status_code == 200, listing.text
+        assert "acme.hl7" not in listing.text
+        assert "/ui/uploaded-logs/file/" not in listing.text
+        assert list(await engine.store.list_audit(action="upload.create", limit=200)) == []
+
+    # POSITIVE CONTROL, same store, same POST, same file -- a FRESH window. Without it the zeros
+    # above are indistinguishable from instruments that cannot see an upload at all.
+    fresh = await _service(engine, ("fresh", Role.OPERATOR))
+    transport2 = httpx.ASGITransport(app=_app(engine, fresh, tmp_path))
+    async with httpx.AsyncClient(transport=transport2, base_url="http://t") as c2:
+        await _login(c2, "fresh")
+        allowed = await c2.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+            follow_redirects=False,
+        )
+        assert allowed.status_code == 303, allowed.text
+        assert allowed.headers["location"] == "/ui/uploaded-logs"
+        listing2 = await c2.get("/ui/uploaded-logs")
+        assert "acme.hl7" in listing2.text
+        assert "/ui/uploaded-logs/file/" in listing2.text
+        assert len(await engine.store.list_audit(action="upload.create", limit=200)) == 1
 
 
 async def test_resend_confirm_does_not_reflect_hostile_markup(

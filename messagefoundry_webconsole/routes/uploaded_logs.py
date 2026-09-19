@@ -6,10 +6,22 @@ Upload / list / browse / resend / delete over the engine's uploaded-logs CoreHan
 console never touches the filesystem or the store directly — it calls the audited JSON handlers by
 reference and re-asserts the equivalent permission/step-up via ``require_ui*``. The browse GET (which
 decrypts PHI) is step-up-gated + registered as an UNLOCK action (like content search); delete is a
-step-up, body-less, auto-retryable POST behind a confirm step; upload is a same-origin multipart POST
-(no step-up — a body-carrying POST can't survive the re-auth redirect, and browsing PHI is the gated
-surface). Resend is a step-up POST behind a body-less confirm step, its message index and target inbound
-carried in the query so the confirm URL is a valid re-auth continuation (BACKLOG #1227).
+step-up, body-less, auto-retryable POST behind a confirm step; upload is a step-up'd same-origin
+multipart POST whose re-auth continuation is the UNLOCK form page at ``/ui/uploaded-logs/upload-form``
+(BACKLOG #1739). Resend is a step-up POST behind a body-less confirm step, its message index and target
+inbound carried in the query so the confirm URL is a valid re-auth continuation (BACKLOG #1227).
+
+THE UPLOAD SENTENCE USED TO ARGUE THE OPPOSITE CONCLUSION, and it is quoted and answered here rather
+than simply deleted, because it is the argument anyone re-opening this question will reach for again.
+It read: upload takes "no step-up — a body-carrying POST can't survive the re-auth redirect, and
+browsing PHI is the gated surface". The first premise is TRUE and the conclusion does not follow from
+it, which is why a deletion would leave the next reader to re-derive it. Losing the body across
+the redirect is the DESIGNED behaviour of the L0c unlock primitive, not a defect it must route around:
+``POST /ui/users`` loses a typed PASSWORD exactly this way and is step-up-gated regardless — the
+operator lands back on ``/ui/users/new`` inside a fresh window and retypes it. Here they re-pick the
+file. The second premise is wrong on its own terms: upload WRITES PHI at rest, so gating the read
+surface does not cover it. Its JSON twin ``POST /uploads`` has been ``require_step_up`` throughout,
+and that is the parity this closes.
 """
 
 from __future__ import annotations
@@ -38,9 +50,10 @@ from ._common import _form_pairs
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
 # /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
 # body of .../filter (BACKLOG #1184) and so cannot cross the redirect at all. The delete POST is
-# body-less + step-up, so it may be auto-retried after re-auth. Upload/filter are same-origin POSTs
-# (not registered); the resend POST is not registered either — its ``reauth_next`` maps it to the
-# confirm page below, the same shape the /filter POST and messages' edit-resend use.
+# body-less + step-up, so it may be auto-retried after re-auth. The filter POST is a same-origin POST
+# and is not registered; the upload and resend POSTs are not registered either — each is body-carrying,
+# so each maps its ``reauth_next`` to a GET page that IS registered (the upload form below, the resend
+# confirm page below), the same shape messages' edit-resend uses.
 register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
 )
@@ -60,6 +73,24 @@ register_ui_action(
     Permission.FILES_BROWSE,
     auto_retry=False,
     unlock=True,
+)
+# The upload FORM page (BACKLOG #1739), the unlock continuation for the body-carrying upload POST.
+#
+# WHY THE FORM SITS ON ITS OWN PATH RATHER THAN ON THE POST'S. It was the GET half of
+# ``/ui/uploaded-logs/upload``, and registering that path here reds
+# ``test_write_action_method_matches_its_continuation`` — an unlock entry is 303-GET-redirected to,
+# so one that also served POST would be an open-POST gadget. Something had to move.
+#
+# THIS SPLITS THE OPPOSITE WAY FROM ``routes/search.py``, WHICH IS THE ONLY OTHER SPLIT OF AN
+# EXISTING PAIR, so the divergence is deliberate rather than an oversight. There the form KEPT
+# ``/ui/messages/search`` and the POST took the new ``/ui/messages/search/run``. Here the POST is the
+# half that is pinned from outside this package: ``api/app.py``'s ``_UPLOAD_BODY_PATHS`` matches
+# ``request.url.path`` against an EXACT frozenset to lift the 1 MiB request-body cap, so moving the
+# POST means an engine-package edit to keep large uploads working. (The two doc-drift tests that name
+# this path — ASVS file-surface and threat-model — are substring checks and would have tolerated
+# either spelling; the frozenset is the only hard pin, and it is the whole of the reason.)
+register_ui_action(
+    r"^/ui/uploaded-logs/upload-form$", Permission.FILES_UPLOAD, auto_retry=False, unlock=True
 )
 
 _log = logging.getLogger(__name__)
@@ -200,21 +231,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # unrecognized value yields no banner rather than reflected text.
         return HTMLResponse(pages.uploaded_logs(data, error=_LIST_NOTICES.get(e or "", "")))
 
-    @app.get("/ui/uploaded-logs/upload", response_class=HTMLResponse)
+    @app.get("/ui/uploaded-logs/upload-form", response_class=HTMLResponse)
     async def ui_uploaded_logs_upload_form(
-        request: Request,
-        _identity: Identity = Depends(require_ui(Permission.FILES_UPLOAD)),
+        _identity: Identity = Depends(require_ui_step_up(Permission.FILES_UPLOAD)),
     ) -> HTMLResponse:
+        # Renders an empty file input and no stored state, which is what makes it a safe unlock
+        # continuation for the POST below: nothing of the operator's crosses the redirect.
         return HTMLResponse(pages.uploaded_logs_upload())
 
     @app.post("/ui/uploaded-logs/upload")
     async def ui_uploaded_logs_upload(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.FILES_UPLOAD)),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.FILES_UPLOAD,
+                reauth_next=lambda _r: "/ui/uploaded-logs/upload-form",
+            )
+        ),
     ) -> Response:
-        # Same-origin CSRF defense-in-depth on top of the SameSite cookie. No step-up: a multipart body
-        # POST can't survive the re-auth redirect (browsing the PHI is the step-up-gated surface).
+        # Same-origin CSRF defense-in-depth on top of the SameSite cookie, plus the step-up its JSON
+        # twin POST /uploads carries (BACKLOG #1739; the body-loss rationale is in the module
+        # docstring). ``require_ui_step_up``, NOT the per-action variant: POST /uploads is plain
+        # ``require_step_up``, so the shared session window is the parity, and binding a single-use
+        # grant here would make the console the STRICTER door for a reason nothing states.
         assert_same_origin(request)
         try:
             await core.upload_file(request, engine=engine, identity=identity)

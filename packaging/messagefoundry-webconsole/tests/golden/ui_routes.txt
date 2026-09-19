@@ -40,7 +40,7 @@ GET /ui/uploaded-logs
 GET /ui/uploaded-logs/file/{file_id}
 GET /ui/uploaded-logs/file/{file_id}/delete-confirm
 GET /ui/uploaded-logs/file/{file_id}/resend-confirm
-GET /ui/uploaded-logs/upload
+GET /ui/uploaded-logs/upload-form
 GET /ui/users
 GET /ui/users/new
 GET /ui/users/{user_id}

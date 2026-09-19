@@ -693,8 +693,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
-| `GET` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
+| `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
 | `POST` | `/ui/users` | `users:manage` | `require_ui_step_up` |
 | `GET` | `/ui/users/new` | `users:manage` | `require_ui_step_up` |
@@ -749,20 +749,29 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **One console route loses a step-up its JSON counterpart has**: `POST /ui/uploaded-logs/upload`
-   is plain `require_ui`, while `POST /uploads` is `require_step_up` — a multipart body cannot
-   survive the re-auth redirect. So a PHI-at-rest write is gated on `files:upload` alone on this
-   plane. **The resend half of this divergence is CLOSED (BACKLOG #1227):**
-   `POST /ui/uploaded-logs/file/{file_id}/resend` is now `require_ui_step_up`, reached through a
-   body-less confirm step that carries its two parameters in the query, so it survives the re-auth
-   redirect the way `delete` does. The premise that used to stand in for the gate — that the POST
-   arrives from an already-stepped-up browse page — was never enforced by anything.
-   That step introduces one *new*, narrower divergence, disclosed here rather than left to be
-   discovered: `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
+3. **One uploaded-logs GET is weaker than its JSON equivalent, and cannot be otherwise.**
+   `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
    permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
    the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
    indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
-   and a connection name, all three of which the operator supplied on the previous screen.
+   and a connection name, all three of which the operator supplied on the previous screen. The same
+   shape now applies to `GET /ui/uploaded-logs/upload-form`, which *is* step-up-gated — a form page
+   may be gated when re-auth can legitimately hand control back to it, and this one can because it
+   renders nothing the operator has not just supplied.
+
+   **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
+   that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`
+   became `require_ui_step_up` in BACKLOG #1227, reached through a body-less confirm step carrying its
+   two parameters in the query. `POST /ui/uploaded-logs/upload` became `require_ui_step_up` in BACKLOG
+   #1739, matching `POST /uploads`, so a PHI-at-rest write is no longer gated on `files:upload` alone
+   on this plane; its re-auth continuation is the unlock form at `GET /ui/uploaded-logs/upload-form`,
+   and the multipart body is **lost** across that redirect so the operator re-picks the file — the
+   same behaviour `POST /ui/users` has with a typed password. **That body loss was the stated reason
+   the route carried no step-up, and it was never a reason:** it is the designed behaviour of the
+   unlock primitive, and the claim beside it — that browsing PHI is the gated surface — did not cover
+   an upload, which *writes* PHI at rest. The form sits on its own path because an unlock action may
+   not name a path that also serves `POST`; a GET-redirect into a state-changing POST is an open-POST
+   gadget.
 4. **The ADR 0092 PHI-read hop refusal applies on the `/ui` browse routes, and it refuses LATER than
    its JSON twin (BACKLOG #1738).** `require_ui` calls `enforce_phi_read_hop` on its `phi=True` arm,
    so every console gate that sets `phi=True` takes it: `require_ui(..., phi=True)` directly, and

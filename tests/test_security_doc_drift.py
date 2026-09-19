@@ -128,7 +128,9 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        ("POST", "/ui/uploaded-logs/upload"),
+        # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload"): it now carries
+        # `require_ui_step_up`, so the derivation below no longer flags it. See docs/SECURITY.md
+        # item 3 of the behavioural-differences block.
     }
 )
 

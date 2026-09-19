@@ -45,6 +45,19 @@ this line.**
   defaults its DTOs carry (BACKLOG #279).
 
 ### Security
+- **The console upload POST now carries the step-up its JSON twin has** (BACKLOG #1739).
+  `POST /ui/uploaded-logs/upload` was plain `require_ui(files:upload)` while `POST /uploads` is
+  `require_step_up`, so on a deployed instance a stolen cookie session past its step-up window could
+  write PHI at rest through the console that the JSON API would have refused. It is now
+  `require_ui_step_up(files:upload)` -- the shared session window, matching the twin, not a
+  per-action grant. **Operator-visible change:** the upload **form** moved from
+  `GET /ui/uploaded-logs/upload` to `GET /ui/uploaded-logs/upload-form` and is step-up-gated and
+  registered as the POST's unlock continuation; the POST keeps its path. A stale window now answers
+  the upload with `303` to `/ui/reauth`, and after re-authentication the operator lands back on the
+  empty form and **re-picks the file** -- the multipart body does not survive the redirect, exactly
+  as a typed password does not on `POST /ui/users`. The link on the uploaded-logs list page points
+  at the new form path. **No engine UI seam change:** the route reuses `core.upload_file` and the
+  existing `require_ui_step_up` gate.
 - **The `/ui` PHI routes now take the ADR 0092 serve-hop refusal** (BACKLOG #1738).
   `enforce_phi_read_hop` is folded into the JSON plane's `require_phi_read`, but the console reaches
   `get_message` / `list_messages` / `list_dead_letters` / `download_attachment` **in-process**, which
