@@ -11,9 +11,11 @@ each measured 2026-09-06 and each guarded below:
 
   1. ROSTER. korus and this table have never matched, and neither leads the other. The MANAGER
      joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
-     SPECIAL seat joined on 2026-09-16, taking the table to six. The `elsewhere` bucket emptied
-     the same day by owner instruction, so the tests below guard its MECHANISM rather than an
-     occupant.
+     SPECIAL seat joined on 2026-09-16, taking the table to six. On 2026-09-19 the owner retired
+     the REGULATOR and added the WATCHDOG, which holds the table at six and is NOT its successor:
+     it measures whether reds are cleared and never says whose one is. The `elsewhere` bucket
+     emptied on 2026-09-16 by owner instruction, so the tests below guard its MECHANISM rather
+     than an occupant.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -43,8 +45,9 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. SIX seats since 2026-09-16, when the owner added SPECIAL.
-EXPECTED_SEATS = frozenset({"manager", "builder", "regulator", "steward", "lander", "special"})
+#: Section 5's table governs. SIX seats: SPECIAL joined 2026-09-16, and on 2026-09-19 the owner
+#: retired the REGULATOR and added the WATCHDOG, which is not its successor.
+EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "steward", "lander", "special"})
 
 #: Seats live in korus and absent here. They must resolve to a card-less explanation, never to
 #: silence. EMPTY SINCE 2026-09-16 by owner instruction, and empty is the correct state -- so any
