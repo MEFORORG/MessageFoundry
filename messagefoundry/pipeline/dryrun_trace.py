@@ -82,6 +82,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.redaction import safe_error
 
 __all__ = ["trace_dry_run"]
 
@@ -471,7 +472,10 @@ def trace_dry_run(
         # live-debug question. Handler names carry no PHI, so this is not show_phi-gated.
         "accepts_declined": tracer.accepts_declined,
         "sends": [{"outbound": d.to} for d in result.deliveries],
-        "error": result.error,
+        # The error carries the Router/Handler's own `raise`, which can quote field values, so it takes
+        # the same show_phi gate as every captured local (BACKLOG #1668). `safe_error` rather than the
+        # blanket "REDACTED" `_safe_value` applies: a traced run is read FOR that prose.
+        "error": safe_error(result.error, show_phi=show_phi),
         # trace_ok verifies the tracer actually observed lines on the calling thread (thread-locality).
         "trace_ok": any(rec.events for rec in tracer.invocations),
         "invocations": [rec.to_dict(disposition) for rec in tracer.invocations],

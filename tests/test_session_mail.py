@@ -45,6 +45,8 @@ from typing import Any
 
 import pytest
 
+from tests._spawn_lock import spawn_burst
+
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
 HOOKS = ROOT / "scripts" / "hooks"
@@ -653,7 +655,12 @@ def _race(tmp_path: Path, mode: str, rounds: int) -> tuple[list[dict[str, Any]],
             capture_output=True, text=True, timeout=240, check=False,
         )  # fmt: skip
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=RACERS) as ex:
+    # RACERS stays 16 -- see tests/_spawn_lock.py for why cutting it is the wrong fix. The burst lock
+    # keeps single-launch tests off these vCPUs while the storm runs, without changing what runs here.
+    with (
+        spawn_burst(f"session_mail._race {mode} x{RACERS}"),
+        concurrent.futures.ThreadPoolExecutor(max_workers=RACERS) as ex,
+    ):
         procs = [f.result() for f in [ex.submit(one, i) for i in range(1, RACERS + 1)]]
     rows: list[dict[str, Any]] = []
     for p in procs:
@@ -948,7 +955,10 @@ def test_concurrent_drains_deliver_one_message_once(repo: Path, tmp_path: Path) 
     def one(_: int) -> subprocess.CompletedProcess[str]:
         return run_drain(repo)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DRAINS) as ex:
+    with (
+        spawn_burst(f"session_mail.concurrent_drains x{DRAINS}"),
+        concurrent.futures.ThreadPoolExecutor(max_workers=DRAINS) as ex,
+    ):
         procs = [f.result() for f in [ex.submit(one, i) for i in range(DRAINS)]]
 
     texts = [injection(p) for p in procs]

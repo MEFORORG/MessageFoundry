@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from _ast_sites import find_funcs, named_func
+
 _RUNNER = Path(__file__).resolve().parents[1] / "messagefoundry" / "pipeline" / "wiring_runner.py"
 
 #: Function bodies that run OFF the event loop, in a ThreadPoolExecutor.
@@ -30,17 +32,10 @@ _OFF_LOOP_FUNCTIONS = ("_run_fused_route", "_run_fused_transform")
 _FORBIDDEN_NAMES = ("_reply_rendezvous", "ReplyRendezvous", "reply_rendezvous")
 
 
-def _function_source(tree: ast.Module, name: str) -> ast.AST | None:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
-            return node
-    return None
-
-
 def test_the_off_loop_functions_exist() -> None:
     """Liveness receipt: a rename would otherwise turn this module into green over nothing."""
     tree = ast.parse(_RUNNER.read_text(encoding="utf-8"))
-    missing = [name for name in _OFF_LOOP_FUNCTIONS if _function_source(tree, name) is None]
+    missing = [name for name in _OFF_LOOP_FUNCTIONS if not find_funcs(tree, name)]
     assert not missing, (
         f"{missing} no longer exist in wiring_runner.py. If the fused route/transform bodies were "
         "renamed or removed, update _OFF_LOOP_FUNCTIONS — do not delete this guard, the thread-safety "
@@ -54,19 +49,17 @@ def test_no_rendezvous_reference_in_an_off_loop_function() -> None:
 
     violations: list[str] = []
     for func_name in _OFF_LOOP_FUNCTIONS:
-        func = _function_source(tree, func_name)
-        if func is None:
-            continue
-        for node in ast.walk(func):
-            name = (
-                node.attr
-                if isinstance(node, ast.Attribute)
-                else node.id
-                if isinstance(node, ast.Name)
-                else None
-            )
-            if name in _FORBIDDEN_NAMES:
-                violations.append(f"{func_name} references {name!r} at line {node.lineno}")
+        for func in find_funcs(tree, func_name):
+            for node in ast.walk(func):
+                name = (
+                    node.attr
+                    if isinstance(node, ast.Attribute)
+                    else node.id
+                    if isinstance(node, ast.Name)
+                    else None
+                )
+                if name in _FORBIDDEN_NAMES:
+                    violations.append(f"{func_name} references {name!r} at line {node.lineno}")
 
     assert not violations, (
         "the reply rendezvous is reachable from a function that runs OFF the event loop: "
@@ -83,8 +76,7 @@ def test_the_guard_catches_a_planted_violation() -> None:
         "    self._reply_rendezvous.signal(item.message_id, item.destination_name)\n"
         "    return None\n"
     )
-    func = _function_source(planted, "_run_fused_route")
-    assert func is not None
+    func = named_func(planted, "_run_fused_route")
     found = [
         n.attr
         for n in ast.walk(func)
