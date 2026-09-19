@@ -624,6 +624,9 @@ class AuthService:
                 settings.oidc_tls_ca_cert_file,
                 pin=settings.oidc_tls_ca_cert_pin,
                 enforcing=self._trust_anchors_enforcing,
+                # BACKLOG #299: revocation checking against the IdP certificate. This hop resolves no
+                # trust anchor, so it carries its own CRL setting rather than inheriting [tls].crl_file.
+                crl_file=settings.oidc_tls_crl_file,
             )
             self._oidc_jwks = oidc.JwksCache(
                 jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),

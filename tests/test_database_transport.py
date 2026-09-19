@@ -33,6 +33,7 @@ from messagefoundry.transports.database import (
     _build_dsn,
     _build_odbc_dsn,
     _classify_db_error,
+    _driver_code,
     _is_transient,
     _parse_named_params,
     _sqlstate,
@@ -87,6 +88,77 @@ def test_classify_db_error() -> None:
     assert type(_classify_db_error("08S01", "x")) is DeliveryError  # transient → retry
     permanent = _classify_db_error("23000", "constraint")
     assert isinstance(permanent, NegativeAckError) and permanent.permanent is True
+
+
+# The two driver texts BACKLOG #1661 measured, with a synthetic identifier standing in for the
+# offending column value. 424242 is six digits on purpose: that is the longest a native error code
+# can be, so an extractor that is not anchored on the driver's own `(SQLFunctionName)` suffix would
+# lift it and report it as the error number.
+_SYNTHETIC_ID = "424242"
+_SQLSERVER_DUP = (
+    "[23000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Violation of PRIMARY KEY "
+    "constraint 'PK_obs'. Cannot insert duplicate key in object 'dbo.obs'. The duplicate key "
+    f"value is ({_SYNTHETIC_ID}). (2627) (SQLExecDirectW)"
+)
+_POSTGRES_DUP = (
+    '[23505] ERROR: duplicate key value violates unique constraint "ix_obs_mrn";\n'
+    f"Error while executing the query: Key (mrn)=({_SYNTHETIC_ID}) already exists. (7) "
+    "(SQLExecDirectW)"
+)
+
+
+def _driver_exc(sqlstate: str, message: str) -> Exception:
+    """A pyodbc-shaped error: ``args == (sqlstate, message)``, so ``str(exc)`` is the tuple repr the
+    connector's call sites actually hand to :func:`_classify_db_error`."""
+    return Exception(sqlstate, message)
+
+
+@pytest.mark.parametrize(
+    ("state", "message"), [("23000", _SQLSERVER_DUP), ("23505", _POSTGRES_DUP)]
+)
+def test_classify_db_error_never_carries_the_driver_message(state: str, message: str) -> None:
+    """BACKLOG #1661: the driver's text, and the value it embeds, stay out of the delivery error.
+
+    Both shapes here keep their identifier through ``safe_exc`` — it is neither HL7-delimited nor
+    name-shaped, and it sits well inside the 200-character truncation — so redaction downstream is
+    not a control for this. The only control is not interpolating the message in the first place.
+
+    Red mutation: restore the ``: {message}`` suffix on either branch. Both arms red.
+    """
+    err = _classify_db_error(state, str(_driver_exc(state, message)))
+    assert _SYNTHETIC_ID not in str(err)
+    assert "duplicate key" not in str(err).lower()
+    assert "Key (mrn)" not in str(err)
+
+
+def test_classify_db_error_keeps_the_sqlstate_and_the_driver_error_number() -> None:
+    """The extraction the row asks for: enough to tell 2627 from 2601 under one generic SQLSTATE.
+
+    Red mutation: drop ``_driver_code`` from the detail — the second assertion reds while the
+    PHI-freedom tests above stay green, so the two properties are pinned independently.
+    """
+    permanent = _classify_db_error("23000", str(_driver_exc("23000", _SQLSERVER_DUP)))
+    assert "[23000]" in str(permanent)
+    assert "driver error 2627" in str(permanent)
+    link_down = str(_driver_exc("08S01", "[08S01] link failure (10054) (SQLDriverConnect)"))
+    transient = _classify_db_error("08S01", link_down)
+    assert isinstance(transient, DeliveryError) and "driver error 10054" in str(transient)
+
+
+def test_driver_code_will_not_lift_a_parenthesised_column_value() -> None:
+    """The anchor, not the digit bound, is what makes the extraction safe.
+
+    ``The duplicate key value is (424242).`` is indistinguishable from a native error code by shape
+    alone; only the driver's trailing ``(SQLFunctionName)`` separates them, and the driver always
+    writes its own suffix last.
+
+    Red mutation: relax ``_DRIVER_CODE_RE`` to a bare ``\\((\\d+)\\)`` — the first assertion reds
+    with the synthetic identifier reported as the error number.
+    """
+    assert _driver_code(_SQLSERVER_DUP) == "2627"  # the suffix, not the embedded value
+    assert _driver_code(_POSTGRES_DUP) == "7"
+    assert _driver_code(f"The duplicate key value is ({_SYNTHETIC_ID}).") is None
+    assert _driver_code("no driver code here at all") is None
 
 
 def test_sqlstate_extraction() -> None:
@@ -477,6 +549,27 @@ async def test_send_transient_db_error_retries() -> None:
     assert conn.rolledback
 
 
+async def test_send_dead_letter_text_carries_no_driver_value() -> None:
+    """BACKLOG #1661, the delivery path end to end: a duplicate-key rejection is the routine failure
+    on an MRN-keyed index, and its text reaches ``queue.last_error``, ``message_events.detail`` and
+    the ``connection_error`` alert. On a first deployment it would carry the partner's identifier
+    into all three.
+
+    Red mutation: interpolate ``str(exc)`` at the ``send`` call site again. Reds here while the
+    helper-level test above stays green, so the call site is pinned separately from the helper.
+    """
+    conn = _FakeConn(_FakeCursor(_driver_exc("23000", _SQLSERVER_DUP)))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    text = str(ei.value)
+    assert _SYNTHETIC_ID not in text
+    assert "duplicate key" not in text.lower()
+    assert "[23000]" in text and "driver error 2627" in text  # still diagnosable
+    assert conn.rolledback
+
+
 async def test_send_non_db_error_propagates() -> None:
     conn = _FakeConn(_FakeCursor(ValueError("a real bug")))  # args[0] not SQLSTATE-shaped
     dest = _dest()
@@ -768,6 +861,58 @@ async def test_source_missing_body_column_skips_row() -> None:
     cur = await _run_poll(src, ["id", "payload"], [(1, "A")], h)
     assert h.bodies == []  # no body could be built → row skipped, not delivered
     assert cur.marks == []
+
+
+async def test_source_mark_failure_log_carries_no_driver_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1661, the source's log limb: a mark is an ``UPDATE`` bound from the row's own
+    columns, so the driver quotes the bound value straight back at a rejection.
+
+    Redaction IS applied to this record — ``logging_setup.RedactionFilter`` is a HANDLER filter and
+    runs on every record process-wide — and it DOES NOT CATCH THIS: ``redact`` rewrites HL7-delimited
+    spans and whitespace-separated name runs, and a bare identifier is neither. So the control has to
+    be at the call site, which is what this pins.
+
+    Red mutation: pass the bare ``exc`` to the mark-failure log again. Reds here.
+    """
+    src = _src(body_column="payload")
+    h = _RecordingHandler()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(
+            src,
+            ["id", "payload"],
+            [(1, "A")],
+            h,
+            mark_exc=_driver_exc("23000", _SQLSERVER_DUP),
+        )
+    assert "mark failed" in caplog.text  # the instrument fired
+    assert _SYNTHETIC_ID not in caplog.text
+    assert "duplicate key" not in caplog.text.lower()
+
+
+async def test_source_handler_failure_log_is_scrubbed_and_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The handler-failure limb of the same line. The handler is pipeline code that can raise with a
+    message built from the body, so an HL7-shaped span in it must not reach the log — and the whole
+    rendering is length-bounded whatever its shape.
+
+    ``safe_exc`` is a bound plus HL7-shaped redaction, NOT a guarantee that every identifier is gone.
+    This asserts what it really provides — the type is kept, an HL7 span is scrubbed, the line is
+    bounded — rather than a stronger claim it would not survive.
+
+    Red mutation: pass the bare ``exc`` to the handler-failure log again. Both assertions red.
+    """
+    leaky = "PID|1||" + "9" * 400 + "^^^MF|" + "|DOE^JANE"
+    src = _src(body_column="payload")
+    h = _RecordingHandler(exc=RuntimeError(leaky))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+    assert "handler failed" in caplog.text  # the instrument fired
+    assert "RuntimeError" in caplog.text  # the TYPE survives; safe_exc keeps it deliberately
+    assert leaky not in caplog.text
+    assert "9" * 400 not in caplog.text  # bounded, so the raw run cannot be reassembled
 
 
 async def test_source_run_loop_survives_a_poll_error() -> None:

@@ -69,53 +69,109 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await SqlServerStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        cur = await conn.cursor()
-        for table in (
-            "message_events",
-            "audit_log",
-            "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
-            #                      leaving it would fail-close a later keyless record_audit (poison)
-            "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
-            "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
-            #                      runs and break the key-rotation reencrypt scan (persistent contamination)
-            "state",
-            "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
-            #               exact reencrypt counts (the == 6 in
-            #               test_reencrypt_to_active_rotates_all_columns_including_state)
-            "reference_version",  # ADR 0006 active-version pointers (no FK)
-            "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
-            "attachment_chunk",  # #149 attachment chunks (no FK)
-            "attachment",  # #149 attachment headers (no FK)
-            "queue",  # FK to messages(id) — must be cleared before messages
-            "response",  # FK to messages(id) — must be cleared before messages
-            "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
-            "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
-            "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
-            "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
-            #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
-            #                    counts (the == 6 / == 2 above), so a preset left behind by one test
-            #                    silently miscounts an unrelated one
-            "messages",
-            "sessions",
-            "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
-            "user_roles",
-            "ad_group_role_map",
-            "users",
-            "roles",
-        ):
-            await cur.execute(f"DELETE FROM {table}")
-        await conn.commit()
-    # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
-    # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
-    # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
-    await s._load_reference_cache()
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in (
+                "message_events",
+                "audit_log",
+                "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it;
+                #                      leaving it would fail-close a later keyless record_audit (poison)
+                "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+                "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
+                #                      runs and break the key-rotation reencrypt scan (persistent contamination)
+                "state",
+                "reference",  # ADR 0006 snapshot rows (no FK) — leaked ciphered/plaintext rows break the
+                #               exact reencrypt counts (the == 6 in
+                #               test_reencrypt_to_active_rotates_all_columns_including_state)
+                "reference_version",  # ADR 0006 active-version pointers (no FK)
+                "message_attachment",  # #149 attachment linkage (no FK; cleared for a clean slate)
+                "attachment_chunk",  # #149 attachment chunks (no FK)
+                "attachment",  # #149 attachment headers (no FK)
+                "queue",  # FK to messages(id) — must be cleared before messages
+                "response",  # FK to messages(id) — must be cleared before messages
+                "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
+                "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
+                "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+                "search_presets",  # ADR 0136 saved searches (no FK) — the ciphered `criteria` rides the
+                #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
+                #                    counts (the == 6 / == 2 above), so a preset left behind by one test
+                #                    silently miscounts an unrelated one
+                "messages",
+                "sessions",
+                "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+                "user_roles",
+                "ad_group_role_map",
+                "users",
+                "roles",
+            ):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
+        # audit_chain_meta was cleared above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        # open() seeded the reference read-through cache BEFORE the clean-slate DELETE above, so re-load it
+        # from the now-empty tables — otherwise a prior test's reference rows linger in this handle's
+        # in-memory cache/versions and leak across tests (mirrors the Postgres fixture; Track B Step 6).
+        await s._load_reference_cache()
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``SqlServerStore.open``
+    carries its own M-6 guard (``except Exception:`` -> ``pool.close()``/``wait_closed()`` plus the
+    executor shutdown), so a failure injected into any step ``open()`` performs is caught and the
+    pool closed *there*, ``open()`` never returns, and the fixture's ``try``/``finally`` is never
+    entered -- the closed-pool assertion below would then hold with the fix reverted, which is no
+    test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance rather
+    than on the class. ``open()`` therefore runs its own ``_load_reference_cache`` for real, and the
+    raise can only land in the fixture's own call to it -- after the clean-slate DELETE batch,
+    before the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool,
+    so one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
+    """
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    opened: list[SqlServerStore] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("fixture setup failed after open")
+
+    real_open = SqlServerStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> SqlServerStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.closed, "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_reference_cache", _boom)  # noqa: B010 - shadows the method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(SqlServerStore, "open", _open_then_arm)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
+    assert opened[0]._pool.closed, "the fixture left its pool open on the failure path"
 
 
 async def test_enqueue_creates_message_and_outbox(store) -> None:
