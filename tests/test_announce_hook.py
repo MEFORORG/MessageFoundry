@@ -1042,3 +1042,339 @@ def test_the_hook_script_is_ascii_only() -> None:
     instruction. The default console encoding has already broken a consumer once in this repo."""
     data = HOOK.read_bytes()
     assert max(data) < 128, "non-ASCII byte in the hook source"
+
+
+# --------------------------------------------------------------------------------------------------
+# The mail lane: the cross-account half. Section 16b of the hook.
+#
+# THESE TESTS EXIST BECAUSE THE SUITE WENT GREEN WITHOUT THEM. Measured 2026-09-14: all 50 tests
+# passed on the first run after the mail lane was added, and the reason was that $MailScript defaults
+# to the REAL scripts/coord/mail.ps1, which refuses this module's fake D:\t\... recipient paths with
+# "Recipient worktree does not exist". So every send failed, every mailable peer fell back to SKIP,
+# and the existing SKIP assertions kept passing while the new feature did nothing at all. A green
+# suite that cannot tell a working feature from an inert one is the failure this file's own history is
+# full of, so the lane is driven through an injected stub from here down.
+# --------------------------------------------------------------------------------------------------
+
+
+def mail_stub(tmp_path: Path, *, exit_code: int = 0, name: str = "mail-stub") -> tuple[Path, Path]:
+    """Stand-in for mail.ps1. MUST declare the real param names or pwsh errors on -Send."""
+    log = tmp_path / (name + ".log")
+    stub = tmp_path / (name + ".ps1")
+    lit = str(log).replace("'", "''")
+    stub.write_text(
+        "param([switch]$Send,[string]$To,[string]$Body,[string]$ToSessionId,"
+        "[int]$TtlMinutes,[string]$Kind,[switch]$List,[switch]$Status,"
+        "[switch]$Json,[string]$MailRoot)\n"
+        "$log = '" + lit + "'\n"
+        'Add-Content -LiteralPath $log -Value ("SEND|" + $To + "|" + $Kind + "|" + $TtlMinutes)\n'
+        'foreach ($l in ($Body -split "`n")) { Add-Content -LiteralPath $log -Value ("BODY|" + $l) }\n'
+        "exit " + str(exit_code) + "\n",
+        encoding="utf-8",
+    )
+    return stub, log
+
+
+def sends(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    return [
+        ln.split("|")[1]
+        for ln in log.read_text(encoding="utf-8").splitlines()
+        if ln.startswith("SEND|")
+    ]
+
+
+def body_lines(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    return [
+        ln.split("|", 1)[1]
+        for ln in log.read_text(encoding="utf-8").splitlines()
+        if ln.startswith("BODY|")
+    ]
+
+
+def mail_counts(sd: Path) -> list[int]:
+    return [int(c.split("mail=")[1].split("\t")[0]) for c in receipts(sd) if "mail=" in c]
+
+
+def acct_peer(i: int) -> dict[str, Any]:
+    return {
+        **ACCT,
+        "SessionId": f"bbbbbbb{i}-1111-1111-1111-111111111111",
+        "Short": f"bbbbbbb{i}",
+        "Cwd": f"D:\\t\\acct-{i}",
+        "Worktree": f"acct-{i}",
+    }
+
+
+def test_a_cross_login_peer_is_mailed_and_reads_MAILED(repo: Path, tmp_path: Path) -> None:
+    """The whole point. A peer on another login is unaddressable by the model's tools no matter how
+    well it is instructed, so the hook mails it itself and tells the model there is nothing to do."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert sends(log) == [ACCT["Cwd"]], f"the cross-login peer was not mailed: {sends(log)!r}"
+    assert any(ACCT["Worktree"] in ln for ln in peer_lines(p.stdout, "MAILED"))
+    assert not any(ACCT["Worktree"] in ln for ln in peer_lines(p.stdout, "SKIP"))
+    assert mail_counts(sd) == [1], f"the receipt did not record the send: {receipts(sd)!r}"
+    m = marker_obj(sd)
+    assert int(m["mailSent"]) == 1
+    assert m["mailed"] == ["d:/t/acct-wt"], m["mailed"]
+
+
+def test_a_surface_the_mcp_cannot_enumerate_is_mailed_too(repo: Path, tmp_path: Path) -> None:
+    """The second of the two cases mail.ps1's own header names. Measured live 2026-09-14: a real peer
+    in this repo was unreachable for the surface reason, not the login one, so this is populated."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, VSCODE],
+        extra=("-MailScript", str(stub)),
+    )
+    assert sends(log) == [VSCODE["Cwd"]], f"the vscode peer was not mailed: {sends(log)!r}"
+
+
+def test_an_unattended_peer_is_never_mailed(repo: Path, tmp_path: Path) -> None:
+    """Deliberately excluded. The Kind filter is flagged UNEXERCISED at the top of the hook, and
+    mail's own staleness argument cuts against waking a scheduled run with a stale announce."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, REMOTE],
+        extra=("-MailScript", str(stub)),
+    )
+    assert sends(log) == [], f"an unattended peer was mailed: {sends(log)!r}"
+    assert any(
+        REMOTE["Worktree"] in ln and "unattended" in ln for ln in peer_lines(p.stdout, "SKIP")
+    )
+
+
+def test_a_refused_mail_leaves_the_peer_unmailed_and_receipts_the_refusal(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Why the hook shells out instead of writing the inbox file: mail.ps1 REFUSES loudly where the
+    drain TRUNCATES silently. A refusal must not retire the peer, or one cap violation would silence
+    it permanently."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path, exit_code=1)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert sends(log) == [ACCT["Cwd"]], "the send was never attempted"
+    assert any(ACCT["Worktree"] in ln for ln in peer_lines(p.stdout, "SKIP"))
+    assert mail_counts(sd) == [0]
+    assert marker_obj(sd)["mailed"] == [], "a refused send retired the peer"
+
+
+def test_mail_goes_out_even_when_no_mcp_peer_is_reachable(repo: Path, tmp_path: Path) -> None:
+    """The case section 16b's PLACEMENT exists for. $new is computed from $reachable alone, so an
+    all-cross-login fleet takes the NO_PEERS exit below; sending after that exit would leave this
+    case exactly as silent as before the feature. stdout stays empty because there is nothing for the
+    MODEL to do -- the hot path must stay free."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert p.stdout.strip() == "", f"nothing was messageable, so nothing should print: {p.stdout!r}"
+    assert sends(log) == [ACCT["Cwd"]], "the only peer in the fleet was never announced to"
+    assert "ANNOUNCED_MAIL" in outcomes(sd), outcomes(sd)
+    assert "NO_PEERS" not in outcomes(sd), "a cross-account announce filed as nothing happening"
+
+
+def test_mail_is_capped_per_prompt(repo: Path, tmp_path: Path) -> None:
+    """UserPromptSubmit has a 15 s timeout and its failure mode is a BLOCKED USER PROMPT, not
+    degraded coordination. Measured 2026-09-14: one send costs 0.76-1.32 s wall clock, so an
+    uncapped fan-out to 7 cross-login peers is 8-10 s of that budget."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    peers = [acct_peer(i) for i in range(1, 6)]
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, *peers],
+        extra=("-MailScript", str(stub), "-MaxMailPerPrompt", "2"),
+    )
+    assert len(sends(log)) == 2, f"the per-prompt cap did not bind: {sends(log)!r}"
+
+
+def test_mail_has_a_lifetime_bound_of_its_own(repo: Path, tmp_path: Path) -> None:
+    """Separate from $MaxTotal, which caps requests made of the MODEL. Without a bound of its own the
+    mail lane is an unbounded arrival process against a 5-per-injection drain cap."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    peers = [acct_peer(i) for i in range(1, 4)]
+    for _ in range(3):
+        run(
+            repo,
+            tmp_path=tmp_path,
+            state_dir=sd,
+            rows=[SELF_ROW, PEER, *peers],
+            extra=("-MailScript", str(stub), "-MaxMailTotal", "1"),
+        )
+    assert len(sends(log)) == 1, f"the lifetime bound did not hold across prompts: {sends(log)!r}"
+
+
+def test_a_mailed_peer_is_not_mailed_again(repo: Path, tmp_path: Path) -> None:
+    """Announce traffic is unchosen and the hook fires on every prompt, so re-mailing a known peer
+    would put a sustained arrival process on a queue shared with real handoffs."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    for _ in range(3):
+        run(
+            repo,
+            tmp_path=tmp_path,
+            state_dir=sd,
+            rows=[SELF_ROW, PEER, ACCT],
+            extra=("-MailScript", str(stub)),
+        )
+    assert len(sends(log)) == 1, f"the same peer was mailed repeatedly: {sends(log)!r}"
+
+
+def test_the_mail_body_never_breaches_the_receiver_line_cap(repo: Path, tmp_path: Path) -> None:
+    """mail.ps1:337 THROWS on any line over 240 chars and the drain cuts at the same number, so an
+    unwrapped body does not arrive ugly -- it does not arrive. Measured by a peer 2026-09-14: an
+    ordinary 370-char intent line refused all 7 of its sends. The note here is one unbroken 400-char
+    token, which word wrapping ALONE cannot fix, so this also covers the hard-cut path."""
+    sd = tmp_path / "mefor-coord" / "announce"
+    claims = tmp_path / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "self.json").write_text(
+        json.dumps({"key": "self", "note": "x" * 400, "worktree": str(repo)}),
+        encoding="utf-8",
+    )
+    stub, log = mail_stub(tmp_path)
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    lines = body_lines(log)
+    assert lines, "no body was captured"
+    worst = max(len(ln) for ln in lines)
+    assert worst <= 240, f"a body line would be refused by mail.ps1 at {worst} chars"
+    assert any(ln.startswith("intent: ") for ln in lines), lines
+
+
+def test_the_body_carries_the_claim_note_as_the_intent(repo: Path, tmp_path: Path) -> None:
+    """The intent is the whole payload. It comes from the claim note, the one field written
+    deliberately to say what a session is doing."""
+    sd = tmp_path / "mefor-coord" / "announce"
+    claims = tmp_path / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "self.json").write_text(
+        json.dumps({"key": "self", "note": "WIRING THE MAIL LANE", "worktree": str(repo)}),
+        encoding="utf-8",
+    )
+    stub, log = mail_stub(tmp_path)
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert any("WIRING THE MAIL LANE" in ln for ln in body_lines(log)), body_lines(log)
+
+
+def test_an_undeclared_intent_says_so_rather_than_inventing_one(repo: Path, tmp_path: Path) -> None:
+    """A body that reads deliberate and says nothing is worse than an honest blank, because the
+    roster elsewhere instructs readers to PREFER the claim note over the worktree name."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert any("NOT DECLARED" in ln for ln in body_lines(log)), body_lines(log)
+
+
+def test_the_body_never_carries_the_users_prompt(repo: Path, tmp_path: Path) -> None:
+    """mail.ps1's header forbids message content in a body, and delivery copies the body into the
+    recipient's transcript, which nothing in this repo can delete. The hook HAS the prompt in its
+    payload and must never mail it. run() sends the prompt 'do a thing'."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(stub)),
+    )
+    assert not any("do a thing" in ln for ln in body_lines(log)), body_lines(log)
+
+
+def test_a_missing_mail_script_is_harmless(repo: Path, tmp_path: Path) -> None:
+    """Fail open, always. Nothing in this hook may block a prompt, and run() already asserts both a
+    zero exit and a clean stderr."""
+    sd = tmp_path / "state"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, ACCT],
+        extra=("-MailScript", str(tmp_path / "nope.ps1")),
+    )
+    assert any(ACCT["Worktree"] in ln for ln in peer_lines(p.stdout, "SKIP"))
+    assert mail_counts(sd) == [0]
+
+
+def test_the_self_test_reports_the_mail_split_under_a_stated_login(
+    repo: Path, tmp_path: Path
+) -> None:
+    """-SelfTest cannot resolve its own login, so without -AsLogin the filter goes OFF and every
+    cross-login peer renders reachable -- an upper bound presented as a measurement. Measured on the
+    live fleet 2026-09-14: the same roster read 9 reachable without it and 3 with it."""
+    stub, _ = mail_stub(tmp_path)
+    presence = presence_stub(tmp_path, [SELF_ROW, PEER, ACCT, VSCODE])
+    args = [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        str(HOOK),
+        "-PresenceScript",
+        str(presence),
+        "-MailScript",
+        str(stub),
+        "-SelfTest",
+        "-AsLogin",
+        "default",
+    ]
+    p = subprocess.run(
+        args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
+    )
+    assert p.returncode == 0, p.stderr
+    assert "nothing was written" in p.stdout
+    assert "2 of 2 unreachable peer(s) are mailable" in p.stdout, p.stdout
+    assert "STATED via -AsLogin" in p.stdout, p.stdout
+    assert sends(_) == [], "a read-only diagnostic sent mail"

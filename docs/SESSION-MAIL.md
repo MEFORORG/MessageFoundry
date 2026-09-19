@@ -160,6 +160,10 @@ writes a receipt under `mefor-coord/mail/receipts/`. That distinction is the fai
 exists to make visible, so `-Send` says it on every send and `-Status` reports undelivered and
 already-shown counts separately.
 
+**An absent receipt means one of two things, and only one of them is "not yet".** The drain sweeps
+`receipts/` of files past its retention window, so a missing receipt is either a message no drain has
+reached or a receipt that aged out. Read a receipt inside the window or not at all.
+
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
 being queued and is not lost; it is not shown. It reaches **already-running** sessions, which an
 environment variable cannot, and that is the point of it being a file. Delete it to resume.
@@ -267,9 +271,10 @@ its `SKIP_DIRS`. A queue full of tokens would leave the forbidden-content gate g
 not evidence about this path**, and must never be cited as though it were.
 
 **3. The retention sweep bounds the queue copy only.** The drain sweeps `seen/` and `expired/` of files
-older than 7 days. That bounds the copy this repo controls. It does not reach the transcript copy from
-(1), and citing it as PHI coverage would be exactly the compensating-control-resting-on-a-false-premise
-defect CLAUDE.md section 11 forbids.
+older than 7 days, in **every** box rather than only the one belonging to the worktree it is running in,
+and sweeps `receipts/` under the guards below. That bounds the copy this repo controls. It does not
+reach the transcript copy from (1), and citing it as PHI coverage would be exactly the
+compensating-control-resting-on-a-false-premise defect CLAUDE.md section 11 forbids.
 
 **4. A body here would be PL-1 content with none of PL-1's controls.** By [PHI.md](PHI.md) section 2's
 own classification, a full clinical message body is PL-1. This queue has no cipher, no ACL beyond the
@@ -398,6 +403,98 @@ meant editing all six.
 `claiming`-to-`seen` finalize, its dead-owner sweep to `stranded/`, and the sender's publish out of
 `tmp/`. The retention sweep of `seen`/`expired` is **not** in that list and does not use it -- it is a
 plain delete of files this channel minted, and it is the one move-free path in the drain.
+
+## What the retention sweep removes, and the three guards on `receipts/`
+
+The sweep runs on every drain, over **every box**, deletes only files older than `RETAIN_DAYS` (7)
+whose names this channel minted, and removes **at most a fixed number per pass**:
+
+| Directory | Swept | Per-pass budget | Why |
+|---|---|---|---|
+| `seen/`, `expired/` | Yes, in every box | `$MESSAGE_DELETE_BUDGET` | Terminal. Nothing is ever read out of one into a delivery. |
+| `shown/` | Yes, in every box, markers only | `$MARKER_DELETE_BUDGET` | An aged marker costs a duplicate display and nothing else. |
+| `receipts/` | Yes, under the guards below | `$RECEIPT_DELETE_BUDGET` | One flat directory for the whole queue, so no box-scoped loop reached it. |
+| `inbox/`, `claiming/`, `stranded/` | **Never** | -- | Undelivered mail, a claim in flight, and the record of a claim whose owner died. |
+
+**A box outlives its worktree, which is why the sweep had to widen.** A box is keyed by worktree path,
+worktrees are removed once their work lands, and a removed worktree's box is never drained again. The
+sweep used to read only the current worktree's box, so the only boxes it ever reached were the ones
+still being drained.
+
+**Widening it gave the first pass a five-week backlog, and the drain is killed at 20 seconds.** The
+hook is registered with `"timeout": 20` on `SessionStart` and on `Stop` in every config root. A pass
+killed there renders nothing at all -- no counter block, no partial line -- and a pass cut short
+inside the message loop never reaches `receipts/`, the largest class of all. So the record that grows
+fastest would be the one that silently never drains.
+
+**Each phase carries its OWN budget rather than a share of one.** A pooled budget spent entirely on
+`seen/` would leave `receipts/` unreached, which is that defect rather than a smaller version of it.
+The three numbers, the measurements behind them and the arithmetic against the 20-second timeout live
+beside the constants in [`mail-drain.ps1`](../scripts/hooks/mail-drain.ps1) -- read them there.
+
+**A pass that stopped at a budget prints a line naming the phase and saying it did not reach the end
+of its input.** "Swept 1,000" and "swept 1,000, and did not reach the end" are different facts about
+the queue, and a reader who cannot separate them reads a bounded pass as a finished one. The flag
+means the second sentence exactly: it is set only where a file or a box was left **unexamined**, never
+by comparing a counter to its cap, so a pass that spends its last delete on the last file it had to
+examine is finished and says nothing.
+
+**The receipt phase budgets its DELETES and not its scan; the other two budget the loop itself.** A
+guard-protected receipt stays a candidate until its guard releases it, so capping the candidate list
+would let a block of protected receipts at the front of the enumeration fill it on every pass and hide
+everything behind them forever. Nothing protects an aged, well-named file in `seen/`, so that loop can
+stop where it stands.
+
+**Boxes come back in the same order every pass, so a bounded sweep always stops in the same place.**
+That is not starvation -- the front of the enumeration shrinks monotonically, so a box at the back is
+reached in a bounded number of passes -- but the back does wait for the front, which is why the
+truncation line exists rather than a bare claim that the sweep ran.
+
+`tests/test_session_mail_held.py` section 8h plants more deletable files than one pass may remove,
+asserts the remainder survives and the sentence prints, asserts a second pass clears it and the
+sentence stops, asserts `receipts/` is still swept when the message phase stops short, and runs the
+same plants against a build with the budgets lifted in which the whole pile dies.
+
+**Three guards stand between that sweep and `receipts/`,** because a receipt is the only record of what
+was observed about a message:
+
+1. **The message is still in play.** A stem with a file in `inbox/`, `claiming/` or `stranded/` in any
+   box keeps its receipt. Deleting it would make `mail.ps1 -Status` report a file anyone can open as
+   delivery UNPROVEN, which is a false statement rather than a missing one.
+2. **Something outside the queue quotes it.** Stems are quoted by hand into handoff notes and seat
+   records under `mefor-coord/`, so a receipt is a citation target. The scan excludes `mail/` itself --
+   the queue is made of stems, so reading it would mark every receipt as cited and the sweep would
+   delete nothing while looking exactly like a sweep that ran -- and it excludes the frozen
+   **`_retired-` family, matched as a whole path segment**, whose citations nobody reads back.
+3. **Never both halves in one pass.** The keep set is read before anything is deleted, so a receipt
+   whose message this same drain removes from `seen/` survives to the next drain. A reader who finds
+   one half gone can always still find the other.
+
+**Guard 2 excludes a PREFIX, not a date, because these trees are minted rather than authored.**
+[`scripts/coord/handoff.ps1`](../scripts/coord/handoff.ps1) builds `_retired-<yyyy-MM-dd>` from the
+current date on every `-Retire`, so a literal date stops excluding the next one. That failure would be
+silent and permanent: every stem quoted in the new frozen tree pins its receipt forever, while the
+counter line goes on truthfully reporting a sweep that ran.
+
+**This page said "the frozen `_retired-2026-08-22/` tree" until now, and the code stopped reading that
+date at `0bb2605b4`.** Recorded rather than quietly swapped, because a documented claim that no longer
+matches its code is the same defect class the guard itself was rewritten to close, and the pointer
+and the thing it points at are two edits with nothing failing when only the first is made.
+
+**The match is on a path SEGMENT, so it names a directory and never a filename.** A live note called
+`_retired-notes.md` is read like any other document and the stems in it stay ordinary live citations.
+Without that, the family match would double as a way to opt a document out of counting.
+
+**Guard 2's MARGINAL protection is 1 receipt, not 16.** Measured read-only on the live spool at
+`0bb2605b4`: the citation walk finds 16 cited stems among the aged receipts, and 15 of them are
+already held by guard 1, whose message is still sitting in a box. Written down because an overstated
+guard invites the next reader to delete it the day they measure the real figure. One file is still the
+right answer -- a dangling citation is the failure nothing else here reports.
+
+**A guard that cannot be evaluated keeps the file.** If either set fails to build, the receipt sweep
+does not run and the injection says so. `tests/test_session_mail_held.py` section 8g plants one
+survivor per guard, a file that must be deleted beside them, and a build with the guard removed in
+which every survivor dies.
 
 **Ceding is the safe failure direction.** The exclusive open is very slightly over-strict, so a claimer
 occasionally cannot prove a claim it actually won. That message stays in `claiming/`, is never
