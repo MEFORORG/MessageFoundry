@@ -26,7 +26,7 @@ import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
-import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -3077,29 +3077,61 @@ def _serve(args: argparse.Namespace) -> int:
     import os
 
     from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.redaction import safe_exc
 
     def env_values() -> dict[str, Any]:
-        return load_environment_values(
-            base_dir=env_base,
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
-        )
+        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+        # WiringError is the type both the serve gate below and that route already understand, so
+        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+        #
+        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+        # keeps the exception type and bounds the length.
+        try:
+            return load_environment_values(
+                base_dir=env_base,
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+        except (ValueError, RecursionError, OSError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
+            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+            # an embedder's arbitrary callable, while this one wraps our own call into a function that
+            # returns a dict or raises.
+            raise WiringError(
+                f"could not read environment values from {env_file}: {safe_exc(exc)}"
+            ) from exc
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
     # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
     # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
-    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise inside env_values() —
     # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
-    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    # a clean error like every other serve gate. env_values() now wraps that as a WiringError which
+    # already names the value file (path only, PHI-safe), so print it rather than re-stating the path.
     try:
         env_values_empty = not env_values()
-    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
-        print(
-            f"error: could not read environment values from {env_file}: {exc}",
-            file=sys.stderr,
-        )
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
     # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
@@ -3122,6 +3154,10 @@ def _serve(args: argparse.Namespace) -> int:
     # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
     registry_filter = None
     if args.shard is not None:
+        # WiringError is also bound above (env_values), and this local re-import is deliberate: the
+        # shard closure below raises it, so binding it here keeps this block self-contained. Relying
+        # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
+        # a NameError, on a path only `serve --shard` against a mismatched store reaches.
         from messagefoundry.config.wiring import Registry, WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
@@ -3349,7 +3385,6 @@ def _serve(args: argparse.Namespace) -> int:
 
             run_kwargs["http"] = client_cert_http_protocol_class()
     from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
-    from messagefoundry.redaction import safe_exc
 
     install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
     # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
