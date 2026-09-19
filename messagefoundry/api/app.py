@@ -601,9 +601,28 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
     gate = ApprovalGate(engine.store, settings)
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
+        # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
+        # auditor filtering on the action name sees the released replays too.
+        channel_id = p.get("channel_id")
+        destination_name = p.get("destination_name")
         requeued = await engine.replay_dead(
-            channel_id=p.get("channel_id"), destination_name=p.get("destination_name")
+            channel_id=channel_id, destination_name=destination_name
         )
+        if requeued:  # only when PHI was actually re-transmitted (review M-4), as inline
+            # `.get`, never p["requester"] the way _config_reload reads it below: a request
+            # persisted before the guard started capturing that key carries none, and a KeyError
+            # here would route a released replay into the ASVS 2.3.3 compensation path and record an
+            # operation that actually ran as failed. A zero-requeue release is not hidden by the
+            # guard above -- approval.approved carries this executor's own {"requeued": 0} result.
+            # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
+            # _record_reload_audit's docstring (ADR 0150).
+            requester = p.get("requester")
+            await engine.store.record_audit(
+                "dead_letter_replay",
+                actor=str(requester) if requester else None,
+                channel_id=channel_id,
+                detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+            )
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -2981,7 +3000,21 @@ def create_app(
         ):  # dual-control: hold for a second approver when [approvals] gates replay
             pending = await gate.guard(
                 "dead_letter_replay",
-                {"channel_id": req.channel_id, "destination_name": req.destination_name},
+                {
+                    "channel_id": req.channel_id,
+                    "destination_name": req.destination_name,
+                    # KNOWN DUPLICATION of the `requester=` keyword below, not a pattern to copy
+                    # (BACKLOG #1646): `_replay` only ever sees this mapping, so the requester has
+                    # to be routed back through it to attribute the audit row it writes on release.
+                    # The config_reload guard already does the same, and connection_purge will need
+                    # it for the same parity. The real fix is an execution context on the Executor
+                    # signature -- ApprovalGate.approve already holds the requester and hands the
+                    # executor only the JSON params -- left as a follow-up because it changes all
+                    # three executors and both guard sites, which is a different row's scope. The
+                    # DISPLAY name is the right value (every audit actor here is one); the immutable
+                    # id stays the refusal's key and is deliberately not duplicated in beside it.
+                    "requester": identity.username,
+                },
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
