@@ -193,8 +193,17 @@ def test_wrong_ec_curve_rejected() -> None:
 
 
 def test_unloadable_key_fails_loud() -> None:
-    with pytest.raises(SigningError, match="could not load the signing private key"):
+    with pytest.raises(SigningError, match="could not load the signing private key") as excinfo:
         MessageSigner(OutboundSigning(algorithm="RS256", private_key="-----BEGIN NOT A KEY-----"))
+    # The refusal exists to withhold the cryptography deserialization detail, which could echo key
+    # material. `raise ... from None` did not achieve that: it clears __cause__ and sets
+    # __suppress_context__, but LEAVES __context__ populated, so a chain-walking handler still
+    # reached the underlying error. Raising outside the `except` block empties both chains.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None, (
+        "the deserialization error is still reachable on __context__ — `from None` only sets "
+        "__suppress_context__, which stops the default printer, not an attribute walk"
+    )
 
 
 def test_encrypted_key_needs_the_password(rsa_pem: str) -> None:
