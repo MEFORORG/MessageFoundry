@@ -1317,6 +1317,19 @@ class Engine:
             set(self._registry_runner.registry.outbound)
         )
         await self.store.dead_letter_missing_handlers(set(self._registry_runner.registry.handlers))
+        # A3c — the third lane key. Ingress, routed and response rows key on `channel_id`, and the
+        # pooled lane provider for those stages is the live registry's inbound set, so a removed
+        # inbound's rows are never claimed, never swept by the two sweeps above (which key on the
+        # other two columns), and invisible to the buildup and stall alerts (they ask pending_depth
+        # about registry lanes only). Before this they sat pending forever with no disposition at all
+        # — an ACKed message stuck "in progress" for the life of the store, which count-and-log
+        # forbids. Keyed off `inbound_names()`, NOT `registry.inbound`: under engine sharding the
+        # latter is only THIS shard's slice, and the store is unified, so it would kill every sibling
+        # shard's live rows. As with the two sweeps above, clustered/sharded nodes must run identical
+        # config (a coordinated, not rolling, restart for config changes).
+        await self.store.dead_letter_missing_inbounds(
+            set(self._registry_runner.registry.inbound_names())
+        )
         # Reference sets (ADR 0006): materialize declared sets BEFORE listeners accept (a transform's
         # reference(...) resolves on the first message), then keep the periodic loop running (idempotent
         # — already started on every node in start() for clustered followers to converge). Leader-gated
@@ -1602,9 +1615,10 @@ class Engine:
         version right after bumping, so its convergence loop sees no change and does not re-reload.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value) — the
-        caller maps these to HTTP errors. Every one of them is raised BEFORE the swap, so a raise
-        from this method always means the live graph is the one that was already running.
+        (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value / an
+        environment value file this reload could not read) — the caller maps these to HTTP errors.
+        Every one of them is raised BEFORE the swap, so a raise from this method always means the
+        live graph is the one that was already running.
         """
         failures: list[ReloadStepFailure] = []
         path = self._resolve_reload_target(config_dir)
@@ -1615,7 +1629,39 @@ class Engine:
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
         if self._env_values_provider is not None:
-            self._env_values = dict(self._env_values_provider())
+            # Guard the provider. On the CLI path it is tomllib.load over environments/<env>.toml, and
+            # for an embedder it is arbitrary caller code, so an unreadable value file raised straight
+            # out of the reload: TOMLDecodeError is a ValueError, not a WiringError, so POST
+            # /config/reload answered 500 with NO config_reload_failed audit row (BACKLOG #1652).
+            # Re-raise as WiringError, which puts it in the same audited 422 arm as every other bad
+            # config. This runs BEFORE the swap either way, so the live graph is untouched. The CLI
+            # provider wraps its own read and names the value file; this covers an embedder-supplied
+            # provider, and it covers every caller that reaches reload_detail (the route, the
+            # dual-control release executor, the cluster convergence loop, the DR-threshold re-apply).
+            try:
+                self._env_values = dict(self._env_values_provider())
+            except WiringError:
+                # Already a wiring failure that names its own source. Re-raise unwrapped rather than
+                # nesting the same sentence twice.
+                raise
+            except (ValueError, TypeError, RecursionError, OSError) as exc:
+                # The tuple is specific rather than a blanket Exception (section 6), and each entry is
+                # a MEASURED escape, not a guess. ValueError covers tomllib.TOMLDecodeError and
+                # UnicodeDecodeError (the CLI shapes). RecursionError covers a deeply nested value
+                # file -- measured on 3.14, `a = ` + 600 `[` makes tomllib recurse past the limit, and
+                # RecursionError derives from RuntimeError, so without it the whole point of the guard
+                # fails on real TOML input. TypeError is the embedder shape: dict(None) and dict(5)
+                # raise TypeError while dict(["a"]) raises ValueError, so without it two adjacent
+                # provider bugs get opposite handling, one audited at 422 and the other the unaudited
+                # 500 that #1652 is about. Together these are every way READING A VALUE FILE fails. An
+                # embedder provider that raises something else (KeyError, RuntimeError) is a bug in
+                # the host application rather than a bad value file, and a 500 is the honest signal
+                # for it -- widening to Exception would relabel the host's bug as the operator's
+                # config being invalid.
+                raise WiringError(
+                    "could not re-read this environment's values for the reload, so the live graph "
+                    f"is unchanged: {safe_exc(exc)}"
+                ) from exc
             if self._registry_runner is not None:
                 self._registry_runner.set_env_values(self._env_values)
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy

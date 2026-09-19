@@ -160,6 +160,52 @@ by the cleartext-proxy-hop refusal, redaction, and secret-in-`env()` handling.
 executor honours proxy settings from `connections`/`[egress]` but the factory adds no kwarg here); an
 inbound/reverse-proxy change; per-scheme distinct proxies; SOCKS proxies.
 
+## Amendments
+
+### Amendment A (2026-09-16) — the proxy host gets its own allow-list, `[egress].allowed_proxy`
+
+**The scope sentence above stays true and is not being reopened.** `[egress].allowed_http` still gates
+the **destination** (and the token endpoints), and the proxy host is still out of its scope, for the
+reason recorded there: one corporate proxy fronts many hosts and would have to be co-listed with every
+destination.
+
+What that sentence did **not** settle is whether the proxy is gated **at all**, and it was not. The
+Decision above makes the proxy a credential-bearing host — under the default `proxy_auth_type = basic`
+the engine mints a pre-emptive `Proxy-Authorization` that urllib carries to the proxy on **both**
+destination schemes — so an un-listed proxy would receive that credential on first delivery, and for a
+permitted cleartext `http` destination the PHI body would follow it. Reading "out of `allowed_http`'s
+scope" as "ungated" was the gap.
+
+A **dedicated `[egress].allowed_proxy` list** closes it while answering this ADR's own objection
+rather than evading it: listing the proxy once permits it for every destination, so there is no
+co-listing. It matches the house pattern in [ADR 0135](0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md),
+which gave the AI broker `[ai].allowed_endpoints` for the same reason — `allowed_http` is
+permissive-when-empty and cannot be the gate for a new credential-bearing egress surface.
+
+- **Deny-by-default**, following `[ai].allowed_endpoints` rather than the `allowed_*` destination
+  lists: an explicit `proxy_url` with an **empty** `allowed_proxy` is refused at config load. An empty
+  list refuses nothing until a proxy is configured, so an operator who uses none is unaffected.
+- **Both arms**, in lockstep: `check_egress_allowed` (outbound) and `check_fhir_lookup_allowed`
+  (the `fhir_lookup` read), checked **outside** each one's `allowed_http` guard — that list being
+  empty says nothing about whether the proxy is permitted.
+- **The `"default"` sentinel is exempt.** It names no address at config time (urllib resolves the OS
+  proxy per request), and `proxy_config_from_settings` already refuses to pair it with proxy
+  credentials, so that path mints no `Proxy-Authorization`. A residual gap remains there: a system
+  proxy chosen by the OS environment still sees the `CONNECT` target or a cleartext body, and no
+  config-time list can name it.
+- **`proxy_url` is deliberately NOT in `_CREDENTIAL_EGRESS_URL_KEYS`** (the table that gates token
+  endpoints against `allowed_http`). Putting it there is the mechanism this ADR's scope sentence
+  forbids; the code carries a note saying so at the table.
+
+- **AC-10** — IF an http-family outbound or a `FhirLookup` resolves an explicit `proxy_url` whose host
+  is not in `[egress].allowed_proxy` (an empty list included), THEN THE SYSTEM SHALL refuse at config
+  load/reload/start; `proxy_url = "default"` SHALL be exempt.
+  → `tests/test_egress_allowlist.py` (the `allowed_proxy` block) and
+  `tests/test_outbound_forward_proxy.py::test_egress_default_proxy_is_gated_by_allowed_proxy`
+
+Filed as BACKLOG #1659. The row's own closing step said to add `proxy_url` to
+`_CREDENTIAL_EGRESS_URL_KEYS`; that was not built, for the reason above.
+
 ## Deviations from the phase doc
 
 - **Proxy-auth dispatch lives in `transports/rest.py`, not `transports/http_auth.py`.** `smart.py`'s token

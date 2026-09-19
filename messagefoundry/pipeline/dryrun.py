@@ -212,8 +212,13 @@ class StateOpPreview:
 @dataclass(frozen=True)
 class MetaOpPreview:
     """A per-message metadata write a Handler would declare (ADR 0081, BACKLOG #150) — captured for the
-    dry-run, applied nowhere. ``value`` may carry PHI, so the CLI gates it behind ``--show-phi`` exactly
-    like a delivery payload / state write."""
+    dry-run, applied nowhere. Both members are message-derived in the general case (a Handler is free to
+    build either from a field), so the CLI redacts **key and value alike** unless ``--show-phi`` is
+    passed — the same gate, on the same two members, as a :class:`StateOpPreview`.
+
+    The gate had nothing to gate until BACKLOG #1692: neither ``dry_run`` path passed ``meta_ops`` to
+    its :class:`DryRunResult`, so the field was empty whatever a Handler declared, and the CLI printed
+    no ``meta_ops`` key at all. This docstring asserted the gate throughout that window."""
 
     key: str
     value: str
@@ -771,6 +776,7 @@ def _dry_run_raw(
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
         state_ops=outcome.state_ops,
+        meta_ops=outcome.meta_ops,
         declined=outcome.declined,
     )
 
@@ -882,6 +888,7 @@ def dry_run(
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
         state_ops=outcome.state_ops,
+        meta_ops=outcome.meta_ops,
         declined=outcome.declined,
     )
 

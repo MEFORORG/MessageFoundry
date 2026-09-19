@@ -43,7 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.config.tls_policy import harden_cipher_suites
+from messagefoundry.config.tls_policy import harden_cipher_suites, harden_crl_check
 
 # A LEAF MODULE, imported for its DEFINITION rather than its behaviour (BACKLOG #1273). controlchars
 # imports nothing from this package, so there is no cycle -- checked by import, not assumed.
@@ -380,8 +380,9 @@ class SyslogForward:
     connection-oriented protocols (see :func:`configure_logging`). ``fmt`` is ``"json"`` or ``"text"``
     and is independent of the stdout format. The ``tls_*`` fields apply only when ``protocol == "tls"``:
     ``tls_ca_file`` is the PEM trust anchor (only that CA is trusted; system roots are not loaded),
-    ``tls_verify`` toggles certificate + hostname verification (default on), and ``tls_client_cert`` is
-    an optional PEM cert+key chain for mutual TLS."""
+    ``tls_verify`` toggles certificate + hostname verification (default on), ``tls_client_cert`` is
+    an optional PEM cert+key chain for mutual TLS, and ``tls_crl_file`` (BACKLOG #299) is an optional
+    CRL that turns on leaf revocation checking against the collector's certificate."""
 
     host: str
     port: int = 514
@@ -390,6 +391,7 @@ class SyslogForward:
     tls_ca_file: str | None = None
     tls_verify: bool = True
     tls_client_cert: str | None = None
+    tls_crl_file: str | None = None
 
 
 #: Socket timeout (seconds) pinned on a **TCP** off-box forwarder.
@@ -523,6 +525,13 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
         ctx.load_cert_chain(certfile=forward.tls_client_cert)
+    if forward.tls_verify and forward.tls_crl_file is not None:
+        # BACKLOG #299: revocation checking against the collector's certificate. Guarded on tls_verify
+        # because the opt-out arm above is CERT_NONE -- there is no chain to check a CRL against, and
+        # setting the flag there would refuse every collector while claiming a check. It loads after
+        # the CA and any client chain so harden_crl_check's "the CRL really landed" assertion answers
+        # for the final trust store.
+        harden_crl_check(ctx, forward.tls_crl_file)
     # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). This runs on the
     # tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log records still cross
     # the network encrypted, so the suite list still decides whether a recorded session stays private.

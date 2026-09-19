@@ -243,6 +243,54 @@ $MAX_LINE_CHARS = 240
 # receipts' "did it actually deliver" question answerable.
 $RETAIN_DAYS = 7
 
+# --- PER-PASS DELETE BUDGETS. --------------------------------------------------------------------
+# THE HOOK IS KILLED AT 20 SECONDS, AND A KILLED PASS IS NOT MERELY A SLOW ONE. The registration is
+# `"timeout": 20` on SessionStart and on Stop, in the settings.json of every config root -- measured
+# 2026-09-17, twelve registrations across six roots, every one of them 20. A pass killed inside the
+# message loop never reaches the receipt sweep at all, so the LARGEST class silently never drains
+# while the counter line that would have said so never renders either. That is the failure these
+# numbers exist to stop, and it is strictly worse than sweeping less per pass.
+#
+# THE ARITHMETIC. Measured on this machine, live spool, 2026-09-17:
+#   Remove-Item + Test-Path, the pair this file runs per file  0.77 ms  (3,000 files, temp directory)
+#   keep-set build, 188 boxes / 24,584 stems                   709-998 ms over three runs
+#   receipt pass A, enumerate + validate + C5 over 33,480      729-929 ms over three runs
+#   citation walk, 4,100 files                                 706 ms warm; 2.1 s cold at 1ab08076a
+#   bare pwsh startup                                          ~267 ms (see the PreToolUse paragraph)
+#   the rest -- box enumeration, dead-owner sweep, delivery, injection      call it 1 s
+# Fixed cost at the worst of each: 0.27 + 1.0 + 0.93 + 2.1 + 1.0 = 5.3 s.
+# Deletes at 1000 + 250 + 1000 = 2,250 per pass: 1.73 s, for 7.0 s total -- 35% of the timeout.
+#
+# THE BENCHMARK IS OPTIMISTIC AND IS SIZED AS SUCH. It ran in a throwaway temp directory with no
+# on-access scanner in the path, which the live spool does not have. At THREE times that cost the
+# deletes take 5.2 s and the pass 10.5 s; at FIVE times, 8.7 s and 14.0 s. Both are inside 20 s.
+#
+# WHAT IT COSTS. The first widened pass had 33,159 deletable files measured across the spool, so the
+# message phase needs 24 passes and the receipt phase 10. The hook fires at SessionStart and at every
+# Stop, so an ordinary working day clears it. A backlog that drains over a day is not the problem; a
+# pass that is killed before it reaches receipts/ is.
+#
+# EACH PHASE GETS ITS OWN BUDGET RATHER THAN A SHARE OF ONE. Three phases delete: seen/ and expired/
+# across every box, shown/ markers, and receipts/. A single pooled budget spent entirely on seen/
+# would leave receipts/ unreached -- which is the defect being fixed, not a smaller version of it --
+# so no phase can be starved by another's backlog here, and the worst-case wall time is the SUM
+# above, which is the number sized against the timeout.
+$MESSAGE_DELETE_BUDGET = 1000
+$MARKER_DELETE_BUDGET = 250
+$RECEIPT_DELETE_BUDGET = 1000
+
+# The directory-name PREFIX the receipt sweep's citation guard does NOT read. A `_retired-<date>` tree
+# is a frozen copy of an older coordination tree, so a stem quoted inside one cites state nobody reads
+# back, and honouring those citations would pin receipts to a snapshot forever. mail/ is the other
+# exclusion and is not spelled here: the sweep already knows where the queue is.
+#
+# A PREFIX RATHER THAN ONE DATE, because these are MINTED and not authored:
+# scripts/coord/handoff.ps1 builds `_retired-$($now.ToString('yyyy-MM-dd'))` on every -Retire, so a
+# literal date stops matching the day somebody retires a handoff. That failure would be silent and
+# permanent -- every stem quoted in the new frozen tree would pin its receipt forever, while the
+# counter line went on truthfully reporting a sweep that ran.
+$CITATION_EXCLUDED_PREFIX = '_retired-'
+
 # The hook-authored frame around each body: the id delimiter, the two [UNVERIFIED] metadata lines,
 # the closing delimiter and a blank. Its width is driven by the metadata caps above, so it is bounded
 # -- 25 + 200 + 120 + 16 + 40 plus fixed labels, rounded up. Charged per message by the selection
@@ -525,6 +573,125 @@ function Write-MailReceipt {
     Set-Content -LiteralPath $Path -Value ($receipt | ConvertTo-Json -Depth 5) -Encoding ascii -ErrorAction Stop
 }
 
+function Get-LiveMessageStems {
+    # EVERY STEM THAT STILL HAS A MESSAGE FILE SOMEWHERE, read in one pass over every box, and read
+    # BEFORE anything is deleted. It is the keep set for the receipt sweep, and reading it first is
+    # the whole of the "never both halves in one pass" rule: a receipt whose message THIS drain is
+    # about to remove from seen/ is still in this set, so it survives to the next drain. A reader who
+    # finds one half gone can therefore always still find the other.
+    #
+    # THE FIVE STATES ARE THE GUARDS, NOT A TIDY LIST. inbox/, claiming/ and stranded/ hold messages
+    # still in play -- undelivered, mid-claim, or left behind by a session that died -- and for one of
+    # those the receipt is the only record of what was observed. seen/ and expired/ hold the very
+    # message the receipt describes, and mail.ps1 -Status reads the two together: delete the receipt
+    # while the message is on disk and -Status reports that message as delivery UNPROVEN, which is a
+    # false statement about a file anyone can still open.
+    #
+    # A NAME THIS CHANNEL DID NOT MINT CONTRIBUTES NOTHING, exactly as everywhere else in this file:
+    # it is not ours to reason about, and no path is built from it.
+    #
+    # IT THROWS RATHER THAN RETURNING A SHORT ANSWER. A half-built keep set is byte-identical to a
+    # complete one and would license deleting a receipt whose guard was never evaluated, so the caller
+    # treats any failure here as "sweep no receipts at all".
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$BoxRoot)
+    $out = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($bd in [System.IO.Directory]::EnumerateDirectories($BoxRoot)) {
+        foreach ($state in @('inbox', 'claiming', 'stranded', 'seen', 'expired')) {
+            $sd = [System.IO.Path]::Combine($bd, $state)
+            if (-not [System.IO.Directory]::Exists($sd)) { continue }
+            foreach ($p in [System.IO.Directory]::EnumerateFiles($sd, '*.json')) {
+                $parts = Split-MailFileName -Name ([System.IO.Path]::GetFileName($p))
+                if ($parts) { [void]$out.Add($parts.Stem) }
+            }
+        }
+    }
+    # The leading comma stops PowerShell unrolling the set into the output stream one string at a time.
+    return , $out
+}
+
+function Get-CitedStems {
+    # A RECEIPT IS A CITATION TARGET, and that is what this guard exists for. Handoff notes and seat
+    # records under the coordination tree quote a message stem by hand, and the receipt that stem names
+    # is the only thing left that can answer what happened to it. Deleting one turns a live citation
+    # into a dangling one, with nothing anywhere reporting it.
+    #
+    # ONE WALK, NOT ONE PER CANDIDATE. The set is read once and asked about thousands of times.
+    #
+    # THE TWO EXCLUSIONS ARE WHAT MAKE THE GUARD MEAN ANYTHING. mail/ is the queue itself -- every
+    # message filename, every receipt name and every marker name IS a stem -- so scanning it would
+    # report every receipt as cited, and the sweep would then delete nothing while looking exactly
+    # like a sweep that ran. The other is the frozen-tree FAMILY named by $ExcludedPrefix, matched as a
+    # whole path SEGMENT so a file merely named like one is not exempted with it.
+    #
+    # LATIN1, NOT UTF8, AND ReadAllText RATHER THAN Get-Content. Every byte decodes under Latin1, so a
+    # binary file in the tree -- there is at least one git bundle -- can neither throw nor swallow a
+    # match, and a stem is ASCII by construction so nothing inside one decodes differently. A false
+    # match out of binary noise only ever protects a receipt, which is the safe direction.
+    #
+    # IT THROWS RATHER THAN RETURNING A SHORT ANSWER, for the same reason as the keep set above: an
+    # unreadable corner of the tree is indistinguishable from a corner with no citations in it.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CoordRoot,
+        [Parameter(Mandatory)][string]$MailRoot,
+        [Parameter(Mandatory)][string]$ExcludedPrefix
+    )
+    $out = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $mailPrefix = [System.IO.Path]::GetFullPath($MailRoot).TrimEnd($sep) + $sep
+    $excluded = "$sep$ExcludedPrefix"
+    $re = [regex]::new((Get-MailStemPattern), [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    $base = [System.IO.Path]::GetFullPath($CoordRoot)
+    foreach ($p in [System.IO.Directory]::EnumerateFiles($base, '*', [System.IO.SearchOption]::AllDirectories)) {
+        if ($p.StartsWith($mailPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        # The prefix must start a SEGMENT, and the thing carrying it must be a DIRECTORY, so another
+        # separator has to follow. `...\_retired-2026-08-22\x.md` is excluded; a live note called
+        # `_retired-notes.md` in an ordinary directory is not, and stays a citation like any other.
+        $at = $p.IndexOf($excluded, [StringComparison]::OrdinalIgnoreCase)
+        if ($at -ge 0 -and $p.IndexOf($sep, $at + 1) -ge 0) { continue }
+        $text = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::Latin1)
+        foreach ($m in $re.Matches($text)) {
+            # Test-MailStem is the authority; the pattern only proposes. See Get-MailStemPattern.
+            if (Test-MailStem -Stem $m.Value) { [void]$out.Add($m.Value) }
+        }
+    }
+    return , $out
+}
+
+function Test-ReceiptProtected {
+    # THE GUARDS ON DELETING A RECEIPT, IN ONE PLACE, so a test can neutralise exactly this and watch
+    # the files it protects disappear. A guard that protects everything and a sweep that deletes
+    # everything fail identically from the outside -- neither can be told from a broken one by looking
+    # at what it did -- so each arm here is exercised by a planted survivor AND the sweep itself is
+    # exercised by a planted file that must go.
+    #
+    # FAILING CLOSED IS THE CALLER'S JOB, NOT THIS FUNCTION'S. An empty set reads here as "nothing is
+    # protected", so this is only ever asked once both sets are known to be complete.
+    #
+    # [AllowEmptyCollection()] ON BOTH SETS IS LOAD-BEARING, NOT TIDINESS, and it is the same trap
+    # Write-MailReceipt records for [AllowEmptyString()]. A Mandatory collection parameter REJECTS an
+    # empty collection at BINDING time -- ParameterBindingValidationException, thrown before the body
+    # runs -- and both sets are legitimately empty: the citation set is passed empty on purpose by the
+    # cheap first pass below, and a queue in which every box is empty yields an empty keep set.
+    # Measured against this file: without it every call threw, the caller's catch read that as a guard
+    # that could not be evaluated, and the receipt sweep skipped every pass while reporting itself
+    # correctly as skipped. A sweep that never runs and a guard that protects everything are the same
+    # silence.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Stem,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$MessageStems,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$CitedStems
+    )
+    # The message half is still on disk: in play in inbox/, claiming/ or stranded/, or terminal in
+    # seen/ or expired/. Either way the receipt is the record of a file a reader can still open.
+    if ($MessageStems.Contains($Stem)) { return $true }
+    # Quoted by hand somewhere outside the queue.
+    if ($CitedStems.Contains($Stem)) { return $true }
+    return $false
+}
+
 try {
     # --- Read the hook input. It carries session_id and cwd, which is our whole addressing substrate.
     $stdinRaw = ''
@@ -573,7 +740,11 @@ try {
         $common = & git -C $AnchorRepo rev-parse --path-format=absolute --git-common-dir 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
     }
-    $root = Join-Path $common.Trim() 'mefor-coord/mail'
+    # The coordination root is named in its own variable because the receipt sweep's citation guard
+    # reads the coordination tree OUTSIDE mail/. Deriving it back out of $root with Split-Path would
+    # be a second spelling of the same path; two Join-Paths is one.
+    $coordRoot = Join-Path $common.Trim() 'mefor-coord'
+    $root = Join-Path $coordRoot 'mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
     $asOf = [DateTime]::UtcNow.ToString('o')
@@ -638,6 +809,26 @@ try {
     $strandedUnproven = 0
     $unownedClaims = 0
     $swept = 0
+    # Receipts removed, and the boxes the sweep reached. Reported separately from $swept because they
+    # answer different questions: $swept bounds the queue, this bounds the record OF the queue, and a
+    # reader who sees one move and not the other is entitled to know which one ran.
+    $sweptReceipts = 0
+    # FAIL CLOSED, AND SAY SO. A guard that could not be evaluated keeps every receipt, and a silent
+    # skip would be indistinguishable from a sweep that found nothing to do.
+    $receiptSweepSkipped = $false
+    # --- TRUNCATION, ONE FLAG PER BUDGETED PHASE. -------------------------------------------------
+    # "swept 1,000" and "swept 1,000, and did not reach the end" are different facts about the queue,
+    # and the whole reason the budgets exist is that the second one must never print as the first. A
+    # reader who cannot tell them apart reads a bounded pass as a finished one and stops looking.
+    #
+    # THE FLAG MEANS "THIS PHASE DID NOT REACH THE END OF ITS INPUT", NOT "deletes == budget". A pass
+    # whose budget ran out on the very last file it had to examine IS complete, and saying otherwise
+    # would cost a wholly pointless next pass and teach the reader to ignore the line. So each flag is
+    # set only where a candidate was left UNEXAMINED -- a file the loop broke before, or a box the
+    # loop skipped -- never by comparing a counter to its cap.
+    $messageSweepTruncated = $false
+    $markerSweepTruncated = $false
+    $receiptSweepTruncated = $false
     $duplicateStems = 0
     # --- The show/consume split's own counters. ---
     $alreadyShown = 0       # the held count, named for what the reader cares about.
@@ -656,8 +847,8 @@ try {
     # older wording said no such counter could ever exist and was wrong the moment that step moved.
 
     # --- Retention sweep of the TERMINAL directories. -------------------------------------------
-    # seen/ and expired/ only: NEVER inbox/ and NEVER claiming/. Nothing is ever read out of a
-    # terminal directory into a delivery, and the threshold cannot reach a file this drain just wrote,
+    # seen/ and expired/ only: NEVER inbox/, NEVER claiming/, NEVER stranded/. Nothing is ever read out
+    # of a terminal directory into a delivery, and the threshold cannot reach a file this drain wrote,
     # so a plain delete here cannot race a concurrent drain out of a message -- which is why this is
     # the one move-free path in the file.
     #
@@ -665,8 +856,11 @@ try {
     # and it is NOT a PHI retention control -- see docs/SESSION-MAIL.md, "What may never go in a
     # message body". Citing it as one would be a compensating control resting on a false premise, since the
     # copy that matters is the one it cannot reach.
-    # -File, AND its own try, AND a name we minted. Each closes a different hole, and the first two
-    # were found by measurement rather than by reading:
+    #
+    # FILES ONLY, AND ITS OWN try, AND a name we minted. Each closes a different hole, and the first
+    # two were found by measurement rather than by reading. The files-only half is spelled
+    # `DirectoryInfo.EnumerateFiles` here rather than `Get-ChildItem -File`; the guarantee is the same
+    # one and the reason it exists is unchanged:
     #
     #   -File   -- `Get-ChildItem -Filter *.json` MATCHES DIRECTORIES. A directory named `x.json` in
     #              seen/ therefore reached Remove-Item, which without -Recurse asks the host whether to
@@ -682,28 +876,156 @@ try {
     #              never be able to abort the work it precedes.
     #   the name -- a file in a terminal directory whose name this channel did not mint is not ours to
     #              delete, for the same reason the claiming/ sweep leaves such files alone.
+    #
+    # EVERY BOX, NOT THIS ONE, AND THAT WIDENING IS THE DEFECT THIS BLOCK WAS REWRITTEN TO CLOSE. The
+    # loop used to run over $seenDir and $expiredDir -- the CURRENT worktree's box. A box is keyed by
+    # worktree, a worktree is removed once its work lands, and the box outlives it with nobody left to
+    # drain it. So the only boxes the rule ever reached were the ones still being drained, which are
+    # exactly the boxes whose contents are newest, and every other box kept everything forever.
+    #
+    # MEASURED READ-ONLY ON THE LIVE SPOOL, 2026-09-17, over 188 boxes: 23,855 of 24,205 files in
+    # seen/ were already past a rule written to delete them, and 33,121 of 33,474 receipts were.
+    #   $cut=[DateTime]::UtcNow.AddDays(-7)
+    #   foreach($b in Get-ChildItem <root>/box -Directory){ Get-ChildItem $b/seen -File } | measure
+    #
+    # THE STATE LIST IS THE WHOLE SAFETY PROPERTY OF THE WIDENING, and it is the one thing here that
+    # must not be relaxed. inbox/ holds undelivered mail and stranded/ holds the record of a claim
+    # whose owner died; both are older than the window almost by definition, and neither is this
+    # sweep's to touch. Measured at the same reading: 285 undelivered messages and 6 stranded records
+    # sit inside the window's reach and are alive only because they are not in this list.
+    #
+    # ONE try PER BOX, not one around all of them. With 188 boxes, a single unreadable directory used
+    # to be able to end the sweep for every other box as well.
     $cutoff = [DateTime]::UtcNow.AddDays(-$RETAIN_DAYS)
-    try {
-        foreach ($d in @($seenDir, $expiredDir)) {
-            foreach ($old in @(Get-ChildItem -LiteralPath $d -Filter *.json -File -EA SilentlyContinue)) {
-                if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
-                if (-not (Split-MailFileName -Name $old.Name)) { continue }
-                Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
-                if (-not (Test-Path -LiteralPath $old.FullName)) { $swept++ }
+    $boxRoot = Join-Path $root 'box'
+    $boxDirs = @()
+    try { $boxDirs = @([System.IO.Directory]::EnumerateDirectories($boxRoot)) }
+    catch { $sweepFailed = $true }
+
+    # THE KEEP SET FOR THE RECEIPT SWEEP, READ BEFORE ANY DELETE. Its position in this file is load
+    # bearing, not incidental: see Get-LiveMessageStems. $null means it could not be built, and the
+    # receipt sweep below reads that as "keep everything".
+    $messageStems = $null
+    try { $messageStems = Get-LiveMessageStems -BoxRoot $boxRoot }
+    catch { $messageStems = $null; $sweepFailed = $true }
+
+    # THE BUDGETS BIND HERE, AND THE ORDER THIS LOOP RUNS IN IS WORTH ONE SENTENCE. Boxes come back in
+    # the same enumeration order every pass, so a bounded pass always stops in the same place. That is
+    # not starvation: the front of the enumeration shrinks monotonically, so a box at the back is
+    # reached in a bounded number of passes. It does mean the back waits for the front, which is the
+    # honest description and is why the truncation line exists rather than a claim that the sweep ran.
+    foreach ($bd in $boxDirs) {
+        # A BOX THIS PHASE IS ABOUT TO SKIP IS A BOX IT DID NOT EXAMINE, which is the flag's exact
+        # meaning. Set here rather than by comparing the counter to its cap at the end, because the
+        # pass that spends its last delete on the last file of the last box is COMPLETE and must not
+        # claim otherwise.
+        if ($swept -ge $MESSAGE_DELETE_BUDGET) { $messageSweepTruncated = $true }
+        if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true }
+        if ($messageSweepTruncated -and $markerSweepTruncated) { break }
+        try {
+            foreach ($state in @('seen', 'expired')) {
+                if ($messageSweepTruncated) { break }
+                $d = [System.IO.Path]::Combine($bd, $state)
+                if (-not [System.IO.Directory]::Exists($d)) { continue }
+                # EnumerateFiles RETURNS FILES ONLY, which is the same guarantee -File was carrying and
+                # for the same measured reason: a DIRECTORY named x.json under seen/ reached Remove-Item,
+                # which without -Recurse asks the host whether to delete a non-empty container, and a
+                # hook has no host UI -- so the call threw PSInvalidOperationException and
+                # -ErrorAction SilentlyContinue did not suppress it. It is also the fast path: Get-ChildItem
+                # over 188 boxes measured 2,699ms against 159ms here on the live spool, 2026-09-17.
+                foreach ($old in @(([System.IO.DirectoryInfo]::new($d)).EnumerateFiles('*.json'))) {
+                    # At the TOP, so reaching it proves there was another file to examine. Placing it
+                    # after the delete would fire on a pass that had just finished its input and
+                    # report a complete sweep as a bounded one.
+                    if ($swept -ge $MESSAGE_DELETE_BUDGET) { $messageSweepTruncated = $true; break }
+                    if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
+                    if (-not (Split-MailFileName -Name $old.Name)) { continue }
+                    Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+                    if (-not (Test-Path -LiteralPath $old.FullName)) { $swept++ }
+                }
+            }
+            # ORPHAN MARKERS, BY AGE. The message-based sweep below cannot see the one case that matters
+            # here: a marker sitting beside a message nobody ever consumes, whose session is long gone.
+            # Widened with the rest, and for the same reason -- age is a property of the marker, not of
+            # whose box it sits in, and a dead worktree's markers were never swept by anything.
+            $shownForBox = [System.IO.Path]::Combine($bd, 'shown')
+            if ([System.IO.Directory]::Exists($shownForBox) -and -not $markerSweepTruncated) {
+                foreach ($old in @(([System.IO.DirectoryInfo]::new($shownForBox)).EnumerateFiles('*.marker'))) {
+                    if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true; break }
+                    if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
+                    if (-not (Split-ShownMarkerName -Name $old.Name)) { continue }
+                    Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+                    if (-not (Test-Path -LiteralPath $old.FullName)) { $sweptMarkers++ }
+                }
             }
         }
-        # ORPHAN MARKERS, BY AGE. The message-based sweep below cannot see the one case that matters
-        # here: a marker sitting beside a message nobody ever consumes, whose session is long gone. Same
-        # three hardenings and the same measured reasons as above -- -File, this file's own try, and a
-        # name this channel minted.
-        foreach ($old in @(Get-ChildItem -LiteralPath $shownDir -Filter *.marker -File -EA SilentlyContinue)) {
-            if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
-            if (-not (Split-ShownMarkerName -Name $old.Name)) { continue }
-            Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
-            if (-not (Test-Path -LiteralPath $old.FullName)) { $sweptMarkers++ }
+        catch { $sweepFailed = $true }
+    }
+
+    # --- Retention sweep of receipts/. ------------------------------------------------------------
+    # THE RECORD GREW WITHOUT BOUND BECAUSE NOTHING EVER SWEPT IT. receipts/ is one flat directory for
+    # the whole queue, so it was never box-scoped and never reached by the loop above either.
+    #
+    # A RECEIPT NAME IS A BARE STEM, <stem>.json, SO Split-ReceiptFileName IS THE VALIDATOR AND
+    # Split-MailFileName IS THE WRONG ONE. Split-MailFileName requires the --<claim token> half that a
+    # message filename carries and a receipt name does not, so it rejects every receipt in the
+    # directory -- and a sweep guarded by it deletes nothing while reporting, truthfully, that it ran.
+    # That failure is silent in both directions, which is why mail-key.ps1 says it again at the
+    # function rather than leaving it to a reader comparing two function names.
+    #
+    # FAIL CLOSED. Either guard set failing to build keeps every receipt and says so in the counters.
+    if ($null -eq $messageStems) { $receiptSweepSkipped = $true }
+    else {
+        # PASS A: the aged, well-named receipts, guarded with an EMPTY citation set. This is the cheap
+        # half of the guard and it decides exactly one thing -- whether the expensive citation walk is
+        # worth starting. IT IS NEVER A VERDICT: every candidate it yields is asked again below with
+        # the real set before anything is removed. An empty set can only ever under-protect, so a
+        # receipt kept here is one no citation could have released.
+        $emptyCited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        # A List, not `$candidates += ...`. Appending to a PowerShell array reallocates and copies the
+        # whole array every time, and the first pass after this shipped had 33,121 aged receipts to
+        # consider -- quadratic on exactly the run that is largest.
+        $candidates = [System.Collections.Generic.List[pscustomobject]]::new()
+        try {
+            foreach ($old in @(([System.IO.DirectoryInfo]::new($receiptDir)).EnumerateFiles('*.json'))) {
+                if ($old.LastWriteTimeUtc -ge $cutoff) { continue }
+                $rparts = Split-ReceiptFileName -Name $old.Name
+                if (-not $rparts) { continue }
+                if (Test-ReceiptProtected -Stem $rparts.Stem -MessageStems $messageStems -CitedStems $emptyCited) { continue }
+                $candidates.Add([pscustomobject]@{ File = $old; Stem = $rparts.Stem })
+            }
+        }
+        catch { $sweepFailed = $true; $receiptSweepSkipped = $true; $candidates.Clear() }
+
+        # THE SCAN ABOVE IS NOT BUDGETED; ONLY THE DELETES BELOW ARE, AND THAT ASYMMETRY IS THE WHOLE
+        # DESIGN OF THIS PHASE. Capping the candidate LIST would wedge the sweep: a block of
+        # guard-protected receipts at the front of the enumeration would fill the list on every pass,
+        # be released by nothing, and every receipt behind them would go unexamined forever.
+        # Guard-protected files exist here by design and do not exist in the message phase -- nothing
+        # protects an aged, well-named file in seen/ -- which is why that loop may break on its budget
+        # and this one may not. Full-width scanning is affordable: 729-929 ms over all 33,480 receipts,
+        # three runs on the live spool 2026-09-17, and it is charged in the arithmetic at the budgets.
+        if ($candidates.Count -gt 0 -and -not $receiptSweepSkipped) {
+            # PASS B: the citation walk, then the verdict. The walk reads the whole coordination tree
+            # outside mail/ -- measured 4,092 files and 45MB in 0.9s warm and 2.1s cold on the live
+            # tree, 2026-09-17 -- so a drain with nothing to sweep must not pay for it, and that is the
+            # only reason the two passes exist.
+            $citedStems = $null
+            try { $citedStems = Get-CitedStems -CoordRoot $coordRoot -MailRoot $root -ExcludedPrefix $CITATION_EXCLUDED_PREFIX }
+            catch { $citedStems = $null; $sweepFailed = $true }
+            if ($null -eq $citedStems) { $receiptSweepSkipped = $true }
+            else {
+                foreach ($c in $candidates) {
+                    # At the TOP, so reaching it proves a candidate was left unexamined. A pass that
+                    # spends its last delete on the last candidate finished its input and says so.
+                    if ($sweptReceipts -ge $RECEIPT_DELETE_BUDGET) { $receiptSweepTruncated = $true; break }
+                    if (Test-ReceiptProtected -Stem $c.Stem -MessageStems $messageStems -CitedStems $citedStems) { continue }
+                    Remove-Item -LiteralPath $c.File.FullName -Force -ErrorAction SilentlyContinue
+                    if (-not (Test-Path -LiteralPath $c.File.FullName)) { $sweptReceipts++ }
+                }
+            }
         }
     }
-    catch { $sweepFailed = $true }
 
     # --- Sweep claims whose owner died. ----------------------------------------------------------
     # A claimer that wins the move and then dies leaves the message in claiming/ under its own token.
@@ -766,7 +1088,12 @@ try {
             $lp = Split-MailFileName -Name $lf.Name
             if ($lp) { [void]$liveStems.Add($lp.Stem) }
         }
+        # THE SAME MARKER BUDGET, BECAUSE THIS INCREMENTS THE SAME COUNTER. Two sweeps remove markers
+        # -- the by-age one in the box loop above and this by-message one over the current box -- and a
+        # budget that bound only the first would leave $sweptMarkers unbounded and the truncation line
+        # reporting on half of what produced it.
         foreach ($mk in @(Get-ChildItem -LiteralPath $shownDir -Filter *.marker -File -EA SilentlyContinue)) {
+            if ($sweptMarkers -ge $MARKER_DELETE_BUDGET) { $markerSweepTruncated = $true; break }
             $mp = Split-ShownMarkerName -Name $mk.Name
             if (-not $mp) { $unownedMarkers++; continue }
             if ($liveStems.Contains($mp.Stem)) { continue }
@@ -1061,9 +1388,39 @@ try {
     }
     if ($filtered -gt 0) { $counterLines += "$filtered message(s) are addressed to a different session id and were left in the inbox." }
     if ($duplicateStems -gt 0) { $counterLines += "$duplicateStems file(s) repeat a message id already seen this pass and were left in the inbox." }
-    if ($sweepFailed) { $counterLines += "A housekeeping sweep of seen/, expired/ or shown/ could not complete; delivery was unaffected." }
+    if ($sweepFailed) { $counterLines += "A housekeeping sweep of seen/, expired/, shown/ or receipts/ could not complete; delivery was unaffected." }
     if ($unownedClaims -gt 0) { $counterLines += "$unownedClaims file(s) in claiming/ carry a name this channel did not mint and were left alone." }
-    if ($swept -gt 0) { $counterLines += "$swept message(s) older than $RETAIN_DAYS days were removed from seen/ and expired/." }
+    # $boxDirs.Count is what the sweep EXAMINED, which includes any box whose own try threw. That is
+    # the honest number here: the reader is being told how wide the pass was, not how many boxes lost
+    # a file, and $sweepFailed is what reports the difference.
+    if ($swept -gt 0) { $counterLines += "$swept message(s) older than $RETAIN_DAYS days were removed from seen/ and expired/ across $($boxDirs.Count) box(es) examined." }
+    if ($sweptReceipts -gt 0) {
+        $counterLines += "$sweptReceipts receipt(s) older than $RETAIN_DAYS days were removed. Each named a message that is"
+        $counterLines += "in no box any more and is quoted nowhere outside mail/."
+    }
+    if ($receiptSweepSkipped) {
+        # NAMED, because the alternative is a guard that failed and a sweep that found nothing to do
+        # rendering as the same silence.
+        $counterLines += "The receipt sweep did not run: a guard could not be evaluated, so every receipt was kept."
+    }
+    # --- WHAT A BOUNDED PASS SAYS ABOUT ITSELF. ---------------------------------------------------
+    # A hook killed at its 20-second timeout renders NOTHING -- no counter block, no sentence, no
+    # partial line -- so the only thing that can report a bounded sweep is a sweep that chose to stop.
+    # These lines are that report, and they say the fact the budget actually establishes: the phase
+    # did not reach the end of its input. Each names its own phase, because the budgets are
+    # independent and "the sweep is behind" would not tell a reader WHICH record is still growing.
+    if ($messageSweepTruncated) {
+        $counterLines += "The seen/ and expired/ sweep stopped at its per-pass budget of $MESSAGE_DELETE_BUDGET delete(s)"
+        $counterLines += "without reaching the end of its input. The rest is still on disk and the next drain resumes."
+    }
+    if ($markerSweepTruncated) {
+        $counterLines += "The shown/ marker sweep stopped at its per-pass budget of $MARKER_DELETE_BUDGET delete(s)"
+        $counterLines += "without reaching the end of its input. The rest is still on disk and the next drain resumes."
+    }
+    if ($receiptSweepTruncated) {
+        $counterLines += "The receipt sweep stopped at its per-pass budget of $RECEIPT_DELETE_BUDGET delete(s) without"
+        $counterLines += "reaching the end of its candidates. The rest is still on disk and the next drain resumes."
+    }
     # The show/consume split's own outcome. ONE sentence now, because there is only one: a marker can
     # suppress a re-display at a non-consuming event and nothing else. A consuming drain ignores markers
     # entirely, so $alreadyShown is unreachable when $consuming and the branch that used to report a
@@ -1101,9 +1458,21 @@ try {
         # A box holding shown-and-held mail must never take the "box is EMPTY" branch below: that would
         # be a false statement about a box with mail in it, which is the defect this channel exists to
         # make impossible.
+        # $swept and $sweptReceipts are in the sum for the same reason $sweptMarkers already was: the
+        # widened sweep removes files in boxes NOBODY is sitting in, so the drain that does it is
+        # routinely one with an empty box of its own, and a mass delete that renders as silence is
+        # indistinguishable from a hook that did not run. The first pass after this shipped removed
+        # tens of thousands of files.
         $anything = ($unreadable + $expired + $malformed + $filtered + $deferred + $ceded + $stranded +
-            $unownedClaims + $duplicateStems + $alreadyShown + $unownedMarkers + $sweptMarkers)
-        if ($anything -gt 0) {
+            $unownedClaims + $duplicateStems + $alreadyShown + $unownedMarkers + $sweptMarkers +
+            $swept + $sweptReceipts)
+        # A TRUNCATED PHASE IS SOMETHING THAT HAPPENED, and it is carried separately rather than
+        # folded into the sum because a boolean is not a count. Today every truncation implies a
+        # non-zero counter above it -- a budget cannot be spent without deletes -- so this clause
+        # changes nothing. It is here so that the day somebody moves a break, a bounded pass cannot
+        # start rendering as silence, which is the failure this whole block exists to prevent.
+        $bounded = ($messageSweepTruncated -or $markerSweepTruncated -or $receiptSweepTruncated)
+        if ($anything -gt 0 -or $bounded) {
             $z = @("[mefor-mail] Drain ran at $asOf over $inboxDir. Nothing is being shown to you.")
             $z += $counterLines
             $z += "If that is surprising, run scripts\coord\mail.ps1 -List."

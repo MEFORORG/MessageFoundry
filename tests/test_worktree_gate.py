@@ -23,6 +23,8 @@ from typing import Any, NamedTuple
 
 import pytest
 
+from tests._spawn_lock import run_single
+
 GATE = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "worktree_gate.ps1"
 
 pytestmark = pytest.mark.skipif(
@@ -109,7 +111,9 @@ def run_gate(
     """
     raw = payload if isinstance(payload, str) else json.dumps(payload)
     try:
-        proc = subprocess.run(
+        # run_single, not subprocess.run: holds the shared side of tests/_spawn_lock.py so this
+        # launch is never in flight beside a 16-process pwsh storm (BACKLOG #1304).
+        proc = run_single(
             [
                 "pwsh",
                 "-NoProfile",
