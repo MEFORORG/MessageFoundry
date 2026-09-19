@@ -79,8 +79,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
-    ResponseTooLargeError,
-    read_bounded,
+    EgressReplyError,
+    drain_bounded,
     read_bounded_text,
 )
 
@@ -791,7 +791,7 @@ class SoapDestination(DestinationConnector):
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion. Unlike the length gate this
                 # method deliberately omits, this bound CAN fire: the peer chooses the body.
-                read_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"SOAP {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -872,9 +872,10 @@ class SoapDestination(DestinationConnector):
                     connector=f"SOAP {_redact_url(self.url)} fault body",
                     encoding=self.encoding,
                 )
-            except ResponseTooLargeError:
+            except EgressReplyError:
+                # The FAMILY, not just the byte bound -- see the twin arm in fhir.py.
                 logger.warning(
-                    "SOAP %s returned an HTTP %s fault body over the response bound; "
+                    "SOAP %s returned an HTTP %s fault body the engine could not read whole; "
                     "classifying on the status alone",
                     _redact_url(self.url),
                     exc.code,

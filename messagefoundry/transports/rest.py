@@ -72,7 +72,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import read_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -1613,7 +1613,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                read_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
