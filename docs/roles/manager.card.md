@@ -88,7 +88,7 @@ The change itself, the enqueue, the merge, and the ruling on a red.
 
 ## The full playbook
 
-`MANAGER.md`, in the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a
+`MANAGER.md`, in the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a
 working tree:
 
     git -C <korus clone> fetch origin

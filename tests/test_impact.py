@@ -602,3 +602,59 @@ def test_codeset_remove_surfaces_dangling_referrers_before_unlink(tmp_path: Path
     result = codeset_edit.remove_code_set(config_dir, "diets", validate=_validate_code_set)
     assert not (config_dir / "codesets" / "diets.csv").exists()
     assert result["referrers"] == [{"referrer_kind": "handler", "referrer": "h_cs"}]
+
+
+# The same module with its two connection declarations removed: a handler that still names the code
+# set, in a dir that declares no connection at all. The A/B partner of _CODESET_MOD.
+_CODESET_MOD_NO_CONNECTIONS = (
+    "from messagefoundry import Send, code_set, handler, router\n"
+    "\n"
+    "\n"
+    '@router("r_cs")\n'
+    "def r_cs(msg):\n"
+    '    return ["h_cs"]\n'
+    "\n"
+    "\n"
+    '@handler("h_cs")\n'
+    "def h_cs(msg):\n"
+    '    label = code_set("diets").get("A")\n'
+    '    return Send("OB_CS", msg)\n'
+)
+
+
+def test_codeset_rename_still_rewrites_referents_with_no_connection_declared(
+    tmp_path: Path,
+) -> None:
+    """The #1648 empty-graph refusal must not reach this pre-flight, which SWALLOWS load failures.
+
+    ``_load_referent_registry`` catches ``WiringError`` and returns ``None``, so a refusal here is
+    silent: the table moves and every ``code_set("diets")`` call is left pointing at a file that no
+    longer exists, with no ``referents_rewritten`` key and no error. Measured A/B against
+    ``test_codeset_rename_rewrites_referent_and_moves_file`` above -- the only difference between the
+    two fixtures is whether a connection is declared.
+
+    Falsified by dropping ``allow_empty=True`` from ``_load_referent_registry``."""
+    config_dir = _write_config(tmp_path, {"mod.py": _CODESET_MOD_NO_CONNECTIONS})
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    (codesets / "diets.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+
+    result = codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate_code_set)
+
+    assert result["referents_rewritten"] == 1
+    mod = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'code_set("meals")' in mod and 'code_set("diets")' not in mod
+
+
+def test_codeset_remove_still_surfaces_referrers_with_no_connection_declared(
+    tmp_path: Path,
+) -> None:
+    """The delete pre-flight degrades the same silent way — zero referrers when there is one."""
+    config_dir = _write_config(tmp_path, {"mod.py": _CODESET_MOD_NO_CONNECTIONS})
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    (codesets / "diets.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+
+    result = codeset_edit.remove_code_set(config_dir, "diets", validate=_validate_code_set)
+
+    assert result["referrers"] == [{"referrer_kind": "handler", "referrer": "h_cs"}]

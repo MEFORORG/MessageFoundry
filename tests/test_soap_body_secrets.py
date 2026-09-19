@@ -278,6 +278,18 @@ def test_construction_rejects_secret_not_encodable_in_the_connection_encoding() 
     msg = str(ei.value)
     assert TOKEN in msg and "ascii" in msg  # names the token + the codec
     assert "é" not in msg and non_ascii not in msg  # never the character or the value
+    # The value must not be reachable on the exception chain either. A UnicodeEncodeError's `.object`
+    # is the string it failed on — HERE that string IS the secret. `raise ... from None` clears
+    # __cause__ but LEAVES __context__ populated (the flag only stops the default traceback printer
+    # walking), so the raise happens outside the `except` block instead.
+    assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None, (
+        "the UnicodeEncodeError is still on __context__ and its `.object` IS the secret"
+    )
+    node: BaseException | None = ei.value.__cause__ or ei.value.__context__
+    while node is not None:
+        assert non_ascii not in f"{node!r} {getattr(node, 'object', '')!r}"
+        node = node.__cause__ or node.__context__
     # utf-8 (the default encoding) encodes it fine — no false positive.
     _dest(secret=non_ascii)  # builds without raising
 

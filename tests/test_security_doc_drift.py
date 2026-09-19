@@ -459,6 +459,11 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # WP #285 (ASVS 6.7.1): the optional SHA-256 integrity pin over the OIDC CA anchor above —
         # an integrity control on trust material, not a consumer/environment access-decision input.
         "oidc_tls_ca_cert_pin",
+        # BACKLOG #299: the optional CRL checked against the IdP's certificate on the same back-channel
+        # hop. Sits with its two siblings above for the same reason — it decides whether the ENGINE
+        # trusts the IdP's certificate, not what the engine decides about a request it receives. A
+        # certificate it rejects never yields an identity at all.
+        "oidc_tls_crl_file",
         # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
         # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
         # ALERT — no login, session or authorization outcome turns on it (contrast its sibling

@@ -1104,8 +1104,8 @@ async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
-    Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
-    only an unexpected bug would 500. Closes the test connector afterward.
+    Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
+    raising — only an unexpected bug would 500. Closes the test connector afterward.
 
     Every ``detail`` here is scrubbed and length-bounded, because it does not stay in the response: the
     route JSON-dumps it into ``audit_log.detail``, the one at-rest error column written **without** the
@@ -1143,6 +1143,10 @@ async def _run_connection_test(
     try:
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
+        # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
+        # WiringError; it did not always, and the escape cost more than a 500. The credential route's
+        # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
+        # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
@@ -2082,23 +2086,38 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
-            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
-            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
-            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
-            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
-            # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
-            # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
-            # deployed=False wins over the tri-state.
+            # Also surface EVERY configured outbound with no failed/filtered/edge row yet, so an
+            # idle/no-edge lane stays visible + selectable whatever it is currently doing (its
+            # purge-eligibility is the `paused` field below; the status is the live per-outbound state,
+            # reason None — no failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced)
+            # just like a start-disabled one, so outbound_status reports "stopped" for it too — but it
+            # must surface as "not_deployed", never a silent "stopped", or a never-trafficked
+            # not-deployed lane is invisible (or worse, indistinguishable from a lane that SHOULD be
+            # running). Checked FIRST so deployed=False wins over the live state.
+            #
+            # #1568: the status recorded here is the lane's CURRENT state, never a list of the states
+            # judged worth a row. An earlier form listed only the paused ones, so STARTING an idle
+            # outbound deleted its row — and that row carries the selection a browser client reads its
+            # Start/Stop/Restart target from, so on a deploying site the control would vanish at exactly
+            # the moment an operator reached for it and recovery would mean the JSON API. Recording the
+            # state unconditionally also means a state added later surfaces here with no edit.
+            #
+            # `rr.running` gates the tri-state because `outbound_status` reports "running" for any lane
+            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
+            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
+            # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
+            # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
+            # that node, so the contradiction would ship WITH this fix if the gate were left out.
             for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
                     continue
-                if not oc.deployed:
-                    standalone[oname] = ("not_deployed", None)
-                    continue
-                ostatus = rr.outbound_status(oname)
-                if ostatus in ("stopping", "stopped"):
-                    standalone[oname] = (ostatus, None)
+                status = (
+                    "not_deployed"
+                    if not oc.deployed
+                    else (rr.outbound_status(oname) if rr.running else "stopped")
+                )
+                standalone[oname] = (status, None)
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -5142,6 +5161,10 @@ def create_app(
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
+        # BACKLOG #1741: the deployed inbounds that failed to build/bind at start (ADR 0031). The
+        # console's nav heart reads these — without them it reported "ok" over an engine listening on
+        # nothing. Names are scoped to the caller (see EngineInfo); the count is not.
+        failed_in: list[str] = []
         # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
         # running/stopped breakdown (vs channels_*, which count inbound only).
         conn_total = conn_running = conn_not_deployed = 0
@@ -5158,6 +5181,10 @@ def create_app(
             out_deployed = [name for name, oc in rr.registry.outbound.items() if oc.deployed]
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
+            # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
+            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            failed_in = [name for name in in_deployed if rr.connection_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane not operator-paused — consistent with inbound_running's
             # actually-started semantics (outbound_status reports "running" for any non-paused lane even
@@ -5261,6 +5288,13 @@ def create_app(
                 channels_running=running,
                 channels_stopped=total - running,
                 outbox_by_status=await engine.store.stats(),
+                channels_failed=len(failed_in),
+                # Scoped to the caller: an unscoped identity (allowed_channels is None) sees every
+                # name, a channel-scoped one only its own. `_user` keeps its historical underscore
+                # because both console call sites pass it by keyword across the UI seam.
+                channels_failed_names=[
+                    name for name in failed_in if _user.can_access_channel(name)
+                ],
             ),
             kpis=kpis,
             db=DbInfo(

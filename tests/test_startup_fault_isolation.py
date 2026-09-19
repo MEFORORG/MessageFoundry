@@ -451,3 +451,83 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
         assert "out_dir" in (failed[0]["error"] or "")
     finally:
         await engine.stop()
+
+
+async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: Path) -> None:
+    """BACKLOG #1741: /status carries the DEPLOYED inbounds that failed to start, so the console's
+    nav heart can stop reporting ok over an engine listening on nothing.
+
+    The count is estate-wide; the NAMES are the caller-visible subset, because /connections already
+    hides an out-of-scope inbound's name from a channel-scoped operator and this must not be a side
+    channel around that. Both identities are exercised against ONE engine, so the two answers are
+    read off the same degraded graph rather than two independently-built ones.
+    """
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.auth import Role
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.pipeline import Engine
+
+    port = _free_port()
+    reg = Registry()
+    # Same (host, port) twice: 'winner' binds, 'loser' is isolated (ADR 0031) — the row's measured
+    # case, an MLLP inbound that never got its port.
+    reg.add_inbound(build_inbound_connection("winner", MLLP(port=port), router="r"))
+    reg.add_inbound(build_inbound_connection("loser", MLLP(port=port), router="r"))
+    reg.add_router("r", lambda m: [])
+
+    pw = "a-strong-test-passphrase"
+    engine = await Engine.create(tmp_path / "status.db", poll_interval=0.02)
+    engine.add_registry(reg)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        # 'wide' sees the whole estate; 'narrow' is scoped to 'winner' only, so the FAILED inbound
+        # is out of its scope.
+        for username, channels in (("wide", [ALL_CHANNELS]), ("narrow", ["winner"])):
+            uid = await service.create_local_user(
+                username=username,
+                password=pw,
+                display_name=None,
+                email=None,
+                roles=[Role.VIEWER.value],
+                actor="test",
+            )
+            await service.set_channel_scope(uid, channels, actor="test")
+            u = await service.store.get_user(uid)
+            assert u is not None and u.password_hash is not None
+            await service.store.set_password(
+                uid, password_hash=u.password_hash, must_change_password=False
+            )
+
+        await engine.start()  # degraded — does NOT raise (ADR 0031)
+        assert engine.registry_runner is not None
+        assert set(engine.registry_runner.degraded_connections()) == {"loser"}
+
+        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+
+            async def _engine_info(username: str) -> dict[str, object]:
+                r = await c.post(
+                    "/auth/login",
+                    json={"username": username, "password": pw, "provider": "local"},
+                )
+                auth_header = {"Authorization": f"Bearer {r.json()['token']}"}
+                body = (await c.get("/status", headers=auth_header)).json()
+                assert isinstance(body, dict), body
+                return dict(body["engine"])
+
+            wide = await _engine_info("wide")
+            narrow = await _engine_info("narrow")
+
+        # Both inbounds are deployed, so the estate-wide counters agree for either caller.
+        assert wide["channels_total"] == narrow["channels_total"] == 2
+        assert wide["channels_failed"] == narrow["channels_failed"] == 1
+        # Only the unscoped caller learns WHICH one. 'narrow' is scoped to 'winner', so the failed
+        # 'loser' is out of its scope and is not named — the count alone still warns its heart.
+        assert wide["channels_failed_names"] == ["loser"]
+        assert narrow["channels_failed_names"] == []
+    finally:
+        await engine.stop()

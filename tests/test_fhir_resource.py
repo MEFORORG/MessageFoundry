@@ -96,4 +96,17 @@ def test_validation_error_never_leaks_the_body() -> None:
     exc = excinfo.value
     assert PHI_CANARY not in str(exc)
     assert PHI_CANARY not in repr(exc)
-    assert exc.__cause__ is None  # `from None` severed the PHI-bearing pydantic ValidationError
+    assert exc.__cause__ is None  # nothing chained on __cause__
+    # ...and nothing on __context__ either. `raise ... from None` clears __cause__ and sets
+    # __suppress_context__, but LEAVES __context__ populated — the flag only stops the default
+    # traceback printer walking, it does not detach the exception, so a chain-walking handler still
+    # reached the pydantic ValidationError and the PHI in it. The raise now happens outside the
+    # `except` block, which is what actually empties both chains.
+    assert exc.__context__ is None, (
+        "the pydantic ValidationError is still reachable on __context__ — `from None` does not "
+        "remove it; raise from outside the handler"
+    )
+    node: BaseException | None = exc.__cause__ or exc.__context__
+    while node is not None:
+        assert PHI_CANARY not in f"{node!r}", "PHI reachable by walking the exception chain"
+        node = node.__cause__ or node.__context__
