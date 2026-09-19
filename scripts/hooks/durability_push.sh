@@ -94,8 +94,16 @@ URL=$(git remote get-url "$REMOTE" 2>/dev/null)
 # Hard refusal for the canonical PUBLIC remote. This is a named-target check, not a general
 # visibility test -- there is no offline visibility test. It exists because the most likely
 # misconfiguration by far is nominating the remote that is already there.
+#
+# THE TRAILING MATCH IS LOAD-BEARING, AND A PREFIX GLOB HERE FAILED IN EXACTLY THE WRONG DIRECTION.
+# This read `*MEFORORG/MessageFoundry*` until 2026-09-19, when the private vault was transferred
+# into the same organization and became `MEFORORG/MessageFoundry-vault`. That path matches the
+# prefix glob, so the hook began refusing the PRIVATE remote as though it were the public one --
+# and because the refusal is `exit 0`, every commit still succeeded with durability silently OFF.
+# The two repositories are now one suffix apart under one owner, so nothing before the end of the
+# path distinguishes them. Anchor on the end, and accept only the spellings git actually stores.
 case "$URL" in
-  *MEFORORG/MessageFoundry*)
+  *MEFORORG/MessageFoundry | *MEFORORG/MessageFoundry.git | *MEFORORG/MessageFoundry/)
     echo "durability_push: REFUSING -- mefor.durabilityRemote names the canonical PUBLIC repo." >&2
     echo "  A push there is publication, which is the gate this hook exists to avoid tripping." >&2
     echo "  Nominate a private remote instead, then re-commit." >&2
