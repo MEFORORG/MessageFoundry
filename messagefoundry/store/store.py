@@ -924,9 +924,13 @@ def _alert_summary(row: Any) -> AlertSummary:
     zero rows is NULL and an unrecognised severity ranks 0; both land on ``worst_severity=None``.
     """
     if row is None:
-        # Structural only: an un-grouped aggregate always returns exactly one row. Each backend's
-        # fetch-one is typed Optional, so the narrowing lives here rather than at three call sites.
-        return AlertSummary(total=0, worst_severity=None)
+        # An un-grouped aggregate always returns exactly one row, so this is unreachable by design --
+        # but it must RAISE rather than fall back to an empty summary. AlertSummary(total=0) is not a
+        # safe default here: it paints a confident gray "no active alerts" bell over an estate that may
+        # be full of criticals, which is the silent-wrong class this whole item exists to remove. The
+        # nav route already degrades correctly on an exception (alerts=None HIDES the bell rather than
+        # asserting zero), so raising reaches a better answer than any value this could invent.
+        raise RuntimeError("active-alert aggregate returned no row")
     return AlertSummary(
         total=int(row["n"] or 0),
         worst_severity=_SEVERITY_BY_RANK.get(int(row["worst"] or 0)),
