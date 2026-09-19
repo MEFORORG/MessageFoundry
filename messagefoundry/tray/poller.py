@@ -5,7 +5,9 @@
 A single daemon thread ticks every few seconds: read the local SCM state, probe the tokenless
 ``/health`` and ``/ui``, derive the :class:`~messagefoundry.tray.state.TrayState`, and hand a :class:`PollResult`
 to the shell's update callback (which repaints the icon on the UI thread). The cadence tightens
-to ``waitHint/10`` while a service transition is in flight.
+to ``waitHint/10`` while a service transition is in flight. A tick that *raises* is logged and
+published as ``UNKNOWN`` rather than ending the thread: an icon frozen on its last good reading
+reports stale state as live, and says nothing about having stopped.
 
 The timing that turns raw readings into :class:`~messagefoundry.tray.state.ProbeInputs` — the boot-grace clock and
 stuck-pending detection — is the **pure** :func:`advance`, keyed to a **monotonic** ``now`` so a
@@ -163,7 +165,12 @@ class StatusPoller:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            result = self.poll_once(self._clock())
+            now = self._clock()
+            try:
+                result = self.poll_once(now)
+            except Exception:  # supervisory boundary -- see the module docstring
+                log.exception("tray status poll raised; publishing UNKNOWN for this tick")
+                result = self._unknown_result(now)
             try:
                 self._on_update(result)
             except Exception:  # a UI callback must never kill the poll loop (supervisory boundary)
@@ -178,6 +185,21 @@ class StatusPoller:
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
         ui = self._ui_probe(client) if client is not None else UiProbe.UNKNOWN
         self._tracking, inputs = advance(self._tracking, reading, health, ui, now)
+        return self._build_result(inputs, reading, now)
+
+    def _unknown_result(self, now: float) -> PollResult:
+        """The stand-in :class:`PollResult` for a tick that raised.
+
+        Folded through the same pure :func:`advance` / :meth:`_build_result` path as a real tick, so
+        the tracking clock keeps moving and the next successful tick sees a consistent history.
+        :func:`derive_state` already reduces an unqueryable SCM with both probes dark to
+        :data:`~messagefoundry.tray.state.TrayState.UNKNOWN`, so the reducer needs no failure case
+        of its own.
+        """
+        reading = ScmReading(state=ScmState.UNAVAILABLE)
+        self._tracking, inputs = advance(
+            self._tracking, reading, HealthProbe.DOWN, UiProbe.UNKNOWN, now
+        )
         return self._build_result(inputs, reading, now)
 
     def _build_result(self, inputs: ProbeInputs, reading: ScmReading, now: float) -> PollResult:

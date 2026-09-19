@@ -4,14 +4,19 @@
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Iterator
 
 import httpx
+import pytest
 
+from messagefoundry.tray import state as state_mod
 from messagefoundry.tray.config import TrayConfig
-from messagefoundry.tray.poller import StatusPoller, Tracking, advance
+from messagefoundry.tray.poller import PollResult, StatusPoller, Tracking, advance
 from messagefoundry.tray.state import HealthProbe, ScmState, TrayState, UiProbe
 from messagefoundry.tray.winsvc import ScmReading
+
+_ENGINE_URL = "http://127.0.0.1:8765"
 
 # --- pure advance() ---------------------------------------------------------
 
@@ -63,7 +68,7 @@ def _scripted_poller(
     scm_it: Iterator[ScmReading] = iter(scm)
     health_it: Iterator[HealthProbe] = iter(health)
     ui_it: Iterator[UiProbe] = iter(ui)
-    cfg = TrayConfig(engine_url="http://127.0.0.1:8765", service_name="MessageFoundry")
+    cfg = TrayConfig(engine_url=_ENGINE_URL, service_name="MessageFoundry")
 
     def reader(_name: str) -> ScmReading:
         return next(scm_it)
@@ -84,7 +89,7 @@ def _scripted_poller(
         health_probe=hp,
         ui_probe=up,
     )
-    dummy = httpx.Client(base_url="http://127.0.0.1:8765")
+    dummy = httpx.Client(base_url=_ENGINE_URL)
     poller._client = dummy  # non-None so the injected probes are consulted
     return poller, dummy
 
@@ -148,3 +153,45 @@ def test_poller_snapshot_reflects_ui_and_monitor_only() -> None:
         client.close()
     assert result.snapshot.console_enabled is False  # /ui was DISABLED
     assert result.snapshot.monitor_only is False  # local http engine
+
+
+# --- the poll thread outlives a failing tick --------------------------------
+
+
+def test_poll_thread_survives_a_raising_tick_and_publishes_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tick that raises is published as UNKNOWN and the thread ticks on, rather than dying."""
+    # The real next_poll_seconds against a near-zero base, so the recovery tick lands without a
+    # sleep in the test and the cadence function itself is still exercised.
+    monkeypatch.setattr(state_mod, "POLL_BASE_S", 0.001)
+
+    first_tick = iter([True])
+
+    def reader(_name: str) -> ScmReading:
+        if next(first_tick, False):
+            raise OSError("QueryServiceStatusEx blew up")
+        return ScmReading(ScmState.RUNNING)
+
+    published: queue.Queue[PollResult] = queue.Queue()
+    client = httpx.Client(base_url=_ENGINE_URL)
+    poller = StatusPoller(
+        TrayConfig(engine_url=_ENGINE_URL, service_name="MessageFoundry"),
+        on_update=published.put,
+        scm_reader=reader,
+        health_probe=lambda _c: HealthProbe.OK,
+        ui_probe=lambda _c: UiProbe.ENABLED,
+        client_factory=lambda _url: client,
+    )
+    poller.start()
+    try:
+        # A dead thread publishes nothing at all, so both gets time out on the unfixed loop.
+        fallback = published.get(timeout=10.0)
+        recovered = published.get(timeout=10.0)
+        thread = poller._thread
+        assert thread is not None and thread.is_alive()  # outlived the raising tick
+    finally:
+        poller.stop()
+
+    assert fallback.snapshot.state is TrayState.UNKNOWN  # published instead of freezing the icon
+    assert recovered.snapshot.state is TrayState.RUNNING  # and the tick after it recovered
