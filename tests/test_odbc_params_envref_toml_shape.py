@@ -4,18 +4,34 @@
 
 `_reject_envref_odbc_params` tested `isinstance(v, EnvRef)` and nothing else, which is only the
 CODE-FIRST shape. A `connections.toml` `[settings.odbc_params]` inline table arrives as a RAW DICT,
-because `parse_env_setting` decodes only top-level settings values and does not descend. Since
-`"database"` and `"database_poll"` are both live in `connections_file._TRANSPORTS`, that raw dict
-reached `Database()` unrefused and stringified into the DSN with its fallback value attached.
+because `parse_env_setting` decodes only top-level settings values and does not descend -- so that
+raw dict reached the connector factory unrefused and stringified into the DSN with its fallback
+value attached.
 
-The arms below are deliberately mixed. The TOML arm goes through the real loader, so it fails if the
-transport table ever stops routing `database` here. The EnvRef arms are PINS on behaviour that
-already worked. The two "still passes" arms are over-widening controls: the new predicate must not
-start refusing an ordinary nested mapping that is not an env marker.
+The TOML arms go through the REAL loader, and they cover BOTH odbc_params-taking transports, so the
+claim that each is reachable from a TOML table is gated rather than asserted in prose: drop either
+from the loader's transport table and an arm here goes red.
+
+At least one further position exists: `odbc_params = { env = "..." }` names the whole table, which IS
+a top-level settings value, so it decodes to an `EnvRef`, which has no `items()`; the resulting
+`AttributeError` escaped the loader as a bare traceback. Its arms are below.
+
+"At least", not a closed set. A marker ONE CONTAINER DEEP -- `env` plus an unrecognised key, or a
+marker inside a list -- still reaches the DSN with its `default` attached. Closing that means
+refusing every non-scalar odbc_params value, a wider rule than mirroring the decoder, and it is
+deliberately NOT folded in here; the over-widening arms below pin the current boundary, so whoever
+takes that on should expect to move them rather than read them as a false positive.
+
+The "still passes" arms are over-widening controls: the predicate must not start refusing an
+ordinary nested mapping that is not an env marker. The code-first `EnvRef` spelling already had its
+factory-level pin at `tests/test_database_transport.py::test_database_odbc_params_reject_envref`;
+this module pins it at the unit instead of restating that call.
 """
 
 from __future__ import annotations
 
+import inspect
+import re
 import textwrap
 from pathlib import Path
 from typing import Any, cast
@@ -53,30 +69,65 @@ def _database_kwargs(**over: Any) -> dict[str, Any]:
 # --- the defect: the connections.toml raw-dict spelling --------------------------------------
 
 
-def test_a_toml_inline_env_table_in_odbc_params_is_refused(tmp_path: Path) -> None:
+#: One `connections.toml` per odbc_params-taking transport, each with a nested env marker. Both are
+#: loaded through `load_config`, so the pair is what gates "every such transport is covered" --
+#: `database` is an outbound write, `database_poll` an inbound source, and they take different
+#: statement settings, which is why this is two documents rather than one parametrized string.
+_TOML_ARMS: dict[str, str] = {
+    "database": f"""
+        [[outbound]]
+        name = "OB_PG"
+        transport = "database"
+
+        [outbound.settings]
+        server = "db.example"
+        statement = "INSERT INTO t (a) VALUES (:a)"
+        dialect = "generic"
+        odbc_driver = "PostgreSQL Unicode"
+
+        [outbound.settings.odbc_params]
+        PORT = "5432"
+        SSLmode = {{ env = "pg_sslmode", default = "{FALLBACK_PROBE}" }}
+        """,
+    "database_poll": f"""
+        [[inbound]]
+        name = "IB_PG"
+        transport = "database_poll"
+        router = "r"
+
+        [inbound.settings]
+        server = "db.example"
+        poll_statement = "SELECT 1"
+        dialect = "generic"
+        odbc_driver = "PostgreSQL Unicode"
+
+        [inbound.settings.odbc_params]
+        PORT = "5432"
+        SSLmode = {{ env = "pg_sslmode", default = "{FALLBACK_PROBE}" }}
+        """,
+}
+
+
+@pytest.mark.parametrize("transport", sorted(_TOML_ARMS))
+def test_a_toml_inline_env_table_in_odbc_params_is_refused(transport: str, tmp_path: Path) -> None:
     """The arm that was red before #1806. Goes through the REAL loader, not a hand-built dict."""
     (tmp_path / "connections.toml").write_text(
-        textwrap.dedent(
-            f"""
-            [[outbound]]
-            name = "OB_PG"
-            transport = "database"
-
-            [outbound.settings]
-            server = "db.example"
-            statement = "INSERT INTO t (a) VALUES (:a)"
-            dialect = "generic"
-            odbc_driver = "PostgreSQL Unicode"
-
-            [outbound.settings.odbc_params]
-            PORT = "5432"
-            SSLmode = {{ env = "pg_sslmode", default = "{FALLBACK_PROBE}" }}
-            """
-        ),
-        encoding="utf-8",
+        textwrap.dedent(_TOML_ARMS[transport]), encoding="utf-8"
     )
     with pytest.raises(WiringError, match="may not use env"):
         load_config(tmp_path)
+
+
+def test_every_odbc_params_taking_transport_has_a_toml_arm() -> None:
+    """A coverage gate, so adding a third odbc_params-taking transport cannot ship untested here."""
+    from messagefoundry.config.connections_file import _TRANSPORTS
+
+    taking_odbc_params = {
+        name
+        for name, factory in _TRANSPORTS.items()
+        if "odbc_params" in inspect.signature(factory).parameters
+    }
+    assert taking_odbc_params == set(_TOML_ARMS)
 
 
 def test_the_toml_shape_is_refused_by_the_unit_too() -> None:
@@ -118,17 +169,78 @@ def test_database_poll_refuses_the_toml_shape_at_the_factory() -> None:
         )
 
 
+# --- the third position: an env ref on the odbc_params TABLE itself --------------------------
+
+
+def test_an_env_ref_on_the_odbc_params_table_itself_is_refused(tmp_path: Path) -> None:
+    """`parse_env_setting` DOES decode this one -- it is a top-level settings value -- so the factory
+    used to receive an `EnvRef`, call `.items()` on it, and die with a bare `AttributeError` that
+    `connections_file._build_spec` does not convert (it catches only TypeError/ValueError). The fix
+    makes it a typed WiringError; it stays un-located, because `_build_spec` re-raises a factory
+    WiringError ahead of the arm that adds the connection and file."""
+    (tmp_path / "connections.toml").write_text(
+        textwrap.dedent(
+            """
+            [[outbound]]
+            name = "OB_PG"
+            transport = "database"
+
+            [outbound.settings]
+            server = "db.example"
+            statement = "INSERT INTO t (a) VALUES (:a)"
+            dialect = "generic"
+            odbc_driver = "PostgreSQL Unicode"
+            odbc_params = { env = "pg_params", default = "PORT=5432" }
+            """
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="must be a table of ODBC keyword"):
+        load_config(tmp_path)
+
+
+#: Every arm carries `_NON_MAPPING_PROBE` somewhere inside it, so the value-echo assertion below is
+#: a LIVE control on each: a refusal that interpolated the value would fail all three, not just the
+#: one whose repr happens to contain the probe.
+_NON_MAPPING_PROBE = "PORT=5432"
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        (
+            "an EnvRef, from a decoded top-level marker",
+            env("pg_params", default=_NON_MAPPING_PROBE),
+        ),
+        ("a bare string", _NON_MAPPING_PROBE),
+        ("a list", [_NON_MAPPING_PROBE]),
+        ("an empty string, which is falsy AND not a table", ""),
+    ],
+)
+def test_a_non_mapping_odbc_params_is_refused_at_authoring(label: str, value: Any) -> None:
+    """`_build_odbc_dsn` already refuses a non-mapping at CONNECT; this moves the same refusal to
+    authoring time as a typed WiringError instead of a bare AttributeError. It does NOT name the
+    connection or the file -- `_build_spec` re-raises a factory WiringError unwrapped.
+
+    The empty-string arm is why the mapping check sits ABOVE the empty-table short-circuit: `""` is
+    falsy, so an earlier `if not odbc_params: return` accepted it and `_build_odbc_dsn`'s `or {}`
+    then read it as no params at all, with no diagnostic from either end.
+
+    The message must carry the TYPE, never the value. That last assertion is a live control on the
+    first three arms; the empty-string arm carries no probe and does not test it."""
+    with pytest.raises(WiringError, match="must be a table of ODBC keyword") as exc:
+        _reject_envref_odbc_params(cast("Any", value))
+    assert _NON_MAPPING_PROBE not in str(exc.value)
+    assert type(value).__name__ in str(exc.value)
+
+
 # --- pins: the code-first spelling was already refused and must stay refused -----------------
 
 
-def test_the_code_first_envref_spelling_is_still_refused() -> None:
-    """PIN, not new coverage -- this arm passed before #1806 and must not regress on the widening."""
-    with pytest.raises(WiringError, match="may not use env"):
-        Database(**_database_kwargs(odbc_params={"SSLmode": env("pg_sslmode")}))
-
-
 def test_the_code_first_envref_spelling_is_still_refused_at_the_unit() -> None:
-    """PIN."""
+    """PIN, not new coverage -- this arm passed before #1806 and must not regress on the widening.
+    The factory-level twin lives at
+    `tests/test_database_transport.py::test_database_odbc_params_reject_envref`."""
     with pytest.raises(WiringError, match="may not use env"):
         _reject_envref_odbc_params({"SSLmode": env("pg_sslmode", default=FALLBACK_PROBE)})
 
@@ -195,6 +307,9 @@ def test_the_refusal_lists_every_offending_key_sorted() -> None:
                 "Static": "keep-me",
             }
         )
-    message = str(exc.value)
-    assert "Alpha, Zeta" in message
-    assert "Static" not in message
+    # Assert against the PARENTHESISED offender list, not the whole message. `"Static" not in
+    # message` would be green only by letter case -- the refusal's own prose ends "only static
+    # driver keywords", so capitalising that word there would red this test for an unrelated reason.
+    listed = re.search(r"may not use env\(\) \(([^)]*)\)", str(exc.value))
+    assert listed is not None
+    assert listed.group(1) == "Alpha, Zeta"

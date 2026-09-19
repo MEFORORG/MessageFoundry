@@ -2530,12 +2530,41 @@ def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
     second through (BACKLOG #1806). Code-first ``odbc_params={"PWD": env("acme_pw")}`` arrives as an
     :class:`EnvRef`. A ``connections.toml`` ``[settings.odbc_params]`` inline table arrives as a **raw
     dict** — :func:`parse_env_setting` decodes only *top-level* settings values and does not descend, so
-    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Since ``"database"`` and
-    ``"database_poll"`` are both live in ``connections_file._TRANSPORTS``, that raw dict used to pass
-    unrefused and stringify into the DSN with its fallback value attached.
+    ``PWD = { env = "acme_pw", default = "…" }`` is copied through verbatim. Both factories that take
+    ``odbc_params`` are reachable from a TOML table (see :mod:`messagefoundry.config.connections_file`),
+    so that raw dict used to pass unrefused and stringify into the DSN with its fallback attached.
+
+    At least one further position exists and is not nested: ``odbc_params = { env = "..." }`` names
+    the *whole table*, which IS a top-level settings value, so ``parse_env_setting`` decodes it to an
+    :class:`EnvRef`. That object has no ``items()``, and the resulting :class:`AttributeError` is
+    neither a ``TypeError`` nor a ``ValueError``, so ``connections_file._build_spec`` did not convert
+    it — the operator got a bare traceback. The mapping check below makes that a typed
+    :class:`WiringError` instead; ``_build_odbc_dsn`` already refuses a non-mapping at connect, so
+    this only moves an existing refusal earlier. It does **not** make the refusal name the connection
+    or the file: ``_build_spec`` re-raises a factory ``WiringError`` unwrapped, ahead of the arm that
+    adds that context, so every factory refusal is un-located in the same way.
+
+    **The residual is a marker one container deep**, and it is deliberately still open here: a dict
+    carrying ``env`` plus an unrecognised key, or a marker inside a list, fails ``set(v) <=
+    _ENVREF_KEYS`` and reaches ``_build_odbc_dsn``, which ``str()``-splices it into the DSN with any
+    ``default`` attached. Closing it means refusing every non-scalar ``odbc_params`` value (no ODBC
+    keyword takes a container), which is a wider rule than mirroring the decoder and wants its own
+    row rather than being folded in here.
 
     Offenders are reported as **keys only**; the refusal must never echo the value, which may be a
-    fallback secret."""
+    fallback secret. The non-mapping arm reports the type name for the same reason."""
+    if odbc_params is None:
+        return
+    # Ahead of the empty-table short-circuit on purpose: `odbc_params = ""` is falsy AND not a table,
+    # and `_build_odbc_dsn`'s `or {}` would otherwise read it as "no params" with no diagnostic.
+    if not isinstance(odbc_params, Mapping):
+        raise WiringError(
+            "Database odbc_params must be a table of ODBC keyword -> value pairs, not "
+            f"{type(odbc_params).__name__} — write it as a table (TOML "
+            "[settings.odbc_params], or a Python dict). An env() reference naming the whole table "
+            "is refused here too; put a credential/password in the top-level username/password "
+            "fields (env-resolved + redacted)."
+        )
     if not odbc_params:
         return
     offenders = sorted(
