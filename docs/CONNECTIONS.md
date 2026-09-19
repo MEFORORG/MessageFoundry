@@ -1046,7 +1046,7 @@ one.
 | `url` | — (required) | endpoint; `http`/`https` only. Use `env()` for a DEV/PROD-specific host. |
 | `method` | `POST` | HTTP method |
 | `content_type` | `application/json` | sets the `Content-Type` header |
-| `headers` | `{}` | extra **static** headers (no secrets — these aren't `env()`-resolved) |
+| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
@@ -1328,7 +1328,7 @@ follow-on and is **not** built.
 | `url` | — (required) | endpoint; `http`/`https` only. Use `env()` for a DEV/PROD-specific host. |
 | `soap_action` | — | the `SOAPAction` (1.1 header; 1.2 `action` content-type param) |
 | `soap_version` | `1.1` | `1.1` (`text/xml`) or `1.2` (`application/soap+xml`) |
-| `headers` | `{}` | extra **static** headers (no secrets — not `env()`-resolved) |
+| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
@@ -1630,7 +1630,7 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`PUT {base}/{ResourceType}/{id}`) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware PUT) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
-| `headers` | `{}` | extra **static** headers (no secrets — not `env()`-resolved) |
+| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
@@ -1961,7 +1961,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 | `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able) |
 | `study_uid` | `None` → `POST {base}/studies` | when set, store into a known study (`POST {base}/studies/{study_uid}`) |
 | `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`) |
-| `headers` | `{}` | static extra headers (no secrets — not `env()`-resolved) |
+| `headers` | `{}` | static extra headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `timeout_seconds` | `30.0` | request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |
 | `capture_response` | `false` | capture the STOW-RS `dicom+json` response as a reply (ADR 0013) |

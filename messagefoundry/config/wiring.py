@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeIs
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -284,17 +284,77 @@ _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
 _ENVREF_KEYS = frozenset({"env", "default", "cast"})
 
 
-def _is_env_marker(value: Any) -> bool:
+def _is_env_marker(value: Any) -> TypeIs[dict[str, Any]]:
     """Is ``value`` a ``connections.toml`` env-ref inline table -- ``{env = "k", default = "..."}``?
 
     Factored out of :func:`parse_env_setting` so the nested-reference refusals test the SAME predicate
-    the decoder does. The two used to be one expression in one place; once a second caller needed it
-    (:func:`_reject_envref_headers`), a copy would have been free to drift, and a drifted copy fails
-    open -- it stops recognizing a marker the decoder still recognizes, and the refusal goes quiet."""
+    the decoder does. The two used to be one expression in one place; once other callers needed it
+    (:func:`_is_nested_envref`, :func:`_redact_header_value`), a copy would have been free to drift,
+    and a drifted copy fails open -- it stops recognizing a marker the decoder still recognizes, and
+    the refusal goes quiet.
+
+    It returns ``TypeIs`` rather than ``bool`` so a caller holding an ``object`` can index the marker
+    it just recognized. The alternative was a second ``isinstance(value, dict)`` at each such call --
+    redundant to this predicate, and a standing invitation for a reader to treat it as a real second
+    condition and widen this one to match."""
     return isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS
 
 
-def _reject_envref_headers(factory: str, headers: Mapping[str, Any] | None) -> None:
+def _is_nested_envref(value: Any) -> bool:
+    """Either shape a nested ``env()`` reference arrives in, since both have to be refused.
+
+    Code-first authoring gives an :class:`EnvRef` instance. ``connections.toml`` gives a RAW
+    ``{"env": ..., "default": ...}`` dict, because :func:`parse_env_setting` decodes only top-level
+    values and does not descend into a nested table -- so an ``isinstance(..., EnvRef)`` test alone
+    would refuse the code-first surface while the TOML one still shipped the default to the partner."""
+    return isinstance(value, EnvRef) or _is_env_marker(value)
+
+
+def _envref_label(value: Any) -> str:
+    """Name a nested reference in an operator message WITHOUT echoing its ``default``.
+
+    ``str()`` on an :class:`EnvRef` renders the whole dataclass, ``default=`` and all, and on the raw
+    marker the whole dict. So a refusal that builds its text by stringifying the offender MOVES the
+    leak into the operator log, ``messagefoundry check`` output and the support bundle rather than
+    closing it -- the shape BACKLOG #1183 is about. Only the env KEY is ever named."""
+    key = value.key if isinstance(value, EnvRef) else value.get("env")
+    return f"env({key!r})"
+
+
+#: How far into one header's value :func:`_contains_envref` looks. A header value is ultimately a
+#: string, so anything structured under it is already unusual; the cap exists so a pathological or
+#: self-referential structure cannot spin the loader, not because a legitimate table is ever deep.
+_MAX_HEADER_SCAN_DEPTH = 6
+
+
+def _contains_envref(value: Any, depth: int = 0) -> bool:
+    """Does ``value`` hold an ``env()`` reference anywhere a ``str()`` of it would expose?
+
+    A TOP-LEVEL scan is not enough. ``str(v)`` renders a container whole, so a marker one level down
+    lands on the wire with its ``default`` inside it exactly as a bare one does. Measured before this
+    scan existed: ``X-Partner-Key = [ { env = "partner_key", default = "..." } ]`` in a
+    ``connections.toml`` headers table built clean and sent
+    ``[{'env': 'partner_key', 'default': '...'}]`` to the partner; a sub-table did the same.
+
+    Non-reference structure is left alone -- this looks for references, not for nesting, so an
+    ordinary list or table under a header value is still the author's business."""
+    if _is_nested_envref(value):
+        return True
+    if depth >= _MAX_HEADER_SCAN_DEPTH:
+        return False
+    if isinstance(value, Mapping):
+        return any(
+            _contains_envref(k, depth + 1) or _contains_envref(v, depth + 1)
+            for k, v in value.items()
+        )
+    # str/bytes are Sequences and must not be walked -- they contain no references and recursing a
+    # string yields its characters forever.
+    if isinstance(value, list | tuple | set | frozenset):
+        return any(_contains_envref(item, depth + 1) for item in value)
+    return False
+
+
+def _reject_envref_headers(factory: str, headers: Any) -> None:
     """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
 
     Nested settings are NOT env-resolved: :func:`resolve_env_settings` walks only the TOP level, which
@@ -302,31 +362,58 @@ def _reject_envref_headers(factory: str, headers: Mapping[str, Any] | None) -> N
     So an ``env()`` inside ``headers`` reaches the connector unresolved and every ``_build_headers``
     does ``str(v)`` on it -- putting the reference's ``repr``, ``default=`` and all, on the wire to the
     partner. Fail loud at authoring instead, pointing at the typed credential fields, which ARE
-    env-resolved and secret-redacted.
-
-    TWO value shapes reach here and BOTH have to be refused. Code-first authoring gives an
-    :class:`EnvRef` instance. ``connections.toml`` gives a RAW ``{"env": ..., "default": ...}`` dict,
-    because :func:`parse_env_setting` decodes only top-level values and does not descend into a nested
-    table -- so an ``isinstance(..., EnvRef)`` test alone would refuse the code-first surface while the
-    TOML one still shipped the default to the partner. Measured on ``Rest`` before this guard existed:
+    env-resolved and secret-redacted. Measured on ``Rest`` before this guard existed:
     ``{'env': 'acme_key', 'default': 'FALLBACK-SECRET'}`` arrived as the header value, stringified.
+
+    BOTH AXES OF THE TABLE ARE SCANNED, because every ``_build_headers`` does ``str(k)`` as well as
+    ``str(v)`` -- names land on the wire exactly as values do. A value-shaped scan alone left
+    ``headers={env("hdr_name", default=...): "static"}`` building clean and sent the dataclass repr as
+    the header NAME. Only an :class:`EnvRef` can sit in the key position (the raw marker is a dict and
+    a dict is unhashable), but the predicate is asked rather than assumed, so the two axes cannot drift.
+
+    A REFERENCE STANDING FOR THE WHOLE TABLE IS NOT NESTED AND STAYS SUPPORTED.
+    ``Rest(headers=env("all_headers"))`` -- and the ``connections.toml`` spelling
+    ``headers = { env = "all_headers" }``, which :func:`parse_env_setting` decodes into an
+    :class:`EnvRef` because it IS a top-level settings value -- put the reference where
+    :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
+    runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
+    Only a reference INSIDE the table is unresolvable, so only that is refused.
+
+    A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
+    input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
+    which :func:`~messagefoundry.config.connections_file._build_spec` does not catch (it catches
+    :class:`WiringError` and ``TypeError``/``ValueError``), so the operator would get an internal
+    traceback where every other malformed setting in that loader gives a configuration error.
+    :func:`_hoist_body_secrets` raises :class:`WiringError` on the same input and this matches it.
+    Neither error names the connection or the file: ``_build_spec`` re-raises a ``WiringError``
+    verbatim rather than prefixing its ``where``, which is true of every factory-level refusal here
+    and is not fixed by this function.
 
     This refuses rather than resolves, which is the row's other option. Recursive resolution would have
     to reach into every nested settings shape and would undercut the top-level-only ruling the two
     functions named above already depend on."""
-    if not headers:
+    if headers is None or isinstance(headers, EnvRef):
         return
-    offenders = sorted(
-        str(name)
-        for name, value in headers.items()
-        if isinstance(value, EnvRef) or _is_env_marker(value)
-    )
+    if not isinstance(headers, Mapping):
+        raise WiringError(
+            f"{factory} headers must be a table of header name to value, or a single env() reference "
+            f"standing for the whole table -- not {type(headers).__name__}."
+        )
+    offenders: list[str] = []
+    for name, value in headers.items():
+        if _is_nested_envref(name):
+            # The NAME is the reference. Label it by its env key -- str(name) here would print the
+            # repr that carries the default, which is the leak this refusal exists to stop.
+            offenders.append(f"{_envref_label(name)} used as a header name")
+        elif _contains_envref(value):
+            offenders.append(str(name))
     if offenders:
         raise WiringError(
-            f"{factory} headers may not use env() ({', '.join(offenders)}) - nested settings are not "
-            "env-resolved, so the reference reaches the partner as its repr with any default= inside "
-            "it. Put a credential in the top-level bearer_token / basic_user / basic_password fields "
-            "(env-resolved and secret-redacted); headers carries only static, non-secret values."
+            f"{factory} headers may not use env() ({', '.join(sorted(offenders))}) - nested settings "
+            "are not env-resolved, so the reference reaches the partner as its repr with any default= "
+            "inside it. Put a credential in the top-level bearer_token / basic_user / basic_password "
+            "fields (env-resolved and secret-redacted); headers carries only static, non-secret "
+            "names and values."
         )
 
 
@@ -601,7 +688,8 @@ def FhirLookup(
     *,
     url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
     fhir_version: str = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str
     | EnvRef
     | None = None,  # Authorization: Bearer … (static; or compose with_smart_backend)
@@ -1049,6 +1137,19 @@ def _mask_url_userinfo(value: object) -> object:
     return f"{scheme}//{user}:***@{hostpart}"
 
 
+def _redact_header_name(name: object) -> str:
+    """One header's NAME, rendered JSON-safe and secret-free (BACKLOG #1649).
+
+    A name is normally a string, and the factories refuse a reference in this slot -- but this is a
+    DISPLAY control over settings that reach it from elsewhere too, and an :class:`EnvRef` key was
+    handled by neither axis. It kept its ``default`` under ``str()``/``repr()`` AND left the key a
+    non-str object, so ``json.dumps`` refused the whole map: measured, ``GET /metadata`` and
+    ``graph --json`` raised rather than rendering. Name it by its env key, as the refusal does."""
+    if _is_nested_envref(name):
+        return _envref_label(name)
+    return str(name)
+
+
 def _redact_header_value(name: str, value: object) -> object:
     """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
 
@@ -1061,9 +1162,18 @@ def _redact_header_value(name: str, value: object) -> object:
     from ``env()`` is a credential by intent -- nobody env-refs a ``Content-Type`` -- so the name
     heuristic is the wrong gate here, and it is exactly the gate that failed: the measured instance
     used ``X-Vendor-Thing``, which matches no substring rule.
+
+    BOTH NESTED SHAPES ARE DROPPED, not just the ``EnvRef`` one (BACKLOG #1649). The factory now
+    refuses either shape, but this is a DISPLAY control over settings that reach it from more places
+    than one factory call -- a hand-built ``ConnectionSpec``, a stored graph, a settings map built
+    before that refusal existed -- so it must drop the default wherever the value came from. The raw
+    ``connections.toml`` marker was served verbatim here, fallback secret included, because
+    ``parse_env_setting`` never descends into a nested table and so the ``EnvRef`` arm never saw it.
     """
     if isinstance(value, EnvRef):
         return {"env": value.key}
+    if _is_env_marker(value):
+        return {"env": value["env"]}
     return "***" if _is_secret_header(name, value) else value
 
 
@@ -1087,7 +1197,13 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
             out[name] = _mask_url_userinfo(value)
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {k: _redact_header_value(k, v) for k, v in value.items()}
+            # Both axes: a header NAME is rendered through _redact_header_name before it is used as
+            # the output key AND before it is handed to the value rule, so a reference in the name
+            # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
+            out[name] = {
+                (safe := _redact_header_name(k)): _redact_header_value(safe, v)
+                for k, v in value.items()
+            }
         elif name == "odbc_params" and isinstance(value, dict):
             # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
             # redactor honoured that by not descending -- so a credential inside it was served verbatim
@@ -2082,7 +2198,8 @@ def Rest(
     url: str | EnvRef,  # the endpoint; may be env() for DEV/PROD-specific hosts
     method: str = "POST",
     content_type: str = "application/json",
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
     basic_user: str
     | EnvRef
@@ -2163,7 +2280,8 @@ def FHIR(
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
     | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
     basic_user: str
     | EnvRef
@@ -2492,7 +2610,8 @@ def DICOMweb(
     url: str | EnvRef,  # the DICOMweb STOW-RS BASE url, e.g. https://host/dicom-web (may be env())
     study_uid: str | EnvRef | None = None,  # POST to {base}/studies (server assigns) or, when set,
     # {base}/studies/{study_uid} (store into a known study)
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str
     | EnvRef
     | None = None,  # Authorization: Bearer … (OAuth; use env() for the secret)
@@ -2832,7 +2951,8 @@ def Soap(
     url: str | EnvRef,  # the SOAP endpoint (may be env())
     soap_action: str | EnvRef | None = None,  # SOAPAction (1.1 header / 1.2 content-type param)
     soap_version: Literal["1.1", "1.2"] = "1.1",  # "1.1" | "1.2"
-    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    headers: dict[str, str]
+    | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,

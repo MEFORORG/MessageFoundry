@@ -652,6 +652,42 @@ def test_an_env_ref_inside_a_headers_table_does_not_disclose_its_default() -> No
     assert SENTINEL not in str(got)
 
 
+def test_the_raw_toml_env_marker_in_headers_does_not_disclose_its_default_either() -> None:
+    """The second nested shape, which the `EnvRef` arm above never saw (BACKLOG #1649).
+
+    `parse_env_setting` decodes only TOP-LEVEL values, so a `[settings.headers]` inline table arrives
+    as a raw `{"env": ..., "default": ...}` dict rather than an `EnvRef`. This redactor's only nested
+    arm was `isinstance(value, EnvRef)`, and `_is_secret_header` does not match `X-Vendor-Thing`, so
+    the raw shape fell through and `/metadata` and `graph --json` served the fallback secret verbatim.
+
+    The docstring above says this control must drop the default "wherever the value came from". It
+    said so of both shapes while handling one; this pins the other.
+    """
+    settings = dict(messagefoundry.Rest(url="https://example.invalid/x").settings)
+    settings["headers"] = {"X-Vendor-Thing": {"env": "acme_key", "default": SENTINEL}}
+    got = redacted_settings(settings)["headers"]["X-Vendor-Thing"]
+    assert got == {"env": "acme_key"}, got
+    assert SENTINEL not in str(got)
+
+
+def test_an_env_ref_in_the_header_NAME_slot_is_dropped_and_leaves_the_view_json_safe() -> None:
+    """The other axis of the same container, which BOTH nested arms above missed (BACKLOG #1649).
+
+    An `EnvRef` in the key slot failed twice over. It kept its `default` under any `str()`/`repr()`
+    render -- a log line, an exception, a support bundle -- AND it left the map's key a non-str
+    object, so `json.dumps` refused the whole thing: measured, `GET /metadata` and `graph --json`
+    raised `TypeError: keys must be str, int, float, bool or None, not EnvRef` rather than rendering.
+    A redactor that makes the view uncomputable is not a safe failure; it is an outage.
+    """
+    settings = dict(messagefoundry.Rest(url="https://example.invalid/x").settings)
+    settings["headers"] = {messagefoundry.env("acme_key", default=SENTINEL): "static"}
+    got = redacted_settings(settings)["headers"]
+    assert SENTINEL not in str(got), got
+    assert all(isinstance(key, str) for key in got), got
+    # The whole point of this control is that the view RENDERS. Encode it.
+    assert SENTINEL not in json.dumps(got)
+
+
 def test_a_credential_in_url_userinfo_is_masked_on_url_and_proxy_url() -> None:
     """`url="https://user:SECRET@host"` was returned verbatim while `proxy_password` on the SAME
     object masked -- safe in the typed field, disclosed in the URL beside it."""
