@@ -1104,8 +1104,8 @@ async def _run_connection_test(
     rr: RegistryRunner, name: str, direction: str
 ) -> ConnectionTestResult:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
-    Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
-    only an unexpected bug would 500. Closes the test connector afterward.
+    Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
+    raising — only an unexpected bug would 500. Closes the test connector afterward.
 
     Every ``detail`` here is scrubbed and length-bounded, because it does not stay in the response: the
     route JSON-dumps it into ``audit_log.detail``, the one at-rest error column written **without** the
@@ -1143,6 +1143,10 @@ async def _run_connection_test(
     try:
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
+        # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
+        # WiringError; it did not always, and the escape cost more than a 500. The credential route's
+        # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
+        # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
         return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
