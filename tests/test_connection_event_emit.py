@@ -389,6 +389,12 @@ async def test_a_trickling_peer_is_dropped_at_the_frame_deadline() -> None:
         feeder.cancel()
         await asyncio.gather(feeder, return_exceptions=True)
         writer.close()
+        # Awaited, so the socket is gone before the next test runs on this shared loop rather than
+        # tearing down under it — the #55 Proactor wedge is attributed to whichever test is running
+        # when it lands, not to the one that left the socket behind. Suppressed because the listener
+        # dropped us first, and a reset peer raises here on Windows.
+        with contextlib.suppress(ConnectionResetError):
+            await writer.wait_closed()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
@@ -420,6 +426,8 @@ async def test_an_idle_peer_still_hits_receive_timeout_while_a_frame_is_open() -
         await writer.drain()
         assert await asyncio.wait_for(reader.read(), 2.0) == b""  # idle close
         writer.close()
+        with contextlib.suppress(ConnectionResetError):
+            await writer.wait_closed()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
@@ -557,6 +565,8 @@ async def test_per_host_cap_refuses_a_further_connection_from_the_same_address()
         assert await _wait_for(lambda: source._active == 2)
         for w in (w2, w3, w4):
             w.close()
+            with contextlib.suppress(ConnectionResetError):
+                await w.wait_closed()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
@@ -582,8 +592,10 @@ async def test_the_global_cap_refusal_is_still_unqualified() -> None:
         assert await asyncio.wait_for(r2.read(), 2.0) == b""
         assert await _wait_for(lambda: "at_capacity" in cap.kinds())
         assert next(r for k, _, r in cap.events if k == "at_capacity") is None
-        w1.close()
-        w2.close()
+        for w in (w1, w2):
+            w.close()
+            with contextlib.suppress(ConnectionResetError):
+                await w.wait_closed()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
@@ -602,8 +614,11 @@ def test_both_new_caps_ship_on_and_are_reachable_through_the_mllp_factory() -> N
     source = _mllp()
     assert source.max_frame_seconds == mllp_mod.DEFAULT_MAX_FRAME_SECONDS
     assert source.max_connections_per_host == mllp_mod.DEFAULT_MAX_CONNECTIONS_PER_HOST
-    # Well under the socket cap: a per-host term set near the global one bounds nothing.
-    assert source.max_connections_per_host * 4 <= mllp_mod.DEFAULT_MAX_CONNECTIONS
+    # An EIGHTH, which is the number the constant's own docstring and docs/CONNECTIONS.md both
+    # commit to ("at least eight distinct source addresses to fill a default listener"). Pinned at
+    # the documented ratio rather than a looser one: a `* 4` bound passes at 64 per host, which
+    # would falsify all three statements while leaving this test green.
+    assert source.max_connections_per_host * 8 <= mllp_mod.DEFAULT_MAX_CONNECTIONS
 
     settings = MLLP(port=2575).settings
     assert settings["max_frame_seconds"] == mllp_mod.DEFAULT_MAX_FRAME_SECONDS

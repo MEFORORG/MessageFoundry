@@ -1325,22 +1325,23 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port + the five resource caps below (the bind interface comes
-    from the service's ``[inbound].bind_host``, so ``host`` is rejected on an inbound); outbound uses
+    """An MLLP endpoint. Inbound uses port + the resource caps below (the bind interface comes from
+    the service's ``[inbound].bind_host``, so ``host`` is rejected on an inbound); outbound uses
     host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding`` applies to framing in both
     directions. ``capture_response`` (outbound, ADR 0013) records the application ACK as a captured
     reply (a negative ACK still dead-letters/retries unchanged).
 
-    **Inbound resource caps (BACKLOG #1725).** Five keys on five different units, all shipped on, each
-    disabled by ``None``/``0``: ``max_connections`` (256) bounds concurrent sockets on the listener;
-    ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer address, the term
-    ``max_connections`` does not carry, since it counts sockets rather than hosts;
-    ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte received**;
-    ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its end byte, which is
-    what stops a peer trickling a byte at a time from holding a slot and a decoder buffer while never
-    being idle; ``max_frame_bytes`` (16 MiB) bounds that same frame's size. Both connection refusals
-    are **pre-ingress** — the socket is accepted, then refused and closed with an ``at_capacity``
-    connection event, and no message was received to drop.
+    **Inbound resource caps (BACKLOG #1725).** ``max_connections`` (256) bounds concurrent sockets on
+    the listener and ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer
+    address, which is the term ``max_connections`` does not carry since it counts sockets rather than
+    hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
+    received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
+    end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size; **raise ``max_frame_seconds`` whenever
+    you raise it**, since a larger frame needs proportionally longer to arrive. Each is disabled by
+    ``None``/``0``. Both connection refusals are **pre-ingress** — the socket is accepted, then
+    refused and closed with an ``at_capacity`` connection event, and no message was received to drop.
+    Each cap's full rationale, and what it does not cover, is on its constant in ``transports.mllp``.
 
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.

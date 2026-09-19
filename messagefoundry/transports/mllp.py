@@ -121,8 +121,17 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: a frame, so no frame deadline would ever fire on it).
 #:
 #: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
-#: as a quiet socket gets to stay open". A partner that legitimately needs longer for one very large
-#: frame raises this key alone. ``None``/``0`` disables it, like every cap here.
+#: as a quiet socket gets to stay open". ``None``/``0`` disables it, like every cap here.
+#:
+#: **It does not derive from** :data:`DEFAULT_MAX_FRAME_BYTES`, **and the pair is only satisfiable
+#: above a certain link speed.** Delivering the 16 MiB the byte cap permits inside 60 s needs roughly
+#: 2.2 Mbps sustained on that one socket. A connection carrying large embedded documents — a base64
+#: PDF spliced into OBX-5.5, ADR 0105 — over a slower WAN link will hit the deadline mid-document on
+#: every message. **Raise this key whenever you raise** ``max_frame_bytes``: the two are one bound on
+#: a frame expressed in two units, and setting only the byte half is how a feed that was working
+#: starts being dropped. Nothing warns about the combination at start today; wiring that check is
+#: left unbuilt rather than guessed at, since the honest threshold is a link speed the engine cannot
+#: see.
 DEFAULT_MAX_FRAME_SECONDS = 60.0
 
 #: Concurrent inbound clients allowed from ONE peer address (BACKLOG #1725).
@@ -135,13 +144,27 @@ DEFAULT_MAX_FRAME_SECONDS = 60.0
 #: real partner needs: MLLP is request/response over one socket per sending channel, so a partner
 #: holding thirty-two simultaneous connections into one listener port is already unusual.
 #:
-#: This is a CONNECTION cap, not a rate cap, which is why it does not contradict
-#: :class:`_MessagePacer`'s "never scoped per PEER". That rule is about a per-IP MESSAGE budget, which
-#: NAT collapses — two feeds behind one egress address would throttle each other. A slot cap inverts
-#: the argument: thirty-two simultaneous sockets from one address into one listener port is not a
-#: shape ordinary NAT'd traffic produces, and the refusal costs no message. It is pre-ingress at
-#: accept, exactly like the ``max_connections`` refusal, so nothing was received to drop and the peer
-#: reconnects as soon as one of its own connections finishes. ``None``/``0`` disables it.
+#: **What it does NOT bound, stated because the cap is easy to over-read.** It keys on the source
+#: address, so an attacker holding eight addresses — an IPv6 /64 hands out far more — gets a fresh
+#: budget per address and is bounded by :data:`DEFAULT_MAX_CONNECTIONS` alone. This raises the floor
+#: on the single-address case the row measured; it does not make a listener safe against a
+#: distributed peer, and nothing here should be read as claiming it does.
+#:
+#: This is a CONNECTION cap, not a rate cap, which is why it does not simply contradict
+#: :class:`_MessagePacer`'s "never scoped per PEER". That rule is about a per-IP MESSAGE budget,
+#: where NAT makes two feeds behind one egress address throttle each other. A slot cap refuses
+#: pre-ingress at accept, exactly like the ``max_connections`` refusal, so nothing was received to
+#: drop and the peer reconnects as soon as one of its own connections ends.
+#:
+#: **The NAT objection does still land on one topology, and it ships ON, so say so plainly.** Behind
+#: a source-NAT load balancer or proxy that does not preserve the client address, EVERY partner
+#: arrives as one peer and this becomes the effective listener capacity — 32 rather than 256, while
+#: the operator is reading ``max_connections`` in their config. That is a real way to lose a go-live.
+#: Two things make it survivable rather than a trap: the refusal names itself (a
+#: ``max_connections_per_host`` reason on the ``at_capacity`` event, and one warning per episode), so
+#: the diagnosis is the log line rather than an investigation; and ``None``/``0`` turns it off, which
+#: is the documented setting for exactly that topology. A proxied listener has a single upstream
+#: address it trusts, so it is the deployment with the least to gain from a per-host term anyway.
 DEFAULT_MAX_CONNECTIONS_PER_HOST = 32
 
 #: Message-rate pacing ships OFF, and that is a DELIBERATE DEVIATION from this module's
@@ -1630,21 +1653,16 @@ class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
     and frame whatever the handler returns back to the sender as the ACK.
 
-    **Four resource caps, on four different units, all shipped on (BACKLOG #1725).** They are
-    separate because each bounds something the others do not, and a peer can sit inside three of them
-    while abusing the fourth:
+    **The inbound resource caps are separate on purpose: each bounds a unit the others do not, so a
+    peer can sit inside all of them but one.** ``max_connections`` counts sockets on this listener
+    and ``max_connections_per_host`` counts sockets from one peer address; ``receive_timeout`` bounds
+    SILENCE between reads and ``max_frame_seconds`` bounds one frame's life; ``max_frame_bytes``
+    bounds that frame's size. Each takes ``None``/``0`` to disable it.
 
-    ==========================  =========================================================
-    ``max_connections``         concurrent sockets on this listener
-    ``max_connections_per_host``   concurrent sockets from ONE peer address
-    ``receive_timeout``         SILENCE between reads — resets on every byte received
-    ``max_frame_seconds``       one frame's life, start byte to end byte
-    ==========================  =========================================================
-
-    ``max_frame_bytes`` bounds the same frame's size. A peer trickling one byte at a time is inside
-    ``receive_timeout`` forever, which is why the frame deadline exists; a peer opening many
-    connections from one address is inside ``max_connections`` until it has taken every slot, which
-    is why the per-host cap does. Each takes ``None``/``0`` to disable it.
+    Every one of those is documented once, on its ``DEFAULT_*`` constant above — what it bounds, why
+    the default is the number it is, and what it does NOT cover. Read those rather than a summary
+    here; this docstring deliberately does not restate them, and does not count them either, because
+    a closed count is a claim that goes stale the next time a cap is added.
     """
 
     def __init__(self, config: Source) -> None:
@@ -1681,12 +1699,21 @@ class MLLPSource(SourceConnector):
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
-        #: Live connections per peer address, for `max_connections_per_host`. A host is DROPPED at
-        #: zero rather than left sitting at 0, because a dict that only ever grows is the memory leak
-        #: a per-host cap would otherwise introduce — and a peer cycling source addresses is exactly
-        #: the caller this cap exists to bound. Keyed by IP string; a peer whose address the socket
-        #: cannot report (`_peer_host` -> None) is never counted and never refused by that cap.
+        #: Live connections per peer address, for `max_connections_per_host`. Keyed by IP string; a
+        #: peer whose address the socket cannot report (`_peer_host` -> None) is never counted and
+        #: never refused by that cap.
+        #:
+        #: A host is DROPPED at zero rather than left sitting at 0. This table is keyed by an
+        #: attacker-chosen value, so a peer cycling source addresses would otherwise grow it without
+        #: bound — the table would become a memory leak inside a control whose whole subject is
+        #: bounded resources. Dropping at zero holds it to the live connections, which
+        #: `max_connections` already bounds. **That is a bound on the TABLE, not a claim about the
+        #: cap:** a peer with many source addresses gets a fresh per-host budget for each one and is
+        #: bounded by `max_connections` alone. See DEFAULT_MAX_CONNECTIONS_PER_HOST.
         self._per_host: dict[str, int] = {}
+        #: Hosts already warned about their per-host cap this episode, cleared with the count above.
+        #: See `_log_host_capacity_once` for why the refusal is not logged per attempt.
+        self._host_capacity_warned: set[str] = set()
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
@@ -1788,6 +1815,35 @@ class MLLPSource(SourceConnector):
             return False
         return self._per_host.get(peer_host, 0) >= self.max_connections_per_host
 
+    def _log_host_capacity_once(self, writer: asyncio.StreamWriter, peer_host: str) -> None:
+        """Warn the FIRST time a host hits its cap, then stay quiet until it has no connections left.
+
+        Clearing at zero rather than the moment the host drops back under the cap is deliberate: a
+        peer oscillating on the boundary — close one, open two — would otherwise earn a line per
+        cycle, which is connection churn and unbounded. Requiring a full disconnect makes one line
+        per episode a real bound rather than a slower leak.
+
+        A peer that loops ``connect()`` against a budget it has already filled is refused as fast as
+        it can open sockets, so a line per refusal would let an unauthenticated peer fill the log
+        volume — the service's stdout is captured to files under NSSM. That turns the defense into an
+        amplifier for the very flood it exists to stop. The global ``max_connections`` refusal logs
+        nothing at all for the same reason; one line per episode is the middle ground, and the
+        `at_capacity` event still records every individual refusal for anyone counting them.
+
+        The warned set is keyed and cleared exactly like :attr:`_per_host`, so it inherits that
+        table's bound and adds no second population to leak.
+        """
+        if peer_host in self._host_capacity_warned:
+            return
+        self._host_capacity_warned.add(peer_host)
+        logger.warning(
+            "MLLP connections from %s refused: %s holds max_connections_per_host (%d). Further "
+            "refusals for this host are not logged until it has no connections left.",
+            writer.get_extra_info("peername"),
+            peer_host,
+            self.max_connections_per_host,
+        )
+
     def _admit(self, peer_host: str | None) -> None:
         """Take one connection slot, globally and (when the peer has an address) for that host."""
         self._active += 1
@@ -1805,6 +1861,9 @@ class MLLPSource(SourceConnector):
             self._per_host[peer_host] = remaining
         else:
             self._per_host.pop(peer_host, None)
+            # Dropped together with the count, so the next episode for this host warns again and
+            # neither table outlives the connections it describes.
+            self._host_capacity_warned.discard(peer_host)
 
     def _log_frame_deadline(self, writer: asyncio.StreamWriter) -> None:
         """Say which bound dropped the connection (BACKLOG #1725). The `closed` event's reason says
@@ -1823,9 +1882,8 @@ class MLLPSource(SourceConnector):
         """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
 
         ``None`` means "this bound has nothing to say" — either ``max_frame_seconds`` is off or no
-        frame is open. A value at or below zero means the frame outlived its budget. The result may
-        be negative: the caller clamps it where it is spent as a timeout, and reads its SIGN where it
-        is deciding which bound fired.
+        frame is open. The result may be NEGATIVE, and the sign is the answer: at or below zero the
+        frame has outlived its budget, which is what both callers test.
         """
         if frame_opened_at is None or self.max_frame_seconds is None:
             return None
@@ -1833,9 +1891,18 @@ class MLLPSource(SourceConnector):
 
     def _read_budget(self, frame_left: float | None) -> float | None:
         """How long the next read may block: the idle bound, the open frame's remaining life, or the
-        smaller of the two. ``None`` only when neither bound is configured (an unbounded read)."""
-        budgets = [b for b in (self.receive_timeout, frame_left) if b is not None]
-        return max(0.0, min(budgets)) if budgets else None
+        smaller of the two. ``None`` only when neither bound is configured (an unbounded read).
+
+        Both inputs are positive here — ``receive_timeout`` is ``None`` rather than falsy when it is
+        off, and the caller has already broken out of the loop on a spent ``frame_left`` — so there is
+        no clamp. An earlier draft carried ``max(0.0, ...)``; it could not fire on any reachable
+        input, and dead defensive code in a bound is a claim nobody can check.
+        """
+        if frame_left is None:
+            return self.receive_timeout
+        if self.receive_timeout is None:
+            return frame_left
+        return min(self.receive_timeout, frame_left)
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
@@ -1864,18 +1931,13 @@ class MLLPSource(SourceConnector):
             if self.max_connections is not None and self._active >= self.max_connections:
                 await self._emit_event("at_capacity", peer_host=peer_host)
                 return  # at capacity — refuse the new client (closed in the outer finally)
-            if self._at_host_capacity(peer_host):
+            if peer_host is not None and self._at_host_capacity(peer_host):
                 # Same refusal, a different budget: this peer address already holds its share
                 # (BACKLOG #1725). Deliberately the SAME `at_capacity` kind rather than a new one —
                 # the connection event vocabulary is asserted against the emit sites and mirrored in
                 # the web console filter, and what an operator needs here is WHICH cap refused them,
                 # which the reason carries. The counter is not incremented, as above.
-                logger.warning(
-                    "MLLP connection from %s refused: %s already holds max_connections_per_host (%d)",
-                    writer.get_extra_info("peername"),
-                    peer_host,
-                    self.max_connections_per_host,
-                )
+                self._log_host_capacity_once(writer, peer_host)
                 await self._emit_event(
                     "at_capacity", peer_host=peer_host, reason="max_connections_per_host"
                 )
