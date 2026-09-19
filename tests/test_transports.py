@@ -870,6 +870,17 @@ def test_file_source_rejects_unknown_after_read(tmp_path: Path) -> None:
         )
 
 
+def test_file_source_rejects_unknown_sort(tmp_path: Path) -> None:
+    # #1655: `sort` used to accept any string and _candidates() fell through to name order, so a typo
+    # would give an operator a process order they did not ask for without saying so. The File()
+    # factory's Literal catches it under mypy; this raise is what catches it at run time (a TOML
+    # connection, or a value that reached the settings dict some other way).
+    with pytest.raises(ValueError, match="sort must be 'name' or 'mtime'"):
+        FileSource(
+            Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path), "sort": "mtiem"})
+        )
+
+
 async def test_file_source_leave_in_place_keeps_file_and_dedups(tmp_path: Path) -> None:
     # after_read='leave' (#142): the source file is NEVER moved/deleted, and the durable ledger dedups
     # so it is ingested exactly ONCE despite many polls. The ledger holds a HASHED key (64 hex chars).

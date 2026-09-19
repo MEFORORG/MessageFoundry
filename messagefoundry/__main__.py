@@ -24,9 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sqlite3  # stdlib; only for the exception type the store-opening subcommands translate (#1670)
+import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys
-import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -41,6 +41,36 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
     query_sntp_offset,
 )
+
+
+class _VersionAction(argparse.Action):
+    """``--version``: print the version AND the package directory that answered (BACKLOG #1677).
+
+    The working directory precedes the venv's editable ``.pth`` entry on ``sys.path``, so running from
+    a directory that holds another tracked copy of ``messagefoundry/`` resolves the import to THAT
+    copy. There is no error, and nothing in the output says which tree answered, so an instrument that
+    trusts the run reports a self-consistent wrong answer.
+
+    A CUSTOM ACTION RATHER THAN ``action="version"`` WITH AN EMBEDDED NEWLINE. argparse's own version
+    action routes its text through ``HelpFormatter._fill_text``, which re-wraps it into a single
+    width-dependent paragraph: the newline is collapsed and the path lands mid-line at whatever column
+    the terminal happens to be. Printing the two lines here keeps them apart at any width -- which is
+    also why the test for this asserts on the presence of the path token, never on a line index.
+
+    ``Path(__file__).parent`` IS the package directory -- this module lives inside it -- so answering
+    the question needs no new import and no ``importlib`` lookup.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        _safe_print(f"messagefoundry {__version__}")
+        _safe_print(f"package: {Path(__file__).resolve().parent}")
+        parser.exit()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,8 +89,38 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, OSError):
                 pass
 
+    # The last-resort hooks are a PROCESS property, so they are installed here, once, for every
+    # subcommand (BACKLOG #1674). `last_resort` states the ASVS 16.5.4 guarantee that an unhandled
+    # error can never escape as a raw traceback quoting a PHI-bearing value; until this call site they
+    # were installed inside `_serve` only, leaving the other 32 subcommands unguarded. `dryrun`,
+    # `audit-verify` and `backup` open the store, so an uncaught exception from one of them is the
+    # case that could carry a field value.
+    #
+    # INSTALLING THE HOOK CHANGES NO EXIT CODE: the interpreter still exits 1 after calling
+    # `sys.excepthook`. That is why this shape was taken over the alternative of wrapping the dispatch
+    # and exiting 2, which would have made every CLI exit-code assertion in the suite a fresh question.
+    #
+    # LATE IMPORT, DELIBERATELY. Two `tests/test_config_anchoring.py` monkeypatches target the module
+    # attribute `messagefoundry.last_resort.install_excepthook`; importing the name at module scope
+    # here would bind it before they can patch it, and they would silently stop applying.
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
+
+    install_excepthook()
+    # The sibling hook for every OTHER thread (BACKLOG #1055), which had the identical serve-only gap.
+    # sys.excepthook does not cover them, and the engine runs non-asyncio threads whose except clauses
+    # are deliberately narrow -- the sandbox session's raw stdout reader catches only OSError -- so
+    # anything else would otherwise reach the stdlib default and print an unredacted traceback to the
+    # NSSM-captured stderr.
+    install_thread_excepthook()
+
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"messagefoundry {__version__}")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="print the version and the package directory that answered",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the engine + localhost API")
@@ -662,6 +722,13 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     audit_verify.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    audit_verify.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
+        "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
+        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store')",
+    )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
     audit_verify_anchor = audit_verify.add_mutually_exclusive_group()
@@ -1612,9 +1679,14 @@ def _serve(args: argparse.Namespace) -> int:
     # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
-    # [egress] declares EIGHT allowed_* lists and every one is enforced downstream by _allowlist_for
-    # (pipeline/wiring_runner.py). Counting only six here meant a mail-only or Direct-only instance
-    # could enumerate every destination it actually uses and still be refused as "UNRESTRICTED", with
+    # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
+    # _allowlist_for (pipeline/wiring_runner.py). ([egress].allowed_proxy is a ninth allowed_* key and
+    # is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a destination, is
+    # not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG #1659 — so listing a
+    # proxy says nothing about where PHI may be sent and must not satisfy this gate.)
+    #
+    # Counting only six here meant a mail-only or Direct-only instance could enumerate every
+    # destination it actually uses and still be refused as "UNRESTRICTED", with
     # nothing in the refusal naming the two lists that did not count. allowed_smtp/allowed_direct are
     # counted only when [security].block_unlisted_outbound was NOT set explicitly — precisely the state
     # the flip below turns deny-by-default ON for, so such an instance still starts fail-closed. An
@@ -1734,6 +1806,7 @@ def _serve(args: argparse.Namespace) -> int:
             tls_ca_file=settings.logging.forward_tls_ca_file,
             tls_verify=settings.logging.forward_tls_verify,
             tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -3065,29 +3138,61 @@ def _serve(args: argparse.Namespace) -> int:
     import os
 
     from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.redaction import safe_exc
 
     def env_values() -> dict[str, Any]:
-        return load_environment_values(
-            base_dir=env_base,
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
-        )
+        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+        # WiringError is the type both the serve gate below and that route already understand, so
+        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+        #
+        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+        # keeps the exception type and bounds the length.
+        try:
+            return load_environment_values(
+                base_dir=env_base,
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+        except (ValueError, RecursionError, OSError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
+            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+            # an embedder's arbitrary callable, while this one wraps our own call into a function that
+            # returns a dict or raises.
+            raise WiringError(
+                f"could not read environment values from {env_file}: {safe_exc(exc)}"
+            ) from exc
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
     # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
     # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
-    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise inside env_values() —
     # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
-    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    # a clean error like every other serve gate. env_values() now wraps that as a WiringError which
+    # already names the value file (path only, PHI-safe), so print it rather than re-stating the path.
     try:
         env_values_empty = not env_values()
-    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
-        print(
-            f"error: could not read environment values from {env_file}: {exc}",
-            file=sys.stderr,
-        )
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
     # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
@@ -3110,6 +3215,10 @@ def _serve(args: argparse.Namespace) -> int:
     # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
     registry_filter = None
     if args.shard is not None:
+        # WiringError is also bound above (env_values), and this local re-import is deliberate: the
+        # shard closure below raises it, so binding it here keeps this block self-contained. Relying
+        # on the earlier binding would make an unrelated reorder turn the no-split-store refusal into
+        # a NameError, on a path only `serve --shard` against a mismatched store reaches.
         from messagefoundry.config.wiring import Registry, WiringError
         from messagefoundry.pipeline.sharding import (
             filter_registry_for_shard,
@@ -3336,15 +3445,10 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
-    from messagefoundry.redaction import safe_exc
 
-    install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
-    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
-    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
-    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
-    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
-    install_thread_excepthook()
+    # The last-resort sys/threading excepthooks are already in force here: `main()` installs them for
+    # every subcommand (BACKLOG #1674). The asyncio loop handler is separate and is installed by the
+    # serving lifespan, inside the running loop.
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -3560,6 +3664,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args)
     if isinstance(resolved, int):
@@ -3621,14 +3726,17 @@ def _dryrun(args: argparse.Namespace) -> int:
                     "control_id": result.control_id,
                     # The summary is PHI (MRN + patient name from PID-3/5), so gate it like raw/
                     # payloads — dryrun stdout is routinely piped to files/CI logs (review H-12).
-                    # (The `error` text can also quote field values; that's tracked separately as
-                    # low-8, gated holistically with the API's error exposure.)
                     "summary": result.summary if show_phi else None,
                     "handlers": result.handlers,
                     "deliveries": [
                         {"to": d.to, "payload": d.payload if show_phi else _redact_body(d.payload)}
                         for d in result.deliveries
                     ],
+                    # Destinations a Handler addressed that are present but NOT deployed (#233,
+                    # BACKLOG #1690). Printed beside `deliveries` because that list is empty for
+                    # exactly these, and without the names a NOT_DEPLOYED row says what happened but
+                    # not to which connection. Connection names carry no PHI, so no --show-phi gate.
+                    "declined": result.declined,
                     # Declared state writes (ADR 0005). The value can be PHI (e.g. an MRN→anon
                     # mapping), so gate it behind --show-phi exactly like a delivery payload.
                     "state_ops": [
@@ -3639,7 +3747,20 @@ def _dryrun(args: argparse.Namespace) -> int:
                         }
                         for s in result.state_ops
                     ],
-                    "error": result.error,
+                    # Declared metadata writes (ADR 0081, BACKLOG #1692). A SetMeta key and value are
+                    # both message-derived in the general case, so both take the same --show-phi gate
+                    # as a state write. Without this key a Handler's SetMeta was invisible here.
+                    "meta_ops": [
+                        {
+                            "key": m.key if show_phi else _redact_body(str(m.key)),
+                            "value": m.value if show_phi else _redact_body(str(m.value)),
+                        }
+                        for m in result.meta_ops
+                    ],
+                    # The error carries the Router/Handler's own `raise`, which can quote field
+                    # values, so it takes the same --show-phi gate as `summary` (BACKLOG #1668).
+                    # `safe_error`, not `_redact_body`: see its docstring for why the prose survives.
+                    "error": safe_error(result.error, show_phi=show_phi),
                     "raw": result.raw if show_phi else _redact_body(result.raw),
                 }
             )
@@ -4595,9 +4716,68 @@ def _provision_admin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_a_store_that_is_not_an_audit_log(
+    *, is_sqlite: bool, path: str, refusal: str, as_json: bool = False
+) -> int | None:
+    """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
+
+    Two ways it cannot be one, and the second is the one that used to pass: the file is ABSENT (a
+    typo'd path, which ``open_store`` would create), or the file EXISTS but carries no ``audit_log``
+    table. A zero-byte file is the second case -- it is a valid, empty SQLite database, so every
+    existence check says yes, and ``open_store`` then runs the schema migration INTO the file that
+    was supposed to be the evidence and reports a clean chain of nothing.
+
+    The probe opens a ``mode=ro`` URI on stdlib ``sqlite3``, which is load-bearing twice over: a
+    read-only handle can neither create the file nor migrate it, so the check cannot write to the
+    evidence it is checking, and it never reaches the engine's own store layer at all. Only SQLite
+    is probed; a server backend's connection string is not a file and cannot be conjured by opening
+    it. ``audit_log`` is the table the three callers actually read, so its absence is the exact
+    question, not a proxy for it.
+
+    This probe runs BEFORE the ``sqlite3.DatabaseError`` catch each caller inherits from #1670, and
+    the two answer different questions -- "this is a database but not an audit log" here, "this is
+    not a database at all" there -- so both stay. Where they overlap, on a path SQLite cannot read,
+    the probe reaches it first and hands it to ``_emit_store_open_error`` so the operator sees one
+    line for one condition, whichever guard happened to catch it.
+    """
+    import contextlib
+
+    # `sqlite3` and `Path` are module-level (see the header imports) -- re-importing them here would
+    # shadow the same objects for no gain.
+    if not is_sqlite:
+        return None
+
+    tail = "(check --db / [store].path)"
+    if not Path(path).exists():
+        print(f"error: no audit database at {path} — {refusal} {tail}", file=sys.stderr)
+        return 2
+
+    try:
+        # `as_uri()` percent-encodes, which SQLite decodes back -- a bare f-string would misread a
+        # Windows path holding `?`, `#` or `%`. `resolve()` is safe here: the file exists.
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+            found = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'"
+            ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        # `OperationalError` subclasses this, so an unreadable path lands here too. #1670 owns the
+        # general case of a non-database at `--db`; refusing it before the store opens is a side
+        # effect of probing first, not this item's fix -- so it reports in #1670's words and with
+        # #1670's exit code rather than minting a second message for one condition.
+        return _emit_store_open_error(exc, path, as_json=as_json)
+
+    if found is None:
+        print(
+            f"error: {path} is a SQLite database with no audit_log table — {refusal} {tail}",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4620,36 +4800,57 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # A SQLite store would otherwise be CREATED on open: a compliance job pointed at a typo'd path
-    # would silently get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31).
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one and report "
-            f"a false 'verified 0 rows' (check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # A SQLite store would otherwise be CREATED (or schema-migrated) on open: a compliance job
+    # pointed at a typo'd path, or at the zero-byte file a touch/failed copy leaves behind, would
+    # get a fresh empty DB and report "OK: verified 0 audit row(s)" forever (M-31, #1669).
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one and report a false 'verified 0 rows'",
+    )
+    if refused is not None:
+        return refused
 
-    async def run() -> tuple[bool, str | None]:
+    async def run() -> tuple[bool, str | None, int]:
         store = await open_store(settings.store)
         try:
-            return await store.verify_audit_chain(expected_anchor=expected_anchor)
+            ok, message = await store.verify_audit_chain(expected_anchor=expected_anchor)
+            if not ok:
+                return ok, message, -1  # a FAIL exits 1 whatever the count; don't query for it
+            # The row count decides the empty-log exit below. Ask the store for an integer rather
+            # than pattern-matching "verified 0 " out of a human-readable message.
+            count, _head = await store.audit_anchor()
+            return ok, message, count
         finally:
             await store.close()
 
     try:
-        ok, message = asyncio.run(run())
+        ok, message, count = asyncio.run(run())
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
+        # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
+        # ONLY SQLite; this catch is what a server backend and any error raised after the open
+        # still land in, so both guards stay live.
         return _emit_store_open_error(exc, settings.store.path)
     print(("OK: " if ok else "FAIL: ") + (message or ""))
-    if ok and message and "verified 0 " in message:
-        # An empty log on a real DB is legitimate but worth flagging — it's indistinguishable at a
-        # glance from pointing at the wrong database (M-31).
-        print(
-            "warning: the audit log is empty — confirm this is the intended database.",
-            file=sys.stderr,
-        )
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    if count:
+        return 0
+
+    # An empty log on a real audit database is legitimate, and at a glance indistinguishable from
+    # having verified the wrong database (M-31). An operator who says so gets exit 0 -- either with
+    # --allow-empty, or by passing an expected anchor, which on a chain that verified clean can only
+    # have been `0:` and is therefore already an explicit assertion that the log holds nothing.
+    expected_empty = args.allow_empty or expected_anchor is not None
+    print(
+        "warning: the audit log is empty — confirm this is the intended database."
+        + ("" if expected_empty else " Exiting 3; pass --allow-empty if that is expected."),
+        file=sys.stderr,
+    )
+    # EXIT 3, NOT 1. This command already spends 1 on a BROKEN CHAIN and 2 on "could not start", so
+    # a compliance job keying on the exit code would otherwise read an empty log as detected tamper
+    # or as its own misconfiguration. 3 says "ran, and found nothing to verify" (#1669).
+    return 0 if expected_empty else 3
 
 
 def _audit_anchor(args: argparse.Namespace) -> int:
@@ -4662,7 +4863,6 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     a ticket, an object store, or a compliance job's own database.
     """
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4678,16 +4878,20 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # The SAME M-31 guard as _audit_verify, and it matters MORE here: opening a SQLite store creates
-    # it, so a typo'd path would mint a fresh empty DB and print `0:` — an anchor OF NOTHING, which a
-    # later verify against the wrong database would then happily confirm.
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one and print "
-            f"an anchor of an empty log (check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # The SAME guard as _audit_verify, and it matters MORE here: opening a SQLite store creates or
+    # migrates it, so a typo'd path or a zero-byte file would mint a fresh empty DB and print `0:` —
+    # an anchor OF NOTHING, which a later verify against the wrong database would happily confirm.
+    # Unlike the verify twin this keeps exit 0 on a REAL store whose log is legitimately empty:
+    # anchoring a fresh instance as `0:` is a supported workflow (#328), not a defect to refuse.
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one and print an anchor of an empty log",
+        # Only this one of the three callers has --json, and #1670 routes its store-open error there.
+        as_json=args.json,
+    )
+    if refused is not None:
+        return refused
 
     async def run() -> tuple[int, str]:
         store = await open_store(settings.store)
@@ -4725,7 +4929,6 @@ def _rekey_audit(args: argparse.Namespace) -> int:
     keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
     stopped so no concurrent append races the watermark move."""
     import asyncio
-    from pathlib import Path
 
     from pydantic import ValidationError
 
@@ -4741,14 +4944,15 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path (mirrors _audit_verify M-31).
-    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
-        print(
-            f"error: no audit database at {settings.store.path} — refusing to create one "
-            f"(check --db / [store].path)",
-            file=sys.stderr,
-        )
-        return 2
+    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path or a zero-byte file
+    # (mirrors the _audit_verify guard).
+    refused = _refuse_a_store_that_is_not_an_audit_log(
+        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
+        path=settings.store.path,
+        refusal="refusing to create one",
+    )
+    if refused is not None:
+        return refused
 
     async def run() -> tuple[bool, str]:
         store = await open_store(settings.store)
@@ -4990,8 +5194,10 @@ def _restore_verify(args: argparse.Namespace) -> int:
     """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049, #60 — 0049's owned
     primitive that ADR 0048's cold-seed activation calls): key-fingerprint precheck (a clean
     ``KEY_MISMATCH`` before any decrypt) -> decrypt -> open the embedded store read-only ->
-    ``integrity_check`` + per-table row-count vs the manifest. Reports ``PASS``/``FAIL``/
-    ``KEY_MISMATCH``; PHI-safe (counts + a reason only, never a body)."""
+    ``integrity_check`` + per-table row-count vs the manifest. ``--full`` additionally re-opens the
+    snapshot under THIS instance's real store settings (cipher, keyring, key provider) and decrypts +
+    authenticates its cipher-covered cells. Reports ``PASS``/``FAIL``/``KEY_MISMATCH``; PHI-safe (counts
+    + a reason only, never a body)."""
     import asyncio
     from pathlib import Path
 
@@ -5021,6 +5227,10 @@ def _restore_verify(args: argparse.Namespace) -> int:
         "integrity_ok": result.integrity_ok,
         "row_counts": result.row_counts,
         "manifest_counts": result.manifest_counts,
+        # A count of the cipher-covered cells --full decrypted AND authenticated (0 on a lightweight
+        # verify, and on an unencrypted store). It is what separates "the snapshot opened" from "its
+        # PHI was readable", so an operator can see which claim a PASS is making.
+        "decrypted_cells": result.decrypted_cells,
         "reason": result.reason,
     }
     if args.json:
@@ -5029,6 +5239,8 @@ def _restore_verify(args: argparse.Namespace) -> int:
         print(f"{result.status}: {result.reason or 'archive verified'}")
         if result.row_counts:
             print(f"  row_counts={result.row_counts}")
+        if result.decrypted_cells:
+            print(f"  decrypted_cells={result.decrypted_cells}")
     # exit 0 only on PASS; FAIL/KEY_MISMATCH are non-zero so a script/cold-seed activation can gate on it.
     return 0 if result.ok else 1
 

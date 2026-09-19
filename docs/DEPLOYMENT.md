@@ -567,6 +567,29 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 - **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS or a declared
   terminator and is refused without one — `--allow-insecure-bind` does not cover it.
 
+### Exit codes — a startup-stage refusal exits **3**, not 2
+
+Every refusal listed above happens in `serve`'s pre-flight, before the web server starts, and exits
+**2**. One refusal happens later and exits **3**: the PHI **security-notice deliverability** gate
+([ADR 0167](adr/0167-phi-security-notification-readiness-gates-on-a-deliverable-address-checked-early-in-the-asgi-lifespan.md)).
+On an instance under `[security].enforcement = enforce` with security notices switched on and
+`[alerts].security_notifications_required = true`, it refuses to start when **no enabled
+Administrator has a notification address** — so a configured SMTP transport does not by itself mean
+any notice is deliverable. Set an address on at least one enabled Administrator (on a new install,
+`messagefoundry provision-admin --username <name> --email <address>` before the first `serve` avoids
+the state entirely), or record the pull-only `/me/security-events` feed as accepted in writing with
+`[alerts].security_notifications_required = false`.
+
+**Why the number differs, since it will look like an inconsistency.** The check needs the user
+table, and the pre-flight is synchronous and opens no store — so the only place the store and the
+freshly created bootstrap administrator are both in hand is the ASGI lifespan. A failure there is a
+startup failure as far as `uvicorn` is concerned, and `uvicorn` exits **3** for one regardless of
+what the refusal asks for. There is no spelling of it from inside the lifespan that keeps exit 2.
+
+**This changes nothing operationally under the shipped service wrapper.** `install-service.ps1` sets
+NSSM `AppExit Default Restart`, which restarts on any exit code. The reason to write the number down
+is a reader's surprise, not a broken script.
+
 ---
 
 ## Revocation-guard behavior

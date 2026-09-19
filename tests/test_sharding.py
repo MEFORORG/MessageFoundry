@@ -454,6 +454,30 @@ def test_filter_pins_unfiltered_loopback_inbounds() -> None:
     assert f.loopback_inbound_names() == frozenset({"IB_LOOP"})
 
 
+def test_filter_pins_the_whole_configs_inbound_names() -> None:
+    # BACKLOG #1612. The startup dead_letter_missing_inbounds sweep asks "is this channel_id still
+    # configured?" and writes to the UNIFIED store every shard shares (ADR 0063). A shard's `inbound`
+    # map is only its own slice, so keying that sweep off it would answer no for every SIBLING
+    # shard's inbound and dead-letter their live ingress/routed/response rows. The whole config's
+    # names ride the filtered registry instead, exactly like the loopback names above.
+    reg = _registry()
+    a = filter_registry_for_shard(reg, "a")
+    assert set(a.inbound) == {"ib_a1", "ib_a2"}  # the inbound MAP stays filtered...
+    assert a.inbound_names() == frozenset(  # ...and the NAME set spans the deployment
+        {"ib_a1", "ib_a2", "ib_b1", "ib_default"}
+    )
+    # The property that matters: no sibling shard's lane looks removed from shard a's point of view.
+    assert {"ib_b1", "ib_default"} <= a.inbound_names()
+    assert reg.all_inbound is None  # the filter never mutates the source
+
+    # Single-shard: nothing is pinned and the accessor derives the graph's own inbounds — byte-
+    # identical to plain `serve`, where `inbound` already IS the whole config.
+    single = Registry()
+    single.add_inbound(_inb("ib1", 2575))
+    f = filter_registry_for_shard(single, DEFAULT_SHARD)
+    assert f.all_inbound is None and f.inbound_names() == frozenset({"ib1"})
+
+
 def test_source_registry_identity_defaults_none_and_is_untouched() -> None:
     reg = _registry()
     assert reg.shard_id is None and reg.all_shard_ids is None

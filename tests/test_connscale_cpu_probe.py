@@ -39,8 +39,10 @@ from harness.load.connscale.probe import (
     _CREATION_SKEW_TOLERANCE_S,
     _PROBE_TIMEOUT_S,
     FdSampler,
+    ProbeDegraded,
     ProcRow,
     ProcSample,
+    _gap,
     _posix_stat_ppid_starttime,
     _validated_descendants,
 )
@@ -247,8 +249,96 @@ def test_flat_counter_with_a_membership_change_still_gaps_not_zero() -> None:
 _BURN = "x=0\nfor i in range(300_000_000): x+=i"
 
 
+def _budget_exhausted(cause: ProbeDegraded | None) -> bool:
+    """Did the gap this cause describes SPEND its whole timeout?
+
+    Delegates to ``ProbeDegraded.is_budget_exhausted`` instead of listing members here: that vocabulary
+    draws the line once and says consumers must stay on it, and a second copy of a member list is a
+    second thing to drift. The ``None`` arm is the one a reader mis-reads. ``degraded`` is set only on a
+    FULL gap, so an absent ``cpu_seconds`` carrying NO cause is the POSIX partial read (handles read,
+    CPU did not) -- a read that RAN and produced no CPU, which is measured-and-broken, not
+    could-not-measure. Reading the missing cause as "nothing went wrong" would invent the timeout the
+    probe was careful not to claim.
+
+    ``tests/test_connscale_smoke.py`` has a twin, ``_is_budget_exhausted``, kept separate rather than
+    imported: it classifies a cause RECORDED AS A STRING and treats an unrecognised one as not
+    tolerable, where this classifies a typed cause taken live off a ``ProcSample`` and owes its ``None``
+    arm the meaning above. Both delegate to the one property, so the member set cannot drift between
+    them -- only these two adapters exist to converge, and doing so would edit a second test module."""
+    return cause is not None and cause.is_budget_exhausted
+
+
+def _cpu_seconds_or_verdict(
+    sampler: FdSampler, extension_walks: int, which: str
+) -> tuple[float, int]:
+    """One usable CPU reading and the extension walks left unspent, or a verdict naming what stopped it.
+
+    The BOUNDED EXTENSION (BACKLOG #1290) that
+    ``test_subtree_re_resolution_picks_up_a_late_spawned_child`` gives a stalled WALK, applied here to a
+    stalled READING -- both are the same shell-out on the same starved host, and the argument carries
+    over unchanged: retrying at the same bound is cut off at the same point, so only a LONGER budget
+    attacks the cause. A gap that spent its budget earns that extension and then a skip.
+
+    A gap from ANY OTHER cause is a FAILURE and is never downgraded, including one that appears partway
+    through the extension. A probe that ran and produced nothing is a probe defect, and a skip that
+    swallows it hides that defect forever -- which is the rule #1290 exists to hold, stated at the walk
+    level there and at the reading level here.
+
+    The sibling draws the same line by a DIFFERENT mechanism -- it compares what a failed walk spent
+    against what it was allowed (``_BUDGET_CONSUMED_FRACTION``) -- and the honest statement of why is
+    that it keeps less evidence, not that less is available. ``FdSampler._resolve_degraded`` carries the
+    cause for a walk too; ``_walk_succeeded`` reads it and throws the cause away, keeping the boolean.
+    So one rule stands on two hand-maintained mechanisms, held together only by the note in
+    ``ProbeDegraded``. Converging them is a real cleanup and NOT done here: it would rewrite a
+    currently-passing test's bookkeeping, which is the test this change has to prove it left alone."""
+    used = 0
+    causes: list[ProbeDegraded | None] = []
+    sample = sampler.sample_proc()
+    with pytest.MonkeyPatch.context() as mp:
+        # Scoped to THIS reading and undone on the way out. The caller takes two readings, and a second
+        # one silently inheriting a raised bound would make its verdict unattributable to the budget it
+        # was actually given. Entered unconditionally, which costs a no-op setattr/restore on the
+        # healthy path and buys ONE statement of when a retry is allowed: a second eligibility test
+        # guarding this block would be a copy of the loop's own condition, free to drift from it.
+        mp.setattr(probe, "_PROBE_TIMEOUT_S", _STALLED_WALK_TIMEOUT_S)
+        while sample.cpu_seconds is None:
+            causes.append(sample.degraded)
+            # Stop on the first reading that either succeeds or fails FAST. A fast failure has no
+            # budget to run out of, so a longer one attacks nothing and would only grind a probe defect
+            # into a skip -- and that holds for a fast failure arriving mid-extension, not just for the
+            # first reading, which is why the test is here and not on the way in.
+            if used >= extension_walks or not _budget_exhausted(sample.degraded):
+                break
+            used += 1
+            sample = sampler.sample_proc()
+
+    if sample.cpu_seconds is not None:
+        return sample.cpu_seconds, extension_walks - used
+
+    fast = [c for c in causes if not _budget_exhausted(c)]
+    if fast:
+        pytest.fail(
+            f"CPU PROBE DEFECT -- the {which} reading returned no CPU, and {len(fast)} of "
+            f"{len(causes)} attempt(s) failed WITHOUT spending the timeout they were given (causes in "
+            f"order: {causes}). A cause that is not budget-exhausted means the probe RAN and produced "
+            f"nothing usable, so it is a defect in the probe: reported as a FAILURE and deliberately "
+            f"NOT downgraded to a skip (BACKLOG #1290). The burn measurement was never reached, so the "
+            f"CPU path itself was not assessed either way."
+        )
+    pytest.skip(
+        f"CPU PROBE TIMEOUT -- the {which} reading returned no CPU in {len(causes)} attempt(s), every "
+        f"one of them spending its whole timeout (causes in order: {causes}); the bounded extension "
+        f"was granted {extension_walks} walk(s) of {_STALLED_WALK_TIMEOUT_S:.0f}s and spent {used}. "
+        f"This reports COULD NOT MEASURE, not measured-and-wrong: an exhausted budget measures the "
+        f"runner, not this tree (BACKLOG #1290). A reading that fails WITHOUT spending its budget still "
+        f"FAILS, so a broken probe cannot hide behind this skip."
+    )
+
+
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS CPU probe path")
-def test_sampler_measures_a_descendant_that_actually_burns_cpu() -> None:
+def test_sampler_measures_a_descendant_that_actually_burns_cpu(
+    pytestconfig: pytest.Config,
+) -> None:
     """The positive control the CPU path never had: a burning DESCENDANT is measured as burning.
 
     This is a real launcher-confound reproduction. On Windows a venv's ``Scripts/python.exe`` is a thin
@@ -258,26 +348,130 @@ def test_sampler_measures_a_descendant_that_actually_burns_cpu() -> None:
 
     Both readings are taken over a STABLE subtree (the burner already exists when the sampler resolves),
     because differencing a sum across a CHANGING PID set is not a CPU delta.
-    """
+
+    BOTH READINGS ARE GUARDED THE SAME WAY, and they used to be guarded in opposite directions: the
+    first skipped on any gap at all, the second was a bare ``assert ... is not None``. The second walk
+    is the likelier of the two to time out -- it runs later, on a host that has had longer to get busy
+    -- so the unguarded side was the one that fired, killing a merge-queue entry with ``WALK_TIMEOUT``.
+    Symmetry corrects both directions at once: an exhausted budget now skips on EITHER reading, and a
+    probe that fails FAST now fails on either, where the first reading used to swallow it."""
+    # ONE extension allowance for the whole test, carried from the first reading to the second rather
+    # than granted afresh to each. `_STALL_EXTENSION_WALKS` is a per-test ceiling, and two full grants
+    # could outrun the watchdog the grant is trimmed to fit -- being killed by the watchdog reports no
+    # verdict at all, which is strictly worse than the failure this guard is fixing. A second grant
+    # would also buy nothing: a first reading that spends the whole extension has already outlived the
+    # bounded burner, so the second reading reaches the could-not-measure skip below whatever it does.
+    extension_walks = _granted_extension_walks(pytestconfig)
+
     child = subprocess.Popen([sys.executable, "-c", _BURN])  # noqa: S603 - fixed argv, no shell
     try:
         time.sleep(
             1.0
         )  # let the redirector's real interpreter appear before the subtree is resolved
         sampler = FdSampler(os.getpid(), resolve_interval_s=0.0)
-        first = sampler.sample_proc()
-        if first.cpu_seconds is None:
-            pytest.skip("OS CPU probe unavailable on this runner")
+        first_cpu_s, extension_walks = _cpu_seconds_or_verdict(sampler, extension_walks, "FIRST")
         time.sleep(2.0)
-        after = sampler.sample_proc()
+        after_cpu_s, extension_walks = _cpu_seconds_or_verdict(sampler, extension_walks, "SECOND")
+        burner_rc = child.poll()
     finally:
         child.kill()
         child.wait(timeout=10)
 
-    assert after.cpu_seconds is not None
+    # THE BURNER MUST HAVE OUTLIVED BOTH READINGS, OR THE DIFFERENCE IS NOT A CPU DELTA. `_BURN` is a
+    # BOUNDED loop (roughly 12 s, then it exits on its own), the sampler re-walks every tick
+    # (`resolve_interval_s=0.0`), and a departed PID drops straight out of the summed set -- so a second
+    # reading taken after the burner exits is summed over a SMALLER subtree than the first and can come
+    # out at or below it with nothing wrong. Unreachable on the healthy path, where both readings land
+    # within about 3 s of the spawn; reachable only once a bounded extension has spent tens of seconds
+    # first. That is the same latent edge the extension turned into a designed path in the sibling test
+    # below, closed here for the same reason: a green resting on an unmeasurable run is the defect.
+    if burner_rc == 0:
+        pytest.skip(
+            "COULD NOT MEASURE -- the burner ran to completion before the second reading, so that "
+            "reading is summed over a subtree it had already left and the difference is not a CPU "
+            "delta. Reachable only when the bounded extension outlasts the burner. Reported as "
+            "could-not-measure rather than as a flat counter, which would accuse the probe of a defect "
+            "this run never tested for."
+        )
+    assert burner_rc is None, (
+        f"POSITIVE CONTROL FAILED -- the burner exited {burner_rc} before the readings completed, so it "
+        f"never burned the CPU this test measures. Nothing here is evidence about the probe: a sampler "
+        f"asked to see work that was never done reports a flat counter for the right reason. A failure "
+        f"rather than a skip -- a positive control that cannot RUN is a broken rig, not a slow host."
+    )
+
     # The burner consumed ~2 core-seconds in the window. A subtree that stopped at the idle redirector
-    # would show only this test process — well under 0.5 s.
-    assert after.cpu_seconds - first.cpu_seconds > 0.5
+    # would show only this test process -- well under 0.5 s.
+    assert after_cpu_s - first_cpu_s > 0.5, (
+        f"THE SUBTREE DID NOT SEE THE BURNING DESCENDANT -- the summed CPU moved "
+        f"{after_cpu_s - first_cpu_s:.3f}s across a window in which a live descendant burned roughly "
+        f"two core-seconds. Both readings succeeded and the burner outlived them, so this is "
+        f"measured-and-wrong rather than could-not-measure: a sampler bound to the idle launcher shim "
+        f"instead of the subtree reports exactly this, and it is the constant 0.00 the rig saw."
+    )
+
+
+def _canned_sampler(monkeypatch: pytest.MonkeyPatch, samples: list[ProcSample]) -> FdSampler:
+    """An ``FdSampler`` whose ``sample_proc`` serves a scripted sequence, repeating the last entry.
+
+    The two arms of ``_cpu_seconds_or_verdict`` are reachable only on a host too starved to enumerate,
+    which no healthy runner reproduces on demand -- so without a scripted sampler the
+    fast-failure-still-fails rule would ship with nothing able to exercise it, on any runner, ever. That
+    is the shape #1290 is about, so the guard it motivates must not be built with it. The constructor
+    touches no OS state, so these run on every platform."""
+    sampler = FdSampler(os.getpid(), resolve_interval_s=0.0)
+    queue = list(samples)
+
+    def _next() -> ProcSample:
+        return queue.pop(0) if queue else samples[-1]
+
+    monkeypatch.setattr(sampler, "sample_proc", _next)
+    return sampler
+
+
+def test_a_cpu_reading_that_fails_without_spending_its_budget_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1290's rule at the reading level. A walk that errored out immediately measures the probe, not
+    # the host, so no budget may be extended to it and no skip may absorb it.
+    sampler = _canned_sampler(monkeypatch, [_gap(ProbeDegraded.WALK_ERROR)])
+    with pytest.raises(pytest.fail.Exception, match="CPU PROBE DEFECT"):
+        _cpu_seconds_or_verdict(sampler, 2, "FIRST")
+
+
+def test_a_cpu_reading_whose_budget_ran_out_skips_rather_than_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The arm the asymmetry cost us: a second reading that spent its whole timeout used to red a
+    # required context. It measures the runner, so it reports could-not-measure.
+    sampler = _canned_sampler(monkeypatch, [_gap(ProbeDegraded.WALK_TIMEOUT)])
+    with pytest.raises(pytest.skip.Exception, match="CPU PROBE TIMEOUT"):
+        _cpu_seconds_or_verdict(sampler, 2, "SECOND")
+
+
+def test_the_extension_cannot_launder_a_fast_failure_into_a_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The composite case, and the one a blanket skip gets wrong. The first reading times out, which
+    # opens the extension; an extension walk then fails FAST. The verdict follows the fast failure --
+    # otherwise a single load-induced timeout would be enough to hide every probe defect behind it.
+    sampler = _canned_sampler(
+        monkeypatch, [_gap(ProbeDegraded.WALK_TIMEOUT), _gap(ProbeDegraded.WALK_EMPTY)]
+    )
+    with pytest.raises(pytest.fail.Exception, match="CPU PROBE DEFECT"):
+        _cpu_seconds_or_verdict(sampler, 2, "SECOND")
+
+
+def test_a_reading_recovered_by_the_extension_returns_the_walks_it_did_not_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The unspent remainder is what lets one per-test allowance cover both readings; a per-reading
+    # grant would let a doubly-stalled run outrun the watchdog it is trimmed to fit.
+    recovered = ProcSample(
+        handles=7, cpu_seconds=1.5, working_set_bytes=1_000, cpu_pids=frozenset({1})
+    )
+    sampler = _canned_sampler(monkeypatch, [_gap(ProbeDegraded.WALK_TIMEOUT), recovered])
+    assert _cpu_seconds_or_verdict(sampler, 2, "FIRST") == (1.5, 1)
 
 
 def _granted_extension_walks(config: pytest.Config) -> int:
@@ -287,7 +481,13 @@ def _granted_extension_walks(config: pytest.Config) -> int:
     the number in this file would drift from the matrix, and the direction it drifts in is the bad one —
     an extension that outgrows the watchdog converts a clean skip into a timeout kill with no verdict.
     Returns 0 when there is no room, which is a correct outcome, not a degraded one: the poll still runs
-    for ``_RESOLUTION_DEADLINE_S`` and still reports which of the two failures occurred."""
+    for ``_RESOLUTION_DEADLINE_S`` and still reports which of the two failures occurred.
+
+    ``test_sampler_measures_a_descendant_that_actually_burns_cpu`` shares this grant, and the
+    ``_RESOLUTION_DEADLINE_S`` subtracted here is a poll IT does not run -- so the number it gets is
+    conservative by roughly 27 s. That is the safe direction and it is why the grant is shared rather
+    than copied: an under-grant costs a skip that was already going to be a skip, while a second copy of
+    this arithmetic could drift the other way, into the watchdog kill the paragraph above is about."""
     watchdog = config.getoption("timeout", default=None)
     if not isinstance(watchdog, int | float) or watchdog <= 0:
         return _STALL_EXTENSION_WALKS  # no watchdog to fit inside; the hard ceiling still applies

@@ -784,3 +784,78 @@ async def test_a_verified_clean_install_still_starts_silently(
         assert sink.events == []
     finally:
         await store.close()
+
+
+# --- BACKLOG #1679 act 5: an editable install under an opted-in fail-closed posture ---
+
+
+def _editable_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fabricated install that DECLARES itself editable — the AC-12 no-op shape."""
+    pkg = "mfengine"
+    files = {
+        f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
+        f"{pkg}/core.py": b"def go():\n    return 1\n",
+    }
+    dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files, editable=True)
+    _patch(monkeypatch, dist, loaded, pkg)
+
+
+async def test_declared_editable_under_fail_closed_warns_and_names_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An operator who set ``[integrity].fail_closed_on_drift`` on an editable install WOULD start
+    with the tripwire disarmed, and before this change with zero signal (BACKLOG #1679 act 5).
+
+    AC-12 keeps the exemption — a declared-editable install is still never refused, never audited and
+    never alerted, so a dev checkout is not bricked. What was missing is the operator's side of it:
+    the posture readout said nothing at all, so the opt-in looked honoured.
+
+    This is a MISCONFIGURATION control and nothing more. It closes no hole: an adversary with
+    venv-write plants a ``direct_url.json`` or rewrites this module in the same single write.
+    """
+    import logging
+
+    _editable_install(tmp_path, monkeypatch)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_fc.db")))
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            out = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+        assert out.declared_editable is True and out.attested_nothing is True
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "a fail-closed opt-in on an editable install must not start silently"
+        assert any("DISARMED" in m for m in warnings), warnings
+        # The reason token is what carries the cause into the boot-log posture readout.
+        assert any("declared_editable" in m for m in warnings), warnings
+        # AC-12 is untouched: still no refusal, no audit row, no alert.
+        assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_declared_editable_under_the_default_posture_stays_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE PAIRED ARM. The warning above is keyed on the fail-closed OPT-IN, not on editability.
+
+    Off the default alert-only posture an editable install is an ordinary dev checkout and there is no
+    misconfiguration to report, so it must stay silent. Without this arm the change could be satisfied
+    by warning on every dev run, which is how a warning stops being read.
+    """
+    import logging
+
+    _editable_install(tmp_path, monkeypatch)
+
+    store = await open_store(sqlite_settings(str(tmp_path / "ed_default.db")))
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            out = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert out.declared_editable is True
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
+        assert sink.events == []
+    finally:
+        await store.close()

@@ -92,19 +92,74 @@ async def store() -> AsyncIterator[object]:
 
     settings = load_settings(environ=os.environ).store
     s = await PostgresStore.open(settings)
-    # Clean slate (the container DB persists across tests in a run).
-    async with s._pool.acquire() as conn:
-        await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
-    # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
-    # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
-    # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
-    await s._load_state_cache()
-    await s._load_reference_cache()
-    # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
-    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
-    s._audit_keyed_from = None
-    yield s
-    await s.close()
+    # BACKLOG #1629: everything between open() and the yield runs inside this try, so a setup
+    # failure still closes the pool. Without it one failing setup step would leak a pool per test
+    # and the rest of the run would error on the connection cap, burying the real cause.
+    try:
+        # Clean slate (the container DB persists across tests in a run).
+        async with s._pool.acquire() as conn:
+            await conn.execute("TRUNCATE " + ", ".join(_TABLES) + " RESTART IDENTITY CASCADE")
+        # open() seeded the read-through caches from the DB BEFORE this truncate, so re-load them from the
+        # now-empty tables — otherwise a prior test's state/reference rows linger in this handle's in-memory
+        # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
+        await s._load_state_cache()
+        await s._load_reference_cache()
+        # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
+        # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+        s._audit_keyed_from = None
+        yield s
+    finally:
+        await s.close()
+
+
+async def test_store_fixture_closes_the_pool_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1629: a setup failure between open() and the yield still closes the pool.
+
+    The window under test is the FIXTURE's own setup, not ``open()``'s. ``PostgresStore.open``
+    carries its own M-6 guard (``except Exception: await pool.close(); raise``), so a failure
+    injected into any step ``open()`` performs is caught and the pool closed *there*, ``open()``
+    never returns, and the fixture's ``try``/``finally`` is never entered -- the closed-pool
+    assertion below would then hold with the fix reverted, which is no test at all.
+
+    So the failure is armed only once ``open()`` has RETURNED, and on the returned instance
+    rather than on the class. ``open()`` therefore runs its own ``_load_state_cache`` for real,
+    and the raise can only land in the fixture's own call to it -- after the TRUNCATE, before
+    the ``yield``. Without the ``try``/``finally`` the generator walks away from a live pool, so
+    one bad setup step would leak a handle per test and every later test would error on the
+    connection cap instead of on the real fault. Test infrastructure: no deployment axis.
+
+    ``store.__wrapped__`` is the undecorated generator pytest keeps on the fixture object.
+    """
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.postgres import PostgresStore
+
+    opened: list[PostgresStore] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("fixture setup failed after open")
+
+    real_open = PostgresStore.open
+
+    async def _open_then_arm(settings: StoreSettings) -> PostgresStore:
+        s = await real_open(settings)
+        # open() returned, so its M-6 guard is behind us and the pool is live. Patching the
+        # INSTANCE (not the class) is what pins the raise to a fixture-owned step: nothing
+        # inside open() can reach this attribute, because open() is already done.
+        assert not s._pool.is_closing(), "open() handed back a closed pool -- anchor broken"
+        setattr(s, "_load_state_cache", _boom)  # noqa: B010 - shadows the bound method on purpose
+        opened.append(s)
+        return s
+
+    monkeypatch.setattr(PostgresStore, "open", _open_then_arm)
+
+    gen = store.__wrapped__()
+    with pytest.raises(RuntimeError, match="fixture setup failed after open"):
+        await anext(gen)
+
+    assert opened, "open() never returned, so no fixture-owned step ran and this asserts nothing"
+    assert opened[0]._pool.is_closing(), "the fixture left its pool open on the failure path"
 
 
 # --- parity tests (mirror tests/test_sqlserver_store.py) -----------------------
@@ -682,6 +737,24 @@ async def test_dead_letter_missing_destinations(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
 
 
+async def test_dead_letter_missing_inbounds(store) -> None:
+    # BACKLOG #1612. The channel-keyed sweep, at parity with its two siblings: an ingress row whose
+    # inbound left the registry is dead-lettered (nothing else would ever claim it), while an
+    # outbound row is spared even when ITS origin channel is the removed one — outbound lanes key on
+    # destination_name and drain regardless of where the message came from.
+    orphan = await store.enqueue_ingress(channel_id="GONE_IN", raw=RAW, now=100.0)
+    outbound = await store.enqueue_message(
+        channel_id="GONE_IN", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    assert await store.dead_letter_missing_inbounds({"IB"}, now=200.0) == 1
+    assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
+    assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
+    # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
+    assert await store.replay(orphan, now=300.0) == 1
+    item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
+    assert item is not None and item.payload == RAW
+
+
 async def test_audit_chain_verifies(store) -> None:
     await store.record_audit("message_view", actor="alice", detail="view 1")
     await store.record_audit("export", actor="bob", detail="export 1")
@@ -828,6 +901,18 @@ async def test_lockout_store_contract(store) -> None:
     from tests._lockout_store_contract import _assert_lockout_contract
 
     await _assert_lockout_contract(store)
+
+
+async def test_pending_approval_store_contract(store) -> None:
+    """BACKLOG #1540 ``pending_approvals.requester_user_id`` on the real Postgres backend.
+
+    The dual-control self-approval refusal keys on this column, and a backend that drops it refuses
+    every release fail-closed rather than failing loudly. ``test_store_schema_hash.py`` pins the DDL
+    text; only this leg executes the ``INSERT``/``SELECT`` that have to carry the value. Extra-free
+    import, for the reason the WebAuthn contract above states."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:

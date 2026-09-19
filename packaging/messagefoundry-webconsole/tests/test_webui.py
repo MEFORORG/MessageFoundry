@@ -2749,6 +2749,32 @@ async def test_reset_password_shows_temp_once(engine: Engine) -> None:
         assert "Temporary password issued" in r.text and "<code>" in r.text
         user = await service.store.get_user(uid)
         assert user is not None and user.must_change_password
+        # BACKLOG #1141 (ASVS 6.4.5): the page an administrator actually reads states the deadline.
+        # Asserting the RENDERED instant, not merely that some date appears: the sentence is the
+        # renewal instruction, and one naming a moment the gate does not honour is worse than none.
+        from datetime import UTC, datetime
+
+        assert user.password_changed_at is not None
+        deadline = service.initial_credential_deadline(user.password_changed_at)
+        assert deadline is not None
+        assert (
+            datetime.fromtimestamp(deadline, UTC).strftime("%Y-%m-%d %H:%M:%SZ") in r.text
+            and "It stops working at" in r.text
+        )
+
+
+async def test_temp_password_page_states_no_deadline_when_expiry_is_off() -> None:
+    # The control for the assertion above. `initial_password_expiry_hours = 0` is a documented,
+    # supported value, and the honest page then says nothing about a deadline rather than softening
+    # the sentence -- so the assertion above is measuring the deadline arm, not boilerplate that is
+    # always present.
+    from messagefoundry_webconsole.pages import admin as pages
+
+    with_deadline = pages.temp_password_page("u2", "temp-secret", 1_800_000_000.0)
+    assert "It stops working at" in str(with_deadline)
+    without = pages.temp_password_page("u2", "temp-secret", None)
+    assert "It stops working at" not in str(without)
+    assert "Temporary password issued" in str(without)  # the rest of the page is unchanged
 
 
 async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:

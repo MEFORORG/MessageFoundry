@@ -21,10 +21,15 @@ row kind reaching an OLD consumer renders a blank, titleless row. Both new kinds
 behind an explicit ``contract`` argument (``lens parse --contract N``):
 
 * :data:`CONTRACT_V1` (the default) is the shipped contract — no ``note`` rows, no ``route`` rows, no
-  ``@router`` projection, no ``role``/``contract_version`` fields. A consumer that passes nothing gets
-  **byte-identical** output to the pre-amendment parser.
-* :data:`CONTRACT_V2` adds the ``note`` and ``route`` kinds, projects ``@router`` defs, and stamps each
-  entry with ``role`` + ``contract_version`` so a consumer can tell the two projections apart.
+  ``@router`` projection, no ``role``/``contract_version`` fields, no ``param_modes``. A consumer that
+  passes nothing gets **byte-identical** output to the pre-amendment parser.
+* :data:`CONTRACT_V2` adds the ``note`` and ``route`` kinds, projects ``@router`` defs, stamps each
+  entry with ``role`` + ``contract_version`` so a consumer can tell the two projections apart, and
+  carries Amendment E's per-argument ``param_modes`` map on every row with typed arguments.
+
+``param_modes`` is a new FIELD rather than a new kind, so it cannot render a blank row at an older
+consumer — it rides v2 instead of minting a version of its own, and an older consumer simply ignores a
+key it does not read (§E.8).
 
 Two contract details worth stating for L3 consumers: a ``lookup`` row may carry an extra ``assign_to``
 field (the assignment target of e.g. ``row = db_lookup(...)`` — within §3's contract, optional). And at
@@ -63,7 +68,8 @@ __all__ = [
 #: the grammar amendments) can never be handed a kind it has no renderer for (§A.7 / §D.7).
 CONTRACT_V1 = 1
 #: Adds the ``note`` kind (Amendment A) and the ``route`` kind + ``@router`` projection (Amendment D),
-#: and stamps each entry with ``role`` ("handler"/"router") + ``contract_version``.
+#: stamps each entry with ``role`` ("handler"/"router") + ``contract_version``, and carries the
+#: per-argument ``param_modes`` map (Amendment E).
 CONTRACT_V2 = 2
 #: The newest contract this parser can emit. A consumer asks for the version it can RENDER, never this.
 CONTRACT_LATEST = CONTRACT_V2
@@ -269,7 +275,7 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
 
 
 def _native_action_row(
-    native: _NativeAction, s: ast.stmt, nesting: int, source: str
+    native: _NativeAction, s: ast.stmt, nesting: int, source: str, contract: int
 ) -> dict[str, Any]:
     """Build the ADR 0076 ``action`` row contract for a recognized native write (ADR 0089 Phase A).
 
@@ -277,22 +283,28 @@ def _native_action_row(
     each read-only keyword (``occurrence=``), so the row carries the same shape as the wrapper form.
     ``literal_params`` is the subset of *slot* params whose argument is a string/scalar literal — the
     IDE offers only those as editable, exactly as for wrapper actions (a keyword like ``occurrence`` is
-    never listed, so it stays a bound read-only field)."""
-    params: dict[str, Any] = {}
-    for name, node in native.slots:
-        params[name] = _render_value(node, source)
-    for name, node in native.display:
-        params[name] = _render_value(node, source)
+    never listed, so it stays a bound read-only field).
+
+    ``param_modes`` (Amendment E) covers the display keywords too, because AC-M1 makes it total over
+    ``params``. A constant ``occurrence=`` is therefore ``static`` while staying out of
+    ``literal_params`` — a LITERAL THAT IS NOT EDITABLE, which is a coherent state only because the two
+    fields answer different questions, and is exactly why AC-M2 is scoped to editable params (E.10)."""
+    slots_and_display = [*native.slots, *native.display]
+    params = {name: _render_value(node, source) for name, node in slots_and_display}
     literal_params = [name for name, node in native.slots if isinstance(node, ast.Constant)]
-    return {
-        "kind": "action",
-        "action": native.action,
-        "params": params,
-        "literal_params": literal_params,
-        "line_start": s.lineno,
-        "line_end": s.end_lineno or s.lineno,
-        "nesting": nesting,
-    }
+    return _attach_param_modes(
+        {
+            "kind": "action",
+            "action": native.action,
+            "params": params,
+            "literal_params": literal_params,
+            "line_start": s.lineno,
+            "line_end": s.end_lineno or s.lineno,
+            "nesting": nesting,
+        },
+        {name: _param_mode(node) for name, node in slots_and_display},
+        contract,
+    )
 
 
 # --- public entry points -----------------------------------------------------
@@ -938,39 +950,51 @@ def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | N
     if isinstance(s, ast.Expr):
         native = _recognize_native_method(call)
         if native is not None:
-            return _native_action_row(native, s, nesting, source)
+            return _native_action_row(native, s, nesting, source, ctx.contract)
 
     name = _callee_name(call.func)
     if name in _ACTIONS and isinstance(s, ast.Expr):
-        return {
-            "kind": "action",
-            "action": name,
-            "params": _render_params(call, _ACTION_PARAMS[name], source),
-            "literal_params": _literal_param_names(call, _ACTION_PARAMS[name]),
-            "line_start": line_start,
-            "line_end": line_end,
-            "nesting": nesting,
-        }
+        return _attach_param_modes(
+            {
+                "kind": "action",
+                "action": name,
+                "params": _render_params(call, _ACTION_PARAMS[name], source),
+                "literal_params": _literal_param_names(call, _ACTION_PARAMS[name]),
+                "line_start": line_start,
+                "line_end": line_end,
+                "nesting": nesting,
+            },
+            _param_modes_for_call(call, _ACTION_PARAMS[name]),
+            ctx.contract,
+        )
     if name in _DIAGNOSTICS and isinstance(s, ast.Expr):
-        return {
-            "kind": "diagnostic",
-            "call": name,
-            "params": _render_params(call, _DIAGNOSTIC_PARAMS[name], source),
-            "literal_params": _literal_param_names(call, _DIAGNOSTIC_PARAMS[name]),
-            "line_start": line_start,
-            "line_end": line_end,
-            "nesting": nesting,
-        }
+        return _attach_param_modes(
+            {
+                "kind": "diagnostic",
+                "call": name,
+                "params": _render_params(call, _DIAGNOSTIC_PARAMS[name], source),
+                "literal_params": _literal_param_names(call, _DIAGNOSTIC_PARAMS[name]),
+                "line_start": line_start,
+                "line_end": line_end,
+                "nesting": nesting,
+            },
+            _param_modes_for_call(call, _DIAGNOSTIC_PARAMS[name]),
+            ctx.contract,
+        )
     if name in _LOOKUPS:
-        row: dict[str, Any] = {
-            "kind": "lookup",
-            "call": name,
-            "params": _render_params(call, _LOOKUP_PARAMS[name], source),
-            "literal_params": _literal_param_names(call, _LOOKUP_PARAMS[name]),
-            "line_start": line_start,
-            "line_end": line_end,
-            "nesting": nesting,
-        }
+        row: dict[str, Any] = _attach_param_modes(
+            {
+                "kind": "lookup",
+                "call": name,
+                "params": _render_params(call, _LOOKUP_PARAMS[name], source),
+                "literal_params": _literal_param_names(call, _LOOKUP_PARAMS[name]),
+                "line_start": line_start,
+                "line_end": line_end,
+                "nesting": nesting,
+            },
+            _param_modes_for_call(call, _LOOKUP_PARAMS[name]),
+            ctx.contract,
+        )
         if assign_to:
             row["assign_to"] = assign_to
         return row
@@ -1147,28 +1171,64 @@ def _delivering_accumulators(node: ast.FunctionDef | ast.AsyncFunctionDef) -> se
 # --- parameter rendering -----------------------------------------------------
 
 
+def _rendered_param_nodes(call: ast.Call, param_names: list[str]) -> list[tuple[str, ast.expr]]:
+    """``(emitted param name, the node its value comes from)`` for every param the row will carry.
+
+    ONE name mapping, consumed by :func:`_render_params` and :func:`_param_modes_for_call` alike. AC-M1
+    requires ``param_modes`` to be TOTAL over ``params``, and a second copy of this walk would make that
+    totality a coincidence that holds until one copy learns a name the other does not."""
+    mapped: list[tuple[str, ast.expr]] = []
+    for i, arg in enumerate(call.args):
+        if isinstance(arg, ast.Starred):
+            mapped.append((f"*{param_names[i] if i < len(param_names) else f'arg{i}'}", arg.value))
+            continue
+        name = param_names[i] if i < len(param_names) else f"arg{i}"
+        if name == "msg":
+            continue
+        mapped.append((name, arg))
+    for kw in call.keywords:
+        mapped.append(("**kwargs" if kw.arg is None else kw.arg, kw.value))
+    return mapped
+
+
 def _render_params(call: ast.Call, param_names: list[str], source: str) -> dict[str, Any]:
     """Map a call's positional + keyword args to ``{param: value}``, dropping the leading ``msg``.
 
     A literal arg renders to its Python value (JSON scalar or list of scalars); anything else renders to
     its verbatim source text (a bounded ``Message`` read such as ``msg["PID-5"]``)."""
-    params: dict[str, Any] = {}
-    for i, arg in enumerate(call.args):
-        if isinstance(arg, ast.Starred):
-            params[f"*{param_names[i] if i < len(param_names) else f'arg{i}'}"] = _render_value(
-                arg.value, source
-            )
-            continue
-        name = param_names[i] if i < len(param_names) else f"arg{i}"
-        if name == "msg":
-            continue
-        params[name] = _render_value(arg, source)
-    for kw in call.keywords:
-        if kw.arg is None:
-            params["**kwargs"] = _render_value(kw.value, source)
-        else:
-            params[kw.arg] = _render_value(kw.value, source)
-    return params
+    return {
+        name: _render_value(node, source) for name, node in _rendered_param_nodes(call, param_names)
+    }
+
+
+def _param_modes_for_call(call: ast.Call, param_names: list[str]) -> dict[str, str]:
+    """The ADR 0076 E.4 mode of every param a wrapper call's row carries (AC-M1: total over ``params``).
+
+    Keyed off :func:`_rendered_param_nodes`, so it covers the synthetic ``*arg1`` / ``**kwargs`` keys and
+    the extra positionals past the signature that ``literal_params`` deliberately skips. That widening is
+    correct rather than sloppy because the two fields answer DIFFERENT questions (E.4, E.10):
+    ``literal_params`` answers *is this argument editable*, ``param_modes`` answers *what shape is it* —
+    and a shape exists for an argument no edit may splice."""
+    return {name: _param_mode(node) for name, node in _rendered_param_nodes(call, param_names)}
+
+
+def _attach_param_modes(
+    row: dict[str, Any], modes: dict[str, str], contract: int
+) -> dict[str, Any]:
+    """Add ADR 0076 Amendment E's ``param_modes`` to ``row`` at :data:`CONTRACT_V2` and above.
+
+    GATED, because AC-M7 requires a contract version that emits no such key at all: ``param_modes`` is
+    Amendment E's only field, so :data:`CONTRACT_V1` stays byte-identical to the pre-amendment parser
+    exactly as it does across Amendments A and D (§A.7 / §D.7).
+
+    It rides :data:`CONTRACT_V2` rather than minting a version of its own because E.8 puts the FORWARD
+    skew on the consumer — an older IDE keeps reading ``params``/``literal_params`` and ignores the key
+    it does not know — and the shipped extension asks for contract 2, so that is a live consumer rather
+    than a hypothetical one. A version of its own would instead make an OLDER engine refuse a NEWER IDE
+    outright, which is the other skew direction and not the one E.8 describes."""
+    if contract >= CONTRACT_V2:
+        row["param_modes"] = modes
+    return row
 
 
 def _literal_param_names(call: ast.Call, param_names: list[str]) -> list[str]:

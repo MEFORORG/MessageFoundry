@@ -21,17 +21,27 @@ is defined here and nowhere else, so other pages point at this line rather than 
 | Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
 
-**NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE.** The owner starts each Manager in a desktop
-instance, and a Manager's workers are **subagents in its own process**, on its own account. So a
-Manager needs no spawn grant, no account roster, and no way to reach another Manager: the shape
+**A MANAGER AND THE LANDER MAY SPAWN A SESSION; every other seat needs permission first (owner
+ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
+workers are **subagents in its own process**, on its own account, rather than spawned sessions. So a
+Manager needs no spawn grant for its workers, no account roster, and still no way to reach another
+Manager -- spawning makes a NEW session rather than addressing an existing one, so the shape still
 dissolves the cross-account coordination problem rather than solving it. Several Managers run at
 once, usually one per account, and what binds them is the repository they share.
 
-**The grant below is kept as a measurement, not as a live rule.** It gated the retired Console's
-session-spawning, and the numbers are kept so nobody re-derives them and nobody reads the
-retirement as a capability that broke. In the `settings.json` of the config root named by
+**The case spawning exists for is a PR that needs a fix with no Manager alive**, which nothing else
+resolves: no workflow reads a red PR back. `CLAUDE.md` section 5 carries the reasoning and the two
+spelling hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
+true when written and false by 2026-09-16.
+
+**The grant below is LIVE again, and the measurements are kept because they still apply.** It gated
+the retired Console's session-spawning, went unused while nothing spawned, and is what a Manager or
+the Lander now spawns under. In the `settings.json` of the config root named by
 `CLAUDE_CONFIG_DIR`, under `permissions.allow`, it is a rule matching `Bash(claude:*)` or
-`PowerShell(claude:*)`.
+`PowerShell(claude:*)`. **Measured 2026-09-16: present on all six config roots** -- the base
+`~/.claude` was missing it and was corrected that day; accounts 1 through 5 already carried both.
+`~/.claude-account-2.lock` holds a `settings.json` and four backups and nothing else, so it is a
+backup directory rather than a root, and carries no grant by design.
 
 Measured 2026-09-02: `.claude-account-1` carries both rules and spawned a Builder, exit 0 in 38.8
 seconds. Every root measured that day without them was refused by the classifier. Read that exit
@@ -51,8 +61,9 @@ name pattern and prints `Roots examined: <n>` with a line per root, so enumerate
 each root's own `settings.json` for the grant.
 
 Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, PM, Cleaner, Role
-Manager, Process Improvement and ASVS Tracker. **The Reviewer went on 2026-09-05**, with the
-`reviewed` label and `review-gate.yml`. **The CONSOLE went on 2026-09-10, and the Manager above
+Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**, with the
+`reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
+repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** If a document names one, that document is stale.
 
 **A Manager is not a renamed Console, and substituting one for the other is the measured failure
@@ -63,7 +74,7 @@ does not. `docs/roles/seats.json` resolves every spelling of `console` to a noti
 
 Three rules went with those seats, and they are not repeated anywhere. Routing an owner question
 through the Liaison is retired. Getting owner approval before your own push is retired. Falling back
-to the Lander when no Reviewer is running is retired too.
+to the Lander for a second reading is retired too.
 
 **RETIRED 2026-09-05, and the retraction is kept because the wrong version was load-bearing.** This
 paragraph used to end "A `reviewed` label now gates the merge, and no seat can merge without it."
@@ -213,8 +224,8 @@ is yours.
 ### There is no reviewed label
 
 **RETIRED 2026-09-05.** This section used to give the protocol: `gh pr edit <N> --add-label reviewed`,
-stripped by a `synchronize` run so unread commits were unread again. The label, the workflow and the
-Reviewer seat are gone. Read a diff because it is worth reading; no machine records that you did.
+stripped by a `synchronize` run so unread commits were unread again. The label, the workflow and the seat that
+owned them are gone. Read a diff because it is worth reading; no machine records that you did.
 Labelling your own unread PR satisfies the machine and defeats the point.
 
 ### The merge queue re-checks everything

@@ -1414,11 +1414,21 @@ _SCHEMA: list[str] = [
         uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
         since FLOAT NOT NULL)""",
+    # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
+    # self-approval refusal compares (the Store protocol's create_pending_approval says why).
+    # NVARCHAR(64) matches users.id and this table's own id column.
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
+        requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
+    # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
+    # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
+    # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
+    # matches and the column never appears, with no error.
+    """IF COL_LENGTH('pending_approvals','requester_user_id') IS NULL
+        ALTER TABLE pending_approvals ADD requester_user_id NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -6000,6 +6010,64 @@ class SqlServerStore:
         )
         return len(orphans)
 
+    async def dead_letter_missing_inbounds(
+        self, valid_names: set[str], now: float | None = None
+    ) -> int:
+        """Dead-letter non-terminal channel-keyed queue rows (ingress/routed/response) whose
+        channel_id is no longer in the registry (a removed/renamed inbound) — no router, transform or
+        re-ingress worker is spawned for it and no dispatcher claims its lane, so they'd strand
+        forever. Outbound rows key on destination_name and drain regardless of origin, so they are
+        excluded. Call ONCE at startup, AFTER reset_stale_inflight. ``valid_names`` is the WHOLE
+        deployment's inbound names, never one engine shard's slice. Per-message finalize applocks are
+        pre-acquired in sorted id order to avoid multi-message deadlock; a killed row -> DEAD -> the
+        finalizer resolves the message to ERROR."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT id, message_id, channel_id FROM queue"
+                    " WHERE stage IN (?, ?, ?) AND status IN (?, ?)",
+                    (
+                        Stage.INGRESS.value,
+                        Stage.ROUTED.value,
+                        Stage.RESPONSE.value,
+                        OutboxStatus.PENDING.value,
+                        OutboxStatus.INFLIGHT.value,
+                    ),
+                )
+                rows = await cur.fetchall()  # positional: (id, message_id, channel_id)
+                orphans = [r for r in rows if r[2] not in valid_names]
+                if not orphans:
+                    await self._commit(conn)
+                    return 0
+                error = "inbound removed from registry"
+                await self._lock_finalize_batch(cur, {r[1] for r in orphans})
+                for row in orphans:
+                    await cur.execute(
+                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=?",
+                        (
+                            OutboxStatus.DEAD.value,
+                            now,
+                            self._enc(error, aad=cell_aad("queue", "last_error", row[0])),  # H4
+                            now,
+                            row[0],
+                        ),
+                    )
+                    await self._event(cur, row[1], "dead", None, error, now)
+                    await self._maybe_finalize(cur, row[1], now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        log.warning(
+            "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
+            " inbound(s): %s",
+            len(orphans),
+            ", ".join(sorted({r[2] for r in orphans})),
+        )
+        return len(orphans)
+
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     # The RetentionRunner drives these once the staged pipeline is enabled. Bodies are blanked to ''
     # (not deleted) so cipher re-encrypt scans skip them and the FK to messages stays intact. SQL
@@ -9614,27 +9682,37 @@ class SqlServerStore:
         operation: str,
         params: str,
         requester: str,
+        requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
     ) -> None:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
         await self._execute(
             "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requested_at, status, expires_at) "
-            "VALUES (?,?,?,?,?,'pending',?)",
-            (approval_id, operation, params, requester, requested_at, expires_at),
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+            " VALUES (?,?,?,?,?,?,'pending',?)",
+            (
+                approval_id,
+                operation,
+                params,
+                requester,
+                requester_user_id,
+                requested_at,
+                expires_at,
+            ),
         )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-            " expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
+            # No requester_user_id here — see the SQLite twin.
             "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
             " decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
