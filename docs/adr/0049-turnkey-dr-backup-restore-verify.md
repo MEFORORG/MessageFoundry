@@ -257,7 +257,7 @@ surface; consistent with the on-prem/no-egress default and ADR 0026's posture).
 
 ### CLI
 
-Two subcommands on the existing `messagefoundry` argparse surface (sibling of `serve`/`rotate-key`/`protect-key`):
+Subcommands on the existing `messagefoundry` argparse surface (sibling of `serve`/`rotate-key`/`protect-key`):
 
 - **`messagefoundry backup`** — take an **on-demand** backup now: resolve settings + the store key, snapshot,
   bundle, encrypt, write to `--destination` (or `[backup].destination`), restore-verify, prune to keep-N,
@@ -270,6 +270,15 @@ Two subcommands on the existing `messagefoundry` argparse surface (sibling of `s
   `store.db` read-only, run `PRAGMA integrity_check`, compare per-table row counts against the manifest, and
   report a structured `PASS` / `FAIL` / `KEY_MISMATCH` result + the manifest. The same verification the runner
   runs after each backup.
+- **`messagefoundry restore <archive> --to <store path>`** — put the archive BACK (added under BACKLOG
+  #1717; this ADR shipped with a writer and a verifier and no way to restore, and ADR 0048 deferred the
+  restore mechanic here). Key-fingerprint precheck, decrypt the archive **once**, bounded-extract
+  `store.db`, run the same `integrity_check` + manifest row-count compare on the extracted file, then
+  place **those exact bytes** at `--to`. It **refuses to overwrite** an existing destination or a leftover
+  SQLite `-wal`/`-shm` sidecar — restoring over a live store is unrecoverable and a CLI cannot ask — and
+  the write is an exclusive create, so the refusal is not a check-then-write race. Optional
+  `--config-to <dir>` restores the config bundle; that is a **refusal**, not a silent no-op, when the
+  archive carries none. A config-only archive (server-DB store) is refused: there is no store in it.
 
 The CLI must **never** print a message body and runs the heavy PRAGMA/decrypt work synchronously in the
 command (it is not in the serving hot path).

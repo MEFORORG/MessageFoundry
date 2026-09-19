@@ -228,6 +228,17 @@ not a warm DB replica.** The DR box does not maintain a live, continuously-repli
 store; it is seeded by **restoring #60 / ADR 0049's most recent encrypted, restore-verified backup** at the moment
 of activation. The engine owns only the feed-priority + selective-startup half; the restore mechanic is #60's.
 
+> **Amendment (BACKLOG #1717): the restore mechanic now EXISTS, and this ADR's cold seed consumes it.** The
+> deferral above was written when #60 shipped a `backup` that wrote a `.mfbak` archive and a `restore-verify`
+> that opened one, and **nothing that could restore one** — the operator was left to hand-extract the tar, a
+> step no shipped code or document described. `messagefoundry restore <archive> --to <store path>` is that
+> missing half: verify, decrypt, write the archive's `store.db` to a destination it **refuses to overwrite**
+> (restoring over a live store is unrecoverable), with an optional `--config-to` for the config bundle.
+> Activation still does not load the archive itself — the restore stays a deliberate, separate operator step —
+> so activation now **also refuses when the DR store does not carry the verified seed**. Before that gate, a DR
+> box that skipped the restore verified a perfectly good archive, recorded a `dr_seed` marker for an archive it
+> had never loaded, and reported a successful promotion onto an empty store.
+
 - **Cold — restore from #60 backups (the default and only built seed path).** The DR box is seeded from #60's
   scheduled, **encrypted** config + store backup (restore-verified). **RPO** = backup cadence (e.g. daily, the #60
   default, or on-demand → up to one cadence interval of loss); **RTO** = restore time + engine start
