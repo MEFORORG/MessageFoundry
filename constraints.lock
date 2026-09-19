@@ -12,7 +12,7 @@ annotated-types==0.7.0
     #   pydantic
 antlr4-python3-runtime==4.13.2
     # via fhirpathpy
-anyio==4.14.0
+anyio==4.14.2
     # via
     #   httpx
     #   starlette

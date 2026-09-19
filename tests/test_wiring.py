@@ -400,12 +400,13 @@ def test_real_encodings_validate_cleanly(tmp_path: Path, encoding: str) -> None:
     assert validate_config(tmp_path) == []
 
 
-def test_env_supplied_encoding_is_left_unchecked_without_masking_a_literal_typo(
+def test_env_supplied_encoding_is_deferred_by_the_literal_pass_without_masking_a_literal_typo(
     tmp_path: Path,
 ) -> None:
     # An env() ref carries no value at load time (resolve_env_settings needs the instance's
-    # environment values), so it is skipped deliberately — and probing the EnvRef object itself would
-    # raise TypeError, not LookupError, so this also pins that the skip happens before any probe.
+    # environment values), so THIS pass skips it deliberately — and probing the EnvRef object itself
+    # would raise TypeError, not LookupError, so this also pins that the skip happens before any probe.
+    # "Deferred", not "unchecked": since #1767 the resolved pass in build_check_registry probes it.
     # The bad literal beside it is the positive control: without it this test would pass just as well
     # if the check never ran at all.
     _encoding_cfg(
@@ -420,7 +421,7 @@ def test_env_supplied_encoding_is_left_unchecked_without_masking_a_literal_typo(
 
 def test_encoding_census_counts_what_was_probed(tmp_path: Path) -> None:
     # Three literals probed — the fourth connection never set one, so its factory wrote the "utf-8"
-    # default into settings — and one env ref left unchecked.
+    # default into settings — and one env ref on a deployed entry, deferred to the resolved pass.
     _encoding_cfg(
         tmp_path,
         "inbound('i', MLLP(port=2575, encoding='utf-8'), router='r')\n"
@@ -428,13 +429,14 @@ def test_encoding_census_counts_what_was_probed(tmp_path: Path) -> None:
         "outbound('b', File(directory='.', encoding=env('charset')))\n"
         "outbound('c', MLLP(host='h', port=1234))",
     )
-    assert load_config(tmp_path).encoding_census() == (3, 1)
+    assert load_config(tmp_path).encoding_census() == (3, 1, 0)
 
 
-def test_an_all_env_config_is_counted_as_unchecked_not_reported_as_clean(tmp_path: Path) -> None:
-    # The failure this guards: every encoding deferred, nothing probed, and the pass reporting no
-    # problems — indistinguishable from a pass that checked everything. The census is what separates
-    # them, so pin the zero.
+def test_an_all_env_config_is_counted_as_deferred_not_reported_as_clean(tmp_path: Path) -> None:
+    # The failure this guards: every encoding deferred, nothing probed HERE, and this pass reporting
+    # no problems — indistinguishable from a pass that checked everything. The census is what
+    # separates them, so pin the zero in the `checked` column. Both entries are deployed, so both are
+    # deferred and the `unchecked` column is zero too: nothing here is beyond every pass's reach.
     _encoding_cfg(
         tmp_path,
         "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
@@ -442,7 +444,7 @@ def test_an_all_env_config_is_counted_as_unchecked_not_reported_as_clean(tmp_pat
     )
     reg = load_config(tmp_path)  # no WiringError, no TypeError
     assert validate_config(tmp_path) == []
-    assert reg.encoding_census() == (0, 2)
+    assert reg.encoding_census() == (0, 2, 0)
 
 
 def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> None:
@@ -456,7 +458,227 @@ def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> No
     )
     result = _check_validate(tmp_path)
     assert result.ok is True
-    assert "encodings checked: 1, unchecked env() refs: 1" in result.detail
+    assert (
+        "encodings checked: 1, env() refs deferred to build-check: 1, unchecked: 0" in result.detail
+    )
+
+
+# --- the RESOLVED env() encoding pass (BACKLOG #1767) ------------------------
+# The second half of the pass above: an env()-supplied encoding is legible only once this instance's
+# environment values are in hand, so it is probed in build_check_registry. See
+# resolved_encoding_problems in messagefoundry/config/wiring.py.
+
+
+def _build_check(reg: Registry, env_values: dict[str, object]) -> None:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    build_check_registry(
+        reg, inbound_bind_host="127.0.0.1", env_values=env_values, egress=EgressSettings()
+    )
+
+
+def test_env_supplied_encoding_naming_a_real_codec_builds_clean(tmp_path: Path) -> None:
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    _build_check(load_config(tmp_path), {"charset": "latin-1"})  # no WiringError
+
+
+def test_env_supplied_encoding_naming_no_codec_is_refused_at_build_check(tmp_path: Path) -> None:
+    # The whole point of #1767: this config LOADS clean (the literal pass has nothing to probe) and is
+    # caught only once the environment values resolve it.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    reg = load_config(tmp_path)  # no WiringError at load
+    assert reg.encoding_problems() == []  # ... and nothing for the literal pass to say
+    with pytest.raises(WiringError) as exc:
+        _build_check(reg, {"charset": "not-a-real-codec"})
+    assert "outbound connection 'o'" in str(exc.value)
+    assert "'charset'" in str(exc.value)  # names the env key, so the operator knows where to fix it
+    assert "not a Python text codec" in str(exc.value)
+
+
+def test_a_non_text_codec_from_the_environment_is_refused_too(tmp_path: Path) -> None:
+    # `base64` IS a registered codec, so codecs.lookup() accepts it — str.encode/bytes.decode do not,
+    # and those are what the transports call. Same probe as the literal pass, same verdict.
+    # The message names the KEY and not the value (see the secret test below), so 'charset' is what
+    # there is to match on; matching 'base64' here would pin the leak instead of the diagnostic.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": "base64"})
+    # Both halves, because the key ALONE is satisfied by any WiringError quoting it — including
+    # resolve_env_settings' uncastable message from a different pass entirely. The diagnostic phrase
+    # is what says THIS pass produced it.
+    assert "'charset'" in str(ei.value)
+    assert "not a Python text codec" in str(ei.value)
+
+
+def test_the_undefined_codec_from_the_environment_is_a_wiringerror_not_a_unicodeerror(
+    tmp_path: Path,
+) -> None:
+    # "undefined" is a REGISTERED codec that refuses every conversion, so codecs.lookup() finds it and
+    # "".encode() raises UnicodeError — a ValueError, NOT a LookupError. Measured: with _is_text_codec
+    # catching LookupError alone, this escaped build_check_registry as a bare UnicodeError, which
+    # `messagefoundry check` (catching WiringError) turned into a traceback and reload/upsert into a
+    # 500 instead of a 422. The exception TYPE is the whole assertion here.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": "undefined"})
+    assert "'charset'" in str(ei.value)
+    assert "not a Python text codec" in str(ei.value)
+
+
+@pytest.mark.parametrize("declared", ["None", "''"])
+def test_an_env_encoding_that_declines_to_set_a_value_is_not_a_bad_codec(
+    tmp_path: Path, declared: str
+) -> None:
+    # `env("charset", default=None)` is an opt-out, not a typo: ingress_guards.ingress_encoding
+    # documents an explicit None as "not declared" and falls back to utf-8. Refusing it would
+    # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that runs
+    # correctly. Measured: the first cut of this pass did exactly that.
+    _encoding_cfg(
+        tmp_path,
+        f"outbound('o', File(directory='.', encoding=env('charset', default={declared})))",
+    )
+    _build_check(load_config(tmp_path), {})  # no WiringError
+
+
+def test_a_non_string_environment_value_names_its_type(tmp_path: Path) -> None:
+    # `charset = 8859` in a TOML value file types as an int. With the value withheld, "not a text
+    # codec" alone sends the operator hunting for a misspelling that is not there — the TYPE is the
+    # other half of the diagnostic and is safe to name.
+    # The value is 8859 and not the obvious 1252 because the message's own example codec is 'cp1252',
+    # so a withholding assertion against 1252 fails on the example rather than on a leak — measured,
+    # and the kind of instrument error that otherwise reads as a real finding.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": 8859})
+    assert "type int" in str(ei.value)
+    assert "8859" not in str(ei.value), "the value is withheld even when its type is named"
+
+
+def test_the_undefined_codec_as_a_literal_is_refused_at_load_too(tmp_path: Path) -> None:
+    # The literal pass shares _is_text_codec, so it had the same hole and the same fix closes it:
+    # before it, load_config raised a bare UnicodeError instead of the WiringError callers expect.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding='undefined'))")
+    with pytest.raises(WiringError, match="not a Python text codec"):
+        load_config(tmp_path)
+
+
+def test_the_resolved_pass_never_echoes_the_environment_value(tmp_path: Path) -> None:
+    # A MEFOR_VALUE_* value can be a secret and the env KEY is operator-authored, so a copy-pasted
+    # `encoding=env('store_password')` would print the password into the operator log, the support
+    # bundle, GET /logs/tail and a 422 body. BACKLOG #1183 stripped exactly that carriage out of
+    # resolve_env_settings; this pass must not put it back. Measured: the pre-fix message rendered
+    # the value verbatim.
+    secret = "pw-C4st_Val-66"
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('store_password')))")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"store_password": secret})
+    msg = str(ei.value)
+    assert secret not in msg, f"the raw env value survived into the error text: {msg!r}"
+    # Positive control: the diagnostic an operator acts on must survive the redaction, or this test
+    # would pass just as well against a message that said nothing at all.
+    assert "store_password" in msg, f"the key is the operator's whole diagnostic: {msg!r}"
+    assert "value withheld" in msg, f"a silent redaction reads as a truncated error: {msg!r}"
+
+
+def test_every_bad_env_encoding_is_reported_not_just_the_first(tmp_path: Path) -> None:
+    # build_check_registry joins the whole list, and the comment there promises "all of them at once,
+    # not the first" — the caller is usually rendering a 422 an operator reads once. Two entries in
+    # two different tables, so this also pins that the pass walks past the outbound table.
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575, encoding=env('in_charset')), router='r')\n"
+        "outbound('o', File(directory='.', encoding=env('out_charset')))",
+    )
+    with pytest.raises(WiringError) as ei:
+        _build_check(
+            load_config(tmp_path),
+            {"in_charset": "not-a-real-codec", "out_charset": "also-not-a-codec"},
+        )
+    msg = str(ei.value)
+    assert "inbound connection 'i'" in msg
+    assert "outbound connection 'o'" in msg
+
+
+def test_env_supplied_encoding_on_a_not_deployed_connection_is_skipped(tmp_path: Path) -> None:
+    # ADR 0111: a not-deployed connection's env() values are NEVER resolved, on any path — so the
+    # resolved pass cannot follow the literal pass there, and the bad value goes unchecked. That is
+    # the accepted cost of the owner ruling, and this pins it rather than leaving it to drift.
+    # The deployed sibling carrying the SAME bad key is the positive control: without it this test
+    # would pass just as well if the resolved pass never ran at all.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))",
+    )
+    reg = load_config(tmp_path)
+    with pytest.raises(WiringError) as exc:
+        _build_check(reg, {"charset": "not-a-real-codec"})
+    assert "'live'" in str(exc.value)
+    assert "'parked'" not in str(exc.value)  # the not-deployed one produced nothing
+
+
+def test_a_literal_typo_on_a_not_deployed_connection_is_still_caught(tmp_path: Path) -> None:
+    # The other half of the split, and the half that did NOT change: the literal pass reads the codec
+    # name straight off the graph, resolving nothing, so ADR 0111 does not reach it and declaring a
+    # feed not-deployed still does not make a typo'd codec name correct. Without this the diff's
+    # headline claim — that only the env() half loses coverage — rests on prose alone.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('parked', File(directory='.', encoding='not-a-real-codec'), deployed=False)",
+    )
+    with pytest.raises(WiringError, match="'parked'"):
+        load_config(tmp_path)
+
+
+def test_a_not_deployed_env_encoding_with_no_value_at_all_does_not_raise(tmp_path: Path) -> None:
+    # ADR 0111 AC-1, at this seam: an entirely-absent value set must not raise for a not-deployed
+    # connection. Probing its encoding would have resolved the ref and broken exactly that.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    _build_check(load_config(tmp_path), {})  # no WiringError
+
+
+def test_an_unresolvable_env_encoding_is_left_to_the_connector_build(tmp_path: Path) -> None:
+    # A DEPLOYED connection whose env key has no value is already reported loud by
+    # resolve_env_settings. The resolved pass must not pre-empt that with a second, vaguer message —
+    # the first error an operator reads should be the one naming the missing key.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as exc:
+        _build_check(load_config(tmp_path), {})
+    assert "missing: charset" in str(exc.value)
+    assert "not a Python text codec" not in str(exc.value)
+
+
+def test_encoding_census_separates_deferred_from_unchecked(tmp_path: Path) -> None:
+    # The three populations, each with exactly one member, so a collapse of any pair is visible.
+    _encoding_cfg(
+        tmp_path,
+        "outbound('lit', File(directory='.', encoding='utf-8'))\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))\n"
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    assert load_config(tmp_path).encoding_census() == (1, 1, 1)
+
+
+def test_check_validate_detail_reports_the_three_populations_distinctly(tmp_path: Path) -> None:
+    # A census that folded "deferred" into "unchecked" would report an env() ref the build-check line
+    # DOES probe as one nothing looks at, and vice versa. The operator-visible line keeps them apart.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(
+        tmp_path,
+        "outbound('lit', File(directory='.', encoding='utf-8'))\n"
+        "outbound('live', File(directory='.', encoding=env('charset')))\n"
+        "outbound('parked', File(directory='.', encoding=env('charset')), deployed=False)",
+    )
+    result = _check_validate(tmp_path)
+    assert result.ok is True
+    assert (
+        "encodings checked: 1, env() refs deferred to build-check: 1, unchecked: 1" in result.detail
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (CONFIG-2 / review M-21)")
