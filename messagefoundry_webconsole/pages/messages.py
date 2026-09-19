@@ -92,6 +92,7 @@ def messages(
     data: MessageList | None,
     *,
     deferred: bool = False,
+    error: str = "",
     channel_id: str = "",
     status: str = "",
     message_type: str = "",
@@ -103,16 +104,19 @@ def messages(
 
     ``deferred`` (or ``data is None``) renders the pre-filled filter form WITHOUT running a query — the
     "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table + pager
-    render as usual."""
+    render as usual.
+
+    ``error`` renders a refusal banner in place of the "click Search" hint, the shape
+    ``message_search`` uses: the filters come back carrying what the operator typed, and the route
+    answers 400 instead of searching under a bound it dropped (BACKLOG #1744)."""
     filters = _msg_filters(channel_id, status, message_type, control_id, received_from, received_to)
     if deferred or data is None:
-        return page(
-            "Messages",
-            el("h1", "Messages"),
-            filters,
-            el("p", "Adjust the filters and click Search to run.", class_="muted"),
-            active="messages",
+        hint = (
+            el("p", error, class_="banner")
+            if error
+            else el("p", "Adjust the filters and click Search to run.", class_="muted")
         )
+        return page("Messages", el("h1", "Messages"), filters, hint, active="messages")
     headers = ["Received", "Channel", "Type", "Status", "Control ID", "Summary"]
     body = [
         [
