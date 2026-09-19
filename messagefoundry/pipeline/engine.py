@@ -1644,7 +1644,20 @@ class Engine:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
                 raise
-            except (ValueError, OSError) as exc:  # tomllib.TOMLDecodeError is a ValueError
+            except (ValueError, TypeError, RecursionError, OSError) as exc:
+                # The tuple is specific rather than a blanket Exception (section 6), and each entry is
+                # a MEASURED escape, not a guess. ValueError covers tomllib.TOMLDecodeError and
+                # UnicodeDecodeError (the CLI shapes). RecursionError covers a deeply nested value
+                # file -- measured on 3.14, `a = ` + 600 `[` makes tomllib recurse past the limit, and
+                # RecursionError derives from RuntimeError, so without it the whole point of the guard
+                # fails on real TOML input. TypeError is the embedder shape: dict(None) and dict(5)
+                # raise TypeError while dict(["a"]) raises ValueError, so without it two adjacent
+                # provider bugs get opposite handling, one audited at 422 and the other the unaudited
+                # 500 that #1652 is about. Together these are every way READING A VALUE FILE fails. An
+                # embedder provider that raises something else (KeyError, RuntimeError) is a bug in
+                # the host application rather than a bad value file, and a 500 is the honest signal
+                # for it -- widening to Exception would relabel the host's bug as the operator's
+                # config being invalid.
                 raise WiringError(
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {safe_exc(exc)}"
