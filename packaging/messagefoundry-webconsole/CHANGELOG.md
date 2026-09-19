@@ -32,6 +32,10 @@ this line.**
   PHI.
 
 ### Changed
+- **The engine UI seam moved for the `/ui` PHI serve-hop refusal** (BACKLOG #1738): `_auth.py` now
+  imports `api.security.enforce_phi_read_hop`, and seam discovery derives the console's security
+  surface from those import statements, so the import alone moves the digest. Same one-value
+  `SUPPORTED_ENGINE_SEAMS` rule as the entries below.
 - **The engine UI seam moved for the High Availability page** (BACKLOG #1495): `CoreHandlers` gained
   `cluster_stepdown`, and the console now constructs `ClusterStepdownRequest`. Same one-value
   `SUPPORTED_ENGINE_SEAMS` rule as the entry below.
@@ -41,6 +45,19 @@ this line.**
   defaults its DTOs carry (BACKLOG #279).
 
 ### Security
+- **The `/ui` PHI routes now take the ADR 0092 serve-hop refusal** (BACKLOG #1738).
+  `enforce_phi_read_hop` is folded into the JSON plane's `require_phi_read`, but the console reaches
+  `get_message` / `list_messages` / `list_dead_letters` / `download_attachment` **in-process**, which
+  skips that `Depends` -- and `require_ui(..., phi=True)` re-applied the permission and the per-actor
+  PHI-read budget without it. On a deployed production-PHI instance whose serve hop is neither
+  loopback, nor in-process TLS, nor a declared TLS-terminating proxy, the JSON API would have refused
+  a PHI read while `/ui` served the same body. **Operator-visible change:** on such an instance the
+  six PHI browse routes (`GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/parse-tree`,
+  `/ui/messages/{id}/attachments/{attachment_id}`, `/ui/dead-letters`, `/ui/messages/{id}/edit`) plus
+  `POST /ui/messages/{id}/edit-resend` now return `403` with a PHI-free message naming the posture;
+  every other console route is untouched. The refusal lands **below** the session check, so an
+  unauthenticated visitor still gets the login redirect rather than a 403 disclosing the posture, and
+  **above** the budget, so a read that will not be served spends no quota.
 - **The message editor now requires `messages:view_raw` alongside `messages:edit`** (BACKLOG #324).
   `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` gated on `messages:edit`
   alone, but the editor *displays* the body it edits (the textarea plus the pristine `data-original`
