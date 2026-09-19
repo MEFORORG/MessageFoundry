@@ -4,9 +4,11 @@
 
 Runs a message through an inbound connection's Router and Handler(s) exactly as the engine would,
 but with **no store, connectors, network, or ACK** — capturing the routing decision, the disposition
-(RECEIVED/UNROUTED/FILTERED/ERROR), and the payload each Handler *would* send. This powers the IDE
-Test Bench and the ``dryrun`` CLI. The routing core (:func:`route_message`) is shared with the live
-engine (:class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner`) so both route identically.
+(RECEIVED/UNROUTED/FILTERED/NOT_DEPLOYED/ERROR), and the payload each Handler *would* send. This
+powers the IDE Test Bench and the ``dryrun`` CLI. The routing core (:func:`route_message`) is shared
+with the live engine (:class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner`) so both route
+identically, and the pre-routing decode + guards are shared through
+:mod:`messagefoundry.pipeline.ingress_guards` so both admit and refuse identically (BACKLOG #1689).
 """
 
 from __future__ import annotations
@@ -42,12 +44,18 @@ from messagefoundry.parsing import (
     Message,
     Peek,
     RawMessage,
-    normalize,
     split_batch,
     summarize,
     validate,
 )
 from messagefoundry.pipeline._sandbox_codec import build_payload
+from messagefoundry.pipeline.ingress_guards import (
+    IngressGuardError,
+    carry_binary_ingress,
+    decode_ingress,
+    peek_max_bytes,
+    store_safe_raw,
+)
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
 
@@ -204,8 +212,13 @@ class StateOpPreview:
 @dataclass(frozen=True)
 class MetaOpPreview:
     """A per-message metadata write a Handler would declare (ADR 0081, BACKLOG #150) — captured for the
-    dry-run, applied nowhere. ``value`` may carry PHI, so the CLI gates it behind ``--show-phi`` exactly
-    like a delivery payload / state write."""
+    dry-run, applied nowhere. Both members are message-derived in the general case (a Handler is free to
+    build either from a field), so the CLI redacts **key and value alike** unless ``--show-phi`` is
+    passed — the same gate, on the same two members, as a :class:`StateOpPreview`.
+
+    The gate had nothing to gate until BACKLOG #1692: neither ``dry_run`` path passed ``meta_ops`` to
+    its :class:`DryRunResult`, so the field was empty whatever a Handler declared, and the CLI printed
+    no ``meta_ops`` key at all. This docstring asserted the gate throughout that window."""
 
     key: str
     value: str
@@ -648,10 +661,20 @@ def disposition_for(outcome: RouteOutcome) -> MessageStatus:
     engine records the post-router state differently for the same outcome: the ingress worker persists
     ``ROUTED`` (then ``PROCESSED`` once delivered), because ``RECEIVED`` now means "committed at ingress,
     awaiting routing." So this is a deliberate preview-vs-live difference, not a shared mapping — the
-    live path does NOT call this function (see ``RegistryRunner._ingress_worker``)."""
+    live path does NOT call this function (see ``RegistryRunner._ingress_worker``).
+
+    ``NOT_DEPLOYED`` separates a decline from an intentional filter (BACKLOG #1690). #233 ruled that
+    the two must be distinguishable, and the live finalizer already keeps them apart; collapsing them
+    here made the pre-deploy gate the one surface that could not say *"your handler ran, produced a
+    Send, and the destination is not deployed"* — which reads as *"your filter dropped it"*, the one
+    wrong conclusion an author acts on. A routed outcome with no deliveries is ``NOT_DEPLOYED`` when
+    anything was declined and ``FILTERED`` only when nothing was: a handler that both filters one Send
+    and has another declined still has a decline to report, so the decline wins."""
     if outcome.deliveries:
         return MessageStatus.RECEIVED
-    return MessageStatus.UNROUTED if not outcome.routed else MessageStatus.FILTERED
+    if not outcome.routed:
+        return MessageStatus.UNROUTED
+    return MessageStatus.NOT_DEPLOYED if outcome.declined else MessageStatus.FILTERED
 
 
 @dataclass(frozen=True)
@@ -668,6 +691,19 @@ class DryRunResult:
     deliveries: list[DeliveryPreview] = field(default_factory=list)
     state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
     meta_ops: list[MetaOpPreview] = field(default_factory=list)  # metadata writes (ADR 0081)
+    # Destinations a Handler addressed that are present in the graph but NOT deployed (#233, ADR 0111).
+    # Carried out of RouteOutcome so a caller can see WHY a routed run delivered nothing — dropping it
+    # is what made a decline indistinguishable from a filter (BACKLOG #1690). Connection names, never
+    # message content, so no --show-phi gate applies.
+    declined: list[str] = field(default_factory=list)
+    # **PHI. Every consumer that prints, logs or serves this must pass it through
+    # `messagefoundry.redaction.safe_error` first** (BACKLOG #1668). It is built unredacted on purpose:
+    # a consumer that holds a `--show-phi` opt-in has to still have the raw text to honor it, so
+    # scrubbing here would close the leak by deleting the feature. Four producers feed it below
+    # (`exc.reason`, `parse error:`, the joined strict-validation errors, `router/handler error:`) and
+    # at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
+    # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
+    # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
 
 
@@ -694,13 +730,32 @@ def _dry_run_raw(
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = False,
 ) -> DryRunResult:
-    """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage."""
-    text = raw if isinstance(raw, str) else raw.decode("utf-8")
+    """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage.
+
+    The body reaches the Router/Handlers in the form the live listener would hand them, which splits on
+    ``content_type.is_binary`` (BACKLOG #1689). A **binary** feed (BINARY, DICOM) is base64-carried
+    verbatim via ADR 0028 and never text-decoded; a **text** feed is decoded with the connection's
+    declared charset at ``errors="strict"``, NUL-guarded and size-bounded. The old single path decoded
+    everything as strict UTF-8 outside any ``try``, so a DICOM fixture previewed a mangled body and a
+    latin-1 one raised ``UnicodeDecodeError`` straight out of ``dry_run`` instead of reporting ERROR."""
+    ct = ic.content_type.value
+    try:
+        body = (
+            carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
+        )
+    except IngressGuardError as exc:
+        return DryRunResult(
+            inbound=ic.name,
+            disposition=MessageStatus.ERROR,
+            raw=store_safe_raw(raw, ct),
+            message_type=ct,
+            error=exc.reason,
+        )
     try:
         outcome = route_message(
             registry,
             ic,
-            text,
+            body,
             ingest_time=time.time(),
             tracer=tracer,
             snapshot_on_send=snapshot_on_send,
@@ -709,18 +764,20 @@ def _dry_run_raw(
         return DryRunResult(
             inbound=ic.name,
             disposition=MessageStatus.ERROR,
-            raw=text,
-            message_type=ic.content_type.value,
+            raw=body,
+            message_type=ct,
             error=f"router/handler error: {exc}",
         )
     return DryRunResult(
         inbound=ic.name,
         disposition=disposition_for(outcome),
-        raw=text,
-        message_type=ic.content_type.value,
+        raw=body,
+        message_type=ct,
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
         state_ops=outcome.state_ops,
+        meta_ops=outcome.meta_ops,
+        declined=outcome.declined,
     )
 
 
@@ -732,9 +789,21 @@ def dry_run(
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = False,
 ) -> DryRunResult:
-    """Parse → (strict-validate) → route one message, returning disposition + would-send payloads.
+    """Decode → guard → parse → (strict-validate) → route one message; return disposition + payloads.
 
     Mirrors the engine's disposition logic with **no side effects**.
+
+    ``raw`` is preferably **bytes**: the decode is the connection's own (declared ``encoding``,
+    ``errors="strict"``) and lives in :func:`~messagefoundry.pipeline.ingress_guards.decode_ingress`
+    alongside the NUL and size guards the listener applies, so handing this function bytes is what
+    makes the preview answer the question the engine will answer (BACKLOG #1689). A ``str`` is still
+    accepted — the Test Bench and a programmatic caller hold text — and simply skips the charset guard,
+    since there is nothing left to decode.
+
+    **Two live guards are deliberately not mirrored, and a preview can therefore differ from the engine
+    on exactly these two points** (rationale in :mod:`messagefoundry.pipeline.ingress_guards`):
+    the strict-validation **timeout** (mirroring it would force this function ``async``), and
+    **document detach** (``async`` and side-effecting, so there is no honest pure mirror).
 
     ``tracer`` (ADR 0072) is an optional observer threaded to the routing core so the traced dry-run
     (:func:`messagefoundry.pipeline.dryrun_trace.trace_dry_run`) can capture the Router/Handler execution;
@@ -756,10 +825,19 @@ def dry_run(
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
         return _dry_run_raw(registry, ic, raw, tracer=tracer, snapshot_on_send=snapshot_on_send)
-    text = normalize(raw)
 
     try:
-        peek = Peek.parse(text)
+        text = decode_ingress(raw, ic)
+    except IngressGuardError as exc:
+        return DryRunResult(
+            inbound=ic.name,
+            disposition=MessageStatus.ERROR,
+            raw=store_safe_raw(raw, ic.content_type.value),
+            error=exc.reason,
+        )
+
+    try:
+        peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
     except HL7PeekError as exc:
         return DryRunResult(
             inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=f"parse error: {exc}"
@@ -810,28 +888,56 @@ def dry_run(
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
         state_ops=outcome.state_ops,
+        meta_ops=outcome.meta_ops,
+        declined=outcome.declined,
     )
 
 
-def split_messages(raw: bytes) -> list[str]:
-    """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries.
+def split_messages(raw: bytes) -> list[bytes]:
+    """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries — as BYTES.
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     dry-run / commit-check sees every message in a batch file, not just the first. Delegates to the
     shared :func:`messagefoundry.parsing.split.split_batch` so the live File-source ingress split
     (transports/file.py) and this dry-run / ``messagefoundry check`` path stay byte-identical.
+
+    **Bytes in, bytes out** (BACKLOG #1689). Returning ``str`` meant this function had already decoded
+    the fixture — tolerantly, as UTF-8 — before any inbound was in scope, so the connection's declared
+    charset never got a chance to apply and a latin-1 byte reached the Router as U+FFFD. The decode
+    belongs to the inbound, in :func:`dry_run`; this function's job is only to find the boundaries.
+
+    It finds them on a **latin-1 view**, which is a total bijection between the 256 byte values and
+    U+0000..U+00FF: ``\\rMSH`` in that view is exactly ``b"\\x0dMSH"`` in the bytes. So the split is
+    charset-agnostic — correct for every ASCII-compatible encoding without being told which one — and
+    each member re-encodes to the file's own bytes. A payload holding a **single** message returns the
+    original bytes verbatim, exactly as the File source hands a non-batch file off unchanged; only a
+    true batch pays the normalize (line endings collapsed to ``\\r``, the ``FHS``/``BHS`` envelope
+    dropped), which is the same transformation that source applies to a batch.
+
+    A UTF-16/32 payload has no ``b"\\x0dMSH"`` to find, so it comes back as one message and
+    :func:`dry_run` decodes and parses it whole. That is narrower than the live File source, which
+    decodes before splitting — and still strictly better than the UTF-8/``replace`` decode this
+    replaced, which turned such a payload into mojibake before anything looked at it.
     """
-    return split_batch(raw)
+    messages = split_batch(raw.decode("latin-1"))
+    # A non-batch payload goes back byte-identical, as the File source hands one off.
+    if len(messages) == 1:
+        return [raw]
+    return [m.encode("latin-1") for m in messages]
 
 
-def read_messages(paths: list[str]) -> list[tuple[str, str, str]]:
+def read_messages(paths: list[str]) -> list[tuple[str, str, bytes]]:
     """Resolve ``paths`` (files and/or directories) to ``(label, file_path, content)`` per message.
 
     Directories contribute their ``*.hl7`` files (sorted); batch files yield one entry per message
     (``"name [i]"``). Raises ``FileNotFoundError`` for a missing path and ``ValueError`` for a
     directory with no ``*.hl7`` files.
+
+    ``content`` is **bytes** — the fixture's own, undecoded (BACKLOG #1689). See
+    :func:`split_messages` for why the decode cannot happen here: it belongs to the inbound a fixture
+    is about to be run against, and this reader does not know which one that is.
     """
-    out: list[tuple[str, str, str]] = []
+    out: list[tuple[str, str, bytes]] = []
     for raw_path in paths:
         path = Path(raw_path)
         if path.is_dir():
@@ -853,7 +959,7 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, str]]:
 
 def read_message_sets(
     root: str | Path, inbound_names: Collection[str]
-) -> list[tuple[str, str, str, str | None]]:
+) -> list[tuple[str, str, bytes, str | None]]:
     """Like :func:`read_messages` but **recursive** and feed-aware, for ``messagefoundry check`` (#11).
 
     A fixture whose top-level subdirectory under ``root`` names an inbound connection
@@ -863,6 +969,11 @@ def read_message_sets(
     the all-×-all fallback. Returns ``(label, file_path, content, target_inbound | None)`` per message
     (a batch file yields one entry per message). A single-file ``root`` is one unmapped fixture.
     Raises ``FileNotFoundError`` for a missing ``root``.
+
+    ``content`` is **bytes**, for the reason :func:`read_messages` gives — and the cross-product is
+    what makes it the only coherent contract here: ONE unmapped fixture is dry-run against EVERY
+    deployed inbound, each with its own declared ``encoding``, so there is no single charset this
+    function could decode with, and no single inbound it could be handed instead.
     """
     names = set(inbound_names)
     root_path = Path(root)
@@ -878,7 +989,7 @@ def read_message_sets(
         pairs.append((root_path, None))
     else:
         raise FileNotFoundError(f"no such file or directory: {root_path}")
-    out: list[tuple[str, str, str, str | None]] = []
+    out: list[tuple[str, str, bytes, str | None]] = []
     for f, target in pairs:
         messages = split_messages(f.read_bytes())
         if len(messages) == 1:

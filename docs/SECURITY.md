@@ -705,7 +705,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/users/{user_id}/reset-password` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_password`) |
 | `POST` | `/ui/users/{user_id}/revoke-sessions` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up` |
+| `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up_action` (action `admin_user_update`) |
 
 **The two-permission `/ui` routes**, each failing closed on either permission:
 
@@ -1277,7 +1277,8 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify + an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the password path still runs a dummy argon2 verify to keep timing flat) | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
-| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window | on | `[auth].require_action_step_up` |
+| Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind**, see the row below | on | `[auth].require_action_step_up` |
+| Binding a NEW second factor | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, or the code/passkey leg of `/ui/reauth`). An account with **no** factor still enrols its first one from a password-only session; that carve-out is what the MFA gate's enrollment exemption is for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
@@ -1699,12 +1700,15 @@ offer.
 `[security].allowed_client_networks` is a pre-auth network
 gate that applies to **every** pathway equally, so it is a note here rather than a column.
 
-**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** The engine's per-account lockout
-protects **Local** accounts only, and only the password and TOTP/recovery legs **feed** it; WebAuthn
-assertion failures deliberately do not (signatures are not guessable secrets, and a flaky authenticator
+**Lockout asymmetry and control coverage (ASVS 6.1.3 / 6.3.4).** Only the **Local** password and
+TOTP/recovery legs **feed** the engine's per-account lockout, but the lock they set is **enforced
+wherever a pathway reaches an engine account row, directory accounts included** — `verify_mfa` and
+`finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
+OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
+assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
-`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every local factor even
+`auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every factor leg even
 though only two legs feed it. Neither fed nor enforced on `POST /me/reauth` or
 `POST /me/password` — which now matters more, because since the AD sign-in was retired the step-up
 re-auth route is the **only** place an AD password is still bound, and it is covered by a per-actor
@@ -1970,7 +1974,18 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
 previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
 detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. It does **not** mean nothing was removed: deleting the *newest*
+surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
+path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
+absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
+database at all — the verifier refuses each rather than creating or migrating the evidence it was
+asked to check, and it opens read-only so it cannot write to that file either way. It never spends
+`1` on any of them, because `1` is reserved for a chain that was read and found broken. Exit 3
+exists because "there was nothing to verify" is not a
+pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
+pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
+exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
+non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
 audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it

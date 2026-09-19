@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _ast_sites import call_sites, callee_name, calls_to, named_func
 
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
@@ -226,24 +227,6 @@ def _decorated_path(node: ast.AST) -> str | None:
     return None
 
 
-def _calls_to(tree: ast.AST, names: set[str]) -> set[str]:
-    """Every function name in ``names`` that is called anywhere in ``tree``."""
-    found: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else func.id
-                if isinstance(func, ast.Name)
-                else None
-            )
-            if name in names:
-                found.add(name)
-    return found
-
-
 def _route_limiter_calls(path: Path, limiters: set[str]) -> dict[str, set[str]]:
     """``{"<METHOD> <path>": {limiter, …}}`` for every decorated route function in ``path``."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -254,7 +237,7 @@ def _route_limiter_calls(path: Path, limiters: set[str]) -> dict[str, set[str]]:
         route = _decorated_path(node)
         if route is None:
             continue
-        used = _calls_to(node, limiters)
+        used = calls_to(node, limiters)
         if used:
             method = next(
                 deco.func.attr.upper()
@@ -615,12 +598,12 @@ def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
     # rather than a check that a particular function still holds the call: shrinking the pinned set to
     # the one route that still charges inline would have stopped guarding the other three entirely.
     chargers = {"enforce_phi_read_pacing"} | {
-        f.name for f in funcs if _calls_to(f, {"enforce_phi_read_pacing"})
+        f.name for f in funcs if calls_to(f, {"enforce_phi_read_pacing"})
     }
     charged: set[str] = set()
     for node in funcs:
         route = _decorated_path(node)
-        if route and _calls_to(node, chargers):
+        if route and calls_to(node, chargers):
             charged.add(route)
     assert charged >= _FOUR_GET_SCOPE, (
         "the explicit PHI-read pacing call sites changed: "
@@ -647,7 +630,7 @@ def _phi_read_dependency_routes() -> set[str]:
             continue
         defaults = [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
         for default in defaults:
-            if _calls_to(default, {"require_phi_read"}):
+            if calls_to(default, {"require_phi_read"}):
                 routes.add(route)
                 break
     return routes
@@ -658,18 +641,7 @@ def _ui_phi_view_count() -> int:
     count = 0
     for module in sorted(_CONSOLE_ROUTES.rglob("*.py")):
         tree = ast.parse(module.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = (
-                node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else node.func.id
-                if isinstance(node.func, ast.Name)
-                else None
-            )
-            if name != "require_ui":
-                continue
+        for node in call_sites(tree, "require_ui"):
             for kw in node.keywords:
                 if (
                     kw.arg == "phi"
@@ -693,7 +665,7 @@ def _ui_delegating_phi_get_count() -> int:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and _decorated_path(node) is not None
-        and _calls_to(node, {"enforce_phi_read_pacing"})
+        and calls_to(node, {"enforce_phi_read_pacing"})
     }
     assert charging, "no route handler in api/app.py charges enforce_phi_read_pacing any more"
     count = 0
@@ -709,7 +681,7 @@ def _ui_delegating_phi_get_count() -> int:
                 for deco in node.decorator_list
                 if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute)
             )
-            if method == "get" and _calls_to(node, charging):
+            if method == "get" and calls_to(node, charging):
                 count += 1
     return count
 
@@ -772,7 +744,7 @@ def _pacing_charging_factories() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, {"_enforce_admin_write_pacing"})
+        and calls_to(node, {"_enforce_admin_write_pacing"})
     }
 
 
@@ -781,7 +753,7 @@ def test_both_pacing_gate_families_are_named() -> None:
     tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
     callers: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _calls_to(
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and calls_to(
             node, {"_enforce_admin_write_pacing"}
         ):
             callers.add(node.name)
@@ -958,13 +930,7 @@ def _limiter_accessors() -> dict[str, str]:
         if not isinstance(node, ast.Assign | ast.AnnAssign):
             continue
         for sub in ast.walk(node.value) if node.value is not None else ():
-            if isinstance(sub, ast.Call) and (
-                (isinstance(sub.func, ast.Name) and sub.func.id == "SlidingWindowRateLimiter")
-                or (
-                    isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "SlidingWindowRateLimiter"
-                )
-            ):
+            if isinstance(sub, ast.Call) and callee_name(sub) == "SlidingWindowRateLimiter":
                 target = node.targets[0] if isinstance(node, ast.Assign) else node.target
                 attr = getattr(target, "attr", None)
                 if attr:
@@ -1162,12 +1128,7 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     )
 
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
-    register = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
-        and node.name == "_register_failure"
-    )
+    register = named_func(tree, "_register_failure")
     user_reads = {
         node.attr
         for node in ast.walk(register)
@@ -1194,7 +1155,7 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
         and node.name != "_register_failure"
-        and _calls_to(node, {"_register_failure"})
+        and calls_to(node, {"_register_failure"})
     }
     assert feeders == {"_login_local", "verify_mfa"}, (
         f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes it to "
@@ -1288,12 +1249,8 @@ def test_reauth_surface_has_no_lockout_and_the_doc_says_so() -> None:
     source = ast.parse(
         (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
     )
-    reauth = next(
-        node
-        for node in ast.walk(source)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "reauth"
-    )
-    assert not _calls_to(reauth, {"_register_failure"}), (
+    reauth = named_func(source, "reauth")
+    assert not calls_to(reauth, {"_register_failure"}), (
         "reauth now feeds the per-account lockout — the doc's honest caveat is stale, update it."
     )
     block = _section(_H_BRUTE)
@@ -1331,7 +1288,7 @@ def test_console_entry_route_breach_shape_is_documented_per_route() -> None:
             for branch in ast.walk(node):
                 # `if not auth.allow_login_attempt(...):` — inspect what that branch does.
                 if not (
-                    isinstance(branch, ast.If) and _calls_to(branch.test, {"allow_login_attempt"})
+                    isinstance(branch, ast.If) and calls_to(branch.test, {"allow_login_attempt"})
                 ):
                     continue
                 body = ast.dump(ast.Module(body=branch.body, type_ignores=[]))
@@ -1385,7 +1342,7 @@ def _retry_after_routes() -> set[str]:
                 if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute)
             )
             for branch in ast.walk(node):
-                if not (isinstance(branch, ast.If) and _calls_to(branch.test, limiters)):
+                if not (isinstance(branch, ast.If) and calls_to(branch.test, limiters)):
                     continue
                 body = ast.dump(ast.Module(body=branch.body, type_ignores=[]))
                 if "Retry-After" in body:
@@ -1475,12 +1432,7 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
     what it does not do is FEED the lockout.
     """
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
-    assertion = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
-        and node.name == "finish_webauthn_assertion"
-    )
+    assertion = named_func(tree, "finish_webauthn_assertion")
     reads_lock = any(
         isinstance(n, ast.Attribute) and n.attr == "locked_until" for n in ast.walk(assertion)
     )
@@ -1488,7 +1440,7 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         "finish_webauthn_assertion no longer refuses a locked account; docs/SECURITY.md says the "
         "lock is ENFORCED across every local factor."
     )
-    assert not _calls_to(assertion, {"_register_failure"}), (
+    assert not calls_to(assertion, {"_register_failure"}), (
         "WebAuthn assertion failures now feed the lockout; the doc's deliberate-divergence note is "
         "stale — update it in the same change."
     )
@@ -1563,7 +1515,7 @@ def _charging_console_gates() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, {"allow_admin_write"})
+        and calls_to(node, {"allow_admin_write"})
     }
     assert factories, "no console gate charges allow_admin_write any more; this guard is now blind"
     derived = {
@@ -1571,7 +1523,7 @@ def _charging_console_gates() -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name.startswith("require")
-        and _calls_to(node, factories)
+        and calls_to(node, factories)
     }
     return factories | derived
 

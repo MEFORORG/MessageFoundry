@@ -687,3 +687,119 @@ async def test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard(
         assert (await service.mfa_status(identity)).enabled is False
     finally:
         await store.close()
+
+
+# --- BACKLOG #1638: the failure counter clears at FULL authentication, not at the password step ----
+
+
+async def test_a_password_only_login_does_not_reset_the_second_factor_failure_counter() -> None:
+    """THE REGRESSION THE LEDGER ROW NAMES: a login between runs of wrong codes used to wipe them.
+
+    ``record_login_success`` zeroes ``failed_attempts`` and NULLs ``locked_until`` in one UPDATE, and
+    ``_login_local`` called it BEFORE the second factor was proven. So a holder of the first factor
+    could guess the second indefinitely: four wrong codes, log in again, four more, and the counter
+    never reached the threshold. Measured at engine ``2ffcf3347``: three such cycles never locked.
+
+    The middle assertion is the one that fails without the fix. The outer two bound the behaviour
+    rather than establishing it -- they would pass on an implementation that merely moved the call --
+    so all three are kept: the counter must accumulate ACROSS a re-login, and the threshold must
+    then still be reached.
+    """
+    store = await _store()
+    try:
+        # lockout_threshold defaults to 5. The recovery-code count is trimmed because every WRONG
+        # code falls through to the argon2id recovery path, so it sets this test's runtime.
+        service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+
+        good = totp.totp(enroll.secret)
+        wrong = "000000" if good != "000000" else "111111"
+
+        out = await service.login("admin", password)
+        assert out.ok and out.mfa_required, "the password step was treated as full authentication"
+        for _ in range(4):  # one short of the threshold
+            assert (await service.verify_mfa(out.token, wrong)).ok is False
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == 4
+
+        # The re-login. It must NOT clear what the wrong codes accumulated.
+        again = await service.login("admin", password)
+        assert again.ok and again.mfa_required
+        user = await store.get_user(identity.user_id)
+        assert user is not None, "the account vanished"
+        assert user.failed_attempts == 4, (
+            "the password step reset the second factor's failure counter, so a first-factor holder "
+            "can guess the second factor without bound"
+        )
+
+        # ...so the very next wrong code is the fifth, and it locks.
+        assert (await service.verify_mfa(again.token, wrong)).ok is False
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.locked_until is not None, "the threshold was never reached"
+        locked = await service.login("admin", password)
+        assert locked.ok is False and locked.error == "account locked"
+    finally:
+        await store.close()
+
+
+async def test_completing_the_second_factor_still_clears_the_counter() -> None:
+    """The must-not-fire arm. Moving the clear must not DELETE it: a user who proves both factors
+    walks away with a clean row, or the next run of typos starts partway to a lockout it did not earn.
+
+    **The passing factor is a RECOVERY CODE, not a live TOTP, and that is not incidental.** A TOTP
+    code is single-use within its step (ASVS 6.5.1) and ``confirm_mfa_enrollment`` has just spent the
+    current one, so a positive verify here needs a LATER step. The wrong codes in between fall
+    through to the argon2id recovery-code path and cost real seconds, which makes the wait for that
+    step a race rather than a delay. A recovery code has no step to consume, so this arm is
+    deterministic; the TOTP path's own single-use property is pinned by its own test.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_recovery_code_count=3))
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        enrolled = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert enrolled.ok and len(enrolled.recovery_codes) == 3
+
+        wrong = "000000" if totp.totp(enroll.secret) != "000000" else "111111"
+        out = await service.login("admin", password)
+        for _ in range(3):
+            assert (await service.verify_mfa(out.token, wrong)).ok is False
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == 3
+
+        assert (await service.verify_mfa(out.token, enrolled.recovery_codes[0])).ok is True
+        user = await store.get_user(identity.user_id)
+        assert user is not None
+        assert user.failed_attempts == 0, "the completed second factor left the counter standing"
+        assert user.locked_until is None
+    finally:
+        await store.close()
+
+
+async def test_an_account_owing_no_second_factor_still_clears_at_the_password_step() -> None:
+    """The other must-not-fire arm: for an account with nothing left to prove, the password step IS
+    full authentication, so the clear must still happen there. Without it the counter would only
+    ever shed by waiting the lockout window out."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        boot = await service.initialize()
+        assert boot is not None
+        for _ in range(3):
+            assert (await service.login("admin", "wrong-passphrase-entirely")).ok is False
+        row = await store.get_user_by_username("admin")
+        assert row is not None and row.failed_attempts == 3
+
+        out = await service.login("admin", boot.password)
+        assert out.ok and not out.mfa_required, "the account unexpectedly owes a second factor"
+        row = await store.get_user_by_username("admin")
+        assert row is not None and row.failed_attempts == 0, (
+            "a fully authenticated password-only login left the failure counter standing"
+        )
+    finally:
+        await store.close()

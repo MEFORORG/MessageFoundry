@@ -457,6 +457,11 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # WP #285 (ASVS 6.7.1): the optional SHA-256 integrity pin over the OIDC CA anchor above —
         # an integrity control on trust material, not a consumer/environment access-decision input.
         "oidc_tls_ca_cert_pin",
+        # BACKLOG #299: the optional CRL checked against the IdP's certificate on the same back-channel
+        # hop. Sits with its two siblings above for the same reason — it decides whether the ENGINE
+        # trusts the IdP's certificate, not what the engine decides about a request it receives. A
+        # certificate it rejects never yields an identity at all.
+        "oidc_tls_crl_file",
         # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
         # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
         # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
@@ -490,7 +495,7 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: Body-row counts of the two decision tables. Row-scoping alone cannot catch the deletion of a row
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
-_CONTEXT_TABLE_A_ROWS = 36
+_CONTEXT_TABLE_A_ROWS = 37
 _CONTEXT_TABLE_B_ROWS = 9
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with

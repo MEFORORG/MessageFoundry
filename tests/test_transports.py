@@ -16,6 +16,13 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from _phi_log_capture import (
+    IDENTIFIER_SHAPE,
+    IDENTIFIER_SHAPED_NAMES,
+    SAFE_NAME_LABEL,
+    filtered_sink,
+    strip_safe_labels,
+)
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.wiring import MLLP, File
@@ -860,6 +867,17 @@ def test_file_source_rejects_unknown_after_read(tmp_path: Path) -> None:
             Source(
                 type=ConnectorType.FILE, settings={"directory": str(tmp_path), "after_read": "x"}
             )
+        )
+
+
+def test_file_source_rejects_unknown_sort(tmp_path: Path) -> None:
+    # #1655: `sort` used to accept any string and _candidates() fell through to name order, so a typo
+    # would give an operator a process order they did not ask for without saying so. The File()
+    # factory's Literal catches it under mypy; this raise is what catches it at run time (a TOML
+    # connection, or a value that reached the settings dict some other way).
+    with pytest.raises(ValueError, match="sort must be 'name' or 'mtime'"):
+        FileSource(
+            Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path), "sort": "mtiem"})
         )
 
 
@@ -1870,6 +1888,119 @@ async def test_tcp_source_accepts_and_ignores_leader_gate() -> None:
         assert TcpSource.polls_shared_resource is False
     finally:
         await src.stop()
+
+
+# --- BACKLOG #1748: the File source never logs a partner-chosen name ---------
+
+_FILE_LOGGER = "messagefoundry.transports.file"
+
+
+def _file_source_for(inbox: Path, **over: object) -> FileSource:
+    settings: dict[str, object] = {"directory": str(inbox), "pattern": "*.hl7"}
+    settings.update(over)
+    return FileSource(Source(type=ConnectorType.FILE, settings=settings))
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+async def test_file_source_oversize_reject_never_logs_the_partner_chosen_name(
+    tmp_path: Path, name: str
+) -> None:
+    """The whole chain, not the helper in isolation: a real oversize reject, through the real
+    ``_install_phi_filters`` sink, on a drop named the way a partner names one.
+
+    BACKLOG #1748 measured this arm emitting the name verbatim. The shipped filters cannot catch it —
+    ``_NAME_RUN`` needs whitespace and ``_DATE_RUN`` needs a word boundary — so the control the
+    positive-control test below pins is exactly why the fix had to be at the call site."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / ".error").mkdir()  # start() would make it; _scan_once is driven directly here
+    (inbox / name).write_bytes(ADT.encode("utf-8"))
+    src = _file_source_for(inbox, max_file_bytes=4)
+    src._handler = _noop_handler
+    with filtered_sink(_FILE_LOGGER) as sink:
+        await src._scan_once()
+    assert (inbox / ".error" / name).exists()  # the arm really ran (not a vacuous pass)
+    assert "exceeds max_file_bytes" in sink.text
+    assert name not in sink.text
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+    assert SAFE_NAME_LABEL.search(sink.text)  # a correlatable label took its place
+
+
+async def test_file_source_control_the_shipped_filters_alone_would_not_have_caught_it(
+    tmp_path: Path,
+) -> None:
+    """The negative control, and it is the load-bearing one.
+
+    Every assertion above is equally consistent with "the filter chain was already scrubbing the name",
+    in which case the twenty call-site edits bought nothing. Push the cleartext name through the SAME
+    sink and it arrives whole, so the fix — not the chain — is what removes it."""
+    with filtered_sink(_FILE_LOGGER) as sink:
+        logging.getLogger(_FILE_LOGGER).warning(
+            "file %s exceeds max_file_bytes (%s); routing to error dir", "MRN123456789_ADT.hl7", 4
+        )
+    assert "MRN123456789_ADT.hl7" in sink.text
+    assert IDENTIFIER_SHAPE.search(sink.text)
+
+
+async def test_file_source_move_failure_logs_neither_the_name_nor_a_raw_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive-move arm carries both helpers: ``safe_name`` for the drop and ``safe_exc`` for the
+    OSError, whose message can itself carry the full path the engine was moving."""
+    from messagefoundry.transports import file as file_mod
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / ".processed").mkdir()  # so the injected failure is the ONLY reason the move can fail
+    name = "DOE_JANE_19800505_ADT.hl7"
+    (inbox / name).write_bytes(ADT.encode("utf-8"))
+
+    def _locked(*_a: object, **_k: object) -> None:
+        raise OSError(f"locked: {name}")  # the path rides the exception too
+
+    monkeypatch.setattr(file_mod, "_claim_unique", _locked)
+    with filtered_sink(_FILE_LOGGER) as sink:
+        _file_source_for(inbox)._after_processing(inbox / name)
+    assert "could not move" in sink.text  # the arm ran
+    assert name not in sink.text
+    assert "OSError" in sink.text  # safe_exc keeps the type — the useful, non-PHI part
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+
+
+async def test_file_source_delete_failure_logs_neither_the_name_nor_a_raw_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    name = "PID-100001-DOE-JANE.hl7"
+    (inbox / name).write_bytes(ADT.encode("utf-8"))
+
+    def _locked(*_a: object, **_k: object) -> None:
+        raise OSError(f"locked: {name}")
+
+    monkeypatch.setattr(Path, "unlink", _locked)
+    with filtered_sink(_FILE_LOGGER) as sink:
+        _file_source_for(inbox, after_read="delete")._after_processing(inbox / name)
+    assert "could not delete" in sink.text
+    assert name not in sink.text
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
+
+
+async def test_file_source_symlink_escape_skip_never_logs_the_name(tmp_path: Path) -> None:
+    """The one arm that logs a name with no exception beside it, so it would be missed by a sweep that
+    keyed on ``safe_exc`` alone."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    name = "MRN123456789_ADT.hl7"
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / name).write_bytes(ADT.encode("utf-8"))
+    src = _file_source_for(inbox)
+    with filtered_sink(_FILE_LOGGER) as sink:
+        assert src._within_root(outside / name) is False  # the arm ran
+    assert "resolves outside the watch root" in sink.text
+    assert name not in sink.text
+    assert IDENTIFIER_SHAPE.search(strip_safe_labels(sink.text)) is None
 
 
 # --- helpers -----------------------------------------------------------------

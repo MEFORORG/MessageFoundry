@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """PHI redaction on the exception/logging path (WP-6c, ASVS 16.2.5 / PHI.md P1-3): redact() scrubs
-HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message."""
+HL7-shaped content; safe_exc() keeps the exception type while redacting + bounding the message;
+safe_name() derives a safe label for a partner-chosen file name, which redact() is measured blind to
+(BACKLOG #1748)."""
 
 from __future__ import annotations
 
@@ -9,9 +11,10 @@ import re
 import time
 
 import pytest
+from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
 from messagefoundry import redaction
-from messagefoundry.redaction import redact, safe_exc, safe_text
+from messagefoundry.redaction import redact, safe_error, safe_exc, safe_name, safe_text
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -288,3 +291,435 @@ def test_the_linear_scan_guard_does_not_change_what_is_redacted(line: str) -> No
     assert redaction._HL7_FIELD_RUN.sub("[redacted]", line) == _PRE_GUARD_FIELD_RUN.sub(
         "[redacted]", line
     )
+
+
+# --- BACKLOG #1572: read the delimiters MSH declares, do not assume them ----------------------------
+
+#: A message whose FIELD separator is custom (``*``) but whose encoding characters are the defaults
+#: (``^~\&``). The MSH segment still carries ``^``, ``~`` and ``&``, so the hardcoded field-run pattern
+#: fires on that one line by coincidence and the header looks scrubbed. The PID segment carries no
+#: default delimiter at all, so its identifiers walk straight through.
+#:
+#: **Calibrate to the fixture below, not to this one.** The BACKLOG row's own example had this shape
+#: and therefore understated the defect.
+ADT_CUSTOM_FIELD_SEP = (
+    "MSH*^~\\&*SENDINGAPP*FAC*RECV*RFAC*20260604**ADT^A01*MSG1*P*2.5.1\r"
+    "PID*1**MRN12345*DOE*JANE*19800101*M\r"
+)
+
+#: A message whose encoding characters are custom TOO (``$`` component, ``@`` repetition, ``#`` escape,
+#: ``%`` subcomponent). Nothing here contains ``| ^ ~ &``, so before #1572 the only thing the redactor
+#: removed was the 8-digit date run: the record identifier, the surname and the given name all survived
+#: ``safe_exc``, the installed four-filter logging chain, and the support-bundle redactor.
+ADT_FULLY_CUSTOM = (
+    "MSH*$@#%*SENDINGAPP*FAC*RECV*RFAC*20260604**ADT$A01*MSG1*P*2.5.1\r"
+    "PID*1**MRN12345$$$H$MR**DOE$JANE**19800101*M\r"
+)
+
+#: The synthetic identifiers both fixtures carry. No real PHI (PHI.md §9).
+_CUSTOM_IDENTIFIERS = ("MRN12345", "DOE", "JANE")
+
+#: Ordinary operational text a redactor must never touch, and the reason this fix SNIFFS rather than
+#: widening :data:`~messagefoundry.redaction._HL7_FIELD_RUN`'s character class. Widening it to cover
+#: ``*``/``$``/``@``/``%`` costs almost nothing in CPU and scrubs every line below, wrecking the two
+#: artefacts designed to leave the box (the support bundle and the forwarded log stream).
+_OPERATIONAL_LINES = (
+    "2026-09-11T04:12:07Z INFO     messagefoundry.pipeline: IB_ACME_ADT started",
+    "loaded config from C:/ProgramData/MessageFoundry/config/connections.toml",
+    "GET https://fhir.example.org/Patient?identifier=urn:oid:1.2.3 -> 200 in 41ms",
+    "connect 192.0.2.10:2575 failed: WinError 10061",
+    "retry 3/5 scheduled at 04:12:37 (backoff 2.5s)",
+    "ValueError raised in Handler archive",
+    "hl7 version 2.5.1 != expected 2.3",
+)
+
+
+def _pre_sniff_redact(text: str) -> str:
+    """``redact`` exactly as it shipped BEFORE #1572: the four hardcoded-delimiter passes, in order.
+
+    This is the byte-identity control. The fix must add a pass that fires only when MSH declares a
+    delimiter outside ``| ^ ~ &``; on everything else the output has to be unchanged down to the byte,
+    or the fix has quietly become the character-class widening it was chosen instead of."""
+    if not text:
+        return text
+    scrubbed = redaction._HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|[redacted]", text)
+    scrubbed = redaction._HL7_FIELD_RUN.sub("[redacted]", scrubbed)
+    scrubbed = redaction._DATE_RUN.sub("[redacted]", scrubbed)
+    return redaction._NAME_RUN.sub("[redacted]", scrubbed)
+
+
+def _custom_delimiter_message(segments: int) -> str:
+    """A fully-custom-delimiter message of ``segments`` OBX segments, for the cost arm. Long, one
+    whitespace-free token per line -- the shape the separator-aware scan is measured against."""
+    header = "MSH*$@#%*SENDINGAPP*FAC*RECV*RFAC*20260604**ORU$R01*MSG1*P*2.5.1\r"
+    body = "".join(
+        f"OBX*{i}*NM*GLU$Glucose$L**99*mg/dL*70-110*N***F\r" for i in range(1, segments + 1)
+    )
+    return header + body
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_redact_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """Both custom-delimiter shapes: the identifiers must be gone, the segment IDs must stay.
+
+    A deploying site with a custom-delimiter feed would otherwise have these reach its logs whenever a
+    Router or Handler raised carrying the body."""
+    out = redact(message)
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out, f"{identifier!r} survived redaction of {message!r}"
+    assert "PID" in out and "[redacted]" in out  # segment IDs kept (not PHI, useful)
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_safe_exc_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """The realistic vector, end to end: user code raises with the body interpolated in."""
+    out = safe_exc(ValueError(f"cannot transform {message}"), limit=10_000)
+    assert out.startswith("ValueError:")
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_the_support_bundle_redactor_scrubs_a_custom_delimiter_message(message: str) -> None:
+    """The support path (``messagefoundry.support.redact``) delegates its PHI pass to ``redact``, so it
+    inherits the fix. Pinned here because a support bundle is one of the two artefacts designed to
+    leave the box, and it reads a log line at a time."""
+    from messagefoundry.support.redact import redact_log_line
+
+    out = redact_log_line(f"ERROR pipeline: cannot transform {message}")
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier not in out
+
+
+@pytest.mark.parametrize("message", [ADT_CUSTOM_FIELD_SEP, ADT_FULLY_CUSTOM])
+def test_redact_is_a_fixed_point_on_a_custom_delimiter_message(message: str) -> None:
+    """``safe_text`` re-applies ``redact`` at the store-layer chokepoint, so the separator-aware pass
+    must not keep rewriting its own output. The second pass sniffs an already-scrubbed MSH, finds no
+    delimiter declaration, and does nothing."""
+    assert redact(redact(message)) == redact(message)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        *_OPERATIONAL_LINES,
+        ADT,
+        "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1",
+        "PID|1||100^^^H^MR||DOE^JANE||19800101|M",
+        "patient DOE JANE dob 1980-05-05 not found",
+        "mrn 100^^^H^MR here",
+        "abc|def",
+        "a|b|c",
+        "[redacted]",
+        "no-delims-at-all",
+        "",
+        # Prose that MENTIONS a segment id. A looser sniff read a delimiter set out of these and
+        # over-redacted the line -- measured against this module's own docstrings while building the
+        # fix, and the reason the encoding-characters field is pinned to its conformant width.
+        "#: a 3-char segment ID (``MSH``/``PID``/``OBX``) followed by the field separator",
+        "the delimiters are **read from MSH** rather than assumed",
+        "see MSH-1 and MSH-2, at the offsets HL7 declares them",
+        "MSH||A|B",  # a degenerate empty MSH-2: nothing to recover, and all defaults anyway
+    ],
+)
+def test_the_separator_sniff_leaves_default_delimiter_output_byte_identical(line: str) -> None:
+    """The sniff must be inert on everything that does not declare a non-default delimiter.
+
+    This is the arm that fails if someone reaches for the obvious fix and widens the hardcoded
+    character class instead. Widening scrubs ISO timestamps, ``C:/`` paths, ``https://`` URLs and
+    ``host:port`` out of ordinary operational text; sniffing cannot, because the extra pass never runs
+    on text with no custom-delimiter MSH in it."""
+    assert redact(line) == _pre_sniff_redact(line)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("MSH|^~\\&|A|B", frozenset("|^~&")),  # the defaults, read rather than assumed
+        ("MSH|^~\\&#|A|B", frozenset("|^~&")),  # 2.7 truncation char is not a field boundary
+        ("MSH*$@#%*A*B", frozenset("*$@%")),  # fully custom; the escape char (#) is skipped
+        ("MSH*^~\\&*A*B", frozenset("*^~&")),  # custom field separator, default encoding chars
+        ("BHS+$@#%+A", frozenset("+$@%")),  # a batch header declares the same delimiters
+        ("no header here at all", frozenset()),  # the headerless residual
+        ("the delimiters are **read from MSH** rather than assumed", frozenset()),
+    ],
+)
+def test_the_sniff_reads_what_the_header_declares(text: str, expected: frozenset[str]) -> None:
+    """Isolates the sniff from the passes that consume it, so a regression in either is visible."""
+    assert redaction._sniff_delimiters(text) == expected
+
+
+def test_disabling_the_sniff_restores_the_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live negative control, and the reason the arms above are not vacuous.
+
+    With the sniff stubbed out to find nothing, the separator-aware pass never runs and the fully-custom
+    fixture leaks every identifier again -- while the default-delimiter output is unchanged either way.
+    That pairing is the whole claim: the new pass is what closes #1572, and it is doing nothing at all
+    to the default path."""
+    monkeypatch.setattr(redaction, "_sniff_delimiters", lambda text: frozenset())
+    leaked = redaction.redact(ADT_FULLY_CUSTOM)
+    for identifier in _CUSTOM_IDENTIFIERS:
+        assert identifier in leaked, (
+            f"{identifier!r} was scrubbed with the sniff disabled, so something OTHER than the "
+            f"separator-aware pass is removing it and the arms above are not measuring the fix"
+        )
+    assert redaction.redact(ADT) == _pre_sniff_redact(ADT)
+
+
+def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
+    """Cost, on the two inputs that matter: a block of ordinary operational text carrying no MSH (the
+    sniff runs and finds nothing) and a long fully-custom message (the sniff runs and the extra pass
+    fires). Both share the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, and best-of-5 for the same
+    reason: a scheduling hiccup can only inflate a sample."""
+    ops_block = "\n".join(_OPERATIONAL_LINES * 40)  # about 10 KB, no MSH anywhere
+    assert len(ops_block) > 9_000
+    custom = _custom_delimiter_message(300)
+
+    for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
+        best = float("inf")
+        for _ in range(5):
+            start = time.perf_counter()
+            redact(text)
+            best = min(best, time.perf_counter() - start)
+        assert best < _SCAN_BUDGET_SECONDS, (
+            f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
+            f"a {_SCAN_BUDGET_SECONDS}s budget"
+        )
+
+    assert "MRN12345" not in redact(custom) and "Glucose" not in redact(custom)
+
+
+def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> None:
+    """DOCUMENTED RESIDUAL, pinned so a future change to it is deliberate.
+
+    The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
+    nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
+    completeness: the "never put PHI in an exception message" convention remains the control for a
+    headerless fragment, exactly as it does for a bare single-token identifier."""
+    assert redact("mrn MRN123$$$H$MR here") == "mrn MRN123$$$H$MR here"
+
+
+# --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_redact_is_blind_to_an_identifier_shaped_file_name(name: str) -> None:
+    """The measurement this fix rests on, pinned so it cannot quietly change meaning.
+
+    ``_NAME_RUN`` needs ``\\s+`` between its tokens and ``_DATE_RUN`` needs a word boundary before the
+    digits; a file name supplies neither, so all three of these pass through untouched. The control
+    below proves the same chain is not simply inert."""
+    line = f"file {name} exceeds max_file_bytes (10); routing to error dir"
+    assert redact(line) == line
+
+
+def test_redact_control_a_whitespace_name_with_a_delimited_date_is_caught() -> None:
+    """The positive control for the test above. Without it, ``redact(line) == line`` would be equally
+    consistent with a redactor that had stopped working altogether."""
+    line = "file DOE JANE 1980-05-05.hl7 exceeds max_file_bytes (10); routing to error dir"
+    out = redact(line)
+    assert "DOE JANE" not in out and "1980-05-05" not in out
+    assert out.count("[redacted]") == 2
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_name_drops_every_identifier_shape(name: str) -> None:
+    label = safe_name(name)
+    assert name not in label
+    for token in ("MRN123456789", "DOE", "JANE", "19800505", "100001"):
+        assert token not in label
+    assert re.fullmatch(r"\[name:[0-9a-f]{12}\.hl7\]", label)
+
+
+def test_safe_name_is_stable_and_distinguishing() -> None:
+    """Both halves are the point: stable, so an operator recognises the same stuck file across polls;
+    distinguishing, so two files in one directory are not one line."""
+    assert safe_name("a.hl7") == safe_name("a.hl7")
+    assert safe_name("a.hl7") != safe_name("b.hl7")
+
+
+def test_safe_name_keeps_a_double_extension_so_the_gzip_mode_stays_legible() -> None:
+    assert safe_name("msg1.hl7.gz").endswith(".hl7.gz]")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_suffix"),
+    [
+        ("patient.MRN123456789", "]"),  # not a format marker, so nothing is carried through
+        ("drop.2026_MRN00042", "]"),  # nor this
+        ("plainname", "]"),  # no extension at all
+        ("msg.HL7", ".hl7]"),  # recognised case-insensitively, emitted lower-cased
+        ("msg.hl7", ".hl7]"),
+    ],
+)
+def test_safe_name_only_carries_a_known_format_marker(name: str, expected_suffix: str) -> None:
+    """The extension is the one part of a partner's name that passes through, so it is an allowlist."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+# --- the suffix allowlist: a length bound let a dotted identifier through (BACKLOG #1748) ------
+#
+# Measured on the pre-fix `_SAFE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,8}\Z")`: any segment of eight
+# or fewer alphanumerics qualified as an "extension", and a dotted identifier is exactly that. Nine
+# characters failed the bound and eight passed it, so it separated a long identifier from a short one
+# rather than an identifier from an extension. Each value below is SYNTHETIC.
+
+#: A partner-chosen name whose trailing dotted segment is an identifier, paired with the fragment the
+#: pre-fix code carried into the log line. Reverting the allowlist turns every one of these red.
+LEAKED_DOTTED_IDENTIFIERS = [
+    ("ACC.12345678.hl7", "12345678"),  # an 8-digit accession
+    ("patient.MRN12345.hl7", "MRN12345"),  # an MRN token
+    ("DOE.19800505.hl7", "19800505"),  # a birthdate `_DATE_RUN` exists to catch
+    ("A.87654321.txt", "87654321"),
+]
+
+#: Names the product itself builds or ingests, whose marker MUST still reach the log line. These are
+#: the control arm: they pass before and after the fix, so a red one means the fix over-reached.
+KEPT_FORMAT_MARKERS = [
+    ("report.hl7.gz", ".hl7.gz]"),  # the FILE destination's own gzip-mode name
+    ("x.dcm", ".dcm]"),
+    ("scan.xml", ".xml]"),
+    ("note.txt", ".txt]"),
+    ("msg1.hl7", ".hl7]"),
+]
+
+
+@pytest.mark.parametrize(("name", "leaked"), LEAKED_DOTTED_IDENTIFIERS)
+def test_safe_name_drops_a_dotted_identifier_that_a_length_bound_admitted(
+    name: str, leaked: str
+) -> None:
+    """A dotted segment is kept only when it IS a format marker, so an identifier that happens to be
+    short contributes nothing. On a first deployment the pre-fix code would have written the fragment
+    asserted absent here into the general application log."""
+    label = safe_name(name)
+    assert leaked not in label
+    # And what IS kept is the real marker, not simply everything dropped.
+    assert label.endswith(f".{name.rsplit('.', 1)[-1]}]")
+
+
+@pytest.mark.parametrize(("name", "expected_suffix"), KEPT_FORMAT_MARKERS)
+def test_safe_name_keeps_the_format_markers_the_product_reads_and_writes(
+    name: str, expected_suffix: str
+) -> None:
+    """The compatibility arm of the control above. ``.hl7.gz`` is the load-bearing one: the FILE
+    destination appends ``.gz`` to the rendered name in gzip mode, so collapsing it to ``.gz`` would
+    lose which format the operator is looking at."""
+    assert safe_name(name).endswith(expected_suffix)
+
+
+def test_safe_name_suffix_is_a_literal_from_the_allowlist_never_partner_bytes() -> None:
+    """The property the length bound could not state: the label's suffix is a concatenation of at most
+    two literals from a fixed set, so nothing a partner chose survives the digest — not even a segment
+    that looks like an extension."""
+    for name, _ in [*LEAKED_DOTTED_IDENTIFIERS, ("weird.MRN1.Z9", "")]:
+        suffix = safe_name(name).removeprefix("[name:")[12:].removesuffix("]")
+        parts = [f".{p}" for p in suffix.split(".") if p]
+        assert len(parts) <= redaction._SAFE_SUFFIX_MAX
+        assert all(p in redaction._SAFE_SUFFIXES for p in parts)
+
+
+def test_safe_name_allowlist_covers_every_format_the_engine_discriminates() -> None:
+    """The drift gate the allowlist's own comment promises. ``redaction`` is pure stdlib by design and
+    cannot import ``parsing``, so the entries are duplicated literals; this asserts the duplication
+    stays a superset of the source maps rather than silently falling behind one."""
+    from messagefoundry.parsing import sniff
+    from messagefoundry.uploads import _ALLOWED_UPLOAD_EXTENSIONS
+
+    for source in (
+        sniff._EXTENSION_CONTENT_TYPE,
+        sniff._EXTENSION_MAGIC,
+        _ALLOWED_UPLOAD_EXTENSIONS,
+    ):
+        assert set(source) <= redaction._SAFE_SUFFIXES
+
+
+def test_log_capture_helper_marker_list_matches_the_allowlist() -> None:
+    """``_phi_log_capture`` keeps its own copy of the markers on purpose — it decides what is stripped
+    out of a log line before that line is scanned for an identifier, so deriving it from the module it
+    is grading would let a widened allowlist widen the strip. Independent, but not free to rot."""
+    assert {f".{s}" for s in SAFE_NAME_SUFFIXES} == redaction._SAFE_SUFFIXES
+
+
+def test_safe_name_takes_the_basename_so_a_path_never_leaks() -> None:
+    """Callers pass a basename today, but a directory component can itself embed an identifier, so the
+    helper is total rather than trusting its callers."""
+    label = safe_name("/drops/MRN123456789/ADT_DOE_JANE.hl7")
+    assert "MRN123456789" not in label and "DOE" not in label
+    assert safe_name("C:\\drops\\ADT_DOE_JANE.hl7") == safe_name("ADT_DOE_JANE.hl7")
+
+
+@pytest.mark.parametrize("name", [*IDENTIFIER_SHAPED_NAMES, "msg1.hl7.gz", "plainname"])
+def test_safe_name_output_survives_the_redactor_unchanged(name: str) -> None:
+    """The label is emitted INTO a log line the RedactionFilter then redacts. If ``redact`` ate part of
+    it, the operator would lose the correlation the label exists to give."""
+    label = safe_name(name)
+    assert redact(label) == label
+
+
+@pytest.mark.parametrize("name", IDENTIFIER_SHAPED_NAMES)
+def test_safe_exc_file_name_swaps_the_name_out_of_the_exception_message(name: str) -> None:
+    """An OSError renders its path INTO its message, so routing a file source's error arm through
+    ``safe_exc`` alone would keep the name. This is the half of #1748 that the call-site swap to
+    ``safe_name`` does not reach on its own."""
+    exc = OSError(f"[WinError 32] file in use: 'C:\\\\drops\\\\{name}'")
+    out = safe_exc(exc, file_name=name)
+    assert name not in out
+    assert out.startswith("OSError:")  # the type survives
+    assert "WinError 32" in out  # and so does the OS diagnostic, which is the point of keeping it
+    assert safe_name(name) in out
+
+
+def test_safe_exc_without_file_name_is_unchanged() -> None:
+    """The parameter is opt-in: every existing caller keeps its exact rendering."""
+    exc = ValueError("patient DOE JANE dob 1980-05-05 not found")
+    assert safe_exc(exc, file_name=None) == safe_exc(exc)
+
+
+def test_safe_exc_file_name_covers_a_bare_basename_too() -> None:
+    """A remote client quotes the name without a directory; the swap must still fire."""
+    out = safe_exc(
+        OSError("550 no such file: MRN123456789_ADT.hl7"), file_name="MRN123456789_ADT.hl7"
+    )
+    assert "MRN123456789" not in out and "550" in out
+
+
+def test_safe_name_is_exported() -> None:
+    assert "safe_name" in redaction.__all__
+
+
+# --- safe_error: the optional, opt-in-gated form the CLI surfaces use (BACKLOG #1668) -------------
+
+
+def test_safe_error_passes_none_through() -> None:
+    """An absent error is not a value to redact -- the CLIs emit it as JSON ``null``, not ``""``."""
+    assert safe_error(None) is None
+    assert safe_error(None, show_phi=True) is None
+
+
+def test_safe_error_redacts_by_default_and_keeps_the_prose() -> None:
+    """The stage prefix and the author's own words survive; only the HL7-shaped runs collapse.
+
+    That is the whole reason this is ``safe_text`` and not a whole-string drop: the diagnostic is what
+    somebody ran ``dryrun`` to read."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q mrn 900123456^^^H^MR"
+    out = safe_error(raised)
+    assert out is not None
+    assert "DOE" not in out and "900123456" not in out
+    assert out.startswith("router/handler error: unmapped patient ")
+
+
+def test_safe_error_show_phi_returns_the_text_unchanged() -> None:
+    """The opt-in arm is byte-identical -- a caller that may see it gets exactly what was raised."""
+    raised = "router/handler error: unmapped patient DOE^JANE^Q"
+    assert safe_error(raised, show_phi=True) == raised
+
+
+def test_safe_error_defaults_closed() -> None:
+    """A surface with no opt-in (the ``check`` gate) passes no keyword, so the default must redact."""
+    raised = "parse error: PID|1||900123456^^^H^MR"
+    assert safe_error(raised) == safe_error(raised, show_phi=False)
+    assert "900123456" not in str(safe_error(raised))
+
+
+def test_safe_error_is_exported() -> None:
+    assert "safe_error" in redaction.__all__

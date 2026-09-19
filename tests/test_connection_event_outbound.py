@@ -98,6 +98,40 @@ async def test_capture_off_emits_nothing(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_queue_overflow_drops_the_event_and_counts_it(tmp_path: Path) -> None:
+    """A full queue drops the observation, counts it, and lets the emit site RETURN (#46).
+
+    Drive it through a real emit site, never ``q.put_nowait`` — calling the queue directly would test
+    asyncio, not the runner's overflow arm. Set ``maxsize`` on the queue rather than monkeypatching
+    ``_CONN_EVENT_QUEUE_MAX``: the constant is read only inside ``start()``, which this shape skips.
+    """
+    store = await MessageStore.open(tmp_path / "overflow.db")
+    try:
+        sink = _RecordingSink()
+        runner = _runner_with_outbound(store, sink)
+        runner._conn_event_q = asyncio.Queue(maxsize=1)  # normally created in start()
+
+        runner._note_lane_unhealthy("OB_PARTNER_ADT", "m1", DeliveryError("connect refused"))
+        assert runner._conn_events_dropped == 0  # the first event fits
+
+        # Every further edge overflows. Losing the observation is the designed trade; raising here
+        # would unwind whichever delivery lane happened to be emitting, so a connection flood would
+        # take the lane down instead of merely going unlogged.
+        runner._note_lane_healthy("OB_PARTNER_ADT")
+        runner._note_lane_unhealthy("OB_PARTNER_ADT", "m2", DeliveryError("still down"))
+
+        assert runner._conn_events_dropped == 2  # exactly the overflow amount, not once per call
+        assert [e["message_id"] for e in _drain(runner)] == ["m1"]  # only the first survived
+        # The enqueue precedes the alert-sink call in _note_lane_unhealthy, so a SECOND down-edge
+        # alert is the witness that the overflow arm returned rather than unwinding the emit site.
+        assert [(n, k) for n, k, _ in sink.errors] == [
+            ("OB_PARTNER_ADT", "connection_lost"),
+            ("OB_PARTNER_ADT", "connection_lost"),
+        ]
+    finally:
+        await store.close()
+
+
 def test_connection_error_alert_rule_round_trips() -> None:
     rule = AlertRule(event_type="connection_error", connection="OB_*")
     assert rule.event_type == "connection_error"

@@ -2488,6 +2488,7 @@ def create_app(
                 "connection_purge",
                 {"name": name, "scope": scope},
                 requester=identity.username,
+                requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
@@ -2982,6 +2983,7 @@ def create_app(
                 "dead_letter_replay",
                 {"channel_id": req.channel_id, "destination_name": req.destination_name},
                 requester=identity.username,
+                requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
@@ -3029,7 +3031,11 @@ def create_app(
             raise HTTPException(503, "approval workflow is not available")
         try:
             outcome = await gate.approve(
-                approval_id, approver=identity.username, client=client_ip(request)
+                approval_id,
+                approver=identity.username,
+                # BACKLOG #1540: the self-approval refusal keys on the immutable id, not the name.
+                approver_user_id=identity.user_id,
+                client=client_ip(request),
             )
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
@@ -3089,6 +3095,7 @@ def create_app(
                 "config_reload",
                 {"config_dir": req.config_dir, "requester": user.username},
                 requester=user.username,
+                requester_user_id=user.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
@@ -6522,8 +6529,11 @@ def create_managed_app(
         # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
         # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
         # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
-        # the store is closed in the except below and no listener ever binds. A no-op off an editable
-        # install (no RECORD baseline), so dev is never bricked. Off only if [integrity].enabled=false.
+        # the store is closed in the except below and no listener ever binds. It raises for the same
+        # reason when attestation verified NOTHING — no baseline, a RECORD stripped of its package rows,
+        # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
+        # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
+        # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
         integ = integrity_settings or IntegritySettings()
         if integ.enabled:
             try:

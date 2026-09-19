@@ -86,6 +86,7 @@ from messagefoundry.config.wiring import (
     inbound_binding_conflicts,
     resolve_env_settings,
     resolve_listener_binding,
+    resolved_encoding_problems,
 )
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.logging_guard import LogSinkEvent
@@ -168,6 +169,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
+from messagefoundry.transports.rest import PROXY_DEFAULT
 
 __all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
@@ -1869,11 +1871,13 @@ class RegistryRunner:
         ``_start_outbound_unsafe`` RAISES (``NotDeployedError``) while this one returns QUIETLY, so
         fusing them would make "it returned normally" stop meaning "it started".
 
-        A reload is untouched either way, and not because of this placement: its outbound
-        reconciliation resumes a lane through :meth:`_unpark_outbound_lane`, never through
-        ``_start_outbound_unsafe``. What makes THAT safe is ``_stop_outbound_unsafe`` dropping the
-        ``_gate_parked`` marker, so a halt-paused lane reads as operator-paused and no reload
-        resumes it (#115/#233)."""
+        A reload is untouched by this placement: its outbound reconciliation resumes a lane through
+        :meth:`_unpark_outbound_lane`, never through ``_start_outbound_unsafe``. ``_stop_outbound_
+        unsafe`` dropping the ``_gate_parked`` marker covers the lane the HALT paused — it reads as
+        operator-paused, so no reload resumes it (#115/#233). **It says nothing about the lane the
+        halt never touched**: a lane the ENGINE parked is already in ``_outbound_paused`` when the
+        halt runs, so the halt skips it and its marker survives, and the reload was lifting exactly
+        that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             if not self._outbound_start_permitted(name):
@@ -2282,6 +2286,13 @@ class RegistryRunner:
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
+        # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
+        # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
+        # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
+        # odd one out of this block in two ways, both deliberate — it reads the InboundConnection rather
+        # than the built Source (stream_threshold_bytes is a wiring field, not a transport setting), and
+        # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
+        warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -2508,11 +2519,7 @@ class RegistryRunner:
                     # One connection refusing to stop must not leave the others running: this is a
                     # fail-closed halt, so a partial stop is strictly better than an abandoned one.
                     log.exception("log-failure stop: inbound %r did not stop cleanly", name)
-            for name in outbounds:
-                try:
-                    self._stop_outbound_unsafe(name)
-                except Exception:
-                    log.exception("log-failure stop: outbound %r did not pause cleanly", name)
+            self._pause_delivery_lanes(outbounds)
         for name in inbounds + outbounds:
             try:
                 # ADR 0014's connection_stopped reports a stop but was never DRIVEN by a log-write
@@ -2523,6 +2530,27 @@ class RegistryRunner:
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
 
+    def _pause_delivery_lanes(self, names: Iterable[str]) -> None:
+        """Pause these outbound lanes for a #122 log-failure halt. Sync and await-free.
+
+        The one place that knows HOW the halt takes the DELIVERY tier down, for the same reason
+        :meth:`_pause_internal_lanes` owns the internal one: two halts need exactly this loop and a
+        third copy is how they drift. The callers choose the lanes rather than this method selecting
+        them — :meth:`_stop_all_for_log_failure` has to build its list before the loop anyway (it
+        alerts first, and the alert carries the count), and
+        :meth:`_park_delivery_for_log_failure` takes every owned lane.
+
+        Routes through :meth:`_stop_outbound_unsafe`, so a paused lane reads as an OPERATOR pause
+        (``_gate_parked`` dropped) and no reload resumes it. Queued rows are RETAINED PENDING, never
+        dead-lettered. Callers hold the reload lock."""
+        for name in names:
+            try:
+                self._stop_outbound_unsafe(name)
+            except Exception:
+                # One lane refusing to pause must not leave the others delivering: a fail-closed halt
+                # is strictly better partial than abandoned.
+                log.exception("log-failure halt: outbound %r did not pause cleanly", name)
+
     def _pause_internal_lanes(self, names: Iterable[str]) -> None:
         """Pause the pooled INGRESS / ROUTED / RESPONSE lanes for ``names``. Sync and await-free.
 
@@ -2530,7 +2558,7 @@ class RegistryRunner:
         exactly this loop and a fourth copy is how they drift: the halt itself
         (:meth:`_halt_inbound_processing`), the fresh dispatchers at start
         (:meth:`_start_pooled_dispatchers` step 2.6), and the reload re-apply
-        (:meth:`_reconcile_pooled_dispatchers`). A stage with no dispatcher is skipped -- per_lane
+        (:meth:`_reload_pooled_dispatchers`). A stage with no dispatcher is skipped -- per_lane
         mode builds none, and a graph with no loopback inbound has no RESPONSE dispatcher.
         ``pause_lane`` on an unregistered key registers it ALREADY-PAUSED, so calling this before a
         dispatcher starts is what makes step 2.6 work at all (#115)."""
@@ -2627,20 +2655,30 @@ class RegistryRunner:
             log.exception("alert sink raised on a refused log-failure restart for %r", name)
 
     def _outbound_start_permitted(self, name: str) -> bool:
-        """The #122 (ADR 0162) log-recovery gate on the two per-connection doors into resuming
-        delivery — :meth:`start_outbound` and :meth:`restart_outbound`.
+        """The #122 (ADR 0162) log-recovery gate on the doors into resuming delivery —
+        :meth:`start_outbound`, :meth:`restart_outbound`, and the reload's un-park in
+        :meth:`_reconcile_outbounds`.
 
-        **Scoped to those two deliberately, and NOT a claim that nothing else can resume delivery.**
-        At least :meth:`start`'s own outbound spawn does not pass through here, which is a separate
-        open gap rather than an exemption this helper grants; an absolute here would be a
-        compensating control resting on a false premise.
+        **Not a claim that nothing else can resume delivery.** :meth:`start`'s own outbound spawn
+        still does not pass through here; what keeps it honest is
+        :meth:`_park_delivery_for_log_failure`, which pauses the tier before those lanes are built,
+        because ``start`` has just probed the guard itself and a second probe would be a second write.
+        An absolute here would be a compensating control resting on a false premise.
 
         One shared helper rather than the check spelled out in each door, because the defect this
-        closes was precisely two doors and one gate: ``start_outbound`` asked, ``restart_outbound``
-        called ``_start_outbound_unsafe`` straight through, and a restart would therefore resume a
-        log-halted lane and deliver rows with no application log behind them — silently defeating the
-        count-and-log invariant on a first deployment. Two copies of a check can drift apart with
-        nothing reporting it; one cannot.
+        closes was precisely several doors and one gate: ``start_outbound`` asked, ``restart_outbound``
+        called ``_start_outbound_unsafe`` straight through, and the reload lifted an engine-park with
+        no gate at all — so a restart or a re-deploy would resume a log-halted lane and deliver rows
+        with no application log behind them, silently defeating the count-and-log invariant on a first
+        deployment. Copies of a check can drift apart with nothing reporting it; one cannot.
+
+        **Every caller must ask at most once per operator action.** This is not a predicate:
+        :meth:`_log_recovery_ok` performs a synchronous re-validation WRITE and clears the halt latch,
+        and a refusal PAGES. A caller that loops over lanes memoises the answer (see
+        :meth:`_reconcile_outbounds`) rather than probing per lane. ``name`` reaches the page only as
+        the connection the operator asked about, so a memoising caller's page names the first lane it
+        asked for and not every lane left down — which is the honest shape anyway, since the broken
+        thing is a process-global sink with no per-connection attribution to offer.
 
         Returns True when delivery may resume. A refusal PAGES through the notifier
         (:meth:`_log_write_refused_restart`) and the caller then returns quietly — a raise here would
@@ -2650,13 +2688,46 @@ class RegistryRunner:
         self._log_write_refused_restart(name)
         return False
 
+    def _park_delivery_for_log_failure(self) -> None:
+        """Take the DELIVERY tier down when :meth:`start` came up into an unwritable application log
+        (#122) — the third tier of the start-time halt, beside :meth:`_unbind_for_log_failure`'s
+        intake half and the internal-stage halt ``start`` records in :attr:`_log_halted`.
+
+        **A teardown drops the pause, so a start-after-stop has to write it again.**
+        :meth:`_teardown_body` clears ``_outbound_paused`` on purpose (an operator pause is in-memory
+        and must not outlive the process's graph), and the mid-run halt's own pause goes with it — so
+        ``stop()`` + ``start()`` against still-dead sinks rebuilt every lane RUNNING and drained the
+        backlog the halt was retaining. MEASURED in both claim modes, on a rig with a real delivery row
+        already on the outbound stage: the row was written to the destination while ``guard.can_log()``
+        read False throughout. A service restart, an HA demote-then-promote, or ``stop()``+``start()``
+        from the API would each have delivered unlogged on a first deployment.
+
+        **Called BEFORE the outbound lanes are built, and that placement is the fix rather than a
+        detail.** Pooled replays ``_outbound_paused`` onto the fresh OUTBOUND dispatcher at
+        :meth:`_start_pooled_dispatchers` step 2.5, and a per_lane delivery worker reads
+        ``_outbound_resume`` at its loop-top gate from the moment :meth:`_spawn_worker` starts it.
+        Pausing after the build loop — where the intake half runs — would leave a window in both modes
+        for exactly the delivery this refuses.
+
+        Shares :meth:`_pause_delivery_lanes` with the mid-run halt, which owns how a lane goes down
+        and what that leaves behind. Recovery is unchanged: :meth:`start_outbound` /
+        :meth:`restart_outbound` lift the pause once the log works.
+
+        Scoped to the lanes this process owns (ADR 0073), because pausing another shard's lane would
+        report a stop that did not happen — the same narrowest-honest-scope rule
+        :meth:`_stop_all_for_log_failure` states at length."""
+        self._pause_delivery_lanes(
+            [name for name in self.registry.outbound if self._owns_destination(name)]
+        )
+
     async def _unbind_for_log_failure(self) -> None:
         """Take intake back down when :meth:`start` came up into an unwritable application log (#122).
 
         The counterpart of :meth:`_stop_all_for_log_failure`'s inbound half, for the one case that
         method cannot cover: at ``start`` there was no halt to fire, the log was *already* dead. Called
         with the reload lock held, AFTER the dispatchers exist, so the internal stages are halted
-        before the listeners go down rather than after.
+        before the listeners go down rather than after. The delivery tier is NOT here — it has to be
+        paused before the lanes are built, which is why it is :meth:`_park_delivery_for_log_failure`.
 
         **Unbinding is not belt-and-braces.** Leaving intake up with the internal stages halted would
         ACK a sender into a lane nothing is draining — the same reason
@@ -2683,8 +2754,9 @@ class RegistryRunner:
                 stage="unwritable",
                 reason=(
                     "the engine started while the application log was unwritable, so it is running "
-                    "HALTED: intake is down and nothing is being routed or transformed. Fix the log, "
-                    "then restart the connections"
+                    "HALTED: intake is down, nothing is being routed or transformed, and every "
+                    "delivery lane this process owns is paused with its queued rows retained. Fix "
+                    "the log, then restart the connections"
                 ),
                 stopped=len(bound),
             )
@@ -2870,8 +2942,10 @@ class RegistryRunner:
                     # recovery path live in a RUNNING engine, and tearing them down is how an operator
                     # loses the explanation for why the engine went quiet — the same reason ADR 0162
                     # rejects halting the whole engine. The per_lane workers read this set at their
-                    # loop top; the pooled lanes are paused in :meth:`_start_pooled_dispatchers`, and
-                    # the listeners that bound above come back down in :meth:`_unbind_for_log_failure`.
+                    # loop top; the pooled lanes are paused in :meth:`_start_pooled_dispatchers`; the
+                    # DELIVERY tier is paused in :meth:`_park_delivery_for_log_failure` before its
+                    # lanes are built; and the listeners that bind below come back down in
+                    # :meth:`_unbind_for_log_failure`. All three tiers, as the mid-run halt does.
                     self._log_write_stopped = True
                     self._log_halted.update(self.registry.inbound)
                 guard.set_escalation(self._on_log_sink_event)
@@ -2899,6 +2973,12 @@ class RegistryRunner:
                 # still comes up (a failed connection must not crash the engine). The outer except below
                 # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
                 # lookup executor), which still unwind + raise.
+                # #122 (ADR 0162): this runner came up into an unwritable application log, so the
+                # delivery tier is paused BEFORE its lanes are built — see
+                # :meth:`_park_delivery_for_log_failure` for why "before" is load-bearing. The intake
+                # half runs at the end of this block, once the listeners exist to be unbound.
+                if self._log_write_stopped:
+                    self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
                     await self._start_outbound(name, oc)
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
@@ -3886,6 +3966,15 @@ class RegistryRunner:
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce."""
+        # #122 (ADR 0162) THE DOOR A RELOAD OPENS INTO RESUMING DELIVERY: `_unpark_outbound_lane`
+        # below, on a lane the ENGINE parked that the halt therefore skipped — :meth:`start_outbound`
+        # carries that mechanism, and its "says nothing about the lane the halt never touched"
+        # paragraph is what this gate closes.
+        #
+        # MEMOISED because :meth:`_outbound_start_permitted` must be asked at most once per operator
+        # action and that helper's docstring says why. None = not asked yet; a reload with no parked
+        # lane never asks, so a healthy reload pays one set-membership test per lane and nothing else.
+        unpark_permitted: bool | None = None
         for name, oc in new.outbound.items():
             # workers read retry + ordering + internal-error policy live each item, so a reload
             # retunes (incl. re-arming a previously stopped connection) without a restart
@@ -3939,6 +4028,17 @@ class RegistryRunner:
             # change) would silently not deploy it. A no-op for an OPERATOR pause (not in _gate_parked):
             # a reload never undoes an operator action. Placed ABOVE the DR gate so a DR park applies its
             # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
+            #
+            # REFUSED while a #122 halt is in force and the log is still unwritable (see the memo at
+            # the top of this method). Fail closed by leaving the lane exactly as it was — parked,
+            # connector-less, rows retained PENDING — so `continue` rather than a rebuild that would
+            # warm a connector for a lane that may not deliver. Recoverable: the marker is untouched,
+            # so the next reload on a repaired log lifts it.
+            if name in self._gate_parked:
+                if unpark_permitted is None:
+                    unpark_permitted = self._outbound_start_permitted(name)
+                if not unpark_permitted:
+                    continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
@@ -3978,12 +4078,26 @@ class RegistryRunner:
                     )
                 self._failed.pop(name, None)
                 self._spawn_worker(name)
-            elif failed or old.outbound.get(name) is None or old.outbound[name].spec != oc.spec:
+            elif (
+                failed
+                or name not in self._destinations
+                or old.outbound.get(name) is None
+                or old.outbound[name].spec != oc.spec
+            ):
                 # live worker but a missing/mismatched connector → (re)build it in place, close any old
                 # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
                 # is alive with no connector, so a reload once the cause is fixed self-heals the lane
                 # (build_check above already re-validated the whole new registry, so this build can't
                 # fail here — a still-broken connector would have raised before any quiesce).
+                #
+                # `name not in self._destinations` makes the condition match that first line, which
+                # promised "missing OR mismatched" while only ever testing `failed` (a subset: every
+                # site that records a failure has already popped the connector). MEASURED on a
+                # per_lane rig, where `live` above is WORKER-keyed and the boot gates spawn a worker
+                # without a connector: AC-4's "flip the flag back with no other change" un-parked a
+                # lane that then had nothing to deliver through, and its rows retried forever. Pooled
+                # is untouched — `live` is connector-keyed there, so reaching this elif already means
+                # the connector is built.
                 old_conn = self._destinations.get(name)
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
@@ -4797,6 +4911,45 @@ class RegistryRunner:
 
     # --- delivery path -------------------------------------------------------
 
+    async def _repend_claimed_on_fault(self, worker: str, name: str, ids: Sequence[str]) -> None:
+        """Best-effort re-pend of the rows a per-lane worker was holding when its loop faulted
+        (BACKLOG #1611 step 1) — the per-lane analogue of the pooled T17 head re-pend in
+        :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
+
+        The claim is its own committed transaction, so a fault in the handoff that follows leaves the
+        claimed row INFLIGHT. Every claim path selects ``status='pending'``, so the surviving worker
+        never reconsiders it, and ``reset_stale_inflight`` runs from ``Engine.start()`` and the
+        cluster promotion path only — **not** from ``reload()``. Without this the row waits for a
+        service restart, overtaken by its successors, while ``pending_depth`` (pending rows only)
+        reports the lane healthy to the buildup and stall alerts.
+
+        Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
+        T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
+        them and a broken dependency is re-claimed ~4x/s. ``reschedule_claimed`` is guarded
+        ``status='inflight'`` and FIFO-neutral (``seq`` is never re-minted), so rows the worker already
+        resolved are left untouched and the survivors keep their lane position — which is why a caller
+        may pass its whole claimed batch without tracking which row died.
+
+        Wrapped in its own ``except`` because a re-pend that raises inside an except arm would kill the
+        worker, which is strictly worse than the leak it fixes; a failure here simply falls back to the
+        pre-existing recovery (``reset_stale_inflight`` at the next start).
+        """
+        if not ids:
+            return
+        try:
+            await self.store.reschedule_claimed(
+                list(ids), time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            )
+        except Exception:  # noqa: BLE001 — recovery must never kill the worker; see the docstring
+            log.warning(
+                "%s worker %r: reschedule_claimed failed for %d claimed row(s); they stay INFLIGHT "
+                "for reset_stale_inflight at the next start",
+                worker,
+                name,
+                len(ids),
+                exc_info=True,
+            )
+
     async def _delivery_worker(self, name: str) -> None:
         # B11: was the previous wait a wake (.set() — herd) or a poll-interval timeout (idle)? Seeds
         # False so the first claim at startup classifies as idle-poll, not a spurious wake.
@@ -4805,6 +4958,9 @@ class RegistryRunner:
         # registers the lane); else the shared singleton (byte-identical). Resolved once — the object is
         # stable for the worker's life (never replaced), so a sticky set survives a respawn.
         wait_ev = self._lane_event(Stage.OUTBOUND, name) if self._per_lane_wake else self._work
+        # #1611: the rows THIS loop claimed, for the except arm's re-pend. A batching outbound
+        # coalesces further rows inside _process_delivery_batch; those are not tracked here.
+        claimed: list[str] = []
         while not self._stop.is_set():
             try:
                 # Connection controls: loop-top operator-PAUSE gate, BEFORE the claim. When paused, signal
@@ -4852,6 +5008,7 @@ class RegistryRunner:
                         time.perf_counter_ns() - _claim_t0, lanes=1, rows=len(items)
                     )
                     self._claim_phase_stats.maybe_emit(stage="outbound", claimers=1)
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -4880,6 +5037,9 @@ class RegistryRunner:
                 log.exception(
                     "delivery worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("delivery", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5241,9 +5401,40 @@ class RegistryRunner:
         ACK), so the response is always one-way here.
 
         The lane's processing slot is held for the coalescing window (bounded by ``max_wait_ms`` and by
-        ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size."""
+        ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size.
+
+        **Member ownership on a fault (BACKLOG #1579).** The coalesced members past the head are claimed
+        *here* and named nowhere else: the pooled dispatcher's T17 arm re-pends only the head it handed
+        in, and the per_lane worker's #1611 arm re-pends only the row IT claimed. So an exception
+        escaping the body would leave ``members[1:]`` INFLIGHT with **no recovery owner** — invisible to
+        every claim path (all select ``status='pending'``) and to ``pending_depth``, waiting for
+        ``reset_stale_inflight`` at the next service start. The guard below hands those extras back and
+        re-raises. It re-pends **the extras only**: the head already has an owner in both claim modes,
+        and re-pending it twice would be a second defect."""
+        members: list[OutboxItem] = [head]
+        try:
+            return await self._deliver_coalesced_batch(name, cfg, members)
+        except Exception:
+            # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
+            # dead-lettered / re-pended failed) or released them (leadership lost), so a `finally`
+            # would re-pend rows that legitimately completed. ``reschedule_claimed`` being
+            # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
+            # it is not a licence to run the re-pend unconditionally.
+            await self._repend_claimed_on_fault(
+                "batch delivery", name, [it.id for it in members[1:]]
+            )
+            raise
+
+    async def _deliver_coalesced_batch(
+        self, name: str, cfg: BatchConfig, items: list[OutboxItem]
+    ) -> tuple[_ItemOutcome, float | None]:
+        """The body of :meth:`_process_delivery_batch` — split out ONLY so that method can wrap the whole
+        post-head region in the BACKLOG #1579 re-pend guard without re-indenting it. ``items`` is the
+        caller's list, seeded with the already-claimed head and appended to **in place** as the window
+        coalesces, so the guard can name the members this body claimed. Never call it directly: without
+        that wrapper a fault here strands every coalesced member."""
         retry = self._retry.get(name) or RetryPolicy()
-        items: list[OutboxItem] = [head]
+        head = items[0]
         # Deadline measured from the head's ingest time (ADR 0009, re-run-stable). created_at is now
         # projected by every outbound claim; fall back to now defensively (a slightly later window start).
         base = head.created_at if head.created_at is not None else time.time()
@@ -5392,6 +5583,7 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
         )
+        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
             # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
@@ -5411,6 +5603,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.INGRESS.value, limit=self._fifo_batch
                     )
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -5434,6 +5627,9 @@ class RegistryRunner:
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
                 # back off, and keep going (mirrors the delivery worker).
                 log.exception("router worker %r: unexpected error; backing off and retrying", name)
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("router", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5526,7 +5722,9 @@ class RegistryRunner:
             # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
             # never-attempted message purely for being removed) so the message is never
             # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
+            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
+            # and drains the PENDING backlog while the tail stays in flight until a restart.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -5731,11 +5929,13 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
         )
+        claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
+                claimed = [] if item is None else [item.id]  # #1611
                 if item is None:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     woken = await self._wait_for_work(wait_ev)
@@ -5751,6 +5951,9 @@ class RegistryRunner:
                 log.exception(
                     "response worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("response", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5814,6 +6017,7 @@ class RegistryRunner:
         # B12 (ADR 0061): wait on THIS inbound's ROUTED lane Event when per-lane wake is on; else the
         # shared singleton (byte-identical). Resolved once.
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
+        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
         while not self._stop.is_set():
             if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
                 return
@@ -5829,6 +6033,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.ROUTED.value, limit=self._fifo_batch
                     )
+                claimed = [it.id for it in items]  # #1611
                 if not items:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
@@ -5856,6 +6061,9 @@ class RegistryRunner:
                 log.exception(
                     "transform worker %r: unexpected error; backing off and retrying", name
                 )
+                # #1611: surviving is not enough — hand the claimed row back (see the helper).
+                await self._repend_claimed_on_fault("transform", name, claimed)
+                claimed = []
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -5953,7 +6161,9 @@ class RegistryRunner:
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
             # router worker), so the ACKed-but-unprocessed message is never dropped. The
             # unprocessed batch tail stays INFLIGHT and is recovered in order by
-            # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+            # reset_stale_inflight on the next START (ADR 0058 INV-3) — #1611: NOT on a reload.
+            # reload_detail never calls it, so a reload restoring the inbound re-arms this worker
+            # and drains the PENDING backlog while the tail stays in flight until a restart.
             # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
             # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
             # purely for outliving a reload — the one thing these three sites exist to prevent.
@@ -6857,6 +7067,17 @@ def build_check_registry(
     )
     if conflicts:
         raise PortConflictError("; ".join(conflicts))
+    # Encoding pre-flight, the RESOLVED half of Registry.encoding_problems (BACKLOG #1767). Same shape
+    # and same place as the port pre-flight above and for the same reason: an env()-supplied value is
+    # legible only once this instance's environment values are in hand, which is here and not at
+    # load_config. It builds no connector either, so it runs outside the posture scope. Every message
+    # reads this codec name, so a bad one takes the whole connection down on the first message, and
+    # `raise` here turns that into a WiringError at `check` / reload / promote / connection upsert.
+    # All of them at once, not the first: the caller is usually showing an operator a 422, and the
+    # second bad environment value is no less true than the first.
+    encoding_problems = resolved_encoding_problems(registry, env_values=env_values)
+    if encoding_problems:
+        raise WiringError("; ".join(encoding_problems))
     try:
         # Stamp the derived posture for the whole build so a cell's posture-keyed hop-refusal (ADR 0092)
         # decides against THIS config's posture. The port-conflict pre-flight above builds no connector,
@@ -7050,6 +7271,17 @@ def check_reference_backend_supported(registry: Registry, store: QueueStore) -> 
     )
 
 
+#: The connector types delivered through the stdlib HTTP opener family. They share the
+#: ``[egress].allowed_http`` destination arm AND read the ADR 0126 forward-proxy settings, so both the
+#: destination gate and :func:`_check_forward_proxy_egress` key off this one tuple.
+_HTTP_FAMILY_DEST_TYPES: tuple[ConnectorType, ...] = (
+    ConnectorType.REST,
+    ConnectorType.SOAP,
+    ConnectorType.FHIR,
+    ConnectorType.DICOMWEB,
+)
+
+
 def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str]:
     """The ``[egress]`` allowlist that governs a connector type (X12 shares TCP's; REST/SOAP/FHIR share
     the HTTP list). Returns ``[]`` for a type with no egress list — which under ``deny_by_default`` means
@@ -7060,12 +7292,7 @@ def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str
         return egress.allowed_tcp  # DIMSE is a raw socket (the Phase-2 C-STORE SCU dials it out)
     if conn_type is ConnectorType.FILE:
         return egress.allowed_file_dirs
-    if conn_type in (
-        ConnectorType.REST,
-        ConnectorType.SOAP,
-        ConnectorType.FHIR,
-        ConnectorType.DICOMWEB,
-    ):
+    if conn_type in _HTTP_FAMILY_DEST_TYPES:
         return egress.allowed_http  # DICOMWEB is STOW-RS over HTTP (gated like REST/SOAP/FHIR)
     if conn_type is ConnectorType.DATABASE:
         return egress.allowed_db
@@ -7154,13 +7381,22 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
 
 
 # Every settings key naming a SECOND egress host that the HTTP family POSTs **credentials** to — a
-# host distinct from the data ``url`` the caller's own gate already checks. Each one must ride the
-# same ``[egress].allowed_http`` allowlist or it is a fail-open credential-exfiltration hole: the
-# allowlist would gate the data host while the credential leaves for anywhere.
+# host distinct from the data ``url`` the caller's own gate already checks — AND that is itself a PHI
+# DESTINATION-class host. Each one rides the same ``[egress].allowed_http`` allowlist; an ungated one
+# would be a fail-open credential-exfiltration hole, the allowlist gating the data host while the
+# credential leaves for anywhere.
 #
 # ADD A KEY HERE when a new credential-bearing endpoint setting is introduced. That is the whole
 # maintenance contract — both call sites iterate this table, so a new key is gated on both arms at
 # once and cannot repeat the DELTA-04 drift (one arm gated, the other not).
+#
+# ``proxy_url`` IS credential-bearing and is DELIBERATELY NOT IN THIS TABLE (BACKLOG #1659). ADR 0126
+# rules the proxy host out of this gate's scope in terms: "The forward proxy is an operator-chosen
+# transport intermediary, not a PHI destination; gating it against ``allowed_http`` would be wrong
+# (one corporate proxy fronts many hosts, and it would have to be co-listed with every destination)."
+# It is gated instead by its own ``[egress].allowed_proxy`` list — see
+# :func:`_check_forward_proxy_egress`, called from BOTH arms beside this table's helper. Adding
+# ``proxy_url`` here would re-create the co-listing the ADR rejected; do not.
 _CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
     # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
     ("smart_token_url", "SMART token endpoint"),
@@ -7198,6 +7434,57 @@ def _check_credential_token_url_egress(
             )
 
 
+def _check_forward_proxy_egress(
+    label: str, settings: Mapping[str, Any], allowed_proxy: list[str]
+) -> None:
+    """Gate the resolved forward/egress web proxy host (ADR 0126) against ``[egress].allowed_proxy``.
+
+    The proxy is a THIRD egress host on an http-family connection — distinct from the data ``url`` and
+    from the token endpoints :data:`_CREDENTIAL_EGRESS_URL_KEYS` covers — and it is credential-bearing:
+    under the default ``proxy_auth_type = basic`` the connector mints a pre-emptive
+    ``Proxy-Authorization: Basic …`` that urllib carries to the proxy on an ``http`` destination as a
+    request header and on an ``https`` one inside the ``CONNECT`` tunnel, so it reaches the proxy on
+    BOTH schemes. An un-listed proxy would therefore receive that credential on first delivery.
+
+    **Its own list, not ``allowed_http``.** ADR 0126 puts the proxy host out of ``allowed_http``'s
+    scope — that list gates the PHI destination, and one corporate proxy fronts many destinations, so
+    folding it in would force the proxy to be co-listed with every host. A dedicated list answers the
+    objection instead of evading it, and leaves the ADR's scope sentence literally true.
+
+    **Deny-by-default**, following ``[ai].allowed_endpoints`` (ADR 0135) rather than the permissive-
+    when-empty destination lists: a configured proxy with an EMPTY ``allowed_proxy`` is refused. The
+    asymmetry is deliberate — an empty list refuses nothing until a proxy is actually configured, and
+    permissive-when-empty would leave this credential-bearing host ungated on the default posture,
+    which is the hole the key exists to close.
+
+    The ``"default"`` sentinel is exempt: it names no address at config time (urllib resolves the OS
+    proxy at request time), and ``proxy_config_from_settings`` refuses to combine it with proxy
+    credentials, so that path mints no ``Proxy-Authorization``. ``settings`` are the already-``env()``-
+    resolved settings with the ``[egress]`` site-wide default merged in by
+    :func:`_apply_egress_proxy_default`, so this sees the EFFECTIVE proxy either way. An unset
+    ``proxy_url`` is a no-op."""
+    proxy_url = str(settings.get("proxy_url", "") or "").strip()
+    if not proxy_url or proxy_url.lower() == PROXY_DEFAULT:
+        return
+    if not allowed_proxy:
+        log.warning(
+            "egress denied: %s forward proxy set with an empty [egress].allowed_proxy", label
+        )
+        raise WiringError(
+            f"{label}: a forward proxy is configured but [egress].allowed_proxy is empty — list the "
+            "proxy host to permit it (the proxy receives a Proxy-Authorization credential, so this "
+            "list is deny-by-default, unlike the [egress].allowed_* destination lists)"
+        )
+    if not _http_egress_allowed(proxy_url, allowed_proxy):
+        host = urllib.parse.urlsplit(proxy_url).hostname or ""
+        log.warning(
+            "egress denied: %s forward proxy host %r not in [egress].allowed_proxy", label, host
+        )
+        raise WiringError(
+            f"{label}: forward proxy host {host!r} is not in the [egress].allowed_proxy allowlist"
+        )
+
+
 def check_fhir_lookup_allowed(
     name: str, settings: Mapping[str, Any], egress: EgressSettings
 ) -> None:
@@ -7206,7 +7493,12 @@ def check_fhir_lookup_allowed(
     outbound + SMART token endpoint use (a read is an egress host) — checked at load/reload/start so the
     engine is never pointed at a non-allowlisted FHIR server. ``settings`` are the already-``env()``-resolved
     connection settings. Under ``[egress].deny_by_default`` an empty ``allowed_http`` refuses the read
-    outright — an un-allowlisted FHIR read can never dial out (the SSRF-shaped fail-open is closed)."""
+    outright — an un-allowlisted FHIR read can never dial out (the SSRF-shaped fail-open is closed).
+
+    The read arm dials through the same ADR 0126 forward proxy as the FHIR outbound, so it is gated by
+    ``[egress].allowed_proxy`` here too — outside the ``allowed_http`` guard below, because that list
+    being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep)."""
+    _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
             f"FhirLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_http is "
@@ -7671,6 +7963,47 @@ def check_tcp_tls_exposure(
     )
 
 
+def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> bool:
+    """Warn at listener start when ``ic`` enables the ADR 0105 over-threshold detach while
+    ``[inbound].stream_inflight_budget_bytes`` is unlimited (#149, BACKLOG #1729). Returns whether it
+    warned, so a caller (and a test) can tell "warned" from "nothing to say".
+
+    **It WARNS and never raises, and that scoping is the whole design decision here.** The backlog row
+    proposes refusing ``serve`` on a PHI-carrying environment in this state. That refusal is not
+    buildable as written: ``HopPosture.is_phi`` was retired (BACKLOG #1279) precisely because *every*
+    instance carries patient data, so "on a PHI-carrying environment" no longer selects a subset — the
+    refusal would fire on every streaming graph that is valid today, with no new opt-in gating it. That
+    is the shape docs/CONFIGURATION.md's ``require_memory_encryption_declaration`` row forbids ("a new
+    refusal fires only on a new opt-in"), whose single recorded exception (BACKLOG #326 / ADR 0140)
+    says in the same breath not to generalise it. A warning is outside that rule, and it is rung 1 of
+    the same ladder ADR 0152 climbs: the refusal stays available later behind a new opt-in setting.
+
+    Silent in both of the cases where there is nothing to say: a positive budget (the aggregate IS
+    bounded) and an inbound with no ``stream_threshold_bytes`` (the detach path is never reached, so
+    the budget bounds nothing that runs — which is why a stock graph is byte-identical and quiet).
+
+    **What it does NOT distinguish is an explicit ``0`` from an unset default**, and that is a
+    deliberate limit rather than an oversight. The exposure is identical either way, so for a warning
+    the distinction carries nothing; it would matter for a refusal, where an explicit ``0`` should read
+    as an audited opt-out the way ``[security].allow_keeping_phi_indefinitely`` does for retention. Any
+    future refusal has to thread ``model_fields_set`` down from the settings object, which reaches this
+    runner only through ``pipeline/engine.py`` and ``api/app.py``."""
+    if budget > 0 or ic.stream_threshold_bytes is None:
+        return False
+    log.warning(
+        "inbound %r enables very-large-document streaming (stream_threshold_bytes=%d) while "
+        "[inbound].stream_inflight_budget_bytes is 0 (unlimited in the AGGREGATE). A single body is "
+        "still bounded by this connection's max_message_bytes (%s), but the number of over-threshold "
+        "bodies buffered mid-detach at once is uncapped, so a burst of large documents is bounded only "
+        "by that size times the listener's connection limit. Set a positive "
+        "[inbound].stream_inflight_budget_bytes to bound the aggregate.",
+        ic.name,
+        ic.stream_threshold_bytes,
+        ic.max_message_bytes if ic.max_message_bytes is not None else "the engine 16 MiB ceiling",
+    )
+    return True
+
+
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
@@ -7680,6 +8013,12 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
 
     Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
     outright (fail-closed); with the list set, the per-list matching below is unchanged."""
+    # ADR 0126 forward proxy: an http-family destination may dial through an operator-chosen proxy that
+    # receives a Proxy-Authorization credential. Gated by its OWN [egress].allowed_proxy list, BEFORE
+    # and independently of the per-transport destination chain below — an empty allowed_http says
+    # nothing about whether the proxy is permitted (BACKLOG #1659).
+    if dest.type in _HTTP_FAMILY_DEST_TYPES:
+        _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         log.warning(
             "egress denied: outbound %r %s has no [egress] allowlist under deny_by_default",
@@ -7762,16 +8101,7 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: File directory {directory!r} is not under any "
                 "[egress].allowed_file_dirs entry"
             )
-    elif (
-        dest.type
-        in (
-            ConnectorType.REST,
-            ConnectorType.SOAP,
-            ConnectorType.FHIR,
-            ConnectorType.DICOMWEB,
-        )
-        and egress.allowed_http
-    ):
+    elif dest.type in _HTTP_FAMILY_DEST_TYPES and egress.allowed_http:
         # DICOMWEB (STOW-RS) folds into the HTTP host-check branch: it stores its endpoint under "url"
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))

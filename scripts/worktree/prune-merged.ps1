@@ -47,7 +47,7 @@
          <config-root>/sessions/<pid>.json, maps each session's recorded cwd onto a worktree, and
          fences it on pid + process start time. Only LIVE / UNVERIFIED / UNREADABLE veto, for the
          veto-only reason above. A session in a NESTED worktree vetoes its ancestor too.
-      2. RECENT ACTIVITY (-IdleHours, default 36). Newest mtime of the worktree's PRIVATE git metadata
+      2. RECENT ACTIVITY (-IdleHours, default 72). Newest mtime of the worktree's PRIVATE git metadata
          (index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG, MERGE_MSG) crossed with the timestamp of
          the LAST ENTRY IN logs/HEAD -- the reflog is read by CONTENT, never by mtime, because a
          `git gc` rewrites every reflog in place and moved all 48 of them to one identical mtime on
@@ -80,11 +80,29 @@
     path-based (the Desktop app's own session tooling only lists what it spawned).
 
     FENCE UNAVAILABLE => NOTHING IS PRUNED, LOUDLY (exit 2). "The fence found nobody" and "the fence
-    could not look" are the same empty answer, so availability is checked explicitly: at least one
-    config root with a session registry, at least one readable record, and NO record that failed to
-    parse (an unparseable record's cwd is unknowable, so it cannot be cleared from any candidate -- and
-    a file caught half-written is precisely what a session that launched a second ago looks like). When
-    it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
+    could not look" are the same empty answer, so availability is checked explicitly.
+    Get-WorktreeOccupancy in scripts/coord/occupancy.ps1 withholds it on five conditions of two
+    DIFFERENT kinds, and a flat list of the five drops the half that matters:
+
+      * IT COULD NOT LOOK -- the -Repo hint resolves to no worktree at all, the session registry throws
+        on read, no config root carries a registry, or not one readable record is in them. Nothing was
+        examined, so nothing can be cleared. The first of those sets RepoFound false too and this
+        script refuses on THAT at its first read, but the re-check before each removal reads Available
+        alone, so it arrives here instead.
+      * IT LOOKED, AND A SESSION IS SOMEWHERE IT CANNOT NAME -- one or more records it did examine can
+        be placed in no worktree. Three shapes qualify: a file that will not parse, a record that
+        parses but carries no cwd, and a record whose cwd is a checkout of THIS repo that `git worktree
+        list` no longer carries. This is the only refusal resting on POSITIVE evidence. A session
+        demonstrably exists, the fence cannot say which tree it is in, so it clears NONE of them -- and
+        the tree it is in could be the one this run is about to delete. A file caught half-written is
+        precisely what a session that launched a second ago looks like, and the third shape is what the
+        incident above LEAVES BEHIND: deregister a worktree out from under its occupant and that
+        session's recorded cwd names a checkout git no longer lists.
+
+    The second kind is tested BEFORE the empty-record count, so a registry holding nothing but
+    unreadable files reports the unplaceable record rather than "not one readable record".
+
+    When it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
     pruning unfenced, and the fence is re-read immediately before each removal so a fence that DIES
     mid-run stops the rest. There is deliberately no override flag.
 
@@ -117,10 +135,49 @@
     repo's worktree admin area while git no longer lists it is reported the same way, ledger or not.
 
     EXIT CODES, highest severity wins: 0 nothing wrong; 1 something was attempted and failed without
-    destroying anything; 2 REFUSED -- nothing was attempted because safety could not be established
-    (bad cwd, unavailable fence, a -Name that matched nothing); 3 ORPHANED -- a directory is broken on
-    disk right now and needs the recovery recipe. 3 outranks 2 because damage on disk outranks a
-    refusal to act.
+    destroying anything; 2 REFUSED -- something you asked for was not attempted, because safety could
+    not be established; 3 ORPHANED -- a directory is broken on disk right now and needs the recovery
+    recipe. 3 outranks 2 because damage on disk outranks a refusal to act.
+
+    2 IS PER-REQUEST, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing was
+    attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)". The list went stale
+    silently: -ReapVenvs added four refusal causes of its own -- the fence down, transcript roots
+    unreadable, no config root carrying a projects/ directory, and -IdleHours 0 emptying both idle
+    windows -- and it did not move. So read 2 as "some request of yours was refused", and read the
+    removed / failed counts for what the run did.
+
+    BUT 2 STILL MEANS NOTHING WAS REMOVED, AND THIS PARAGRAPH SAID OTHERWISE FOR ONE COMMIT. It read
+    "The universal is false on its own terms too: a fence that dies PART WAY through the apply loop
+    sets 2 over removals that already landed ... the mid-run fence death does not [report 1]". No
+    such run exists. Seven sites can produce 2, and not one of them can co-occur with a removal:
+
+      * three bare `exit $EXIT_REFUSED` in the preamble -- a negative -IdleHours, not a repository,
+        not the primary checkout -- every one of them before a candidate set exists;
+      * the decision-pass fence check, where an unavailable $occ adds a SKIP reason to EVERY
+        candidate, so $prunable is empty and the apply loop never runs at all;
+      * the mid-loop fence check, where $occ2 is read ONCE on the line above
+        `foreach ($d in $prunable)` and nothing inside the loop re-reads it or mutates Available --
+        so a fence that is down skips iteration 1 and every later one, and $removed stays 0;
+      * the -Name and -ReapVenvs guards, both explicitly ternary on `$removed -gt 0`.
+
+    ESTABLISHED OVER THE AST RATHER THAN BY GREP, because a grep for ^\s*exit misses four keywords
+    and any wrapper that reads the exit variable. Parsing the file and classifying every Exit,
+    Return, Throw, Break and Continue statement by whether an ancestor is a FunctionDefinitionAst
+    gives 89. Outside a function: 5 Exit, 1 Throw, 20 Continue, 2 Return. Inside one: 47 Return,
+    13 Continue, 1 Break.
+
+    THE 2 RETURNS OUTSIDE A FUNCTION ARE NOT SCRIPT-LEVEL EITHER, and the line is worth spending
+    because a reader re-running the predicate above will meet them. They are the `return $true` /
+    `return $false` of the `$matchesName` scriptblock literal, and they return from that
+    scriptblock. Counting a ScriptBlockExpressionAst as a nesting level too moves exactly those two
+    rows and nothing else, which is the whole of what the two predicates disagree about. This
+    paragraph published the broader reading, 49 Return nested, while naming the narrower predicate.
+
+    WHAT THE ARGUMENT RESTS ON SURVIVES BOTH READINGS: 0 Exit sits inside a function under either,
+    so no `exit` here is scoped to anything narrower than the process, and the two that end an
+    ordinary run are both `exit $exit`. tests/test_worktree_prune_merged.py's
+    test_a_fence_that_dies_mid_run_refuses_and_says_so is the standing pin: it kills the fence
+    between the decision pass and the removal pass, and asserts counts.removed is 0 beside the 2.
 
     A BRANCH IS NEVER FORCE-DELETED ON A STALE VERDICT. `git branch -d` refuses a branch merged only
     into origin/main when the local main lags, so `-D` used to be the ROUTINE path and git's last
@@ -131,6 +188,52 @@
 
     DRY-RUN by default: prints the decision table and does nothing. -Apply re-evaluates everything
     from scratch in the same run and acts on THAT table, never on a table you read a minute ago.
+
+    -ReapVenvs REPORTS REAPABLE VIRTUALENVS AND DELETES NOTHING. THERE IS NO DELETION PATH FOR A
+    VENV IN THIS SCRIPT -- not behind -Apply, not behind a confirmation, not at all. A `.venv` is
+    REBUILDABLE state (`.venv/` is gitignored, `constraints.lock` is tracked, and new.ps1 rebuilds
+    with `pip install --constraint constraints.lock`), so deleting one costs a rebuild while deleting
+    a worktree costs work. Different blast radii, so different gates -- and the gate for the cheaper
+    loss is still the ENTIRE conjunction above plus two more, because an adversarial review returned
+    NEEDS_A_GUARD on every reaper proposed and the standing instruction is to arm the dry run for a
+    week before anything destructive ships. This IS the dry run. See "THE NINE CONJUNCTS" below.
+
+    THE NINE CONJUNCTS a venv must satisfy to be reported reapable. Numbered here; EVALUATED in a
+    different order, cheapest first, because C8 can cost a gh round trip:
+
+      C1 venv-present     the tree carries a `.venv` directory at all (the population gate)
+      C2 rebuildable      the tree carries `constraints.lock` -- the file new.ps1 rebuilds FROM.
+                          NOT `uv.lock`: that file is also present, is also a lockfile, and is not
+                          what any install here reads. A predicate on it is a neighbouring value
+                          dressed as agreement.
+      C3 fence-available  the liveness fence could look at all (same rule as the worktree pass)
+      C4 unlocked         `git worktree lock` is git's own "in use" flag
+      C5 unoccupied       no live session in it or in a worktree nested inside it (signal 1)
+      C6 clean            no uncommitted tracked changes and no untracked files
+      C7 idle             its private git metadata has not been touched within -IdleHours (signal 2)
+      C8 merged           the same merge test the worktree pass uses
+      C9 unowned          NO SESSION TRANSCRIPT FOR THE OWNING SESSION HAS BEEN WRITTEN WITHIN
+                          -IdleHours. The owning session id is parsed out of the worktree name (the
+                          six-hex token Claude-managed slugs carry) and looked for as
+                          `<config-root>/projects/*<id>*/*.jsonl` across every `.claude*` root.
+                          NO ID PARSED AND NO TRANSCRIPT FOUND BOTH MEAN SKIP: absence of a
+                          transcript is not proof of death, it is the absence of evidence either
+                          way. Measured: nine idle venvs of about 8.0 GB belonged to a session that
+                          had written a transcript 4.4 hours before the sweep, and C1-C8 cleared
+                          every one of them.
+
+    THE VENV PASS REACHES TREES -Apply NEVER WILL, and that is safe ONLY because it removes nothing.
+    It considers every registered worktree of this repo except the primary, including the
+    .claude/worktrees population the candidate set excludes outright -- which is where most of the
+    bytes are. If anybody ever arms a removal here, the population question has to be answered again
+    from scratch; do not read this report's reach as a licence for one.
+
+    EVERY COUNT IT PRINTS CARRIES ITS DENOMINATOR, and the reason is a measured false zero: a claim
+    of "462 of 462 process module lists read, 0 unreadable" did not survive re-measurement, which
+    found 464 processes, 222 readable and 242 unreadable. A fail-closed rule built on that zero
+    either reclaims nothing or means nothing, and no reader could tell which from the number alone.
+    So wherever this counts what it could inspect it prints BOTH numbers and says which way it
+    failed closed.
 
     NEVER touches: the primary checkout, the .claude/worktrees Claude-managed worktrees, the Temp
     scratchpad worktrees, detached worktrees, or the separate sibling REPOS living beside this one.
@@ -144,6 +247,7 @@
     scripts\worktree\prune-merged.ps1 -Apply -Name pins    # also confirm past the activity veto
     scripts\worktree\prune-merged.ps1 -Apply -SkipFetch    # offline / faster
     scripts\worktree\prune-merged.ps1 -Json                # machine-readable decisions + receipt
+    scripts\worktree\prune-merged.ps1 -ReapVenvs           # ALSO report reapable .venv dirs (no deletion)
 #>
 [CmdletBinding()]
 param(
@@ -162,19 +266,35 @@ param(
     [switch]$SkipGh,
     # Emit JSON: the same decision objects the table renders, plus the fence receipt and the counts.
     [switch]$Json,
+    # ALSO report which `.venv` directories are reapable. REPORT ONLY -- this switch has no
+    # destructive path anywhere in this script, and adding one needs the week of dry-run evidence the
+    # header describes, not an -Apply. It adds a receipt to the report and does NOT return: the run
+    # CONTINUES past the pass, so `-ReapVenvs -Apply` still prunes worktrees. That is why the suite
+    # covers the combination, and why the refusal exit code is decided after the apply loop.
+    [switch]$ReapVenvs,
     # Repo to operate on. Defaults to this script's own checkout; tests point it at a fixture so the
     # real logic is what gets exercised.
     [string]$RepoRoot,
     # Config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry. Setting it
     # explicitly REPLACES the real registry, so the run is reported as reduced-assurance.
     [string[]]$ConfigRoot,
-    # A worktree whose git metadata was touched more recently than this is treated as occupied. Default
-    # 36h: longer than any plausible working day, because this is the only signal that sees a session
-    # writing in by absolute path, and it was once measured within 1.6h of expiring on two OCCUPIED
-    # worktrees. 0 turns signal 2 OFF and the run says so in red -- and so does anything under the 12h
-    # floor, because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
+    # A worktree whose git metadata was touched more recently than this is treated as occupied.
+    #
+    # RAISED FROM 36 TO 72, AND THE OLD NUMBER'S OWN MEASUREMENT IS WHY. This comment used to read
+    # "36h: longer than any plausible working day ... it was once measured within 1.6h of expiring on
+    # two OCCUPIED worktrees" -- i.e. the largest idle reading ever taken on a worktree somebody was
+    # demonstrably in was 34.4h, against a 36h window. A margin of 1.6h on the only signal that sees a
+    # session writing in by absolute path is not a margin, it is a coincidence. 72h is that worst
+    # measured reading doubled. It is longer than a weekend, which is the point: the window has to
+    # outlive the gap between two working days, and 36 did not.
+    #
+    # THE COST IS FEWER REMOVALS, WHICH IS THE CHEAP DIRECTION. A false SKIP is a minor annoyance and
+    # a false PRUNE destroys a session, so widening the veto trades nothing this script values.
+    #
+    # 0 turns signal 2 OFF and the run says so in red -- and so does anything under the 12h floor,
+    # because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
     # released every worktree on this repo and printed no warning at all.
-    [double]$IdleHours = 36,
+    [double]$IdleHours = 72,
     # Liveness fence tolerance, passed through to the shared fence.
     [int]$StartSkewMinutes = 15,
     # The ref a branch must be merged into.
@@ -192,7 +312,12 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $EXIT_OK = 0
 $EXIT_FAILED = 1   # something was attempted and did not fully succeed
-$EXIT_REFUSED = 2  # nothing was attempted, because safety could not be established
+# 2 is per-REQUEST: safety could not be established for something that was ASKED FOR, and the causes
+# are not a closed list. It DOES promise nothing was removed, and the header's exit-code paragraph
+# walks all seven sites that can set it. This comment read "It does not promise the run removed
+# nothing" for one commit, on the strength of a mid-run fence death that paragraph now retracts as
+# unreachable.
+$EXIT_REFUSED = 2
 $EXIT_ORPHANED = 3 # a directory is broken on disk right now (this run, or one before it)
 
 # The MOST SEVERE outcome decides the code, and severity is the numeric order above. A run that
@@ -810,6 +935,362 @@ foreach ($w in $occ.Worktrees) {
     }
 }
 
+# --- REPORT-ONLY: reapable virtualenvs (-ReapVenvs) ----------------------------------------------
+# THIS SECTION DELETES NOTHING AND CONTAINS NO CALL THAT COULD. It computes a verdict per `.venv` and
+# hands the operator a receipt. The nine conjuncts, why a venv is fenced at all, and why the pass
+# reaches trees -Apply never will are all written out in the header; do not re-derive them here.
+#
+# It runs BEFORE $ghDetail is written, deliberately: C8 uses the same Test-Merged as the worktree
+# pass, so its probes must be inside the numbers that receipt reports. A receipt that under-counts
+# the probes it made is the same defect class as one asserting a check that never ran.
+
+# The two files that decide C2, spelled once. `uv.lock` is deliberately absent: it is a real lockfile
+# sitting right beside the real one, which is exactly what makes it dangerous -- a predicate on it
+# looks right, is green on this repo, and measures something no install here reads.
+$VENV_DIR_NAME = '.venv'
+$REBUILD_LOCK_NAME = 'constraints.lock'
+
+# The six-hex token a Claude-managed worktree slug carries (`manager-a27813-b1572-sep` -> `a27813`).
+# Returns EVERY such token, not the first: a slug can carry more than one, and we cannot tell which
+# is the session. Taking them all and letting ANY of them find a recent transcript is the fail-closed
+# direction -- more evidence of life, more SKIPs. A token that is hex by coincidence (`decade`,
+# `facade`) finds no project directory and therefore also SKIPs, which is the same direction again.
+function Get-OwningSessionIds([string]$Leaf) {
+    $ids = @()
+    foreach ($tok in ([string]$Leaf -split '-')) {
+        # \A..\z, not ^..$: .NET's '$' also matches before a final newline. Same anchoring rule
+        # new.ps1's -Name pattern carries, for the same reason.
+        if ($tok -match '\A[0-9a-f]{6}\z') { $ids += $tok.ToLowerInvariant() }
+    }
+    return @($ids | Select-Object -Unique)
+}
+
+# Enumerate <config-root>/projects ONCE, with the denominators. Every field here exists so that "no
+# transcript was found" can be told apart from "the transcript store could not be read".
+#
+# RootsSeen is the DENOMINATOR and it is deliberately every `.claude*` directory, not only the ones
+# carrying a registry: a root that has lost its `projects` directory is a root whose sessions this
+# pass cannot see, and counting it out of the denominator would hide exactly that.
+function Get-TranscriptIndex {
+    param([string[]]$ConfigRoot)
+    $rootsSeen = @()
+    if ($ConfigRoot) { $rootsSeen = @($ConfigRoot) }
+    else {
+        $rootsSeen = @(Get-ChildItem -Path $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
+                ForEach-Object { $_.FullName })
+    }
+    $withProjects = @()
+    $unreadable = @()
+    $dirs = @()
+    foreach ($r in $rootsSeen) {
+        $p = Join-Path $r 'projects'
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $withProjects += (Split-Path $r -Leaf)
+        try { $dirs += @(Get-ChildItem -LiteralPath $p -Directory -Force -EA Stop) }
+        catch { $unreadable += "$p -- $($_.Exception.Message)" }
+    }
+    return [pscustomobject]@{
+        RootsSeen         = @($rootsSeen)
+        # NAMED, not just counted. The denominator is every `.claude*` directory, and on a real
+        # machine most of them are not transcript stores at all -- backups, tool directories, and the
+        # deliberate `.claude-DOES-NOT-EXIST` control. "6 of 21" alone reads as fifteen stores missed;
+        # naming the six lets the reader check that the six are the right six.
+        RootsWithProjects = @($withProjects)
+        RootsUnreadable   = @($unreadable)
+        Dirs              = @($dirs)
+    }
+}
+
+# The newest transcript write for any of $Ids, with its denominators. $null Newest means NOTHING WAS
+# FOUND, which the caller must read as "cannot clear this tree", never as "nobody is there".
+function Get-NewestTranscriptWrite {
+    param([object]$Index, [string[]]$Ids)
+    $dirsMatched = 0; $filesSeen = 0; $filesRead = 0
+    $unreadable = @()
+    $newest = $null
+    foreach ($d in $Index.Dirs) {
+        $hit = $false
+        foreach ($id in $Ids) { if ($d.Name -like "*$id*") { $hit = $true; break } }
+        if (-not $hit) { continue }
+        $dirsMatched++
+        $files = @()
+        try { $files = @(Get-ChildItem -LiteralPath $d.FullName -Filter '*.jsonl' -File -Force -EA Stop) }
+        catch { $unreadable += "$($d.FullName) -- $($_.Exception.Message)"; continue }
+        foreach ($f in $files) {
+            $filesSeen++
+            try {
+                $t = (Get-Item -LiteralPath $f.FullName -Force -EA Stop).LastWriteTime
+                $filesRead++
+                if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
+            }
+            catch { $unreadable += "$($f.FullName) -- $($_.Exception.Message)" }
+        }
+    }
+    return [pscustomobject]@{
+        Newest = $newest; DirsMatched = $dirsMatched; DirsScanned = $Index.Dirs.Count
+        FilesSeen = $filesSeen; FilesRead = $filesRead; Unreadable = @($unreadable)
+    }
+}
+
+# Bytes on disk, with the count of entries the walk could NOT read. A walk that hit a denied
+# directory returns a number that is a LOWER BOUND, and the receipt says so rather than printing it
+# as a total.
+function Get-VenvSize {
+    param([string]$Path)
+    $errs = $null
+    $items = @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable errs)
+    $sum = ($items | Measure-Object -Property Length -Sum).Sum
+    return [pscustomobject]@{
+        Bytes = [int64]$(if ($null -eq $sum) { 0 } else { $sum })
+        Files = $items.Count
+        Unreadable = @($errs).Count
+    }
+}
+
+# One row of the per-candidate verdict sheet. Accumulates into $script:VenvVerdicts, which the
+# candidate loop resets per tree -- a plain array captured by the loop would need passing through
+# every branch below and is exactly where a missing append hides.
+function Add-Verdict([string]$Id, [string]$Name, [string]$V, [string]$Detail) {
+    $script:VenvVerdicts += , [pscustomobject]@{ id = $Id; name = $Name; verdict = $V; detail = $Detail }
+}
+
+function Format-Bytes([int64]$B) {
+    if ($B -ge 1073741824) { return "{0:N2} GB" -f ($B / 1073741824) }
+    if ($B -ge 1048576) { return "{0:N1} MB" -f ($B / 1048576) }
+    return "$B B"
+}
+
+$venvReap = $null
+if ($ReapVenvs) {
+    $idx = Get-TranscriptIndex -ConfigRoot $ConfigRoot
+
+    # WHY THE PASS MIGHT NOT RUN AT ALL. "Nobody was reapable" and "the check could not run" are the
+    # same empty list, so they are never allowed to print the same thing. Each of these disarms a
+    # conjunct rather than merely narrowing it, and a conjunction with a disarmed member is not the
+    # conjunction this report claims to have applied.
+    $cannotRun = @()
+    if (-not $occ.Available) {
+        $cannotRun += "C3: the liveness fence could not look -- $($occ.Detail)"
+    }
+    if ($idx.RootsUnreadable.Count -gt 0) {
+        $cannotRun += ("C9: $($idx.RootsUnreadable.Count) of $($idx.RootsWithProjects.Count) transcript " +
+            "store(s) could not be enumerated, so no tree can be cleared: $($idx.RootsUnreadable -join '; ')")
+    }
+    if ($idx.RootsWithProjects.Count -eq 0) {
+        $cannotRun += ("C9: 0 of $($idx.RootsSeen.Count) config root(s) carry a projects/ directory, " +
+            "so the ownership conjunct has nothing to read and can never clear anybody")
+    }
+    if (-not $activityVeto) {
+        # -IdleHours 0 makes C7's window empty AND C9's window empty. "Older than 0 hours ago" is true
+        # of every transcript ever written, so the ownership conjunct would clear everything while
+        # still printing as though it had been applied. That is the inverted-guard shape, not a
+        # narrowed one, so it refuses instead of declaring.
+        $cannotRun += 'C7/C9: -IdleHours 0 leaves both idle windows empty, which would clear every tree rather than fence it'
+    }
+
+    $rows = @()
+    $examined = 0
+    if ($cannotRun.Count -eq 0) {
+        foreach ($w in $occ.Worktrees) {
+            if ((ConvertTo-Norm $w.Path) -eq (ConvertTo-Norm $RepoRoot)) { continue }   # the primary, never
+            $examined++
+            $venv = Join-Path $w.Path $VENV_DIR_NAME
+            if (-not (Test-Path -LiteralPath $venv -PathType Container)) { continue }   # C1: not a candidate
+
+            $leaf = Split-Path $w.Path -Leaf
+            # EVERY CONJUNCT'S VERDICT, not only the ones that said no. A row carrying five FAILs and
+            # silence about the other four cannot be told from one where those four were never asked,
+            # and "not asked" is exactly what C8 is on a short-circuited row.
+            $notes = @()
+            $script:VenvVerdicts = @()
+
+            Add-Verdict 'C1' 'venv-present' 'PASS' "$VENV_DIR_NAME is present"
+
+            # C2: one Test-Path, and it is the conjunct most likely to be false for a tree that is not
+            # a MessageFoundry checkout at all.
+            if (Test-Path -LiteralPath (Join-Path $w.Path $REBUILD_LOCK_NAME) -PathType Leaf) {
+                Add-Verdict 'C2' 'rebuildable' 'PASS' "$REBUILD_LOCK_NAME is present, which is the file new.ps1 rebuilds from"
+            }
+            else {
+                Add-Verdict 'C2' 'rebuildable' 'FAIL' "no $REBUILD_LOCK_NAME in the worktree, so nothing here proves the venv can be rebuilt (uv.lock is NOT a substitute: no install in this repo reads it)"
+            }
+
+            # C3 is a run-level condition: the pass does not start at all when the fence is down, so
+            # reaching this line already means it passed. Recorded anyway, so a row carries all nine.
+            Add-Verdict 'C3' 'fence-available' 'PASS' "$($occ.RecordsExamined) record(s) across $($occ.RootsExamined) root(s), $($occ.RecordsUnplaceable) unplaceable"
+
+            # C4
+            if ($w.Locked) {
+                $why = if ($w.LockReason) { ": $($w.LockReason)" } else { '' }
+                Add-Verdict 'C4' 'unlocked' 'FAIL' "locked by git$why"
+            }
+            else { Add-Verdict 'C4' 'unlocked' 'PASS' 'git holds no lock on this worktree' }
+
+            # C5 -- the same helper, with -IncludeNested, that the worktree pass uses. Stricter than a
+            # venv strictly needs (a nested checkout is not inside .venv), and kept that way on
+            # purpose: this is the fence the destructive pass would inherit.
+            $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $w.Path -IncludeNested)
+            if ($occupants.Count -gt 0) {
+                $who = ($occupants | ForEach-Object { "$($_.Short) [$($_.State)]" }) -join ', '
+                Add-Verdict 'C5' 'unoccupied' 'FAIL' "occupied by $($occupants.Count) session(s): $who"
+            }
+            else { Add-Verdict 'C5' 'unoccupied' 'PASS' 'no veto-worthy session is placed in it or in a nested tree' }
+
+            # C6
+            $c = Test-WorktreeClean -Path $w.Path
+            if (-not $c.Clean) { Add-Verdict 'C6' 'clean' 'FAIL' ($c.Reasons -join '; ') }
+            else { Add-Verdict 'C6' 'clean' 'PASS' 'no uncommitted tracked change and no untracked file' }
+
+            # C7
+            $act = Get-WorktreeActivity -Path $w.Path
+            $actAge = $null
+            if ($null -eq $act) {
+                Add-Verdict 'C7' 'idle' 'FAIL' 'activity unknown (git metadata unreadable) -- cannot establish nobody is in it'
+            }
+            else {
+                $actAge = [math]::Round(((Get-Date) - $act).TotalHours, 2)
+                if ($act -gt $idleCut) {
+                    Add-Verdict 'C7' 'idle' 'FAIL' "git metadata touched $actAge h ago, inside the $IdleHours h window"
+                }
+                else { Add-Verdict 'C7' 'idle' 'PASS' "git metadata last touched $actAge h ago, outside the $IdleHours h window" }
+            }
+
+            # C9 -- ownership. BOTH of its empty answers are a SKIP, and they are reported as
+            # different sentences because they have different remedies: no id parsed means this slug
+            # carries no session token at all, and no transcript found means the token found nothing.
+            $ids = @(Get-OwningSessionIds $leaf)
+            $tr = $null
+            if ($ids.Count -eq 0) {
+                Add-Verdict 'C9' 'unowned' 'FAIL' "no session id could be parsed from the worktree name '$leaf', so its owner is unknown -- unknown is not absent"
+            }
+            else {
+                $tr = Get-NewestTranscriptWrite -Index $idx -Ids $ids
+                if ($tr.Unreadable.Count -gt 0) {
+                    Add-Verdict 'C9' 'unowned' 'FAIL' "$($tr.FilesRead) of $($tr.FilesSeen) transcript(s) read, $($tr.Unreadable.Count) unreadable -- an unread transcript could be the newest one"
+                }
+                elseif ($null -eq $tr.Newest) {
+                    Add-Verdict 'C9' 'unowned' 'FAIL' "id(s) $($ids -join '/') matched $($tr.DirsMatched) of $($tr.DirsScanned) project director(ies) and $($tr.FilesSeen) transcript(s); no transcript found is not proof the session is gone"
+                }
+                else {
+                    $trAge = [math]::Round(((Get-Date) - $tr.Newest).TotalHours, 2)
+                    $notes += "newest transcript for $($ids -join '/') is $trAge h old ($($tr.FilesRead) of $($tr.FilesSeen) read across $($tr.DirsMatched) of $($tr.DirsScanned) project dirs)"
+                    if ($tr.Newest -gt $idleCut) {
+                        Add-Verdict 'C9' 'unowned' 'FAIL' "the owning session wrote a transcript $trAge h ago, inside the $IdleHours h window"
+                    }
+                    else { Add-Verdict 'C9' 'unowned' 'PASS' "the owning session's newest transcript is $trAge h old, outside the $IdleHours h window" }
+                }
+            }
+
+            # C8 LAST: it is the only conjunct that can cost a network round trip, and spending it on
+            # a tree something local already stopped answers a question nobody asked. It is therefore
+            # the one conjunct that can legitimately read NOT-EVALUATED.
+            $mergeReason = 'not evaluated (already disqualified)'
+            $merged = $null
+            if (@($script:VenvVerdicts | Where-Object { $_.verdict -eq 'FAIL' }).Count -eq 0) {
+                if ($w.Detached -or -not $w.Branch) {
+                    $mergeReason = 'detached HEAD: there is no branch to test for containment'
+                    Add-Verdict 'C8' 'merged' 'FAIL' $mergeReason
+                }
+                else {
+                    $m = Test-Merged -Branch $w.Branch
+                    $merged = [bool]$m.Merged
+                    $mergeReason = [string]$m.Reason
+                    $notes += @($m.Notes)
+                    if (-not $merged) { Add-Verdict 'C8' 'merged' 'FAIL' "not merged ($mergeReason)" }
+                    else { Add-Verdict 'C8' 'merged' 'PASS' $mergeReason }
+                }
+            }
+            else { Add-Verdict 'C8' 'merged' 'NOT-EVALUATED' $mergeReason }
+
+            # Re-ordered to the DECLARED numbering, not the evaluation order, so a reader comparing
+            # two rows compares the same positions -- and so "which conjunct stopped it" is the
+            # LOWEST-NUMBERED failure rather than whichever happened to be evaluated first.
+            $verdicts = @($script:VenvVerdicts | Sort-Object id)
+            $failed = @($verdicts | Where-Object { $_.verdict -eq 'FAIL' })
+
+            $size = Get-VenvSize -Path $venv
+            $rows += [pscustomobject]@{
+                Leaf         = $leaf
+                Path         = $w.Path
+                VenvPath     = $venv
+                Branch       = $(if ($w.Branch) { $w.Branch } else { '(detached)' })
+                Verdict      = $(if ($failed.Count -eq 0) { 'REAPABLE' } else { 'SKIP' })
+                StoppedBy    = $(if ($failed.Count -eq 0) { '' } else { "$($failed[0].id) $($failed[0].name)" })
+                StoppedDetail = $(if ($failed.Count -eq 0) { '' } else { [string]$failed[0].detail })
+                Verdicts     = @($verdicts)
+                Failed       = @($failed)
+                Notes        = @($notes)
+                Bytes        = $size.Bytes
+                Files        = $size.Files
+                UnreadableEntries = $size.Unreadable
+                SessionIds   = @($ids)
+                ActivityAgeHours = $actAge
+                MergeReason  = $mergeReason
+                Merged       = $merged
+            }
+        }
+    }
+
+    $reapRows = @($rows | Where-Object { $_.Verdict -eq 'REAPABLE' })
+    $skipRows = @($rows | Where-Object { $_.Verdict -eq 'SKIP' })
+    $reapBytes = [int64]0; foreach ($r in $reapRows) { $reapBytes += $r.Bytes }
+    $heldBytes = [int64]0; foreach ($r in $skipRows) { $heldBytes += $r.Bytes }
+    $sizeFaults = @($rows | Where-Object { $_.UnreadableEntries -gt 0 })
+    # Grouped by the conjunct that STOPPED each tree, so the table below can be read as a work list.
+    $byConjunct = @{}
+    foreach ($r in $skipRows) {
+        $k = $r.StoppedBy
+        if (-not $byConjunct.ContainsKey($k)) { $byConjunct[$k] = 0 }
+        $byConjunct[$k]++
+    }
+
+    $venvReap = [pscustomobject]@{
+        ran            = ($cannotRun.Count -eq 0)
+        cannotRun      = @($cannotRun)
+        idleHours      = $IdleHours
+        lockFile       = $REBUILD_LOCK_NAME
+        # EVERY COUNT WITH ITS DENOMINATOR. See the header: a bare zero here is indistinguishable
+        # from a detector that never fired.
+        worktreesExamined = $examined
+        worktreesTotal    = $occ.Worktrees.Count
+        venvsFound        = $rows.Count
+        reapable          = $reapRows.Count
+        skipped           = $skipRows.Count
+        reapableBytes     = $reapBytes
+        heldBytes         = $heldBytes
+        sizeWalkFaults    = $sizeFaults.Count
+        configRootsSeen       = $idx.RootsSeen.Count
+        configRootsWithProjects = $idx.RootsWithProjects.Count
+        configRootsRead         = @($idx.RootsWithProjects)
+        configRootsUnreadable   = $idx.RootsUnreadable.Count
+        projectDirsScanned      = $idx.Dirs.Count
+        stoppedByConjunct = [pscustomobject]($byConjunct)
+        failsClosedToward = 'SKIP: every unreadable root, unreadable transcript, unreadable size entry and unparsed session id keeps the venv, and the byte totals are LOWER bounds'
+        rows           = @($rows | ForEach-Object {
+                [pscustomobject]@{
+                    leaf = $_.Leaf; path = $_.Path; venv = $_.VenvPath; branch = $_.Branch
+                    verdict = $_.Verdict; stoppedBy = $_.StoppedBy; stoppedDetail = $_.StoppedDetail
+                    # ALL NINE, in declared order, so a consumer never has to read a conjunct's
+                    # absence as a pass. `failedConjuncts` is the same rows filtered to FAIL and is
+                    # kept because the human table renders from it.
+                    conjuncts = @($_.Verdicts)
+                    failedConjuncts = @($_.Failed); notes = @($_.Notes)
+                    bytes = $_.Bytes; files = $_.Files; unreadableEntries = $_.UnreadableEntries
+                    sessionIds = @($_.SessionIds); activityAgeHours = $_.ActivityAgeHours
+                    merged = $_.Merged; mergeReason = $_.MergeReason
+                }
+            })
+    }
+
+    # THE EXIT CODE FOR A REFUSED PASS IS NOT SET HERE, and the comment that used to sit on it said
+    # why without noticing: "same standing as a -Name that matched nothing". The -Name path reports
+    # FAILED rather than REFUSED once a removal has happened, and it can only do that because it runs
+    # AFTER the apply loop. This block runs before it, where $removed does not exist yet, so setting
+    # REFUSED from here let `-ReapVenvs -Apply` remove worktrees and still exit 2, which the header
+    # defines as "nothing was removed". Set beside the -Name guard instead; search for
+    # `$venvReap.ran`.
+}
+
 # -Name is the loudest thing an operator can do to the fence: it is -IdleHours 0 scoped to one tree,
 # and signal 1 has been measured vetoing 0 of 4 real siblings. It used to produce only a grey `note:`
 # line, while the flag it is equivalent to got a red banner.
@@ -1098,6 +1579,13 @@ $occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
+    #
+    # ONCE, AND OUTSIDE THE LOOP, WHICH IS WHAT KEEPS EXIT 2 HONEST. Available is a plain [bool] on
+    # the object this returns; nothing in the loop re-reads it or writes it. So the refusal below is
+    # all-or-nothing: down here means down on iteration 1, every candidate skips, and $removed stays
+    # 0. Move this read inside the loop and that stops being true -- the Set-Exit below would then
+    # need the `$removed -gt 0` guard the -Name and -ReapVenvs sites carry, and the header paragraph
+    # that says 2 means nothing was removed would need retracting with it.
     $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
     Write-Note ""
     foreach ($d in $prunable) {
@@ -1303,6 +1791,12 @@ if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
 # wrong-cwd case this script now refuses outright.
 if ($namedMisses.Count -gt 0) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
 
+# -ReapVenvs asked for a reading and did not get one, which has the same standing and now takes the
+# same guard. HERE rather than beside the pass that decided it, for the one reason that settles the
+# placement: $removed does not exist until the apply loop has run, and REFUSED promises nothing was
+# removed. A run that pruned two worktrees and could not judge a venv removed something.
+if ($null -ne $venvReap -and -not $venvReap.ran) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
+
 # BEFORE the report, not after it. The -Json branch below emits the receipt and EXITS, so an exit-code
 # decision made after it would be reached only on the human path -- the receipt would carry exitCode 0
 # over a key nothing can claim, and a CI consumer reading the JSON would see a clean run.
@@ -1358,6 +1852,10 @@ if ($Json) {
         # `reportOnlyHeld` is a COUNT of what was withheld, not a list: naming the withheld trees
         # would re-create the suggestion the withholding exists to avoid.
         reportOnly = @($reportOnly | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; idleHours = $_.IdleH; safety = $_.Landed } })
+        # $null when -ReapVenvs was not asked for; an object with `ran: false` when it WAS asked for
+        # and could not answer. A consumer must be able to tell "not requested" from "requested and
+        # refused" -- collapsing them is the same empty-answer defect the fence receipt exists to fix.
+        venvReap = $venvReap
         excluded = @($excluded | ForEach-Object { [pscustomobject]@{ leaf = (Split-Path $_.Wt.Path -Leaf); reason = $_.Why } })
         namedMisses = @($namedMisses)
         orphansFromEarlierRuns = @($priorOrphans | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; why = $_.Why } })
@@ -1430,6 +1928,69 @@ if ($reportOnly.Count -gt 0 -or $reportHeld -gt 0) {
     }
 }
 
+# --- The venv receipt (-ReapVenvs). REPORT ONLY; nothing above or below acts on it ----------------
+if ($null -ne $venvReap) {
+    Write-Host ""
+    if (-not $venvReap.ran) {
+        # NOT the same sentence as "nothing was reapable", and that is the whole reason this branch
+        # exists. An empty list from a check that could not run looks identical to an empty list from
+        # a check that ran and found nothing.
+        Write-Host "VENV REAP COULD NOT RUN -- no venv was cleared, and none was fenced either:" -ForegroundColor Red
+        foreach ($r in $venvReap.cannotRun) { Write-Host "  $r" -ForegroundColor Red }
+        Write-Host "  This is NOT 'nothing is reapable'. Fix the cause and re-run; nothing was deleted either way." -ForegroundColor Red
+    }
+    else {
+        Write-Host ("VENV REAP (report only -- this script has no venv deletion path at all)") -ForegroundColor Cyan
+        Write-Host ("  {0} venv(s) found across {1} of {2} registered worktree(s) (the primary is never examined)." -f
+            $venvReap.venvsFound, $venvReap.worktreesExamined, $venvReap.worktreesTotal) -ForegroundColor DarkGray
+        Write-Host ("  Ownership (C9) read {0} project director(ies) under {1} of {2} config root(s); {3} unreadable." -f
+            $venvReap.projectDirsScanned, $venvReap.configRootsWithProjects, $venvReap.configRootsSeen,
+            $venvReap.configRootsUnreadable) -ForegroundColor DarkGray
+        Write-Host ("    the {0} carrying a projects/ store: {1}" -f
+            $venvReap.configRootsWithProjects, ($venvReap.configRootsRead -join ', ')) -ForegroundColor DarkGray
+        Write-Host ("  Rebuild predicate: {0} (NOT uv.lock). Idle window: {1} h, both for C7 and for C9." -f
+            $venvReap.lockFile, $venvReap.idleHours) -ForegroundColor DarkGray
+        Write-Host ("  Fails closed toward {0}" -f $venvReap.failsClosedToward) -ForegroundColor DarkGray
+
+        if ($venvReap.rows.Count -eq 0) {
+            Write-Host "  No worktree of this repo carries a .venv, so there was nothing to fence." -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host ""
+            Write-Host ("  {0,-52} {1,10}  {2}" -f 'WORKTREE', 'SIZE', 'VERDICT') -ForegroundColor DarkGray
+            foreach ($r in $venvReap.rows) {
+                $text = if ($r.verdict -eq 'REAPABLE') { 'REAPABLE' } else { "SKIP - $($r.stoppedBy): $($r.stoppedDetail)" }
+                $colour = if ($r.verdict -eq 'REAPABLE') { 'Yellow' } else { 'Gray' }
+                Write-Host ("  {0,-52} {1,10}  {2}" -f $r.leaf, (Format-Bytes $r.bytes), $text) -ForegroundColor $colour
+                # Every OTHER conjunct that also said no. The first one is the verdict; the rest are
+                # the work list, and hiding them would make a tree look one fix away when it is four.
+                foreach ($f in @($r.failedConjuncts | Select-Object -Skip 1)) {
+                    Write-Host ("  {0,-52} {1,10}  also: {2} {3}: {4}" -f '', '', $f.id, $f.name, $f.detail) -ForegroundColor DarkGray
+                }
+                if ($r.unreadableEntries -gt 0) {
+                    Write-Host ("  {0,-52} {1,10}  size is a LOWER BOUND: {2} of {3} entr(ies) unreadable" -f
+                        '', '', $r.unreadableEntries, ($r.files + $r.unreadableEntries)) -ForegroundColor DarkGray
+                }
+            }
+            Write-Host ""
+            Write-Host ("  {0} of {1} venv(s) reapable, {2} ({3} bytes) reclaimable." -f
+                $venvReap.reapable, $venvReap.venvsFound, (Format-Bytes $venvReap.reapableBytes), $venvReap.reapableBytes) -ForegroundColor Cyan
+            Write-Host ("  {0} of {1} skipped, holding {2} ({3} bytes)." -f
+                $venvReap.skipped, $venvReap.venvsFound, (Format-Bytes $venvReap.heldBytes), $venvReap.heldBytes) -ForegroundColor DarkGray
+            foreach ($k in ($venvReap.stoppedByConjunct.PSObject.Properties | Sort-Object Name)) {
+                Write-Host ("    stopped by {0}: {1}" -f $k.Name, $k.Value) -ForegroundColor DarkGray
+            }
+            if ($venvReap.sizeWalkFaults -gt 0) {
+                Write-Host ("  {0} of {1} size walk(s) could not read every entry, so both byte totals are LOWER bounds." -f
+                    $venvReap.sizeWalkFaults, $venvReap.venvsFound) -ForegroundColor Yellow
+            }
+            Write-Host ""
+            Write-Host "  NOTHING WAS DELETED AND NOTHING HERE CAN DELETE. There is no -Apply for a venv, by" -ForegroundColor DarkGray
+            Write-Host "  design: this report is the week of dry-run evidence a destructive path would need first." -ForegroundColor DarkGray
+        }
+    }
+}
+
 Write-Host ""
 if (-not $Apply) {
     if ($prunable.Count -eq 0) {
@@ -1485,18 +2046,49 @@ if ($priorOrphans.Count -gt 0) {
 if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
 
 foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
-if ($exit -eq $EXIT_REFUSED) {
-    if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
-        Write-Host "  Exit 2: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
-        if ($null -ne $occ2 -and -not $occ2.Available) {
-            Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
-        }
-    }
-    if ($namedMisses.Count -gt 0) {
-        Write-Host "  Exit 2: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+# EACH LINE IS KEYED ON ITS OWN CONDITION, NEVER ON THE FINAL CODE. These used to sit inside
+# `if ($exit -eq $EXIT_REFUSED)`, and two different things take a run out of that branch: the
+# `$removed -gt 0` guard on the -Name miss, which reports 1 once something has been removed, and a
+# more severe code from an unrelated cause, such as an orphaned directory reporting 3. Either way the
+# explanation went silent on exactly the run where the halves of the report disagree -- the operator
+# read `Done. removed 1` in red, or a recovery recipe, with nothing saying which request was refused.
+# The -ReapVenvs line below was moved out for this reason in #1244 (6896b3921); these follow it.
+#
+# AND NO LINE PREFIXES THE RUN'S CODE, BECAUSE DOING SO ATTRIBUTES IT. These lines used to open
+# `Exit 2:`, which was true only while the wrapper guaranteed the run WAS a 2. Interpolating $exit
+# instead gets the arithmetic right and the meaning wrong: with the fence down AND a directory
+# broken on disk, `Exit 3: the occupancy fence was unavailable` sends an operator to fix the fence
+# to clear a 3 the fence never set. The fence is worth 2; the broken directory is what makes it 3.
+#
+# So each line opens with the OUTCOME WORD, which is already this file's vocabulary -- the three
+# preamble refusals print bare `REFUSED:` and a failed removal prints bare `FAILED:`. The run's
+# code stays where it was always authoritative: the `Done.` summary and $LASTEXITCODE. The number
+# is not merely moved, either -- `FAILED (1)` would have read as a sibling of the per-candidate
+# `FAILED (exit $removeExit)` above, which is a git exit code and a different thing entirely.
+#
+# The -ReapVenvs line takes the same treatment rather than staying the odd one out: it landed with
+# `Exit ${exit}:` in #1244 (6896b3921) and has the same hole.
+$refusalWord = if ($removed -gt 0) { 'FAILED' } else { 'REFUSED' }
+if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
+    # REFUSED unconditionally, never $refusalWord: an unavailable fence makes every candidate SKIP,
+    # so this branch and a non-zero $removed cannot co-occur. The header paragraph walks that.
+    Write-Host "  REFUSED: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
+    if ($null -ne $occ2 -and -not $occ2.Available) {
+        Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
     }
 }
-elseif ($exit -eq $EXIT_ORPHANED) {
-    Write-Host "  Exit 3: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
+if ($namedMisses.Count -gt 0) {
+    Write-Host "  ${refusalWord}: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+}
+# `if`, not the `elseif` this was: with the branch above gone there is nothing to chain to. Behaviour
+# is unchanged -- the old chain reached here whenever $exit was 3, because 3 is not 2.
+if ($exit -eq $EXIT_ORPHANED) {
+    Write-Host "  ORPHANED: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
+}
+# OUTSIDE the branch above, because the venv refusal no longer decides the code on its own: a run that
+# also removed a worktree reports 1. A line keyed on 2 would go silent on exactly the run where the
+# two halves of the report disagree, which is the run an operator most needs it on.
+if ($null -ne $venvReap -and -not $venvReap.ran) {
+    Write-Host "  ${refusalWord}: -ReapVenvs was asked for and could not answer, so the empty venv list means nothing." -ForegroundColor Red
 }
 exit $exit

@@ -3,11 +3,16 @@
 """Shared TLS hardening policy (ASVS 11.6.2 key exchange + 12.1.4 strict X.509, WP-L3-10 code half).
 
 Pure stdlib ``ssl`` helpers, importable by ``api/`` and ``transports/`` (and the ``config`` settings
-validator) without crossing the engine's one-way dependency boundaries. Three controls:
+validator) without crossing the engine's one-way dependency boundaries. The controls include, at least:
 
 * :func:`validate_tls_ciphers` — reject an operator ``tls_ciphers`` string that would admit a
   non-forward-secret (non-ECDHE/DHE) key exchange, so a misconfiguration cannot widen the suite below
   policy. Run from the ``[api].tls_ciphers`` settings validator, so a bad value fails loud at load.
+* :func:`apply_connection_tls_ciphers` — the same policy on a **partner hop**, opt-in per
+  connection (``tls_ciphers`` on MLLP / DICOM, ADR 0188). Unset it does nothing at all, so the
+  inherited default suite list is untouched; set, it applies the allow-list to that one hop. It
+  narrows only: each seam calls :func:`harden_cipher_suites` after it, where the 12.1.2 call-site
+  guard can see the assertion.
 * :func:`harden_kex_groups` — *attempt* to pin the approved ECDHE groups on a built context, and
   **report whether it managed to**. ``SSLContext.set_groups`` is a **Python 3.15** API (this said
   "3.13+" and was wrong), so today it pins nothing on every supported runtime and the contexts inherit
@@ -55,7 +60,9 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
+    "CONNECTION_TLS_CIPHERS_SETTING",
     "TLS_REVOCATION_ATTESTED_ENV",
+    "apply_connection_tls_ciphers",
     "fips_attestation",
     "HopDisposition",
     "HopPosture",
@@ -75,6 +82,7 @@ __all__ = [
     "smtp_login_approved",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
+    "context_checks_revocation",
     "current_hop_posture",
     "enforce_insecure_hop",
     "harden_cipher_suites",
@@ -283,6 +291,29 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
             "against, which refuses every client rather than skipping the check"
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
+    """Whether ``ctx`` will actually consult a CRL during verification (BACKLOG #299).
+
+    Reads ``VERIFY_CRL_CHECK_LEAF`` off the context itself rather than trusting that some setting was
+    configured somewhere. That distinction is the whole point: ``[tls].crl_file`` is instance-wide, but
+    the hops it reaches are not — an ``ldap3.Tls`` or a ``truststore`` context is built by a library that
+    never sees the policy, so a setting-shaped test would report "revocation is checked" for a handshake
+    that checks nothing. Asking the object that performs the handshake cannot make that mistake.
+
+    ``None`` (no context — a hop that is not TLS, or a caller that has none to hand) is ``False``:
+    absent evidence is not evidence of checking.
+
+    Testing the LEAF bit answers for ``VERIFY_CRL_CHECK_CHAIN`` too, and that is a measurement rather
+    than a reading of the names: on CPython 3.14 / OpenSSL 3.5.7, ``VERIFY_CRL_CHECK_LEAF`` is ``0x4``
+    and ``VERIFY_CRL_CHECK_CHAIN`` is ``0xc`` — the chain flag is the leaf flag OR'd with
+    ``X509_V_FLAG_CRL_CHECK_ALL``, so it carries the leaf bit. Pinned by
+    ``tests/test_tls_policy.py::test_the_chain_crl_flag_contains_the_leaf_bit``, because the two names
+    read as siblings and nothing else here would notice if they stopped overlapping."""
+    if ctx is None:
+        return False
+    return bool(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
 
 
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**
@@ -633,6 +664,66 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
             f"above can see them."
         )
+
+
+#: The connector setting :func:`apply_connection_tls_ciphers` reads. Named ONCE, here, so the four
+#: seams that opt in (MLLP listener/destination, DICOM listener/destination) cannot spell it differently
+#: -- a misspelled key on one seam would read as "operator set nothing" and never fail.
+CONNECTION_TLS_CIPHERS_SETTING = "tls_ciphers"
+
+
+def apply_connection_tls_ciphers(
+    ctx: ssl.SSLContext, settings: Mapping[str, Any], *, connector: str
+) -> None:
+    """Apply a connection's **opt-in** ``tls_ciphers`` to ``ctx`` (ADR 0188).
+
+    The partner-hop counterpart to the ``[api].tls_ciphers`` knob. Until this existed
+    :data:`_APPROVED_TLS_SUITES` governed exactly ONE operator setting -- the engine's own API
+    listener -- while every partner-facing hop ran on an inherited suite list with no lever at all, so
+    an operator who needed a narrower set toward one hospital peer had nowhere to say so.
+
+    **Unset is the shipped default and changes nothing.** With no ``tls_ciphers`` in ``settings`` this
+    returns having touched ``ctx`` not at all: no ``set_ciphers``, so the context keeps the
+    interpreter's inherited default suite list -- **including the six CBC-SHA2 suites the allow-list
+    deliberately excludes**. That retention is the decision recorded at length in
+    :func:`harden_cipher_suites`, and it stands: the allow-list governs what an operator may
+    CONFIGURE, never what an inherited default may contain, and retiring those six is gated on a peer
+    census nobody has run. Opting in is the operator asking for the stricter list; it is not the
+    engine imposing it on anyone who says nothing.
+
+    **Set runs the SAME policy as the API knob**, allow-list included -- :func:`validate_tls_ciphers`
+    itself, not a second copy that could drift -- so an operator cannot put a NULL, anonymous,
+    non-forward-secret or under-strength suite on a hop that carries PHI. A hop is the one place that
+    would matter most and was the one place nothing checked.
+
+    **This narrows; it does NOT assert.** Each seam calls :func:`harden_cipher_suites` on the next
+    line, and that separation is required rather than stylistic: the ASVS 12.1.2 call-site guard
+    (``tests/test_tls_policy.py::test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy``)
+    reads every context builder for the assertion BY NAME, and a wrapper that swallowed the call would
+    make the guard pass over a seam it can no longer see. An earlier draft of this feature folded the
+    two together and turned that guard red on all four seams -- which is the guard working.
+
+    The **order** still matters and the seams keep it: assert last, on the post-``set_ciphers``
+    context the connector will actually use. It is not, however, load-bearing for safety, because the
+    string is validated independently of ``ctx`` before it is applied -- and
+    :func:`validate_tls_ciphers` is strictly stronger than the assertion, allow-list included. What
+    the trailing assertion adds is a check on the REAL context shape: the validator probes a
+    ``PROTOCOL_TLS_SERVER`` context, and a client context could in principle resolve the same string
+    differently.
+
+    Raises :class:`ValueError` at construction (surfaced by ``check`` / dry-run / ``serve``), like
+    every sibling assertion in this module. The message names ``connector`` because
+    :func:`validate_tls_ciphers` speaks about a generic ``tls_ciphers`` and an operator running
+    several connections needs to know WHICH one is at fault."""
+    ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
+    if ciphers is None:
+        return
+    text = str(ciphers)
+    try:
+        validate_tls_ciphers(text)
+        ctx.set_ciphers(text)
+    except (ValueError, ssl.SSLError) as exc:
+        raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
@@ -1311,6 +1402,8 @@ def revocation_hop_disposition(
     is_loopback_hop: bool,
     proxy_proven: bool,
     attested: bool,
+    crl_checked: bool = False,
+    blanket_attested: bool = False,
 ) -> HopDisposition:
     """Decide what to do with a VERIFYING outbound TLS hop that does no revocation checking (#201 — PURE).
 
@@ -1320,29 +1413,52 @@ def revocation_hop_disposition(
 
     #. ``is_loopback_hop`` → :attr:`~HopDisposition.ALLOW` — an on-box hop is not a network exposure, and
        a revoked cert on the local box is not the threat this gate addresses.
+    #. ``crl_checked`` → :attr:`~HopDisposition.ALLOW` — **this hop's own context** checks revocation
+       (BACKLOG #299): a CRL is loaded and ``VERIFY_CRL_CHECK_LEAF`` is set on the very
+       :class:`ssl.SSLContext` the handshake uses, so the gap this gate exists for is closed in-engine
+       rather than declared away. The caller derives it from that context (see
+       :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
+       configured CRL that a given hop's handshake never consults must not silence that hop's guard.
     #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
        revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
-       this hop (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``).
+       **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
+    #. ``blanket_attested`` → :attr:`~HopDisposition.ALLOW` — see the clamp below.
     #. else (non-enforcing — the WARN posture) → :attr:`~HopDisposition.WARN`.
 
+    **``blanket_attested`` sits BELOW the enforcing REFUSE, and that ordering is BACKLOG #299's
+    attestation clamp.** The two attestations used to be OR'd into one ``attested`` argument, so a single
+    process-wide ``MEFOR_TLS_REVOCATION_ATTESTED=1`` returned ALLOW for **every** verifying outbound hop
+    in the instance — one environment variable, set once, defeating an enforcing posture on hops the
+    operator never enumerated. A per-connection ``tls_revocation_attested`` is a claim about one named
+    hop that a reviewer can check against that hop's PKI; the env is a claim about all of them at once,
+    and it is that unreviewable shape the clamp removes. Under a non-enforcing posture the env still
+    ALLOWs, byte-identical to the pre-clamp behaviour, so nothing outside an enforcing posture moves.
+
     A ``not is_phi`` ALLOW arm sat fourth until BACKLOG #1279. Every instance carries patient data now,
-    so it could no longer fire and its removal leaves the remaining three relaxations as the whole set.
+    so it could no longer fire and its removal leaves the remaining relaxations as the whole set.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
-    ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator and an operator
-    attestation. This never turns verification off (the caller has already built
-    a verifying context) — it only decides whether the *unchecked-revocation* property of that verified
-    hop is tolerable, so it composes with (never weakens) the #200 cleartext/verify-off refusals."""
+    only relaxations an ENFORCING hop has are the on-box carve-out, an in-engine CRL check, a declared
+    revocation-checking terminator and a per-connection attestation. This never turns verification off
+    (the caller has already built a verifying context) — it only decides whether the
+    *unchecked-revocation* property of that verified hop is tolerable, so it composes with (never
+    weakens) the #200 cleartext/verify-off refusals."""
     if is_loopback_hop:
+        return HopDisposition.ALLOW
+    if crl_checked:
         return HopDisposition.ALLOW
     if proxy_proven:
         return HopDisposition.ALLOW
     if attested:
         return HopDisposition.ALLOW
     if enforcing:
+        # The clamp: a blanket env attestation does NOT reach this arm. Only the per-connection
+        # attestation above, a proven terminator, or a real in-engine CRL check crosses an enforcing hop.
         return HopDisposition.REFUSE
+    if blanket_attested:
+        return HopDisposition.ALLOW
     return HopDisposition.WARN
 
 
@@ -1367,6 +1483,13 @@ class RevocationHopGuard:
     attested: bool
     proxy_proven: bool
     posture: HopPosture | None
+    #: Whether the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env was set when this hop was captured.
+    #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
+    #: field is exactly what let one env var cross every enforcing hop in the instance.
+    blanket_attested: bool = False
+    #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
+    #: context in :meth:`capture`, never from a global setting.
+    crl_checked: bool = False
 
     @classmethod
     def capture(
@@ -1377,20 +1500,30 @@ class RevocationHopGuard:
         description: str,
         attested: bool,
         proxy_proven: bool = False,
+        context: ssl.SSLContext | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
-        ``attested`` is the per-connection ``tls_revocation_attested`` flag; the blanket
-        ``MEFOR_TLS_REVOCATION_ATTESTED`` env is OR'd in here so either form suppresses the refusal (the
-        same opt-out ADR 0078 gave the in-process listener). ``cell`` is a short PHI-free label of the
-        crossing; ``description`` explains the hop (scheme/host only — never a credential or a body)."""
+        ``attested`` is the per-connection ``tls_revocation_attested`` flag. The blanket
+        ``MEFOR_TLS_REVOCATION_ATTESTED`` env is read here too but kept in its **own** field: it is a
+        weaker claim and :func:`revocation_hop_disposition` ranks it below the enforcing refusal
+        (BACKLOG #299). ``cell`` is a short PHI-free label of the crossing; ``description`` explains the
+        hop (scheme/host only — never a credential or a body).
+
+        ``context`` is the :class:`ssl.SSLContext` this hop's handshake will actually use. When supplied,
+        :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off it, so a hop whose CRL was
+        really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
+        the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
+        one instance-wide setting must never silence a hop whose handshake does not consult it."""
         return cls(
             host=host,
             cell=cell,
             description=description,
-            attested=attested or tls_revocation_attested(),
+            attested=attested,
             proxy_proven=proxy_proven,
             posture=current_hop_posture(),
+            blanket_attested=tls_revocation_attested(),
+            crl_checked=context_checks_revocation(context),
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
@@ -1399,14 +1532,18 @@ class RevocationHopGuard:
             is_loopback_hop=is_loopback_hop_host(self.host),
             proxy_proven=self.proxy_proven,
             attested=self.attested,
+            crl_checked=self.crl_checked,
+            blanket_attested=self.blanket_attested,
         )
 
     def _detail(self) -> str:
         return (
             f"{self.description} to {self.host}: the peer certificate is verified but NO certificate "
             "revocation checking (OCSP/CRL) is performed — stdlib ssl has none (ASVS 12.1.4, ADR 0078). "
-            "Terminate at a revocation-checking egress proxy, or set tls_revocation_attested=true / "
-            f"{TLS_REVOCATION_ATTESTED_ENV}=1 to attest a revocation-checking PKI backs this hop."
+            "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
+            "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection. "
+            f"Under an enforcing posture a blanket {TLS_REVOCATION_ATTESTED_ENV}=1 no longer suffices "
+            "(BACKLOG #299) — it cannot say which hop's PKI was reviewed."
         )
 
     def enforce_construction(self) -> None:
@@ -1420,6 +1557,10 @@ class RevocationHopGuard:
         # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
         # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
         # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
+        # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
+        # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
+        # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
+        # one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
             and (self.attested or self.proxy_proven)
@@ -1469,6 +1610,11 @@ class TrustAnchorPolicy:
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
+    #: ``[tls].crl_file`` — a PEM CRL (or CA+CRL bundle) applied to the OUTBOUND hops this policy
+    #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
+    #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
+    #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
+    crl_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1491,16 +1637,28 @@ class TrustAnchor:
 
     cafile: str | None
     load_system_roots: bool
+    #: A CRL to load onto this hop's context, turning on ``VERIFY_CRL_CHECK_LEAF`` (BACKLOG #299).
+    #: ``None`` — no revocation checking on this hop, the pre-#299 behaviour. Resolved per hop by
+    #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
+    #: configures one.
+    crl_file: str | None = None
 
     @property
     def narrows(self) -> bool:
-        """Whether this anchor names a CA of its own, i.e. whether it changes anything.
+        """Whether this anchor changes anything about how this hop verifies its peer.
 
-        The one predicate a caller needs: an anchor that names no CA resolves to the OS trust store,
-        which is what every hop had before an anchor was resolvable at all. Callers that must choose
-        between a shared, unanchored client and a per-connection one read THIS rather than spelling
-        out the ``cafile is not None`` test, so the five HTTP-family call sites cannot drift apart."""
-        return self.cafile is not None
+        The one predicate a caller needs. An anchor that names neither a CA nor a CRL resolves to the
+        plain OS trust store, which is what every hop had before an anchor was resolvable at all.
+        Callers that must choose between a shared, unanchored client and a per-connection one read THIS
+        rather than spelling out the test, so the five HTTP-family call sites cannot drift apart.
+
+        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared,
+        module-level opener whenever the anchor does not narrow. That opener is built once at import,
+        before any config is loaded, so a CRL could never reach it — a hop that answered "nothing to
+        narrow" here would silently keep the unrevoked shared opener while its guard was told
+        revocation was checked. Widening this predicate is what routes such a hop onto its own
+        opener, with its own context, carrying its own CRL."""
+        return self.cafile is not None or self.crl_file is not None
 
 
 #: The anchor a hop that configures nothing resolves to: the OS trust store, no private CA. The
@@ -1528,20 +1686,31 @@ def resolve_trust_anchor(
     #. Else (a non-loopback internal hop with an internal CA and ``augment``/``pinned``): ``pinned`` →
        ONLY the internal CA (no public bundle); ``augment`` → the OS roots plus the internal CA.
 
-    This only chooses WHICH roots verify the peer — it never turns verification off — so it composes
-    with the connectors' fail-closed no-CA / ``tls_verify=false`` / cleartext-hop refusals rather than
-    weakening them."""
+    ``policy.crl_file`` rides along on **every** non-loopback arm, including the per-connection-CA arm
+    and the ``system`` default (BACKLOG #299). Revocation is orthogonal to which roots anchor the hop:
+    a connection that pins its own CA still wants its issuer's CRL checked, and an instance that pins
+    no CA at all still wants revocation on its public-CA hops. A **loopback** hop gets ``None`` — the
+    same exemption ``internal_ca_file`` has, for the stronger reason that ``VERIFY_CRL_CHECK_LEAF``
+    refuses a peer whose issuer has no CRL in the store, so applying an org CRL to an on-box peer from a
+    different local PKI would break traffic the revocation guard already treats as safe.
+
+    This only chooses WHICH roots verify the peer and WHETHER a CRL is consulted — it never turns
+    verification off — so it composes with the connectors' fail-closed no-CA / ``tls_verify=false`` /
+    cleartext-hop refusals rather than weakening them."""
+    # Loopback is exempt from BOTH the internal anchor and the CRL; resolved once so the arms below
+    # cannot disagree about it.
+    crl = None if is_loopback_hop_host(host) else policy.crl_file
     if connection_ca_file is not None:
         # Per-connection pin wins verbatim (single-anchor, no OS roots — the historical behaviour).
-        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False)
+        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False, crl_file=crl)
     if policy.mode == "system" or policy.internal_ca_file is None or is_loopback_hop_host(host):
-        # Unchanged: OS trust store only (byte-identical default / loopback exemption).
-        return TrustAnchor(cafile=None, load_system_roots=True)
+        # Unchanged trust store: OS roots only (byte-identical default / loopback exemption).
+        return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl)
     if policy.mode == "pinned":
         # ONLY the internal CA — the forward_tls_ca_file template (no public bundle).
-        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False)
+        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False, crl_file=crl)
     # augment: OS roots + the internal CA.
-    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True)
+    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True, crl_file=crl)
 
 
 def build_verifying_client_context(
@@ -1555,14 +1724,21 @@ def build_verifying_client_context(
     the ``create_default_context`` secure defaults) — the caller layers the TLS floor / KEX / strict
     flags / optional mTLS client cert exactly as before. Purpose is a parameter only so a future
     client-auth context could reuse it; every current caller verifies a *server* cert."""
+    ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
         if anchor.cafile is not None:
             # augment: keep the OS default roots loaded above and add the internal CA on top.
             ctx.load_verify_locations(cafile=anchor.cafile)
-        return ctx
-    # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
-    return ssl.create_default_context(purpose, cafile=anchor.cafile)
+    else:
+        # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
+        ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
+    # BACKLOG #299: the CRL loads LAST, once the trust store is final -- harden_crl_check asserts the
+    # CRL actually landed in that store, and a later load_verify_locations would make the assertion
+    # answer for a different store than the one the handshake uses.
+    if anchor.crl_file is not None:
+        harden_crl_check(ctx, anchor.crl_file)
+    return ctx
 
 
 #: urllib's ALPN advertisement — see :func:`build_anchored_https_handler` for why it is replayed.
@@ -1600,12 +1776,18 @@ def build_anchored_https_handler(
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
     if anchor.load_system_roots:
-        # augment: urllib's OWN context, with the internal CA loaded on top. Nothing is replayed
-        # because nothing is rebuilt — the only change is one more trusted root.
+        # augment (and the CRL-only shape below): urllib's OWN context, with the internal CA and/or the
+        # CRL loaded on top. Nothing is replayed because nothing is rebuilt -- the only changes are one
+        # more trusted root and, with a CRL, the revocation flag.
         handler = build_asserted_https_handler(connector=connector)
-        urllib_handler_context(handler, connector=connector).load_verify_locations(
-            cafile=anchor.cafile
-        )
+        ctx = urllib_handler_context(handler, connector=connector)
+        if anchor.cafile is not None:
+            ctx.load_verify_locations(cafile=anchor.cafile)
+        # BACKLOG #299: `system` mode plus a CRL narrows without naming a CA, so this arm now runs with
+        # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
+        # CRL still loads last, against the final trust store.
+        if anchor.crl_file is not None:
+            harden_crl_check(ctx, anchor.crl_file)
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)
@@ -1634,8 +1816,21 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     Worth stating plainly, because the direction is counter-intuitive: this hop is not one of the
     broadly-trusting ones. ``requests`` defaults to the PUBLIC certifi bundle, not the OS store, so an
     internal-CA Vault fails closed today rather than being widely trusted. What was missing here is
-    the ability to reach such a Vault at all."""
-    if not anchor.narrows:
+    the ability to reach such a Vault at all.
+
+    A ``crl_file`` on the anchor is **refused** for the same reason ``augment`` is (BACKLOG #299):
+    ``verify=`` names one bundle and cannot carry a revocation flag, so honouring the CA while dropping
+    the CRL would report a revocation-checked hop that checks nothing. Unreachable today -- both Vault
+    callers build a default :class:`TrustAnchorPolicy`, which has no CRL -- and written anyway, because
+    the day the instance policy is threaded to these hops the silent drop is the failure that would
+    land."""
+    if anchor.crl_file is not None:
+        raise ValueError(
+            f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
+            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy or "
+            f"leave the CRL unset rather than have it silently ignored here."
+        )
+    if anchor.cafile is None:
         return None
     if anchor.load_system_roots:
         raise ValueError(
