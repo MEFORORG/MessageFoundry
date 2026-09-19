@@ -122,3 +122,48 @@ def test_search_presets_last_used_at_present_on_all_backends() -> None:
         "ALTER TABLE search_presets ADD COLUMN IF NOT EXISTS last_used_at DOUBLE PRECISION"
         in postgres._SCHEMA
     )
+
+
+def test_pending_approvals_requester_user_id_present_on_all_backends() -> None:
+    # BACKLOG #1540: the dual-control self-approval refusal keys on this column, so a backend missing
+    # it does not degrade -- ApprovalGate.approve reads NULL and refuses EVERY release fail-closed,
+    # turning dual control off for that store. It must therefore exist on ALL THREE backends, both in
+    # the fresh-DB CREATE TABLE *and* as a guarded ADD for an existing DB.
+    #
+    # This checks the DDL TEXT only. The round-trip through each backend's INSERT/SELECT is
+    # tests/_pending_approval_store_contract.py, which is what the live server legs run.
+    # The server backends carry their guarded migration inside _SCHEMA; sqlserver.py's comment beside
+    # that ALTER states why the placement is load-bearing there. SQLite migrates in _migrate
+    # (PRAGMA table_info-gated), so it is checked there.
+    import inspect
+
+    from messagefoundry.store import store as sqlite_store
+
+    assert "requester_user_id TEXT" in sqlite_store._SCHEMA
+    migrate_src = inspect.getsource(sqlite_store.MessageStore._migrate)
+    assert "ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT" in migrate_src
+
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+    assert any(
+        "CREATE TABLE pending_approvals" in s and "requester_user_id NVARCHAR(64) NULL" in s
+        for s in sqlserver._SCHEMA
+    )
+    assert any(
+        "COL_LENGTH('pending_approvals','requester_user_id')" in s
+        and "ADD requester_user_id NVARCHAR(64) NULL" in s
+        for s in sqlserver._SCHEMA
+    )
+
+    postgres = pytest.importorskip(
+        "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS pending_approvals" in s and "requester_user_id TEXT" in s
+        for s in postgres._SCHEMA
+    )
+    assert (
+        "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT"
+        in postgres._SCHEMA
+    )

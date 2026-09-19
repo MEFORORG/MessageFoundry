@@ -62,7 +62,9 @@ def _client(
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
-async def _add(service: AuthService, username: str, *roles: Role) -> None:
+async def _add(service: AuthService, username: str, *roles: Role) -> str:
+    """Provision a usable local operator; returns the immutable ``users.id`` (BACKLOG #1540 keys the
+    self-approval refusal on it, so the rename tests below need it)."""
     uid = await service.create_local_user(
         username=username,
         password=PW,
@@ -80,6 +82,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
+    return uid
 
 
 async def _token(c: httpx.AsyncClient, username: str) -> dict[str, str]:
@@ -183,6 +186,7 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
         operation="dead_letter_replay",
         params="{}",
         requester="op",
+        requester_user_id="op-id",
         requested_at=1.0,
         expires_at=2.0,
     )
@@ -296,12 +300,14 @@ async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeEr
 async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
     """The row must NOT be left at 'approved' for an operation that did not run."""
     gate, boom = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
 
     # The original executor error still reaches the caller -- compensation must not swallow it.
     with pytest.raises(RuntimeError) as caught:
-        await gate.approve(approval_id, approver="checker")
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value is boom
 
     row = await engine.store.get_pending_approval(approval_id)
@@ -313,10 +319,12 @@ async def test_raising_executor_audits_the_failure_against_both_identities(
     engine: Engine,
 ) -> None:
     gate, _ = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
     with pytest.raises(RuntimeError):
-        await gate.approve(approval_id, approver="checker")
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
 
     rows = await engine.store.list_audit(limit=50)
     audited = {(str(r["action"]), str(r["actor"])) for r in rows}
@@ -340,7 +348,9 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
     """The compensating transition is guarded on 'approved', so it can only ever move a row this
     gate itself released -- never one another caller rejected or expired."""
     gate, _ = await _gate_with_failing_op(engine)
-    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
     assert approval_id is not None
     await gate.reject(approval_id, approver="checker")
 
@@ -355,3 +365,98 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None
     assert str(row["status"]) == "rejected"
+
+
+async def test_pending_approval_store_contract(engine: Engine) -> None:
+    """The SQLite leg of the shared ``requester_user_id`` store contract (BACKLOG #1540).
+
+    The same body runs against live PostgreSQL and SQL Server, so the one round-trip the three SQL
+    bodies owe is asserted once rather than worded three times."""
+    from tests._pending_approval_store_contract import _assert_pending_approval_contract
+
+    await _assert_pending_approval_contract(engine.store)
+
+
+# --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
+# BACKLOG #1532 made `users.username` directory-writable, so the stored `requester` and the live
+# `approver` are two snapshots of a mutable value taken up to `[approvals].expiry_hours` apart.
+# Comparing them fails in BOTH directions, so both directions are pinned here. The session token is
+# deliberately NOT re-issued after the rename: `identity_for_token` rebuilds the Identity from the
+# live users row, which is exactly how the reconciler's new name reaches the approve endpoint.
+
+
+async def test_renamed_requester_still_cannot_approve_their_own_request(engine: Engine) -> None:
+    """The FALSE ACCEPT. Pre-fix, a requester renamed inside the approval window compared unequal to
+    their own stored name, passed the refusal, and released their own gated action."""
+    service = await _service(engine)
+    jdoe_id = await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        jdoe = await _token(c, "jdoe")
+        approval_id = (await _request_replay(c, jdoe)).json()["approval_id"]
+        # The directory renames the requester mid-window; the engine copies the new name down.
+        await engine.store.set_user_username(jdoe_id, "jdoe2")
+        # POSITIVE CONTROL, and it is what makes the 403 below evidence of anything. The stored
+        # `requester` and the approver's LIVE username must actually DIFFER at this point -- if they
+        # did not, a username comparison would refuse too and the assertion could pass under the very
+        # bug this test exists to catch. `identity_for_token` rebuilds the Identity from the users
+        # row, so the renamed row IS what the approve endpoint sees on the unchanged session token.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["requester"]) == "jdoe"
+        renamed = await engine.store.get_user(jdoe_id)
+        assert renamed is not None and renamed.username == "jdoe2"
+
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=jdoe)
+        assert r.status_code == 403  # pre-fix: 200, and the operation ran
+        assert "your own request" in r.json()["detail"]
+        # Still pending: a refused self-approval must not consume the request.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["status"]) == "pending"
+
+
+async def test_a_new_user_holding_the_freed_username_can_approve(engine: Engine) -> None:
+    """The FALSE REFUSAL, the reverse of the test above. Once a rename frees the name, a DIFFERENT
+    person can be given it; pre-fix their approval was refused as a self-approval it is not."""
+    service = await _service(engine)
+    jdoe_id = await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
+        await engine.store.set_user_username(jdoe_id, "jdoe2")
+        await _add(service, "jdoe", Role.ADMINISTRATOR)  # a second person inherits the freed name
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "jdoe"))
+        assert ok.status_code == 200  # pre-fix: 403
+        outcome = ok.json()
+        assert outcome["result"] == {"requeued": 0}  # the captured operation actually executed
+        # Both labels read "jdoe" because `requester` is the pre-rename DISPLAY snapshot and the
+        # approver now holds that same name. They are two different people, and the ids the refusal
+        # compared say so -- which is the whole point of keying on the id.
+        assert outcome["requested_by"] == "jdoe" and outcome["approved_by"] == "jdoe"
+
+
+async def test_a_request_with_no_requester_id_is_refused_fail_closed(engine: Engine) -> None:
+    """A row carrying NULL `requester_user_id` -- the shape the ALTER-in migration leaves behind --
+    cannot be checked for self-approval, so it is refused rather than falling back to the name.
+
+    The refusal is a DISTINCT 409, not the 403: a stale row is not an accusation of self-approval,
+    and the message has to tell the operator the remedy (re-request), which 403 does not."""
+    service = await _service(engine)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    await _add(service, "jdoe", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
+        # Strip the id to model a row written before the column existed.
+        await engine.store._db.execute(
+            "UPDATE pending_approvals SET requester_user_id = NULL WHERE id = ?", (approval_id,)
+        )
+        await engine.store._db.commit()
+        stale = await c.post(
+            f"/approvals/{approval_id}/approve", headers=await _token(c, "approver")
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"]
+        assert "reject it and request the operation again" in detail
+        assert "your own request" not in detail  # must not read as a self-approval accusation
+        # Fail-closed means the row is untouched, not silently consumed.
+        row = await engine.store.get_pending_approval(approval_id)
+        assert row is not None and str(row["status"]) == "pending"
+        # And the id is what the refusal turned on -- the requester's NAME is still present.
+        assert str(row["requester"]) == "jdoe"

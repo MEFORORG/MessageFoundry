@@ -1374,6 +1374,15 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         assert reset.status_code == 200
         temp = reset.json()["temp_password"]
         assert temp and reset.json()["must_change_password"] is True
+        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction travels WITH the credential -- the one
+        # response that reaches the issuing administrator states when it stops working. Pinned to the
+        # stored stamp the login gate reads, not merely asserted non-null: a fresh-clock or
+        # wrong-setting value would pass a non-null check and misinform the holder.
+        hours = AuthSettings().initial_password_expiry_hours
+        assert hours == 72  # the shipped default this route is exercised under
+        carol = await engine.store.get_user(carol_id)
+        assert carol is not None and carol.password_changed_at is not None
+        assert reset.json()["expires_at"] == carol.password_changed_at + hours * 3600
         # the temp logs carol in (rotation required); rotating it clears the gate
         relog = await _login(c, "carol", temp)
         assert relog.status_code == 200 and relog.json()["must_change_password"] is True

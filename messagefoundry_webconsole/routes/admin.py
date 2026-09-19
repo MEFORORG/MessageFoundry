@@ -17,6 +17,7 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    PasswordResetResponse,
     RolesUpdateRequest,
     UserCreateRequest,
     UserUpdateRequest,
@@ -326,7 +327,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         try:
-            result = await admin.reset_user_password(user_id, service=service, identity=identity)
+            # Annotated, and PasswordResetResponse imported for it, so the seam discovery SEEDS this
+            # DTO: handler RETURN types are not otherwise reached (only import statements are), and
+            # this route reads a field off one. Without the annotation a console built against a
+            # newer engine would read `expires_at` off an older one and raise AttributeError at
+            # reset time — the exact skew SUPPORTED_ENGINE_SEAMS exists to refuse loudly at startup.
+            result: PasswordResetResponse = await admin.reset_user_password(
+                user_id, service=service, identity=identity
+            )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -336,7 +344,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         user = await service.store.get_user(user_id)
         username = user.username if user is not None else user_id
         # The one-time credential is rendered ONCE for out-of-band delivery — never logged/stored.
-        return HTMLResponse(pages.temp_password_page(username, result.temp_password))
+        # BACKLOG #1141 (ASVS 6.4.5): its deadline rides along on the same page, read off the same
+        # response, so the administrator who conveys the credential can convey when it dies.
+        return HTMLResponse(
+            pages.temp_password_page(username, result.temp_password, result.expires_at)
+        )
 
     @app.post("/ui/users/{user_id}/reset-mfa")
     async def ui_user_reset_mfa(

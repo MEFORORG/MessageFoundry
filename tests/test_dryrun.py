@@ -92,9 +92,15 @@ def test_handler_filters_is_filtered() -> None:
 def test_router_to_unknown_handler_is_error() -> None:
     # Router names a handler that isn't registered (typo / renamed / removed handler). This must FAIL
     # CLOSED — ERROR (+ NAK on the live path), never a silent FILTERED accept-and-drop (review M-7).
+    #
+    # BACKLOG #1688: the assertion has to name the ROUTER stage, because ERROR-plus-"ghost" is not
+    # unique to it. With `route_only`'s fail-closed deleted, this message reaches `transform_one`,
+    # whose `registry.handlers[hname]` raises `KeyError('ghost')` a stage later; `dry_run`'s catch-all
+    # renders that as "router/handler error: 'ghost'" — still ERROR, still carrying "ghost". So the
+    # weaker pin stayed green with the guard gone and reported only that SOMETHING failed.
     result = dry_run(_registry(lambda m: ["ghost"], {}), ADT_A01)
     assert result.disposition is MessageStatus.ERROR
-    assert result.error and "ghost" in result.error
+    assert result.error and "returned unknown handler 'ghost'" in result.error
 
 
 def test_parse_error_is_error() -> None:
@@ -222,10 +228,11 @@ def test_split_messages_separator_agnostic() -> None:
         b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
         b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
     )
+    # Bytes in, bytes out since BACKLOG #1689 — the decode belongs to the inbound, in `dry_run`.
     msgs = split_messages(batch)
     assert len(msgs) == 2
-    assert msgs[0].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")
-    assert msgs[1].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A02")
+    assert msgs[0].startswith(b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")
+    assert msgs[1].startswith(b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02")
 
 
 def test_split_messages_pipe_batch_and_single() -> None:
@@ -315,6 +322,42 @@ def test_route_message_nonhl7_shares_one_rawmessage() -> None:
     # All THREE are the one shared RawMessage (read-only → safe to reuse across the fan-out).
     assert seen[0] is seen[1] and seen[1] is seen[2]
     assert [d.to for d in outcome.deliveries] == ["out", "out"]  # both handlers still delivered
+
+
+# --- BACKLOG #1692: DryRunResult.meta_ops ---------------------------------------------------------
+
+
+def test_dry_run_surfaces_declared_metadata_writes_on_the_hl7_path() -> None:
+    """A Handler's ``SetMeta`` reaches ``DryRunResult.meta_ops`` (ADR 0081).
+
+    ``dry_run`` built its result without ``meta_ops=outcome.meta_ops`` from the day ``MetaOpPreview``
+    arrived, so the field was empty whatever a Handler declared and a ``SetMeta`` was invisible to the
+    CLI and the Test Bench. The ``SetState`` beside it is asserted on the SAME run: without it, an
+    outcome that produced nothing at all would satisfy the metadata assertion by being empty too.
+    """
+
+    def handle(msg: Message) -> list[Any]:
+        return [Send("out", msg), SetState("ns", "sk", "sv"), SetMeta("mk", "mv")]
+
+    result = dry_run(_registry(lambda m: ["h"], {"h": handle}), ADT_A01)
+    assert [(s.namespace, s.key, s.value) for s in result.state_ops] == [("ns", "sk", "sv")]
+    assert [(m.key, m.value) for m in result.meta_ops] == [("mk", "mv")]
+
+
+def test_dry_run_surfaces_declared_metadata_writes_on_the_raw_path() -> None:
+    """The same, through ``_dry_run_raw`` — the non-HL7 construction is a SECOND call site.
+
+    Both sites omitted ``meta_ops`` and each has to be pinned: fixing one leaves a JSON/X12 feed's
+    ``SetMeta`` as invisible as before, with the HL7 test green over it.
+    """
+
+    def handle(msg: RawMessage) -> list[Any]:
+        return [Send("out", msg.raw), SetState("ns", "sk", "sv"), SetMeta("mk", "mv")]
+
+    reg = _raw_registry(lambda m: ["h"], {"h": handle}, content_type=ContentType.JSON)
+    result = dry_run(reg, '{"a": 1}')
+    assert [(s.namespace, s.key, s.value) for s in result.state_ops] == [("ns", "sk", "sv")]
+    assert [(m.key, m.value) for m in result.meta_ops] == [("mk", "mv")]
 
 
 def test_transform_one_honors_prebuilt_payload() -> None:

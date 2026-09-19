@@ -19,13 +19,22 @@ caller input" — it would still pass if the deadline were computed from the use
 the seam computed instead of paying a wall-clock wait. The directory is the duck-typed fake the
 ``/ui/sso`` suite already uses. Owner ruling 2026-08-20: there is no multi-VM lab, so a control whose
 verification needed a live domain controller would not be verifiable here at all.
+
+**Reading the deadline is not the same as being off the wall clock, and this docstring used to say it
+was.** The retired sentence lived on :class:`_DeadlineRecorder` and claimed the deadline "is the value
+the control actually computes; a measured elapsed would only be that value plus scheduler jitter".
+That holds inside one slot and not across slots. :func:`~messagefoundry.auth.service._failure_deadline`
+QUANTIZES — it reads the measured elapsed and rounds up to the next whole multiple of the budget — so
+a process stall longer than the budget moves the deadline a whole slot without any branch doing extra
+work. The invariance assertions below therefore ARE wall-clock measurements. What keeps them reading
+the code rather than the runner is the sampling in :func:`_least_deadline_offsets`, not the recorder.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -53,10 +62,14 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 class _DeadlineRecorder:
     """Stands in for ``service._sleep_until``: records the deadline, never waits.
 
-    Recording the deadline rather than the elapsed is what keeps these tests off the wall clock. The
-    deadline is the value the control actually computes; a measured elapsed would only be that value
-    plus scheduler jitter, which on Windows is ~15 ms and would force a tolerance wide enough to hide
-    the differences the tests exist to catch.
+    Recording the deadline rather than the elapsed is what buys the tight tolerance. The deadline is
+    the value the control actually computes, so it carries none of the scheduler jitter a measured
+    elapsed would add on the way back out — on Windows ~15 ms, which would force a tolerance wide
+    enough to hide the differences these tests exist to catch.
+
+    It does NOT take these tests off the wall clock, and an earlier version of this docstring said it
+    did. The deadline is quantized from a measured elapsed, so a stall still reaches it; see the
+    module docstring and :func:`_least_deadline_offsets`.
     """
 
     def __init__(self) -> None:
@@ -74,6 +87,85 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> _DeadlineRecorder:
     # warning regardless of which tests ran before it.
     monkeypatch.setattr(svc, "_BUDGET_OVERRUN_WARNED", set())
     return rec
+
+
+#: Samples per branch for the two invariance assertions. Kept BELOW the lockout threshold, pinned on
+#: the line under it, because the sign-in seam's branches are not all idempotent: repeating a wrong
+#: password against a real account walks it toward lockout, which would silently turn the
+#: `wrong_password` branch into the `locked_account` branch and leave both assertions passing while
+#: measuring four branches instead of five. The per-sample outcome check below is the second guard on
+#: that, and the one that still holds if the threshold ever changes.
+_DEADLINE_SAMPLES = 3
+assert AuthSettings().lockout_threshold > _DEADLINE_SAMPLES
+
+#: A seam's failure branches: name -> (a callable that drives it, the error it must keep returning).
+#: The call is re-invoked per sample, so it is a factory rather than a coroutine, which can only be
+#: awaited once.
+type _Branches = Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]]
+
+
+async def _least_deadline_offsets(
+    recorder: _DeadlineRecorder, branches: _Branches
+) -> dict[str, float]:
+    """Drive each branch several times and return its SMALLEST ``deadline - call start``.
+
+    **Why a minimum and not a single sample (BACKLOG #1140).** The deadline is quantized: a failure
+    whose elapsed outran the budget lands on the next whole slot. That is the control's fail-safe and
+    it is correct, but it means ANY process stall longer than the budget — a garbage-collection pause,
+    CPU starvation on a shared runner, the OS descheduling the interpreter — moves one branch a whole
+    slot with no branch-dependent cause. One sample cannot tell that apart from a real side-channel,
+    and the numbers it prints look identical: one branch at exactly 2x the others.
+
+    **The minimum is the reading that survives.** Load can only make a branch read HIGH; nothing makes
+    work finish early. So a branch whose own cost CONSISTENTLY needs two slots has a minimum of two
+    slots and still reds this assertion, at the same 1 ms tolerance, while a branch pushed there by a
+    stall falls back to its true slot on another sample. This is the shape
+    ``test_the_shipped_budget_leaves_room_above_a_real_argon2_verify`` already uses against the same
+    hazard, for the same stated reason.
+
+    **What the minimum costs, stated rather than glossed.** It is biased toward reading clean, so it
+    is weaker than a single sample against a branch that overruns only SOMETIMES — a data-dependent
+    cost that fires on a fraction ``p`` of calls is caught with probability ``p ** _DEADLINE_SAMPLES``,
+    so a 50/50 branch is missed seven times in eight. That is a deliberate trade and not a free one.
+    Two things bound it. A single sample is not the safer alternative: it catches that branch half the
+    time while reporting a stall as a side-channel the rest of the time, which is the failure that
+    evicted PR 1170, and a guard that reds for the wrong reason gets relaxed by whoever is unblocking
+    the queue. And an intermittent branch would have to swing across a whole 500 ms slot to be visible
+    to EITHER form, which against branches costing 0.3-55 ms is a hundredfold regression with louder
+    symptoms than this assertion. Raising ``_DEADLINE_SAMPLES`` is not the lever — it is capped by the
+    lockout threshold above. A statistical test over many samples is, if a branch of that shape is
+    ever suspected; it is not built, because none is.
+
+    **Measured 2026-09-16, the eviction this fixes.** ``ad_pathway_retired`` read 1.0000056 against
+    0.5000016-0.5000029 for the other four. It is the CHEAPEST branch on the seam, not the dearest:
+    instrumented in-process at 4 concurrent python processes on the author's box, 12 interleaved
+    samples per branch, it costs 0.30 ms min / 0.47 ms median / 1.29 ms max against 34-55 ms for every
+    local branch, which is dominated by the one argon2id verify. A 0.3 ms branch cannot reliably need
+    a second 500 ms slot, and the 40 ms branch would have crossed first if the cost were the branch's
+    own. The direction of the anomaly is what identifies it as the environment.
+
+    **A uniform stall is deliberately tolerated.** There is no assertion that the minima land in slot
+    1. If every branch is pushed to a later slot together they are still indistinguishable, which is
+    the property; asserting the slot index would put the load sensitivity straight back.
+
+    **Every sample re-checks that the branch is still the branch**, so repetition cannot quietly
+    collapse two branches into one and leave the invariance assertion trivially satisfied.
+    """
+    offsets: dict[str, float] = {}
+    for name, (call, expected_error) in branches.items():
+        samples: list[float] = []
+        for _ in range(_DEADLINE_SAMPLES):
+            recorder.deadlines.clear()
+            start = time.monotonic()
+            outcome = await call()
+            assert not outcome.ok, f"{name} was expected to fail"
+            assert outcome.error == expected_error, (
+                f"{name} stopped being that branch under repetition: {outcome.error!r}"
+            )
+            assert len(recorder.deadlines) == 1, f"{name} did not pad exactly once"
+            samples.append(recorder.deadlines[0] - start)
+        offsets[name] = min(samples)
+    return offsets
 
 
 # --- the deadline primitive --------------------------------------------------
@@ -165,31 +257,37 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
     """THE INVARIANCE ASSERTION for the sign-in seam.
 
     Five failure branches whose real costs differ by 75x at the parent commit. Each is driven from a
-    call start captured here, and the assertion is that ``deadline - start`` is the same for all of
-    them — not that it equals any particular number, and not that it equals a constant the production
-    code also reads.
+    call start captured in :func:`_least_deadline_offsets`, and the assertion is that
+    ``deadline - start`` is the same for all of them — not that it equals any particular number, and
+    not that it equals a constant the production code also reads.
     """
     service = await _service(engine)
-    branches = {
-        "unknown_username": lambda: service.login("nosuchuser", "definitely-not-it"),
-        "wrong_password": lambda: service.login("jane", "definitely-not-it"),
-        "locked_account": lambda: service.login("locky", "definitely-not-it"),
+    retired = "Directory password sign-in has been retired; use Windows SSO or OIDC"
+    branches: _Branches = {
+        "unknown_username": (
+            lambda: service.login("nosuchuser", "definitely-not-it"),
+            "invalid credentials",
+        ),
+        "wrong_password": (
+            lambda: service.login("jane", "definitely-not-it"),
+            "invalid credentials",
+        ),
+        "locked_account": (lambda: service.login("locky", "definitely-not-it"), "account locked"),
         # The bootstrap spelling takes an extra store lookup plus the supersession check (#1268), and
         # measured 3.6 ms slower than every other local branch before the pad.
-        "bootstrap_username": lambda: service.login("admin", "definitely-not-it"),
+        "bootstrap_username": (
+            lambda: service.login("admin", "definitely-not-it"),
+            "invalid credentials",
+        ),
         # BACKLOG #1137 retired directory password sign-in on 2026-08-22, AFTER this item's research
-        # was written. It refuses before any store lookup, so it was by far the loudest branch here.
-        "ad_pathway_retired": lambda: service.login("jane", PW, provider=AuthProvider.AD),
+        # was written. It refuses before any store lookup, so it was by far the loudest branch here —
+        # and, measured 2026-09-16, by far the CHEAPEST, which is why a stall reaches it first.
+        "ad_pathway_retired": (
+            lambda: service.login("jane", PW, provider=AuthProvider.AD),
+            retired,
+        ),
     }
-    offsets: dict[str, float] = {}
-    for name, call in branches.items():
-        recorder.deadlines.clear()
-        start = time.monotonic()
-        outcome = await call()
-        assert not outcome.ok, f"{name} was expected to fail"
-        assert len(recorder.deadlines) == 1, f"{name} did not pad exactly once"
-        offsets[name] = recorder.deadlines[0] - start
-
+    offsets = await _least_deadline_offsets(recorder, branches)
     spread = max(offsets.values()) - min(offsets.values())
     # The tolerance covers only the microseconds between this test's `time.monotonic()` and the
     # seam's own — NOT the branch's work, which is on the other side of the deadline. At the parent
@@ -301,23 +399,25 @@ async def test_every_kerberos_reject_answers_at_one_deadline(
         roles=[Role.OPERATOR.value],
         actor="test",
     )
-    branches = {
-        "no_principal": None,
-        "not_in_directory": "stranger",
-        "local_account_conflict": "jdoe",
+
+    def _reject(principal_name: str | None) -> Callable[[], Awaitable[LoginOutcome]]:
+        # The principal patch is re-applied per sample rather than once per branch, so each sample is
+        # self-contained and no sample can run against the name a previous branch installed.
+        async def _call() -> LoginOutcome:
+            monkeypatch.setattr(
+                "messagefoundry.auth.service.kerberos_principal",
+                lambda _t, _s, _p=principal_name: _p,
+            )
+            return await service.authenticate_kerberos(b"spnego-token")
+
+        return _call
+
+    branches: _Branches = {
+        "no_principal": (_reject(None), "SSO authentication failed"),
+        "not_in_directory": (_reject("stranger"), "user not found in directory"),
+        "local_account_conflict": (_reject("jdoe"), "account conflict"),
     }
-    offsets: dict[str, float] = {}
-    for name, principal_name in branches.items():
-        monkeypatch.setattr(
-            "messagefoundry.auth.service.kerberos_principal",
-            lambda _t, _s, _p=principal_name: _p,
-        )
-        recorder.deadlines.clear()
-        start = time.monotonic()
-        outcome = await service.authenticate_kerberos(b"spnego-token")
-        assert not outcome.ok, f"{name} was expected to fail"
-        assert len(recorder.deadlines) == 1, f"{name} did not pad exactly once"
-        offsets[name] = recorder.deadlines[0] - start
+    offsets = await _least_deadline_offsets(recorder, branches)
     spread = max(offsets.values()) - min(offsets.values())
     assert spread < 0.001, f"deadline depends on the reject branch: {offsets}"
 

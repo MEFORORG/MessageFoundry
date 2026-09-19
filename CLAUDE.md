@@ -280,7 +280,7 @@ ASVS Tracker.
 **An eighth went on 2026-09-10, by owner decision: the CONSOLE. The MANAGER replaces it, and a
 Manager is NOT a renamed Console.** A Console's workers were separate `claude -p` sessions across
 several accounts, spawned under a per-root grant, and exactly one Console ran. A Manager's workers
-are **subagents inside its own process on its own account**, it needs **no spawn grant**, and
+are **subagents inside its own process on its own account**, it needs **no spawn grant for them**, and
 **several Managers run at once, usually one per account**. The Manager also does **not enqueue** --
 that moved to the Lander. **So a Console rule does not transfer by substitution.** Read the Manager's
 row below and korus `MANAGER.md`, and decide as a Manager; do not reach for what a Console would have
@@ -332,6 +332,7 @@ recency.
 | **Regulator** | spawned on a red | Deciding whose failure it is: the PR's, `main`'s, a flake's, or the queue's. Keeps a log. | Assume it remembers an earlier red; it starts with none. Send anything but the PR's own failure back to a Builder. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and the vault scorecard re-score (owner ruling 2026-09-05). Standing authority on the engine repo and the vault, with no per-action owner approval. Resolving a POSITIONAL ledger conflict (owner ruling 2026-09-11; see below). | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or that requires choosing what an item SAYS. |
+| **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **The Lander may resolve a POSITIONAL ledger conflict, and only that (owner ruling 2026-09-11).**
 Permitted when `git merge-tree --name-only origin/main <head>` names **`docs/BACKLOG.md` alone** and
@@ -354,10 +355,49 @@ own pre-fix head (non-zero, so the 0 is attributable to *this* merge), the ledge
 #1030's authoring session had died -- leaving its PR unlandable by anyone until the owner routed a
 new session to it.
 
-**NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds nothing. The owner starts each
-Manager, in a desktop instance, and a Manager's workers are subagents in its own process.** That is
-why a Manager needs no account roster and cannot reach another Manager: the shape dissolves the
-cross-account coordination problem instead of solving it.
+**THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
+exists for work that falls outside the other five, so its instruction is the whole of its scope and
+it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
+an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
+ruling below binds it.
+
+**Standing by is its normal state, not a fault in it.** An idle Special session is the owner holding
+one in reserve, and work it finds itself spends that. It announces and declares before its first
+SHARED write rather than on arrival, which is the one point where it parts company with every other
+seat here: the arrival prompt that tells each session to declare is the line this seat alone does
+not act on. The cost of that silence is real and lands on nobody while the seat touches nothing --
+`fleet.ps1` omits it and no peer can forecast a collision with it -- which is why the deferral ends
+at the first shared write and not later. Its card is
+[`docs/roles/special.card.md`](docs/roles/special.card.md); the full playbook is korus
+`roles/SPECIAL.md`, read at `origin/main` like every other playbook.
+
+**A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
+ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
+workers are still subagents in its own process rather than spawned sessions. A Manager still needs
+no account roster and still cannot reach another Manager: spawning makes a NEW session, it does not
+address an existing one, so the shape still dissolves the cross-account problem rather than solving
+it.
+
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing reads a red
+PR -- `failure-signal.yml` sets a `ci-red` label no workflow reads back, and `stalled-prs.yml`
+reports green-but-unmergeable PRs rather than red ones -- so the work stops until somebody happens
+to look. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
+was written against.
+
+**SPAWNING SHOULD BE RARE, AND REACHING FOR IT IS WORTH NOTICING.** A Manager's subagents already
+cover almost everything it does, and the load-bearing property is that **a subagent cannot outlive a
+mistake** -- it needs no grant and it dies with its Manager. **A spawned session can outlive one**,
+which is the whole of the added risk. So a spawn is better read as a SIGNAL THAT SOMETHING UPSTREAM
+HAS FAILED -- a seat died with work outstanding, or nobody was alive to take a red -- than as a
+routine tool. Raised by a Manager seat on 2026-09-16, about its own grant, which is the direction
+that argument is most credible from.
+
+**THIS REPLACED A RULE READING "NO SEAT SPAWNS A SESSION ANY MORE, so the spawn grant binds
+nothing."** That was true when written and false by 2026-09-16, when the grant was measured present
+on all six config roots. It is named rather than deleted because a seat that read it did not try,
+rendered unable to spawn, and confirmed it -- the same self-confirming shape this section already
+records for seat declaration.
 
 **The grant's measurements are kept, not deleted, so nobody re-derives them and nobody mistakes this
 for a capability that was lost.** The grant is a rule matching `Bash(claude:*)` or
@@ -466,10 +506,21 @@ gates a merge**, and no seat has to clear one.
   seat can raise a chip, and in the 2026-09-04 case above the spawner was
   the session that then pushed the fix. It corrected its own BACKLOG item in the same change and
   still could not reach the chip, which is the whole shape of the defect -- BACKLOG #1448.
-- Give each session its own git worktree (`scripts/worktree/new.ps1 -Name <x>`, cleanup with
-  `remove.ps1`). Each gets an isolated checkout, branch and `.venv` on the same remote and the same
-  PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md). The AI project memory is shared across
-  sessions, so coordinate memory writes.
+- **Give each session its own git worktree, and START the session in it.** `scripts/worktree/new.ps1
+  -Name <x>` creates one (cleanup with `remove.ps1`); `spawn.ps1 -Name <x>` creates it *and* opens an
+  editor window on it, which is the entry point to reach for. Each gets an isolated checkout, branch
+  and `.venv` on the same remote and the same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
+  The AI project memory is shared across sessions, so coordinate memory writes.
+- **Never brief a worker to RELOCATE into a worktree -- from a subagent it cannot work.** A
+  subagent's `EnterWorktree` call into a `new.ps1` sibling is **refused outright** (the path is outside
+  `.claude/worktrees/`), so the brief burns the worker's one turn on a call that cannot succeed. From a
+  session the same call instead raises an owner prompt that no `permissions.allow` rule can suppress.
+  Start the session in its worktree (`spawn.ps1`), or dispatch a file-editing subagent with
+  `isolation: worktree` and have it run `pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1`
+  **before its first `pytest`/`mypy`/`ruff` run** -- a managed worktree arrives with no `.venv`, and
+  without one `pytest` dies at import rather than running slowly. The measurements, the cost of that
+  bootstrap, and why not to engineer around the check are stated once in
+  [`docs/WORKTREES.md`](docs/WORKTREES.md) section "Start the session in the worktree".
 - **Put the prompt FIRST when you spawn, or close the flags with `--`.** At least `--allowedTools`,
   `--disallowedTools`, `--tools`, `--add-dir`, `--mcp-config`, `--betas` and `--file` take lists, so
   `claude --bg --allowedTools Bash Edit "do the work"` swallows the prompt as a third tool name. The
@@ -510,9 +561,9 @@ gates a merge**, and no seat has to clear one.
 - **Name the ref, not the checkout.** The superseded line said a checkout, and its own next sentence
   warned that a checkout is not a ref. Both halves were right and the first one won.
 - **What that costs, measured 2026-09-06.** The korus primary sat on a branch 15 commits ahead of
-  `origin/main` and 14 behind it. `roles/REVIEWER.md` was absent from its working tree and present
+  `origin/main` and 14 behind it. One seat's playbook was absent from its working tree and present
   on `origin/main`.
-- **So a seat reading the folder finds no Reviewer playbook, and no error.** An `ls` of a directory
+- **So a seat reading the folder finds no playbook for itself, and no error.** An `ls` of a directory
   is not evidence that you have a file, and a missing file is the quietest failure in this list.
 - **The failure this cost is the one to carry forward.** A pointer and the thing it points at are
   two edits, and nothing fails when only the first is made. The playbooks moved on 2026-09-04 and

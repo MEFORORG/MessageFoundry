@@ -11,8 +11,10 @@ web-console layer.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import threading
+import urllib.error
 from collections.abc import Mapping
 from typing import Any
 
@@ -642,6 +644,55 @@ def test_exchange_code_without_id_token_raises() -> None:
             code_verifier="v",
             opener=opener,  # type: ignore[arg-type]
         )
+
+
+class _RaisingOpener:
+    """An opener that raises whatever it is handed — for the token endpoint's two refusal paths."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def open(self, req: Any, timeout: float = 0.0) -> Any:
+        raise self._exc
+
+
+def test_exchange_code_token_endpoint_errors_leave_no_exception_chain() -> None:
+    """Both token-endpoint refusals must sever the chain, not merely suppress it.
+
+    ``FlowError`` reports the RFC 6749 status (or the transport error's class name) and deliberately
+    withholds the response body, which can echo this POST's request params — the client secret among
+    them. ``raise ... from None`` did NOT deliver that: it clears ``__cause__`` and sets
+    ``__suppress_context__``, but LEAVES ``__context__`` populated. The flag stops the default
+    traceback printer walking; it does not detach the exception, so the ``HTTPError`` — a readable
+    response object — stayed reachable by attribute. Raising outside the handler empties both."""
+    http_error = urllib.error.HTTPError(
+        "https://idp.example/token",
+        400,
+        "Bad Request",
+        {},  # type: ignore[arg-type]
+        io.BytesIO(b'{"error":"invalid_client","hint":"client_secret=SYNTHETIC-SECRET"}'),
+    )
+    for raised, match in (
+        (http_error, "returned HTTP 400"),
+        (urllib.error.URLError("connection refused"), "unreachable"),
+    ):
+        with pytest.raises(oidc.FlowError, match=match) as excinfo:
+            oidc.exchange_code(
+                token_endpoint="https://idp.example/token",
+                client_id="c",
+                client_secret="SYNTHETIC-SECRET",
+                code="x",
+                redirect_uri="http://localhost/cb",
+                code_verifier="v",
+                opener=_RaisingOpener(raised),  # type: ignore[arg-type]
+            )
+        exc = excinfo.value
+        assert exc.__cause__ is None
+        assert exc.__context__ is None, (
+            f"{type(raised).__name__} is still reachable on __context__ — `from None` only sets "
+            "__suppress_context__; raise from outside the `except` block"
+        )
+        assert "SYNTHETIC-SECRET" not in f"{exc!r}"
 
 
 class _TripwireOpener:

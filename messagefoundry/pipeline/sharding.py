@@ -191,4 +191,10 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         # check must still see the whole config or every non-owning shard fails its build_check. Derived
         # from the SOURCE registry: deriving it from `selected` would reintroduce exactly that bug.
         all_loopback_inbound=registry.loopback_inbound_names() if sharded else None,
+        # Pin the UNFILTERED inbound names for the same reason, and with a sharper edge: the startup
+        # `dead_letter_missing_inbounds` sweep asks "is this channel_id still configured?" and writes
+        # to the UNIFIED store every shard shares (ADR 0063). Keyed off `selected` it would answer no
+        # for every sibling shard's inbound and dead-letter their live ingress/routed/response rows.
+        # Derived from the SOURCE registry, as above.
+        all_inbound=frozenset(registry.inbound) if sharded else None,
     )
