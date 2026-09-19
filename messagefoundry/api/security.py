@@ -206,7 +206,7 @@ def bearer_token(request: Request) -> str | None:
     return None
 
 
-def client_ip(request: Request) -> str | None:
+def client_ip(conn: Request | WebSocket) -> str | None:
     """The caller's client address, matching how login records it on the session (``_client`` in
     ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
     apples-to-apples, and — since ADR 0150 — as the ``client`` recorded on audit rows. It is public
@@ -214,12 +214,20 @@ def client_ip(request: Request) -> str | None:
     second, divergent notion of "the client address": two extractors would eventually disagree about
     proxy handling and the audit trail would contradict the risk signal.
 
+    **Takes either plane, and that is what the no-second-extractor rule above requires here.**
+    :func:`authorize_ws` audits the same three authorization outcomes :func:`require` does, over a
+    :class:`WebSocket` rather than a :class:`Request`, so a WS-only extractor is exactly the second
+    notion this docstring forbids. Widening costs nothing structural: ``client`` is ONE property on
+    starlette's ``HTTPConnection``, which both classes inherit unchanged, so this is the same read on
+    both planes rather than two reads that agree today. The parameter is ``conn`` rather than
+    ``request`` for the same reason, matching ``_auth.session_cookie_name``.
+
     Behind a declared trusted proxy this already resolves to the real client:
     uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
     defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
     residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
     rotation by a directly-reachable attacker (SEC-024)."""
-    return request.client.host if request.client else None
+    return conn.client.host if conn.client else None
 
 
 def require(
@@ -262,7 +270,7 @@ def require(
             and (request.method, request.url.path) not in _MFA_EXEMPT_ROUTES
             and not await auth.mfa_satisfied(bearer_token(request))
         ):
-            await auth.audit_mfa_denied(identity, request.url.path)
+            await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "multi-factor verification required; POST /auth/mfa-verify then retry",
@@ -270,7 +278,9 @@ def require(
             )
         for permission in permissions:
             if not identity.has(permission):
-                await auth.audit_permission_denied(identity, permission, request.url.path)
+                await auth.audit_permission_denied(
+                    identity, permission, request.url.path, client=client_ip(request)
+                )
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
                 )
@@ -284,7 +294,9 @@ def require(
         if audit_all or request.method != "GET":
             audited = _grant_audit_permission(permissions, audit_all=audit_all)
             if audited is not None:
-                await auth.audit_permission_granted(identity, audited, request.url.path)
+                await auth.audit_permission_granted(
+                    identity, audited, request.url.path, client=client_ip(request)
+                )
         return identity
 
     return dependency
@@ -494,7 +506,17 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
                     # gate, ``GET /service/identity``, writes its own ``service_cert_auth`` row in the
                     # ROUTE BODY. That covers authentication for that route only; a future route built
                     # on this factory inherits nothing, which is the gap the grant work would close.
-                    await auth.audit_permission_denied(identity, permission, request.url.path)
+                    #
+                    # ``client`` (ADR 0150) is threaded HERE and not inherited: this factory is the
+                    # one authorization gate that does NOT delegate to :func:`require` — it
+                    # authenticates through :func:`resolve_client_cert_identity` and runs its own
+                    # permission loop — so "fix require() and the factories follow" is true of
+                    # ``require_paced`` / ``require_step_up`` and false of this one. A cert plane's
+                    # peer address is the whole of what identifies the calling SERVICE host, since
+                    # there is no session row to join back to.
+                    await auth.audit_permission_denied(
+                        identity, permission, request.url.path, client=client_ip(request)
+                    )
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
                 )
@@ -831,13 +853,16 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     # RESIDUAL: checked once at handshake. A role change that newly puts a live session in scope does
     # not tear down an established socket; the connection's own revalidation is the backstop.
     if not await auth.mfa_satisfied(ws_token(websocket)):
-        await auth.audit_mfa_denied(identity, websocket.url.path)
+        await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None
     for permission in permissions:
         if not identity.has(permission):
             # Audit the denial like the HTTP require() path does, so a revoked/under-privileged
-            # user probing the stats feed leaves a trail too (review low-9).
-            await auth.audit_permission_denied(identity, permission, websocket.url.path)
+            # user probing the stats feed leaves a trail too (review low-9). ``client`` via the shared
+            # :func:`client_ip` (see its docstring for why a WS-only extractor was refused).
+            await auth.audit_permission_denied(
+                identity, permission, websocket.url.path, client=client_ip(websocket)
+            )
             return None
     # BACKLOG #195a (ASVS 16.3.2): audit the grant. Under [diagnostics].audit_all_authz — ON by default
     # since BACKLOG #1277 — every satisfied WS route is audited (PHI-view still excluded). THIS RUNS ONCE
@@ -847,5 +872,7 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     audit_all = _audit_all_authz(websocket.app.state)
     audited = _grant_audit_permission(permissions, audit_all=audit_all)
     if audited is not None:
-        await auth.audit_permission_granted(identity, audited, websocket.url.path)
+        await auth.audit_permission_granted(
+            identity, audited, websocket.url.path, client=client_ip(websocket)
+        )
     return identity

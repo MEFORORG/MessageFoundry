@@ -56,8 +56,15 @@ async def _service(engine: Engine, settings: AuthSettings | None = None) -> Auth
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+def _client(
+    engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
+) -> httpx.AsyncClient:
+    """``peer`` sets the ASGI scope's client address, which ``httpx.ASGITransport`` otherwise omits.
+
+    Omitted, ``request.client`` is None. That is fine for the RBAC behaviour most of this file
+    asserts, and fatal for the ADR 0150 section below, where an assertion on the audited ``client``
+    would otherwise compare None to None and pass against unfixed code (BACKLOG #1644)."""
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=peer)
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -1614,6 +1621,43 @@ async def test_engine_internal_write_does_not_inherit_a_request_address(engine: 
     await engine.store.record_audit("retention.purge", actor="system")
     row = dict((await engine.store.list_audit(limit=1))[0])
     assert row["action"] == "retention.purge" and row["client"] is None
+
+
+async def test_the_authorization_rows_carry_the_caller_address(engine: Engine) -> None:
+    """BACKLOG #1644: the three AUTHORIZATION audit rows record WHERE FROM, like every other row.
+
+    They were the gap ADR 0150 left. `auth.permission_granted` is written by the shipped default on
+    every authenticated request, so a NULL client there was not a corner case — it was the bulk of the
+    table asserting the false half of the docs/PHI.md section 6 contract, which says NULL means *no
+    client was in scope* and never *unknown*. A client was always in scope: these rows are only ever
+    reached from a request.
+
+    RED when `client=` is dropped from either call in `require()`. The MFA-denial arm is pinned in
+    tests/test_mfa_access_gate.py, the cert-plane arm in tests/test_api_tls.py, and the WebSocket arm
+    in tests/test_auth_hardening.py -- four gates, and `require_service_cert` does not delegate to this
+    one, so no single assertion covers them all.
+
+    `peer=` is what makes this non-vacuous; `_client` says why.
+    """
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # holds messages:read, NOT users:manage
+    async with _client(engine, service, peer=("10.4.2.9", 51234)) as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/messages", headers=vw)).status_code == 200  # grant
+        assert (await c.get("/users", headers=vw)).status_code == 403  # denial
+
+    granted = [dict(r) for r in await engine.store.list_audit(action="auth.permission_granted")]
+    assert granted, "the shipped audit_all_authz default must record the grant"
+    assert {r["client"] for r in granted} == {"10.4.2.9"}
+
+    denied = [dict(r) for r in await engine.store.list_audit(action="auth.permission_denied")]
+    assert len(denied) == 1 and denied[0]["actor"] == "vw"
+    assert denied[0]["client"] == "10.4.2.9"
+
+    # The addresses are folded INSIDE the tamper-evident chain (ADR 0150), so threading them through
+    # a new set of writers must not break it.
+    ok, message = await engine.store.verify_audit_chain()
+    assert ok, message
 
 
 async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(

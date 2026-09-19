@@ -1299,6 +1299,10 @@ def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
     role holds ``monitoring:read``, so the only wired route cannot produce a denial at all; and because
     the property under test belongs to the gate that any future service route would also use. The
     query string is deliberately non-empty: the audit row must carry the PATH and never the full URL.
+
+    ``client`` is a REAL peer address (RFC 5737 TEST-NET-1) and not an omitted key: starlette resolves
+    an absent one to None without raising, which would make the BACKLOG #1644 assertion below vacuous
+    rather than failing.
     """
     return Request(
         {
@@ -1310,6 +1314,7 @@ def _shim_cert_request(app: object, cn: str = "svc.internal") -> Request:
             "app": app,
             "scheme": "http",
             "server": ("t", 80),
+            "client": ("192.0.2.77", 51234),
             "state": {MF_CLIENT_PEERCERT_STATE_KEY: _peercert(cn)},
         }
     )
@@ -1343,6 +1348,10 @@ async def test_service_cert_authz_denial_is_audited(tmp_path: Path) -> None:
             "permission": "users:manage",
             "path": "/service/probe",
         }
+        # BACKLOG #1644 (ADR 0150): the row records WHERE FROM, and this gate needs its own threading
+        # to get it — the comment on the ``audit_permission_denied`` call in ``require_service_cert``
+        # says why. RED when ``client=`` is dropped from that call; nothing else covers it.
+        assert rows[0]["client"] == "192.0.2.77"
 
         # POSITIVE CONTROL, same store and same counter: the bearer plane's denial also lands, so the
         # zero this test was written against could not have been an inert audit path on this app.
