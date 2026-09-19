@@ -58,7 +58,7 @@ The fix, the merge, and picking the work.
 
 ## The full playbook
 
-`roles/REGULATOR.md`, in the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a
+`roles/REGULATOR.md`, in the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a
 working tree:
 
     git -C <korus clone> fetch origin

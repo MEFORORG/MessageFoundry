@@ -64,7 +64,7 @@ Picking the work, or writing it.
 
 ## The full playbook
 
-`roles/LANDER.md`, in the **`wshallwshall/korus`** repository, read at `origin/main` and never out of a
+`roles/LANDER.md`, in the **`MEFORORG/korus`** repository, read at `origin/main` and never out of a
 working tree:
 
     git -C <korus clone> fetch origin
